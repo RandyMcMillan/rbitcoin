@@ -75,6 +75,18 @@ pub struct ProcessOwnedSizes {
     /// Write-published recent-create identity ring (heights / live keys).
     pub recent_heights: usize,
     pub recent_keys: usize,
+    /// Published Arc keys (may equal live, or lag until flush).
+    pub recent_pub_keys: usize,
+    pub recent_overlay_keys: usize,
+    /// Fifo txid copies (one vec per height).
+    pub recent_fifo_keys: usize,
+    /// PublishedIds / LiveUnion layer chain (shared Arcs; count once).
+    pub union_layers: usize,
+    pub union_keys: usize,
+    /// Confirmed hash→height map entries.
+    pub h2h_keys: usize,
+    /// Height-fence run count (no Vec clone).
+    pub fence_runs: usize,
     /// Body-queue heights whose raw payload was dropped after lookup decode.
     pub bq_promoted: usize,
 }
@@ -143,7 +155,10 @@ pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{IdLayer, IdMap, LiveUnion, PublishedIds, TxidHasher};
-pub use recent_creates::{recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_FLOOR};
+pub use recent_creates::{
+    recent_creates_ewma_step, recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_CAP,
+    RECENT_CREATES_HORIZON_FLOOR,
+};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
@@ -1092,6 +1107,10 @@ pub struct Query {
     block_queue_pressure: AtomicBool,
     /// Last 1-min confirm window (`bq soft=n/win` `win`). 0 = rate unknown.
     soft_confirm_window: AtomicU32,
+    /// Last contiguous height lookup dequeued into loadq (`u32::MAX` = none).
+    lookup_taken_hi: AtomicU32,
+    /// EWMA of `lookup_taken_hi − tip` for RecentCreates horizon.
+    recent_lead_ewma: AtomicU32,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -1193,6 +1212,8 @@ impl Query {
             }),
             block_queue_pressure: AtomicBool::new(false),
             soft_confirm_window: AtomicU32::new(0),
+            lookup_taken_hi: AtomicU32::new(u32::MAX),
+            recent_lead_ewma: AtomicU32::new(0),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -1457,6 +1478,32 @@ impl Query {
         self.soft_confirm_window.load(AtomicOrdering::Relaxed)
     }
 
+    /// Last contiguous height lookup took off the BQ (`None` if none yet).
+    pub fn lookup_taken_hi(&self) -> Option<u32> {
+        let h = self.lookup_taken_hi.load(AtomicOrdering::Relaxed);
+        if h == u32::MAX {
+            None
+        } else {
+            Some(h)
+        }
+    }
+
+    /// Publish lookup consume high-water. `None` resets (disconnect / reject).
+    pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
+        self.lookup_taken_hi
+            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+    }
+
+    /// Densify / offer: height is already in the confirm pipeline.
+    pub fn lookup_already_taken(&self, height: u32) -> bool {
+        Self::lookup_taken_covers(height, self.lookup_taken_hi())
+    }
+
+    /// `taken_hi == None` means lookup has not consumed any height yet.
+    pub fn lookup_taken_covers(height: u32, taken_hi: Option<u32>) -> bool {
+        taken_hi.is_some_and(|hi| height <= hi)
+    }
+
     /// Current soft-assign restricted flag (over free-byte floor).
     pub fn block_queue_soft_pressure(&self) -> bool {
         self.block_queue_pressure.load(AtomicOrdering::Relaxed)
@@ -1595,9 +1642,16 @@ impl Query {
     /// Expire without rebuilding the snapshot (write batch flushes once).
     pub fn expire_recent_creates_defer(&self, tip_hint: u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(tip_hint);
-        let horizon = crate::recent_creates_horizon(self.soft_confirm_window());
-        self.recent_creates
-            .expire_to_horizon(tip.max(tip_hint), horizon);
+        let tip = tip.max(tip_hint);
+        let taken = self.lookup_taken_hi().unwrap_or(tip);
+        let span = taken.saturating_sub(tip);
+        let ewma = crate::recent_creates_ewma_step(
+            self.recent_lead_ewma.load(AtomicOrdering::Relaxed),
+            span,
+        );
+        self.recent_lead_ewma.store(ewma, AtomicOrdering::Relaxed);
+        let horizon = crate::recent_creates_horizon(ewma);
+        self.recent_creates.expire_to_horizon(tip, horizon);
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.
@@ -1685,6 +1739,12 @@ impl Query {
     pub fn block_queue_has_height(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();
         g.contains_height(height)
+    }
+
+    /// Take raw payload and remove the BQ row (lookup consume).
+    pub fn block_queue_take_raw(&self, height: u32) -> Option<rbitcoin_store::TakenRaw> {
+        let mut g = self.block_queue.lock().unwrap();
+        g.take_raw(height)
     }
 
     /// Hash of the first body-queue entry at `height`, if any.
@@ -1793,7 +1853,14 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
-        let (rec_h, rec_k) = self.recent_creates.size_snapshot();
+        let rec = self.recent_creates.size_detail();
+        let (union_layers, union_keys) = self.published_ids.size_snapshot();
+        let h2h_keys = self
+            .height_by_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len();
         let mut head = self.store.txs.head_resize_size_snapshot();
         head.class_c_l2_bytes = self.store.class_c_l2_resident_bytes();
         ProcessOwnedSizes {
@@ -1808,8 +1875,15 @@ impl Query {
             pstore_weak: mem.pstore_weak,
             pstore_live: mem.pstore_live,
             pstore_bytes: mem.pstore_bytes,
-            recent_heights: rec_h,
-            recent_keys: rec_k,
+            recent_heights: rec.0,
+            recent_keys: rec.1,
+            recent_pub_keys: rec.2,
+            recent_overlay_keys: rec.3,
+            recent_fifo_keys: rec.4,
+            union_layers,
+            union_keys,
+            h2h_keys,
+            fence_runs: self.store.height_fence_run_count(),
             bq_promoted: self.block_queue_promoted_count(),
         }
     }

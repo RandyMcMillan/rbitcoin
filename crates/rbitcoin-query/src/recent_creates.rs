@@ -5,13 +5,13 @@
 //! (not a process pin FIFO).
 //!
 //! Expire is `pop_front` of whole heights. Horizon is
-//! [`recent_creates_horizon`] (`2 * soft_win`, floor 256) so the ring outlives
-//! BQ / lookup lead (1× the soft 1-min window is not enough).
+//! [`recent_creates_horizon`] on an EWMA of `lookup_taken_hi − tip`
+//! plus 25% (floor 32, cap `32*144`).
 //!
-//! Writers mutate the locked map and mark dirty. [`RecentCreates::publish_if_dirty`]
-//! is the only full-map snapshot rebuild (confirm write: once per batch). Load
-//! [`RecentCreates::get`] / [`RecentSnap::get`] see a small dirty overlay first
-//! so stamp hits unflushed notes without cloning the live map.
+//! Overlay + tombstones hold unflushed notes. [`RecentCreates::publish_if_dirty`]
+//! builds **one** published [`Arc`] (confirm write: once per batch). There is no
+//! second live HashMap. Load [`get`](RecentCreates::get) / [`RecentSnap::get`]
+//! see overlay first so stamp hits unflushed notes without cloning.
 
 use crate::published_ids::TxidHasher;
 use arc_swap::ArcSwap;
@@ -20,14 +20,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 
-/// Floor so a cold / tiny `soft_win` still covers a short lookup lead.
-pub const RECENT_CREATES_HORIZON_FLOOR: u32 = 256;
+/// Floor so a cold / empty lead still covers one pipeline of 1-high batches.
+pub const RECENT_CREATES_HORIZON_FLOOR: u32 = 32;
+/// Cap: 32 load-sized batches × 144-block hard pack.
+pub const RECENT_CREATES_HORIZON_CAP: u32 = 32 * 144;
 
-/// Heights to retain: twice the 1-min confirm window, at least
-/// [`RECENT_CREATES_HORIZON_FLOOR`].
+/// One EWMA step: `(3·ewma + span) / 4`. Cold `ewma == 0` starts at `span`.
 #[inline]
-pub fn recent_creates_horizon(soft_win: u32) -> u32 {
-    soft_win.saturating_mul(2).max(RECENT_CREATES_HORIZON_FLOOR)
+pub fn recent_creates_ewma_step(ewma: u32, span: u32) -> u32 {
+    if ewma == 0 {
+        span
+    } else {
+        ewma.saturating_mul(3).saturating_add(span) / 4
+    }
+}
+
+/// Heights to retain: EWMA lead + 25%, clamped to floor/cap.
+#[inline]
+pub fn recent_creates_horizon(ewma_lead: u32) -> u32 {
+    ewma_lead
+        .saturating_add(ewma_lead / 4)
+        .clamp(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_CAP)
 }
 
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
@@ -41,7 +54,6 @@ struct LiveEnt {
 }
 
 struct Inner {
-    live: LiveMap,
     overlay: LiveMap,
     dead: DeadSet,
     fifo: VecDeque<(u32, Vec<[u8; 32]>)>,
@@ -82,7 +94,6 @@ impl Default for RecentCreates {
         Self {
             live: ArcSwap::from_pointee(LiveMap::default()),
             inner: Mutex::new(Inner {
-                live: LiveMap::default(),
                 overlay: LiveMap::default(),
                 dead: DeadSet::default(),
                 fifo: VecDeque::new(),
@@ -97,11 +108,7 @@ impl RecentCreates {
         Self::default()
     }
 
-    fn publish(live: &ArcSwap<LiveMap>, g: &Inner) {
-        live.store(Arc::new(g.live.clone()));
-    }
-
-    /// Rebuild the load snapshot if [`Self::note`] / expire / drop dirtied the map.
+    /// Merge overlay/dead into one new published Arc. No second live HashMap.
     ///
     /// No-op when clean. Confirm write flushes once after all height notes + expire.
     pub fn publish_if_dirty(&self) {
@@ -109,7 +116,15 @@ impl RecentCreates {
         if !g.dirty {
             return;
         }
-        Self::publish(&self.live, &g);
+        let published = self.live.load_full();
+        let mut next = (*published).clone();
+        for (k, e) in g.overlay.iter() {
+            next.insert(*k, *e);
+        }
+        for k in g.dead.iter() {
+            next.remove(k);
+        }
+        self.live.store(Arc::new(next));
         g.overlay.clear();
         g.dead.clear();
         g.dirty = false;
@@ -126,7 +141,6 @@ impl RecentCreates {
                 continue;
             }
             let ent = LiveEnt { fk, range, height };
-            g.live.insert(txid, ent);
             g.overlay.insert(txid, ent);
             g.dead.remove(&txid);
             keys.push(txid);
@@ -141,6 +155,7 @@ impl RecentCreates {
     /// Drop heights `≤ through` (inclusive). A key stays if a newer height
     /// re-noted it (last-write `LiveEnt.height`).
     pub fn expire_through(&self, through: u32) {
+        let published = self.live.load_full();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut changed = false;
         while let Some(&(h, _)) = g.fifo.front() {
@@ -149,10 +164,16 @@ impl RecentCreates {
             }
             let (_, keys) = g.fifo.pop_front().expect("front");
             for t in keys {
-                if let Some(ent) = g.live.get(&t) {
+                if let Some(ent) = g.overlay.get(&t) {
                     if ent.height <= through {
-                        g.live.remove(&t);
                         g.overlay.remove(&t);
+                        g.dead.insert(t);
+                        changed = true;
+                    }
+                    continue;
+                }
+                if let Some(ent) = published.get(&t) {
+                    if ent.height <= through {
                         g.dead.insert(t);
                         changed = true;
                     }
@@ -175,23 +196,30 @@ impl RecentCreates {
 
     /// Disconnect: drop heights `≥ height`.
     pub fn drop_from(&self, height: u32) {
+        let published = self.live.load_full();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let before = g.live.len();
         g.fifo.retain(|(h, _)| *h < height);
-        let mut dropped: Vec<[u8; 32]> = Vec::new();
-        g.live.retain(|t, ent| {
+        let mut changed = false;
+        let mut drop_ov: Vec<[u8; 32]> = Vec::new();
+        g.overlay.retain(|t, ent| {
             if ent.height < height {
                 true
             } else {
-                dropped.push(*t);
+                drop_ov.push(*t);
                 false
             }
         });
-        for t in dropped {
-            g.overlay.remove(&t);
+        for t in drop_ov {
             g.dead.insert(t);
+            changed = true;
         }
-        if g.live.len() != before {
+        for (t, ent) in published.iter() {
+            if ent.height >= height {
+                g.dead.insert(*t);
+                changed = true;
+            }
+        }
+        if changed {
             g.dirty = true;
         }
     }
@@ -213,8 +241,22 @@ impl RecentCreates {
 
     /// Occupancy for `ibd: sizes`.
     pub fn size_snapshot(&self) -> (usize, usize) {
+        let d = self.size_detail();
+        (d.0, d.1)
+    }
+
+    /// `(heights, live, pub, overlay, fifo_keys)`.
+    pub fn size_detail(&self) -> (usize, usize, usize, usize, usize) {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        (g.fifo.len(), g.live.len())
+        let fifo_keys = g.fifo.iter().map(|(_, k)| k.len()).sum();
+        let pub_k = self.live.load().len();
+        (
+            g.fifo.len(),
+            pub_k.saturating_add(g.overlay.len()),
+            pub_k,
+            g.overlay.len(),
+            fifo_keys,
+        )
     }
 }
 
@@ -229,11 +271,18 @@ mod tests {
     }
 
     #[test]
-    fn recent_creates_horizon_is_2x_soft_win_with_floor() {
+    fn horizon_is_ewma_lead_plus_quarter() {
+        assert_eq!(recent_creates_ewma_step(0, 40), 40);
+        assert_eq!(recent_creates_ewma_step(40, 40), 40);
         assert_eq!(recent_creates_horizon(0), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(100), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(200), 400);
-        assert_eq!(recent_creates_horizon(400), 800);
+        assert_eq!(recent_creates_horizon(40), 50);
+        assert_eq!(recent_creates_horizon(10_000), RECENT_CREATES_HORIZON_CAP);
+        let mut e = 0u32;
+        for _ in 0..8 {
+            e = recent_creates_ewma_step(e, 40);
+        }
+        let h = recent_creates_horizon(e);
+        assert!((40..=50).contains(&h), "settled horizon={h}");
     }
 
     #[test]
@@ -245,6 +294,30 @@ mod tests {
             r.size_snapshot(),
             (2, 2),
             "one fifo row per prepared height, not one per write batch"
+        );
+    }
+
+    #[test]
+    fn size_detail_counts_live_and_pub_separately() {
+        let r = RecentCreates::new();
+        r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        let (h, live, pub_k, ov, fifo) = r.size_detail();
+        assert_eq!(h, 1);
+        assert_eq!(live, 1);
+        assert_eq!(pub_k, 0, "unpublished notes are not on the ArcSwap");
+        assert_eq!(ov, 1);
+        assert_eq!(fifo, 1);
+        r.publish_if_dirty();
+        let (_, live, pub_k, ov, fifo) = r.size_detail();
+        assert_eq!(live, 1);
+        assert_eq!(pub_k, 1);
+        assert_eq!(ov, 0);
+        assert_eq!(fifo, 1);
+        let a = r.snapshot();
+        let b = r.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&a.published, &b.published),
+            "flush must not keep a second live HashMap; snapshots share the Arc"
         );
     }
 
@@ -318,7 +391,7 @@ mod tests {
         let r = RecentCreates::new();
         r.note(0, [(tid(1), Fk(1), (1, 2))]);
         r.publish_if_dirty();
-        r.expire_to_horizon(100, RECENT_CREATES_HORIZON_FLOOR);
+        r.expire_to_horizon(16, RECENT_CREATES_HORIZON_FLOOR);
         assert_eq!(
             r.get(&tid(1)),
             Some((Fk(1), (1, 2))),

@@ -65,6 +65,14 @@ before 1.0).
   after `getmempoolinfo.permitbaremultisig` and `incrementalrelayfee`
   match Core. Q-41 is 38/267.
 
+- **Lookup→load queue:** explicit `loadq=8` of load-sized batches.
+  Lookup walks BQ in height order, dequeues raw on emit, and parks
+  decoded `Block`+pres on the queue. Densify skips `H <= lookup_taken_hi`.
+  RecentCreates horizon is EWMA(`lookup_taken_hi − tip`)+25% (floor 32,
+  cap 32×144). `ibd: sizes` keeps `union=` / `h2h=` / `fence=` /
+  `recent= live=/pub=/ov= fifo=` and adds loadq wire to `accounted`.
+  `ready=` / `bq_dec=` are no longer queue tokens.
+
 - **v2-only peer discovery (Q-49):** DNS queries `x809.<seed>`
   (`NETWORK|WITNESS|P2P_V2`) before the unfiltered name; learned
   `addr`/`addrv2` requires `P2P_V2`; dial ranking omits known-v1

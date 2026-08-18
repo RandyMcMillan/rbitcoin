@@ -468,6 +468,25 @@ mod tests {
     }
 
     #[test]
+    fn lookup_take_removes_bq_row_via_query() {
+        let (dir, q) = temp_query();
+        q.block_queue_enqueue(3, [3u8; 32], 1, b"xyz").unwrap();
+        assert!(q.block_queue_has_height(3));
+        let got = q.block_queue_take_raw(3).expect("take");
+        assert_eq!(got.payload, b"xyz");
+        assert!(!q.block_queue_has_height(3));
+        assert!(q.block_queue_take_raw(3).is_none());
+        assert!(!q.lookup_already_taken(3));
+        q.set_lookup_taken_hi(Some(3));
+        assert!(q.lookup_already_taken(3));
+        assert!(q.lookup_already_taken(2));
+        assert!(!q.lookup_already_taken(4));
+        q.set_lookup_taken_hi(None);
+        assert!(!q.lookup_already_taken(3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn wave_intake_does_not_clone_raw_for_asked_set() {
         let (dir, q) = temp_query();
         for h in 0..64u32 {

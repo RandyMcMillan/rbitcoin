@@ -300,6 +300,9 @@ fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 /// all pending first left densify-ahead heights frozen (tip advances past tip-batch
 /// cover, soft filled, conf stuck on a later hole).
 fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
+    if hub.query.lookup_already_taken(ht) {
+        return None;
+    }
     let &h = st.height_to_hash.get(&ht)?;
     if st.inflight.contains_key(&h) || st.body.is_rejected(&h) {
         return None;
@@ -627,6 +630,16 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn densify_skips_at_or_below_lookup_taken_hi() {
+        assert!(!Query::lookup_taken_covers(5, None));
+        assert!(!Query::lookup_taken_covers(0, None));
+        assert!(Query::lookup_taken_covers(5, Some(5)));
+        assert!(Query::lookup_taken_covers(4, Some(5)));
+        assert!(!Query::lookup_taken_covers(6, Some(5)));
+        assert!(Query::lookup_taken_covers(0, Some(0)));
+    }
 
     fn h(n: u32) -> BlockHash {
         let mut b = [0u8; 32];

@@ -124,7 +124,7 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 | `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
 | Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). Experimental user-agent still limits inbound |
 | Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB** (Core-class); **scripts verified on accept** |
-| Confirm lookup/load | **Load** packs by soft **Σ inputs** (hardcoded **8000**) or hard **144** blocks — dense mainnet is typically **a few blocks per batch** (often 1–3; live `n=`), not ~32-block waves (8000/250 is mid-chain, not fat-era). IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, and holds under **8000** inputs when more unresolved heights remain. Real queues scriptq=4 · writeq=20; `ready=` is BQ resolve-complete count |
+| Confirm lookup/load | **Load** recvs load-sized batches (soft **8000** inputs / hard **144** blocks) from `loadq=8`. Dense mainnet is typically **a few blocks per batch**. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, in order from `path_lo`. Real queues loadq=8 · scriptq=4 · writeq=20 |
 | Not Core/Fulcrum | No production SLA; schema unstable until 1.0; reindex on incompatible layout changes |
 
 ## Related docs

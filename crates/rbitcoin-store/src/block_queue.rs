@@ -44,6 +44,14 @@ fn note_raw_clone() {
     RAW_CLONE_N.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Raw row removed by [`BlockQueue::take_raw`] (lookup consume).
+#[derive(Debug, Clone)]
+pub struct TakenRaw {
+    pub hash: [u8; 32],
+    pub header_fk: u64,
+    pub payload: Vec<u8>,
+}
+
 /// One queued block. `payload` is empty after [`BlockQueue::promote_wave`].
 #[derive(Debug, Clone)]
 pub struct QueuedBlock {
@@ -276,6 +284,25 @@ impl BlockQueue {
         Ok(true)
     }
 
+    /// Take raw payload and remove the row. `None` if missing or already promoted.
+    pub fn take_raw(&mut self, height: u32) -> Option<TakenRaw> {
+        let id = *self.height_to_id.get(&height)?;
+        let e = self.index.get_mut(&id)?;
+        let payload = match &mut e.body {
+            QueuedBody::Raw(v) => std::mem::take(v),
+            QueuedBody::Promoted { .. } => return None,
+        };
+        let e = self.index.get(&id)?;
+        let out = TakenRaw {
+            hash: e.hash,
+            header_fk: e.header_fk,
+            payload,
+        };
+        self.bytes = self.bytes.saturating_sub(out.payload.len() as u64);
+        let _ = self.dequeue(id);
+        Some(out)
+    }
+
     /// Dequeue all records for a confirmed height (may be 0 or 1 in normal path).
     pub fn dequeue_height(&mut self, height: u32) -> Result<usize, StoreError> {
         let mut n = 0usize;
@@ -288,25 +315,27 @@ impl BlockQueue {
         Ok(n)
     }
 
-    /// Lowest distinct queued heights `≥ path_lo` that are not resolve-complete
-    /// and not in `skip`, capped at `cap`. One pass over the index (no
-    /// per-height `is_resolve_complete` scan). Sorted ascending.
+    /// Contiguous unresolved heights from `path_lo`. Stops at the first height
+    /// not on the queue (a hole). Skips resolve-complete and `skip` without
+    /// treating those as a gap. Capped at `cap`.
     pub fn unresolved_heights(&self, path_lo: u32, skip: &HashSet<u32>, cap: usize) -> Vec<u32> {
         if cap == 0 {
             return Vec::new();
         }
-        let mut seen = HashSet::new();
         let mut out: Vec<u32> = Vec::new();
-        for e in self.index.values() {
-            if e.height < path_lo || e.resolve_complete || skip.contains(&e.height) {
-                continue;
+        let mut h = path_lo;
+        while out.len() < cap {
+            if !self.contains_height(h) {
+                break;
             }
-            if seen.insert(e.height) {
-                out.push(e.height);
+            if !self.is_resolve_complete(h) && !skip.contains(&h) {
+                out.push(h);
             }
+            h = match h.checked_add(1) {
+                Some(n) => n,
+                None => break,
+            };
         }
-        out.sort_unstable();
-        out.truncate(cap);
         out
     }
 
@@ -691,6 +720,28 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_heights_stops_at_first_gap() {
+        use std::collections::HashSet;
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(12, [12u8; 32], 1, b"a").unwrap();
+        q.enqueue(13, [13u8; 32], 1, b"b").unwrap();
+        let none = HashSet::new();
+        assert!(
+            q.unresolved_heights(10, &none, 8).is_empty(),
+            "missing path_lo must not skip ahead: {:?}",
+            q.unresolved_heights(10, &none, 8)
+        );
+        q.enqueue(10, [10u8; 32], 1, b"c").unwrap();
+        q.enqueue(11, [11u8; 32], 1, b"d").unwrap();
+        assert_eq!(q.unresolved_heights(10, &none, 8), vec![10, 11, 12, 13]);
+        // Hole at 12 after removing it — prefix only.
+        q.dequeue_height(12).unwrap();
+        assert_eq!(q.unresolved_heights(10, &none, 8), vec![10, 11]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn absolute_budget_refuses_enqueue() {
         let dir = temp();
         // 64 MiB floor still applies — use small payload vs tiny budget override
@@ -756,6 +807,25 @@ mod tests {
         assert!(q.contains_height(9));
         assert!(!q.is_resolve_complete(9));
         assert!(q.mark_resolve_complete(10).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lookup_take_removes_bq_row() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        q.enqueue(10, [10u8; 32], 7, b"aaaa").unwrap();
+        q.enqueue(11, [11u8; 32], 8, b"bb").unwrap();
+        assert_eq!(q.bytes(), 6);
+        let got = q.take_raw(10).expect("take 10");
+        assert_eq!(got.hash, [10u8; 32]);
+        assert_eq!(got.header_fk, 7);
+        assert_eq!(got.payload, b"aaaa");
+        assert!(!q.contains_height(10));
+        assert!(q.contains_height(11));
+        assert_eq!(q.bytes(), 2);
+        assert!(q.take_raw(10).is_none());
+        assert!(q.take_raw(99).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -163,9 +163,22 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
     };
 
     // Two packs: write parent (drain+fence) before the child is even offered.
-    feed.note_wire(h_parent, parent.block_hash(), Some(parent));
+    // Production path is BQ raw → lookup take → loadq (not feed.note_wire).
+    use bitcoin::consensus::encode::serialize;
+    hub.query
+        .block_queue_enqueue(
+            h_parent,
+            parent.block_hash().to_byte_array(),
+            1,
+            &serialize(&parent),
+        )
+        .unwrap();
+    feed.note(h_parent, parent.block_hash());
     wait_tip(h_parent);
-    feed.note_wire(child_h, child_hash, Some(child));
+    hub.query
+        .block_queue_enqueue(child_h, child_hash.to_byte_array(), 1, &serialize(&child))
+        .unwrap();
+    feed.note(child_h, child_hash);
     wait_tip(child_h);
 
     feed.request_stop();
@@ -277,6 +290,89 @@ fn pack_confirm_run_len_policy() {
     assert_eq!(pack_confirm_run_len(&[4000, 4000, 1], 8000, 144), 3);
     // After third, sum=8001 > 8000 stops at 3
     assert_eq!(pack_confirm_run_len(&[4000, 4000, 1, 1], 8000, 144), 3);
+}
+
+#[test]
+fn split_wave_into_load_batches_is_eight_by_8000() {
+    use super::{
+        split_wave_into_load_batches, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS,
+        LOAD_QUEUE_CAP_DEFAULT,
+    };
+    assert_eq!(LOAD_QUEUE_CAP_DEFAULT, 8);
+    assert_eq!(super::confirm_queue_caps().load, LOAD_QUEUE_CAP_DEFAULT);
+    assert_eq!(super::load_queue_cap(), LOAD_QUEUE_CAP_DEFAULT);
+    assert!(super::LoadBatch { items: vec![] }.items.is_empty());
+    // 8 × 8001 inputs (each block overshoots 8000) → 8 batches of one.
+    let wave: Vec<u32> = vec![8001; 8];
+    let parts =
+        split_wave_into_load_batches(&wave, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS);
+    assert_eq!(parts, vec![1, 1, 1, 1, 1, 1, 1, 1]);
+    // Exactly 8000 does not stop; two 8000-input blocks are one batch.
+    assert_eq!(
+        split_wave_into_load_batches(&[8000, 8000], 8000, 144),
+        vec![2]
+    );
+    // Empty / single megablock.
+    assert!(split_wave_into_load_batches(&[], 8000, 144).is_empty());
+    assert_eq!(split_wave_into_load_batches(&[50_000], 8000, 144), vec![1]);
+    // 144 thin blocks then 144 more → two hard-cap batches.
+    let thin = vec![1u32; 288];
+    assert_eq!(
+        split_wave_into_load_batches(&thin, 8000, 144),
+        vec![144, 144]
+    );
+}
+
+#[test]
+fn load_recv_is_lookup_order() {
+    use super::LoadBatch;
+    use rbitcoin_query::{ResolvedWire, TxPrecompute};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    let (tx, rx) = mpsc::sync_channel::<LoadBatch>(8);
+    let mk = |h: u32| {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let pres: Arc<[TxPrecompute]> = genesis
+            .txdata
+            .iter()
+            .map(TxPrecompute::from_tx)
+            .collect::<Vec<_>>()
+            .into();
+        (
+            h,
+            [h as u8; 32],
+            ResolvedWire {
+                block: Arc::new(genesis),
+                pres,
+            },
+        )
+    };
+    tx.send(LoadBatch {
+        items: vec![mk(1), mk(2)],
+    })
+    .unwrap();
+    tx.send(LoadBatch { items: vec![mk(3)] }).unwrap();
+    let a = rx.recv().unwrap();
+    let b = rx.recv().unwrap();
+    assert_eq!(a.items[0].0, 1);
+    assert_eq!(a.items[1].0, 2);
+    assert_eq!(b.items[0].0, 3);
+}
+
+#[test]
+fn lookup_blocks_when_loadq_full() {
+    use super::{LoadBatch, LOAD_QUEUE_CAP_DEFAULT};
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::sync_channel::<LoadBatch>(LOAD_QUEUE_CAP_DEFAULT);
+    for _ in 0..LOAD_QUEUE_CAP_DEFAULT {
+        tx.send(LoadBatch { items: vec![] }).unwrap();
+    }
+    assert!(
+        tx.try_send(LoadBatch { items: vec![] }).is_err(),
+        "9th send must wait / fail while loadq is full"
+    );
+    let _ = rx.recv().unwrap();
+    tx.send(LoadBatch { items: vec![] }).unwrap();
 }
 
 #[test]
@@ -402,13 +498,13 @@ fn queue_hwm_tracks_max_depth() {
     let q = ConfirmQueueDepths::new();
     q.note_script_send(32, 1, 0);
     q.note_script_send(32, 1, 0);
-    assert_eq!(q.snap().0, 2);
+    assert_eq!(q.snap().1, 2);
     q.note_script_recv(32, 1, 0);
-    assert_eq!(q.snap().0, 1);
-    let (sh, wh) = q.sample_hwm_and_reset();
+    assert_eq!(q.snap().1, 1);
+    let (_lh, sh, wh) = q.sample_hwm_and_reset();
     assert_eq!(sh, 2, "hwm keeps max even after recv");
     assert_eq!(wh, 0);
-    let (sh2, _) = q.sample_hwm_and_reset();
+    let (_, sh2, _) = q.sample_hwm_and_reset();
     assert_eq!(sh2, 0, "hwm resets each sample window");
 }
 
@@ -540,16 +636,16 @@ fn queue_depth_log_and_caps_surface() {
     assert_eq!(format_queue_depth("script", 1, 2), "script=1/2");
     assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
     assert_eq!(
-        format_conf_q(0, 0, 1, 2, 2),
-        "ready=0 scriptq<0/2 writeq=1/2"
+        format_conf_q(0, 0, 1, 8, 2, 2),
+        "loadq<0/8 scriptq<0/2 writeq=1/2"
     );
     assert_eq!(
-        format_conf_q(3, 1, 0, 2, 2),
-        "ready=3 scriptq=1/2 writeq<0/2"
+        format_conf_q(3, 1, 0, 8, 2, 2),
+        "loadq=3/8 scriptq=1/2 writeq<0/2"
     );
     assert_eq!(
-        format_conf_q(0, 0, 0, 2, 2),
-        "ready=0 scriptq<0/2 writeq<0/2"
+        format_conf_q(0, 0, 0, 8, 2, 2),
+        "loadq<0/8 scriptq<0/2 writeq<0/2"
     );
 
     let caps = super::confirm_queue_caps();
@@ -561,20 +657,24 @@ fn queue_depth_log_and_caps_surface() {
         assert!(c >= 1, "queue cap must be positive: {c}");
     }
     assert_eq!(
-        format_conf_q(0, 0, 0, caps.script, caps.write),
-        format!("ready=0 scriptq<0/{} writeq<0/{}", caps.script, caps.write)
+        format_conf_q(0, 0, 0, caps.load, caps.script, caps.write),
+        format!(
+            "loadq<0/{} scriptq<0/{} writeq<0/{}",
+            caps.load, caps.script, caps.write
+        )
     );
     assert_eq!(
         format_conf_q(
-            caps.script,
+            caps.load,
             caps.script,
             caps.write,
+            caps.load,
             caps.script,
             caps.write
         ),
         format!(
-            "ready={0} scriptq={1}/{1} writeq={2}/{2}",
-            caps.script, caps.script, caps.write
+            "loadq={0}/{0} scriptq={1}/{1} writeq={2}/{2}",
+            caps.load, caps.script, caps.write
         )
     );
 }
@@ -610,7 +710,7 @@ fn claim_feed_stops_at_gap() {
 fn confirm_queue_depths_content_snap_and_notes() {
     use super::ConfirmQueueDepths;
     let q = ConfirmQueueDepths::new();
-    assert_eq!(q.snap(), (0, 0));
+    assert_eq!(q.snap(), (0, 0, 0));
     let c0 = q.content_snap();
     assert_eq!(c0.script_batches, 0);
     assert_eq!(c0.write_batches, 0);
@@ -629,7 +729,7 @@ fn confirm_queue_depths_content_snap_and_notes() {
     assert_eq!(c1.write_wire_bytes, 500);
     assert_eq!(c1.write_parents, 7);
     assert_eq!(c1.parents_total(), 9);
-    assert_eq!(q.snap(), (1, 1));
+    assert_eq!(q.snap(), (0, 1, 1));
 
     q.note_script_recv(3, 1000, 2);
     q.note_write_recv(2, 500, 7);
@@ -855,13 +955,6 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     assert!(super::pack_stop_after(0, 144, 8000, 144));
     assert!(super::pack_stop_after(8001, 1, 8000, 144));
     assert!(!super::pack_stop_after(8000, 1, 8000, 144));
-    assert!(super::pack_empty_waits_for_lookup(0, 0));
-    assert!(!super::pack_empty_waits_for_lookup(1, 0));
-    assert!(!super::pack_empty_waits_for_lookup(0, 1));
-    let expect =
-        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
-    assert!(super::pack_stored_hash_ok(&expect.to_byte_array(), &expect));
-    assert!(!super::pack_stored_hash_ok(&[0u8; 32], &expect));
     assert_eq!(
         super::confirm_batch_max_inputs(),
         super::CONFIRM_BATCH_INPUTS_DEFAULT

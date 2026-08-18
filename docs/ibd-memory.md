@@ -8,7 +8,7 @@ IBD path. It is **not** about kernel page cache under FdOnly store files
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). `bytes()` is raw length or decoded charge after promote | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); lookup **promotes** to decoded-only (`Arc<Block>` + `TxPrecompute`, raw dropped); load pack uses that Arc. Confirm-write **dequeues** after tip advance. **Never both** raw and decoded. **RAM-only by design** — avoids double-writing every block (queue + Class A). Restart empties the queue; **tip-batch Class A is reconstructed into BQ** (`rehydrate_class_a_into_body_queue`, ≤`TIP_HOLE_MAX`) so claim does not wait on re-getdata when bodies are already packed. Logs: `bq soft=n/win RAM=` `bq_dec=`. |
+| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). `bytes()` is **raw only** | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); lookup **takes** the row (dequeue) after decode. Decoded `Arc<Block>` + `TxPrecompute` live on **loadq** (cap 8), then scriptq/writeq. Densify assigns only `H > lookup_taken_hi` and skips heights still on BQ. **Never both** raw and decoded. **RAM-only by design**. Restart empties BQ+loadq. Logs: `bq soft=n/win RAM=` `loadq=n/8`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary gate is soft assign (100 MiB free / 1 min confirm window). |
 | **Confirm feed** | readiness (height/hash), no wire retain | **Load** packs tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (hardcoded **8000**, overshoot block included) or hard **144** blocks. At dense mainnet heights **8000 inputs ≈ a few blocks** (often 1–3; early chain can pack many tiny blocks up to 144). Do not treat ~32 as pack size. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave. Hard **min 8000** inputs when more unresolved heights remain (`ready=0` included). Also holds a short wave while `ready` is over half the 1-min BQ window, unless the first unresolved height is in the load-facing half of that window **and** the collect is already ≥8000. Requeue / finish on outcome |
 
@@ -31,7 +31,7 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 |-----------|-------------|---------------------------|
 | **Published identity union** | Per-wave parent maps still on the BQ (`ArcSwap` of the layer-chain head; get walks, no union rebuild) | Lookup drops a layer once no height in its span remains on the BQ. Disconnect stores `None`. Not a process FIFO. |
 | **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range) |
-| **RecentCreates identity ring** | `txid → fk+range` only; expire `2×soft_win` (floor 256 heights) | Write notes per height then **one** `flush_recent_creates` (and expire) after Class A+idx; disconnect `drop_from` + flush. Not a pin/outs FIFO |
+| **RecentCreates identity ring** | `txid → fk+range` only; expire EWMA(`lookup_taken_hi − tip`)+25% (floor 32, cap 32×144) | Write notes per height then **one** `flush_recent_creates` (and expire) after Class A+idx; disconnect `drop_from` + flush. Sizes: `recent=… live=/pub=/ov= fifo=`. Not a pin/outs FIFO |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
@@ -86,12 +86,12 @@ known retain structures:
 |-------------|----------------|
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
-| `bq soft=n/win RAM=` `bq_dec=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB (decoded charge after promote) + promoted height count |
+| `bq soft=n/win RAM=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB (**raw only**) |
 | `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
-| `conf ready=` / `scriptq` / `writeq` | `ready=` = BQ resolve-complete inventory; scriptq/writeq are real queue contents + pipeline-wide `parents=` + feed ready/inflight |
+| `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap 8) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
-| `heap … iflight= pstore= recent= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh/Nk≈NMiB`) + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `heap … iflight= pstore= recent= union= h2h= fence= sh_mt= fuse8= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB`; one published Arc + overlay + fifo) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 

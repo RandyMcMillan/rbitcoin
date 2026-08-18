@@ -326,6 +326,9 @@ pub(crate) enum ConfirmEvent {
     },
     /// Confirm saw tip+1 without durable Class A — clear optimistic `known` and
     /// drop the feed entry so offer re-probes the store (no permanent blacklist).
+    /// Load no longer constructs this (lookup dequeues BQ); keep the arm for
+    /// the IBD event protocol.
+    #[allow(dead_code)]
     BodyMissing { hash: BlockHash },
 }
 
@@ -369,30 +372,54 @@ pub(crate) fn pack_stop_after(
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Empty pack that is not a body-missing reject: wait on `feed.cv` (lookup
-/// `notify` after resolve-complete). Do **not** busy-spin while tip+1 sits
-/// in `ready` but BQ is not resolve-complete — that hammers feed + BQ locks.
-#[inline]
-pub(crate) fn pack_empty_waits_for_lookup(run_n: usize, body_missing_n: usize) -> bool {
-    run_n == 0 && body_missing_n == 0
-}
-
-/// Happy-path pack hash check: compare the **stored** BQ/feed hash. Do not
-/// `block.block_hash()` when lookup already stored the hash.
-#[inline]
-pub(crate) fn pack_stored_hash_ok(stored: &[u8; 32], expect: &BlockHash) -> bool {
-    *stored == expect.to_byte_array()
-}
-
+/// Default lookup→load depth (`loadq`): one lookup-wave of prefetch (8×8000).
+pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 8;
 /// Default load→scripts depth (`scriptq`): script is the long pole; modest buffer.
 pub(crate) const SCRIPT_QUEUE_CAP_DEFAULT: usize = 4;
 /// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
 /// script output so script thr does not stall on a full writeq.
 pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 20;
 
-/// Resolved script / write queue capacities. Load claims BQ; no lookup→load channel.
+/// One load-sized run produced by lookup (decoded wire + pres, height-ordered).
+pub(crate) struct LoadBatch {
+    pub items: Vec<(u32, [u8; 32], rbitcoin_query::ResolvedWire)>,
+}
+
+/// Split a lookup-wave input-count run into load-sized batch lengths.
+///
+/// Uses the same [`pack_stop_after`] rule as load pack (soft 8000 / hard 144).
+pub(crate) fn split_wave_into_load_batches(
+    input_counts: &[u32],
+    soft_max_inputs: u32,
+    hard_max_blocks: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < input_counts.len() {
+        let rest = &input_counts[i..];
+        let mut sum = 0u32;
+        let mut n = 0usize;
+        for &c in rest {
+            sum = sum.saturating_add(c);
+            n += 1;
+            if pack_stop_after(sum, n, soft_max_inputs, hard_max_blocks) {
+                break;
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        out.push(n);
+        i += n;
+    }
+    out
+}
+
+/// Resolved lookup→load / script / write queue capacities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmQueueCaps {
+    /// lookup→load (`loadq`)
+    pub load: usize,
     /// load→scripts (`scriptq`)
     pub script: usize,
     /// scripts→write (`writeq`)
@@ -403,6 +430,7 @@ pub(crate) struct ConfirmQueueCaps {
 ///
 /// | Queue | Default |
 /// |-------|---------|
+/// | lookup→load (`loadq`) | **8** |
 /// | load→scripts (`scriptq`) | **4** |
 /// | scripts→write (`writeq`) | **20** |
 ///
@@ -410,11 +438,16 @@ pub(crate) struct ConfirmQueueCaps {
 #[inline]
 pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
     ConfirmQueueCaps {
+        load: LOAD_QUEUE_CAP_DEFAULT,
         script: SCRIPT_QUEUE_CAP_DEFAULT,
         write: WRITE_QUEUE_CAP_DEFAULT,
     }
 }
 
+/// Lookup→load (`loadq`) capacity.
+pub(crate) fn load_queue_cap() -> usize {
+    confirm_queue_caps().load
+}
 /// Load→scripts (`scriptq`) capacity.
 pub(crate) fn script_queue_cap() -> usize {
     confirm_queue_caps().script
@@ -439,9 +472,10 @@ pub(crate) fn write_drain_max_parts(writeq_cap: usize) -> usize {
 /// Lookup may start the next run while load/scripts/write hold earlier ones,
 /// but must **not** skip a stuck tip+1 and claim thousands of far heights.
 /// Depth units = sum of stage caps (write is usually largest).
+#[cfg(test)]
 fn max_claim_ahead() -> u32 {
     let c = confirm_queue_caps();
-    let q = c.script.saturating_add(c.write);
+    let q = c.load.saturating_add(c.script).saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
 }
 
@@ -468,6 +502,14 @@ pub(crate) fn confirm_ready_count(
 /// samples alone almost always show 0 under a lookup-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
+    /// lookup → load (`loadq`; capacity [`load_queue_cap`]).
+    lookup_to_load: AtomicUsize,
+    /// Max loadq depth since last HWM sample.
+    load_hwm: AtomicUsize,
+    /// Sum of `batch.len()` sitting in loadq.
+    load_blocks: AtomicUsize,
+    /// Approx decoded wire bytes sitting in loadq.
+    load_wire_bytes: AtomicUsize,
     /// load → scripts (`scriptq`; capacity [`script_queue_cap`]).
     load_to_scripts: AtomicUsize,
     /// scripts → write (`writeq`; capacity [`write_queue_cap`]).
@@ -492,7 +534,11 @@ pub(crate) struct ConfirmQueueDepths {
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ConfirmPipelineSizes {
-    /// BQ resolve-complete heights load can claim (not a queue).
+    /// lookup→load batches (`loadq`).
+    pub load_batches: usize,
+    pub load_blocks: usize,
+    pub load_wire_bytes: usize,
+    /// BQ resolve-complete leftover (not a queue; unused after loadq).
     pub ready: usize,
     pub script_batches: usize,
     pub script_blocks: usize,
@@ -527,20 +573,21 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// Confirm pipeline: `ready=` (BQ resolve-complete) + real `scriptq` / `writeq`.
+/// Confirm pipeline: real `loadq` / `scriptq` / `writeq`.
 ///
 /// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
 #[inline]
 pub(crate) fn format_conf_q(
-    ready: usize,
+    load: usize,
     script: usize,
     write: usize,
+    load_cap: usize,
     script_cap: usize,
     write_cap: usize,
 ) -> String {
     format!(
-        "ready={} {} {}",
-        ready,
+        "{} {} {}",
+        format_queue_depth("loadq", load, load_cap),
         format_queue_depth("scriptq", script, script_cap),
         format_queue_depth("writeq", write, write_cap),
     )
@@ -551,17 +598,19 @@ impl ConfirmQueueDepths {
         Arc::new(Self::default())
     }
 
-    /// `(load→scripts, scripts→write)`.
-    pub(crate) fn snap(&self) -> (usize, usize) {
+    /// `(lookup→load, load→scripts, scripts→write)`.
+    pub(crate) fn snap(&self) -> (usize, usize, usize) {
         (
+            self.lookup_to_load.load(Ordering::Relaxed),
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
     }
 
     /// Max queue depths since last call; resets HWMs to 0.
-    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize) {
+    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
         (
+            self.load_hwm.swap(0, Ordering::Relaxed),
             self.script_hwm.swap(0, Ordering::Relaxed),
             self.write_hwm.swap(0, Ordering::Relaxed),
         )
@@ -570,6 +619,9 @@ impl ConfirmQueueDepths {
     /// Full content snapshot (depths + blocks/wire/parents in each queue).
     pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
         ConfirmPipelineSizes {
+            load_batches: self.lookup_to_load.load(Ordering::Relaxed),
+            load_blocks: self.load_blocks.load(Ordering::Relaxed),
+            load_wire_bytes: self.load_wire_bytes.load(Ordering::Relaxed),
             ready: 0,
             script_batches: self.load_to_scripts.load(Ordering::Relaxed),
             script_blocks: self.script_blocks.load(Ordering::Relaxed),
@@ -606,6 +658,33 @@ impl ConfirmQueueDepths {
         let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_sub(1))
         });
+    }
+
+    fn note_load_send(&self, blocks: usize, wire_bytes: usize) {
+        Self::note_batch_depth_send(&self.lookup_to_load, &self.load_hwm);
+        self.load_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(blocks))
+            })
+            .ok();
+        self.load_wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(wire_bytes))
+            })
+            .ok();
+    }
+    fn note_load_recv(&self, blocks: usize, wire_bytes: usize) {
+        Self::note_batch_depth_recv(&self.lookup_to_load);
+        self.load_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(blocks))
+            })
+            .ok();
+        self.load_wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(wire_bytes))
+            })
+            .ok();
     }
 
     fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
@@ -945,6 +1024,7 @@ pub(crate) fn spawn_confirm_engine(
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<ScriptsIn>(caps.script);
     let (write_tx, write_rx) =
         std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(caps.write);
+    let (load_tx, load_rx) = std::sync::mpsc::sync_channel::<LoadBatch>(caps.load);
     // Write reject: plan drops reserved fks + last_loaded so re-lookup after
     // Class A partial commit does not drift next_tx_start.
     let load_ahead_reset = Arc::new(AtomicBool::new(false));
@@ -1290,201 +1370,43 @@ pub(crate) fn spawn_confirm_engine(
                 }
                 lookup_ahead.apply_disconnect(&hub_load);
                 confirm_thr_stats::add_load_prune(t_hygiene.elapsed());
-                let batch: (Vec<(u32, BlockHash, Arc<bitcoin::Block>)>, u32) = {
-                    let mut g = feed_load.inner.lock().unwrap();
-                    let found: Option<(Vec<(u32, BlockHash, Arc<bitcoin::Block>)>, u32)> = loop {
-                        if feed_load.stopped() {
-                            drop(g);
-                            drop(mat_tx);
-                            let _ = scripts.join();
-                            return;
-                        }
-                        let tip = hub_load.tip_height();
-                        let tip_h = tip.unwrap_or(0);
-                        let path_lo = if tip.is_none() {
-                            0u32
-                        } else {
-                            tip_h.saturating_add(1)
-                        };
-                        g.ready.retain(|&h, _| h >= path_lo);
-                        g.inflight.retain(|&h| h >= path_lo);
-
-                        let mut claim_at = path_lo;
-                        let claim_ahead = max_claim_ahead();
-                        while g.inflight.contains(&claim_at)
-                            && claim_at < path_lo.saturating_add(claim_ahead)
-                        {
-                            claim_at = claim_at.saturating_add(1);
-                        }
-                        let claim_start = if claim_at > path_lo.saturating_add(claim_ahead)
-                        {
-                            None
-                        } else if g.inflight.contains(&claim_at) {
-                            None
-                        } else if g.ready.contains_key(&claim_at) {
-                            Some(claim_at)
-                        } else {
-                            None
-                        };
-                        if let Some(expect) = claim_start {
-                            let claim_hi = path_lo.saturating_add(claim_ahead);
-                            let soft_inputs = confirm_batch_max_inputs();
-                            let hard_blocks = CONFIRM_RUN_MAX_BLOCKS;
-                            drop(g);
-                            let mut run: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> =
-                                Vec::with_capacity(hard_blocks.min(32));
-                            let mut sum_inputs = 0u32;
-                            let mut body_missing: Vec<(u32, BlockHash)> = Vec::new();
-                            let t_pack_io = Instant::now();
-                            let candidates: Vec<(
-                                u32,
-                                BlockHash,
-                                Option<bitcoin::Block>,
-                            )> = {
-                                let gg = feed_load.inner.lock().unwrap();
-                                let mut out = Vec::new();
-                                let mut h = expect;
-                                while out.len() < hard_blocks && h <= claim_hi {
-                                    if gg.inflight.contains(&h) {
-                                        break;
-                                    }
-                                    let Some(entry) = gg.ready.get(&h) else {
-                                        break;
-                                    };
-                                    out.push((h, entry.0, entry.1.clone()));
-                                    h = h.saturating_add(1);
-                                }
-                                out
-                            };
-                            let need_bq: Vec<u32> = candidates
-                                .iter()
-                                .filter(|(_, _, w)| w.is_none())
-                                .map(|(h, _, _)| *h)
-                                .collect();
-                            let snaps = hub_load.query.block_queue_pack_snapshot(&need_bq);
-                            let mut snap_by_h: HashMap<u32, rbitcoin_query::BlockQueuePackSnap> =
-                                snaps.into_iter().map(|s| (s.height, s)).collect();
-                            let mut take: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> =
-                                Vec::new();
-                            let mut skip_have: Vec<u32> = Vec::new();
-                            for (h, hash, opt_wire) in candidates {
-                                if hub_load.has_block(&hash) {
-                                    skip_have.push(h);
-                                    continue;
-                                }
-                                let block = if let Some(b) = opt_wire {
-                                    Arc::new(b)
-                                } else {
-                                    match snap_by_h.remove(&h) {
-                                        Some(s) if !s.resolve_complete => {
-                                            break;
-                                        }
-                                        Some(s) if !pack_stored_hash_ok(&s.hash, &hash) => {
-                                            body_missing.push((h, hash));
-                                            let _ = hub_load.query.block_queue_dequeue_height(h);
-                                            break;
-                                        }
-                                        Some(s) => {
-                                            if let Some(b) = s.block {
-                                                b
-                                            } else {
-                                                match load_decode_bq_block(&hub_load, h, &hash)
-                                                {
-                                                    Ok(b) => b,
-                                                    Err(PackWireErr::Missing) => {
-                                                        body_missing.push((h, hash));
-                                                        break;
-                                                    }
-                                                    Err(
-                                                        PackWireErr::HashMismatch
-                                                        | PackWireErr::Decode,
-                                                    ) => {
-                                                        body_missing.push((h, hash));
-                                                        let _ = hub_load
-                                                            .query
-                                                            .block_queue_dequeue_height(h);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            body_missing.push((h, hash));
-                                            break;
-                                        }
-                                    }
-                                };
-                                let inputs = block_input_count(block.as_ref());
-                                take.push((h, hash, block));
-                                sum_inputs = sum_inputs.saturating_add(inputs);
-                                if pack_stop_after(
-                                    sum_inputs,
-                                    take.len(),
-                                    soft_inputs,
-                                    hard_blocks,
-                                ) {
-                                    break;
-                                }
-                            }
-                            {
-                                let mut gg = feed_load.inner.lock().unwrap();
-                                for h in skip_have {
-                                    gg.ready.remove(&h);
-                                }
-                                for (h, hash, block) in take {
-                                    if gg.inflight.contains(&h) {
-                                        continue;
-                                    }
-                                    gg.ready.remove(&h);
-                                    gg.inflight.insert(h);
-                                    run.push((h, hash, block));
-                                }
-                            }
-                            confirm_thr_stats::add_load_pack(t_pack_io.elapsed());
-                            if !body_missing.is_empty() {
-                                for (mh, mhash) in &body_missing {
-                                    let _ = event_tx_load.send(ConfirmEvent::BodyMissing {
-                                        hash: *mhash,
-                                    });
-                                    feed_load.finish(std::iter::once(*mh));
-                                }
-                            }
-                            if !run.is_empty() {
-                                break Some((run, sum_inputs));
-                            }
-                            g = feed_load.inner.lock().unwrap();
-                            if pack_empty_waits_for_lookup(run.len(), body_missing.len()) {
-                                let t_idle = Instant::now();
-                                let (gg, wait_res) = feed_load
-                                    .cv
-                                    .wait_timeout(g, Duration::from_millis(20))
-                                    .unwrap();
-                                confirm_thr_stats::add_load_recv_wait(t_idle.elapsed());
-                                g = gg;
-                                if wait_res.timed_out() {
-                                    break None;
-                                }
-                            }
-                            continue;
-                        }
-                        let t_idle = Instant::now();
-                        let (gg, wait_res) = feed_load
-                            .cv
-                            .wait_timeout(g, Duration::from_millis(20))
-                            .unwrap();
-                        confirm_thr_stats::add_load_recv_wait(t_idle.elapsed());
-                        g = gg;
-                        if wait_res.timed_out() {
-                            break None;
-                        }
-                    };
-                    match found {
-                        Some(x) => x,
-                        None => {
-                            continue;
-                        }
+                if feed_load.stopped() {
+                    drop(mat_tx);
+                    let _ = scripts.join();
+                    return;
+                }
+                let t_recv = Instant::now();
+                let lb = match load_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(b) => b,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        confirm_thr_stats::add_load_recv_wait(t_recv.elapsed());
+                        continue;
                     }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                confirm_thr_stats::add_load_pack(t_recv.elapsed());
+                let n = lb.items.len();
+                let wire: usize = lb.items.iter().map(|(_, _, w)| w.block.total_size()).sum();
+                queues_load.note_load_recv(n, wire);
+                let batch: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> = {
+                    let mut g = feed_load.inner.lock().unwrap();
+                    let mut run = Vec::with_capacity(lb.items.len());
+                    for (h, raw, wire) in lb.items {
+                        let hash = BlockHash::from_byte_array(raw);
+                        if hub_load.has_block(&hash) {
+                            g.ready.remove(&h);
+                            continue;
+                        }
+                        if g.inflight.contains(&h) {
+                            continue;
+                        }
+                        g.ready.remove(&h);
+                        g.inflight.insert(h);
+                        run.push((h, hash, wire.block));
+                    }
+                    run
+                };
+                let batch = (batch, 0u32);
 
                 let (batch, _batch_inputs) = batch;
                 if batch.is_empty() {
@@ -1715,8 +1637,8 @@ pub(crate) fn spawn_confirm_engine(
     let lookup_join = std::thread::Builder::new()
         .name("ibd-confirm-lookup".into())
         .spawn(move || {
-            info!("ibd: confirm lookup on dedicated OS thread (BQ-ahead TipOnly head_fk)");
-            let _ = queues_lookup;
+            info!("ibd: confirm lookup on dedicated OS thread (in-order BQ take → loadq)");
+            let queues_lookup = queues_lookup;
             let mut live_union = rbitcoin_query::LiveUnion::new();
             let mut disco_seen = 0u64;
             loop {
@@ -1726,6 +1648,7 @@ pub(crate) fn spawn_confirm_engine(
                 if hub.query.take_disconnect(&mut disco_seen).is_some() {
                     live_union = rbitcoin_query::LiveUnion::new();
                     hub.query.published_ids().unpublish();
+                    hub.query.set_lookup_taken_hi(None);
                 }
                 let t_sel = Instant::now();
                 let skip: std::collections::HashSet<u32> = {
@@ -1753,8 +1676,36 @@ pub(crate) fn spawn_confirm_engine(
                         &wave_h,
                         Some((&mut live_union, hub.query.published_ids().as_ref())),
                     ) {
-                        Ok(st) if st.heights > 0 => {
+                        Ok(wave) if !wave.items.is_empty() => {
                             did = true;
+                            let counts: Vec<u32> = wave
+                                .items
+                                .iter()
+                                .map(|(_, _, w)| block_input_count(w.block.as_ref()))
+                                .collect();
+                            let parts = split_wave_into_load_batches(
+                                &counts,
+                                confirm_batch_max_inputs(),
+                                CONFIRM_RUN_MAX_BLOCKS,
+                            );
+                            let mut i = 0usize;
+                            for n in parts {
+                                let end = i.saturating_add(n).min(wave.items.len());
+                                if i >= end {
+                                    break;
+                                }
+                                let chunk = wave.items[i..end].to_vec();
+                                i = end;
+                                let t_send = Instant::now();
+                                let n = chunk.len();
+                                let wire: usize =
+                                    chunk.iter().map(|(_, _, w)| w.block.total_size()).sum();
+                                if load_tx.send(LoadBatch { items: chunk }).is_err() {
+                                    break;
+                                }
+                                queues_lookup.note_load_send(n, wire);
+                                confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
+                            }
                             feed.notify();
                         }
                         Ok(_) => {}
@@ -1779,60 +1730,6 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-lookup");
     (lookup_join, queues)
-}
-
-enum PackWireErr {
-    Missing,
-    Decode,
-    HashMismatch,
-}
-
-/// Confirm-side load of one body-queue height (pack path only).
-///
-/// Prefers lookup-promoted `Arc<Block>` (no second consensus_decode).
-fn load_decode_bq_block(
-    hub: &ChainHub,
-    height: u32,
-    expect_hash: &BlockHash,
-) -> Result<Arc<bitcoin::Block>, PackWireErr> {
-    use bitcoin::consensus::Decodable;
-    if let Some(w) = hub.query.block_queue_resolved(height) {
-        if w.block.block_hash() != *expect_hash {
-            warn!(
-                "ibd: body queue hash mismatch @{height}: feed={expect_hash} payload={}",
-                w.block.block_hash()
-            );
-            return Err(PackWireErr::HashMismatch);
-        }
-        return Ok(w.block);
-    }
-    match hub.query.block_queue_payload(height) {
-        Ok(Some(payload)) if !payload.is_empty() => {
-            let mut cursor = std::io::Cursor::new(payload.as_slice());
-            match bitcoin::Block::consensus_decode(&mut cursor) {
-                Ok(block) => {
-                    if block.block_hash() != *expect_hash {
-                        warn!(
-                            "ibd: body queue hash mismatch @{height}: feed={expect_hash} payload={}",
-                            block.block_hash()
-                        );
-                        Err(PackWireErr::HashMismatch)
-                    } else {
-                        Ok(Arc::new(block))
-                    }
-                }
-                Err(e) => {
-                    warn!("ibd: body queue decode fail @{height} {expect_hash}: {e}");
-                    Err(PackWireErr::Decode)
-                }
-            }
-        }
-        Ok(Some(_)) | Ok(None) => Err(PackWireErr::Missing),
-        Err(e) => {
-            warn!("ibd: body queue read fail @{height} {expect_hash}: {e}");
-            Err(PackWireErr::Missing)
-        }
-    }
 }
 
 /// Offer a run of claim-ready heights starting at tip+1 into the confirm feed.

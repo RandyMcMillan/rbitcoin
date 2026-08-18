@@ -91,6 +91,12 @@ pub fn bq_resolve_wave_hold_partial(
     ready > soft_win / 2
 }
 
+/// Decoded heights from one lookup wave (BQ rows already taken).
+pub struct BqResolveWave {
+    pub stats: BqResolveWaveStats,
+    pub items: Vec<(u32, [u8; 32], ResolvedWire)>,
+}
+
 /// Outcome of one TipOnly wave over BQ-ready heights.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BqResolveWaveStats {
@@ -140,14 +146,6 @@ fn collect_resolve_keys(
     need
 }
 
-fn decoded_charge(payload_len: u64, n_tx: usize) -> u64 {
-    let approx = payload_len
-        .saturating_add(256)
-        .saturating_add((n_tx as u64).saturating_mul(256))
-        .saturating_add((n_tx as u64).saturating_mul(std::mem::size_of::<TxPrecompute>() as u64));
-    payload_len.max(approx)
-}
-
 fn decode_bq_block(payload: &[u8]) -> Option<Block> {
     let mut cur = Cursor::new(payload);
     Block::consensus_decode(&mut cur).ok()
@@ -168,7 +166,7 @@ pub fn confirm_bq_resolve_wave(
     params: &ChainParams,
     heights: &[u32],
 ) -> Result<BqResolveWaveStats, ConsensusError> {
-    confirm_bq_resolve_wave_with_ids(query, params, heights, None)
+    Ok(confirm_bq_resolve_wave_with_ids(query, params, heights, None)?.stats)
 }
 
 /// [`confirm_bq_resolve_wave`] with a lookup-owned live union.
@@ -180,14 +178,14 @@ pub fn confirm_bq_resolve_wave_with_ids(
         &mut rbitcoin_query::LiveUnion,
         &rbitcoin_query::PublishedIds,
     )>,
-) -> Result<BqResolveWaveStats, ConsensusError> {
+) -> Result<BqResolveWave, ConsensusError> {
     let t0 = Instant::now();
     let mut stats = BqResolveWaveStats::default();
     let mut per_height: Vec<(u32, Vec<[u8; 32]>)> = Vec::new();
     let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
         HashSet::with_hasher(BuildHasherDefault::default());
     let mut sum_inputs = 0u32;
-    let mut promote: Vec<(u32, ResolvedWire, u64)> = Vec::new();
+    let mut wires: Vec<(u32, [u8; 32], ResolvedWire)> = Vec::new();
 
     let intake = query.block_queue_wave_intake(heights);
     let raw_h: HashSet<u32> = intake.raw.into_iter().collect();
@@ -197,7 +195,9 @@ pub fn confirm_bq_resolve_wave_with_ids(
     }
 
     for &h in heights {
+        let hash = query.block_queue_hash_at_height(h).unwrap_or([0u8; 32]);
         let (block, pres) = if let Some(wire) = resolved_by_h.remove(&h) {
+            wires.push((h, hash, wire.clone()));
             (Arc::clone(&wire.block), Arc::clone(&wire.pres))
         } else if raw_h.contains(&h) {
             let Ok(Some(payload)) = query.block_queue_raw_payload(h) else {
@@ -215,16 +215,15 @@ pub fn confirm_bq_resolve_wave_with_ids(
             stats.precompute_ns = stats
                 .precompute_ns
                 .saturating_add(t_pre.elapsed().as_nanos() as u64);
-            let charge = decoded_charge(payload.len() as u64, pres.len());
             let pres = Arc::<[TxPrecompute]>::from(pres);
             let block = Arc::new(block);
-            promote.push((
+            wires.push((
                 h,
+                hash,
                 ResolvedWire {
                     block: Arc::clone(&block),
                     pres: Arc::clone(&pres),
                 },
-                charge,
             ));
             (block, pres)
         } else {
@@ -260,12 +259,6 @@ pub fn confirm_bq_resolve_wave_with_ids(
         }
     }
 
-    if !promote.is_empty() {
-        query
-            .block_queue_promote_wave(promote)
-            .map_err(ConsensusError::from)?;
-    }
-
     if let Some(&(first, _)) = per_height.first() {
         let path_lo = query
             .tip_height()
@@ -293,7 +286,10 @@ pub fn confirm_bq_resolve_wave_with_ids(
                 stats.collect_ns,
                 stats.head_ns,
             );
-            return Ok(stats);
+            return Ok(BqResolveWave {
+                stats,
+                items: Vec::new(),
+            });
         }
     }
 
@@ -342,7 +338,9 @@ pub fn confirm_bq_resolve_wave_with_ids(
         let t_keep = Instant::now();
         let queued = query.block_queue_queued_heights();
         let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-        let horizon = rbitcoin_query::recent_creates_horizon(query.soft_confirm_window());
+        let taken = query.lookup_taken_hi().unwrap_or(tip);
+        let span = taken.saturating_sub(tip);
+        let horizon = rbitcoin_query::recent_creates_horizon(span);
         live.keep_queued_or_horizon(&queued, tip, horizon);
         live.publish(published);
         crate::confirm_phase_stats::LOOKUP_KEEP_NS
@@ -350,10 +348,16 @@ pub fn confirm_bq_resolve_wave_with_ids(
     }
 
     let done: Vec<u32> = per_height.iter().map(|(h, _)| *h).collect();
-    query
-        .block_queue_mark_resolve_complete_wave(&done)
-        .map_err(ConsensusError::from)?;
-    stats.heights = done.len() as u32;
+    let mut items = Vec::with_capacity(done.len());
+    for (h, hash, wire) in wires {
+        if !done.contains(&h) {
+            continue;
+        }
+        let _ = query.block_queue_take_raw(h);
+        query.set_lookup_taken_hi(Some(h));
+        items.push((h, hash, wire));
+    }
+    stats.heights = items.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
     lookup_stage_stats::note_wave_decode(
         stats.decode_ns,
@@ -361,7 +365,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
         stats.collect_ns,
         stats.head_ns,
     );
-    Ok(stats)
+    Ok(BqResolveWave { stats, items })
 }
 
 #[cfg(test)]
@@ -495,14 +499,16 @@ mod tests {
             .unwrap();
 
         let mut live = rbitcoin_query::LiveUnion::new();
-        let st = confirm_bq_resolve_wave_with_ids(
+        let wave = confirm_bq_resolve_wave_with_ids(
             &q,
             &params,
             &[1, 2],
             Some((&mut live, q.published_ids().as_ref())),
         )
         .unwrap();
+        let st = wave.stats;
         assert_eq!(st.heights, 2);
+        assert_eq!(wave.items.len(), 2);
         assert!(st.keys >= 1);
         assert!(st.hits >= 1);
         assert!(
@@ -523,8 +529,8 @@ mod tests {
             "one lookup wave is one published layer, not one layer per height"
         );
         assert_eq!((head.lo, head.hi), (1, 2));
-        assert!(q.block_queue_is_resolve_complete(1));
-        assert!(q.block_queue_is_resolve_complete(2));
+        assert!(!q.block_queue_has_height(1));
+        assert!(!q.block_queue_has_height(2));
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -551,15 +557,10 @@ mod tests {
             "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
         );
         assert!(
-            q.block_queue_raw_payload(1).unwrap().is_none(),
-            "lookup must drop raw after first decode"
+            !q.block_queue_has_height(1),
+            "lookup must dequeue the BQ row after decode"
         );
-        let w = q.block_queue_resolved(1).expect("promoted");
-        assert_eq!(w.pres.len(), w.block.txdata.len());
-        assert_eq!(
-            w.pres[0].txid,
-            w.block.txdata[0].compute_txid().to_byte_array()
-        );
+        assert!(q.block_queue_resolved(1).is_none());
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -658,20 +659,16 @@ mod tests {
         assert_eq!(st.heights, 0, "fat BQ must not mint a 1-block layer");
         assert!(!q.block_queue_is_resolve_complete(8));
         assert!(
-            q.block_queue_raw_payload(8).unwrap().is_none(),
-            "first decode must drop raw even when the wave holds"
+            q.block_queue_has_height(8),
+            "hold leaves raw on BQ until the wave emits"
         );
-        let held = q.block_queue_resolved(8).expect("promoted on hold");
-        assert_eq!(held.pres.len(), held.block.txdata.len());
-        assert_eq!(
-            held.pres[0].txid,
-            held.block.txdata[0].compute_txid().to_byte_array()
-        );
+        assert!(q.block_queue_raw_payload(8).unwrap().is_some());
+        assert!(q.block_queue_resolved(8).is_none());
 
         let _ = q.block_queue_update_soft_pressure(None);
         let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
         assert_eq!(st.heights, 1, "unknown window must allow a short wave");
-        assert!(q.block_queue_is_resolve_complete(8));
+        assert!(!q.block_queue_has_height(8));
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -700,7 +697,7 @@ mod tests {
             st.heights, 1,
             "unresolved height in the first half of the soft window must emit"
         );
-        assert!(q.block_queue_is_resolve_complete(1));
+        assert!(!q.block_queue_has_height(1));
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -734,8 +731,8 @@ mod tests {
             st.heights, 10,
             "unknown window + whole remaining set must emit"
         );
-        assert!(q.block_queue_is_resolve_complete(1));
-        assert!(q.block_queue_is_resolve_complete(10));
+        assert!(!q.block_queue_has_height(1));
+        assert!(!q.block_queue_has_height(10));
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -766,13 +763,15 @@ mod tests {
         let published = rbitcoin_query::PublishedIds::new();
         let st1 =
             confirm_bq_resolve_wave_with_ids(&q, &params, &[1], Some((&mut live, &published)))
-                .unwrap();
+                .unwrap()
+                .stats;
         assert_eq!(st1.skipped, 0);
         assert!(st1.hits >= 1);
         assert!(published.get(&g_cb.to_byte_array()).is_some());
         let st2 =
             confirm_bq_resolve_wave_with_ids(&q, &params, &[2], Some((&mut live, &published)))
-                .unwrap();
+                .unwrap()
+                .stats;
         assert!(
             st2.skipped >= 1,
             "second wave must skip genesis parent already in live_union"
@@ -806,8 +805,8 @@ mod tests {
         // Caller skipped height 2 (claimed / inflight) — only resolve 1.
         let st = confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
         assert_eq!(st.heights, 1);
-        assert!(q.block_queue_is_resolve_complete(1));
-        assert!(!q.block_queue_is_resolve_complete(2));
+        assert!(!q.block_queue_has_height(1), "emitted height is dequeued");
+        assert!(q.block_queue_has_height(2));
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -839,13 +838,14 @@ mod tests {
             &[2],
             Some((&mut live, q.published_ids().as_ref())),
         )
-        .unwrap();
+        .unwrap()
+        .stats;
         assert_eq!(st.heights, 1);
         assert!(
             q.published_ids().get(&cb1.to_byte_array()).is_none(),
             "abandoned-fork coinbase must not be a TipOnly hit (TipThenAny would attach it)"
         );
-        assert!(q.block_queue_is_resolve_complete(2));
+        assert!(!q.block_queue_has_height(2));
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -1112,7 +1112,7 @@ mod tests {
         q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
             .unwrap();
         confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
-        assert!(q.block_queue_is_resolve_complete(1));
+        assert!(!q.block_queue_has_height(1));
         let items = [(Height(1), std::sync::Arc::new(b1))];
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("coinbase-only block needs no external head");

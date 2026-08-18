@@ -428,6 +428,56 @@ mod tests {
     }
 
     #[test]
+    fn block_queue_promote_wave_keeps_resolved_drops_raw() {
+        use crate::ResolvedWire;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode};
+        use std::sync::Arc;
+
+        let (dir, q) = temp_query();
+        q.block_queue_enqueue(7, [7u8; 32], 1, b"wire-7").unwrap();
+        q.block_queue_enqueue(8, [8u8; 32], 2, b"wire-8").unwrap();
+        let block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::from_byte_array([0; 32]),
+                merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207fffff),
+                nonce: 0,
+            },
+            txdata: vec![],
+        };
+        let wire = ResolvedWire {
+            block: Arc::new(block),
+        };
+        let intake = q.block_queue_wave_intake(&[7, 8]);
+        assert_eq!(intake.raw.len(), 2);
+        assert!(intake.resolved.is_empty());
+        q.block_queue_promote_wave(vec![(7, wire.clone(), 64)])
+            .unwrap();
+        assert!(q.block_queue_raw_payload(7).unwrap().is_none());
+        assert!(q.block_queue_payload(7).unwrap().unwrap().is_empty());
+        assert_eq!(
+            q.block_queue_stats().1,
+            64 + 6,
+            "charge 64 + leftover raw wire-8"
+        );
+        let got = q.block_queue_resolved(7).expect("resolved");
+        assert_eq!(got.block.header.time, 1);
+        let intake2 = q.block_queue_wave_intake(&[7, 8]);
+        assert_eq!(intake2.resolved.len(), 1);
+        assert_eq!(intake2.raw.len(), 1);
+        assert_eq!(intake2.raw[0].0, 8);
+        q.block_queue_drop_resolved_from(7);
+        assert!(q.block_queue_resolved(7).is_none());
+        assert_eq!(q.block_queue_dequeue_height(8).unwrap(), 1);
+        assert!(q.block_queue_resolved(8).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn obfuscation_on_disk_via_store_put() {
         let (dir, q) = temp_query();
         let script = vec![0x76, 0xa9, 0x14, 0x11, 0x22, 0x33];

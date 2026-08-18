@@ -39,6 +39,11 @@ before 1.0).
   wall microbenches. Default graph is product + suite
   (`scripts/check_default_targets.test.sh`). Host A/B is musl + `ibd: perf`.
 
+- **Unused spend-annotate wrappers:** `Store::put_spend_batch_by_create` and
+  `_ranged`. Confirm write is abs-meta only
+  (`put_spend_batch_by_abs_meta_known`). `put_spend` / `put_spend_batch`
+  (txid) stay for `connect_block` / archive commit.
+
 ### Changed
 
 - **Confirm pack / leftover / lookup meters:** load waits on `feed.cv` when

@@ -608,20 +608,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Confirm hot path: edges already have `create_tx_fk` (+ optional body range).
-    ///
-    /// Tuple: `(create_tx_fk, vout, spending_tx_fk, Option<(body_off, body_len)>)`.
-    /// Sorted by create for locality. **No `tx.head`**. Uses body range when present
-    /// so **no `tx.idx`** either (load-cached).
-    pub fn put_spend_batch_by_create(&self, edges: &[(Fk, u32, Fk)]) -> Result<(), StoreError> {
-        let mut work: Vec<(Fk, u32, Fk)> = edges.to_vec();
-        work.sort_unstable_by_key(|(c, v, _)| (c.0, *v));
-        for (create_fk, vout, spend_fk) in work {
-            self.put_spend_create(create_fk, vout, spend_fk)?;
-        }
-        Ok(())
-    }
-
     /// Bulk create heights from the RAM fence (confirm write / BIP68).
     pub fn tx_height_get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
         Ok(self.fence().get_batch(fks))
@@ -689,38 +675,6 @@ impl Store {
     ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
         self.txs
             .put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
-    }
-
-    /// Like [`Self::put_spend_batch_by_create`] with cache-held body ranges.
-    /// Tuple: `(create_tx_fk, vout, spending_tx_fk, body_off, body_len)`.
-    ///
-    /// Groups by create body and applies all vouts with **one** packed walk per
-    /// create (no per-edge full input walk).
-    pub fn put_spend_batch_by_create_ranged(
-        &self,
-        edges: &[(Fk, u32, Fk, u64, u64)],
-    ) -> Result<(), StoreError> {
-        if edges.is_empty() {
-            return Ok(());
-        }
-        let mut work = edges.to_vec();
-        work.sort_unstable_by_key(|(c, v, _, off, _)| (c.0, *off, *v));
-        let mut i = 0;
-        while i < work.len() {
-            let (cfk, _, _, off, len) = work[i];
-            if cfk.is_null() {
-                return Err(StoreError::InvalidFk);
-            }
-            let mut j = i + 1;
-            while j < work.len() && work[j].0 == cfk && work[j].3 == off && work[j].4 == len {
-                j += 1;
-            }
-            let batch: Vec<(u32, Fk)> = work[i..j].iter().map(|(_, v, s, _, _)| (*v, *s)).collect();
-            self.txs
-                .put_spends_on_create_at(&self.spenders, off, len, &batch)?;
-            i = j;
-        }
-        Ok(())
     }
 
     /// Resolve txid → Class A fk without full body decode (head probe + body txid).
@@ -1603,15 +1557,12 @@ mod tests {
         let spend3_fk = s.put_tx_full_batch_indexed(&[spend3], true).unwrap()[0];
         s.put_spend(&[10u8; 32], 0, spend3_fk, 0).unwrap();
         s.put_spend_batch(&[([10u8; 32], 1, spend_fk, 0)]).unwrap();
-        s.put_spend_batch_by_create(&[(create_fk, 1, spend2_fk)])
-            .unwrap();
-        let (off, len) = s.tx_body_range(create_fk).unwrap();
+        s.put_spend_create(create_fk, 1, spend2_fk).unwrap();
         let (soff, slen) = s.tx_spent_range(create_fk).unwrap();
         s.put_spend_create_at(create_fk, 1, spend3_fk, soff, slen)
             .unwrap();
-        s.put_spend_batch_by_create_ranged(&[]).unwrap();
-        // Re-annotate vout1 with ranged multi path already multi.
-        s.put_spend_batch_by_create_ranged(&[(create_fk, 1, spend_fk, soff, slen)])
+        // Re-annotate vout1 (already multi).
+        s.put_spend_create_at(create_fk, 1, spend_fk, soff, slen)
             .unwrap();
 
         // Class C: confirm spenders + heights. Body list must include spend_fk

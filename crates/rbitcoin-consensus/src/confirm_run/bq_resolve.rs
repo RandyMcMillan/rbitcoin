@@ -312,7 +312,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
     };
     let mut need = need;
     let t_head = Instant::now();
-    need.sort_unstable_by_key(|txid| query.store().txs.head_primary_slot(txid));
+    need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
 
     if !need.is_empty() {
         let rows = query

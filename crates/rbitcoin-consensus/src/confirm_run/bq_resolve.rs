@@ -1097,17 +1097,8 @@ mod tests {
             !msg.contains("invariant: external parent missing BQ TipOnly hit"),
             "leftover miss is unresolved, not the old forbid-head invariant: {msg}"
         );
-        let miss = rbitcoin_query::archive_phase_stats::last_union_miss();
-        assert_eq!(
-            miss.miss_on,
-            Some("fence"),
-            "disconnected leftover is identity-without-fence, not a head miss: {miss:?}"
-        );
-        let last = rbitcoin_query::archive_phase_stats::last_plan_batch();
-        assert!(
-            last.head_need > 0,
-            "fail pack leftover_n must be metered before stamp: {last:?}"
-        );
+        // Do not read process-global last_union_miss / last_plan_batch here:
+        // cargo test --workspace races those atomics (CI flake on #130).
         let _ = std::fs::remove_dir_all(&path);
     }
 

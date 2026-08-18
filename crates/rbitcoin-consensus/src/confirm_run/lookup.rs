@@ -82,7 +82,7 @@ pub struct PlanStampOutcome {
 /// IBD **lookup** stage: structure + stamp create_fk + parent body ranges.
 ///
 /// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
-/// Parent create_fk: in-flight → published `live_union` → TipOnly leftover.
+/// Parent create_fk: in-flight → published `live_union` → recent creates → TipOnly leftover.
 /// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
 /// cloning full `Block` payloads into stamp.
 pub fn confirm_wire_lookup_stamp(
@@ -164,6 +164,7 @@ pub(super) fn stamp_parent_pin_archived(
         &need_vec,
         ifo,
         query.published_ids(),
+        query.recent_creates(),
     )
     .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
@@ -719,6 +720,7 @@ mod tests {
             &[parent_txid],
             &rbitcoin_query::InFlightView::empty(),
             q.published_ids(),
+            q.recent_creates(),
         )
         .expect("shared helper");
 

@@ -340,6 +340,9 @@ pub(crate) struct IbdPerfSample {
     /// Unique prev_txids resolved from live pipeline pins (not in-flight).
     pub arch_pin_txid: u64,
     pub arch_pin_txid_ms: u64,
+    /// Write-published recent-create identity hits (after published, before leftover).
+    pub arch_recent_n: u64,
+    pub arch_recent_ms: u64,
     pub arch_batch_stamp: u64,
     pub arch_resolve_ns: u64,
     pub arch_resolve_blocks: u64,
@@ -580,6 +583,8 @@ impl Default for IbdPerfSample {
             leftover_age_n: 0,
             arch_pin_txid: 0,
             arch_pin_txid_ms: 0,
+            arch_recent_n: 0,
+            arch_recent_ms: 0,
             arch_batch_stamp: 0,
             arch_resolve_ns: 0,
             arch_resolve_blocks: 0,
@@ -1008,6 +1013,8 @@ pub(crate) fn sample(
         leftover_age_n: arch_res.leftover_age_n,
         arch_pin_txid: arch_res.pin_txid_n,
         arch_pin_txid_ms: ns_ms(arch_res.pin_txid_ns),
+        arch_recent_n: arch_res.recent_n,
+        arch_recent_ms: ns_ms(arch_res.recent_ns),
         arch_batch_stamp: arch_res.batch_stamp,
         arch_resolve_ns: arch_res.resolve_ns,
         arch_resolve_blocks: arch_res.blocks,
@@ -1191,6 +1198,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             " stamp_sub(struct={}ms prepare={}ms filter={}ms batch={}ms \
              batch_assign={}ms collect={}ms pin_txid={} pin_txid%={} pin_txid_ms={} \
              leftover_n={} leftover_hit={} leftover_ms={} leftover_pend={} leftover_cdf0={} leftover_cdf3={} leftover_age_n={} \
+             recent={} recent_ms={} \
              head={}ms stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
@@ -1208,6 +1216,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.leftover_cdf0_pct,
             s.leftover_cdf3_pct,
             s.leftover_age_n,
+            s.arch_recent_n,
+            s.arch_recent_ms,
             s.stamp_batch_head_ms,
             s.stamp_batch_stamp_ms,
             s.stamp_batch_finish_ms,
@@ -1547,7 +1557,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         };
         out.push_str(&format!(
             " | plan_batch assign={} collect={} inflight={} pin_txid={}/{} pin_txid_ms={} \
-             us/pin_txid={} head_fk={} head={} \
+             us/pin_txid={} recent={} recent_ms={} head_fk={} head={} \
              stamp={} finish={} resolve_us/blk={} ext={} head_hit={}/{} \
              stamp_n batch={}",
             s.arch_prep_assign_ms,
@@ -1557,6 +1567,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_head_need,
             s.arch_pin_txid_ms,
             us_pin_txid(s),
+            s.arch_recent_n,
+            s.arch_recent_ms,
             s.arch_prep_head_fk_ms,
             s.arch_prep_head_ms,
             s.arch_prep_stamp_ms,
@@ -1692,6 +1704,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let if_mib = o.inflight_bytes / (1024 * 1024);
     let ps_mib = o.pstore_bytes / (1024 * 1024);
+    // txid + fk + range + hash overhead — identity only, no outs.
+    let recent_bytes = (o.recent_keys as u64).saturating_mul(96);
+    let recent_mib = recent_bytes / (1024 * 1024);
     // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
     let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
     let conf_wire_mib = (script_wire_mib.saturating_add(write_wire_mib)) as u64;
@@ -1701,6 +1716,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let accounted_mib = bq_mib
         .saturating_add(if_mib)
         .saturating_add(ps_mib)
+        .saturating_add(recent_mib)
         .saturating_add(sh_mt_mib)
         .saturating_add(conf_wire_mib)
         .saturating_add(fuse8_mib)
@@ -1716,7 +1732,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | conf_plans={} \
          | conf ready={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
-         | heap bq={}MiB iflight={}L/{}pin≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
+         | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h/{}k≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
            wire={}MiB fuse8={}MiB open_keys={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
@@ -1760,6 +1776,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.inflight_layers,
         o.inflight_pins,
         if_mib,
+        o.recent_heights,
+        o.recent_keys,
+        recent_mib,
         o.pstore_weak,
         o.pstore_live,
         ps_mib,
@@ -2153,6 +2172,8 @@ mod tests {
         s.arch_head_need = 25;
         s.arch_pin_txid = 15;
         s.arch_pin_txid_ms = 2;
+        s.arch_recent_n = 9;
+        s.arch_recent_ms = 3;
         s.arch_batch_stamp = 4;
         s.arch_prep_probe_ms = 8;
         s.arch_prep_idx_ms = 4;
@@ -2184,12 +2205,16 @@ mod tests {
         assert!(info.contains("pin_txid_ms=2"), "{info}");
         assert!(info.contains("leftover_n=25"), "{info}");
         assert!(info.contains("leftover_hit="), "{info}");
+        assert!(info.contains("recent=9"), "{info}");
+        assert!(info.contains("recent_ms=3"), "{info}");
         assert!(info.contains("head_loc(cdf0=10"), "{info}");
         assert!(info.contains("lookup_sub(blks=4"), "{info}");
         let dbg = format_debug(&s);
         assert!(dbg.contains("plan_batch "), "{dbg}");
         assert!(dbg.contains("pin_txid=15/25"), "{dbg}");
         assert!(dbg.contains("us/pin_txid=133"), "{dbg}");
+        assert!(dbg.contains("recent=9"), "{dbg}");
+        assert!(dbg.contains("recent_ms=3"), "{dbg}");
         assert!(dbg.contains("head_rd("), "{dbg}");
         assert!(dbg.contains("pend=3"), "{dbg}");
         assert!(dbg.contains("probe_us/key="), "{dbg}");
@@ -2334,6 +2359,8 @@ mod tests {
         s.owned.inflight_layers = 3;
         s.owned.inflight_pins = 12_000;
         s.owned.inflight_bytes = 48 * 1024 * 1024;
+        s.owned.recent_heights = 12;
+        s.owned.recent_keys = 400;
         s.owned.pstore_weak = 20_000;
         s.owned.pstore_live = 8_000;
         s.owned.pstore_bytes = 16 * 1024 * 1024;
@@ -2392,7 +2419,7 @@ mod tests {
         assert!(line.contains("segs=3 sealed=2"), "{line}");
         assert!(line.contains("class_a=2000000"), "{line}");
         assert!(
-            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB"),
+            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB recent=12h/400k≈0MiB"),
             "{line}"
         );
         assert!(line.contains("pstore weak=20000/live=8000≈16MiB"), "{line}");

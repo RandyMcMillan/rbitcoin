@@ -213,8 +213,21 @@ impl RecentCreates {
 
     /// Occupancy for `ibd: sizes`.
     pub fn size_snapshot(&self) -> (usize, usize) {
+        let d = self.size_detail();
+        (d.0, d.1)
+    }
+
+    /// `(heights, live, pub, overlay, fifo_keys)`.
+    pub fn size_detail(&self) -> (usize, usize, usize, usize, usize) {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        (g.fifo.len(), g.live.len())
+        let fifo_keys = g.fifo.iter().map(|(_, k)| k.len()).sum();
+        (
+            g.fifo.len(),
+            g.live.len(),
+            self.live.load().len(),
+            g.overlay.len(),
+            fifo_keys,
+        )
     }
 }
 
@@ -246,6 +259,24 @@ mod tests {
             (2, 2),
             "one fifo row per prepared height, not one per write batch"
         );
+    }
+
+    #[test]
+    fn size_detail_counts_live_and_pub_separately() {
+        let r = RecentCreates::new();
+        r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        let (h, live, pub_k, ov, fifo) = r.size_detail();
+        assert_eq!(h, 1);
+        assert_eq!(live, 1);
+        assert_eq!(pub_k, 0, "unpublished notes are not on the ArcSwap");
+        assert_eq!(ov, 1);
+        assert_eq!(fifo, 1);
+        r.publish_if_dirty();
+        let (_, live, pub_k, ov, fifo) = r.size_detail();
+        assert_eq!(live, 1);
+        assert_eq!(pub_k, 1);
+        assert_eq!(ov, 0);
+        assert_eq!(fifo, 1);
     }
 
     #[test]

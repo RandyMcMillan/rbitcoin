@@ -352,6 +352,11 @@ impl Store {
         self.fence().clone()
     }
 
+    /// Run count only (sizes tick — no Vec clone).
+    pub fn height_fence_run_count(&self) -> usize {
+        self.fence().len()
+    }
+
     /// Highest height whose Class A run is on the RAM fence (`None` if empty).
     ///
     /// Max height on the fence. In-flight prune requires this span **and**

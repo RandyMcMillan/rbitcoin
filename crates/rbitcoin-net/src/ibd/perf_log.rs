@@ -1805,8 +1805,17 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let if_mib = o.inflight_bytes / (1024 * 1024);
     let ps_mib = o.pstore_bytes / (1024 * 1024);
     // txid + fk + range + hash overhead — identity only, no outs.
-    let recent_bytes = (o.recent_keys as u64).saturating_mul(96);
+    // live and pub are separate HashMaps today (step 2 will share the Arc).
+    let recent_bytes = (o.recent_keys as u64)
+        .saturating_add(o.recent_pub_keys as u64)
+        .saturating_mul(96)
+        .saturating_add((o.recent_overlay_keys as u64).saturating_mul(96))
+        .saturating_add((o.recent_fifo_keys as u64).saturating_mul(32));
     let recent_mib = recent_bytes / (1024 * 1024);
+    let union_bytes = (o.union_keys as u64).saturating_mul(88);
+    let union_mib = union_bytes / (1024 * 1024);
+    let h2h_mib = (o.h2h_keys as u64).saturating_mul(48) / (1024 * 1024);
+    let fence_mib = (o.fence_runs as u64).saturating_mul(16) / (1024 * 1024);
     // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
     let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
     let conf_wire_mib = (script_wire_mib.saturating_add(write_wire_mib)) as u64;
@@ -1817,6 +1826,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(if_mib)
         .saturating_add(ps_mib)
         .saturating_add(recent_mib)
+        .saturating_add(union_mib)
+        .saturating_add(h2h_mib)
+        .saturating_add(fence_mib)
         .saturating_add(sh_mt_mib)
         .saturating_add(conf_wire_mib)
         .saturating_add(fuse8_mib)
@@ -1832,7 +1844,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | conf_plans={} \
          | conf ready={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
-         | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h/{}k≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
+         | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h live={}k/pub={}k/ov={} fifo={}k≈{}MiB \
+           union={}L/{}k≈{}MiB h2h={}k≈{}MiB fence={}≈{}MiB \
+           pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
            wire={}MiB fuse8={}MiB open_keys={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
@@ -1879,7 +1893,17 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         if_mib,
         o.recent_heights,
         o.recent_keys,
+        o.recent_pub_keys,
+        o.recent_overlay_keys,
+        o.recent_fifo_keys,
         recent_mib,
+        o.union_layers,
+        o.union_keys,
+        union_mib,
+        o.h2h_keys,
+        h2h_mib,
+        o.fence_runs,
+        fence_mib,
         o.pstore_weak,
         o.pstore_live,
         ps_mib,
@@ -2488,6 +2512,13 @@ mod tests {
         s.owned.inflight_bytes = 48 * 1024 * 1024;
         s.owned.recent_heights = 12;
         s.owned.recent_keys = 400;
+        s.owned.recent_pub_keys = 400;
+        s.owned.recent_overlay_keys = 0;
+        s.owned.recent_fifo_keys = 400;
+        s.owned.union_layers = 2;
+        s.owned.union_keys = 100;
+        s.owned.h2h_keys = 50;
+        s.owned.fence_runs = 10;
         s.owned.pstore_weak = 20_000;
         s.owned.pstore_live = 8_000;
         s.owned.pstore_bytes = 16 * 1024 * 1024;
@@ -2547,9 +2578,12 @@ mod tests {
         assert!(line.contains("segs=3 sealed=2"), "{line}");
         assert!(line.contains("class_a=2000000"), "{line}");
         assert!(
-            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB recent=12h/400k≈0MiB"),
+            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB recent=12h live=400k/pub=400k/ov=0 fifo=400k≈0MiB"),
             "{line}"
         );
+        assert!(line.contains("union=2L/100k≈0MiB"), "{line}");
+        assert!(line.contains("h2h=50k≈0MiB"), "{line}");
+        assert!(line.contains("fence=10≈0MiB"), "{line}");
         assert!(line.contains("pstore weak=20000/live=8000≈16MiB"), "{line}");
         assert!(line.contains("accounted≈"), "{line}");
         assert!(line.contains("residual≈"), "{line}");

@@ -112,6 +112,19 @@ impl PublishedIds {
         self.inner.load_full()
     }
 
+    /// Layer count and sum of hit-map lens (shared Arcs; O(layers)).
+    pub fn size_snapshot(&self) -> (usize, usize) {
+        let mut layers = 0usize;
+        let mut keys = 0usize;
+        let mut cur = self.load();
+        while let Some(layer) = cur {
+            layers = layers.saturating_add(1);
+            keys = keys.saturating_add(layer.hits.len());
+            cur = layer.older.clone();
+        }
+        (layers, keys)
+    }
+
     /// Point get. Zero txid is never a hit.
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
         if *txid == [0u8; 32] {

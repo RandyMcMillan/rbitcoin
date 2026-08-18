@@ -75,6 +75,18 @@ pub struct ProcessOwnedSizes {
     /// Write-published recent-create identity ring (heights / live keys).
     pub recent_heights: usize,
     pub recent_keys: usize,
+    /// Published Arc keys (may equal live, or lag until flush).
+    pub recent_pub_keys: usize,
+    pub recent_overlay_keys: usize,
+    /// Fifo txid copies (one vec per height).
+    pub recent_fifo_keys: usize,
+    /// PublishedIds / LiveUnion layer chain (shared Arcs; count once).
+    pub union_layers: usize,
+    pub union_keys: usize,
+    /// Confirmed hash→height map entries.
+    pub h2h_keys: usize,
+    /// Height-fence run count (no Vec clone).
+    pub fence_runs: usize,
     /// Body-queue heights whose raw payload was dropped after lookup decode.
     pub bq_promoted: usize,
 }
@@ -1793,7 +1805,14 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
-        let (rec_h, rec_k) = self.recent_creates.size_snapshot();
+        let rec = self.recent_creates.size_detail();
+        let (union_layers, union_keys) = self.published_ids.size_snapshot();
+        let h2h_keys = self
+            .height_by_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len();
         let mut head = self.store.txs.head_resize_size_snapshot();
         head.class_c_l2_bytes = self.store.class_c_l2_resident_bytes();
         ProcessOwnedSizes {
@@ -1808,8 +1827,15 @@ impl Query {
             pstore_weak: mem.pstore_weak,
             pstore_live: mem.pstore_live,
             pstore_bytes: mem.pstore_bytes,
-            recent_heights: rec_h,
-            recent_keys: rec_k,
+            recent_heights: rec.0,
+            recent_keys: rec.1,
+            recent_pub_keys: rec.2,
+            recent_overlay_keys: rec.3,
+            recent_fifo_keys: rec.4,
+            union_layers,
+            union_keys,
+            h2h_keys,
+            fence_runs: self.store.height_fence_run_count(),
             bq_promoted: self.block_queue_promoted_count(),
         }
     }

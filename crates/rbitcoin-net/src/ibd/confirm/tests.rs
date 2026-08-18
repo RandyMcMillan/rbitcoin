@@ -361,6 +361,36 @@ fn load_recv_is_lookup_order() {
 }
 
 #[test]
+fn load_stamp_items_keep_pres() {
+    use super::{load_stamp_items, LoadBatch};
+    use rbitcoin_query::{ResolvedWire, TxPrecompute};
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let pres: Arc<[TxPrecompute]> = genesis
+        .txdata
+        .iter()
+        .map(TxPrecompute::from_tx)
+        .collect::<Vec<_>>()
+        .into();
+    let lb = LoadBatch {
+        items: vec![(
+            1,
+            [1u8; 32],
+            ResolvedWire {
+                block: Arc::new(genesis),
+                pres: Arc::clone(&pres),
+            },
+        )],
+    };
+    let items = load_stamp_items(lb.items.into_iter().map(|(h, _, w)| (h, w.block, w.pres)));
+    assert_eq!(items.len(), 1);
+    let got = items[0].2.as_ref().expect("load must pass lookup pres");
+    assert!(
+        Arc::ptr_eq(got, &pres),
+        "stamp input must keep the LoadBatch pres Arc"
+    );
+}
+
+#[test]
 fn lookup_blocks_when_loadq_full() {
     use super::{LoadBatch, LOAD_QUEUE_CAP_DEFAULT};
     use std::sync::mpsc;

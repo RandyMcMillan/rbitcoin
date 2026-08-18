@@ -85,12 +85,17 @@ pub struct PlanStampOutcome {
 /// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
 /// Parent create_fk: in-flight → published `live_union` → recent creates → TipOnly leftover.
 /// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
-/// cloning full `Block` payloads into stamp.
+/// cloning full `Block` payloads into stamp. `pres` is lookup `TxPrecompute`
+/// when the caller already hashed (loadq); `None` hashes here.
 pub fn confirm_wire_lookup_stamp(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
-    blocks: &[(Height, Arc<Block>)],
+    blocks: &[(
+        Height,
+        Arc<Block>,
+        Option<Arc<[rbitcoin_query::TxPrecompute]>>,
+    )],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
@@ -270,7 +275,11 @@ pub(super) fn wire_lookup_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
-    blocks: &[(Height, Arc<Block>)],
+    blocks: &[(
+        Height,
+        Arc<Block>,
+        Option<Arc<[rbitcoin_query::TxPrecompute]>>,
+    )],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<
     (
@@ -308,16 +317,15 @@ pub(super) fn wire_lookup_phase(
     let mut struct_ns = 0u64;
     let mut prepare_ns = 0u64;
 
-    for (i, (height, block)) in blocks.iter().enumerate() {
+    for (i, (height, block, caller_pres)) in blocks.iter().enumerate() {
         let block = Arc::clone(block);
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
         let t_struct = Instant::now();
-        let stashed = query.block_queue_resolved(height.0);
         let pres = crate::block::validate_block_structure_with_pres(
             block.as_ref(),
             &ctx,
-            stashed.as_ref().map(|w| w.pres.as_ref()),
+            caller_pres.as_ref().map(Arc::clone),
         )?;
         let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
         if i == 0 {
@@ -389,7 +397,7 @@ pub(super) fn wire_lookup_phase(
             header_rec,
             tx_fks: Vec::new(),
             txids,
-            pres: std::sync::Arc::from(pres),
+            pres,
         });
     }
 
@@ -812,6 +820,38 @@ mod tests {
         assert_eq!(stamp.ranges.get(&88), helper.ranges.get(&88));
         assert_eq!(stamp.txids.get(&88), helper.txids.get(&88));
         assert_eq!(stamp.create_by_txid.get(&parent_txid), Some(&88));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Loadq already hashed; stamp must not `from_tx` again.
+    #[test]
+    fn stamp_uses_caller_pres() {
+        use crate::accept_and_connect_block;
+        use crate::regtest_pad::mine_empty_regtest;
+        use rbitcoin_query::TxPrecompute;
+
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let pres: Arc<[TxPrecompute]> = b1
+            .txdata
+            .iter()
+            .map(TxPrecompute::from_tx)
+            .collect::<Vec<_>>()
+            .into();
+        let _ = plan_stamp_sub_stats::sample_and_reset();
+        let items = [(Height(1), Arc::new(b1), Some(Arc::clone(&pres)))];
+        let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
+            .expect("coinbase-only stamp");
+        let s = plan_stamp_sub_stats::sample_and_reset();
+        assert_eq!(s.struct_txid_ns, 0, "caller pres must not from_tx: {s:?}");
+        assert!(s.struct_walk_ns > 0, "merkle/weight must still run: {s:?}");
+        assert!(
+            Arc::ptr_eq(&stamped.metas[0].pres, &pres),
+            "BodyMeta must keep the caller Arc"
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -1660,7 +1660,7 @@ fn store_start_states_lookup_load_confirm() {
         vec![spend(c1, 0, Amount::from_sat(49_0000_0000))],
     );
     {
-        let arcs = [(Height(h_s0), Arc::new(b_s0.clone()))];
+        let arcs = [(Height(h_s0), Arc::new(b_s0.clone()), None)];
         let stamped = confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S0 lookup");
         assert!(stamped.plan.is_some(), "S0 must plan Class A");
         assert!(
@@ -1684,7 +1684,7 @@ fn store_start_states_lookup_load_confirm() {
     q.commit_class_a_only(&header_s1, &txs_s1).unwrap();
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s0));
     {
-        let arcs = [(Height(h_s1), Arc::new(b_s1.clone()))];
+        let arcs = [(Height(h_s1), Arc::new(b_s1.clone()), None)];
         let stamped = confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S1 lookup");
         assert!(stamped.plan.is_none(), "S1 already-archived → plan=None");
         let mat =

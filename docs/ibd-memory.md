@@ -16,8 +16,8 @@ IBD path. It is **not** about kernel page cache under FdOnly store files
 
 Peers enqueue **raw** framed block payloads into the **in-RAM** body queue (no
 peer full-block decode). Lookup is the first decode: it runs `TxPrecompute::from_tx`,
-promotes the height to decoded-only, and drops the raw frame (one BQ mutex per
-wave). Load pack clones the `Arc<Block>` and structure reuses stashed pres.
+**`take_raw`** (row gone), and sends `ResolvedWire` on loadq. Load stamp takes
+that same `pres` Arc (no second `from_tx`; do not re-stash on the BQ).
 Confirm commit is the sole Class A appender (**no** dual-track archive-job /
 ContigPark pipeline).
 

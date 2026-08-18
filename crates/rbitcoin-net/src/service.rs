@@ -144,7 +144,7 @@ impl P2PNode {
                         };
                         tokio::spawn(async move {
                             let _session_slot = permit;
-                            let (ver, reader, writer) = match connect_and_handshake(
+                            let (ver, reader, writer, wire) = match connect_and_handshake(
                                 stream, magic_c, our, peer_addr, height, true, &ua,
                             )
                             .await
@@ -160,6 +160,7 @@ impl P2PNode {
                             };
                             let sess =
                                 peers.register(peer_addr, bind, &ver, true, PeerConnType::Inbound);
+                            sess.attach_wire(wire);
                             let id = sess.id;
                             let meta = FollowSessionMeta {
                                 peer: Some(peer_addr),
@@ -362,9 +363,10 @@ async fn run_outbound_session(
     let stream = TcpStream::connect(peer).await?;
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
-    let (ver, reader, writer) =
+    let (ver, reader, writer, wire) =
         connect_and_handshake(stream, magic, local, peer, height, false, &user_agent).await?;
     let sess = peers.register(peer, bind, &ver, false, typ);
+    sess.attach_wire(wire);
     let id = sess.id;
     follow_live.fetch_add(1, Ordering::SeqCst);
     let tip_rx = hub.subscribe_tips();

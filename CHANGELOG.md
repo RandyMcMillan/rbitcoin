@@ -33,6 +33,18 @@ before 1.0).
 
 ### Changed
 
+- **Core functional leftover-P2P.** Official unmodified
+  `p2p_initial_headers_sync.py` is `run` (33→**34**). Initial
+  `getheaders` goes to one `NODE_NETWORK` peer until the tip is within
+  24h; each new block INV may add one extra peer; headers-download
+  timeout disconnects a stalling peer unless whitelist `noban`. v2
+  length-prefix reject logs `V2 transport error: packet too large`
+  and disconnects; unknown short/long type logs and stays connected
+  (`*other*` raw size). `getnettotals` counts raw TCP when a session
+  has `WireBytes`. `p2p_invalid_messages.py` stays skip at inbound
+  `sendaddrv2` (`:188`). `p2p_compactblocks.py` stays skip at
+  `test_sendcmpct` announcement (`:206` / `:215`). Q-41 is 34/267.
+
 - **Script steal claim + join:** `rbtc-scripts-*` claim a published
   wave snapshot (`ArcSwap`) instead of locking `WAVES` per job;
   `in_wave` is AcqRel. After feed-ahead submits N+1, scripts join

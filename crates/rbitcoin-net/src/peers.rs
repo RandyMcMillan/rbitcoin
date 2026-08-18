@@ -77,8 +77,12 @@ pub struct LivePeer {
     best_known: Mutex<Option<BlockHash>>,
     /// Block hashes this peer just sent us — do not announce them back.
     recently_from: Mutex<HashSet<BlockHash>>,
-    /// We already sent inv-triggered getheaders this session.
+    /// We already sent inv-triggered getheaders this session (before sync).
     inv_asked_headers: AtomicBool,
+    /// Core `fSyncStarted` — this peer is the initial headers-sync peer.
+    sync_started: AtomicBool,
+    /// Unix seconds when initial headers sync times out (`0` = none).
+    headers_sync_timeout: AtomicU64,
     /// Waiting for a headers reply to our getheaders (no BIP130 cap).
     awaiting_headers: AtomicBool,
     /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
@@ -104,9 +108,42 @@ pub struct LivePeer {
     last_block: AtomicU64,
     last_transaction: AtomicU64,
     minfeefilter_sat_kvb: AtomicU64,
+    /// Shared with the TCP reader so split-header bytes count (`p2p_invalid_messages`).
+    wire_recv: Mutex<Option<std::sync::Arc<AtomicU64>>>,
+    wire_sent: Mutex<Option<std::sync::Arc<AtomicU64>>>,
 }
 
 impl LivePeer {
+    pub fn attach_wire(&self, wire: crate::v2::WireBytes) {
+        *self.wire_recv.lock().unwrap_or_else(|e| e.into_inner()) = Some(wire.recv);
+        *self.wire_sent.lock().unwrap_or_else(|e| e.into_inner()) = Some(wire.sent);
+    }
+
+    pub fn has_wire(&self) -> bool {
+        self.wire_recv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    pub fn raw_recv(&self) -> u64 {
+        self.wire_recv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub fn raw_sent(&self) -> u64 {
+        self.wire_sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     pub fn note_recv(&self, cmd: &str, nbytes: u64) {
         let n = acct_bytes(cmd, nbytes);
         *self
@@ -115,6 +152,16 @@ impl LivePeer {
             .unwrap_or_else(|e| e.into_inner())
             .entry(cmd.into())
             .or_insert(0) += n;
+    }
+
+    /// Store an already-computed wire size (v2 `*other*` = contents + expansion).
+    pub fn note_recv_raw(&self, cmd: &str, nbytes: u64) {
+        *self
+            .recv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(cmd.into())
+            .or_insert(0) += nbytes;
     }
 
     pub fn note_sent(&self, cmd: &str, nbytes: u64) {
@@ -179,12 +226,27 @@ impl LivePeer {
         !self.inv_asked_headers.swap(true, Ordering::Relaxed)
     }
 
+    pub fn is_sync_started(&self) -> bool {
+        self.sync_started.load(Ordering::Relaxed)
+    }
+
     pub fn advertises_network(&self) -> bool {
         self.services & service_flags_u64(ServiceFlags::NETWORK) != 0
     }
 
+    /// Core `CanServeBlocks`: NETWORK or NETWORK_LIMITED.
+    pub fn can_serve_blocks(&self) -> bool {
+        let net = service_flags_u64(ServiceFlags::NETWORK);
+        let lim = service_flags_u64(ServiceFlags::NETWORK_LIMITED);
+        self.services & (net | lim) != 0
+    }
+
     pub fn note_awaiting_headers(&self) {
         self.awaiting_headers.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_awaiting_headers(&self) -> bool {
+        self.awaiting_headers.load(Ordering::Relaxed)
     }
 
     pub fn take_awaiting_headers(&self) -> bool {
@@ -251,6 +313,10 @@ impl LivePeer {
 
     pub fn note_minfeefilter_sat_kvb(&self, sat_kvb: u64) {
         self.minfeefilter_sat_kvb.store(sat_kvb, Ordering::Relaxed);
+    }
+
+    pub(crate) fn hub(&self) -> Option<Arc<PeerHub>> {
+        self.owner.upgrade()
     }
 
     pub fn clock_now(&self) -> u64 {
@@ -442,6 +508,12 @@ pub struct PeerHub {
     hb_selected: Mutex<Vec<u64>>,
     /// `setmocktime` seconds; `0` means wall clock.
     mock_now: AtomicU64,
+    /// Core `nSyncStarted`.
+    n_sync_started: AtomicU64,
+    /// Last inv hash that started headers sync with a not-yet-sync peer.
+    last_inv_headers_sync: Mutex<Option<BlockHash>>,
+    /// Core whitelist `noban` — do not disconnect a stalling headers-sync peer.
+    noban: AtomicBool,
 }
 
 impl PeerHub {
@@ -453,7 +525,102 @@ impl PeerHub {
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
             mock_now: AtomicU64::new(0),
+            n_sync_started: AtomicU64::new(0),
+            last_inv_headers_sync: Mutex::new(None),
+            noban: AtomicBool::new(false),
         })
+    }
+
+    pub fn set_noban(&self, v: bool) {
+        self.noban.store(v, Ordering::Relaxed);
+    }
+
+    fn is_preferred_download(p: &LivePeer) -> bool {
+        matches!(
+            p.conn_type,
+            PeerConnType::OutboundFullRelay | PeerConnType::BlockRelay
+        )
+    }
+
+    /// Core: only one initial headers-sync peer unless the tip is within 24h.
+    pub fn try_start_headers_sync(&self, peer: &LivePeer, now: u64, best_header_time: u64) -> bool {
+        if peer.sync_started.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !peer.can_serve_blocks() {
+            return false;
+        }
+        let caught_up = now.saturating_sub(best_header_time) < 24 * 3600;
+        if !caught_up && self.n_sync_started.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        peer.sync_started.store(true, Ordering::Relaxed);
+        self.n_sync_started.fetch_add(1, Ordering::Relaxed);
+        let timeout = crate::chain::headers_download_timeout_secs(now, best_header_time);
+        peer.headers_sync_timeout.store(timeout, Ordering::Relaxed);
+        true
+    }
+
+    /// Core inv-triggered extra headers-sync peer (at most one new peer per block).
+    pub fn should_getheaders_for_inv(&self, peer: &LivePeer, hash: BlockHash) -> bool {
+        if peer.sync_started.load(Ordering::Relaxed) {
+            return true;
+        }
+        if peer.inv_asked_headers.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut last = self
+            .last_inv_headers_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *last == Some(hash) {
+            return false;
+        }
+        *last = Some(hash);
+        peer.inv_asked_headers.store(true, Ordering::Relaxed);
+        true
+    }
+
+    fn end_headers_sync(&self, peer: &LivePeer) {
+        if peer.sync_started.swap(false, Ordering::Relaxed) {
+            self.n_sync_started.fetch_sub(1, Ordering::Relaxed);
+            peer.headers_sync_timeout.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn check_headers_sync_timeouts(&self, now: u64) {
+        let n = self.n_sync_started.load(Ordering::Relaxed);
+        if n != 1 {
+            return;
+        }
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        let n_preferred = g
+            .values()
+            .filter(|p| Self::is_preferred_download(p))
+            .count();
+        let noban_all = self.noban.load(Ordering::Relaxed);
+        for p in g.values() {
+            if !p.sync_started.load(Ordering::Relaxed) {
+                continue;
+            }
+            let deadline = p.headers_sync_timeout.load(Ordering::Relaxed);
+            if deadline == 0 || now <= deadline {
+                continue;
+            }
+            let stalling_pref = Self::is_preferred_download(p);
+            if n_preferred.saturating_sub(stalling_pref as usize) < 1 {
+                continue;
+            }
+            if noban_all {
+                rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
+                p.sync_started.store(false, Ordering::Relaxed);
+                p.headers_sync_timeout.store(0, Ordering::Relaxed);
+                self.n_sync_started.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                rbitcoin_log::info!("{}", crate::chain::headers_timeout_disconnect_log(p.id));
+                p.request_disconnect();
+            }
+        }
     }
 
     pub fn now_secs(&self) -> u64 {
@@ -473,6 +640,8 @@ impl PeerHub {
         for p in g.values() {
             p.request_tx_inv();
         }
+        drop(g);
+        self.check_headers_sync_timeouts(ts);
     }
 
     pub fn queue_pings(&self) {
@@ -513,6 +682,8 @@ impl PeerHub {
             best_known: Mutex::new(None),
             recently_from: Mutex::new(HashSet::new()),
             inv_asked_headers: AtomicBool::new(false),
+            sync_started: AtomicBool::new(false),
+            headers_sync_timeout: AtomicU64::new(0),
             awaiting_headers: AtomicBool::new(false),
             announced_wtx: Mutex::new(HashSet::new()),
             last_inv_sequence: AtomicU64::new(1),
@@ -529,6 +700,8 @@ impl PeerHub {
             last_block: AtomicU64::new(0),
             last_transaction: AtomicU64::new(0),
             minfeefilter_sat_kvb: AtomicU64::new(0),
+            wire_recv: Mutex::new(None),
+            wire_sent: Mutex::new(None),
         });
         // Handshake already exchanged version + verack (+ maybe ping).
         peer.note_recv("version", 100);
@@ -542,10 +715,14 @@ impl PeerHub {
     }
 
     pub fn unregister(&self, id: u64) {
-        self.live
+        let removed = self
+            .live
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
+        if let Some(p) = removed {
+            self.end_headers_sync(&p);
+        }
     }
 
     pub fn snapshot(&self) -> Vec<PeerInfo> {
@@ -556,13 +733,24 @@ impl PeerHub {
         v
     }
 
-    /// Sum of per-peer message byte counters (`getnettotals`).
+    /// Sum of per-peer byte counters (`getnettotals`).
+    /// Prefers raw TCP (partial frames) when attached.
     pub fn byte_totals(&self) -> (u64, u64) {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
         let mut recv = 0u64;
         let mut sent = 0u64;
-        for p in self.snapshot() {
-            recv = recv.saturating_add(p.bytesrecv_per_msg.values().sum());
-            sent = sent.saturating_add(p.bytessent_per_msg.values().sum());
+        for p in g.values() {
+            let raw_r = p.raw_recv();
+            let raw_s = p.raw_sent();
+            if p.has_wire() {
+                recv = recv.saturating_add(raw_r);
+                sent = sent.saturating_add(raw_s);
+            } else {
+                let now = self.now_secs();
+                let snap = p.snapshot(now);
+                recv = recv.saturating_add(snap.bytesrecv_per_msg.values().sum());
+                sent = sent.saturating_add(snap.bytessent_per_msg.values().sum());
+            }
         }
         (recv, sent)
     }
@@ -773,6 +961,42 @@ mod tests {
         p.note_best_known(h);
         assert_eq!(p.header_marks(), (Some(h), Some(h)));
         assert!(p.advertises_network());
+    }
+
+    #[test]
+    fn only_one_initial_headers_sync_peer_when_tip_is_old() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let p1 = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let p2 = hub.register(b, b, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let now = 1_700_000_000;
+        // genesis-era header: not caught up.
+        assert!(hub.try_start_headers_sync(&p1, now, 1_231_006_505));
+        assert!(p1.is_sync_started());
+        assert!(!hub.try_start_headers_sync(&p2, now, 1_231_006_505));
+        assert!(!p2.is_sync_started());
+        let h1 = BlockHash::from_byte_array([1u8; 32]);
+        let h2 = BlockHash::from_byte_array([2u8; 32]);
+        // Sync peer always gets inv-triggered getheaders.
+        assert!(hub.should_getheaders_for_inv(&p1, h1));
+        // First extra peer for this hash.
+        assert!(hub.should_getheaders_for_inv(&p2, h1));
+        let p3 = hub.register(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3),
+            b,
+            &ver("/rbitcoin:0.1.0/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        // Same hash: no third peer.
+        assert!(!hub.should_getheaders_for_inv(&p3, h1));
+        // New hash: remaining peer.
+        assert!(hub.should_getheaders_for_inv(&p3, h2));
+        hub.unregister(p1.id);
+        assert!(!p1.is_sync_started());
+        // After the sync peer leaves, another inbound may start.
+        assert!(hub.try_start_headers_sync(&p2, now, 1_231_006_505));
     }
 
     #[test]

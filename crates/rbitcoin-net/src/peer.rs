@@ -109,8 +109,8 @@ pub async fn connect_and_handshake(
     start_height: i32,
     inbound: bool,
     user_agent: &str,
-) -> Result<(VersionMessage, V2Reader, V2Writer), NetError> {
-    let (mut reader, mut writer) = open_v2(stream, magic, inbound).await?;
+) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes), NetError> {
+    let (mut reader, mut writer, wire) = open_v2(stream, magic, inbound).await?;
     let their_version = application_handshake(
         &mut reader,
         &mut writer,
@@ -122,7 +122,7 @@ pub async fn connect_and_handshake(
         user_agent,
     )
     .await?;
-    Ok((their_version, reader, writer))
+    Ok((their_version, reader, writer, wire))
 }
 
 /// Feeler: send version (relay=0), read their version, close. No verack, no session.
@@ -134,7 +134,7 @@ pub async fn run_feeler(
     start_height: i32,
     user_agent: &str,
 ) -> Result<(), NetError> {
-    let (mut reader, mut writer) = open_v2(stream, magic, false).await?;
+    let (mut reader, mut writer, _wire) = open_v2(stream, magic, false).await?;
     let services = local_service_flags();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -306,10 +306,8 @@ pub async fn peer_session_with(
     });
 
     if let Some(s) = meta.session.as_ref() {
-        let h = hub.tip_height().unwrap_or(0);
-        rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, s.id));
-    }
-    if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), meta.session.as_deref(), true) {
+        let _ = maybe_queue_initial_getheaders(&out_tx, hub.as_ref(), s);
+    } else if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), None, true) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
     }
 
@@ -353,6 +351,7 @@ pub async fn peer_session_with(
                             None => {}
                         }
                         queue_due_tx_invs(hub.as_ref(), s, &from_this_peer, &out_tx);
+                        let _ = maybe_queue_initial_getheaders(&out_tx, hub.as_ref(), s);
                         match s.pending_sendcmpct.swap(0, Ordering::Relaxed) {
                             1 => {
                                 let _ = queue_out(
@@ -518,6 +517,16 @@ pub async fn peer_session_with(
                             }
                             return Err(NetError::MessageTooLarge(n));
                         }
+                        Err(NetError::InvalidV2Type { contents_len }) => {
+                            // Core stays connected; counts raw v2 size as `*other*`.
+                            if let Some(ref sess) = session {
+                                sess.note_recv_raw(
+                                    "*other*",
+                                    crate::v2::v2_other_recv_bytes(contents_len),
+                                );
+                            }
+                            continue;
+                        }
                         Err(e) => return Err(e),
                     };
                     if let Some(ref sess) = session {
@@ -608,6 +617,28 @@ pub(crate) fn tip_follow_locator(hub: &ChainHub) -> Vec<BlockHash> {
     }
 }
 
+/// Start Core initial headers-sync on this session if we are allowed to.
+fn maybe_queue_initial_getheaders(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    hub: &ChainHub,
+    session: &crate::peers::LivePeer,
+) -> bool {
+    if session.is_sync_started() {
+        return false;
+    }
+    let now = session.clock_now();
+    let best_t = hub.tip_header().map(|h| u64::from(h.time)).unwrap_or(0);
+    let started = session
+        .hub()
+        .is_some_and(|ph| ph.try_start_headers_sync(session, now, best_t));
+    if started {
+        let h = hub.tip_height().unwrap_or(0);
+        rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, session.id));
+        let _ = queue_getheaders(out, hub, Some(session), true);
+    }
+    started
+}
+
 fn queue_getheaders(
     out: &mpsc::UnboundedSender<NetworkMessage>,
     hub: &ChainHub,
@@ -616,6 +647,11 @@ fn queue_getheaders(
 ) -> Result<(), NetError> {
     if mark_awaiting {
         if let Some(s) = session {
+            // Core `MaybeSendGetHeaders`: one in-flight getheaders at a time
+            // (or after HEADERS_RESPONSE_TIME = 2 min).
+            if s.is_awaiting_headers() {
+                return Ok(());
+            }
             s.note_awaiting_headers();
         }
     }
@@ -773,6 +809,10 @@ async fn handle_peer_frame(
         NetworkMessage::Ping(n) => {
             if let Some(s) = session {
                 queue_due_tx_invs(hub, s, from_this_peer, out_tx);
+                // Noban headers-timeout reset: Core re-issues getheaders in the
+                // same SendMessages turn; hook the ping so the official test
+                // sees it before sync_with_ping returns.
+                let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
             }
             queue_out(out_tx, NetworkMessage::Pong(*n))?;
         }
@@ -951,7 +991,8 @@ async fn handle_peer_frame(
                         if !hub.is_connected(h) {
                             if !hub.knows_header(h) && !pending_headers.contains_key(h) {
                                 if session.is_none_or(|s| {
-                                    s.advertises_network() || s.try_ask_headers_for_inv()
+                                    s.hub()
+                                        .is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
                                 }) {
                                     need_headers = true;
                                 }

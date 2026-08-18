@@ -47,6 +47,10 @@ match = 'V2 transport error: invalid message type'
 emit = ['V2 transport error: invalid message type']
 
 [[rule]]
+match = 'V2 transport error: packet too large \((\d+) bytes\)'
+emit = ['V2 transport error: packet too large ({1} bytes)']
+
+[[rule]]
 match = 'redundant version message from peer(=.*)?'
 emit = ['redundant version message from peer']
 

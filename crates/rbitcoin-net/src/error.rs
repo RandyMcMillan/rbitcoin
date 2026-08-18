@@ -14,6 +14,10 @@ pub enum NetError {
     Timeout,
     Disconnected,
     MessageTooLarge(usize),
+    /// Unknown v2 short/long type: log + `*other*` bytes, stay connected (Core).
+    InvalidV2Type {
+        contents_len: usize,
+    },
     BadMagic,
     Consensus(String),
 }
@@ -29,6 +33,9 @@ impl fmt::Display for NetError {
             NetError::Timeout => f.write_str("timeout"),
             NetError::Disconnected => f.write_str("peer disconnected"),
             NetError::MessageTooLarge(n) => write!(f, "message too large ({n} bytes)"),
+            NetError::InvalidV2Type { contents_len } => {
+                write!(f, "invalid v2 message type ({contents_len} bytes contents)")
+            }
             NetError::BadMagic => f.write_str("wrong network magic"),
             NetError::Consensus(s) => write!(f, "consensus: {s}"),
         }
@@ -66,6 +73,10 @@ mod tests {
             (NetError::Timeout, "timeout"),
             (NetError::Disconnected, "peer disconnected"),
             (NetError::MessageTooLarge(9), "message too large (9 bytes)"),
+            (
+                NetError::InvalidV2Type { contents_len: 3 },
+                "invalid v2 message type (3 bytes contents)",
+            ),
             (NetError::BadMagic, "wrong network magic"),
             (NetError::Consensus("c".into()), "consensus: c"),
         ];

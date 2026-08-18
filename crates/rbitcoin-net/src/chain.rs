@@ -1774,6 +1774,22 @@ pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
     format!("initial getheaders ({locator_height}) to peer={peer}")
 }
 
+/// Core `HEADERS_DOWNLOAD_TIMEOUT_BASE` (15 min) + 1 ms per header-interval.
+pub fn headers_download_timeout_secs(now: u64, best_header_time: u64) -> u64 {
+    let since = now.saturating_sub(best_header_time);
+    // ceil(1ms * since / 600s) in seconds == ceil(since / 600_000).
+    let variable = since.div_ceil(600_000);
+    now.saturating_add(15 * 60).saturating_add(variable)
+}
+
+pub fn headers_timeout_disconnect_log(peer: u64) -> String {
+    format!("Timeout downloading headers, disconnecting peer={peer}")
+}
+
+pub fn headers_timeout_noban_log(peer: u64) -> String {
+    format!("Timeout downloading headers from noban peer, not disconnecting peer={peer}")
+}
+
 pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) {
     let time = header.time;
     let ver = header.version.to_consensus();
@@ -2048,6 +2064,19 @@ mod tests {
         assert_eq!(
             initial_getheaders_log(0, 0),
             "initial getheaders (0) to peer=0"
+        );
+        assert_eq!(
+            headers_timeout_disconnect_log(0),
+            "Timeout downloading headers, disconnecting peer=0"
+        );
+        assert_eq!(
+            headers_timeout_noban_log(0),
+            "Timeout downloading headers from noban peer, not disconnecting peer=0"
+        );
+        // Test formula: now=1_000_000, genesis=0 → variable = ceil(1e6/6e5)=2.
+        assert_eq!(
+            headers_download_timeout_secs(1_000_000, 0),
+            1_000_000 + 900 + 2
         );
     }
 

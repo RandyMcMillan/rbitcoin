@@ -51,6 +51,25 @@ stage_pair() {
   done
 }
 
+sign_darwin_adhoc() {
+  if ! command -v codesign >/dev/null 2>&1; then
+    if [[ "$(uname -s)" == Darwin ]]; then
+      echo "error: codesign is required to ad-hoc sign Darwin binaries" >&2
+      exit 1
+    fi
+    return 0
+  fi
+  local b
+  for b in rbitcoin-node rbitcoin-cli; do
+    # Ad-hoc identity (`-`). No Apple timestamp (no Developer ID on CI).
+    codesign --sign - --force --timestamp=none "$DEST/$b"
+    if ! codesign --verify "$DEST/$b"; then
+      echo "error: codesign verify failed for $DEST/$b" >&2
+      exit 1
+    fi
+  done
+}
+
 check_darwin_otool() {
   local bin="$1"
   if ! command -v otool >/dev/null 2>&1; then
@@ -96,6 +115,7 @@ darwin)
   stage_pair rbitcoin-node rbitcoin-cli
   check_darwin_otool "$DEST/rbitcoin-node"
   check_darwin_otool "$DEST/rbitcoin-cli"
+  sign_darwin_adhoc
   sha256_dir "$DEST" rbitcoin-node rbitcoin-cli
   ;;
 *)

@@ -53,6 +53,17 @@ fi
 EOF
 chmod +x "$MOCK/otool"
 
+cat >"$MOCK/codesign" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${MOCK_CODESIGN_FAIL:-}" == "1" && ( "$1" == "--verify" || "$1" == "-v" ) ]]; then
+  echo "code object is not signed" >&2
+  exit 1
+fi
+echo "$*" >> "${CODESIGN_LOG:-/dev/null}"
+exit 0
+EOF
+chmod +x "$MOCK/codesign"
+
 DARWIN_SRC="$WORKDIR/darwin-src"
 DARWIN_DEST="$WORKDIR/darwin-dest"
 mkdir -p "$DARWIN_SRC"
@@ -60,12 +71,21 @@ printf 'node\n' >"$DARWIN_SRC/rbitcoin-node"
 printf 'cli\n' >"$DARWIN_SRC/rbitcoin-cli"
 chmod +x "$DARWIN_SRC/rbitcoin-node" "$DARWIN_SRC/rbitcoin-cli"
 
+CODESIGN_LOG="$WORKDIR/codesign.log"
 assert_ok "darwin system-only dylibs stage" \
-  env PATH="$MOCK:$PATH" MOCK_OTOOL_MODE=ok \
+  env PATH="$MOCK:$PATH" MOCK_OTOOL_MODE=ok CODESIGN_LOG="$CODESIGN_LOG" \
   "$STAGE" darwin "$DARWIN_SRC" "$DARWIN_DEST"
 assert_ok "darwin copied node" test -f "$DARWIN_DEST/rbitcoin-node"
 assert_ok "darwin copied cli" test -f "$DARWIN_DEST/rbitcoin-cli"
 assert_ok "darwin sha256sums present" test -s "$DARWIN_DEST/SHA256SUMS"
+assert_ok "darwin ad-hoc codesign node" grep -q 'rbitcoin-node' "$CODESIGN_LOG"
+assert_ok "darwin ad-hoc codesign cli" grep -q 'rbitcoin-cli' "$CODESIGN_LOG"
+
+rm -rf "$DARWIN_DEST"
+: >"$CODESIGN_LOG"
+assert_fail "darwin codesign verify failure is refused" \
+  env PATH="$MOCK:$PATH" MOCK_OTOOL_MODE=ok MOCK_CODESIGN_FAIL=1 \
+  "$STAGE" darwin "$DARWIN_SRC" "$DARWIN_DEST"
 
 rm -rf "$DARWIN_DEST"
 assert_fail "darwin homebrew dylib is refused" \

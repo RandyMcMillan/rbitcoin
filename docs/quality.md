@@ -133,7 +133,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
 | **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
 | **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
-| **—** | Darwin / Windows codesign / notarization | Snapshots exist (`macos.yml` / `windows.yml`). Signing is still not a product |
+| **—** | Darwin notarization / Developer ID | Ad-hoc `codesign -s -` on the macos snapshot. Notarization is still not a product |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |
 
@@ -155,7 +155,7 @@ findings 001–021, CI split, map-free README, …) live in
 | **Q-15 / Q-42–Q-46** | CLI, inbound config, RPC honesty, Libre-only, IO aliases | 2026-08-16 cruft program |
 | **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | 2026-08-12. Wall leftover was **Q-37** (now closed) |
 | **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; `musl.yml` after green master `ci` |
-| **—** | Darwin / Windows operator snapshots | `windows.yml` / `macos.yml` after green master `ci` or PR label `static-binaries`. Not codesigned |
+| **—** | Darwin / Windows operator snapshots | `windows.yml` / `macos.yml` after green master `ci` or PR label `static-binaries`. Native store smoke + Darwin ad-hoc codesign |
 
 ---
 

@@ -1380,7 +1380,9 @@ fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
             if !mp.relay_enabled() {
                 mp.rebroadcast_unbroadcast();
                 mp.notify_inv_flush();
-                if let Some(peers) = ctx.peers.as_ref() {
+                if let (Some(peers), Some(chain)) = (ctx.peers.as_ref(), ctx.chain.as_ref()) {
+                    rbitcoin_net::flush_tx_invs(chain, peers);
+                } else if let Some(peers) = ctx.peers.as_ref() {
                     peers.request_all_tx_inv();
                 }
             }
@@ -1489,7 +1491,11 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         // mutating — use accept and if ok, remove_for_block to roll back.
         match mp.accept_tx(&tx) {
             Ok(r) => {
-                let _ = mp.remove_for_block(&[tx.compute_txid()]);
+                // `remove_for_block` is a no-op while relay is off (IBD /
+                // `-blocksonly`). Dry-run must still roll back or sendraw
+                // becomes a duplicate and never notes unbroadcast
+                // (`p2p_blocksonly.py:48`).
+                let _ = mp.evict_live_txids(&[tx.compute_txid()]);
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,

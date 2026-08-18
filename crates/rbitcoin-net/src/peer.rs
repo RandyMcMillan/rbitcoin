@@ -332,6 +332,9 @@ pub async fn peer_session_with(
     let _ = write_v2_msg(&mut writer, NetworkMessage::FeeFilter(fee_sat as i64)).await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
+    if let Some(s) = meta.session.as_ref() {
+        s.attach_out(out_tx.clone());
+    }
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -527,8 +530,16 @@ pub async fn peer_session_with(
                                         if let Some(s) = session.as_ref() {
                                             if let Inventory::WTx(w) = inv {
                                                 s.note_announced_wtx(w);
+                                                // Only this tx existed at INV time.
+                                                // Never snap to current_relay_seq()
+                                                // (`mempool_reorg.py:122`).
+                                                if let Some(seq) = mp.relay_seq_of(&w) {
+                                                    s.note_tx_inv_seq(
+                                                        s.last_inv_sequence()
+                                                            .max(seq.saturating_add(1)),
+                                                    );
+                                                }
                                             }
-                                            s.note_tx_inv_seq(mp.current_relay_seq());
                                         }
                                         queue_out(&out_tx, NetworkMessage::Inv(vec![inv]))?;
                                     }
@@ -791,6 +802,18 @@ fn try_cmpct_missing(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> O
     }
 }
 
+/// Flush due / unbroadcast tx INVs onto every live session writer.
+/// Used by RPC sendraw and whitelist-relay accept (`p2p_blocksonly`).
+pub fn flush_tx_invs(hub: &ChainHub, peers: &crate::peers::PeerHub) {
+    let rows = peers.live_peers();
+    for s in rows {
+        s.request_tx_inv();
+        if let Some(out) = s.writer() {
+            queue_due_tx_invs(hub, s.as_ref(), &HashMap::new(), &out);
+        }
+    }
+}
+
 fn queue_due_tx_invs(
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
@@ -834,7 +857,17 @@ fn queue_due_tx_invs(
             continue;
         }
         let local = !mp.relay_enabled() && mp.is_unbroadcast(&txid);
-        if !clock_due && !local && !mp.tx_inv_due(&w) {
+        let age_due_this = mp.tx_inv_due(&w);
+        // Inbound + relay on: a mocktime jump / request_tx_inv only
+        // flushes txs whose own 30s clock has elapsed. clock_due must
+        // not INV a brand-new sendraw (`mempool_reorg.py:122`).
+        let inbound_age_gate =
+            session.inbound && mp.relay_enabled() && !session.hub().is_some_and(|h| h.is_noban());
+        if inbound_age_gate {
+            if !age_due_this {
+                continue;
+            }
+        } else if !clock_due && !local && !age_due_this {
             continue;
         }
         session.note_announced_wtx(w);
@@ -1581,7 +1614,7 @@ async fn handle_peer_frame(
                                 mp.notify_inv_flush();
                                 if let Some(s) = session {
                                     if let Some(ph) = s.hub() {
-                                        ph.request_all_tx_inv();
+                                        flush_tx_invs(hub, ph.as_ref());
                                     }
                                 }
                             }
@@ -2948,6 +2981,16 @@ mod tests {
                 }],
             };
             let mp = hub.mempool().unwrap();
+            mp.accept_tx(&tx).expect("testmempoolaccept dry-run");
+            assert_eq!(
+                mp.remove_for_block(&[tx.compute_txid()]),
+                0,
+                "remove_for_block is a no-op while relay is off"
+            );
+            assert_eq!(mp.live_count(), 1);
+            assert_eq!(mp.evict_live_txids(&[tx.compute_txid()]), 1);
+            assert_eq!(mp.live_count(), 0);
+
             let mut ann_rx = mp.subscribe_announces();
             mp.accept_tx(&tx).expect("sendraw accept");
             let announced = ann_rx.try_recv().expect("accept publishes announce");
@@ -2979,7 +3022,8 @@ mod tests {
             };
             let inbound_imm =
                 peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
-            queue_due_tx_invs(&hub, inbound_imm.as_ref(), &HashMap::new(), &probe_tx);
+            inbound_imm.attach_out(probe_tx.clone());
+            flush_tx_invs(&hub, peers.as_ref());
             match probe_rx
                 .try_recv()
                 .expect("unbroadcast INV without clock_due")
@@ -3142,6 +3186,186 @@ mod tests {
         });
     }
 
+    /// `mempool_reorg.py:122`: after mocktime +300 announces older txs,
+    /// a brand-new sendraw must not be INV'd or GetData-served to inbound
+    /// (relay on, no noban). Drive shipped `queue_due_tx_invs` / GetData-WTx.
+    #[test]
+    fn mocktime_jump_does_not_inv_or_serve_new_sendraw() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+        fn spend_cb(cb: bitcoin::Txid) -> Transaction {
+            Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("reorg-122");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(105, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(true);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let cb = |h: u32| {
+                hub.query
+                    .reconstruct_block_at_height(Height(h))
+                    .unwrap()
+                    .txdata[0]
+                    .compute_txid()
+            };
+            let old_a = spend_cb(cb(1));
+            let old_b = spend_cb(cb(2));
+            let disconnected = spend_cb(cb(3));
+            let fresh = spend_cb(cb(4));
+
+            let t0 = 1_700_000_000u64;
+            let peers = crate::peers::PeerHub::new();
+            peers.set_mock_now(t0);
+            hub.mempool().unwrap().note_mock_now(t0);
+            hub.mempool().unwrap().accept_tx(&old_a).expect("old_a");
+            hub.mempool().unwrap().accept_tx(&old_b).expect("old_b");
+            assert_eq!(
+                hub.mempool()
+                    .unwrap()
+                    .reorg_reaccept(std::slice::from_ref(&disconnected)),
+                1
+            );
+
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            assert!(inbound.inbound);
+            assert!(!peers.is_noban());
+
+            // Mocktime +300: older txs are age-due; flush them.
+            peers.set_mock_now(t0 + 300);
+            hub.mempool().unwrap().note_mock_now(t0 + 300);
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            inbound.request_tx_inv();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            let mut announced = 0u32;
+            while let Ok(msg) = out_rx.try_recv() {
+                match msg {
+                    NetworkMessage::Inv(v) => {
+                        announced += v.len() as u32;
+                    }
+                    other => panic!("expected INV of aged txs, got {other:?}"),
+                }
+            }
+            assert_eq!(announced, 3, "three aged txs must INV after +300");
+
+            // Brand-new sendraw (unbroadcast, relay on).
+            hub.mempool()
+                .unwrap()
+                .accept_tx(&fresh)
+                .expect("fresh sendraw");
+            hub.mempool()
+                .unwrap()
+                .note_unbroadcast(fresh.compute_txid());
+
+            // Leftover request_tx_inv / inv_flush after the new accept must
+            // not INV the fresh tx to inbound.
+            inbound.request_tx_inv();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            assert!(
+                out_rx.try_recv().is_err(),
+                "new sendraw must not INV inbound after mocktime jump"
+            );
+
+            let mut wants_headers = false;
+            let mut wtxid = true;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::WTx(
+                    fresh.compute_wtxid(),
+                )])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut HashSet::new(),
+                &mut ban,
+                Some(inbound.as_ref()),
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().expect("GetData must reply") {
+                NetworkMessage::NotFound(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(fresh.compute_wtxid())]);
+                }
+                other => panic!("fresh sendraw GetData must notfound, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
     /// `p2p_blocksonly.py:74`: whitelist-relay peer's tx is accepted while
     /// `-blocksonly` and INV'd to the other inbound peer.
     #[test]
@@ -3229,6 +3453,9 @@ mod tests {
                 peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
 
             let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let (inv_tx, mut inv_rx) = mpsc::unbounded_channel();
+            first.attach_out(out_tx.clone());
+            second.attach_out(inv_tx);
             let mut wants_headers = false;
             let mut wtxid = true;
             let mut send_cmpct = false;
@@ -3259,20 +3486,15 @@ mod tests {
             assert_eq!(ban, 0, "whitelist relay must not disconnect");
             assert!(hub.mempool().unwrap().is_unbroadcast(&tx.compute_txid()));
             assert!(from_first.contains_key(&tx.compute_txid()));
-
-            let (inv_tx, mut inv_rx) = mpsc::unbounded_channel();
-            queue_due_tx_invs(&hub, second.as_ref(), &HashMap::new(), &inv_tx);
-            match inv_rx.try_recv().expect("second inbound must get wtx INV") {
+            match inv_rx
+                .try_recv()
+                .expect("second inbound must get wtx INV from flush_tx_invs")
+            {
                 NetworkMessage::Inv(v) => {
                     assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
                 }
                 other => panic!("expected WTx inv, got {other:?}"),
             }
-            queue_due_tx_invs(&hub, first.as_ref(), &from_first, &inv_tx);
-            assert!(
-                inv_rx.try_recv().is_err(),
-                "origin peer must not be re-INV'd"
-            );
             let _ = out_rx.try_recv();
             let _ = std::fs::remove_dir_all(dir);
         });

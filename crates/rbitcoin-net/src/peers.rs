@@ -1,6 +1,7 @@
 //! Live P2P session table for RPC (`getpeerinfo` / `addnode` / `disconnectnode`).
 
 use crate::error::NetError;
+use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Wtxid};
@@ -116,6 +117,8 @@ pub struct LivePeer {
     /// Compact hashes whose first `blocktxn` reconstruct already failed
     /// (`p2p_compactblocks` `test_multiple_blocktxn_response`).
     failed_cmpct: Mutex<HashSet<BlockHash>>,
+    /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
+    out_tx: Mutex<Option<mpsc::UnboundedSender<NetworkMessage>>>,
 }
 
 impl LivePeer {
@@ -319,6 +322,17 @@ impl LivePeer {
 
     pub fn queue_ping(&self) {
         self.ping_queued.store(true, Ordering::Relaxed);
+    }
+
+    pub fn attach_out(&self, tx: mpsc::UnboundedSender<NetworkMessage>) {
+        *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub fn writer(&self) -> Option<mpsc::UnboundedSender<NetworkMessage>> {
+        self.out_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn note_last_block(&self) {
@@ -792,6 +806,7 @@ impl PeerHub {
             wire_recv: Mutex::new(None),
             wire_sent: Mutex::new(None),
             failed_cmpct: Mutex::new(HashSet::new()),
+            out_tx: Mutex::new(None),
         });
         // Handshake already exchanged version + verack (+ maybe ping).
         peer.note_recv("version", 100);
@@ -813,6 +828,11 @@ impl PeerHub {
         if let Some(p) = removed {
             self.end_headers_sync(&p);
         }
+    }
+
+    pub fn live_peers(&self) -> Vec<Arc<LivePeer>> {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        g.values().cloned().collect()
     }
 
     pub fn snapshot(&self) -> Vec<PeerInfo> {

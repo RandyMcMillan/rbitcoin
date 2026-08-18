@@ -586,9 +586,7 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_blocksonly.py"
-status = "skip"
-reason = "core-log"
-analog = "official: after sendraw inbound wait_for_tx + getpeerinfo.permissions=['relay'], first_peer msg_tx accepted but not relayed to second_peer (p2p_blocksonly.py:74 wait_for_tx); block-relay-only later"
+status = "run"
 
 [[test]]
 name = "p2p_compactblocks.py"

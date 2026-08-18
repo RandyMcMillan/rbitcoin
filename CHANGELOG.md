@@ -61,7 +61,8 @@ before 1.0).
   (`INCOMPATIBLE`) while any better candidate remains.
 
 - **Core functional leftover-P2P follow-up.** Official unmodified
-  `p2p_compactblocks_blocksonly.py` is `run` (35→**36**). `-blocksonly`
+  `p2p_compactblocks_blocksonly.py` and `p2p_blocksonly.py` are `run`
+  (35→**37**). `-blocksonly`
   does not select HB; it getdata's `MSG_WITNESS_BLOCK` while relay
   peers getdata `MSG_CMPCT_BLOCK` after `sendcmpct` v2. Handshake
   advertises BIP155 `sendaddrv2` before verack. Low-work header
@@ -77,8 +78,10 @@ before 1.0).
   INV does not getdata (sendheaders `inv_node`). `-blocksonly` reports
   `localrelay=false`, disconnects P2P txs/tx-invs, and exposes
   `relaytxes`; RPC sendraw is still accepted and INVs inbound peers.
-  `getpeerinfo.permissions` exposes whitelist `relay`. `p2p_blocksonly.py`
-  stays skip at first_peer → second_peer wait_for_tx (`:74`). Q-41 is 36/267.
+  `getpeerinfo.permissions` exposes whitelist `relay`. `testmempoolaccept`
+  rolls back admits while relay is off so sendraw can note unbroadcast.
+  Inbound + relay-on keeps the 30s INV/GetData gate on a brand-new sendraw
+  after a mocktime jump (`mempool_reorg.py:122`). Q-41 is 37/267.
 
 - **Lookup wave intake + write drain:** `wave_intake` classifies raw vs
   promoted heights with **no payload clone**; decode pulls `raw_payload`

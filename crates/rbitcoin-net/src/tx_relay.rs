@@ -1042,6 +1042,32 @@ impl MempoolHub {
     /// **No-op while relay is disabled** (IBD catch-up). Callers must not rely
     /// on per-block strip until [`Self::set_relay_enabled`]`(true)` has run the
     /// deferred [`Self::purge_confirmed_on_chain`].
+    /// Evict live txids even when relay is off (`testmempoolaccept` dry-run
+    /// rollback under `-blocksonly`). Do not sample confirm-memory.
+    pub fn evict_live_txids(&self, txids: &[Txid]) -> usize {
+        let utxo = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
+        let tip = self.chain_tip_ctx();
+        let mut g = self.inner.write().unwrap();
+        let n = g.remove_for_block_with_utxo(txids, &utxo, tip).unwrap_or(0);
+        drop(g);
+        if n > 0 {
+            self.note_template_update();
+            {
+                let mut deltas = self.fee_deltas.lock().unwrap();
+                for tid in txids {
+                    self.unindex_txid(tid);
+                    deltas.remove(tid);
+                }
+            }
+            for tid in txids {
+                self.mark_broadcast(tid);
+            }
+        }
+        n
+    }
+
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
         if !self.relay_enabled() {
             return 0;

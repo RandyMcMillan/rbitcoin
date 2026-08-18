@@ -516,6 +516,14 @@ pub(crate) fn confirm_ready_count(
 /// samples alone almost always show 0 under a lookup-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
+    /// lookup → load (`loadq`; capacity [`load_queue_cap`]).
+    lookup_to_load: AtomicUsize,
+    /// Max loadq depth since last HWM sample.
+    load_hwm: AtomicUsize,
+    /// Sum of `batch.len()` sitting in loadq.
+    load_blocks: AtomicUsize,
+    /// Approx decoded wire bytes sitting in loadq.
+    load_wire_bytes: AtomicUsize,
     /// load → scripts (`scriptq`; capacity [`script_queue_cap`]).
     load_to_scripts: AtomicUsize,
     /// scripts → write (`writeq`; capacity [`write_queue_cap`]).
@@ -540,7 +548,11 @@ pub(crate) struct ConfirmQueueDepths {
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ConfirmPipelineSizes {
-    /// BQ resolve-complete heights load can claim (not a queue).
+    /// lookup→load batches (`loadq`).
+    pub load_batches: usize,
+    pub load_blocks: usize,
+    pub load_wire_bytes: usize,
+    /// BQ resolve-complete leftover (not a queue; unused after loadq).
     pub ready: usize,
     pub script_batches: usize,
     pub script_blocks: usize,
@@ -575,20 +587,21 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// Confirm pipeline: `ready=` (BQ resolve-complete) + real `scriptq` / `writeq`.
+/// Confirm pipeline: real `loadq` / `scriptq` / `writeq`.
 ///
 /// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
 #[inline]
 pub(crate) fn format_conf_q(
-    ready: usize,
+    load: usize,
     script: usize,
     write: usize,
+    load_cap: usize,
     script_cap: usize,
     write_cap: usize,
 ) -> String {
     format!(
-        "ready={} {} {}",
-        ready,
+        "{} {} {}",
+        format_queue_depth("loadq", load, load_cap),
         format_queue_depth("scriptq", script, script_cap),
         format_queue_depth("writeq", write, write_cap),
     )
@@ -599,17 +612,19 @@ impl ConfirmQueueDepths {
         Arc::new(Self::default())
     }
 
-    /// `(load→scripts, scripts→write)`.
-    pub(crate) fn snap(&self) -> (usize, usize) {
+    /// `(lookup→load, load→scripts, scripts→write)`.
+    pub(crate) fn snap(&self) -> (usize, usize, usize) {
         (
+            self.lookup_to_load.load(Ordering::Relaxed),
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
     }
 
     /// Max queue depths since last call; resets HWMs to 0.
-    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize) {
+    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
         (
+            self.load_hwm.swap(0, Ordering::Relaxed),
             self.script_hwm.swap(0, Ordering::Relaxed),
             self.write_hwm.swap(0, Ordering::Relaxed),
         )
@@ -618,6 +633,9 @@ impl ConfirmQueueDepths {
     /// Full content snapshot (depths + blocks/wire/parents in each queue).
     pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
         ConfirmPipelineSizes {
+            load_batches: self.lookup_to_load.load(Ordering::Relaxed),
+            load_blocks: self.load_blocks.load(Ordering::Relaxed),
+            load_wire_bytes: self.load_wire_bytes.load(Ordering::Relaxed),
             ready: 0,
             script_batches: self.load_to_scripts.load(Ordering::Relaxed),
             script_blocks: self.script_blocks.load(Ordering::Relaxed),
@@ -654,6 +672,33 @@ impl ConfirmQueueDepths {
         let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             Some(n.saturating_sub(1))
         });
+    }
+
+    fn note_load_send(&self, blocks: usize, wire_bytes: usize) {
+        Self::note_batch_depth_send(&self.lookup_to_load, &self.load_hwm);
+        self.load_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(blocks))
+            })
+            .ok();
+        self.load_wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(wire_bytes))
+            })
+            .ok();
+    }
+    fn note_load_recv(&self, blocks: usize, wire_bytes: usize) {
+        Self::note_batch_depth_recv(&self.lookup_to_load);
+        self.load_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(blocks))
+            })
+            .ok();
+        self.load_wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(wire_bytes))
+            })
+            .ok();
     }
 
     fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
@@ -1354,6 +1399,9 @@ pub(crate) fn spawn_confirm_engine(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 confirm_thr_stats::add_load_pack(t_recv.elapsed());
+                let n = lb.items.len();
+                let wire: usize = lb.items.iter().map(|(_, _, w)| w.block.total_size()).sum();
+                queues_load.note_load_recv(n, wire);
                 let batch: Vec<(u32, BlockHash, Arc<bitcoin::Block>)> = {
                     let mut g = feed_load.inner.lock().unwrap();
                     let mut run = Vec::with_capacity(lb.items.len());
@@ -1603,8 +1651,8 @@ pub(crate) fn spawn_confirm_engine(
     let lookup_join = std::thread::Builder::new()
         .name("ibd-confirm-lookup".into())
         .spawn(move || {
-            info!("ibd: confirm lookup on dedicated OS thread (BQ-ahead TipOnly head_fk)");
-            let _ = queues_lookup;
+            info!("ibd: confirm lookup on dedicated OS thread (in-order BQ take → loadq)");
+            let queues_lookup = queues_lookup;
             let mut live_union = rbitcoin_query::LiveUnion::new();
             let mut disco_seen = 0u64;
             loop {
@@ -1663,9 +1711,13 @@ pub(crate) fn spawn_confirm_engine(
                                 let chunk = wave.items[i..end].to_vec();
                                 i = end;
                                 let t_send = Instant::now();
+                                let n = chunk.len();
+                                let wire: usize =
+                                    chunk.iter().map(|(_, _, w)| w.block.total_size()).sum();
                                 if load_tx.send(LoadBatch { items: chunk }).is_err() {
                                     break;
                                 }
+                                queues_lookup.note_load_send(n, wire);
                                 confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
                             }
                             feed.notify();

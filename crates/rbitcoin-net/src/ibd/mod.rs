@@ -791,7 +791,7 @@ pub async fn ibd_cancellable(
             let tip_delta = prog.tip.saturating_sub(last_sample_tip);
             let tip_rate = tip_delta as f64 / window_secs;
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
-            let (script_q, write_q) = confirm_queues.snap();
+            let (load_q, script_q, write_q) = confirm_queues.snap();
             let path_lo = hub.tip_height().map(|t| t.saturating_add(1)).unwrap_or(0);
             let inflight_h = {
                 let g = confirm_feed.inner.lock().unwrap();
@@ -809,9 +809,10 @@ pub async fn ibd_cancellable(
             let _ = hub.query.block_queue_update_soft_pressure(eta_rate);
 
             let conf_q = confirm::format_conf_q(
-                ready_n,
+                load_q,
                 script_q,
                 write_q,
+                confirm::load_queue_cap(),
                 confirm::script_queue_cap(),
                 confirm::write_queue_cap(),
             );

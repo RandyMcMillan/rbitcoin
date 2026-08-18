@@ -791,7 +791,7 @@ pub(crate) fn sample(
     conf_ready: usize,
     conf_script_q: usize,
     conf_write_q: usize,
-    conf_q_hwm: (usize, usize),
+    conf_q_hwm: (usize, usize, usize),
     sh_runs: usize,
     work: WorkStructureSizes,
     owned: ProcessOwnedSizes,
@@ -1023,8 +1023,8 @@ pub(crate) fn sample(
         conf_write_q,
         conf_script_q_cap: super::confirm::script_queue_cap(),
         conf_write_q_cap: super::confirm::write_queue_cap(),
-        conf_script_q_hwm: conf_q_hwm.0,
-        conf_write_q_hwm: conf_q_hwm.1,
+        conf_script_q_hwm: conf_q_hwm.1,
+        conf_write_q_hwm: conf_q_hwm.2,
         thr_lookup_claim_ms: ns_ms(thr.lookup_claim_ns),
         thr_lookup_stamp_ms: ns_ms(thr.lookup_stamp_ns),
         thr_lookup_other_ms: ns_ms(thr.lookup_other_ns),
@@ -1516,9 +1516,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_ready,
+        s.conf_pipe.load_batches,
         s.conf_script_q,
         s.conf_write_q,
+        super::confirm::load_queue_cap(),
         s.conf_script_q_cap,
         s.conf_write_q_cap,
     );
@@ -1607,9 +1608,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_ready,
+        s.conf_pipe.load_batches,
         s.conf_script_q,
         s.conf_write_q,
+        super::confirm::load_queue_cap(),
         s.conf_script_q_cap,
         s.conf_write_q_cap,
     );
@@ -1794,6 +1796,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let h = &o.head;
     let cp = &s.conf_pipe;
     let primary_mib = h.primary_body_bytes / (1024 * 1024);
+    let load_wire_mib = cp.load_wire_bytes / (1024 * 1024);
     let script_wire_mib = cp.script_wire_bytes / (1024 * 1024);
     let write_wire_mib = cp.write_wire_bytes / (1024 * 1024);
     let file_pct = if s.rss_kb > 0 {
@@ -1817,7 +1820,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let fence_mib = (o.fence_runs as u64).saturating_mul(16) / (1024 * 1024);
     // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
     let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
-    let conf_wire_mib = (script_wire_mib.saturating_add(write_wire_mib)) as u64;
+    let conf_wire_mib = (load_wire_mib
+        .saturating_add(script_wire_mib)
+        .saturating_add(write_wire_mib)) as u64;
     let fuse8_mib = h.fuse8_bytes / (1024 * 1024);
     let open_keys_mib = h.open_keys_bytes / (1024 * 1024);
     let class_c_l2_mib = h.class_c_l2_bytes / (1024 * 1024);
@@ -1839,9 +1844,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} rej={} \
-         | bq soft={}/{} RAM={}MiB bq_dec={} \
+         | bq soft={}/{} RAM={}MiB \
          | conf_plans={} \
-         | conf ready={} scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf loadq={}/{} blks={} wire={}MiB scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h live={}k/pub={}k/ov={} fifo={}k≈{}MiB \
            union={}L/{}k≈{}MiB h2h={}k≈{}MiB fence={}≈{}MiB \
@@ -1872,9 +1877,11 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_count,
         s.bq_soft_stop,
         bq_mib,
-        o.bq_promoted,
         o.conf_plans,
-        cp.ready,
+        cp.load_batches,
+        super::confirm::load_queue_cap(),
+        cp.load_blocks,
+        load_wire_mib,
         cp.script_batches,
         s.conf_script_q_cap,
         cp.script_blocks,
@@ -2127,7 +2134,7 @@ mod tests {
         s.arch_write_body_ms = 7;
         s.arch_write_head_ms = 2;
         let line = format_info(&s);
-        assert!(line.contains("ready=0 scriptq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("loadq<0/8 scriptq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         // pin_residency slot always 0 (process pin FIFO removed); pin_plan_cache label retired.
         assert!(!line.contains("pin_res="), "{line}");
@@ -2534,7 +2541,9 @@ mod tests {
         s.owned.head.segment_count = 3;
         s.owned.head.sealed_segments = 2;
         s.owned.head.class_a_n = 2_000_000;
-        s.conf_pipe.ready = 40;
+        s.conf_pipe.load_batches = 3;
+        s.conf_pipe.load_blocks = 8;
+        s.conf_pipe.load_wire_bytes = 2 * 1024 * 1024;
         s.conf_pipe.script_batches = 2;
         s.conf_pipe.script_blocks = 16;
         s.conf_pipe.script_wire_bytes = 12 * 1024 * 1024;
@@ -2558,15 +2567,15 @@ mod tests {
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("miss="), "{line}");
         assert!(!line.contains("body_soft"), "{line}");
-        assert!(line.contains("bq soft=4/256 RAM=32MiB bq_dec=3"), "{line}");
+        assert!(line.contains("bq soft=4/256 RAM=32MiB"), "{line}");
+        assert!(!line.contains("bq_dec="), "{line}");
         assert!(!line.contains("bq n="), "{line}");
         assert!(!line.contains(" disk="), "{line}");
         assert!(line.contains("conf_plans=80"), "{line}");
         assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
-        // parents= is pipeline total (scriptq + writeq entry counts).
-        assert!(line.contains("ready=40"), "{line}");
+        assert!(line.contains("loadq=3/8 blks=8 wire=2MiB"), "{line}");
         assert!(line.contains("scriptq=2/5 blks=16 wire=12MiB"), "{line}");
         assert!(
             line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"),
@@ -2655,11 +2664,11 @@ mod tests {
             8,           // peers
             true,        // headers_done
             (50, 10, 0, 0, 0),
-            0,      // ready
-            0,      // script_q
-            0,      // write_q
-            (0, 0), // q hwm
-            1,      // sh_runs
+            0,         // ready
+            0,         // script_q
+            0,         // write_q
+            (0, 0, 0), // q hwm
+            1,         // sh_runs
             work,
             owned,
             conf_pipe,

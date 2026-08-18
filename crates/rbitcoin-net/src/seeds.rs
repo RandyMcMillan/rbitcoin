@@ -325,7 +325,11 @@ impl AddrMan {
     }
 
     /// Ranked dial list: tier 0 first (untried / fast / good history), then slow,
-    /// then failed/incompatible. Within a tier, IPv4 before IPv6.
+    /// then failed-last-connect. Within a tier, IPv4 before IPv6.
+    ///
+    /// `INCOMPATIBLE` is omitted while any other candidate remains so a mixed
+    /// book does not burn outbound slots on known-v1. If every remaining addr
+    /// is incompatible, those are returned as last-resort.
     pub fn take_dial_candidates(
         &self,
         max: usize,
@@ -334,17 +338,20 @@ impl AddrMan {
         if max == 0 || self.order.is_empty() {
             return Vec::new();
         }
-        let mut ranked: Vec<(u8, bool, SocketAddr)> = self
+        let mut ranked: Vec<(u8, bool, bool, SocketAddr)> = self
             .order
             .iter()
             .filter(|a| !exclude.contains(*a))
             .map(|&a| {
                 let f = self.flags(&a);
-                (f.dial_tier(), a.is_ipv6(), a)
+                (f.dial_tier(), a.is_ipv6(), f.is_incompatible(), a)
             })
             .collect();
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        ranked.into_iter().take(max).map(|(_, _, a)| a).collect()
+        if ranked.iter().any(|(_, _, incompat, _)| !*incompat) {
+            ranked.retain(|(_, _, incompat, _)| !*incompat);
+        }
+        ranked.into_iter().take(max).map(|(_, _, _, a)| a).collect()
     }
 
     /// Round-robin-ish: take up to `max` peers starting at `offset` (legacy helper).
@@ -540,14 +547,57 @@ mod tests {
         am.note_connect_failed(incompat, true);
 
         let got = am.take_dial_candidates(4, &HashSet::new());
-        assert_eq!(got.len(), 4);
-        // First two must be preferred tier (good + untried), last two last-resort.
+        assert_eq!(got.len(), 3);
+        assert!(!got.contains(&incompat));
         let tiers: Vec<u8> = got.iter().map(|a| am.flags(a).dial_tier()).collect();
-        assert!(tiers[0] <= tiers[1]);
         assert_eq!(tiers[0], 0);
         assert_eq!(tiers[1], 0);
         assert_eq!(tiers[2], 2);
-        assert_eq!(tiers[3], 2);
+        assert!(am.flags(&got[2]).failed_last_connect());
+    }
+
+    #[test]
+    fn take_dial_skips_incompatible_while_good_remain() {
+        let mut am = AddrMan::new();
+        let good = addr(1);
+        let untried = addr(2);
+        let failed = addr(3);
+        let incompat_a = addr(4);
+        let incompat_b = addr(5);
+        am.add(good);
+        am.add(untried);
+        am.add(failed);
+        am.add(incompat_a);
+        am.add(incompat_b);
+        am.note_connected(good);
+        am.note_connect_failed(failed, false);
+        am.note_connect_failed(incompat_a, true);
+        am.note_connect_failed(incompat_b, true);
+
+        let got = am.take_dial_candidates(48, &HashSet::new());
+        assert!(
+            got.iter().all(|a| !am.flags(a).is_incompatible()),
+            "INCOMPATIBLE must not fill the batch while any other addr remains: {got:?}"
+        );
+        assert!(got.contains(&good));
+        assert!(got.contains(&untried));
+        assert!(got.contains(&failed), "FAILED_LAST_CONNECT stays retryable");
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn take_dial_incompatible_when_nothing_else() {
+        let mut am = AddrMan::new();
+        let a = addr(1);
+        let b = addr(2);
+        am.add(a);
+        am.add(b);
+        am.note_connect_failed(a, true);
+        am.note_connect_failed(b, true);
+        let got = am.take_dial_candidates(48, &HashSet::new());
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&a));
+        assert!(got.contains(&b));
     }
 
     #[test]

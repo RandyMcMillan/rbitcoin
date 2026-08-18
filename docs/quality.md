@@ -3,9 +3,9 @@
 What is strong, what still blocks “industry-leading,” and what is already
 closed. Replaces the 2026-08-06 point-in-time audit.
 
-**Last reaudit:** 2026-08-17 (docs map #81, Core functional **35** `run`,
-no-repo-sniff #85, CI `test` ~85 s). Previous: 2026-08-16 schema 17 +
-harness + Q-15 / Q-42–Q-46.
+**Last reaudit:** 2026-08-18 (confirm perf program #117–#126, repo cruft
+#127, baseline re-measure, new **Q-50**). Previous: 2026-08-17 (docs map
+#81, Core functional **35** `run`, no-repo-sniff #85).
 
 **Three lists only**
 
@@ -76,38 +76,43 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | Rank | ID | Item | Tag | Done looks like |
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: no fuzz crate, no corpus, no job.** |
-| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 35 / 267.** Next: leftover P2P (`p2p_invalid_messages`) and `rpc-missing` / `core-log` that still match claimed node/P2P/miner surface. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
-| 3 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed |
-| 4 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command |
+| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 35 / 268.** Next: leftover P2P (`p2p_invalid_messages`) and `rpc-missing` / `core-log` that still match claimed node/P2P/miner surface. Product-never skips stay skip (`no-wallet` 68, `no-prune` 7, `no-zmq`/`no-ipc`, `v1-only`). Unlabeled PRs stay cargo-only; nightly green |
+| 3 | **Q-50** | Perf meter residual coverage | ops | On a saturated confirm thread, the named `ibd: perf` sub-meters account for (nearly) all busy wall. 2026-08-18 mainnet run: lookup 5.15s busy vs 1.76s metered, write 5.05s vs 2.39s, `stamp_sub batch=` 854ms wall vs ~170ms subs — both perf audits this week spent most of their effort attributing dark time. Done: an explicit residual per stage wall (wall − named subs ≈ 0), same-commit rule as the AGENTS timer inventory |
+| 4 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Getheaders storm (#43) and SH megakey 10 s heartbeat are closed. Q-50 adds meters on DEBUG/`tip: perf`, never more INFO |
 | 5 | **Q-49** | v2-only peer discovery | ops | Tip-follow is not starved by v1-only DNS seeds. Documented v2 seed set and/or addr relay that finds BIP324 peers without dual-stack |
-| 6 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 7 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
-| 8 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-17 giants: `rpc/methods` **4.8k**, `scripthash` **4.0k**, `query/lib` **3.5k**, `electrum/server` **3.3k**, `peer` **2.9k**, `store` **2.9k**. No drive-by splits |
+| 6 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work |
+| 7 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
+| 8 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
+| 9 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-18 giants (raw `wc -l`, inline test mods included): `rpc/methods` **5.5k**, `peer` **4.3k**, `query/lib` **3.7k**, `scripthash` **3.5k**, `electrum/server` **3.3k**, `chain` **3.1k**, `store` **3.0k**, `ibd/perf_log` **2.6k** (new entrant; grows with every perf PR — Q-50 is its seam). No drive-by splits |
 
 ### Still valid? (this reaudit)
 
+2026-08-18 pass. Verified against the tree at #127: zero in-tree fuzz,
+inventory 35 `run` / 232 `skip` / 268 total, schema 17, findings 001–021
+all fixed, **0** `TODO`/`FIXME`, **2** `#[allow(`, `unsafe` confined to
+store IO sessions + `script_pool`, clean tree (no tracked logs or build
+artifacts).
+
 | ID | Verdict |
 |----|---------|
-| **Q-30** | Keep. Highest correctness hole. Zero in-tree fuzz. |
-| **Q-41** | Keep. 9 → **35** `run` (Waves A–D leftovers + leftover-P2P `p2p_initial_headers_sync` + `p2p_compactblocks`). 232 skips remain; `rpc-missing` + `core-log` are the only growth that matches claimed surface. |
-| **Q-37** | **Close.** CI `test` ~85 s (2026-08-17). Recorded in [`TESTING.md`](../TESTING.md). |
-| **Q-47** | **Close.** `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers`. |
-| **Q-31** | Keep, lowered. Useful for Q-30; not blocking operators. |
-| **Q-36** | Keep. IBD/tip INFO is still a firehose (`UpdateTip` + `tip: accept` per block). |
-| **Q-32** | **Won't fix.** Operators grep text. A second JSON dialect is not a goal. |
-| **Q-35** | **Won't fix.** Not a gated program. Signet-first is ordinary run advice. |
+| **Q-30** | Keep rank 1. Still the highest correctness hole; zero in-tree fuzz. |
+| **Q-41** | Keep rank 2. **35** `run` holds; 232 skips (68 `no-wallet`, 53 `rpc-missing`, 32 `core-log`). `rpc-missing` + `core-log` remain the only growth matching claimed surface. |
+| **Q-50** | **New, rank 3.** Confirm perf program (#117–#126) raised IBD 3.9 → 6.4 blk/s, but both remaining saturated threads are >50% unmetered — every reaudit re-derives the same dark time. Cheapest leverage on the active program. |
+| **Q-36** | Keep. IBD/tip INFO is still a firehose; perf lines are ~2.5 KB each. |
+| **Q-49** | Keep, raised above Q-48 (operator-affecting now vs blocked upstream). |
+| **Q-48** | Keep, lowered. Waits on rust-bitcoin (**RB-007**). |
+| **Q-31** | Keep. Useful for Q-30; not blocking operators. |
 | **Q-34** | Keep. Onboarding still medium. |
-| **Q-33** | **Won't fix.** Local `cargo doc` is enough until crates.io. |
-| **Q-24** | **Won't fix.** Single maintainer + bot. GitHub defaults. |
-| **Q-25** | **Won't fix.** Ship musl via Nix, not crates.io. |
-| **Q-38** | **Won't fix.** Heavies stay `#[ignore]` + `scripts/integration.sh`. |
-| **R-10** | Keep last. `rpc/methods` grew with the Core-functional wave — peel when Q-41 needs a seam. |
+| **R-10** | Keep last, list refreshed. `peer` **4.3k** and `ibd/perf_log` **2.6k** joined the giants with the perf program; peel only when Q-50/Q-41 need a seam. |
+
+Prior-reaudit closures (Q-37, Q-47) and Won't-fix calls
+(Q-24/25/32/33/35/38) stand — evidence unchanged.
 
 ### ID aliases (R-program ↔ catalog)
 
 R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed/Won't-fix
 id is in **bold**. Do not start **R-11+** — new work is the next unused
-**Q-id (Q-47+)**.
+**Q-id (Q-51+)**.
 
 | R-id | Canonical | Where |
 |------|-----------|-------|
@@ -115,9 +120,9 @@ id is in **bold**. Do not start **R-11+** — new work is the next unused
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 8 |
+| R-10 | **R-10** | Open rank 9 |
 
-New work after this reaudit starts at **Q-50**.
+New work after this reaudit starts at **Q-51**.
 
 ---
 
@@ -164,7 +169,7 @@ findings 001–021, CI split, map-free README, …) live in
 | Do | Do not |
 |----|--------|
 | Close work by **moving the Open row into Completed** in the same edit as the landing change | Leave `Status: fixed` in Open, or start a second table |
-| New item: next unused **Q-id (Q-50+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
+| New item: next unused **Q-id (Q-51+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
 | Retire a row to **Won't fix** when the product will not do it | Leave dead Open rows “for completeness” |
 | God-file peels only when a higher Open row needs a seam (**R-10**) | Split `query/lib` / `interpreter.rs` as a standalone “modularity” project |
 | Suite: no new remine-100 / default test **&gt;2 s** without justification ([TESTING.md](../TESTING.md)) | Time the full workspace as a planning spike |
@@ -174,17 +179,19 @@ findings 001–021, CI split, map-free README, …) live in
 
 ## Baseline snapshot
 
-**Measured 2026-08-17** (`crates/**/*.rs`, no build artifacts):
+**Measured 2026-08-18** (`crates/**/*.rs` raw `wc -l`, inline test mods
+included; tree at #127):
 
 | Metric | Value |
 |--------|-------|
-| First-party Rust LOC | **~146k** (was ~139k on 2026-08-16) |
+| First-party Rust LOC | **~150k** (was ~146k on 2026-08-17; #127 deleted ~6k of benches/forensics) |
 | Workspace crates | **13** (`rbitcoin-cli` … `rbitcoin-test`; no wallet crate) |
-| Largest production files (lines) | `rpc/methods` **4822**, `scripthash` **4046**, `query/lib` **3461**, `electrum/server` **3267**, `peer` **2945**, `store` **2866**, `chain` **2757**, `sorted_run` **2710**, `interpreter` **2601**, `sh_builder` **2421** |
-| Largest test files (lines) | `tx_table/tests` **2903**, `confirm_reject_tests` **2335**, `scenarios` **2266**, `write_idempotent_tests` **2182** |
-| `#[test]` / `#[tokio::test]` | **~1.43k** |
+| Largest production files (lines) | `rpc/methods` **5475**, `peer` **4279**, `query/lib` **3655**, `scripthash` **3516**, `electrum/server` **3271**, `chain` **3113**, `store` **2951**, `sorted_run` **2710**, `interpreter` **2628**, `ibd/perf_log` **2590** |
+| Largest test files (lines) | `tx_table/tests` **2903**, `confirm_reject_tests` **2335**, `scenarios` **2267**, `write_idempotent_tests` **2250** |
+| `#[test]` / `#[tokio::test]` | **~1.51k** |
+| `TODO` / `FIXME` / `#[allow(` | **0** / **0** / **2** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
-| Required CI | `fmt`, `deny`, `clippy`, `test` **~85 s**, `multinode`, `coverage` (~2.5 min) (+ CodeQL) |
+| Required CI | `fmt`, `deny`, `clippy`, `test`, `multinode`, `coverage` (+ CodeQL) |
 | Extra CI | `musl` / `windows` / `macos` after green master `ci` or PR label `static-binaries`; `core-functional.yml` nightly / labeled PR (not required) |
 | rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.23.x** |
@@ -192,19 +199,20 @@ findings 001–021, CI split, map-free README, …) live in
 | Release | `nix build .#rbitcoin-musl` → static install |
 | Core corpora | **No allowlist** |
 | Findings 001–021 | All **fixed** (no new numbered reports since 021) |
-| Core functional | **28** unmodified v31.1 scripts `run`; 239 skip (68 `no-wallet`, 55 `rpc-missing`, 37 `core-log`, …) |
+| Core functional | **35** unmodified v31.1 scripts `run`; 232 skip (68 `no-wallet`, 53 `rpc-missing`, 32 `core-log`, …) |
 | Residual `RBITCOIN_*` in crates | Honored set listed in `env-knobs.md` (**Q-16** closed) |
 | On-disk | **Schema 17 durable** |
+| IBD confirm rate (mainnet ~890k, fat era) | **6.4 blk/s** (was 3.95 pre-#126); lookup + write threads saturated, >50% unmetered (**Q-50**) |
 | Fuzz | **None** |
 
-### Grade board (subjective; 2026-08-17)
+### Grade board (subjective; 2026-08-18)
 
 | Dimension | Grade | Note |
 |-----------|-------|------|
 | Architecture clarity | Strong | Roles + HWM + single Class A appender; schema 17 freeze in SCHEMA.md |
 | Dependency hygiene | Strong | No `libbitcoinconsensus`; fuse8/script_pool in-tree |
 | Operator honesty | Strong | CLI primary; chaininfo disk/progress are real (Q-47); README size matches SCHEMA census |
-| Code modularity | Medium | `rpc/methods` **4.8k** after Core-functional growth. Residual giants only via **R-10** |
+| Code modularity | Medium | `rpc/methods` **5.5k**, `peer` **4.3k**, `ibd/perf_log` **2.6k** after Core-functional + perf growth. Residual giants only via **R-10** |
 | Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. CI snapshots: musl + CRT-static Windows + system-dylib Darwin |
 | Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
 | Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
@@ -213,6 +221,7 @@ findings 001–021, CI split, map-free README, …) live in
 | Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
 | Tip-follow mempool APIs | Strong | **R-01–R-04**; persist sidecars exist (Core persist script still skip → Q-41) |
 | Adversarial / findings | Medium–Strong | **001–021** closed; **no fuzz** (**Q-30**); Core functional is the active surface program (**Q-41**) |
+| Perf observability | Medium | Meters exist per AGENTS, but saturated confirm threads are >50% dark (**Q-50**); perf INFO lines ~2.5 KB (**Q-36**) |
 
 ---
 
@@ -237,7 +246,7 @@ findings 001–021, CI split, map-free README, …) live in
 
 | Audience | Read |
 |----------|------|
-| Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active program is **Q-41** (Core functional `run` set) |
+| Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active programs: **Q-41** (Core functional `run` set), confirm perf (**Q-50** meters first) |
 | Release engineering | **Q-20**, **Q-21**, **Q-23** (completed) |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** |
 | Docs / README | Map is done; then **Q-34** |

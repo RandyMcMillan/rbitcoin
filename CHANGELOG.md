@@ -44,6 +44,9 @@ before 1.0).
   (`put_spend_batch_by_abs_meta_known`). `put_spend` / `put_spend_batch`
   (txid) stay for `connect_block` / archive commit.
 
+- **`script_bench` facade:** detached script verify and fixture tests use
+  `ScriptCheckJob` + `verify_scripts_pool` / `verify_job_all_inputs`.
+
 ### Changed
 
 - **Confirm pack / leftover / lookup meters:** load waits on `feed.cv` when

@@ -15,83 +15,6 @@ mod script_pool;
 mod signet;
 pub mod silent_payments;
 
-/// Thin public helpers for `script_verify` benches (no UTXO; explicit prevouts only).
-pub mod script_bench {
-    use bitcoin::{Transaction, TxOut};
-
-    use crate::block::ScriptCheckJob;
-    use crate::error::ConsensusError;
-    use crate::script;
-
-    /// Owned job payload for benches outside the crate root.
-    pub struct JobBytes {
-        pub prevouts: Vec<TxOut>,
-        pub tx: Transaction,
-        /// When false, use pre-BIP66 lax DER (historical mainnet).
-        pub bip66_active: bool,
-        /// When false, P2SH template is bare HASH160/EQUAL (pre-BIP16).
-        pub bip16_active: bool,
-        /// When false, v1 witness program is anyone-can-spend (pre-taproot).
-        pub taproot_active: bool,
-    }
-
-    impl JobBytes {
-        pub fn new(prevouts: Vec<TxOut>, tx: Transaction) -> Self {
-            Self {
-                prevouts,
-                tx,
-                bip66_active: true,
-                bip16_active: true,
-                taproot_active: true,
-            }
-        }
-    }
-
-    pub fn verify_job(job: &JobBytes) -> Result<(), ConsensusError> {
-        let j = ScriptCheckJob::new(
-            job.prevouts.clone(),
-            job.tx.clone(),
-            true,
-            true,
-            job.bip66_active,
-            job.bip16_active,
-            job.taproot_active,
-        );
-        script::verify_job_all_inputs(&j)
-    }
-
-    /// Build owned jobs once, then pool-verify without re-cloning each iteration.
-    pub fn owned_jobs(jobs: &[JobBytes]) -> Vec<ScriptCheckJob> {
-        jobs.iter()
-            .map(|j| {
-                ScriptCheckJob::new(
-                    j.prevouts.clone(),
-                    j.tx.clone(),
-                    true,
-                    true,
-                    j.bip66_active,
-                    j.bip16_active,
-                    j.taproot_active,
-                )
-            })
-            .collect()
-    }
-
-    pub fn verify_jobs_pool(jobs: &[JobBytes]) -> Result<(), ConsensusError> {
-        let owned = owned_jobs(jobs);
-        crate::block::verify_scripts_pool(&owned)
-    }
-
-    pub fn verify_owned_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
-        crate::block::verify_scripts_pool(jobs)
-    }
-
-    /// Single job (no pool) — for parallelization strategy benches.
-    pub fn verify_one_job(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
-        script::verify_job_all_inputs(job)
-    }
-}
-
 pub use block::ScriptCheckJob;
 
 /// Consensus script verify for a single tx on the shared `rbtc-scripts` path.
@@ -104,8 +27,8 @@ pub fn verify_tx_scripts_detached(
     tx: bitcoin::Transaction,
 ) -> Result<(), ConsensusError> {
     script_pool::run_detached_join(move || {
-        let job = script_bench::JobBytes::new(prevouts, tx);
-        script_bench::verify_job(&job)
+        let job = ScriptCheckJob::new(prevouts, tx, true, true, true, true, true);
+        crate::script::verify_job_all_inputs(&job)
     })
     .unwrap_or_else(|| Err(ConsensusError::BadBlock("script worker disconnected")))
 }
@@ -114,7 +37,7 @@ pub use block::{
     apply_witness_commitment, bip34_height_script, bip68_active_for_tx, block_has_witness,
     block_subsidy, is_final_tx, sequence_locks_satisfied, tx_gbt_sigops, validate_block_connect,
     validate_block_structure, validate_block_structure_hashed,
-    validate_block_structure_precomputed, validate_block_structure_with_pres,
+    validate_block_structure_precomputed, validate_block_structure_with_pres, verify_scripts_pool,
     witness_commitment_script, TxPrecompute, ValidationContext, LOCKTIME_THRESHOLD,
 };
 pub use clock::{current_now, wall_now, with_now, NodeClock};
@@ -974,10 +897,7 @@ mod coverage_tests {
     }
 
     #[test]
-    fn script_bench_helpers_on_acs_job() {
-        use script_bench::{
-            owned_jobs, verify_job, verify_jobs_pool, verify_one_job, verify_owned_pool, JobBytes,
-        };
+    fn verify_tx_scripts_detached_acs_job() {
         let tx = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -999,12 +919,9 @@ mod coverage_tests {
             value: Amount::from_sat(10),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }];
-        let jb = JobBytes::new(prevouts, tx);
-        verify_job(&jb).unwrap();
-        verify_jobs_pool(std::slice::from_ref(&jb)).unwrap();
-        let owned = owned_jobs(std::slice::from_ref(&jb));
-        verify_owned_pool(&owned).unwrap();
-        verify_one_job(&owned[0]).unwrap();
+        crate::verify_tx_scripts_detached(prevouts.clone(), tx.clone()).unwrap();
+        let job = ScriptCheckJob::new(prevouts, tx, true, true, true, true, true);
+        crate::block::verify_scripts_pool(&[job]).unwrap();
     }
 
     #[test]

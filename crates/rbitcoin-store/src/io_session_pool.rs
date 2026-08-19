@@ -18,6 +18,7 @@ use std::thread;
 static SPAWNED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_POOL: OnceLock<Arc<SharedPool>> = OnceLock::new();
 
+#[cfg(test)]
 pub(crate) fn spawned_workers() -> usize {
     SPAWNED_WORKERS.load(Ordering::Relaxed)
 }

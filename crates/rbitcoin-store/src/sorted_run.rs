@@ -2661,7 +2661,8 @@ mod tests {
             "k-way merge must submit ahead preads on the TLS session"
         );
         assert!(
-            lens.iter().all(|&n| n > 0 && (n as usize) % rec_len == 0),
+            lens.iter()
+                .all(|&n| n > 0 && (n as usize).is_multiple_of(rec_len)),
             "ahead preads must be rec-aligned, got {lens:?}"
         );
         assert_eq!(got, u64::from(n_recs) * 3);

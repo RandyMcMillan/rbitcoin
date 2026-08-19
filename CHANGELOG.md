@@ -30,6 +30,10 @@ before 1.0).
 
 ### Fixed
 
+- **Lookup wave at-least-unless-tip:** the 8000-input floor still
+  holds a thin *far* layer while more BQ heights can join, but a
+  single block at store tip+1 emits so load can take it.
+
 - **IBD most-work rewind:** a heavier header branch (resume sibling
   fork, competing tip+1, or BadPrev) disconnects to the LCA and the
   normal confirm pipeline extends the winner. Gather-then-`accept_branch`

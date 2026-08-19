@@ -56,7 +56,8 @@ pub fn bq_resolve_wave_stop_after(
 /// walk. `soft_win == 0` (rate unknown) skips only the fat-BQ short hold.
 ///
 /// `more_remain`: more unresolved BQ heights can still join this layer.
-/// Under [`BQ_RESOLVE_WAVE_MIN_INPUTS`] that wins over ready=0 / frontier.
+/// [`BQ_RESOLVE_WAVE_MIN_INPUTS`] holds a thin far wave; it does **not**
+/// hold when `first_unresolved == path_lo` (load's next tip block).
 #[inline]
 pub fn bq_resolve_wave_hold_partial(
     ready: u32,
@@ -79,7 +80,7 @@ pub fn bq_resolve_wave_hold_partial(
     if at_max {
         return false;
     }
-    if sum_inputs < BQ_RESOLVE_WAVE_MIN_INPUTS && more_remain {
+    if sum_inputs < BQ_RESOLVE_WAVE_MIN_INPUTS && more_remain && first_unresolved != path_lo {
         return true;
     }
     if soft_win == 0 {
@@ -612,19 +613,19 @@ mod tests {
         assert!(!bq_resolve_wave_hold_partial(
             330, 180, 0, 0, 100, 100, true
         ));
-        // Hard min 8000: hold a thin layer when more BQ heights can still join,
-        // even if ready=0 or the gap is at the load frontier.
+        // Hard min 8000: hold a thin *far* layer when more BQ heights can
+        // still join. A single block at the load frontier (tip+1) must emit.
         assert!(
-            bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, true),
-            "ready=0 must still hold under 8000 inputs when more remain"
+            bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 150, true),
+            "ready=0 must still hold a far <8000-input layer when more remain"
         );
         assert!(
-            bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100, true),
-            "load-frontier exception must not mint a <8000-input layer"
+            !bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100, true),
+            "one tip+1 block must emit even under the 8000-input floor"
         );
         assert!(
-            bq_resolve_wave_hold_partial(0, 0, 4_000, 1, 100, 100, true),
-            "unknown window must still hold under 8000 when more remain"
+            bq_resolve_wave_hold_partial(0, 0, 4_000, 1, 100, 150, true),
+            "unknown window must still hold a far <8000 layer when more remain"
         );
         assert!(
             !bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, false),
@@ -702,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_zero_holds_under_min_inputs_when_more_unresolved() {
+    fn tip_block_emits_under_min_inputs_while_bq_filling() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -716,23 +717,44 @@ mod tests {
                 .unwrap();
             prev = b.block_hash();
         }
-        // IBD-sized window, BQ still filling (10 < 180) — hold even ready=0.
+        // IBD-sized window, BQ still filling (10 < 180). Height 1 is tip+1.
         let _ = q.block_queue_update_soft_pressure(Some(3.0));
         let all: Vec<u32> = (1..=10).collect();
         let st = confirm_bq_resolve_wave(&q, &params, &all).unwrap();
         assert_eq!(
-            st.heights, 0,
-            "must not publish a 10-input layer while the BQ is still filling"
-        );
-        assert!(!q.block_queue_is_resolve_complete(1));
-        let _ = q.block_queue_update_soft_pressure(None);
-        let st = confirm_bq_resolve_wave(&q, &params, &all).unwrap();
-        assert_eq!(
             st.heights, 10,
-            "unknown window + whole remaining set must emit"
+            "tip+1 must emit even under 8000 inputs while the BQ is filling"
         );
         assert!(!q.block_queue_has_height(1));
         assert!(!q.block_queue_has_height(10));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn far_thin_wave_holds_under_min_inputs_when_more_remain() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let mut prev = genesis.block_hash();
+        let mut time = genesis.header.time;
+        for h in 1..=20u32 {
+            time += 600;
+            let b = mine_empty_regtest(prev, time, h);
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
+                .unwrap();
+            prev = b.block_hash();
+        }
+        for h in 1..=10u32 {
+            q.block_queue_mark_resolve_complete(h).unwrap();
+        }
+        let _ = q.block_queue_update_soft_pressure(Some(3.0));
+        let st = confirm_bq_resolve_wave(&q, &params, &[15]).unwrap();
+        assert_eq!(
+            st.heights, 0,
+            "a far 1-block layer must hold under 8000 inputs while more remain"
+        );
+        assert!(q.block_queue_has_height(15));
         let _ = std::fs::remove_dir_all(&path);
     }
 

@@ -1469,6 +1469,18 @@ impl ChainHub {
         Ok(AcceptOutcome::Accepted { height })
     }
 
+    /// Disconnect the best chain down to `keep_height` (inclusive). Losing
+    /// bodies stay in Class A. Does not connect a replacement — IBD then
+    /// confirms the heavier header path as a linear extension.
+    pub fn rewind_to_height(&self, keep_height: u32) -> Result<(), NetError> {
+        let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = self.tip_height().unwrap_or(0);
+        if keep_height > tip {
+            return Err(NetError::Protocol("rewind above tip"));
+        }
+        self.disconnect_to(keep_height)
+    }
+
     /// Production "we received a full block" (P2P `block` / compact, RPC
     /// `submitblock`). Tip-extend via [`Self::accept_block`]; otherwise hold
     /// the body by hash and [`Self::accept_branch`] when a held (or archived)

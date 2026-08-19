@@ -35,7 +35,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
 | Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
 | Idx | Per-stem `*.idx/` directories; **u32 stride-8**; hard span `2^32 × 8` ≈ 32 GiB; soft roll default 16 GiB |
-| Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`) |
+| Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **file** or **dir** orientation (not a version bump) |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
 | Secret | `store.secret` XOR of scripts/witness; keyed `tx.head` mix |
@@ -148,7 +148,10 @@ itself changed.
     # tx_height.body retired in 16 (RAM fence from confirmed + header_txs)
     header_txs_first.body        # header_fk-1 → first_tx_fk
     header_txs_count.body        # header_fk-1 → tx count
-    scripthash.body / scripthash.head/NN[.idx]        # Class B (slabs + sorted heads; no fuse)
+    scripthash.body                  # 17 file variant: one shared TableFile
+    scripthash.body/NN               # 17 dir variant: one TableFile per main shard
+    scripthash.ovf/body              # dir variant: ingest + all sealed ovf
+    scripthash.head/NN[.idx]         # Class B sealed sorted main (no fuse)
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
@@ -510,7 +513,23 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 Schema-13 slab packing (`w0` flagged, `w1` clear) still decodes as paged;
 store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as slabs).
 
-### Body (schema 15)
+### Body (schema 15 layout; 17 orientation)
+
+Schema 17 has two **body orientations**. `SCHEMA_VERSION` stays 17. Open
+detects files; it does **not** rewrite a file body into a directory.
+
+| On disk | Meaning |
+|---------|---------|
+| file `scripthash.body` | **Shared:** one TableFile, one writer (legacy 17) |
+| dir `scripthash.body/NN` + file `scripthash.ovf/body` | **Sharded:** one TableFile per main shard + one ovf body |
+| file **and** dir, or dir without `ovf/body` | **Refuse** `Layout` — wipe `store/scripthash*` and rematerialize |
+
+New `Store::create` writes the dir variant. An old 17 binary that
+`TableFile::open("scripthash.body")` on a directory fails that open
+(not a silent misread). ColdProgress `SHCOLDP1` is unchanged:
+`body_bump` is the shared HWM on the file variant; the dir variant
+ignores it (each file has its own SHAL). Overflow compact still
+merges **heads only** — all ovf keys share `scripthash.ovf/body`.
 
 - Combined prefix: RBT1 at 0–15, SHAL v3 fields at 16–4095, **payload at 4096**.
   Small slabs pack from bump with **no** 4 KiB align. Megakey pages 4 KiB-align
@@ -528,7 +547,8 @@ store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as s
 Heights, value, spentness, vouts: expand from Class A outputs (match full scripthash) + spend annotations + Class C.  
 IBD may stage creates in **sorted runs** (`key_len=40`, unique
 `(scripthash, create_tx_fk)`) and bulk-materialize durable SH at tip
-entry (slab/page packer). Schema-16 `key_len=32` catalogs are refused.
+entry (slab/page packer, sliced k-way onto each shard body — no temp
+pack files). Schema-16 `key_len=32` catalogs are refused.
 
 **Decision:** inline for 1–2-use scripts (~95 % of keys); geometric slabs for
 typical multi-use; page chains only for megakeys. Query cost for busy wallets is

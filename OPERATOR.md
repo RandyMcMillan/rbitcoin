@@ -261,9 +261,10 @@ confirm only enqueues sorted runs (background flush + merge). At tip the node
 **merges remaining runs and cold bulk-loads** durable SH tables before Electrum
 (the only deferred index work). Tip SH materialize **slices the catalog
 k-way by prefix shard** (one worker per CPU core, 256 KiB pages; no
-extra 64-file rewrite). Workers pack locally; a publisher commits
-`scripthash.body` + `scripthash.head/NN` in shard order so SIGINT
-resume is still `scripthash.cold_progress`. Catalog records stay unique
+extra 64-file rewrite). Workers write `scripthash.body/NN` (or the
+legacy shared `scripthash.body` file, serial); a publisher commits
+`scripthash.head/NN` in shard order so SIGINT resume is still
+`scripthash.cold_progress`. No temp `pack*.body`. Catalog records stay unique
 on `(scripthash, create_fk)`, `key_len=40`. Sealed sorted+idx main
 shards (no main fuse; no 0.5–1 GiB in-RAM OA image per shard;
 megakey pages write as they fill — ≤510 FKs buffered). Schema-16

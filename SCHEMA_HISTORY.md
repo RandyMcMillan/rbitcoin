@@ -49,6 +49,12 @@ follow-up). Writer/RAM on 17 (not on-disk): idx stems roll independently;
 Megakey SH pages store ULEB128 fk0+deltas (`ver=1`). Leftover raw-u64
 pages (`ver=0`, `n>0`) rematerialize.
 
+**Body orientation (still 17):** new creates write `scripthash.body/NN`
++ `scripthash.ovf/body`. Existing file `scripthash.body` stays shared
+(one writer). Mixed file+dir or a dir without `ovf/body` is Layout
+refuse (wipe `store/scripthash*`). Not schema 18 — 18 remains the next
+incompatible Class A / idx change.
+
 `archive_epoch` is gone. Create does not plant `wire/` or packed
 `tx.body`. Open unlinks leftover `archive_epoch`, `store/wire`, and
 single-file `sp_tweaks.idx` / `sp_tweaks.body` (schema 17 tweaks are

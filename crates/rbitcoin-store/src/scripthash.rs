@@ -1010,10 +1010,6 @@ impl ScriptHashTable {
     ///
     /// Sorted-chain invariant: max is the last entry of the last page (or max
     /// inline FK). Never walks earlier pages.
-    pub fn last_create_fk_for_value(&self, val: &ShHeadValue) -> Result<Option<Fk>, StoreError> {
-        self.last_create_fk_on(self.body(), val)
-    }
-
     fn last_create_fk_for_key(
         &self,
         scripthash: &[u8; 32],
@@ -2022,10 +2018,6 @@ impl ScriptHashTable {
     /// Dir variant: shard 0's bump (publisher uses per-shard files).
     pub fn alloc_bump(&self) -> u64 {
         self.allocs[0].lock().unwrap().bump
-    }
-
-    pub fn shard_alloc_bump(&self, shard: usize) -> u64 {
-        self.shard_alloc(shard).lock().unwrap().bump
     }
 
     /// Seal `recs` as sorted main shard `shard` and publish alloc HWM.

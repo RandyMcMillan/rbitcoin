@@ -1394,7 +1394,11 @@ mod tests {
         assert!(q.sh_index_enabled());
         let on = enter_tip_mode(&q, None, true);
         assert!(on.tip_follow_ready);
-        assert!(store.join("scripthash.body").is_file());
+        let sh_body = store.join("scripthash.body");
+        assert!(
+            sh_body.is_file() || sh_body.join("00").is_file(),
+            "tip SH materialize must leave a body"
+        );
 
         let off = enter_tip_mode(&q, None, false);
         assert!(off.tip_follow_ready, "follow stays on after disable");
@@ -1402,14 +1406,14 @@ mod tests {
         assert!(!q.sh_index_enabled());
         assert_eq!(q.index_mode(), IndexMode::Tip);
         assert!(
-            store.join("scripthash.body").is_file(),
+            sh_body.is_file() || sh_body.join("00").is_file(),
             "disable must not purge SH tables"
         );
 
         let again = enter_tip_mode(&q, None, true);
         assert!(again.tip_follow_ready);
         assert!(q.sh_index_enabled());
-        assert!(store.join("scripthash.body").is_file());
+        assert!(sh_body.is_file() || sh_body.join("00").is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -20,6 +20,17 @@ before 1.0).
 
 ### Changed
 
+- **SH tip materialize is sliced k-way:** one worker per CPU core
+  (clamped to shard count) k-way-merges one prefix shard's catalog
+  slices with a loser tree of stable 256 KiB double-buffered cursors.
+  Dir-variant `scripthash.body/NN` + `scripthash.ovf/body` (schema 17
+  orientation, not a version bump): workers write the shard file
+  directly; publisher only seals `scripthash.head/NN` in order so
+  `scripthash.cold_progress` (`SHCOLDP1`) is still a prefix HWM.
+  Legacy file `scripthash.body` stays one writer (`workers=1` for pack).
+  No temp `pack*.body`. No extra 64-file catalog pass.
+  `RBITCOIN_SH_MERGE_WORKERS=1` stays the serial oracle.
+
 - **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the
   decode-time `pres` Arc; `confirm_wire_lookup_stamp` must not `from_tx`
   again (`stamp_sub struct_txid=` is 0 on IBD). BQ is not a decoded stash

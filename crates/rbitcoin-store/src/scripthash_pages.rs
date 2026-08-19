@@ -410,24 +410,6 @@ pub fn sh_page_chunk_ranges(fks: &[Fk]) -> Result<Vec<(usize, usize)>, StoreErro
     Ok(out)
 }
 
-/// Whether `next` still fits on a delta page that already holds `fks`.
-pub fn sh_page_would_append(fks: &[Fk], next: Fk) -> Result<bool, StoreError> {
-    if fks.is_empty() {
-        return Ok(uleb128_len(next.0) <= SH_PAGE_STREAM_MAX);
-    }
-    let mut used = 0usize;
-    used += uleb128_len(fks[0].0);
-    for w in fks.windows(2) {
-        used += uleb128_len(w[1].0.saturating_sub(w[0].0));
-    }
-    if next.0 <= fks.last().unwrap().0 {
-        return Err(StoreError::Corrupt(
-            "invariant: scripthash page append create_fk not strictly increasing",
-        ));
-    }
-    Ok(used + uleb128_len(next.0 - fks.last().unwrap().0) <= SH_PAGE_STREAM_MAX)
-}
-
 /// Pack up to [`SH_PAGE_FK_CAP`] **strictly increasing** entries into a fresh page
 /// with `next_page_off` already set.
 ///

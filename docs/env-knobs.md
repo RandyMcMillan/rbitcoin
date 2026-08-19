@@ -36,7 +36,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | default | SH run target size |
 | `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |
 | `RBITCOIN_SH_MEMTABLE_CAP` | default | SH memtable cap |
-| `RBITCOIN_SH_MERGE_WORKERS` | default | SH merge workers |
+| `RBITCOIN_SH_MERGE_WORKERS` | n-cpu | Fan-in reduce + shard-kway materialize (`1` = serial) |
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--maxinbound` / conf omitted |
 
 ## Hardcoded (no env)

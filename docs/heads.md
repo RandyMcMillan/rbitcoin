@@ -15,7 +15,9 @@ txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead
                     4 B relative create id; fuse8 on seal
 
 spk hash    ──► scripthash.head/NN   sealed sorted main after tip bulk (`SHSR`)
+            ──► scripthash.body/NN     dir-variant main slabs/pages (file variant: scripthash.body)
             ──► scripthash.ovf/ingest  incremental + post-seal new keys
+            ──► scripthash.ovf/body    dir-variant ingest + sealed ovf slabs
             ──► scripthash.ovf/NNNNNN  sealed sorted ovf (ingest rolled)
 ```
 
@@ -26,7 +28,7 @@ spk hash    ──► scripthash.head/NN   sealed sorted main after tip bulk (`S
 | `HashHead` + `ShardedHashHead` | `header.head` | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
 | `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, `NNNNNN`, `.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`) | Confirm **lookup** stamp after live pin miss |
 | Sealed sorted SH main | `scripthash.head/NN` (`SHSR` + `.idx`) | Electrum **scripthash prefix** → slab/page locators | After tip bulk |
-| Ingest + sealed ovf | `scripthash.ovf/ingest`, `ovf/NNNNNN` | Same key for incremental / post-seal new keys | Tip + never-bulk; lookup ingest → ovf → main |
+| Ingest + sealed ovf | `scripthash.ovf/ingest`, `ovf/NNNNNN`, `ovf/body` | Same key for incremental / post-seal new keys | Tip + never-bulk; lookup ingest → ovf → main |
 
 `tx.head` is **not** a `HashHead`. `HeadRole` is only Header and ScriptHash.
 

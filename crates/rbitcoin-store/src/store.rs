@@ -1692,7 +1692,7 @@ mod tests {
             use crate::file::{TableFile, FILE_HEADER_LEN};
             use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
             use rbitcoin_primitives::TableKind;
-            let body_path = dir.join("scripthash.body");
+            let body_path = dir.join("scripthash.body").join("00");
             let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
             let mut hdr = [0u8; 24];
             body.read_at(FILE_HEADER_LEN as u64, &mut hdr).unwrap();
@@ -1786,7 +1786,7 @@ mod tests {
             use crate::file::{TableFile, FILE_HEADER_LEN};
             use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
             use rbitcoin_primitives::TableKind;
-            let body_path = dir.join("scripthash.body");
+            let body_path = dir.join("scripthash.body").join("00");
             let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
             let mut page = vec![0u8; SH_ALLOC_HEADER_LEN];
             body.read_at(FILE_HEADER_LEN as u64, &mut page).unwrap();
@@ -2573,6 +2573,8 @@ mod tests {
             drop(s);
             // Remove optional tables so open recreate branches run.
             let _ = std::fs::remove_file(dir.join("scripthash.body"));
+            let _ = std::fs::remove_dir_all(dir.join("scripthash.body"));
+            let _ = std::fs::remove_dir_all(dir.join("scripthash.ovf"));
             let _ = std::fs::remove_dir_all(dir.join("scripthash.head"));
             let _ = std::fs::remove_file(dir.join("scripthash.head"));
             let _ = std::fs::remove_file(dir.join("header_txs_first.body"));

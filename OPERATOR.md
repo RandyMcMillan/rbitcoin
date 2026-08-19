@@ -259,10 +259,14 @@ indexes are **complete before tip** — catch-up must finish; tip entry does not
 backfill them. Scripthash is **not** progressively materialized into heads:
 confirm only enqueues sorted runs (background flush + merge). At tip the node
 **merges remaining runs and cold bulk-loads** durable SH tables before Electrum
-(the only deferred index work). Tip SH materialize **streams catalog runs with
-direct k-way merge** (up to ~4096 open files; records unique on
-`(scripthash, create_fk)`, `key_len=40`) into **sealed sorted+idx
-main shards** (no main fuse; no 0.5–1 GiB in-RAM OA image per shard;
+(the only deferred index work). Tip SH materialize **slices the catalog
+k-way by prefix shard** (one worker per CPU core, 256 KiB pages; no
+extra 64-file rewrite). Workers write `scripthash.body/NN` (or the
+legacy shared `scripthash.body` file, serial); a publisher commits
+`scripthash.head/NN` in shard order so SIGINT resume is still
+`scripthash.cold_progress`. No temp `pack*.body`. Catalog records stay unique
+on `(scripthash, create_fk)`, `key_len=40`. Sealed sorted+idx main
+shards (no main fuse; no 0.5–1 GiB in-RAM OA image per shard;
 megakey pages write as they fill — ≤510 FKs buffered). Schema-16
 `key_len=32` leftover `scripthash.runs` are refused (wipe that dir and
 rematerialize). Class A with creates in the pre-pack 16-byte meta /

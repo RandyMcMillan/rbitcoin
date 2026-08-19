@@ -206,12 +206,6 @@ pub fn sh_encode_slab_head(class: u8, used: u16, off: u64) -> Result<[u8; 16], S
             "scripthash slab head: used < 3 (inline)",
         ));
     }
-    let cap = crate::scripthash_layout::slab_cap(class);
-    if u32::from(used) > cap {
-        return Err(StoreError::Corrupt(
-            "scripthash slab head: used exceeds class cap",
-        ));
-    }
     let w0 = sh_pack_flagged(off)?;
     let packed = u64::from(used) | (u64::from(class) << 16);
     let w1 = sh_pack_flagged(packed)?;
@@ -243,12 +237,6 @@ pub fn sh_decode_slab_head(buf: &[u8; 16]) -> Result<(u8, u16, u64), StoreError>
             if used < 3 {
                 return Err(StoreError::Corrupt(
                     "scripthash slab head: used < 3 (inline)",
-                ));
-            }
-            let cap = crate::scripthash_layout::slab_cap(class);
-            if u32::from(used) > cap {
-                return Err(StoreError::Corrupt(
-                    "scripthash slab head: used exceeds class cap",
                 ));
             }
             Ok((class, used, off))

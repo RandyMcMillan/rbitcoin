@@ -1641,8 +1641,14 @@ mod tests {
         assert_eq!(written, n_fks);
         assert_eq!(store.scripthash.entries(&sh).unwrap().len(), n_fks as usize);
         match store.scripthash.head_value(&sh).unwrap().unwrap() {
-            rbitcoin_store::ShHeadValue::Paged { .. } => {}
-            other => panic!("expected paged megakey, got {other:?}"),
+            rbitcoin_store::ShHeadValue::Slab { used, class, .. } => {
+                assert_eq!(used, n_fks as u16);
+                assert!(
+                    class <= 5,
+                    "600 tight deltas stay in a relocating slab, class={class}"
+                );
+            }
+            other => panic!("expected slab megakey (payload fits class 6), got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

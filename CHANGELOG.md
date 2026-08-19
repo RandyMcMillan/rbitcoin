@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **`--sptweaks` backfill CPU:** `tweak_from_tx` runs on idle
+  `rbtc-scripts-*` steal workers (`try_for_each_parallel_idle`). Block
+  script waves and mempool `run_detached_join` still take the pool
+  first. The uring load machine stays one-core.
+
 - **SH tip materialize is sliced k-way:** one worker per CPU core
   (clamped to shard count) k-way-merges one prefix shard's catalog
   slices with a loser tree of stable 256 KiB double-buffered cursors.

@@ -452,7 +452,8 @@ sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
 Tip follow writes 65 B-class records from already-pinned parents when the
 cursor is caught up. Reorg truncates with tip. Post-IBD backfill is a
 **one-core** completion machine: `txout` wave, then `inwit`/parent `txout`
-only for P2TR creates, secp on the same thread, then **batched** height-blob
+only for P2TR creates, secp on **idle** `rbtc-scripts-*` workers (block
+scripts and mempool accept still win), then **batched** height-blob
 + idx writes (one body pwrite + one idx pwrite per consecutive group — not
 per tx). IO-bound (**hours** on SSD; 9p/spinning rust longer). Kill-safe:
 `next_height` is the last complete put. INFO every 10 s:

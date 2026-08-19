@@ -6,7 +6,8 @@ use crate::error::NetError;
 use crate::ibd::IbdConfig;
 use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta};
 use crate::peer_dos::{inbound_semaphore, DEFAULT_MAX_INBOUND};
-use crate::peers::{DialRequest, PeerConnType, PeerHub};
+use crate::peers::{DialRequest, LivePeer, PeerConnType, PeerHub};
+use crate::v2::{V2Reader, V2Writer};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -280,11 +281,13 @@ impl P2PNode {
 
     /// Persistent outbound peer: tip-follow + announce for the session lifetime.
     ///
+    /// Handshake completes on this task (so an 8s connect timeout is meaningful);
+    /// the session itself is spawned so the caller does not sit in the read loop.
     /// After handshake the session sends `getheaders` from our tip locator so
     /// any gap (e.g. blocks mined during SH materialize) is filled actively.
     /// Call [`Self::sync`] first when far behind (multi-thousand height IBD).
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
-        run_outbound_session(
+        let prepared = prepare_outbound_session(
             peer,
             self.magic,
             self.local_addr,
@@ -294,7 +297,12 @@ impl P2PNode {
             self.follow_live.clone(),
             PeerConnType::OutboundFullRelay,
         )
-        .await
+        .await?;
+        let handle = tokio::spawn(async move {
+            let _ = run_prepared_outbound(prepared).await;
+        });
+        self.tasks.push(handle);
+        Ok(())
     }
 
     pub async fn wait_height(&self, height: u32, timeout: Duration) -> Result<(), NetError> {
@@ -345,6 +353,70 @@ fn default_user_agent() -> String {
         .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")))
 }
 
+struct PreparedOutbound {
+    peer: SocketAddr,
+    magic: Magic,
+    hub: Arc<ChainHub>,
+    peers: Arc<PeerHub>,
+    follow_live: Arc<AtomicUsize>,
+    reader: V2Reader,
+    writer: V2Writer,
+    sess: Arc<LivePeer>,
+    id: u64,
+}
+
+async fn prepare_outbound_session(
+    peer: SocketAddr,
+    magic: Magic,
+    local: SocketAddr,
+    hub: Arc<ChainHub>,
+    peers: Arc<PeerHub>,
+    user_agent: String,
+    follow_live: Arc<AtomicUsize>,
+    typ: PeerConnType,
+) -> Result<PreparedOutbound, NetError> {
+    let stream = TcpStream::connect(peer).await?;
+    let bind = stream.local_addr().unwrap_or(local);
+    let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
+    let (ver, reader, writer, wire) =
+        connect_and_handshake(stream, magic, local, peer, height, false, &user_agent).await?;
+    let sess = peers.register(peer, bind, &ver, false, typ);
+    sess.attach_wire(wire);
+    let id = sess.id;
+    follow_live.fetch_add(1, Ordering::SeqCst);
+    Ok(PreparedOutbound {
+        peer,
+        magic,
+        hub,
+        peers,
+        follow_live,
+        reader,
+        writer,
+        sess,
+        id,
+    })
+}
+
+async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetError> {
+    let tip_rx = prepared.hub.subscribe_tips();
+    let meta = FollowSessionMeta {
+        peer: Some(prepared.peer),
+        live: Some(prepared.follow_live),
+        session: Some(prepared.sess),
+    };
+    let out = peer_session_with(
+        prepared.reader,
+        prepared.writer,
+        prepared.magic,
+        prepared.hub,
+        tip_rx,
+        meta,
+    )
+    .await;
+    prepared.peers.unregister(prepared.id);
+    out
+}
+
 async fn run_outbound_session(
     peer: SocketAddr,
     magic: Magic,
@@ -360,24 +432,10 @@ async fn run_outbound_session(
         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
         return crate::peer::run_feeler(stream, magic, local, peer, height, &user_agent).await;
     }
-    let stream = TcpStream::connect(peer).await?;
-    let bind = stream.local_addr().unwrap_or(local);
-    let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
-    let (ver, reader, writer, wire) =
-        connect_and_handshake(stream, magic, local, peer, height, false, &user_agent).await?;
-    let sess = peers.register(peer, bind, &ver, false, typ);
-    sess.attach_wire(wire);
-    let id = sess.id;
-    follow_live.fetch_add(1, Ordering::SeqCst);
-    let tip_rx = hub.subscribe_tips();
-    let meta = FollowSessionMeta {
-        peer: Some(peer),
-        live: Some(follow_live),
-        session: Some(sess),
-    };
-    let out = peer_session_with(reader, writer, magic, hub, tip_rx, meta).await;
-    peers.unregister(id);
-    out
+    let prepared =
+        prepare_outbound_session(peer, magic, local, hub, peers, user_agent, follow_live, typ)
+            .await?;
+    run_prepared_outbound(prepared).await
 }
 
 /// Map our Network enum to bitcoin Magic.

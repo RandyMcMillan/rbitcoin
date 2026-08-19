@@ -322,9 +322,19 @@ pub async fn peer_session_with(
         }),
     )
     .await;
-    // Untracked keepalive so `connect_nodes` can wait for `bytesrecv_per_msg.pong` ≥ 29
-    // before LivePeer ping state is armed. Session peers send a tracked ping ~50ms later.
-    let _ = write_v2_msg(&mut writer, NetworkMessage::Ping(rand_nonce())).await;
+    // Handshake-writer ping, same nonce as LivePeer: connect_nodes needs pong
+    // bytes before the writer task; a second ping makes the first pong mismatch.
+    let keepalive = if let Some(s) = meta.session.as_ref() {
+        match s.take_ping_action(s.clock_now()) {
+            Some(PingAction::Send { nonce }) => Some(nonce),
+            _ => None,
+        }
+    } else {
+        Some(rand_nonce())
+    };
+    if let Some(n) = keepalive {
+        let _ = write_v2_msg(&mut writer, NetworkMessage::Ping(n)).await;
+    }
     let fee_sat = hub
         .mempool()
         .map(|m| m.min_relay_sat_kvb())

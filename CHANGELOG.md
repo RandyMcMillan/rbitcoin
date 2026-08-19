@@ -20,6 +20,12 @@ before 1.0).
 
 ### Changed
 
+- **`--sptweaks` backfill:** one-core completion machine (`txout`, then
+  `inwit`/parents only for P2TR) and batched height-blob + idx writes.
+  Mainnet origin→tip on SSD is typically **about 1–2 hours** (was several
+  hours at ~15–25 h/s serial `get_tx_full`). INFO every 10 s:
+  `sptweaks: backfill next=… tip=… rate=…/s remain=…`.
+
 - **SH tip materialize is sliced k-way:** one worker per CPU core
   (clamped to shard count) k-way-merges one prefix shard's catalog
   slices with a loser tree of stable 256 KiB double-buffered cursors.

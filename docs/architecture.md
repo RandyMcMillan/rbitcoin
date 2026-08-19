@@ -141,7 +141,7 @@ apply only if every block connects. On fail: restore tip; mark path invalid; re-
 
 | Path | Behavior |
 |------|----------|
-| **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** (soft re-get) or **competing path** (reorg). A competing work-path tip+1 (parent ≠ tip) **searches connecting hashes** (shortest work-winning prefix) after the walk reaches a **connected** LCA. A far linear header horizon is not a fork. Side-branch bodies are held **by hash** (BQ is height first-wins). |
+| **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** or **competing path** (reorg). Work-path slots are **first-wins and prev-anchored** (`prev(slot[h]) == slot[h-1]`; tip+1 onto store tip). Off-path headers stay in `known_headers` / store; bodies for side branches are held **by hash**. Reject after `take_raw` carries the wire Arc (BQ row is gone). Competing prev gathers mids and `accept_branch`; then clear slots above the new tip. Do **not** `mark_missing` / re-getdata the same losing hash. Rewind `lookup_taken_hi` to tip so hole is real. |
 | **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
 | **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. Body preference alone must never re-elect an archived losing fork. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |

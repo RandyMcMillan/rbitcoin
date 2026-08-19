@@ -120,13 +120,7 @@ pub fn median_time_past_store(query: &Query, height: Height) -> Result<u32, Cons
     Ok(median_time_past_times(&times))
 }
 
-/// Median of an already-collected timestamp window (unsorted OK).
-pub fn median_time_past_times(times: &[u32]) -> u32 {
-    debug_assert!(!times.is_empty());
-    let mut sorted = times.to_vec();
-    sorted.sort_unstable();
-    sorted[sorted.len() / 2]
-}
+pub use rbitcoin_primitives::median_time_past_times;
 
 #[cfg(test)]
 mod median_time_past_tests {

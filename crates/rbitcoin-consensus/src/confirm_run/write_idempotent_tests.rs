@@ -417,6 +417,13 @@ fn check_bip34_helper_and_expected_bits_no_retarget() {
     check_bip34(&block, height).unwrap();
     // Wrong height
     assert!(check_bip34(&block, height + 1).is_err());
+    let mut empty_cb = block.clone();
+    empty_cb.txdata[0].input[0].script_sig = ScriptBuf::new();
+    let err = check_bip34(&empty_cb, height).expect_err("empty scriptSig");
+    assert!(
+        err.to_string().contains("bip34 coinbase script empty"),
+        "got: {err}"
+    );
 
     // expected_bits_extending without store: height 0 and no_pow_retargeting regtest
     let params = ChainParams::regtest();

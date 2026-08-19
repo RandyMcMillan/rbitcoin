@@ -30,6 +30,13 @@ before 1.0).
 
 ### Fixed
 
+- **IBD most-work rewind:** a heavier header branch (resume sibling
+  fork, competing tip+1, or BadPrev) disconnects to the LCA and the
+  normal confirm pipeline extends the winner. Gather-then-`accept_branch`
+  could not converge: awaiting was overwritten, `HELD_CAP=32` evicted
+  mids, and lookup stamped disconnected BQ heights (`…f972` @ 961635
+  while tip stayed on the loser).
+
 - **IBD BadPrev / fork child at tip+1:** work-path slots are first-wins
   and prev-anchored. After `take_raw`, Reject carries the wire so
   CompetingPath still classifies; `lookup_taken_hi` rewinds to tip;

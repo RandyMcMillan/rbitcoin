@@ -120,12 +120,17 @@ Tip-follow pending cap is **128** (`MAX_PENDING_BLOCKS`) so a ≥99-block
 divergence can still be assembled.
 
 ```text
-headers / BQ / pending (download window)
+# IBD
+headers prove heavier branch
+    → rewind_to_height(LCA)   (DisconnectTip per dropped block)
+    → plant winning hashes as the linear work path
+    → lookup → load → scripts → write (normal confirm)
+
+# Tip-follow
+headers / pending
     → MostWorkSelector (skip invalid-marked)
-    → gather bodies (BQ · held-by-hash side bodies · Class A)
-    → ChainHub::accept_branch (snapshot → disconnect → connect;
-         each disconnect logs DisconnectTip at warn;
-         mid-branch fail restores prior tip; mark invalid; re-rank)
+    → gather bodies (held-by-hash · Class A)
+    → ChainHub::accept_branch (snapshot → disconnect → connect)
 ```
 
 Two layers:
@@ -141,9 +146,9 @@ apply only if every block connects. On fail: restore tip; mark path invalid; re-
 
 | Path | Behavior |
 |------|----------|
-| **IBD** | Any depth; BadPrev at tip+1 is **corrupt wire** or **competing path** (reorg). Work-path slots are **first-wins and prev-anchored** (`prev(slot[h]) == slot[h-1]`; tip+1 onto store tip). Off-path headers stay in `known_headers` / store; bodies for side branches are held **by hash**. Reject after `take_raw` carries the wire Arc (BQ row is gone). Competing prev gathers mids and `accept_branch`; then clear slots above the new tip. Do **not** `mark_missing` / re-getdata the same losing hash. Rewind `lookup_taken_hi` to tip so hole is real. |
+| **IBD** | Any depth. When headers prove a **strictly heavier** branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant that branch as the linear work path. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
 | **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
-| **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. Body preference alone must never re-elect an archived losing fork. |
+| **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. A greater-work sibling **rewinds to the LCA** and becomes the linear path. Body preference alone must never re-elect an archived losing fork. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |
 
 ```text
@@ -153,9 +158,11 @@ N = other peer chain, work 120, all blocks valid
 Attempt M → fail → tip restored to L; M invalid-marked → re-rank → tip = N
 ```
 
-Never disconnect until bodies are gathered. Orchestration only (IBD main loop /
-peer session) — never confirm lookup/load/scripts/write. Code: `most_work`,
-`ChainHub::accept_branch`, `ibd::reorg`.
+IBD may disconnect on **header work** (losing bodies stay in Class A; the
+winner is confirmed through the pipeline). Tip-follow still gathers bodies
+before `accept_branch`. Orchestration only — never confirm
+lookup/load/scripts/write. Code: `most_work`, `ChainHub::rewind_to_height`,
+`accept_branch`, `ibd::reorg`.
 
 Do **not** reintroduce soft-only BadPrev handling for a **known competing**
 prev — that livelocked confirm on a losing sibling tip.

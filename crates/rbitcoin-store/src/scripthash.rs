@@ -4,34 +4,35 @@
 //! (≤2 inline, geometric **slab**, or megakey first/last **4 KiB page** offs).
 //! Body slabs pack ULEB128 fk deltas; vouts expanded from Class A at query.
 
+use crate::compact::uleb128_len;
 use crate::error::StoreError;
-use crate::file::{FILE_HEADER_LEN, TableFile};
+use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
 use crate::scripthash_head::{
-    ScriptHashHead, ShardedScriptHashHead, sh_per_shard_key_budget, sh_unique_hint_default,
+    sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead, ShardedScriptHashHead,
 };
 use crate::scripthash_layout::{
-    SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
-    SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS, ShEntry, ShHeadValue, head_key_from_full, payload_start,
-    slab_bytes,
+    head_key_from_full, payload_start, slab_bytes, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
+    SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS, SH_MAX_SLAB_CLASS,
+    SH_PAGE_SLAB_CLASS,
 };
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
-    SH_PAGE_SIZE, sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges,
-    sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk, sh_page_next, sh_page_pack,
-    sh_page_set_next, sh_page_try_append, sh_page_would_append,
+    sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
+    sh_page_init_empty, sh_page_last_fk, sh_page_next, sh_page_pack, sh_page_set_next,
+    sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
-    SH_MEGAKEY_MIN_FKS, decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
-    slab_class_for_n_fks_with_slack,
+    decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
+    slab_class_for_n_fks_with_slack, SH_MEGAKEY_MIN_FKS,
 };
 use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
 };
-use bitcoin_hashes::{Hash, sha256};
+use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2200,6 +2201,7 @@ pub struct ShShardPack {
 struct BulkOpenKey {
     key: [u8; 32],
     buf: Vec<u64>,
+    stream_used: usize,
     n_total: u32,
     first_page: Option<u64>,
     last_fk: Option<u64>,
@@ -2307,6 +2309,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             self.open_key = Some(BulkOpenKey {
                 key,
                 buf: Vec::with_capacity(512),
+                stream_used: 0,
                 n_total: 0,
                 first_page: None,
                 last_fk: None,
@@ -2314,8 +2317,11 @@ impl<'a> ScriptHashBulkSession<'a> {
         }
         if let Some(open) = self.open_key.as_ref() {
             if !open.buf.is_empty() {
-                let cur: Vec<Fk> = open.buf.iter().copied().map(Fk).collect();
-                if !sh_page_would_append(&cur, fk)? {
+                let prev = open.last_fk.expect("open page has last_fk");
+                if fk.0 > prev
+                    && open.stream_used.saturating_add(uleb128_len(fk.0 - prev))
+                        > SH_PAGE_STREAM_MAX
+                {
                     self.write_open_full_page_with_next()?;
                 }
             }
@@ -2334,6 +2340,12 @@ impl<'a> ScriptHashBulkSession<'a> {
                 ));
             }
         }
+        let add = if open.buf.is_empty() {
+            uleb128_len(fk.0)
+        } else {
+            uleb128_len(fk.0 - open.last_fk.unwrap())
+        };
+        open.stream_used = open.stream_used.saturating_add(add);
         open.buf.push(fk.0);
         open.last_fk = Some(fk.0);
         open.n_total = open.n_total.saturating_add(1);
@@ -2439,17 +2451,17 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn write_open_full_page_with_next(&mut self) -> Result<(), StoreError> {
-        let fks = self
+        let buf = self
             .open_key
-            .as_ref()
-            .map(|o| o.buf.clone())
+            .as_mut()
+            .map(|o| std::mem::take(&mut o.buf))
             .unwrap_or_default();
-        let off = self.write_page(&fks, true)?;
+        let off = self.write_page(&buf, true)?;
         if let Some(open) = self.open_key.as_mut() {
             if open.first_page.is_none() {
                 open.first_page = Some(off);
             }
-            open.buf.clear();
+            open.stream_used = 0;
         }
         Ok(())
     }
@@ -3537,10 +3549,9 @@ mod tests {
         )
         .unwrap();
         let t = ScriptHashTable::open(&dir).unwrap();
-        assert!(
-            !dir.join(crate::scripthash_overflow::LEGACY_OVERFLOW_HEAD)
-                .exists()
-        );
+        assert!(!dir
+            .join(crate::scripthash_overflow::LEGACY_OVERFLOW_HEAD)
+            .exists());
         assert_eq!(t.entries(&script_hash(&[0x01])).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

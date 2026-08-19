@@ -686,6 +686,14 @@ mod tests {
     }
 
     #[test]
+    fn page_would_append_tracks_uleb_stream() {
+        let first = [Fk(1)];
+        assert!(sh_page_would_append(&first, Fk(2)).unwrap());
+        let many: Vec<Fk> = (1..=SH_PAGE_STREAM_MAX as u64).map(Fk).collect();
+        assert!(!sh_page_would_append(&many, Fk(SH_PAGE_STREAM_MAX as u64 + 1)).unwrap());
+    }
+
+    #[test]
     fn page_count_for_entries_and_pack_sets_next_before_write() {
         assert_eq!(sh_page_count_for_entries(0), 0);
         assert_eq!(sh_page_count_for_entries(1), 1);

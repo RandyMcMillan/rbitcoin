@@ -495,12 +495,31 @@ pub(crate) fn apply_confirm_reject(
         || err.contains("unexpected previous")
         || err.contains("missing retarget first header")
         || err.contains("merkle root mismatch");
+    let bad_prev = super::reorg::is_bad_prev_err(err);
+    if bad_prev {
+        let tip_h = hub.and_then(|h| h.tip_height());
+        if tip_h.map(|t| t.saturating_add(1)) == Some(height) {
+            if let Some(q) = query {
+                q.set_lookup_taken_hi(tip_h);
+            }
+            st.headers_done = false;
+        }
+    }
     if soft_wire {
-        if super::reorg::is_bad_prev_err(err) {
+        if bad_prev {
             if let Some(h) = hub {
-                if try_reorg_on_bad_prev(st, h, height, hash, wire.as_deref()) {
+                let applied = try_reorg_on_bad_prev(st, h, height, hash, wire.as_deref());
+                let still_tip_plus = h.tip_height().map(|t| t.saturating_add(1)) == Some(height);
+                if still_tip_plus && st.height_to_hash.get(&height) == Some(&hash) {
+                    st.height_to_hash.remove(&height);
+                    remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                }
+                if applied {
                     return;
                 }
+            } else if st.height_to_hash.get(&height) == Some(&hash) {
+                st.height_to_hash.remove(&height);
+                remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
             }
         }
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -516,9 +535,15 @@ pub(crate) fn apply_confirm_reject(
                 }
             }
         }
-        st.body.mark_missing(hash);
-        st.body.demote_known(hash);
-        warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
+        if !bad_prev {
+            st.body.mark_missing(hash);
+            st.body.demote_known(hash);
+            warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
+        } else {
+            warn!(
+                "ibd: confirm reject BadPrev @{height} {hash}: {err} (slot evicted, not re-get same hash)"
+            );
+        }
         return;
     }
     if let Some(q) = query {

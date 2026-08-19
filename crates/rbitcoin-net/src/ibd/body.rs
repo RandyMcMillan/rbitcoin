@@ -140,6 +140,10 @@ impl BodyPresence {
         self.is_pending_hash(h)
     }
 
+    pub(crate) fn is_missing(&self, h: &BlockHash) -> bool {
+        self.missing.contains(h)
+    }
+
     /// Hot path: local sets first. Do **not** call `has_block` before checking
     /// `missing` — assign walks tens of thousands of known-missing far hashes.
     ///

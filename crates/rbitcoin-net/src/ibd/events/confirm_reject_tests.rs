@@ -1674,6 +1674,130 @@ fn bad_prev_after_take_raw_classifies() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Tip+1 BadPrev must rewind taken_hi and evict the losing slot identity.
+#[test]
+fn bad_prev_evicts_slot_rewinds_taken() {
+    use crate::chain::ChainHub;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+    };
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-badprev-evict-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let q = Query::open_or_create(dir.join("store")).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let coinbase = |height: u32| {
+        let mut ss = rbitcoin_consensus::bip34_height_script(height);
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    };
+    let mine = |prev: BlockHash, time: u32, height: u32| {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            },
+            txdata: vec![coinbase(height)],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    };
+    let lose = mine(gen, 1_300_000_100, 1);
+    let mut win = mine(gen, 1_300_000_101, 1);
+    if win.block_hash() == lose.block_hash() {
+        let target = Target::from_compact(win.header.bits);
+        for nonce in 0..u32::MAX {
+            win.header.nonce = nonce;
+            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash() {
+                break;
+            }
+        }
+    }
+    hub.accept_block(lose.clone()).unwrap();
+    hub.ensure_header(&win.header).unwrap();
+    let ext = mine(win.block_hash(), 1_300_000_300, 2);
+    hub.ensure_header(&ext.header).unwrap();
+    hub.query.set_lookup_taken_hi(Some(2));
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
+    st.record_height(ext.block_hash(), 2);
+    st.ordered.push_back(ext.block_hash());
+    st.ordered_set.insert(ext.block_hash());
+    apply_confirm_reject(
+        &mut st,
+        2,
+        ext.block_hash(),
+        "consensus: unexpected previous header",
+        Some(hub.query.as_ref()),
+        Some(&hub),
+        Some(Arc::new(ext.clone())),
+    );
+    assert_eq!(
+        hub.query.lookup_taken_hi(),
+        Some(1),
+        "taken_hi must rewind to tip so have_body(tip+1) is false"
+    );
+    assert_ne!(
+        st.height_to_hash.get(&2).copied(),
+        Some(ext.block_hash()),
+        "losing slot identity must be evicted (do not re-getdata the same hash)"
+    );
+    assert!(
+        !st.body.is_missing(&ext.block_hash()),
+        "BadPrev must not mark_missing the losing hash"
+    );
+    assert!(!st.ordered_set.contains(&ext.block_hash()));
+    assert!(st.reorg.awaiting().is_some() || hub.tip_height() == Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Wire-path soft budget charged on receive must release on script reject
 /// **and** on soft prevout-spent (write emits Reject when has_block is false;
 #[test]

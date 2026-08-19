@@ -32,6 +32,15 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
+## v18 (indexes)
+
+Index-only. Sealed SH main is BDZ MPHF + 8 B pack8 (`NN.mphf` / `NN.val`);
+no main fuse8. Membership is mix64(key16) tags after the BDZ `g[]` (pread, not
+RAM). Sealed ovf stays `SHSR`+fuse. `SH_INLINE_CAP = 1`; slab class 0 is 16 B.
+Megakey page header is 8 B (`LAST | index`). A 17 datadir with `tx.head` or
+`scripthash*` data is refused. Sealed `tx.head` MPHF and dropping IBD SH runs
+are the rest of this version.
+
 ## v17 (durable)
 
 Closed layout. SH run catalogs are unique `(scripthash, create_fk)` at

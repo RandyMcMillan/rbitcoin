@@ -34,6 +34,7 @@ mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
 mod scripthash_materialize;
+mod scripthash_mphf;
 mod scripthash_overflow;
 mod scripthash_pages;
 mod scripthash_slabs;

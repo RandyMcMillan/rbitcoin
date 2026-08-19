@@ -11,7 +11,9 @@ use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
 use crate::io_handle::IoHandle;
 use crate::scripthash_layout::{ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -259,6 +261,7 @@ impl SortedHead {
     }
 }
 
+#[cfg(test)]
 fn part_path(final_path: &Path) -> PathBuf {
     let mut s = final_path.as_os_str().to_os_string();
     s.push(".part");
@@ -267,6 +270,7 @@ fn part_path(final_path: &Path) -> PathBuf {
 
 /// Append-only writer for a sealed main shard. Data lands on `path.part` until
 /// [`SortedHeadWriter::finish`]; crash leftovers are not `SHSR` at `path`.
+#[cfg(test)]
 pub struct SortedHeadWriter {
     part: PathBuf,
     file: File,
@@ -276,6 +280,7 @@ pub struct SortedHeadWriter {
     finished: bool,
 }
 
+#[cfg(test)]
 impl SortedHeadWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let final_path = path.as_ref();
@@ -350,6 +355,7 @@ impl SortedHeadWriter {
     }
 }
 
+#[cfg(test)]
 impl Drop for SortedHeadWriter {
     fn drop(&mut self) {
         if self.finished {
@@ -361,6 +367,7 @@ impl Drop for SortedHeadWriter {
 }
 
 /// Rename a finished `.part` (+ `.part.idx`) onto the sealed `path` and open it.
+#[cfg(test)]
 pub fn install_head_part(part: &Path, path: &Path) -> Result<SortedHead, StoreError> {
     std::fs::rename(part, path).map_err(|e| StoreError::io(path, e))?;
     let part_idx = idx_path(part);

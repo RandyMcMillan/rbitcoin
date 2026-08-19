@@ -42,7 +42,7 @@ fn mix64(mut k: u64) -> u64 {
 fn hash3(key: u64, seed: u64, m: u32) -> [u32; 3] {
     let h = mix64(key.wrapping_add(seed));
     let m = m as u64;
-    let a = (h as u128 * m as u128 >> 64) as u32;
+    let a = ((h as u128 * m as u128) >> 64) as u32;
     let b = ((h.rotate_left(21) as u128 * m as u128) >> 64) as u32;
     let c = ((h.rotate_left(42) as u128 * m as u128) >> 64) as u32;
     let mut out = [a, b, c];
@@ -61,6 +61,10 @@ fn hash3(key: u64, seed: u64, m: u32) -> [u32; 3] {
 impl BdzMphf {
     pub fn n(&self) -> u32 {
         self.n
+    }
+
+    pub fn g_bytes(&self) -> usize {
+        self.g.len() * 4
     }
 
     pub fn index(&self, key: u64) -> u32 {
@@ -140,27 +144,20 @@ impl BdzMphf {
         let m = u32::from_le_bytes(buf[12..16].try_into().unwrap());
         let seed = u64::from_le_bytes(buf[16..24].try_into().unwrap());
         let rest = &buf[24..];
-        if rest.len() != m as usize * 4 && !(n <= 1 && rest.len() == 4) {
-            if n == 0 && rest.is_empty() {
-                return Ok(Self {
-                    n: 0,
-                    m: 0,
-                    seed: 0,
-                    g: Box::new([]),
-                });
-            }
-            if n == 1 && rest.len() == 4 {
-                return Ok(Self {
-                    n: 1,
-                    m: 1,
-                    seed,
-                    g: vec![u32::from_le_bytes(rest.try_into().unwrap())].into_boxed_slice(),
-                });
-            }
+        if n == 0 {
+            return Ok(Self {
+                n: 0,
+                m: 0,
+                seed: 0,
+                g: Box::new([]),
+            });
+        }
+        let g_bytes = if n == 1 { 4 } else { m as usize * 4 };
+        if rest.len() < g_bytes {
             return Err(StoreError::Corrupt("bdz mphf: g length"));
         }
-        let mut g = vec![0u32; rest.len() / 4];
-        for (i, chunk) in rest.chunks_exact(4).enumerate() {
+        let mut g = vec![0u32; g_bytes / 4];
+        for (i, chunk) in rest[..g_bytes].chunks_exact(4).enumerate() {
             g[i] = u32::from_le_bytes(chunk.try_into().unwrap());
         }
         Ok(Self {

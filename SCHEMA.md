@@ -154,7 +154,7 @@ itself changed.
     scripthash.body                  # 17 file variant: one shared TableFile
     scripthash.body/NN               # 17 dir variant: one TableFile per main shard
     scripthash.ovf/body              # dir variant: ingest + all sealed ovf
-    scripthash.head/NN[.idx]         # Class B sealed sorted main (no fuse)
+    scripthash.head/NN.mphf + NN.val # Class B sealed MPHF main (8 B pack8; no fuse)
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
     scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
@@ -485,33 +485,36 @@ wrote them; inserting a later block before an earlier one can leave permanent ho
 Cold bulk: pick the **exact** geometric class from the run-group length (or emit
 pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 
-### Head (schema 15)
+### Head (schema 18)
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
-- Record = **32 B**: key[16] + value[16] (two u64s). **Bit 63** of each value word is a flag; payload in low 63 bits.
-- Main is a **sealed sorted** file per shard (`scripthash.head/NN`) plus `.idx`
-  (16 B key + 8 B off per 128 records / 4 KiB page). **No** main `.fuse8` —
-  misses pay one 4 KiB data pread. Record count is immutable after seal.
-  Existing keys update `value16` in place. New keys are **not** punched into main.
+- **Main (sealed):** `scripthash.head/NN.mphf` (BDZ 3-graph, then `n` mix64(key16)
+  tags) + `NN.val` (`n × 8` pack8). MPHF maps into `[0, n)`; a miss fails the
+  tag check (no main `.fuse8`). Record count is immutable after seal. Existing
+  keys pwrite pack8 at `i×8`. New keys are **not** punched into main.
+- pack8 (LE u64): bits 63–62 mode; `00` = 1-fk `create_fk`; `01` = slab
+  `off:u40 \| used:u16 \| class:u6`; `10` = paged `last_page_off` (first page
+  lives in the LAST page header). `SH_INLINE_CAP = 1`.
+- Ingest OA and sealed ovf still use 16 B `ShHeadValue` slots (`SHSR` + fuse on
+  ovf). **Do not fold ovf into main.**
 - Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
-  one shard band at a time). Cold load writes packed records (no 2 GiB OA image).
+  one shard band at a time). Cold load writes packed locators (no OA image).
 - **Overflow:** one **global** ingest OA (`scripthash.ovf/ingest`, 256 slots tiny /
   2²² slots mainnet). Load ≥ ~0.80 **seals** ingest to sorted+fuse+idx
   (`scripthash.ovf/NNNNNN`). ≥8 sealed files **compact** (k-way merge of
-  disjoint records). **Do not fold ovf into main.** Body offs are not copied.
+  disjoint records). Body offs are not copied.
 - Lookup (always): **ingest OA → sealed ovf newest→oldest (fuse skip) →
-  sorted main idx → data** (main only if `SHSR` shards exist). Incremental
-  creates (no bulk yet) live on ingest. A leftover live OA at
-  `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`) is **refused** — wipe
-  `store/scripthash*` and restart with `--shindex` to rematerialize. A key
-  has **exactly one** home.
+  main MPHF+val**. Incremental creates (no bulk yet) live on ingest. A leftover
+  live OA or schema-17 `SHSR` at `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`)
+  is **refused** — wipe `store/scripthash*` and restart with `--shindex` to
+  rematerialize. A key has **exactly one** home.
 
-| Mode | When | Value (`w0`, `w1`) |
-|------|------|---------------------|
-| Empty | no creates | `0`, `0` |
-| Inline | ≤2 create_tx_fks | bit63=0, fk0; bit63=0, fk1 or `0` (fk0 < fk1) |
-| **Slab** | 3–256 fks | both bit63=1; `w0` = body off; `w1` = used:u16 \| class<<16 |
-| **Paged** | ≥257 fks (megakey) | bit63=1, **first** page off; bit63=0, **last** page off |
+| Mode | When | pack8 |
+|------|------|-------|
+| Empty | no creates | `0` |
+| Inline | 1 create_tx_fk | mode `00`, fk |
+| **Slab** | 2–256 fks | mode `01`, off/used/class |
+| **Paged** | ≥257 fks (megakey) | mode `10`, last page off |
 
 Schema-13 slab packing (`w0` flagged, `w1` clear) still decodes as paged;
 store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as slabs).
@@ -532,14 +535,14 @@ New `Store::create` writes the dir variant. An old 17 binary that
 (not a silent misread). ColdProgress `SHCOLDP1` bytes are unchanged:
 `body_bump` is the shared HWM on the file variant. On the dir variant
 `next_shard` is the **lowest unsealed** main shard (holes after it
-stay); sealed `scripthash.head/NN` is the per-shard commit. Overflow
+stay); sealed `scripthash.head/NN.mphf`+`.val` is the per-shard commit. Overflow
 compact still merges **heads only** — all ovf keys share
 `scripthash.ovf/body`.
 
 - Combined prefix: RBT1 at 0–15, SHAL v3 fields at 16–4095, **payload at 4096**.
   Small slabs pack from bump with **no** 4 KiB align. Megakey pages 4 KiB-align
   that alloc only.
-- Geometric slabs class 0–6 (`32 B`–`2 KiB`; cap `4 << class`). Payload:
+- Geometric slabs class 0–7 (`16 B`–`2 KiB`; `slab_bytes(c) = 16 << c`). Payload:
   `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
 - Megakey **pages** (4 KiB): `next:u64` | `n_fks:u16` | `ver:u8=1` | pad 5 B
   | ULEB128 `fk0` + ULEB128 gaps. Page is full when the next uleb does not

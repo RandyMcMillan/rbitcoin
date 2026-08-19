@@ -259,7 +259,7 @@ fn sh_page_write_packed(
     last: bool,
     byte_off: u64,
 ) -> Result<(), StoreError> {
-    if byte_off % SH_PAGE_SIZE as u64 != 0 {
+    if !byte_off.is_multiple_of(SH_PAGE_SIZE as u64) {
         return Err(StoreError::Corrupt("scripthash page off not 4 KiB aligned"));
     }
     let idx = byte_off / SH_PAGE_SIZE as u64;

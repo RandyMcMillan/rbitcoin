@@ -5,6 +5,7 @@
 
 mod address_head;
 mod array_table;
+mod bdz;
 mod binary_fuse8;
 mod block_queue;
 mod bulk_io;

@@ -221,17 +221,6 @@ pub fn plan_sh_pre_materialize(
     ShPreMaterializeAction::Noop
 }
 
-/// Max create_fk gap recollected at Direct enter (crash-window only).
-///
-/// Larger gaps defer to tip finalize so startup does not re-scan all Class A
-/// only for tip FORCE to wipe the catalog again.
-pub const SH_DIRECT_RECOLLECT_MAX_GAP: u64 = 2_000_000;
-
-/// True when Direct enter should skip Class A recollect (leave it for tip finalize).
-pub fn should_defer_direct_recollect(seal: u64, tip_max: u64) -> bool {
-    tip_max.saturating_sub(seal) > SH_DIRECT_RECOLLECT_MAX_GAP
-}
-
 /// Empty head: full Class A recollect when catalog cannot seed a complete cold load.
 fn empty_head_needs_full_class_a_recollect(seal: u64, tip_max: u64, run_records: u64) -> bool {
     if tip_max == 0 {
@@ -277,6 +266,7 @@ pub const SH_RUN_REC_LEN: u32 = 40;
 pub const SH_RUN_KEY_LEN: u32 = SH_RUN_SORT_KEY_LEN;
 
 const DEFAULT_MEMTABLE_CAP: usize = 1_000_000;
+#[cfg(test)]
 const HARD_MEMTABLE_MUL: usize = 2;
 /// Coalesce L0 spills until a cataloged run is about this large.
 const DEFAULT_TARGET_RUN_BYTES: u64 = 512 * 1024 * 1024;
@@ -465,6 +455,7 @@ pub struct ShRunBuilder {
     cv: Arc<Condvar>,
     enabled: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
     pub enqueued: AtomicU64,
     /// Process cache of SEAL (shared with worker).
     sealed_fk: Arc<AtomicU64>,
@@ -490,6 +481,7 @@ impl ShRunBuilder {
             cv: Arc::new(Condvar::new()),
             enabled: AtomicBool::new(false),
             join: Mutex::new(None),
+            #[cfg(test)]
             enqueued: AtomicU64::new(0),
             sealed_fk: Arc::new(AtomicU64::new(sealed)),
             runs_dir,
@@ -579,6 +571,7 @@ impl ShRunBuilder {
         self.inner.lock().unwrap().pending.len()
     }
 
+    #[cfg(test)]
     pub fn enqueue(&self, creates: &[ScriptHashRecord]) {
         if !self.is_enabled() || creates.is_empty() {
             return;

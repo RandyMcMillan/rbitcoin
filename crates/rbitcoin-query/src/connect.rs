@@ -156,35 +156,24 @@ impl Query {
                 use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
                 // Operator shindex off: skip collect/enqueue/durable SH entirely
-                // (tip follow does not need Class B).
-                if !self.sh_index_enabled() {
+                // (tip follow does not need Class B). Direct IBD: no SH until
+                // tip finalize recollect (neither runs nor put_create).
+                if !self.sh_index_enabled() || self.index_mode().is_direct() {
                     return Ok(0);
                 }
 
-                // Direct runs: skip create_fks already in SEAL (durable spills).
                 // Tip durable SH: height + create_fk watermarks after tip commit.
                 let t_filter = std::time::Instant::now();
                 let mut sh_new_txs: Vec<u64> = Vec::new();
                 let wave_tx_n: usize = items.iter().map(|i| i.tx_fks.len()).sum();
                 sh_new_txs.reserve(wave_tx_n);
-                if self.sh_run.is_enabled() {
-                    let sealed = self.sh_run.sealed_max_create_fk();
-                    for item in items {
-                        for &tx_fk in &item.tx_fks {
-                            if tx_fk.0 > sealed {
-                                sh_new_txs.push(tx_fk.0);
-                            }
-                        }
+                let through = self.sh_indexed_through_height();
+                for item in items {
+                    if through.map(|t| item.height.0 <= t).unwrap_or(false) {
+                        continue;
                     }
-                } else {
-                    let through = self.sh_indexed_through_height();
-                    for item in items {
-                        if through.map(|t| item.height.0 <= t).unwrap_or(false) {
-                            continue;
-                        }
-                        for &tx_fk in &item.tx_fks {
-                            sh_new_txs.push(tx_fk.0);
-                        }
+                    for &tx_fk in &item.tx_fks {
+                        sh_new_txs.push(tx_fk.0);
                     }
                 }
                 add_sh_part(
@@ -218,25 +207,19 @@ impl Query {
 
                 let mut tip_sh_max_fk = 0u64;
                 if !sh_creates.is_empty() {
-                    if self.sh_run.is_enabled() {
-                        // Catch-up: enqueue only (sequential runs + low-prio worker).
-                        // No durable scripthash.head seed/head RMW on confirm.
-                        self.sh_run.enqueue(&sh_creates);
-                    } else {
-                        for r in &sh_creates {
-                            tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
-                        }
-                        let mut heads = self.sh_heads.lock().unwrap();
-                        let (n, timing) = self
-                            .store
-                            .scripthash
-                            .put_create_batch_append(&sh_creates, &mut heads)?;
-                        sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
-                        add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
-                        add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
-                        add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);
-                        add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
+                    for r in &sh_creates {
+                        tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
                     }
+                    let mut heads = self.sh_heads.lock().unwrap();
+                    let (n, timing) = self
+                        .store
+                        .scripthash
+                        .put_create_batch_append(&sh_creates, &mut heads)?;
+                    sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
+                    add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
+                    add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
+                    add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);
+                    add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
                 }
                 Ok(tip_sh_max_fk)
             });
@@ -284,9 +267,8 @@ impl Query {
         // Tip-mode durable SH: height + create_fk watermarks only after tip commit.
         // Advancing include_hwm + SEAL keeps restart from re-scanning Class A for
         // creates already written to the durable head during tip follow.
-        // Direct runs: durability is SEAL on cataloged spills (memtable may lag).
-        // shindex off: never advance SH watermarks (no durable SH writes this path).
-        if self.sh_index_enabled() && !self.sh_run.is_enabled() {
+        // Direct / shindex off: no durable SH writes this path.
+        if self.sh_index_enabled() && self.index_mode().is_tip() {
             if let Some(last) = items.last() {
                 self.set_sh_indexed_through_height(Some(last.height.0));
             }

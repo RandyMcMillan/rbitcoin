@@ -157,7 +157,7 @@ itself changed.
     scripthash.head/NN.mphf + NN.val # Class B sealed MPHF main (8 B pack8; no fuse)
     scripthash.ovf/ingest                                # global OA ingest
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
-    scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
+    scripthash.runs              # recollect spill only (key_len=40); unlinked after seal
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
 
 <datadir-cold>/                  # only when --datadir-cold is set

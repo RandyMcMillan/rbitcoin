@@ -269,7 +269,7 @@ pub fn tweaks_for_height(
         parent_txid.entry(Fk(*fk)).or_insert(*txid);
     }
 
-    let mut out = BTreeMap::new();
+    let mut jobs: Vec<([u8; 32], bitcoin::Transaction, Vec<TxOut>)> = Vec::new();
     for t in &wave.txs {
         if !t.need_inwit {
             continue;
@@ -277,12 +277,24 @@ pub fn tweaks_for_height(
         let Some(inputs) = t.inputs.as_ref() else {
             continue;
         };
-        let built = match build_tx_and_prevouts(inputs, &t.outs, &parent_outs, &parent_txid) {
-            Some(v) => v,
-            None => continue,
+        let Some(built) = build_tx_and_prevouts(inputs, &t.outs, &parent_outs, &parent_txid) else {
+            continue;
         };
-        if let Some(tweak) = tweak_from_tx(&built.0, &built.1) {
-            out.insert(t.rec.txid, tweak);
+        jobs.push((t.rec.txid, built.0, built.1));
+    }
+    if jobs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let slots: Vec<OnceLock<Option<TxTweak>>> = (0..jobs.len()).map(|_| OnceLock::new()).collect();
+    let idxs: Vec<usize> = (0..jobs.len()).collect();
+    crate::script_pool::try_for_each_parallel_idle(&idxs, |&i| {
+        let _ = slots[i].set(tweak_from_tx(&jobs[i].1, &jobs[i].2));
+        Ok(())
+    })?;
+    let mut out = BTreeMap::new();
+    for (i, slot) in slots.iter().enumerate() {
+        if let Some(tweak) = slot.get().and_then(|o| o.clone()) {
+            out.insert(jobs[i].0, tweak);
         }
     }
     Ok(out)

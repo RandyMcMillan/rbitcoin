@@ -283,73 +283,6 @@ const DEFAULT_MERGE_FANIN: usize = 64;
 /// Promote L0→catalog only when merged body ≥ this fraction of target (except finalize).
 const PROMOTE_FRAC_NUM: u64 = 3;
 const PROMOTE_FRAC_DEN: u64 = 4;
-/// Wall interval for cold bulk-materialize INFO heartbeats (time-based only).
-const MATERIALIZE_STATUS_INTERVAL: Duration = Duration::from_secs(10);
-/// Mid-key clock sample stride. A megakey stays on one scripthash for tens of
-/// millions of recs (no `put_chain`); 64 Ki recs is ~0.1–0.4 s at merge rate.
-const MATERIALIZE_STATUS_CHECK_EVERY: u64 = 1 << 16;
-
-/// Whether the merge stream should emit a status line.
-///
-/// Time-based only. The stream observes the clock on a key boundary **or**
-/// every [`MATERIALIZE_STATUS_CHECK_EVERY`] recs of the same key. Mid-key ticks
-/// are required: one scripthash can absorb tens of millions of creates and
-/// otherwise go silent for minutes (mainnet shard 1, ~63 M creates / ~6.5 min).
-fn materialize_status_should_emit(
-    last_log: Option<Instant>,
-    now: Instant,
-    interval: Duration,
-    recs_this_key: u64,
-    key_just_closed: bool,
-) -> bool {
-    let time_due = match last_log {
-        None => true,
-        Some(t) => now.saturating_duration_since(t) >= interval,
-    };
-    if !time_due {
-        return false;
-    }
-    if key_just_closed {
-        return true;
-    }
-    recs_this_key > 0 && recs_this_key.is_multiple_of(MATERIALIZE_STATUS_CHECK_EVERY)
-}
-
-/// Creates shown on a status line: committed live_count plus the in-progress chain.
-fn materialize_status_creates(committed: u64, pending_chain: usize) -> u64 {
-    committed.saturating_add(pending_chain as u64)
-}
-
-fn log_materialize_status(
-    last_log: &mut Option<Instant>,
-    keys: u64,
-    committed_creates: u64,
-    pending: usize,
-    shards: u32,
-    n_shards: usize,
-    total_recs: u64,
-    body_flush_ns: u64,
-    head_fill_ns: u64,
-    t0: Instant,
-) {
-    *last_log = Some(Instant::now());
-    let creates = materialize_status_creates(committed_creates, pending);
-    let elapsed = t0.elapsed();
-    let secs = elapsed.as_secs_f64().max(1e-3);
-    let keys_per_s = keys as f64 / secs;
-    let pct = if total_recs > 0 {
-        (100.0 * creates as f64 / total_recs as f64).clamp(0.0, 99.9)
-    } else {
-        0.0
-    };
-    info!(
-        "node: scripthash materialize status keys≈{keys} creates≈{creates} pending≈{pending} \
-         pct≈{pct:.1}% shards={shards}/{n_shards} rate≈{keys_per_s:.0}keys/s \
-         body_flush={:?} head_fill={:?} elapsed={elapsed:?}",
-        Duration::from_nanos(body_flush_ns),
-        Duration::from_nanos(head_fill_ns),
-    );
-}
 
 fn max_direct_merge() -> usize {
     std::env::var("RBITCOIN_SH_MAX_DIRECT_MERGE")
@@ -1674,58 +1607,6 @@ mod tests {
     use super::*;
     use rbitcoin_store::{read_run_body, Store};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn materialize_status_emits_mid_key_after_interval() {
-        // Mainnet shard 1: ~2 M more keys then one scripthash ate ~63 M creates
-        // with no key-boundary — status went silent for ~6.5 min because the
-        // heartbeat only ran after put_chain.
-        let interval = MATERIALIZE_STATUS_INTERVAL;
-        let t0 = Instant::now();
-        let t_due = t0 + interval;
-        assert!(
-            !materialize_status_should_emit(
-                Some(t0),
-                t0,
-                interval,
-                MATERIALIZE_STATUS_CHECK_EVERY,
-                false
-            ),
-            "must not emit before the wall interval"
-        );
-        assert!(
-            materialize_status_should_emit(Some(t0), t_due, interval, 1, true),
-            "key close after interval still emits"
-        );
-        assert!(
-            !materialize_status_should_emit(
-                Some(t0),
-                t_due,
-                interval,
-                MATERIALIZE_STATUS_CHECK_EVERY - 1,
-                false
-            ),
-            "mid-key off-stride must not clock every rec"
-        );
-        assert!(
-            materialize_status_should_emit(
-                Some(t0),
-                t_due,
-                interval,
-                MATERIALIZE_STATUS_CHECK_EVERY,
-                false
-            ),
-            "mid-key megakey after interval must heartbeat on the rec stride"
-        );
-        assert_eq!(
-            materialize_status_creates(92_697_818, 62_870_375),
-            155_568_193
-        );
-        assert_eq!(materialize_status_creates(u64::MAX, 8), u64::MAX);
-        let mut last = None;
-        log_materialize_status(&mut last, 1, 1, 0, 1, 4, 10, 0, 0, Instant::now());
-        assert!(last.is_some());
-    }
 
     #[test]
     fn materialize_streams_megakey_without_full_chain_vec() {

@@ -12,6 +12,64 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+const MATERIALIZE_STATUS_INTERVAL: Duration = Duration::from_secs(10);
+const MATERIALIZE_STATUS_CHECK_EVERY: u64 = 1 << 16;
+
+fn materialize_status_should_emit(
+    last_log: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+    recs_this_key: u64,
+    key_just_closed: bool,
+) -> bool {
+    let time_due = match last_log {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= interval,
+    };
+    if !time_due {
+        return false;
+    }
+    if key_just_closed {
+        return true;
+    }
+    recs_this_key > 0 && recs_this_key.is_multiple_of(MATERIALIZE_STATUS_CHECK_EVERY)
+}
+
+fn materialize_status_creates(committed: u64, pending_chain: usize) -> u64 {
+    committed.saturating_add(pending_chain as u64)
+}
+
+fn log_materialize_status(
+    last_log: &mut Option<Instant>,
+    keys: u64,
+    committed_creates: u64,
+    pending: usize,
+    shards: u32,
+    n_shards: usize,
+    total_recs: u64,
+    body_flush_ns: u64,
+    head_fill_ns: u64,
+    t0: Instant,
+) {
+    *last_log = Some(Instant::now());
+    let creates = materialize_status_creates(committed_creates, pending);
+    let elapsed = t0.elapsed();
+    let secs = elapsed.as_secs_f64().max(1e-3);
+    let keys_per_s = keys as f64 / secs;
+    let pct = if total_recs > 0 {
+        (100.0 * creates as f64 / total_recs as f64).clamp(0.0, 99.9)
+    } else {
+        0.0
+    };
+    rbitcoin_log::info!(
+        "node: scripthash materialize status keys≈{keys} creates≈{creates} pending≈{pending} \
+         pct≈{pct:.1}% shards={shards}/{n_shards} rate≈{keys_per_s:.0}keys/s \
+         body_flush={:?} head_fill={:?} elapsed={elapsed:?}",
+        Duration::from_nanos(body_flush_ns),
+        Duration::from_nanos(head_fill_ns),
+    );
+}
+
 /// Result of [`materialize_sh_shards`].
 #[derive(Debug, Clone, Copy)]
 pub struct ShShardMaterialize {
@@ -57,8 +115,12 @@ fn pack_shard(
     inputs: &[SortedRunPath],
     cuts: &[Vec<u64>],
     shard: usize,
+    n_shards: usize,
+    total_recs: u64,
     cancel: Option<&AtomicBool>,
     recs_out: &AtomicU64,
+    last_log: &Mutex<Option<Instant>>,
+    t0: Instant,
 ) -> Result<ShShardPack, StoreError> {
     let temp_path = table
         .store_dir()
@@ -66,6 +128,7 @@ fn pack_shard(
     let _ = std::fs::remove_file(&temp_path);
     let temp = TableFile::create(&temp_path, TableKind::ScriptHash)?;
     let mut session = table.pack_shard_session(temp)?;
+    let mut recs_this_key = 0u64;
     for_each_merged_rec_shard(inputs, cuts, shard, false, |rec| {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
             return Err(StoreError::Cancelled("scripthash shard pack"));
@@ -75,7 +138,36 @@ fn pack_shard(
             return Ok(());
         }
         session.push_sorted_fk(sh, fk)?;
+        recs_this_key = recs_this_key.saturating_add(1);
         recs_out.fetch_add(1, Ordering::Relaxed);
+        if recs_this_key.is_multiple_of(MATERIALIZE_STATUS_CHECK_EVERY) {
+            let now = Instant::now();
+            let mut g = last_log.lock().unwrap();
+            if materialize_status_should_emit(
+                *g,
+                now,
+                MATERIALIZE_STATUS_INTERVAL,
+                recs_this_key,
+                false,
+            ) {
+                let pending = session
+                    .stream_creates_written()
+                    .saturating_sub(session.creates_written())
+                    as usize;
+                log_materialize_status(
+                    &mut g,
+                    session.keys_written(),
+                    session.creates_written(),
+                    pending,
+                    shard as u32,
+                    n_shards,
+                    total_recs,
+                    session.body_flush_ns,
+                    0,
+                    t0,
+                );
+            }
+        }
         Ok(())
     })?;
     session.finish_pack()
@@ -143,6 +235,8 @@ pub fn materialize_sh_shards(
     );
     let t0 = Instant::now();
     let recs_packed = Arc::new(AtomicU64::new(0));
+    let last_log = Arc::new(Mutex::new(None));
+    let total_recs: u64 = inputs.iter().map(|r| r.count).sum();
     let prior = ColdProgress::load(table.store_dir()).ok().flatten();
     let mut bump = table.alloc_bump();
     let mut live_creates = prior
@@ -151,14 +245,24 @@ pub fn materialize_sh_shards(
         .unwrap_or_else(|| table.entry_count());
     let mut live_keys = prior.as_ref().map(|p| p.keys_written).unwrap_or(0);
     let mut max_fk = 0u64;
-    let mut last_log = Instant::now();
 
     if workers <= 1 {
         for shard in resume_from..n_shards {
             if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
                 return Err(StoreError::Cancelled("scripthash shard pack"));
             }
-            let pack = pack_shard(table, inputs, &cuts, shard, cancel, recs_packed.as_ref())?;
+            let pack = pack_shard(
+                table,
+                inputs,
+                &cuts,
+                shard,
+                n_shards,
+                total_recs,
+                cancel,
+                recs_packed.as_ref(),
+                last_log.as_ref(),
+                t0,
+            )?;
             bump = publish_next(
                 table,
                 shard,
@@ -168,14 +272,30 @@ pub fn materialize_sh_shards(
                 &mut live_creates,
                 &mut max_fk,
             )?;
-            maybe_status(
-                &mut last_log,
-                t0,
-                live_keys,
-                live_creates,
-                shard + 1,
-                n_shards,
-            );
+            {
+                let mut g = last_log.lock().unwrap();
+                let done = shard + 1 == n_shards;
+                if materialize_status_should_emit(
+                    *g,
+                    Instant::now(),
+                    MATERIALIZE_STATUS_INTERVAL,
+                    1,
+                    done,
+                ) {
+                    log_materialize_status(
+                        &mut g,
+                        live_keys,
+                        live_creates,
+                        0,
+                        (shard + 1) as u32,
+                        n_shards,
+                        total_recs,
+                        0,
+                        t0.elapsed().as_nanos() as u64,
+                        t0,
+                    );
+                }
+            }
         }
         return Ok(ShShardMaterialize {
             creates: live_creates,
@@ -197,6 +317,7 @@ pub fn materialize_sh_shards(
         for _ in 0..workers {
             let shared = Arc::clone(&shared);
             let recs_packed = Arc::clone(&recs_packed);
+            let last_log = Arc::clone(&last_log);
             let cuts = &cuts;
             scope.spawn(move || {
                 set_thread_idle_io_priority();
@@ -216,7 +337,18 @@ pub fn materialize_sh_shards(
                     let Some(shard) = shard else {
                         break;
                     };
-                    match pack_shard(table, inputs, cuts, shard, cancel, recs_packed.as_ref()) {
+                    match pack_shard(
+                        table,
+                        inputs,
+                        cuts,
+                        shard,
+                        n_shards,
+                        total_recs,
+                        cancel,
+                        recs_packed.as_ref(),
+                        last_log.as_ref(),
+                        t0,
+                    ) {
                         Ok(pack) => {
                             shared.done.lock().unwrap().insert(shard, pack);
                             shared.cv.notify_all();
@@ -257,14 +389,30 @@ pub fn materialize_sh_shards(
                 &mut live_creates,
                 &mut max_fk,
             )?;
-            maybe_status(
-                &mut last_log,
-                t0,
-                live_keys,
-                live_creates,
-                shard + 1,
-                n_shards,
-            );
+            {
+                let mut g = last_log.lock().unwrap();
+                let done = shard + 1 == n_shards;
+                if materialize_status_should_emit(
+                    *g,
+                    Instant::now(),
+                    MATERIALIZE_STATUS_INTERVAL,
+                    1,
+                    done,
+                ) {
+                    log_materialize_status(
+                        &mut g,
+                        live_keys,
+                        live_creates,
+                        0,
+                        (shard + 1) as u32,
+                        n_shards,
+                        total_recs,
+                        0,
+                        t0.elapsed().as_nanos() as u64,
+                        t0,
+                    );
+                }
+            }
         }
         Ok(())
     })?;
@@ -293,24 +441,56 @@ struct ShardPool {
     cv: Condvar,
 }
 
-fn maybe_status(
-    last: &mut Instant,
-    t0: Instant,
-    keys: u64,
-    creates: u64,
-    next_shard: usize,
-    n_shards: usize,
-) {
-    let now = Instant::now();
-    if now.saturating_duration_since(*last) < Duration::from_secs(10) && next_shard < n_shards {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialize_status_emits_mid_key_after_interval() {
+        let interval = MATERIALIZE_STATUS_INTERVAL;
+        let t0 = Instant::now();
+        let t_due = t0 + interval;
+        assert!(
+            !materialize_status_should_emit(
+                Some(t0),
+                t0,
+                interval,
+                MATERIALIZE_STATUS_CHECK_EVERY,
+                false
+            ),
+            "must not emit before the wall interval"
+        );
+        assert!(
+            materialize_status_should_emit(Some(t0), t_due, interval, 1, true),
+            "key close after interval still emits"
+        );
+        assert!(
+            !materialize_status_should_emit(
+                Some(t0),
+                t_due,
+                interval,
+                MATERIALIZE_STATUS_CHECK_EVERY - 1,
+                false
+            ),
+            "mid-key off-stride must not clock every rec"
+        );
+        assert!(
+            materialize_status_should_emit(
+                Some(t0),
+                t_due,
+                interval,
+                MATERIALIZE_STATUS_CHECK_EVERY,
+                false
+            ),
+            "mid-key megakey after interval must heartbeat on the rec stride"
+        );
+        assert_eq!(
+            materialize_status_creates(92_697_818, 62_870_375),
+            155_568_193
+        );
+        assert_eq!(materialize_status_creates(u64::MAX, 8), u64::MAX);
+        let mut last = None;
+        log_materialize_status(&mut last, 1, 1, 0, 1, 4, 10, 0, 0, Instant::now());
+        assert!(last.is_some());
     }
-    *last = now;
-    let secs = t0.elapsed().as_secs_f64().max(1e-3);
-    rbitcoin_log::info!(
-        "node: scripthash materialize keys≈{keys} creates≈{creates} \
-         shards={next_shard}/{n_shards} rate≈{:.0}key/s elapsed={:?}",
-        keys as f64 / secs,
-        t0.elapsed()
-    );
 }

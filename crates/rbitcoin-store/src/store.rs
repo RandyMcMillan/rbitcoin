@@ -2573,6 +2573,7 @@ mod tests {
             drop(s);
             // Remove optional tables so open recreate branches run.
             let _ = std::fs::remove_file(dir.join("scripthash.body"));
+            let _ = std::fs::remove_dir_all(dir.join("scripthash.body"));
             let _ = std::fs::remove_dir_all(dir.join("scripthash.head"));
             let _ = std::fs::remove_file(dir.join("scripthash.head"));
             let _ = std::fs::remove_file(dir.join("header_txs_first.body"));

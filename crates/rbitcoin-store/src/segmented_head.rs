@@ -260,6 +260,17 @@ impl SegmentedTxHead {
             .sum()
     }
 
+    /// True when `tx.head/meta` records a non-zero segment count (no table open).
+    pub(crate) fn disk_occupied(store_dir: &Path) -> bool {
+        if !meta_path(store_dir).is_file() {
+            return false;
+        }
+        match read_meta(store_dir) {
+            Ok((_, segs)) => segs.iter().any(|s| s.count > 0),
+            Err(_) => true,
+        }
+    }
+
     /// Highest create_fk present in any segment (0 if empty).
     pub fn last_inserted_fk(&self) -> u64 {
         let segs = self.segments_snapshot();

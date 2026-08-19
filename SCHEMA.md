@@ -1,10 +1,10 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **durable**.  
-**Status:** 17 is the frozen on-disk layout. Further durable Class A / B / C
-byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).
-This freeze does **not** wipe a 17 datadir again. Stay on 17 until a listed
-18 change lands.
+**Version:** `SCHEMA_VERSION = 18` (`rbitcoin_primitives`).  
+**Status:** 18 changes **indexes only** (`tx.head`, `scripthash*`). Class A / C
+stay 17 bytes. A 17 datadir with populated `tx.head` or `scripthash*` is
+**refused** (wipe those dirs, keep Class A, restart to rebuild). Empty 17
+indexes rewrite `meta` to 18.
 
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
@@ -20,6 +20,9 @@ rematerialize). Sealed SH head/body kept only if pages are already delta
 (`ver=1`). Class A with 16-layout creates is refused the same as 15→17.
 Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
+**17→18 open:** If `tx.head` occupancy or any `scripthash*` data exists:
+`schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
+Empty 17 indexes rewrite `meta` to 18.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).

@@ -1689,11 +1689,7 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::Empty);
         }
         if n <= SH_INLINE_CAP as u32 {
-            return Ok(if n == 1 {
-                ShHeadValue::inline_one(live[0])
-            } else {
-                ShHeadValue::inline_two(live[0], live[1])
-            });
+            return Ok(ShHeadValue::inline_one(live[0]));
         }
         if n >= SH_MEGAKEY_MIN_FKS {
             let (first, last) = self.write_new_page_chain(body, alloc, live)?;
@@ -2531,11 +2527,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let val = if open.first_page.is_none() {
             let ents: Vec<ShEntry> = open.buf.iter().map(|&fk| ShEntry::new(Fk(fk))).collect();
             if n <= SH_INLINE_CAP as u32 {
-                if n == 1 {
-                    ShHeadValue::inline_one(ents[0])
-                } else {
-                    ShHeadValue::inline_two(ents[0], ents[1])
-                }
+                ShHeadValue::inline_one(ents[0])
             } else {
                 self.flush_body()?;
                 self.bulk_write_slab(&ents)?
@@ -3527,8 +3519,8 @@ mod tests {
         ));
         t.unlink_create(&sh, Fk(2), 2).unwrap();
         match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Inline { used, .. } => assert_eq!(used, 2),
-            other => panic!("expected inline demote, got {other:?}"),
+            ShHeadValue::Slab { used, .. } => assert_eq!(used, 2),
+            other => panic!("expected 2-fk slab, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3926,18 +3918,18 @@ mod tests {
         ));
         assert!(matches!(
             t.head_value(&sh(0x02)).unwrap().unwrap(),
-            ShHeadValue::Inline { used: 2, .. }
+            ShHeadValue::Slab { used: 2, .. }
         ));
         match t.head_value(&sh(0x06)).unwrap().unwrap() {
             ShHeadValue::Slab { class, used, .. } => {
-                assert_eq!(class, 0, "6 tight deltas fit class 0 (32 B)");
+                assert_eq!(class, 0, "6 tight deltas fit class 0 (16 B)");
                 assert_eq!(used, 6);
             }
             other => panic!("expected class-0 slab, got {other:?}"),
         }
         match t.head_value(&sh(0x14)).unwrap().unwrap() {
             ShHeadValue::Slab { class, used, .. } => {
-                assert_eq!(class, 0, "20 tight deltas fit class 0 (32 B)");
+                assert_eq!(class, 1, "20 tight deltas fit class 1 (32 B)");
                 assert_eq!(used, 20);
             }
             other => panic!("expected class-0 slab, got {other:?}"),
@@ -3946,7 +3938,7 @@ mod tests {
             ShHeadValue::Slab { class, used, .. } => {
                 assert_eq!(used, 600);
                 assert!(
-                    class <= 5,
+                    class <= 6,
                     "600 1-byte deltas stay in a relocating slab, class={class}"
                 );
             }
@@ -4173,7 +4165,7 @@ mod tests {
                 ShHeadValue::Slab { class, used, .. } => {
                     assert_eq!(used, n as u16);
                     assert!(
-                        class <= 4,
+                        class <= 5,
                         "300 1-byte deltas (~302 B payload) must not jump to pages; class={class}"
                     );
                 }

@@ -201,10 +201,8 @@ pub fn sh_encode_slab_head(class: u8, used: u16, off: u64) -> Result<[u8; 16], S
     if class > crate::scripthash_layout::SH_MAX_SLAB_CLASS {
         return Err(StoreError::Corrupt("scripthash slab head: class overflow"));
     }
-    if used < 3 {
-        return Err(StoreError::Corrupt(
-            "scripthash slab head: used < 3 (inline)",
-        ));
+    if used as usize <= crate::scripthash_layout::SH_INLINE_CAP {
+        return Err(StoreError::Corrupt("scripthash slab head: used is inline"));
     }
     let w0 = sh_pack_flagged(off)?;
     let packed = u64::from(used) | (u64::from(class) << 16);
@@ -234,10 +232,8 @@ pub fn sh_decode_slab_head(buf: &[u8; 16]) -> Result<(u8, u16, u64), StoreError>
             if class > crate::scripthash_layout::SH_MAX_SLAB_CLASS {
                 return Err(StoreError::Corrupt("scripthash slab head: class overflow"));
             }
-            if used < 3 {
-                return Err(StoreError::Corrupt(
-                    "scripthash slab head: used < 3 (inline)",
-                ));
+            if used as usize <= crate::scripthash_layout::SH_INLINE_CAP {
+                return Err(StoreError::Corrupt("scripthash slab head: used is inline"));
             }
             Ok((class, used, off))
         }
@@ -594,7 +590,7 @@ mod tests {
         let slab = sh_encode_slab_head(1, 5, 4096).unwrap();
         assert_eq!(sh_decode_slab_head(&slab).unwrap(), (1, 5, 4096));
         assert!(sh_encode_slab_head(1, 5, 0).is_err());
-        assert!(sh_encode_slab_head(1, 2, 4096).is_err());
+        assert!(sh_encode_slab_head(1, 1, 4096).is_err());
         assert!(sh_head_value_mode(SH_FLAG_BIT | 0, SH_FLAG_BIT | 5).is_err());
         // Paged: null first or last payload
         assert!(sh_head_value_mode(SH_FLAG_BIT | 0, 8192).is_err());

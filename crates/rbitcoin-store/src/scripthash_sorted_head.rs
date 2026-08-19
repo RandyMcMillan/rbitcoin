@@ -541,7 +541,7 @@ mod tests {
             "idx-only miss must pread the data page"
         );
 
-        let new_val = ShHeadValue::inline_two(ShEntry::new(Fk(1)), ShEntry::new(Fk(99)));
+        let new_val = ShHeadValue::slab(0, 2, 4096);
         assert!(h.update_value(&key_of(7), &new_val).unwrap());
         assert_eq!(h.get(&key_of(7)).unwrap().unwrap(), new_val);
         assert!(!h.update_value(&key_of(n + 1), &new_val).unwrap());

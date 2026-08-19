@@ -19,8 +19,8 @@ use rbitcoin_primitives::Fk;
 
 /// Body / page entry: create Class A fk only.
 pub const SH_ENTRY_LEN: usize = 8;
-/// Max create_tx_fks stored inline in the head value.
-pub const SH_INLINE_CAP: usize = 2;
+/// Max create_tx_fks stored inline in the head value (schema 18: 8 B word).
+pub const SH_INLINE_CAP: usize = 1;
 /// Head key length (prefix of Electrum SHA256(spk)).
 pub const SH_HEAD_KEY_LEN: usize = 16;
 /// Head value: two u64s.
@@ -38,14 +38,14 @@ pub const SH_PREFIX_PAGE: usize = 4096;
 /// SHAL field region after a 16 B RBT1 header (ends at [`SH_PREFIX_PAGE`]).
 pub const SH_ALLOC_HEADER_LEN: usize = SH_PREFIX_PAGE - 16;
 
-/// Legacy size-class constants (page freelist reuses class index for 4 KiB pages).
-/// Class 7: `4 << 7` entries × 8 B = 4096.
+/// Size-class constants (page freelist reuses class index for 4 KiB pages).
+/// `slab_bytes(c) = 16 << c`. Class 0 = 16 B; class 8 = 4096.
 pub const SH_SLAB_BASE: u32 = 4;
 pub const SH_MAX_CLASS: u8 = 24;
-/// Largest relocating geometric class (256 fks / 2 KiB). Class 7 is a page.
-pub const SH_MAX_SLAB_CLASS: u8 = 6;
+/// Largest relocating geometric class (2 KiB). Megakey is still `n ≥ 257` fks.
+pub const SH_MAX_SLAB_CLASS: u8 = 7;
 /// Slab class whose byte size equals one SH page ([`crate::scripthash_pages::SH_PAGE_SIZE`]).
-pub const SH_PAGE_SLAB_CLASS: u8 = 7;
+pub const SH_PAGE_SLAB_CLASS: u8 = 8;
 
 pub type ShHeadKey = [u8; SH_HEAD_KEY_LEN];
 
@@ -64,7 +64,7 @@ pub const fn slab_cap(class: u8) -> u32 {
 
 #[inline]
 pub const fn slab_bytes(class: u8) -> u64 {
-    slab_cap(class) as u64 * SH_ENTRY_LEN as u64
+    16u64 << class
 }
 
 /// One thin create: create_tx_fk only (vout recovered from Class A).
@@ -150,15 +150,9 @@ impl ShHeadValue {
                 } else {
                     0
                 };
-                let w1 = if *used >= 2 {
-                    entries[1].create_tx_fk.0
-                } else {
-                    0
-                };
                 debug_assert_eq!(w0 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
-                debug_assert_eq!(w1 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
                 out[0..8].copy_from_slice(&w0.to_le_bytes());
-                out[8..16].copy_from_slice(&w1.to_le_bytes());
+                out[8..16].copy_from_slice(&0u64.to_le_bytes());
             }
             ShHeadValue::Slab { class, used, off } => {
                 out = sh_encode_slab_head(*class, *used, *off)
@@ -196,14 +190,10 @@ impl ShHeadValue {
                 if e0.is_null() {
                     return Err(StoreError::Corrupt("inline null first fk"));
                 }
-                if sh_word_payload(w1) == 0 {
-                    return Ok(ShHeadValue::inline_one(e0));
+                if sh_word_payload(w1) != 0 {
+                    return Err(StoreError::Corrupt("schema 18 inline holds one fk"));
                 }
-                let e1 = ShEntry::new(Fk(sh_word_payload(w1)));
-                if e1.is_null() {
-                    return Err(StoreError::Corrupt("inline null second fk"));
-                }
-                Ok(ShHeadValue::inline_two(e0, e1))
+                Ok(ShHeadValue::inline_one(e0))
             }
             ShHeadValueMode::Slab => {
                 let (class, used, off) = sh_decode_slab_head(
@@ -229,13 +219,6 @@ impl ShHeadValue {
         let mut entries = [ShEntry::new(Fk::NULL); SH_INLINE_CAP];
         entries[0] = e;
         ShHeadValue::Inline { entries, used: 1 }
-    }
-
-    pub fn inline_two(e0: ShEntry, e1: ShEntry) -> Self {
-        ShHeadValue::Inline {
-            entries: [e0, e1],
-            used: 2,
-        }
     }
 
     pub fn paged(first_page: u64, last_page: u64) -> Self {
@@ -281,8 +264,7 @@ mod tests {
     #[test]
     fn head_value_roundtrip_inline_paged() {
         let e0 = ShEntry::new(Fk(3));
-        let e1 = ShEntry::new(Fk(4));
-        let inline = ShHeadValue::inline_two(e0, e1);
+        let inline = ShHeadValue::inline_one(e0);
         assert_eq!(ShHeadValue::decode(&inline.encode()).unwrap(), inline);
 
         let one = ShHeadValue::inline_one(e0);
@@ -372,7 +354,7 @@ mod tests {
         let one = ShHeadValue::inline_one(ShEntry::new(Fk(1)));
         assert_eq!(one.used(), 1);
         assert!(!one.is_paged());
-        let two = ShHeadValue::inline_two(ShEntry::new(Fk(1)), ShEntry::new(Fk(2)));
+        let two = ShHeadValue::slab(0, 2, 4096);
         assert_eq!(two.used(), 2);
         // used=0 inline encodes as empty words.
         let zero_inline = ShHeadValue::Inline {

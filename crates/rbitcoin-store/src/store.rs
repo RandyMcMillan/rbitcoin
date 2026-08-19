@@ -2207,7 +2207,6 @@ mod tests {
         write_store_meta_ver(&dir, 16);
         let s = Store::open(&dir).unwrap();
         drop(s);
-        assert_eq!(SCHEMA_VERSION, 17);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }

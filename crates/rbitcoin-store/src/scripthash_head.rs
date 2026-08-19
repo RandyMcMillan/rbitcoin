@@ -1613,7 +1613,7 @@ mod tests {
         let mut batch: Vec<(crate::scripthash_layout::ShHeadKey, ShHeadValue)> = Vec::new();
         batch.push((
             head_key_from_full(&existing[0]),
-            ShHeadValue::inline_two(ShEntry::new(Fk(1)), ShEntry::new(Fk(99))),
+            ShHeadValue::slab(0, 2, 4096),
         ));
         for i in 0..6u8 {
             let mut full = [0u8; 32];
@@ -1636,7 +1636,10 @@ mod tests {
         assert_eq!(h.slots(), 8, "no-rehash must not grow");
         // Update applied on the existing key.
         let v = h.get(&existing[0]).unwrap().unwrap();
-        assert_eq!(v.inline_fks(), vec![Fk(1), Fk(99)]);
+        match v {
+            ShHeadValue::Slab { used: 2, .. } => {}
+            other => panic!("expected 2-fk slab update, got {other:?}"),
+        }
         // Remainder keys are not on this head.
         for (hk, _) in &rem {
             let mut full = [0u8; 32];
@@ -1737,7 +1740,7 @@ mod tests {
             let mut key = [0u8; 32];
             key[0..8].copy_from_slice(&i.to_le_bytes());
             let val = if i % 3 == 0 {
-                ShHeadValue::inline_two(ShEntry::new(Fk(i + 1)), ShEntry::new(Fk(i + 100)))
+                ShHeadValue::slab(0, 2, 4096 + i)
             } else if i % 3 == 1 {
                 ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))
             } else {

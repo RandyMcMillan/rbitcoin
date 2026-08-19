@@ -235,18 +235,19 @@ mod tests {
             .block_queue_enqueue(42, [0xCDu8; 32], 7, &payload)
             .unwrap();
         assert_eq!(q.block_queue_stats().2, 1);
-        let all = q.block_queue_load_all().unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].id, id);
-        assert_eq!(all[0].height, 42);
-        assert_eq!(all[0].payload, payload);
+        let _ = id;
+        assert!(q.block_queue_has_height(42));
+        assert_eq!(
+            q.block_queue_payload(42).unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
         // Confirm-write hook: dequeue by height.
         assert_eq!(q.block_queue_dequeue_height(42).unwrap(), 1);
         assert_eq!(q.block_queue_stats().2, 0);
         // Restart: RAM queue is empty (by design — redownload, no double disk write).
         drop(q);
         let q2 = Query::open_or_create(dir.join("store")).unwrap();
-        assert_eq!(q2.block_queue_load_all().unwrap().len(), 0);
+        assert!(!q2.block_queue_has_height(42));
         assert_eq!(q2.block_queue_stats().2, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -266,10 +267,12 @@ mod tests {
         let n = q.block_queue_dequeue_height(1).unwrap();
         assert_eq!(n, 1);
         assert_eq!(q.block_queue_stats().2, 1);
-        let all = q.block_queue_load_all().unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].height, 2);
-        assert_eq!(all[0].payload, p2);
+        assert!(q.block_queue_has_height(2));
+        assert!(!q.block_queue_has_height(1));
+        assert_eq!(
+            q.block_queue_payload(2).unwrap().as_deref(),
+            Some(p2.as_slice())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -412,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_pack_snapshot_complete_and_not() {
+    fn block_queue_promote_marks_resolve_and_omits_missing() {
         use crate::ResolvedWire;
         use bitcoin::block::{Header, Version};
         use bitcoin::hashes::Hash;
@@ -439,15 +442,13 @@ mod tests {
         };
         q.block_queue_promote_wave(vec![(7, wire, 64)]).unwrap();
         q.block_queue_mark_resolve_complete(7).unwrap();
-        let snap = q.block_queue_pack_snapshot(&[7, 8, 9]);
-        assert_eq!(snap.len(), 2, "missing height 9 is omitted");
-        assert_eq!(snap[0].height, 7);
-        assert!(snap[0].resolve_complete);
-        assert!(snap[0].block.is_some());
-        assert_eq!(snap[0].hash, [7u8; 32]);
-        assert_eq!(snap[1].height, 8);
-        assert!(!snap[1].resolve_complete);
-        assert!(snap[1].block.is_none());
+        assert!(q.block_queue_is_resolve_complete(7));
+        assert!(q.block_queue_resolved(7).is_some());
+        assert_eq!(q.block_queue_hash_at_height(7), Some([7u8; 32]));
+        assert!(q.block_queue_has_height(8));
+        assert!(!q.block_queue_is_resolve_complete(8));
+        assert!(q.block_queue_resolved(8).is_none());
+        assert!(!q.block_queue_has_height(9));
         let _ = std::fs::remove_dir_all(dir);
     }
 

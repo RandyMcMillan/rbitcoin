@@ -23,7 +23,7 @@ mod tx_precompute;
 mod wave_prevout;
 
 pub use combined_stage::{body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate};
-pub use resolved_wire::{BlockQueuePackSnap, BlockQueueWaveIntake, ResolvedWire};
+pub use resolved_wire::{BlockQueueWaveIntake, ResolvedWire};
 pub use soft_densify::{
     soft_assign_restricted, soft_confirm_window_covered, soft_confirm_window_n,
     soft_densify_band_hi, BQ_SOFT_CONFIRM_SECS, BQ_SOFT_FREE_BYTES,
@@ -1688,15 +1688,6 @@ impl Query {
         g.unresolved_heights(start, skip, cap)
     }
 
-    /// Load all queued blocks **with full payloads** (tests / tools).
-    ///
-    /// Prefer [`Self::block_queue_list_meta`] for index walks and
-    /// [`Self::block_queue_payload`] for single-height prep.
-    pub fn block_queue_load_all(&self) -> Result<Vec<rbitcoin_store::QueuedBlock>, QueryError> {
-        let g = self.block_queue.lock().unwrap();
-        Ok(g.load_all()?)
-    }
-
     /// Body-queue intake: raw payload for `height` without dequeue.
     ///
     /// Empty after lookup promote (decoded lives in [`Self::block_queue_resolved`]).
@@ -1773,25 +1764,6 @@ impl Query {
     pub fn block_queue_is_resolve_complete(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();
         g.is_resolve_complete(height)
-    }
-
-    /// One BQ lock: stored hash + resolve-complete + promoted `Arc<Block>`
-    /// for each requested height that is still queued. Missing heights are
-    /// omitted (load treats them as body-missing).
-    pub fn block_queue_pack_snapshot(&self, heights: &[u32]) -> Vec<BlockQueuePackSnap> {
-        let g = self.block_queue.lock().unwrap();
-        g.pack_snapshot(heights)
-            .into_iter()
-            .map(|(height, hash, resolve_complete)| BlockQueuePackSnap {
-                height,
-                hash,
-                resolve_complete,
-                block: g
-                    .resolved
-                    .get(&height)
-                    .map(|w| std::sync::Arc::clone(&w.block)),
-            })
-            .collect()
     }
 
     /// One lock: classify `heights` as still-raw vs already promoted.

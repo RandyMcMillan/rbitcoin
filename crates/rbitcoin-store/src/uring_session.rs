@@ -5,6 +5,7 @@
 //! - plan head-resolve (confirm stamp / denserels)
 //! - spend annotate abs-meta RMW / pure pwrite
 //! - [`crate::bulk_io`] pread/pwrite batches and page RMW
+//! - k-way sorted-run merge (ahead pread, wait only on promote)
 //!
 //! Backends: Linux `io_uring`, portable [`crate::io_session_pool`] (Darwin
 //! default + `RBITCOIN_IO=pool`), Windows IOCP.
@@ -643,6 +644,8 @@ pub const KIND_SPEND_PAGE_WRITE: u8 = 8;
 pub const KIND_RMW_READ: u8 = 9;
 #[cfg(test)]
 pub const KIND_RMW_WRITE: u8 = 10;
+/// k-way merge cursor ahead pread (`sorted_run::RunCursor`).
+pub const KIND_MERGE_PREAD: u8 = 11;
 
 /// Pack `(kind, epoch, slot)` into `user_data`.
 ///
@@ -835,6 +838,7 @@ mod tests {
             KIND_SPEND_PAGE_WRITE,
             KIND_RMW_READ,
             KIND_RMW_WRITE,
+            KIND_MERGE_PREAD,
         ];
         let mut seen = std::collections::HashSet::new();
         for k in kinds {
@@ -1147,6 +1151,21 @@ mod tests {
             let kind = with_thread_local(32, |s| s.kind()).expect("tls pool");
             assert_eq!(kind, SessionKind::Pool);
         });
+    }
+
+    #[test]
+    fn pool_sessions_share_worker_threads() {
+        let n0 = crate::io_session_pool::spawned_workers();
+        let _a = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool a");
+        let n1 = crate::io_session_pool::spawned_workers();
+        let _b = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool b");
+        let n2 = crate::io_session_pool::spawned_workers();
+        assert!(n1 > 0, "first pool session must spawn workers");
+        assert_eq!(
+            n1, n2,
+            "second pool session must reuse the process worker set ({n0} → {n1} → {n2})"
+        );
+        assert!(n1 >= n0);
     }
 
     #[test]

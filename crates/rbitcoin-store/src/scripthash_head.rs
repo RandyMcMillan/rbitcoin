@@ -1313,6 +1313,16 @@ impl ShardedScriptHashHead {
         Ok(())
     }
 
+    /// Zero one OA shard (dir-variant resume of an unsealed hole).
+    pub fn reinit_shard(&self, shard: usize) -> Result<(), StoreError> {
+        let Some(s) = self.shards.get(shard) else {
+            return Err(StoreError::Corrupt(
+                "scripthash reinit_shard: shard out of range",
+            ));
+        };
+        s.reinit_empty()
+    }
+
     /// Occupied slot count for one shard (0 if OOB).
     pub fn shard_occupied(&self, shard: usize) -> u64 {
         self.shards.get(shard).map(|s| s.occupied()).unwrap_or(0)

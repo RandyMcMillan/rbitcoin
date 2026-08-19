@@ -19,6 +19,8 @@
 //! bodies are never scanned as orphans.
 
 use crate::error::StoreError;
+use crate::io_handle::IoHandle;
+use crate::uring_session::{self, UringSession};
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -650,24 +652,74 @@ pub fn lookup_key(run: &SortedRunPath, key: &[u8]) -> Result<Option<Vec<u8>>, St
 /// Read-ahead page for merge cursors (~256 KiB; many fixed-width records).
 const RUN_CURSOR_PAGE: usize = 256 * 1024;
 
+fn open_cursor_file(path: &Path) -> Result<File, StoreError> {
+    let mut o = OpenOptions::new();
+    o.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+        o.custom_flags(FILE_FLAG_OVERLAPPED);
+    }
+    o.open(path).map_err(|e| io_err(path, e))
+}
+
+fn pread_exact(
+    handle: IoHandle,
+    path: &Path,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), StoreError> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let rc = handle.pread(offset + done as u64, &mut buf[done..]);
+        if rc < 0 {
+            return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-rc)));
+        }
+        if rc == 0 {
+            return Err(StoreError::io(
+                path,
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "sorted run pread short"),
+            ));
+        }
+        done += rc as usize;
+    }
+    Ok(())
+}
+
+fn read_page_at(
+    handle: IoHandle,
+    path: &Path,
+    offset: u64,
+    buf: &mut [u8],
+    remaining_recs: u64,
+    rec_len: usize,
+) -> Result<usize, StoreError> {
+    let max_from_file = (remaining_recs as usize).saturating_mul(rec_len);
+    let to_read = (buf.len().min(max_from_file) / rec_len).saturating_mul(rec_len);
+    if to_read == 0 {
+        return Ok(0);
+    }
+    pread_exact(handle, path, offset, &mut buf[..to_read])?;
+    Ok(to_read)
+}
+
 /// Streaming cursor over a run (for merge).
-///
-/// Records are served from a block buffer (no per-record heap clone, no 40 B
-/// `read_exact` syscall). [`rec`] is a slice into the page, valid until the
-/// next [`fill_next`].
 struct RunCursor {
     file: File,
+    handle: IoHandle,
     path: PathBuf,
     remaining: u64,
     rec_len: usize,
-    /// Current page; record is `page[cur..cur+rec_len]`.
+    file_off: u64,
     page: Vec<u8>,
     page_len: usize,
     cur: usize,
     next: usize,
-    /// Next file page, filled when the current page is first consumed.
     ahead: Vec<u8>,
     ahead_len: usize,
+    /// Inflight ahead pread length; `0` when idle or ready.
+    ahead_want: usize,
 }
 
 impl RunCursor {
@@ -701,43 +753,30 @@ impl RunCursor {
         }
         let start = first_idx.min(run.count);
         let remaining = count.min(run.count.saturating_sub(start));
-        let mut file = File::open(&run.path).map_err(|e| io_err(&run.path, e))?;
-        let off = HEADER_LEN as u64 + start.saturating_mul(rec_len as u64);
-        file.seek(SeekFrom::Start(off))
-            .map_err(|e| io_err(&run.path, e))?;
+        let file = open_cursor_file(&run.path)?;
+        let handle = IoHandle::from_file(&file);
+        let file_off = HEADER_LEN as u64 + start.saturating_mul(rec_len as u64);
         let page_cap = page_bytes
             .max(rec_len)
             .div_ceil(rec_len)
             .saturating_mul(rec_len);
-        Ok(Self {
+        let cur = Self {
             file,
+            handle,
             path: run.path.clone(),
             remaining,
             rec_len,
+            file_off,
             page: vec![0u8; page_cap],
             page_len: 0,
             cur: 0,
             next: 0,
             ahead: vec![0u8; page_cap],
             ahead_len: 0,
-        })
-    }
-
-    fn read_page_buf(
-        file: &mut File,
-        path: &Path,
-        buf: &mut [u8],
-        remaining: u64,
-        rec_len: usize,
-    ) -> Result<usize, StoreError> {
-        let max_from_file = (remaining as usize).saturating_mul(rec_len);
-        let to_read = (buf.len().min(max_from_file) / rec_len).saturating_mul(rec_len);
-        if to_read == 0 {
-            return Ok(0);
-        }
-        file.read_exact(&mut buf[..to_read])
-            .map_err(|e| io_err(path, e))?;
-        Ok(to_read)
+            ahead_want: 0,
+        };
+        cur.advise_willneed();
+        Ok(cur)
     }
 
     fn advise_willneed(&self) {
@@ -750,27 +789,75 @@ impl RunCursor {
         }
     }
 
-    fn prefetch_ahead(&mut self) -> Result<(), StoreError> {
-        if self.ahead_len > 0 {
-            return Ok(());
-        }
+    fn file_recs_left(&self) -> u64 {
         let unread_in_page = (self.page_len.saturating_sub(self.next)) / self.rec_len;
-        let file_left = self.remaining.saturating_sub(unread_in_page as u64);
-        if file_left == 0 {
+        self.remaining.saturating_sub(unread_in_page as u64)
+    }
+
+    fn ahead_to_read(&self) -> usize {
+        let file_left = self.file_recs_left();
+        let max_from_file = (file_left as usize).saturating_mul(self.rec_len);
+        (self.ahead.len().min(max_from_file) / self.rec_len).saturating_mul(self.rec_len)
+    }
+
+    fn complete_ahead(&mut self, res: i32) -> Result<(), StoreError> {
+        if self.ahead_want == 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: merge ahead cqe without submit",
+            ));
+        }
+        uring_session::require_full_cqe(res, self.ahead_want, &self.path)?;
+        self.ahead_len = self.ahead_want;
+        self.ahead_want = 0;
+        Ok(())
+    }
+
+    fn try_submit_ahead(
+        &mut self,
+        session: &mut UringSession,
+        slot: u32,
+    ) -> Result<bool, StoreError> {
+        if self.ahead_want > 0 || self.ahead_len > 0 {
+            return Ok(false);
+        }
+        let want = self.ahead_to_read();
+        if want == 0 {
+            return Ok(false);
+        }
+        if session.free_sq() == 0 {
+            return Ok(false);
+        }
+        let ud = uring_session::pack_ud(uring_session::KIND_MERGE_PREAD, session.epoch(), slot);
+        session.push_pread(self.handle, self.file_off, &mut self.ahead[..want], ud)?;
+        self.file_off += want as u64;
+        self.ahead_want = want;
+        Ok(true)
+    }
+
+    fn prefetch_ahead_blocking(&mut self) -> Result<(), StoreError> {
+        if self.ahead_want > 0 || self.ahead_len > 0 {
             return Ok(());
         }
-        self.advise_willneed();
-        self.ahead_len = Self::read_page_buf(
-            &mut self.file,
+        let file_left = self.file_recs_left();
+        let n = read_page_at(
+            self.handle,
             &self.path,
+            self.file_off,
             &mut self.ahead,
             file_left,
             self.rec_len,
         )?;
+        self.file_off += n as u64;
+        self.ahead_len = n;
         Ok(())
     }
 
     fn promote_ahead(&mut self) -> Result<(), StoreError> {
+        if self.ahead_want > 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: promote while ahead inflight",
+            ));
+        }
         if self.ahead_len >= self.rec_len {
             std::mem::swap(&mut self.page, &mut self.ahead);
             self.page_len = self.ahead_len;
@@ -786,19 +873,23 @@ impl RunCursor {
         self.page_len = leftover;
         self.next = 0;
         self.cur = 0;
+        let unread_in_page = leftover / self.rec_len;
+        let file_left = self.remaining.saturating_sub(unread_in_page as u64);
         let start = self.page_len;
-        let n = Self::read_page_buf(
-            &mut self.file,
+        let n = read_page_at(
+            self.handle,
             &self.path,
+            self.file_off,
             &mut self.page[start..],
-            self.remaining,
+            file_left,
             self.rec_len,
         )?;
+        self.file_off += n as u64;
         self.page_len = start + n;
         Ok(())
     }
 
-    /// Advance to the next record. Returns false at EOF.
+    /// Advance to the next record without a completion session.
     fn fill_next(&mut self) -> Result<bool, StoreError> {
         if self.remaining == 0 {
             return Ok(false);
@@ -810,7 +901,7 @@ impl RunCursor {
                     "sorted run: short read on merge cursor",
                 ));
             }
-            self.prefetch_ahead()?;
+            self.prefetch_ahead_blocking()?;
         }
         self.cur = self.next;
         self.next += self.rec_len;
@@ -822,6 +913,103 @@ impl RunCursor {
     fn rec(&self) -> &[u8] {
         &self.page[self.cur..self.cur + self.rec_len]
     }
+}
+
+fn harvest_merge_cqes(
+    session: &mut UringSession,
+    cursors: &mut [Option<RunCursor>],
+) -> Result<(), StoreError> {
+    let cqes = session.harvest_ready()?;
+    for (ud, res) in cqes {
+        let (kind, _epoch, slot) = uring_session::unpack_ud(ud);
+        if kind != uring_session::KIND_MERGE_PREAD {
+            return Err(StoreError::Corrupt("invariant: merge cqe kind"));
+        }
+        let i = slot as usize;
+        let Some(c) = cursors.get_mut(i).and_then(|o| o.as_mut()) else {
+            return Err(StoreError::Corrupt("invariant: merge cqe slot"));
+        };
+        c.complete_ahead(res)?;
+    }
+    Ok(())
+}
+
+fn wait_ahead(
+    session: &mut UringSession,
+    cursors: &mut [Option<RunCursor>],
+    idx: usize,
+) -> Result<(), StoreError> {
+    loop {
+        harvest_merge_cqes(session, cursors)?;
+        let inflight = cursors
+            .get(idx)
+            .and_then(|o| o.as_ref())
+            .is_some_and(|c| c.ahead_want > 0);
+        if !inflight {
+            return Ok(());
+        }
+        session.submit_and_wait_one()?;
+    }
+}
+
+fn try_submit_ahead_at(
+    cursors: &mut [Option<RunCursor>],
+    idx: usize,
+    session: &mut UringSession,
+) -> Result<bool, StoreError> {
+    if session.free_sq() == 0 {
+        harvest_merge_cqes(session, cursors)?;
+        if session.free_sq() == 0 {
+            return Ok(false);
+        }
+    }
+    let Some(c) = cursors.get_mut(idx).and_then(|o| o.as_mut()) else {
+        return Ok(false);
+    };
+    c.try_submit_ahead(session, idx as u32)
+}
+
+fn fill_next_at(
+    cursors: &mut [Option<RunCursor>],
+    idx: usize,
+    session: &mut UringSession,
+) -> Result<bool, StoreError> {
+    let remaining = match cursors.get(idx).and_then(|o| o.as_ref()) {
+        Some(c) => c.remaining,
+        None => return Ok(false),
+    };
+    if remaining == 0 {
+        return Ok(false);
+    }
+    let need_promote = {
+        let c = cursors[idx].as_ref().unwrap();
+        c.next + c.rec_len > c.page_len
+    };
+    if need_promote {
+        wait_ahead(session, cursors, idx)?;
+        cursors[idx].as_mut().unwrap().promote_ahead()?;
+        let short = {
+            let c = cursors[idx].as_ref().unwrap();
+            c.next + c.rec_len > c.page_len
+        };
+        if short {
+            return Err(StoreError::Corrupt(
+                "sorted run: short read on merge cursor",
+            ));
+        }
+        if try_submit_ahead_at(cursors, idx, session)? {
+            session.submit()?;
+        }
+    }
+    let c = cursors[idx].as_mut().unwrap();
+    c.cur = c.next;
+    c.next += c.rec_len;
+    c.remaining -= 1;
+    Ok(true)
+}
+
+fn merge_session_entries(k: usize) -> u32 {
+    (k as u32).max(uring_session::DEFAULT_ENTRIES).min(4096)
 }
 
 const MERGE_SENTINEL: usize = usize::MAX;
@@ -1094,20 +1282,34 @@ pub fn for_each_merged_rec_opts(
     verify_crc: bool,
     on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
+    for_each_merged_rec_paged(inputs, verify_crc, RUN_CURSOR_PAGE, on_rec)
+}
+
+fn for_each_merged_rec_paged(
+    inputs: &[SortedRunPath],
+    verify_crc: bool,
+    page_bytes: usize,
+    on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     if inputs.is_empty() {
         return Ok(());
     }
     let (key_len, rec_len) = merge_lens(inputs)?;
-    let mut cursors = Vec::with_capacity(inputs.len());
-    for run in inputs {
-        let mut cursor = RunCursor::open(run, verify_crc)?;
-        if cursor.fill_next()? {
-            cursors.push(Some(cursor));
-        } else {
-            cursors.push(None);
+    let n = merge_session_entries(inputs.len());
+    let open = || -> Result<Vec<Option<RunCursor>>, StoreError> {
+        let mut cursors = Vec::with_capacity(inputs.len());
+        for run in inputs {
+            let c = RunCursor::open_range_paged(run, 0, run.count, verify_crc, page_bytes)?;
+            cursors.push(if c.remaining == 0 { None } else { Some(c) });
         }
+        Ok(cursors)
+    };
+    if crate::bulk_io::io_uring_enabled() {
+        return uring_session::with_thread_local(n, |s| {
+            merge_cursors(Some(s), open()?, key_len, rec_len, on_rec)
+        })?;
     }
-    merge_cursors(cursors, key_len, rec_len, on_rec)
+    merge_cursors(None, open()?, key_len, rec_len, on_rec)
 }
 
 /// k-way merge of one prefix shard's slices (`cuts[run][shard]..cuts[run][shard+1]`).
@@ -1125,26 +1327,31 @@ pub fn for_each_merged_rec_shard(
         return Err(StoreError::Corrupt("sorted run: shard cuts len mismatch"));
     }
     let (key_len, rec_len) = merge_lens(inputs)?;
-    let mut cursors = Vec::with_capacity(inputs.len());
-    for (idx, run) in inputs.iter().enumerate() {
-        let starts = &cuts[idx];
-        if shard + 1 >= starts.len() {
-            return Err(StoreError::Corrupt("sorted run: shard cut out of range"));
+    let n = merge_session_entries(inputs.len());
+    let open = || -> Result<Vec<Option<RunCursor>>, StoreError> {
+        let mut cursors = Vec::with_capacity(inputs.len());
+        for (idx, run) in inputs.iter().enumerate() {
+            let starts = &cuts[idx];
+            if shard + 1 >= starts.len() {
+                return Err(StoreError::Corrupt("sorted run: shard cut out of range"));
+            }
+            let lo = starts[shard];
+            let count = starts[shard + 1].saturating_sub(lo);
+            if count == 0 {
+                cursors.push(None);
+                continue;
+            }
+            let c = RunCursor::open_range(run, lo, count, verify_crc)?;
+            cursors.push(if c.remaining == 0 { None } else { Some(c) });
         }
-        let lo = starts[shard];
-        let count = starts[shard + 1].saturating_sub(lo);
-        if count == 0 {
-            cursors.push(None);
-            continue;
-        }
-        let mut cursor = RunCursor::open_range(run, lo, count, verify_crc)?;
-        if cursor.fill_next()? {
-            cursors.push(Some(cursor));
-        } else {
-            cursors.push(None);
-        }
+        Ok(cursors)
+    };
+    if crate::bulk_io::io_uring_enabled() {
+        return uring_session::with_thread_local(n, |s| {
+            merge_cursors(Some(s), open()?, key_len, rec_len, on_rec)
+        })?;
     }
-    merge_cursors(cursors, key_len, rec_len, on_rec)
+    merge_cursors(None, open()?, key_len, rec_len, on_rec)
 }
 
 fn merge_lens(inputs: &[SortedRunPath]) -> Result<(usize, u32), StoreError> {
@@ -1159,7 +1366,24 @@ fn merge_lens(inputs: &[SortedRunPath]) -> Result<(usize, u32), StoreError> {
 }
 
 fn merge_cursors(
+    session: Option<&mut UringSession>,
     mut cursors: Vec<Option<RunCursor>>,
+    key_len: usize,
+    rec_len: u32,
+    on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    match session {
+        Some(s) => {
+            let mut s = s.drain_guard();
+            merge_cursors_inner(Some(&mut *s), &mut cursors, key_len, rec_len, on_rec)
+        }
+        None => merge_cursors_inner(None, &mut cursors, key_len, rec_len, on_rec),
+    }
+}
+
+fn merge_cursors_inner(
+    mut session: Option<&mut UringSession>,
+    cursors: &mut [Option<RunCursor>],
     key_len: usize,
     rec_len: u32,
     mut on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
@@ -1167,8 +1391,33 @@ fn merge_cursors(
     if cursors.is_empty() {
         return Ok(());
     }
+    if let Some(s) = session.as_mut() {
+        s.begin_batch();
+        let mut pushed = false;
+        for i in 0..cursors.len() {
+            if cursors[i].is_some() && try_submit_ahead_at(cursors, i, s)? {
+                pushed = true;
+            }
+        }
+        if pushed {
+            s.submit()?;
+        }
+    }
+    for i in 0..cursors.len() {
+        if cursors[i].is_none() {
+            continue;
+        }
+        let more = if let Some(s) = session.as_mut() {
+            fill_next_at(cursors, i, s)?
+        } else {
+            cursors[i].as_mut().unwrap().fill_next()?
+        };
+        if !more {
+            cursors[i] = None;
+        }
+    }
     let k = cursors.len();
-    let mut tree = LoserTree::new(&cursors, key_len);
+    let mut tree = LoserTree::new(cursors, key_len);
     let mut prev_buf = [0u8; 40];
     let mut prev_len = 0usize;
     let mut prev_vec: Option<Vec<u8>> = None;
@@ -1197,11 +1446,15 @@ fn merge_cursors(
                 }
             }
         }
-        let more = cursors[w].as_mut().unwrap().fill_next()?;
+        let more = if let Some(s) = session.as_mut() {
+            fill_next_at(cursors, w, s)?
+        } else {
+            cursors[w].as_mut().unwrap().fill_next()?
+        };
         if !more {
             cursors[w] = None;
         }
-        tree.replay(&cursors, w, key_len);
+        tree.replay(cursors, w, key_len);
     }
     Ok(())
 }
@@ -1271,16 +1524,8 @@ pub fn merge_runs_to_file_with_policy(
             .map_err(|e| io_err(&tmp, e))?;
         let hdr = [0u8; HEADER_LEN];
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
-        let mut cursors = Vec::with_capacity(inputs.len());
-        for run in inputs {
-            let mut cursor = RunCursor::open(run, verify_crc)?;
-            if cursor.fill_next()? {
-                cursors.push(Some(cursor));
-            } else {
-                cursors.push(None);
-            }
-        }
-        merge_cursors(cursors, key_len, rec_len, |rec| {
+        let n = merge_session_entries(inputs.len());
+        let on_rec = |rec: &[u8]| -> Result<(), StoreError> {
             f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
             if track_fk && rec.len() >= 40 {
                 let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
@@ -1300,7 +1545,22 @@ pub fn merge_runs_to_file_with_policy(
                 }
             }
             Ok(())
-        })?;
+        };
+        let open_cursors = || -> Result<Vec<Option<RunCursor>>, StoreError> {
+            let mut cursors = Vec::with_capacity(inputs.len());
+            for run in inputs {
+                let c = RunCursor::open(run, verify_crc)?;
+                cursors.push(if c.remaining == 0 { None } else { Some(c) });
+            }
+            Ok(cursors)
+        };
+        if crate::bulk_io::io_uring_enabled() {
+            uring_session::with_thread_local(n, |s| {
+                merge_cursors(Some(s), open_cursors()?, key_len, rec_len, on_rec)
+            })??;
+        } else {
+            merge_cursors(None, open_cursors()?, key_len, rec_len, on_rec)?;
+        }
         body_crc ^= 0xFFFF_FFFF;
         f.seek(SeekFrom::Start(0)).map_err(|e| io_err(&tmp, e))?;
         let mut hdr = [0u8; HEADER_LEN];
@@ -2364,6 +2624,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got, expected);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn kway_merge_submits_ahead_preads_on_session() {
+        use crate::uring_session::{
+            test_take_last_sqe_lens, with_forced_session_kind, SessionKind,
+        };
+        let d = tmp_dir();
+        let rec_len = 40usize;
+        let page = rec_len * 2;
+        let n_recs = 24u8;
+        let mut runs = Vec::new();
+        for r in 0..3u8 {
+            let mut body = Vec::new();
+            for i in 0..n_recs {
+                body.extend_from_slice(&sh_rec(r.saturating_mul(10) + i, u64::from(i)));
+            }
+            let path = d.join(format!("00000{r}.run"));
+            write_sorted_run(&path, 40, 40, &body).unwrap();
+            runs.push(open_run(&path).unwrap());
+        }
+        let _ = test_take_last_sqe_lens();
+        let mut got = 0u64;
+        with_forced_session_kind(SessionKind::Pool, || {
+            super::for_each_merged_rec_paged(&runs, false, page, |_| {
+                got += 1;
+                Ok(())
+            })
+            .unwrap();
+        });
+        let lens = test_take_last_sqe_lens();
+        assert!(
+            !lens.is_empty(),
+            "k-way merge must submit ahead preads on the TLS session"
+        );
+        assert!(
+            lens.iter()
+                .all(|&n| n > 0 && (n as usize).is_multiple_of(rec_len)),
+            "ahead preads must be rec-aligned, got {lens:?}"
+        );
+        assert_eq!(got, u64::from(n_recs) * 3);
         let _ = fs::remove_dir_all(&d);
     }
 

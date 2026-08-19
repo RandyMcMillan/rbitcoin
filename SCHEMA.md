@@ -526,10 +526,12 @@ detects files; it does **not** rewrite a file body into a directory.
 
 New `Store::create` writes the dir variant. An old 17 binary that
 `TableFile::open("scripthash.body")` on a directory fails that open
-(not a silent misread). ColdProgress `SHCOLDP1` is unchanged:
-`body_bump` is the shared HWM on the file variant; the dir variant
-ignores it (each file has its own SHAL). Overflow compact still
-merges **heads only** — all ovf keys share `scripthash.ovf/body`.
+(not a silent misread). ColdProgress `SHCOLDP1` bytes are unchanged:
+`body_bump` is the shared HWM on the file variant. On the dir variant
+`next_shard` is the **lowest unsealed** main shard (holes after it
+stay); sealed `scripthash.head/NN` is the per-shard commit. Overflow
+compact still merges **heads only** — all ovf keys share
+`scripthash.ovf/body`.
 
 - Combined prefix: RBT1 at 0–15, SHAL v3 fields at 16–4095, **payload at 4096**.
   Small slabs pack from bump with **no** 4 KiB align. Megakey pages 4 KiB-align

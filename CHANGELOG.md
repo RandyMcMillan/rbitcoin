@@ -30,6 +30,20 @@ before 1.0).
   Legacy file `scripthash.body` stays one writer (`workers=1` for pack).
   No temp `pack*.body`. No extra 64-file catalog pass.
   `RBITCOIN_SH_MERGE_WORKERS=1` stays the serial oracle.
+  Status is a 10 s observer of global pack/seal counters
+  (`keys` / `creates` / unpublished `pending` / `shards` sealed /
+  `rate`) rather than a per-worker session log.
+  On the dir variant each pack worker seals its own `head/NN` (no
+  ordered publisher). SIGINT keeps sealed holes; resume packs only
+  unsealed shards. Shared file body stays prefix `SHCOLDP1`. Pack
+  threads use default IO priority — tip materialize is the work.
+  Pack streams `head/NN.part` (no in-RAM rec vec). Class A recollect
+  walks `txout` fk-spans, not per-fk get. Seal progress uses observer
+  atomics (not `entry_count()`). Sealed-main lookup is per-shard
+  `RwLock` (not one process mutex). k-way merge submits 256 KiB ahead
+  pages on the pack thread's TLS completion session (`io_uring` /
+  process-shared `pool` / IOCP) and waits only if that page is still
+  inflight at promote; `RBITCOIN_IO=pread` stays blocking.
 
 - **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the
   decode-time `pres` Arc; `confirm_wire_lookup_stamp` must not `from_tx`

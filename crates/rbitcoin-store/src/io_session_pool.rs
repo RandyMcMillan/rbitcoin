@@ -3,13 +3,25 @@
 //! Same harvest contract as io_uring (`user_data`, drain, in-flight cap).
 //! Darwin's file AIO is a thread pool; this is the honest session there and
 //! the Linux CI pin (`RBITCOIN_IO=pool`).
+//!
+//! Workers are **process-shared**. Each [`PoolEngine`] is a session handle
+//! with its own CQE queue so harvest does not steal another thread's
+//! completions.
 
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+
+static SPAWNED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_POOL: OnceLock<Arc<SharedPool>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn spawned_workers() -> usize {
+    SPAWNED_WORKERS.load(Ordering::Relaxed)
+}
 
 struct Job {
     handle: IoHandle,
@@ -18,48 +30,61 @@ struct Job {
     len: usize,
     user_data: u64,
     write: bool,
+    cq: Arc<SessionCq>,
 }
 
 // SAFETY: the machine thread keeps `ptr` live until the matching CQE is harvested.
 unsafe impl Send for Job {}
 
-struct Shared {
-    jobs: Mutex<VecDeque<Job>>,
-    job_cv: Condvar,
+struct SessionCq {
     cqes: Mutex<VecDeque<(u64, i32)>>,
     cqe_cv: Condvar,
+    inflight: AtomicUsize,
+}
+
+struct SharedPool {
+    jobs: Mutex<VecDeque<Job>>,
+    job_cv: Condvar,
     shutdown: AtomicBool,
-    /// Jobs popped by a worker and not yet pushed to `cqes`.
-    running: AtomicUsize,
+}
+
+fn global_pool(n_workers: usize) -> Arc<SharedPool> {
+    GLOBAL_POOL
+        .get_or_init(|| {
+            let n = n_workers.clamp(1, 16);
+            let pool = Arc::new(SharedPool {
+                jobs: Mutex::new(VecDeque::new()),
+                job_cv: Condvar::new(),
+                shutdown: AtomicBool::new(false),
+            });
+            for _ in 0..n {
+                let sh = Arc::clone(&pool);
+                thread::Builder::new()
+                    .name("rbtc-io-pool".into())
+                    .spawn(move || worker_loop(sh))
+                    .expect("spawn io pool worker");
+                SPAWNED_WORKERS.fetch_add(1, Ordering::Relaxed);
+            }
+            pool
+        })
+        .clone()
 }
 
 pub(crate) struct PoolEngine {
-    shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
+    pool: Arc<SharedPool>,
+    cq: Arc<SessionCq>,
 }
 
 impl PoolEngine {
     pub(crate) fn open(n_workers: usize) -> Self {
-        let n = n_workers.clamp(1, 16);
-        let shared = Arc::new(Shared {
-            jobs: Mutex::new(VecDeque::new()),
-            job_cv: Condvar::new(),
-            cqes: Mutex::new(VecDeque::new()),
-            cqe_cv: Condvar::new(),
-            shutdown: AtomicBool::new(false),
-            running: AtomicUsize::new(0),
-        });
-        let mut workers = Vec::with_capacity(n);
-        for _ in 0..n {
-            let sh = Arc::clone(&shared);
-            workers.push(
-                thread::Builder::new()
-                    .name("rbtc-io-pool".into())
-                    .spawn(move || worker_loop(sh))
-                    .expect("spawn io pool worker"),
-            );
+        Self {
+            pool: global_pool(n_workers),
+            cq: Arc::new(SessionCq {
+                cqes: Mutex::new(VecDeque::new()),
+                cqe_cv: Condvar::new(),
+                inflight: AtomicUsize::new(0),
+            }),
         }
-        Self { shared, workers }
     }
 
     pub(crate) fn push_pread(
@@ -108,8 +133,9 @@ impl PoolEngine {
         if len == 0 {
             return Ok(());
         }
+        self.cq.inflight.fetch_add(1, Ordering::AcqRel);
         {
-            let mut q = self.shared.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = self.pool.jobs.lock().unwrap_or_else(|e| e.into_inner());
             q.push_back(Job {
                 handle,
                 offset,
@@ -117,62 +143,34 @@ impl PoolEngine {
                 len,
                 user_data,
                 write,
+                cq: Arc::clone(&self.cq),
             });
         }
-        self.shared.job_cv.notify_one();
+        self.pool.job_cv.notify_one();
         Ok(())
     }
 
     pub(crate) fn harvest_ready(&self) -> Vec<(u64, i32)> {
-        let mut q = self.shared.cqes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.cq.cqes.lock().unwrap_or_else(|e| e.into_inner());
         q.drain(..).collect()
     }
 
     pub(crate) fn wait_one_cqe(&self) {
-        let mut q = self.shared.cqes.lock().unwrap_or_else(|e| e.into_inner());
-        while q.is_empty() && !self.idle() {
-            q = self
-                .shared
-                .cqe_cv
-                .wait(q)
-                .unwrap_or_else(|e| e.into_inner());
+        let mut q = self.cq.cqes.lock().unwrap_or_else(|e| e.into_inner());
+        while q.is_empty() && self.cq.inflight.load(Ordering::Acquire) != 0 {
+            q = self.cq.cqe_cv.wait(q).unwrap_or_else(|e| e.into_inner());
         }
-    }
-
-    fn idle(&self) -> bool {
-        let jobs = self
-            .shared
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty();
-        jobs && self.shared.running.load(Ordering::Acquire) == 0
     }
 
     pub(crate) fn wait_idle(&self) {
-        let mut q = self.shared.cqes.lock().unwrap_or_else(|e| e.into_inner());
-        while !self.idle() {
-            q = self
-                .shared
-                .cqe_cv
-                .wait(q)
-                .unwrap_or_else(|e| e.into_inner());
+        let mut q = self.cq.cqes.lock().unwrap_or_else(|e| e.into_inner());
+        while self.cq.inflight.load(Ordering::Acquire) != 0 {
+            q = self.cq.cqe_cv.wait(q).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
 
-impl Drop for PoolEngine {
-    fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.job_cv.notify_all();
-        self.shared.cqe_cv.notify_all();
-        for h in self.workers.drain(..) {
-            let _ = h.join();
-        }
-    }
-}
-
-fn worker_loop(shared: Arc<Shared>) {
+fn worker_loop(shared: Arc<SharedPool>) {
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
             return;
@@ -184,10 +182,6 @@ fn worker_loop(shared: Arc<Shared>) {
                     return;
                 }
                 if let Some(j) = q.pop_front() {
-                    // Count as in-flight *before* releasing jobs so idle()
-                    // cannot see empty+running==0 between pop and the old
-                    // post-unlock increment (drain would Corrupt / UAF).
-                    shared.running.fetch_add(1, Ordering::AcqRel);
                     break j;
                 }
                 q = shared.job_cv.wait(q).unwrap_or_else(|e| e.into_inner());
@@ -200,10 +194,10 @@ fn worker_loop(shared: Arc<Shared>) {
             job.handle.pread(job.offset, buf)
         };
         {
-            let mut cq = shared.cqes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cq = job.cq.cqes.lock().unwrap_or_else(|e| e.into_inner());
             cq.push_back((job.user_data, res));
+            job.cq.inflight.fetch_sub(1, Ordering::AcqRel);
         }
-        shared.running.fetch_sub(1, Ordering::AcqRel);
-        shared.cqe_cv.notify_all();
+        job.cq.cqe_cv.notify_all();
     }
 }

@@ -467,6 +467,16 @@ impl Store {
         self.txs.get_meta_and_outputs(fk)
     }
 
+    /// Class A outputs for create_fks `first..=last` from a coalesced body span.
+    pub fn for_each_create_outs_in_fk_span(
+        &self,
+        first: u64,
+        last: u64,
+        f: impl FnMut(Fk, &[OutputRecord]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.txs.for_each_outs_in_fk_span(first, last, f)
+    }
+
     /// Load: meta + input prevouts only (no script/output allocation).
     pub fn get_tx_meta_and_prevouts(
         &self,
@@ -1487,6 +1497,13 @@ mod tests {
         assert_eq!(s.get_tx_full(create_fk).unwrap().0.txid, [10u8; 32]);
         assert_eq!(s.get_tx_meta_and_prevouts(create_fk).unwrap().1.len(), 1);
         assert_eq!(s.get_tx_meta_and_outputs_at(off, len).unwrap().1.len(), 2);
+        let mut span_n = 0usize;
+        s.for_each_create_outs_in_fk_span(create_fk.0, create_fk.0, |_fk, outs| {
+            span_n = outs.len();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(span_n, 2, "fk-span scan must match per-fk outs");
         assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
         assert_eq!(s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0, create_fk);
 

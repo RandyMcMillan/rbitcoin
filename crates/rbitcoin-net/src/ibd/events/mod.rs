@@ -169,8 +169,14 @@ pub(crate) fn apply_peer_event(
                     })
                 });
                 if let Some(h) = height {
-                    if !st.hash_height.contains_key(&hash) {
-                        st.record_height(hash, h);
+                    let tip = hub.tip_height().zip(hub.tip_hash());
+                    let on_path = st.try_set_path_slot(hash, h, prev, tip);
+                    if !on_path {
+                        if let Some(&cur) = st.height_to_hash.get(&h) {
+                            if cur != hash {
+                                st.reorg.register_explore(std::iter::once(hash), Some(hash));
+                            }
+                        }
                     }
                     st.max_peer_height = st.max_peer_height.max(h);
                     st.max_ordered_height = st.max_ordered_height.max(h);
@@ -200,6 +206,12 @@ pub(crate) fn apply_peer_event(
                 st.known_headers.insert(hash);
                 // Offer needs a height (ht==tip+1); unknown-height used to stall tip silently.
                 if !st.hash_height.contains_key(&hash) {
+                    continue;
+                }
+                let Some(ht) = st.hash_height.get(&hash).copied() else {
+                    continue;
+                };
+                if !st.is_on_path(&hash, ht) {
                     continue;
                 }
                 if st.ordered.len() >= MAX_ORDERED_HEADERS {

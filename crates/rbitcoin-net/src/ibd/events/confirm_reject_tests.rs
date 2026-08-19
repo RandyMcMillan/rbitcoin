@@ -2622,3 +2622,114 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Two children of tip: first connected occupant keeps the slot; later sibling
+/// is not ordered (Headers intake, not last-write-wins).
+#[test]
+fn path_slot_first_wins_chained_via_headers() {
+    use super::super::peer_io::{PeerEvent, PeerSlot};
+    use super::apply_peer_event;
+    use crate::seeds::AddrMan;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::CompactTarget;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn addr(o: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 2, 0, o)), 18444)
+    }
+    fn dummy_slot(id: usize, a: SocketAddr) -> PeerSlot {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        PeerSlot {
+            id,
+            addr: a,
+            cmd_tx,
+            in_flight: HashSet::new(),
+            block_progress_ms: Arc::new(AtomicU64::new(0)),
+            peer_height: 10,
+            connected_ms: 1,
+            first_data_ms: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            alive: true,
+            task,
+        }
+    }
+    fn dummy_header(prev: BlockHash, n: u8) -> Header {
+        Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([n; 32]),
+            time: 1_300_000_000 + u32::from(n),
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: u32::from(n),
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-path-slot-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let q = Query::open_or_create(dir.join("store")).unwrap();
+    let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let write_next = AtomicU32::new(1);
+    let mut book = AddrMan::new();
+    let local = addr(1);
+    let mut st = IbdWorkState::new(vec![dummy_slot(1, addr(1))], Some(gen), Some(0));
+
+    let a = dummy_header(gen, 1);
+    let b = dummy_header(gen, 2);
+    let ha = a.block_hash();
+    let hb = b.block_hash();
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![a],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![b],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert_eq!(
+        st.height_to_hash.get(&1).copied(),
+        Some(ha),
+        "first chained header keeps the slot"
+    );
+    assert!(st.known_headers.contains(&hb));
+    assert!(
+        !st.ordered_set.contains(&hb),
+        "later sibling must not enter ordered"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

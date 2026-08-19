@@ -185,6 +185,9 @@ impl IbdWorkState {
     }
 
     /// Record `hash` at chain height `ht` (keeps inverse map in sync).
+    ///
+    /// Tests / reorg gather may plant a slot. Header intake uses
+    /// [`Self::try_set_path_slot`] (first-wins, prev-anchored).
     pub(crate) fn record_height(&mut self, hash: BlockHash, ht: u32) {
         if let Some(old) = self.hash_height.insert(hash, ht) {
             if old != ht {
@@ -194,6 +197,42 @@ impl IbdWorkState {
             }
         }
         self.height_to_hash.insert(ht, hash);
+    }
+
+    /// Admit `hash` to the work-path slot `ht` only if it chains onto the
+    /// occupant of `ht-1` (or onto the store tip for tip+1). First-wins:
+    /// a competing header never displaces a connected occupant.
+    ///
+    /// Always records `hash_height`. Returns whether the path slot was set
+    /// to `hash`.
+    pub(crate) fn try_set_path_slot(
+        &mut self,
+        hash: BlockHash,
+        ht: u32,
+        prev: BlockHash,
+        tip: Option<(u32, BlockHash)>,
+    ) -> bool {
+        if let Some(old) = self.hash_height.insert(hash, ht) {
+            if old != ht && self.height_to_hash.get(&old) == Some(&hash) {
+                self.height_to_hash.remove(&old);
+            }
+        }
+        let anchored = match tip {
+            Some((tip_h, tip_hash)) if ht == tip_h.saturating_add(1) => prev == tip_hash,
+            _ => self.height_to_hash.get(&ht.wrapping_sub(1)) == Some(&prev),
+        };
+        if !anchored {
+            return false;
+        }
+        if let Some(cur) = self.height_to_hash.get(&ht) {
+            return *cur == hash;
+        }
+        self.height_to_hash.insert(ht, hash);
+        true
+    }
+
+    pub(crate) fn is_on_path(&self, hash: &BlockHash, ht: u32) -> bool {
+        self.height_to_hash.get(&ht) == Some(hash)
     }
 
     /// Cheap occupancy of work-path maps/deques (for `ibd: sizes`; all O(1) lens).
@@ -233,12 +272,12 @@ impl IbdWorkState {
         self.hash_height.retain(|h, _| {
             live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
         });
-        self.height_to_hash.clear();
-        for (&h, &ht) in &self.hash_height {
-            if live.contains(&h) || inflight.contains_key(&h) {
-                self.height_to_hash.insert(ht, h);
-            }
-        }
+        // Retain chained occupants. Do not clear+rebuild (HashMap order is
+        // last-write and would remix two hashes at one height).
+        self.height_to_hash.retain(|ht, hash| {
+            self.hash_height.get(hash) == Some(ht)
+                && (live.contains(hash) || inflight.contains_key(hash))
+        });
         if self.known_headers.len() > live.len().saturating_add(4096) {
             self.known_headers
                 .retain(|h| live.contains(h) || inflight.contains_key(h));
@@ -338,6 +377,29 @@ mod tests {
         st.hygiene();
         assert!(st.hash_height.contains_key(&keep));
         assert!(st.header_fks.contains_key(&keep));
+    }
+
+    #[test]
+    fn path_slot_first_wins_chained() {
+        let tip = h(0);
+        let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(0));
+        st.height_to_hash.insert(0, tip);
+        let a = h(1);
+        let b = h(2);
+        assert!(st.try_set_path_slot(a, 1, tip, Some((0, tip))));
+        assert_eq!(st.height_to_hash.get(&1), Some(&a));
+        assert!(
+            !st.try_set_path_slot(b, 1, tip, Some((0, tip))),
+            "first connected occupant wins"
+        );
+        assert_eq!(st.height_to_hash.get(&1), Some(&a));
+        assert_eq!(st.hash_height.get(&b), Some(&1), "off-path still noted");
+        let off = h(3);
+        assert!(
+            !st.try_set_path_slot(off, 1, h(9), Some((0, tip))),
+            "prev must be store tip at tip+1"
+        );
+        assert_eq!(st.height_to_hash.get(&1), Some(&a));
     }
 
     /// InflightReq::default + known_headers prune when known ≫ live ordered set.

@@ -112,9 +112,10 @@ pub use sorted_run::{
     load_fanin_checkpoint, lookup_key, merge_runs, merge_runs_to_file,
     merge_runs_to_file_with_policy, merge_runs_with_policy, next_run_path, open_run, read_run_body,
     reduce_runs_to_fanin, reduce_runs_to_fanin_cancellable, remove_run,
-    set_thread_idle_io_priority, sh_merge_workers, verify_run_body, write_fanin_checkpoint,
-    write_sorted_run, write_sorted_run_file_with_policy, MergeToFileResult, RunWritePolicy,
-    SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME, FANIN_TARGET_STREAM_RUNS,
+    set_thread_idle_io_priority, sh_merge_workers, shard_record_starts, verify_run_body,
+    write_fanin_checkpoint, write_sorted_run, write_sorted_run_file_with_policy,
+    MergeToFileResult, RunWritePolicy, SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME,
+    FANIN_TARGET_STREAM_RUNS,
 };
 pub use sp_tweaks::{SpTweaksTable, TWEAK_LEN};
 pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};

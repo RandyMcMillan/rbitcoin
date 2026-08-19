@@ -927,6 +927,60 @@ pub fn list_materialize_claims(dir: &Path) -> Result<Vec<SortedRunPath>, StoreEr
     Ok(out)
 }
 
+fn rec_prefix_shard(rec: &[u8], n_shards: usize) -> usize {
+    let mut full = [0u8; 32];
+    let n = rec.len().min(32);
+    full[..n].copy_from_slice(&rec[..n]);
+    crate::scripthash_head::prefix_shard_of(&full, n_shards)
+}
+
+/// One record at `idx` (0-based). Does not scan the rest of the run.
+pub fn read_run_record_at(run: &SortedRunPath, idx: u64) -> Result<Vec<u8>, StoreError> {
+    if idx >= run.count {
+        return Err(StoreError::Corrupt("sorted run: record index past end"));
+    }
+    let rec_len = run.rec_len as usize;
+    if rec_len == 0 {
+        return Err(StoreError::Corrupt("sorted run: zero rec_len"));
+    }
+    let mut f = File::open(&run.path).map_err(|e| io_err(&run.path, e))?;
+    let off = HEADER_LEN as u64 + idx.saturating_mul(rec_len as u64);
+    f.seek(SeekFrom::Start(off))
+        .map_err(|e| io_err(&run.path, e))?;
+    let mut rec = vec![0u8; rec_len];
+    f.read_exact(&mut rec).map_err(|e| io_err(&run.path, e))?;
+    Ok(rec)
+}
+
+/// First record index of each prefix shard, plus `run.count` as the last cut.
+///
+/// `starts.len() == n_shards + 1`. Slice `s` is `[starts[s], starts[s+1])`.
+/// Empty shards have `starts[s] == starts[s+1]`. Binary search via one-record
+/// pread (not a full-body scan).
+pub fn shard_record_starts(run: &SortedRunPath, n_shards: usize) -> Result<Vec<u64>, StoreError> {
+    let n = n_shards.max(1);
+    let mut starts = vec![0u64; n + 1];
+    starts[n] = run.count;
+    if run.count == 0 {
+        return Ok(starts);
+    }
+    for s in 1..n {
+        let mut lo = 0u64;
+        let mut hi = run.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let rec = read_run_record_at(run, mid)?;
+            if rec_prefix_shard(&rec, n) < s {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        starts[s] = lo;
+    }
+    Ok(starts)
+}
+
 /// Stream k-way merge of sorted runs, invoking `on_rec` for each record in key order.
 ///
 /// Does **not** buffer the full merge body (unlike [`merge_runs`]). Used by SH
@@ -2437,6 +2491,30 @@ mod tests {
         let hit = lookup_key(&run, &rec(5, 0)[..32]).unwrap().unwrap();
         assert_eq!(hit[32], 50);
         assert!(lookup_key(&run, &rec(4, 0)[..32]).unwrap().is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn shard_record_starts() {
+        let d = tmp_dir();
+        let mut body = Vec::new();
+        for sh0 in [0x00u8, 0x10, 0x3f, 0x80, 0x90] {
+            body.extend_from_slice(&sh_rec(sh0, 1));
+        }
+        let run = write_sorted_run(&d.join("000001.run"), 40, 40, &body).unwrap();
+        let starts = super::shard_record_starts(&run, 4).unwrap();
+        assert_eq!(starts, vec![0, 3, 3, 5, 5]);
+        for i in 0..5 {
+            let rec = super::read_run_record_at(&run, i as u64).unwrap();
+            let mut full = [0u8; 32];
+            full.copy_from_slice(&rec[..32]);
+            let s = crate::scripthash_head::prefix_shard_of(&full, 4);
+            assert!(
+                (starts[s] as usize..starts[s + 1] as usize).contains(&i),
+                "rec {i} shard {s} not in {:?}",
+                starts
+            );
+        }
         let _ = fs::remove_dir_all(&d);
     }
 

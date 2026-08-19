@@ -1644,11 +1644,11 @@ mod tests {
             rbitcoin_store::ShHeadValue::Slab { used, class, .. } => {
                 assert_eq!(used, n_fks as u16);
                 assert!(
-                    class <= 5,
+                    class <= rbitcoin_store::SH_MAX_SLAB_CLASS,
                     "600 tight deltas stay in a relocating slab, class={class}"
                 );
             }
-            other => panic!("expected slab megakey (payload fits class 6), got {other:?}"),
+            other => panic!("expected slab (not paged), got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

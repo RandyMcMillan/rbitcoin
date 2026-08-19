@@ -153,7 +153,7 @@ impl BodyPresence {
         if self.rejected.contains(h) || self.is_pending_hash(h) {
             return true;
         }
-        if self.missing.contains(h) {
+        if self.is_missing(h) {
             return false;
         }
         if hub.has_block(h) {

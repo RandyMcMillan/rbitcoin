@@ -184,6 +184,9 @@ fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
 }
 
 impl ScriptHashHead {
+    /// Occupied/slots before ingest seals to L0 (`SHSR`).
+    pub const SH_SEAL_LOAD: f64 = 0.80;
+
     pub fn create_with_slots(path: impl Into<PathBuf>, slots: u64) -> Result<Self, StoreError> {
         let slots = slots.max(2).next_power_of_two();
         let file = TableFile::create(path, TableKind::HashHead)?;
@@ -1305,29 +1308,6 @@ impl ShardedScriptHashHead {
         self.shards.iter().all(|s| s.is_known_empty())
     }
 
-    /// Zero head shards `start..` (resume cold materialize from `start`).
-    pub fn reinit_shards_from(&self, start: usize) -> Result<(), StoreError> {
-        for s in self.shards.iter().skip(start) {
-            s.reinit_empty()?;
-        }
-        Ok(())
-    }
-
-    /// Zero one OA shard (dir-variant resume of an unsealed hole).
-    pub fn reinit_shard(&self, shard: usize) -> Result<(), StoreError> {
-        let Some(s) = self.shards.get(shard) else {
-            return Err(StoreError::Corrupt(
-                "scripthash reinit_shard: shard out of range",
-            ));
-        };
-        s.reinit_empty()
-    }
-
-    /// Occupied slot count for one shard (0 if OOB).
-    pub fn shard_occupied(&self, shard: usize) -> u64 {
-        self.shards.get(shard).map(|s| s.occupied()).unwrap_or(0)
-    }
-
     /// Install a finished [`LiveShardTable`] into `shard` (empty cold path).
     #[cfg(test)]
     pub fn install_live_shard(&self, shard: usize, live: LiveShardTable) -> Result<(), StoreError> {
@@ -1342,20 +1322,12 @@ impl ShardedScriptHashHead {
         live.install_into(&self.shards[shard])
     }
 
-    /// Best-effort page-cache release after a cold shard write.
-    pub fn shard_advise_dont_need(&self, shard: usize) {
-        if let Some(s) = self.shards.get(shard) {
-            s.advise_dont_need_all();
-        }
-    }
-
     /// Insert head values, applying **one shard at a time** (sorted within shard).
     ///
     /// When `flush_each_shard` is true (large materialize runs), flush the shard
     /// file after its bucket so the working set does not keep every shard dirty
     /// at once. Small runs skip the per-shard flush and rely on later table flush.
-    /// Max occupied/slots before SH main/overflow should seal (plan: 0.80).
-    pub const SH_SEAL_LOAD: f64 = 0.80;
+    pub const SH_SEAL_LOAD: f64 = ScriptHashHead::SH_SEAL_LOAD;
 
     pub fn flush(&self) -> Result<(), StoreError> {
         for s in &self.shards {

@@ -169,8 +169,14 @@ pub(crate) fn apply_peer_event(
                     })
                 });
                 if let Some(h) = height {
-                    if !st.hash_height.contains_key(&hash) {
-                        st.record_height(hash, h);
+                    let tip = hub.tip_height().zip(hub.tip_hash());
+                    let on_path = st.try_set_path_slot(hash, h, prev, tip);
+                    if !on_path {
+                        if let Some(&cur) = st.height_to_hash.get(&h) {
+                            if cur != hash {
+                                st.reorg.register_explore(std::iter::once(hash), Some(hash));
+                            }
+                        }
                     }
                     st.max_peer_height = st.max_peer_height.max(h);
                     st.max_ordered_height = st.max_ordered_height.max(h);
@@ -200,6 +206,12 @@ pub(crate) fn apply_peer_event(
                 st.known_headers.insert(hash);
                 // Offer needs a height (ht==tip+1); unknown-height used to stall tip silently.
                 if !st.hash_height.contains_key(&hash) {
+                    continue;
+                }
+                let Some(ht) = st.hash_height.get(&hash).copied() else {
+                    continue;
+                };
+                if !st.is_on_path(&hash, ht) {
                     continue;
                 }
                 if st.ordered.len() >= MAX_ORDERED_HEADERS {
@@ -480,6 +492,7 @@ pub(crate) fn apply_confirm_reject(
     query: Option<&rbitcoin_query::Query>,
     // When set, BadPrev may trigger most-work reorg onto a competing path.
     hub: Option<&crate::chain::ChainHub>,
+    wire: Option<std::sync::Arc<bitcoin::Block>>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects).
@@ -494,12 +507,31 @@ pub(crate) fn apply_confirm_reject(
         || err.contains("unexpected previous")
         || err.contains("missing retarget first header")
         || err.contains("merkle root mismatch");
+    let bad_prev = super::reorg::is_bad_prev_err(err);
+    if bad_prev {
+        let tip_h = hub.and_then(|h| h.tip_height());
+        if tip_h.map(|t| t.saturating_add(1)) == Some(height) {
+            if let Some(q) = query {
+                q.set_lookup_taken_hi(tip_h);
+            }
+            st.headers_done = false;
+        }
+    }
     if soft_wire {
-        if super::reorg::is_bad_prev_err(err) {
+        if bad_prev {
             if let Some(h) = hub {
-                if try_reorg_on_bad_prev(st, h, height, hash) {
+                let applied = try_reorg_on_bad_prev(st, h, height, hash, wire.as_deref());
+                let still_tip_plus = h.tip_height().map(|t| t.saturating_add(1)) == Some(height);
+                if still_tip_plus && st.height_to_hash.get(&height) == Some(&hash) {
+                    st.height_to_hash.remove(&height);
+                    remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                }
+                if applied {
                     return;
                 }
+            } else if st.height_to_hash.get(&height) == Some(&hash) {
+                st.height_to_hash.remove(&height);
+                remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
             }
         }
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -515,9 +547,15 @@ pub(crate) fn apply_confirm_reject(
                 }
             }
         }
-        st.body.mark_missing(hash);
-        st.body.demote_known(hash);
-        warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
+        if !bad_prev {
+            st.body.mark_missing(hash);
+            st.body.demote_known(hash);
+            warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
+        } else {
+            warn!(
+                "ibd: confirm reject BadPrev @{height} {hash}: {err} (slot evicted, not re-get same hash)"
+            );
+        }
         return;
     }
     if let Some(q) = query {
@@ -593,6 +631,7 @@ fn try_reorg_on_bad_prev(
     hub: &crate::chain::ChainHub,
     height: u32,
     hash: BlockHash,
+    reject_wire: Option<&bitcoin::Block>,
 ) -> bool {
     use super::reorg::{
         classify_bad_prev, header_hashes_to_best_ancestor, try_apply_best_candidate, BadPrevClass,
@@ -614,10 +653,13 @@ fn try_reorg_on_bad_prev(
     let Some(tip) = hub.tip_hash() else {
         return false;
     };
-    let ext = hub
-        .query
-        .block_queue_resolved(height)
-        .map(|w| (*w.block).clone())
+    let ext = reject_wire
+        .cloned()
+        .or_else(|| {
+            hub.query
+                .block_queue_resolved(height)
+                .map(|w| (*w.block).clone())
+        })
         .or_else(|| {
             hub.query
                 .block_queue_payload(height)
@@ -811,6 +853,9 @@ fn on_reorg_accepted(
     }
     if let Some(l) = losing_tip {
         remove_from_ordered(&mut st.ordered, &mut st.ordered_set, l);
+    }
+    if let Some(h) = hub.tip_height() {
+        st.clear_path_above(h);
     }
     st.reorg.clear_awaiting();
     st.reorg.clear_explore();

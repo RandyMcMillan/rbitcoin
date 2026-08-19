@@ -433,7 +433,12 @@ pub async fn ibd_cancellable(
                     st.body.demote_known(hash);
                     st.body.mark_missing(hash);
                 }
-                ConfirmEvent::Reject { height, hash, err } => {
+                ConfirmEvent::Reject {
+                    height,
+                    hash,
+                    err,
+                    wire,
+                } => {
                     apply_confirm_reject(
                         &mut st,
                         height,
@@ -441,6 +446,7 @@ pub async fn ibd_cancellable(
                         &err,
                         Some(hub.query.as_ref()),
                         Some(hub.as_ref()),
+                        wire,
                     );
                 }
             }
@@ -527,7 +533,12 @@ pub async fn ibd_cancellable(
                     st.body.demote_known(hash);
                     st.body.mark_missing(hash);
                 }
-                ConfirmEvent::Reject { height, hash, err } => {
+                ConfirmEvent::Reject {
+                    height,
+                    hash,
+                    err,
+                    wire,
+                } => {
                     apply_confirm_reject(
                         &mut st,
                         height,
@@ -535,6 +546,7 @@ pub async fn ibd_cancellable(
                         &err,
                         Some(hub.query.as_ref()),
                         Some(hub.as_ref()),
+                        wire,
                     );
                 }
             }
@@ -1039,15 +1051,21 @@ pub async fn ibd_cancellable(
                             st.body.demote_known(hash);
                             st.body.mark_missing(hash);
                         }
-                        ConfirmEvent::Reject { height, hash, err } => {
+                        ConfirmEvent::Reject {
+                            height,
+                            hash,
+                            err,
+                            wire,
+                        } => {
                             apply_confirm_reject(
-                        &mut st,
-                        height,
-                        hash,
-                        &err,
-                        Some(hub.query.as_ref()),
-                        Some(hub.as_ref()),
-                    );
+                                &mut st,
+                                height,
+                                hash,
+                                &err,
+                                Some(hub.query.as_ref()),
+                                Some(hub.as_ref()),
+                                wire,
+                            );
                         }
                     }
                 }

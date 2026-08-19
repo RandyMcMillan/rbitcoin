@@ -30,6 +30,12 @@ before 1.0).
 
 ### Fixed
 
+- **IBD BadPrev / fork child at tip+1:** work-path slots are first-wins
+  and prev-anchored. After `take_raw`, Reject carries the wire so
+  CompetingPath still classifies; `lookup_taken_hi` rewinds to tip;
+  the losing slot identity is evicted (not `mark_missing` / re-get
+  the same hash). Reorg apply clears the path suffix.
+
 - **Tip-hole / densify / receive share one in-hand rule:** confirmed,
   matching BQ hash, or `H ≤ lookup_taken_hi`. Taken loadq heights are
   not fetch holes and do not re-getdata or `mark_pending`.

@@ -82,6 +82,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 | Class C create-height | (RAM fence) | no IO |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
 | SH k-way merge (sorted runs) | `RBITCOIN_IO` | TLS session positional pread on run files. 256 KiB double buffer: submit ahead, wait only if the page is still inflight at promote. Ring depth grows with k (cap 4096). `pread` fallback is blocking. |
+| SP-tweak backfill | `RBITCOIN_IO` | idx ranges **before** TLS ring; uring/pread `txout.body`, then `inwit` + parent `txout` for P2TR only. Writes are **not** the load ring: batched `sp_tweaks` body+idx pwrite (not per-tx CQEs). |
 
 Default: Linux uring if the ring opens else pool; Darwin pool; Windows
 IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.

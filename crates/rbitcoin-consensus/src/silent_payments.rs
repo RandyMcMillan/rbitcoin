@@ -144,11 +144,29 @@ pub fn backfill_sp_tweaks_cancellable(
     }
     let origin = query.sptweaks_origin();
     let mut wrote = 0u32;
+    const WRITE_BATCH: usize = 16;
+    let t0 = std::time::Instant::now();
+    let mut last_log = t0;
+    let mut pending: Vec<(Height, Fk, Vec<Option<[u8; 33]>>)> = Vec::new();
+    let flush = |pending: &mut Vec<(Height, Fk, Vec<Option<[u8; 33]>>)>,
+                 wrote: &mut u32|
+     -> Result<(), ConsensusError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let n = pending.len() as u32;
+        query.put_sp_tweaks_blocks(pending)?;
+        *wrote = wrote.saturating_add(n);
+        pending.clear();
+        Ok(())
+    };
     loop {
         if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            flush(&mut pending, &mut wrote)?;
             return Ok(wrote);
         }
         let Some(tip) = query.tip_height() else {
+            flush(&mut pending, &mut wrote)?;
             return Ok(wrote);
         };
         let mut h = query
@@ -157,20 +175,26 @@ pub fn backfill_sp_tweaks_cancellable(
             .0
             .max(origin.0);
         if h > tip.0 {
+            flush(&mut pending, &mut wrote)?;
             return Ok(wrote);
         }
         let snapshot = tip.0;
         while h <= snapshot {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                flush(&mut pending, &mut wrote)?;
                 return Ok(wrote);
             }
             let height = Height(h);
             let Some(header_fk) = query.store().confirmed.get(height)? else {
+                flush(&mut pending, &mut wrote)?;
                 return Ok(wrote);
             };
             let fks = match query.block_tx_fks(height) {
                 Ok(f) => f,
-                Err(StoreError::NotFound) => return Ok(wrote),
+                Err(StoreError::NotFound) => {
+                    flush(&mut pending, &mut wrote)?;
+                    return Ok(wrote);
+                }
                 Err(e) => return Err(e.into()),
             };
             let map = tweaks_for_height(query, params, height)?;
@@ -179,11 +203,37 @@ pub fn backfill_sp_tweaks_cancellable(
                 let txid = query.store().txs.body_txid(fk)?;
                 recs.push(map.get(&txid).map(|t| t.tweak));
             }
-            query.put_sp_tweaks_block(height, header_fk, &recs)?;
-            wrote = wrote.saturating_add(1);
+            pending.push((height, header_fk, recs));
+            if pending.len() >= WRITE_BATCH {
+                flush(&mut pending, &mut wrote)?;
+            }
             h = h.saturating_add(1);
+            if last_log.elapsed() >= std::time::Duration::from_secs(10) {
+                last_log = std::time::Instant::now();
+                let next = h;
+                let remain = snapshot.saturating_sub(next.saturating_sub(1));
+                let secs = t0.elapsed().as_secs_f64().max(1e-3);
+                let rate = wrote as f64 / secs;
+                rbitcoin_log::info!(
+                    "{}",
+                    format_sptweaks_progress(next, snapshot, rate, remain, t0.elapsed())
+                );
+            }
         }
+        flush(&mut pending, &mut wrote)?;
     }
+}
+
+pub(crate) fn format_sptweaks_progress(
+    next: u32,
+    tip: u32,
+    rate: f64,
+    remain: u32,
+    elapsed: std::time::Duration,
+) -> String {
+    format!(
+        "sptweaks: backfill next={next} tip={tip} rate={rate:.1}/s remain={remain} elapsed={elapsed:?}"
+    )
 }
 
 /// Confirmed height → eligible txid (internal order) → tweak.
@@ -207,58 +257,32 @@ pub fn tweaks_for_height(
         return Ok(BTreeMap::new());
     }
 
-    let mut bodies = Vec::new();
+    let wave = rbitcoin_store::load_tweak_wave(&query.store().txs, &fks)?;
     let mut parent_outs: HashMap<Fk, Vec<OutputRecord>> = HashMap::new();
     let mut parent_txid: HashMap<Fk, [u8; 32]> = HashMap::new();
-    for &fk in &fks {
-        let (tx, outs) = query.store().get_tx_meta_and_outputs(fk)?;
-        parent_outs.insert(fk, outs.clone());
-        parent_txid.insert(fk, tx.txid);
-        if outs.iter().any(|o| is_p2tr(&o.script)) {
-            let (tx, inputs, outputs) = query.store().get_tx_full(fk)?;
-            bodies.push((fk, tx, inputs, outputs));
-        }
+    for t in &wave.txs {
+        parent_outs.insert(t.fk, t.outs.clone());
+        parent_txid.insert(t.fk, t.rec.txid);
     }
-
-    let mut missing: Vec<Fk> = Vec::new();
-    for (_, _, inputs, _) in &bodies {
-        for inp in inputs {
-            if inp.is_coinbase() {
-                continue;
-            }
-            if !parent_outs.contains_key(&inp.create_fk) {
-                missing.push(inp.create_fk);
-            }
-        }
-    }
-    missing.sort_by_key(|f| f.0);
-    missing.dedup();
-    for fk in missing {
-        match query.store().get_tx_meta_and_outputs(fk) {
-            Ok((meta, outs)) => {
-                parent_outs.insert(fk, outs);
-                parent_txid.insert(fk, meta.txid);
-            }
-            Err(StoreError::NotFound) => {
-                if let Ok(id) = query.store().txs.body_txid(fk) {
-                    parent_txid.insert(fk, id);
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
+    for (fk, (txid, outs)) in &wave.parents {
+        parent_outs.entry(Fk(*fk)).or_insert_with(|| outs.clone());
+        parent_txid.entry(Fk(*fk)).or_insert(*txid);
     }
 
     let mut out = BTreeMap::new();
-    for (_fk, tx_rec, inputs, outputs) in &bodies {
-        if !outputs.iter().any(|o| is_p2tr(&o.script)) {
+    for t in &wave.txs {
+        if !t.need_inwit {
             continue;
         }
-        let built = match build_tx_and_prevouts(inputs, outputs, &parent_outs, &parent_txid) {
+        let Some(inputs) = t.inputs.as_ref() else {
+            continue;
+        };
+        let built = match build_tx_and_prevouts(inputs, &t.outs, &parent_outs, &parent_txid) {
             Some(v) => v,
             None => continue,
         };
         if let Some(tweak) = tweak_from_tx(&built.0, &built.1) {
-            out.insert(tx_rec.txid, tweak);
+            out.insert(t.rec.txid, tweak);
         }
     }
     Ok(out)
@@ -684,6 +708,21 @@ mod tests {
             },
             prevouts,
         )
+    }
+
+    #[test]
+    fn format_sptweaks_progress_has_operator_tokens() {
+        let line = super::format_sptweaks_progress(
+            800_000,
+            963_000,
+            25.0,
+            163_000,
+            std::time::Duration::from_secs(90),
+        );
+        assert!(line.contains("next=800000"), "{line}");
+        assert!(line.contains("tip=963000"), "{line}");
+        assert!(line.contains("rate=25.0/s"), "{line}");
+        assert!(line.contains("remain=163000"), "{line}");
     }
 
     #[test]

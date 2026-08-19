@@ -1802,21 +1802,22 @@ fn header_announcement_connects(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     prev: BlockHash,
 ) -> bool {
-    if prev.to_byte_array() == [0u8; 32]
-        || hub.is_connected(&prev)
-        || hub.held_body(&prev).is_some()
-    {
+    if prev.to_byte_array() == [0u8; 32] || hub.knows_header(&prev) {
         return true;
     }
     let mut h = prev;
     for _ in 0..10_000 {
-        if hub.is_connected(&h) || hub.held_body(&h).is_some() {
+        if hub.knows_header(&h) {
             return true;
         }
-        let Some(hdr) = pending.get(&h) else {
+        let next = pending
+            .get(&h)
+            .map(|hdr| hdr.prev_blockhash)
+            .or_else(|| hub.prev_of(&h));
+        let Some(next) = next else {
             return false;
         };
-        h = hdr.prev_blockhash;
+        h = next;
         if h.to_byte_array() == [0u8; 32] {
             return true;
         }
@@ -2372,6 +2373,98 @@ mod tests {
             other => panic!("expected GetData, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submitheader_parent_p2p_child_header_getdatas_body() {
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::p2p::message::RawNetworkMessage;
+        use bitcoin::Network;
+        use rbitcoin_consensus::mine_regtest_paying;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload: full[24..].to_vec(),
+            }
+        }
+
+        let (dir, q) = tmp_store("tb-hdr-only");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let script = bitcoin::script::ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+        let b0 = hub.tip_hash().unwrap();
+        assert!(hub.is_connected(&b0));
+        let t0 = hub.header_of(&b0).unwrap().time;
+        let b1 = mine_regtest_paying(b0, t0 + 1, 2, script.clone(), vec![]);
+        hub.process_submitted_header(&b1.header).unwrap();
+        assert!(hub.knows_header(&b1.block_hash()));
+        assert!(!hub.is_connected(&b1.block_hash()));
+        let b7 = mine_regtest_paying(b1.block_hash(), t0 + 2, 3, script, vec![]);
+        hub.process_submitted_header(&b7.header).unwrap();
+        assert!(!hub.is_connected(&b7.block_hash()));
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = false;
+        let mut cmpct_ver = 2u32;
+        let mut ban = 0u32;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handle_peer_frame(
+                frame_for(NetworkMessage::Headers(vec![b7.header])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let want = b7.block_hash();
+        let mut saw = false;
+        while let Ok(msg) = out_rx.try_recv() {
+            match msg {
+                NetworkMessage::GetData(inv) => {
+                    saw |= inv.iter().any(|i| match i {
+                        Inventory::WitnessBlock(h)
+                        | Inventory::Block(h)
+                        | Inventory::CompactBlock(h) => *h == want,
+                        _ => false,
+                    });
+                }
+                NetworkMessage::GetHeaders(_) => panic!("headers-only parent must not getheaders"),
+                _ => {}
+            }
+        }
+        assert!(saw, "expected getdata for submitheader child {want}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

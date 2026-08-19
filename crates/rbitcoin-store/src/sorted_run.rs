@@ -760,10 +760,7 @@ impl RunCursor {
     }
 }
 
-struct MergeHead {
-    cursor: RunCursor,
-    idx: usize,
-}
+const MERGE_SENTINEL: usize = usize::MAX;
 
 /// Compare two fixed records for merge / write order.
 ///
@@ -785,32 +782,74 @@ fn rec_key_cmp(a: &[u8], b: &[u8], key_len: usize, rec_len: u32) -> Ordering {
     }
 }
 
-fn head_less(a: &MergeHead, b: &MergeHead, key_len: usize) -> bool {
-    let rec_len = a.cursor.rec_len as u32;
-    match rec_key_cmp(a.cursor.rec(), b.cursor.rec(), key_len, rec_len) {
-        Ordering::Less => true,
-        Ordering::Greater => false,
-        Ordering::Equal => a.idx < b.idx,
+fn cursor_less(cursors: &[Option<RunCursor>], a: usize, b: usize, key_len: usize) -> bool {
+    if a == MERGE_SENTINEL {
+        return false;
+    }
+    if b == MERGE_SENTINEL {
+        return true;
+    }
+    match (&cursors[a], &cursors[b]) {
+        (None, _) => false,
+        (_, None) => true,
+        (Some(ca), Some(cb)) => match rec_key_cmp(ca.rec(), cb.rec(), key_len, ca.rec_len as u32) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => a < b,
+        },
     }
 }
 
-fn sift_down(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
-    let n = heap.len();
-    loop {
-        let l = 2 * i + 1;
-        let r = 2 * i + 2;
-        let mut smallest = i;
-        if l < n && head_less(&heap[l], &heap[smallest], key_len) {
-            smallest = l;
+/// Loser tree over run indices. Internal nodes hold losers; `winner` is the min leaf.
+/// Cursors stay put — the tree only stores indices.
+struct LoserTree {
+    losers: Vec<usize>,
+    winner: usize,
+    n: usize,
+}
+
+impl LoserTree {
+    fn new(cursors: &[Option<RunCursor>], key_len: usize) -> Self {
+        let k = cursors.len();
+        let n = k.next_power_of_two().max(1);
+        let mut winners = vec![MERGE_SENTINEL; 2 * n];
+        let mut losers = vec![MERGE_SENTINEL; n];
+        for i in 0..n {
+            winners[n + i] = if i < k { i } else { MERGE_SENTINEL };
         }
-        if r < n && head_less(&heap[r], &heap[smallest], key_len) {
-            smallest = r;
+        for i in (1..n).rev() {
+            let left = winners[2 * i];
+            let right = winners[2 * i + 1];
+            if cursor_less(cursors, left, right, key_len) {
+                winners[i] = left;
+                losers[i] = right;
+            } else {
+                winners[i] = right;
+                losers[i] = left;
+            }
         }
-        if smallest == i {
-            break;
+        Self {
+            winner: winners[1],
+            losers,
+            n,
         }
-        heap.swap(i, smallest);
-        i = smallest;
+    }
+
+    fn replay(&mut self, cursors: &[Option<RunCursor>], leaf: usize, key_len: usize) {
+        let mut player = leaf;
+        let mut i = self.n + leaf;
+        while i > 1 {
+            let p = i >> 1;
+            if cursor_less(cursors, self.losers[p], player, key_len) {
+                std::mem::swap(&mut self.losers[p], &mut player);
+            }
+            i = p;
+        }
+        self.winner = player;
+    }
+
+    fn winner(&self) -> usize {
+        self.winner
     }
 }
 
@@ -822,18 +861,6 @@ fn should_skip_dup_key(key_len: usize, rec_len: u32, prev: Option<&[u8]>, rec: &
         return false;
     }
     prev.is_some_and(|p| p == rec)
-}
-
-fn sift_up(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
-    while i > 0 {
-        let p = (i - 1) / 2;
-        if head_less(&heap[i], &heap[p], key_len) {
-            heap.swap(i, p);
-            i = p;
-        } else {
-            break;
-        }
-    }
 }
 
 /// Remove one run from the catalog and delete its file (after materialize).
@@ -1007,14 +1034,16 @@ pub fn for_each_merged_rec_opts(
         return Ok(());
     }
     let (key_len, rec_len) = merge_lens(inputs)?;
-    let mut heap: Vec<MergeHead> = Vec::new();
-    for (idx, run) in inputs.iter().enumerate() {
+    let mut cursors = Vec::with_capacity(inputs.len());
+    for run in inputs {
         let mut cursor = RunCursor::open(run, verify_crc)?;
         if cursor.fill_next()? {
-            heap.push(MergeHead { cursor, idx });
+            cursors.push(Some(cursor));
+        } else {
+            cursors.push(None);
         }
     }
-    merge_heads(heap, key_len, rec_len, on_rec)
+    merge_cursors(cursors, key_len, rec_len, on_rec)
 }
 
 /// k-way merge of one prefix shard's slices (`cuts[run][shard]..cuts[run][shard+1]`).
@@ -1032,7 +1061,7 @@ pub fn for_each_merged_rec_shard(
         return Err(StoreError::Corrupt("sorted run: shard cuts len mismatch"));
     }
     let (key_len, rec_len) = merge_lens(inputs)?;
-    let mut heap: Vec<MergeHead> = Vec::new();
+    let mut cursors = Vec::with_capacity(inputs.len());
     for (idx, run) in inputs.iter().enumerate() {
         let starts = &cuts[idx];
         if shard + 1 >= starts.len() {
@@ -1041,14 +1070,17 @@ pub fn for_each_merged_rec_shard(
         let lo = starts[shard];
         let count = starts[shard + 1].saturating_sub(lo);
         if count == 0 {
+            cursors.push(None);
             continue;
         }
         let mut cursor = RunCursor::open_range(run, lo, count, verify_crc)?;
         if cursor.fill_next()? {
-            heap.push(MergeHead { cursor, idx });
+            cursors.push(Some(cursor));
+        } else {
+            cursors.push(None);
         }
     }
-    merge_heads(heap, key_len, rec_len, on_rec)
+    merge_cursors(cursors, key_len, rec_len, on_rec)
 }
 
 fn merge_lens(inputs: &[SortedRunPath]) -> Result<(usize, u32), StoreError> {
@@ -1062,33 +1094,50 @@ fn merge_lens(inputs: &[SortedRunPath]) -> Result<(usize, u32), StoreError> {
     Ok((key_len, rec_len))
 }
 
-fn merge_heads(
-    mut heap: Vec<MergeHead>,
+fn merge_cursors(
+    mut cursors: Vec<Option<RunCursor>>,
     key_len: usize,
     rec_len: u32,
     mut on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    for i in (0..heap.len()).rev() {
-        sift_down(&mut heap, i, key_len);
+    if cursors.is_empty() {
+        return Ok(());
     }
-    let mut prev_rec: Option<Vec<u8>> = None;
-    while !heap.is_empty() {
-        let mut min = heap.swap_remove(0);
-        if !heap.is_empty() {
-            sift_down(&mut heap, 0, key_len);
+    let k = cursors.len();
+    let mut tree = LoserTree::new(&cursors, key_len);
+    let mut prev_buf = [0u8; 40];
+    let mut prev_len = 0usize;
+    let mut prev_vec: Option<Vec<u8>> = None;
+    loop {
+        let w = tree.winner();
+        if w == MERGE_SENTINEL || w >= k || cursors[w].is_none() {
+            break;
         }
-        let rec = min.cursor.rec();
-        if !should_skip_dup_key(key_len, rec_len, prev_rec.as_deref(), rec) {
-            on_rec(rec)?;
-            if key_len == rec_len as usize {
-                prev_rec = Some(rec.to_vec());
+        {
+            let rec = cursors[w].as_ref().unwrap().rec();
+            let prev = if rec_len as usize <= 40 && prev_len > 0 {
+                Some(&prev_buf[..prev_len])
+            } else {
+                prev_vec.as_deref()
+            };
+            let skip = should_skip_dup_key(key_len, rec_len, prev, rec);
+            if !skip {
+                on_rec(rec)?;
+                if key_len == rec_len as usize {
+                    if rec_len as usize <= 40 {
+                        prev_buf[..rec.len()].copy_from_slice(rec);
+                        prev_len = rec.len();
+                    } else {
+                        prev_vec = Some(rec.to_vec());
+                    }
+                }
             }
         }
-        if min.cursor.fill_next()? {
-            heap.push(min);
-            let last = heap.len() - 1;
-            sift_up(&mut heap, last, key_len);
+        let more = cursors[w].as_mut().unwrap().fill_next()?;
+        if !more {
+            cursors[w] = None;
         }
+        tree.replay(&cursors, w, key_len);
     }
     Ok(())
 }
@@ -1140,17 +1189,6 @@ pub fn merge_runs_to_file_with_policy(
     }
     let track_fk = rec_len as usize >= 40;
 
-    let mut heap: Vec<MergeHead> = Vec::new();
-    for (idx, run) in inputs.iter().enumerate() {
-        let mut cursor = RunCursor::open(run, verify_crc)?;
-        if cursor.fill_next()? {
-            heap.push(MergeHead { cursor, idx });
-        }
-    }
-    for i in (0..heap.len()).rev() {
-        sift_down(&mut heap, i, key_len);
-    }
-
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
     }
@@ -1169,43 +1207,36 @@ pub fn merge_runs_to_file_with_policy(
             .map_err(|e| io_err(&tmp, e))?;
         let hdr = [0u8; HEADER_LEN];
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
-        let mut prev_rec: Option<Vec<u8>> = None;
-        while !heap.is_empty() {
-            let mut min = heap.swap_remove(0);
-            if !heap.is_empty() {
-                sift_down(&mut heap, 0, key_len);
-            }
-            let rec = min.cursor.rec();
-            let skip = should_skip_dup_key(key_len, rec_len, prev_rec.as_deref(), rec);
-            if !skip {
-                f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
-                if track_fk && rec.len() >= 40 {
-                    let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
-                    if fk > max_u64_at_32 {
-                        max_u64_at_32 = fk;
-                    }
-                }
-                for &b in rec {
-                    body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
-                }
-                count = count.saturating_add(1);
-                if policy.pace {
-                    pace_since = pace_since.saturating_add(rec.len());
-                    if pace_since >= PACE_CHUNK_BYTES {
-                        pace_since = 0;
-                        std::thread::sleep(PACE_SLEEP);
-                    }
-                }
-                if key_len == rec_len as usize {
-                    prev_rec = Some(rec.to_vec());
-                }
-            }
-            if min.cursor.fill_next()? {
-                heap.push(min);
-                let last = heap.len() - 1;
-                sift_up(&mut heap, last, key_len);
+        let mut cursors = Vec::with_capacity(inputs.len());
+        for run in inputs {
+            let mut cursor = RunCursor::open(run, verify_crc)?;
+            if cursor.fill_next()? {
+                cursors.push(Some(cursor));
+            } else {
+                cursors.push(None);
             }
         }
+        merge_cursors(cursors, key_len, rec_len, |rec| {
+            f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
+            if track_fk && rec.len() >= 40 {
+                let fk = u64::from_le_bytes(rec[32..40].try_into().unwrap());
+                if fk > max_u64_at_32 {
+                    max_u64_at_32 = fk;
+                }
+            }
+            for &b in rec {
+                body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
+            }
+            count = count.saturating_add(1);
+            if policy.pace {
+                pace_since = pace_since.saturating_add(rec.len());
+                if pace_since >= PACE_CHUNK_BYTES {
+                    pace_since = 0;
+                    std::thread::sleep(PACE_SLEEP);
+                }
+            }
+            Ok(())
+        })?;
         body_crc ^= 0xFFFF_FFFF;
         f.seek(SeekFrom::Start(0)).map_err(|e| io_err(&tmp, e))?;
         let mut hdr = [0u8; HEADER_LEN];
@@ -2235,6 +2266,40 @@ mod tests {
             got.push(u64::from_le_bytes(chunk[32..40].try_into().unwrap()));
         }
         assert_eq!(got, vec![1, 2, 5, 255, 256, 257]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn loser_tree_matches_heap_shuffle() {
+        let d = tmp_dir();
+        let mut expected = Vec::new();
+        let mut runs = Vec::new();
+        for r in 0..7u8 {
+            let mut recs: Vec<[u8; 40]> = Vec::new();
+            for i in 0..5u8 {
+                let key = (r.wrapping_mul(3).wrapping_add(i)) % 11;
+                let rec = sh_rec(key, u64::from(r) * 10 + u64::from(i));
+                recs.push(rec);
+                expected.push(rec);
+            }
+            recs.sort_by(|a, b| rec_key_cmp(a, b, 40, 40));
+            let mut sorted = Vec::new();
+            for rec in &recs {
+                sorted.extend_from_slice(rec);
+            }
+            let path = d.join(format!("00000{r}.run"));
+            write_sorted_run(&path, 40, 40, &sorted).unwrap();
+            runs.push(open_run(&path).unwrap());
+        }
+        expected.sort_by(|a, b| rec_key_cmp(a, b, 40, 40));
+        expected.dedup();
+        let mut got = Vec::new();
+        for_each_merged_rec(&runs, |rec| {
+            got.push(rec.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, expected);
         let _ = fs::remove_dir_all(&d);
     }
 

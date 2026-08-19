@@ -158,7 +158,9 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 | `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH breakdown (not emitted on reject) |
 | `UpdateTip` | INFO | New best hash/height after connect |
-| `node: tip=…` | INFO | Tip height change summary (follow_live) |
+| `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `UpdateTip` at info) |
+| `received getdata for: wtx` | DEBUG | One line per peer `MSG_WTX` getdata (Core `p2p_blocksonly` needle; counts are on `tip: perf`) |
+| `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
 Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: perf` instead. Enable `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
 

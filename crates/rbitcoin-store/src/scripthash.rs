@@ -3999,12 +3999,13 @@ mod tests {
 
             let serial_dir = dir.join("serial");
             std::fs::create_dir_all(&serial_dir).unwrap();
-            let serial = four_shard_table(&serial_dir);
+            let serial = four_shard_dir_table(&serial_dir);
             let s = crate::materialize_sh_shards(&serial, &inputs, 0, 1, None).unwrap();
 
             let par_dir = dir.join("par");
             std::fs::create_dir_all(&par_dir).unwrap();
-            let par = four_shard_table(&par_dir);
+            let par = four_shard_dir_table(&par_dir);
+            assert_eq!(par.body_layout(), ShBodyLayout::Sharded);
             let p = crate::materialize_sh_shards(&par, &inputs, 0, 2, None).unwrap();
 
             assert_eq!(s.creates, p.creates);
@@ -4049,7 +4050,7 @@ mod tests {
                 .unwrap();
             let inputs = [crate::sorted_run::open_run(&runs_dir.join("000001.run")).unwrap()];
 
-            let t = four_shard_table(&dir);
+            let t = four_shard_dir_table(&dir);
             let k0 = key(0, 0);
             let mut session = t.pack_shard_session(0).unwrap();
             session.push_sorted_fk(k0, Fk(1)).unwrap();
@@ -4076,7 +4077,7 @@ mod tests {
 
             let resume_dir = dir.join("resume");
             std::fs::create_dir_all(&resume_dir).unwrap();
-            let t2 = four_shard_table(&resume_dir);
+            let t2 = four_shard_dir_table(&resume_dir);
             let mut session = t2.pack_shard_session(0).unwrap();
             session.push_sorted_fk(k0, Fk(1)).unwrap();
             let pack = session.finish_pack().unwrap();
@@ -4144,6 +4145,13 @@ mod tests {
                     "leftover pack body {s}"
                 );
             }
+            let payload0 = crate::scripthash_layout::payload_start(crate::file::FILE_HEADER_LEN);
+            let b0 = t.bodies[0].logical_len();
+            let b1 = t.bodies[1].logical_len();
+            assert!(
+                b0 > b1.saturating_mul(2).max(payload0 + 4096),
+                "megakey shard body must dwarf a small sibling, got {b0} vs {b1}"
+            );
             assert_eq!(t.entries(&sh_prefix_key(0, 0)).unwrap().len(), 1);
             assert_eq!(t.entries(&mega_key).unwrap().len(), n_mega);
             match t.head_value(&mega_key).unwrap().unwrap() {

@@ -265,7 +265,9 @@ k-way by prefix shard** (one worker per CPU core, 256 KiB pages; no
 extra 64-file rewrite). Workers write `scripthash.body/NN` (or the
 legacy shared `scripthash.body` file, serial); a publisher commits
 `scripthash.head/NN` in shard order so SIGINT resume is still
-`scripthash.cold_progress`. No temp `pack*.body`. Catalog records stay unique
+`scripthash.cold_progress`. Pack stays within one worker-window of
+that published prefix (so a megakey cannot let the other cores pack
+every remaining shard unpublished). No temp `pack*.body`. Catalog records stay unique
 on `(scripthash, create_fk)`, `key_len=40`. Sealed sorted+idx main
 shards (no main fuse; no 0.5–1 GiB in-RAM OA image per shard;
 megakey pages write as they fill — ≤510 FKs buffered). Schema-16
@@ -276,7 +278,8 @@ to one **global ingest OA** (mainnet 2²² slots ≈ 128 MiB). Fan-in reduce i
 **fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
 only at ≥75% of target run size (default target **512 MiB**) and compacts tiny
 catalog runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs
-~**every 10s**. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
+~**every 10s** from one observer (`keys`/`creates`/`pending` unpublished/
+`shards` published/`rate`) — not per-worker session counters. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
 `catalog_complete` / `seal` / `tip_max_fk`. **Full cold reinit only if the SH
 head is empty** (or force rebuild); a nearly complete index with residual runs
 uses **warm batch apply** only. **SH runs pipeline:** confirm enqueues → large

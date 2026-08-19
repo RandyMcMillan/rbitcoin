@@ -39,7 +39,8 @@ use rbitcoin_store::{
 pub enum ShTipMaterializeMode {
     /// Head empty (or force rebuild): wipe + cold stream.
     FullCold,
-    /// Resume interrupted cold from `next_shard` (progress present).
+    /// Resume interrupted cold (progress present). Dir-variant: sealed
+    /// `head/NN` stays; `next_shard` is the lowest unsealed hole.
     ColdResume { next_shard: u32 },
     /// Durable head present: batch-warm residual runs only — **never** reinit.
     WarmOnly,

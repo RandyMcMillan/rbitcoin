@@ -1841,6 +1841,35 @@ mod tests {
     }
 
     #[test]
+    fn materialize_parallel_resume() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-resume-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ColdProgress {
+            next_shard: 1,
+            body_bump: 8192,
+            live_count: 8,
+            keys_written: 8,
+        }
+        .store(&dir)
+        .unwrap();
+        let p = ColdProgress::load(&dir).unwrap().unwrap();
+        assert_eq!(p.next_shard, 1);
+        assert_eq!(p.body_bump, 8192);
+        assert_eq!(p.live_count, 8);
+        assert_eq!(p.keys_written, 8);
+        assert_eq!(
+            select_sh_tip_materialize_mode(false, 8, Some(1), 4, 2),
+            ShTipMaterializeMode::ColdResume { next_shard: 1 }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn enqueue_flush_materialize() {
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)

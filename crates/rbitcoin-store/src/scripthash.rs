@@ -2588,6 +2588,7 @@ fn read_alloc_version_on_disk(body: &TableFile) -> Result<u16, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn tmp() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -3590,6 +3591,82 @@ mod tests {
                     );
                 }
             }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn materialize_parallel_resume() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let runs_dir = dir.join("runs");
+            std::fs::create_dir_all(&runs_dir).unwrap();
+            let key = |shard: u8, i: u8| {
+                let mut k = [0u8; 32];
+                k[0] = shard << 6 | (i & 0x3f);
+                k
+            };
+            let rec = |shard: u8, i: u8, fk: u64| {
+                let mut r = [0u8; 40];
+                r[..32].copy_from_slice(&key(shard, i));
+                r[32..40].copy_from_slice(&fk.to_le_bytes());
+                r
+            };
+            let mut body = Vec::new();
+            for shard in 0..4u8 {
+                body.extend_from_slice(&rec(shard, 0, u64::from(shard) + 1));
+            }
+            crate::sorted_run::write_sorted_run(&runs_dir.join("000001.run"), 40, 40, &body)
+                .unwrap();
+            let inputs = [crate::sorted_run::open_run(&runs_dir.join("000001.run")).unwrap()];
+
+            let t = four_shard_table(&dir);
+            let k0 = key(0, 0);
+            let temp = TableFile::create(dir.join("pack0.body"), TableKind::ScriptHash).unwrap();
+            let mut session = t.pack_shard_session(temp).unwrap();
+            session.push_sorted_fk(k0, Fk(1)).unwrap();
+            let pack = session.finish_pack().unwrap();
+            let bump0 = t.alloc_bump();
+            let bump1 = t.publish_packed_shard(0, pack, bump0).unwrap();
+            ColdProgress {
+                next_shard: 1,
+                body_bump: bump1,
+                live_count: 1,
+                keys_written: 1,
+            }
+            .store(&dir)
+            .unwrap();
+            assert_eq!(t.entries(&k0).unwrap().len(), 1);
+
+            let cancel = AtomicBool::new(true);
+            let err = crate::materialize_sh_shards(&t, &inputs, 1, 2, Some(&cancel));
+            assert!(matches!(err, Err(StoreError::Cancelled(_))));
+            assert_eq!(
+                t.entries(&k0).unwrap()[0].1.create_tx_fk,
+                Fk(1),
+                "published shard 0 must survive cancel"
+            );
+
+            let resume_dir = dir.join("resume");
+            std::fs::create_dir_all(&resume_dir).unwrap();
+            let t2 = four_shard_table(&resume_dir);
+            let temp =
+                TableFile::create(resume_dir.join("pack0.body"), TableKind::ScriptHash).unwrap();
+            let mut session = t2.pack_shard_session(temp).unwrap();
+            session.push_sorted_fk(k0, Fk(1)).unwrap();
+            let pack = session.finish_pack().unwrap();
+            let b = t2.publish_packed_shard(0, pack, t2.alloc_bump()).unwrap();
+            ColdProgress {
+                next_shard: 1,
+                body_bump: b,
+                live_count: 1,
+                keys_written: 1,
+            }
+            .store(t2.store_dir())
+            .unwrap();
+            crate::materialize_sh_shards(&t2, &inputs, 1, 2, None).unwrap();
+            assert_eq!(t2.entries(&k0).unwrap()[0].1.create_tx_fk, Fk(1));
+            assert_eq!(t2.entries(&key(3, 0)).unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

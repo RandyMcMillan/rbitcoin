@@ -143,9 +143,13 @@ pub fn materialize_sh_shards(
     );
     let t0 = Instant::now();
     let recs_packed = Arc::new(AtomicU64::new(0));
+    let prior = ColdProgress::load(table.store_dir()).ok().flatten();
     let mut bump = table.alloc_bump();
-    let mut live_creates = table.entry_count();
-    let mut live_keys = 0u64;
+    let mut live_creates = prior
+        .as_ref()
+        .map(|p| p.live_count)
+        .unwrap_or_else(|| table.entry_count());
+    let mut live_keys = prior.as_ref().map(|p| p.keys_written).unwrap_or(0);
     let mut max_fk = 0u64;
     let mut last_log = Instant::now();
 

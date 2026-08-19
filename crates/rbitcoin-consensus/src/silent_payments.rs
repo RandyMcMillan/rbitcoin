@@ -207,24 +207,21 @@ pub fn tweaks_for_height(
         return Ok(BTreeMap::new());
     }
 
-    let mut bodies = Vec::with_capacity(fks.len());
-    for &fk in &fks {
-        let (tx, inputs, outputs) = query.store().get_tx_full(fk)?;
-        bodies.push((fk, tx, inputs, outputs));
-    }
-
+    let mut bodies = Vec::new();
     let mut parent_outs: HashMap<Fk, Vec<OutputRecord>> = HashMap::new();
     let mut parent_txid: HashMap<Fk, [u8; 32]> = HashMap::new();
-    for (fk, tx, _, outs) in &bodies {
-        parent_outs.insert(*fk, outs.clone());
-        parent_txid.insert(*fk, tx.txid);
+    for &fk in &fks {
+        let (tx, outs) = query.store().get_tx_meta_and_outputs(fk)?;
+        parent_outs.insert(fk, outs.clone());
+        parent_txid.insert(fk, tx.txid);
+        if outs.iter().any(|o| is_p2tr(&o.script)) {
+            let (tx, inputs, outputs) = query.store().get_tx_full(fk)?;
+            bodies.push((fk, tx, inputs, outputs));
+        }
     }
 
     let mut missing: Vec<Fk> = Vec::new();
-    for (_, _, inputs, outputs) in &bodies {
-        if !outputs.iter().any(|o| is_p2tr(&o.script)) {
-            continue;
-        }
+    for (_, _, inputs, _) in &bodies {
         for inp in inputs {
             if inp.is_coinbase() {
                 continue;
@@ -1241,6 +1238,106 @@ mod tests {
         assert_eq!(
             indexed.get(&spend_txid).unwrap().output_pubkeys,
             naive.get(&spend_txid).unwrap().output_pubkeys
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fat non-P2TR sibling must not change the P2TR tweak (txout-first filter).
+    #[test]
+    fn tweaks_for_height_skips_inwit_on_non_p2tr_sibling() {
+        use bitcoin::hashes::hash160;
+        use bitcoin::secp256k1::SecretKey;
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let secp_ctx = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &sk);
+        let ser = pk.serialize();
+        let h160 = hash160::Hash::hash(&ser);
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(h160.as_ref());
+        let (xonly, _) = pk.x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&xonly.serialize());
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let h0 = header(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: genesis_txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
+                }],
+            )
+            .unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let mut fat_txid = [0u8; 32];
+        fat_txid[0] = 0x22;
+        let fat_script = vec![0x51; 200];
+        let h1 = header(1, fk0, Some(h0.hash));
+        q.connect_block(
+            Height(1),
+            &h1,
+            &[
+                TxApply {
+                    tx: TxRecord {
+                        txid: fat_txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0xaa; 80], vec![])],
+                    outputs: vec![OutputRecord::unspent(1, fat_script)],
+                },
+                TxApply {
+                    tx: TxRecord {
+                        txid: spend_txid,
+                        version: 2,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord {
+                        prev_txid: genesis_txid,
+                        create_fk,
+                        prev_index: 0,
+                        sequence: u32::MAX,
+                        script_sig: vec![],
+                        witness: vec![vec![0u8; 64], ser.to_vec()],
+                    }],
+                    outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
+                },
+            ],
+        )
+        .unwrap();
+
+        let naive = tweaks_for_height(&q, &params, Height(1)).unwrap();
+        assert_eq!(naive.len(), 1, "fat sibling must not be eligible");
+        assert!(naive.contains_key(&spend_txid));
+        assert!(!naive.contains_key(&fat_txid));
+        let only = tweaks_for_height(&q, &params, Height(1)).unwrap();
+        assert_eq!(
+            only.get(&spend_txid).unwrap().tweak,
+            naive.get(&spend_txid).unwrap().tweak
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

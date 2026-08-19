@@ -455,7 +455,10 @@ cursor is caught up. Reorg truncates with tip. Post-IBD backfill is a
 only for P2TR creates, secp on **idle** `rbtc-scripts-*` workers (block
 scripts and mempool accept still win), then **batched** height-blob
 + idx writes (one body pwrite + one idx pwrite per consecutive group — not
-per tx). IO-bound (**hours** on SSD; 9p/spinning rust longer). Kill-safe:
+per tx). On local SSD, mainnet `origin` (Taproot, 709632) → tip is typically
+**about 1–2 hours** (~200–250 h/s through 2022, then tens of h/s once
+P2TR/ordinals density rises). The old serial `get_tx_full` path was
+~15–25 h/s (**several hours**). 9p / spinning rust longer. Kill-safe:
 `next_height` is the last complete put. INFO every 10 s:
 `sptweaks: backfill next=… tip=… rate=…/s remain=…`.
 

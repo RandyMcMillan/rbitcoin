@@ -20,6 +20,12 @@ before 1.0).
 
 ### Changed
 
+- **`--sptweaks` backfill:** one-core completion machine (`txout`, then
+  `inwit`/parents only for P2TR) and batched height-blob + idx writes.
+  Mainnet origin→tip on SSD is typically **about 1–2 hours** (was several
+  hours at ~15–25 h/s serial `get_tx_full`). INFO every 10 s:
+  `sptweaks: backfill next=… tip=… rate=…/s remain=…`.
+
 - **`--sptweaks` backfill CPU:** `tweak_from_tx` runs on idle
   `rbtc-scripts-*` steal workers (`try_for_each_parallel_idle`). Block
   script waves and mempool `run_detached_join` still take the pool

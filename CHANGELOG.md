@@ -41,6 +41,11 @@ before 1.0).
 
 ### Fixed
 
+- **Darwin / Windows smoke:** schema 17 dir-variant SH body is
+  `scripthash.body/NN` + `scripthash.ovf/body`. Snapshot jobs now accept
+  that layout (legacy file body still ok). Default `--datadir` is
+  `Path::new(".").join("datadir")` so Windows does not mix `./datadir\store`.
+
 - **Lookup wave at-least-unless-tip:** the 8000-input floor still
   holds a thin *far* layer while more BQ heights can join, but a
   single block at store tip+1 emits so load can take it.

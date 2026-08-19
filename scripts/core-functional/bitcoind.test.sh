@@ -218,6 +218,28 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# -blocksdir missing dir refuses like Core (feature_blocksdir.py).
+MISSING_BD="$WORKDIR/no-such-blocksdir"
+assert_fail_msg "blocksdir missing refuses" "Specified blocks directory" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
+  -blocksdir="$MISSING_BD"
+
+# -blocksdir existing: Core-shaped <blocksdir>/<network>/blocks/blk00000.dat
+BD="$WORKDIR/ext-blocks"
+mkdir -p "$BD"
+BD_NODE="$WORKDIR/bd-node"
+mkdir -p "$BD_NODE"
+if RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$BD_NODE" -regtest \
+  -blocksdir="$BD" >/dev/null \
+  && [[ -f "$BD/regtest/blocks/blk00000.dat" ]] \
+  && [[ -d "$BD_NODE/regtest/blocks/index" ]]; then
+  echo "ok - blocksdir layout + default blocks/index"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - blocksdir layout + default blocks/index"
+  FAIL=$((FAIL + 1))
+fi
+
 # Live smoke when a real node binary is on disk (optional in this script).
 REAL=""
 if [[ -n "${RBITCOIN_NODE_REAL:-}" && -x "${RBITCOIN_NODE_REAL}" ]]; then

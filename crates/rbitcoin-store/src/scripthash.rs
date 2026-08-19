@@ -210,6 +210,60 @@ pub struct ScriptHashTable {
     alloc: Mutex<AllocState>,
 }
 
+/// How `scripthash.body` is oriented on disk (schema 17 variant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShBodyLayout {
+    /// Single `scripthash.body` file (legacy 17).
+    Shared,
+    /// `scripthash.body/NN` + `scripthash.ovf/body`.
+    Sharded,
+}
+
+fn sh_body_path(dir: &Path) -> PathBuf {
+    dir.join("scripthash.body")
+}
+
+fn sh_ovf_body_path(dir: &Path) -> PathBuf {
+    dir.join("scripthash.ovf").join("body")
+}
+
+fn sh_shard_body_path(dir: &Path, shard: usize) -> PathBuf {
+    sh_body_path(dir).join(format!("{shard:02x}"))
+}
+
+fn sh_body_layout_wipe_msg() -> String {
+    "scripthash body layout mixed or incomplete; wipe store/scripthash* (head, body, ovf, \
+     runs, include_hwm, cold_progress) and rematerialize"
+        .into()
+}
+
+/// Detect file vs directory SH body. Does not rewrite either orientation.
+pub fn detect_sh_body_layout(dir: &Path) -> Result<ShBodyLayout, StoreError> {
+    let body = sh_body_path(dir);
+    let ovf = sh_ovf_body_path(dir);
+    match (body.is_file(), body.is_dir()) {
+        (true, false) if ovf.exists() => Err(StoreError::Layout(sh_body_layout_wipe_msg())),
+        (true, false) => Ok(ShBodyLayout::Shared),
+        (false, true) if ovf.is_file() => Ok(ShBodyLayout::Sharded),
+        (false, true) => Err(StoreError::Layout(sh_body_layout_wipe_msg())),
+        (false, false) => Err(StoreError::Layout(sh_body_layout_wipe_msg())),
+        (true, true) => Err(StoreError::Layout(sh_body_layout_wipe_msg())),
+    }
+}
+
+fn init_empty_body(body: &TableFile) -> Result<AllocState, StoreError> {
+    let payload0 = payload_start(FILE_HEADER_LEN);
+    body.ensure_capacity(payload0)?;
+    body.set_logical_len(payload0)?;
+    let state = AllocState {
+        live_count: 0,
+        bump: payload0,
+        free_head: [0; SH_MAX_CLASS as usize + 1],
+    };
+    write_alloc_header(body, &state)?;
+    Ok(state)
+}
+
 fn ingest_path(dir: &Path) -> PathBuf {
     dir.join("scripthash.ovf").join("ingest")
 }
@@ -367,20 +421,28 @@ enum KeyHome {
 
 impl ScriptHashTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
-        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash)?;
-        let payload0 = payload_start(FILE_HEADER_LEN);
-        let need = payload0;
-        body.ensure_capacity(need)?;
-        body.set_logical_len(need)?;
-        let state = AllocState {
+        let n_shards = shard_count_for_role(HeadRole::ScriptHash).max(1);
+        let body_dir = sh_body_path(dir);
+        std::fs::create_dir_all(&body_dir).map_err(|e| StoreError::io(&body_dir, e))?;
+        let mut first: Option<TableFile> = None;
+        let mut state = AllocState {
             live_count: 0,
-            bump: payload0,
+            bump: payload_start(FILE_HEADER_LEN),
             free_head: [0; SH_MAX_CLASS as usize + 1],
         };
-        write_alloc_header(&body, &state)?;
-        // Shard-count handle only — not an index. Live OA at `scripthash.head` is
-        // leftover and refused on open.
-        let n_shards = shard_count_for_role(HeadRole::ScriptHash);
+        for i in 0..n_shards {
+            let f = TableFile::create(sh_shard_body_path(dir, i), TableKind::ScriptHash)?;
+            let st = init_empty_body(&f)?;
+            if i == 0 {
+                state = st;
+                first = Some(f);
+            }
+        }
+        let ovf_dir = dir.join("scripthash.ovf");
+        std::fs::create_dir_all(&ovf_dir).map_err(|e| StoreError::io(&ovf_dir, e))?;
+        let ovf = TableFile::create(sh_ovf_body_path(dir), TableKind::ScriptHash)?;
+        let _ = init_empty_body(&ovf)?;
+        let body = first.ok_or(StoreError::Corrupt("scripthash create: no shard body"))?;
         let head = open_or_create_oa_stub(&dir.join("scripthash.head.oa_stub"), n_shards)?;
         Ok(Self {
             store_dir: dir.to_path_buf(),
@@ -395,7 +457,13 @@ impl ScriptHashTable {
     }
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
-        let body = TableFile::open(dir.join("scripthash.body"), TableKind::ScriptHash)?;
+        let layout = detect_sh_body_layout(dir)?;
+        let body = match layout {
+            ShBodyLayout::Shared => TableFile::open(sh_body_path(dir), TableKind::ScriptHash)?,
+            ShBodyLayout::Sharded => {
+                TableFile::open(sh_shard_body_path(dir, 0), TableKind::ScriptHash)?
+            }
+        };
         if leftover_oa_overflow(dir) {
             return Err(StoreError::Layout(leftover_oa_wipe_msg()));
         }
@@ -2601,6 +2669,73 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn sh_body_orientation() {
+        let file_dir = tmp();
+        TableFile::create(file_dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        assert_eq!(
+            detect_sh_body_layout(&file_dir).unwrap(),
+            ShBodyLayout::Shared
+        );
+
+        let dir_dir = tmp();
+        std::fs::create_dir_all(dir_dir.join("scripthash.body")).unwrap();
+        TableFile::create(
+            dir_dir.join("scripthash.body").join("00"),
+            TableKind::ScriptHash,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir_dir.join("scripthash.ovf")).unwrap();
+        TableFile::create(
+            dir_dir.join("scripthash.ovf").join("body"),
+            TableKind::ScriptHash,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_sh_body_layout(&dir_dir).unwrap(),
+            ShBodyLayout::Sharded
+        );
+
+        let mixed = tmp();
+        TableFile::create(mixed.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        std::fs::create_dir_all(mixed.join("scripthash.ovf")).unwrap();
+        TableFile::create(
+            mixed.join("scripthash.ovf").join("body"),
+            TableKind::ScriptHash,
+        )
+        .unwrap();
+        match detect_sh_body_layout(&mixed) {
+            Err(StoreError::Layout(m)) => {
+                assert!(m.contains("scripthash*"), "{m}");
+                assert!(m.contains("wipe"), "{m}");
+            }
+            other => panic!("expected Layout, got {other:?}"),
+        }
+
+        let no_ovf = tmp();
+        std::fs::create_dir_all(no_ovf.join("scripthash.body")).unwrap();
+        match detect_sh_body_layout(&no_ovf) {
+            Err(StoreError::Layout(m)) => {
+                assert!(m.contains("scripthash*"), "{m}");
+            }
+            other => panic!("expected Layout, got {other:?}"),
+        }
+        let created = tmp();
+        let _t = ScriptHashTable::create(&created).unwrap();
+        assert_eq!(
+            detect_sh_body_layout(&created).unwrap(),
+            ShBodyLayout::Sharded
+        );
+        assert!(created.join("scripthash.body").is_dir());
+        assert!(created.join("scripthash.body").join("00").is_file());
+        assert!(created.join("scripthash.ovf").join("body").is_file());
+        let _ = std::fs::remove_dir_all(&file_dir);
+        let _ = std::fs::remove_dir_all(&dir_dir);
+        let _ = std::fs::remove_dir_all(&mixed);
+        let _ = std::fs::remove_dir_all(&no_ovf);
+        let _ = std::fs::remove_dir_all(&created);
     }
 
     fn rec(sh: [u8; 32], tx: u64, _vout: u32) -> ScriptHashRecord {

@@ -81,10 +81,11 @@ pub use io_backend::{read_io_backend, write_io_backend, ReadIoBackend, WriteIoBa
 pub use io_handle::IoHandle;
 pub use point_table::PointRecord;
 pub use scripthash::{
-    copy_sh_body_range, has_sh_run_rebuild_source, load_include_hwm, remap_copied_page_chain,
-    remap_sh_head_value, script_hash, sh_run_catalog_key_len_ok, store_include_hwm, ColdProgress,
-    ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable, ShShardPack,
-    COLD_PROGRESS_NAME, INCLUDE_HWM_NAME, SH_RUN_SORT_KEY_LEN,
+    copy_sh_body_range, detect_sh_body_layout, has_sh_run_rebuild_source, load_include_hwm,
+    remap_copied_page_chain, remap_sh_head_value, script_hash, sh_run_catalog_key_len_ok,
+    store_include_hwm, ColdProgress, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord,
+    ScriptHashTable, ShBodyLayout, ShShardPack, COLD_PROGRESS_NAME, INCLUDE_HWM_NAME,
+    SH_RUN_SORT_KEY_LEN,
 };
 pub use scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,

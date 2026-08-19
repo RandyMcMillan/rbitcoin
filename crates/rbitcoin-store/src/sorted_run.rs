@@ -1001,18 +1001,12 @@ pub fn for_each_merged_rec(
 pub fn for_each_merged_rec_opts(
     inputs: &[SortedRunPath],
     verify_crc: bool,
-    mut on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+    on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     if inputs.is_empty() {
         return Ok(());
     }
-    let key_len = inputs[0].key_len as usize;
-    let rec_len = inputs[0].rec_len;
-    for r in inputs {
-        if r.key_len as usize != key_len || r.rec_len != rec_len {
-            return Err(StoreError::Corrupt("sorted run: merge len mismatch"));
-        }
-    }
+    let (key_len, rec_len) = merge_lens(inputs)?;
     let mut heap: Vec<MergeHead> = Vec::new();
     for (idx, run) in inputs.iter().enumerate() {
         let mut cursor = RunCursor::open(run, verify_crc)?;
@@ -1020,6 +1014,60 @@ pub fn for_each_merged_rec_opts(
             heap.push(MergeHead { cursor, idx });
         }
     }
+    merge_heads(heap, key_len, rec_len, on_rec)
+}
+
+/// k-way merge of one prefix shard's slices (`cuts[run][shard]..cuts[run][shard+1]`).
+pub fn for_each_merged_rec_shard(
+    inputs: &[SortedRunPath],
+    cuts: &[Vec<u64>],
+    shard: usize,
+    verify_crc: bool,
+    on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    if cuts.len() != inputs.len() {
+        return Err(StoreError::Corrupt("sorted run: shard cuts len mismatch"));
+    }
+    let (key_len, rec_len) = merge_lens(inputs)?;
+    let mut heap: Vec<MergeHead> = Vec::new();
+    for (idx, run) in inputs.iter().enumerate() {
+        let starts = &cuts[idx];
+        if shard + 1 >= starts.len() {
+            return Err(StoreError::Corrupt("sorted run: shard cut out of range"));
+        }
+        let lo = starts[shard];
+        let count = starts[shard + 1].saturating_sub(lo);
+        if count == 0 {
+            continue;
+        }
+        let mut cursor = RunCursor::open_range(run, lo, count, verify_crc)?;
+        if cursor.fill_next()? {
+            heap.push(MergeHead { cursor, idx });
+        }
+    }
+    merge_heads(heap, key_len, rec_len, on_rec)
+}
+
+fn merge_lens(inputs: &[SortedRunPath]) -> Result<(usize, u32), StoreError> {
+    let key_len = inputs[0].key_len as usize;
+    let rec_len = inputs[0].rec_len;
+    for r in inputs {
+        if r.key_len as usize != key_len || r.rec_len != rec_len {
+            return Err(StoreError::Corrupt("sorted run: merge len mismatch"));
+        }
+    }
+    Ok((key_len, rec_len))
+}
+
+fn merge_heads(
+    mut heap: Vec<MergeHead>,
+    key_len: usize,
+    rec_len: u32,
+    mut on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     for i in (0..heap.len()).rev() {
         sift_down(&mut heap, i, key_len);
     }
@@ -2491,6 +2539,49 @@ mod tests {
         let hit = lookup_key(&run, &rec(5, 0)[..32]).unwrap().unwrap();
         assert_eq!(hit[32], 50);
         assert!(lookup_key(&run, &rec(4, 0)[..32]).unwrap().is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn merge_shard_slice() {
+        let d = tmp_dir();
+        let mut a = Vec::new();
+        a.extend_from_slice(&sh_rec(0x00, 1));
+        a.extend_from_slice(&sh_rec(0x10, 2));
+        a.extend_from_slice(&sh_rec(0x80, 3));
+        let mut b = Vec::new();
+        b.extend_from_slice(&sh_rec(0x08, 4));
+        b.extend_from_slice(&sh_rec(0x90, 5));
+        b.extend_from_slice(&sh_rec(0xc0, 6));
+        write_sorted_run(&d.join("000001.run"), 40, 40, &a).unwrap();
+        write_sorted_run(&d.join("000002.run"), 40, 40, &b).unwrap();
+        let inputs = [
+            open_run(&d.join("000001.run")).unwrap(),
+            open_run(&d.join("000002.run")).unwrap(),
+        ];
+        let cuts: Vec<Vec<u64>> = inputs
+            .iter()
+            .map(|r| super::shard_record_starts(r, 4).unwrap())
+            .collect();
+        for s in 0..4 {
+            let mut from_slice = Vec::new();
+            super::for_each_merged_rec_shard(&inputs, &cuts, s, false, |rec| {
+                from_slice.push(rec.to_vec());
+                Ok(())
+            })
+            .unwrap();
+            let mut filtered = Vec::new();
+            for_each_merged_rec_opts(&inputs, false, |rec| {
+                let mut full = [0u8; 32];
+                full.copy_from_slice(&rec[..32]);
+                if crate::scripthash_head::prefix_shard_of(&full, 4) == s {
+                    filtered.push(rec.to_vec());
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(from_slice, filtered, "shard {s}");
+        }
         let _ = fs::remove_dir_all(&d);
     }
 

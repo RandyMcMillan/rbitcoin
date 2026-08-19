@@ -18,8 +18,9 @@ use crate::scripthash_layout::{
 };
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
-    sh_page_chunk_ranges, sh_page_decode_slice, sh_page_init_empty, sh_page_last_fk, sh_page_pack,
-    sh_page_set_next, sh_page_try_append, sh_page_would_append, SH_PAGE_SIZE,
+    sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
+    sh_page_init_empty, sh_page_last_fk, sh_page_next, sh_page_pack, sh_page_set_next,
+    sh_page_try_append, sh_page_would_append, SH_PAGE_SIZE,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
@@ -1716,6 +1717,114 @@ impl ScriptHashTable {
     pub fn head_shard_count(&self) -> usize {
         self.head.shard_count()
     }
+
+    /// Seal `recs` as sorted main shard `shard` and publish alloc HWM.
+    pub fn publish_sorted_shard(
+        &self,
+        shard: usize,
+        recs: &[(crate::scripthash_layout::ShHeadKey, [u8; 16])],
+        live_count: u64,
+        bump: u64,
+    ) -> Result<(), StoreError> {
+        let mut recs = recs.to_vec();
+        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        recs.dedup_by(|a, b| a.0 == b.0);
+        if !recs.is_empty() {
+            let n_shards = self.head.shard_count();
+            let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
+            let mut g = self.sorted_main.lock().unwrap();
+            if g.len() < n_shards {
+                g.resize_with(n_shards, || None);
+            }
+            g[shard] = Some(sealed);
+            self.sorted_main_on
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        if bump > self.body.logical_len() {
+            self.body.set_logical_len(bump)?;
+        }
+        let state = AllocState {
+            live_count,
+            bump,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&self.body, &state)?;
+        *self.alloc.lock().unwrap() = state;
+        Ok(())
+    }
+}
+
+/// Shift slab/page file offsets in a packed head value by `delta`. Inline unchanged.
+pub fn remap_sh_head_value(val: &ShHeadValue, delta: u64) -> ShHeadValue {
+    match val {
+        ShHeadValue::Empty | ShHeadValue::Inline { .. } => val.clone(),
+        ShHeadValue::Slab { class, used, off } => {
+            ShHeadValue::slab(*class, *used, off.saturating_add(delta))
+        }
+        ShHeadValue::Paged {
+            first_page,
+            last_page,
+        } => ShHeadValue::paged(
+            first_page.saturating_add(delta),
+            last_page.saturating_add(delta),
+        ),
+    }
+}
+
+/// Copy `[src_lo, src_hi)` from `src` to `dst` at `dst_lo`.
+pub fn copy_sh_body_range(
+    src: &TableFile,
+    src_lo: u64,
+    src_hi: u64,
+    dst: &TableFile,
+    dst_lo: u64,
+) -> Result<(), StoreError> {
+    if src_hi < src_lo {
+        return Err(StoreError::Corrupt("scripthash copy range inverted"));
+    }
+    let len = src_hi - src_lo;
+    let dst_end = dst_lo.saturating_add(len);
+    dst.ensure_capacity(dst_end)?;
+    if dst_end > dst.logical_len() {
+        dst.set_logical_len(dst_end)?;
+    }
+    let mut off = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    while off < len {
+        let n = ((len - off) as usize).min(buf.len());
+        src.read_at(src_lo + off, &mut buf[..n])?;
+        dst.write_at(dst_lo + off, &buf[..n])?;
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// Rewrite `next` on a copied page chain. `first_dest` is already remapped;
+/// bytes still hold local (pre-delta) `next`.
+pub fn remap_copied_page_chain(
+    body: &TableFile,
+    first_dest: u64,
+    delta: u64,
+) -> Result<(), StoreError> {
+    let mut off = first_dest;
+    while off != 0 {
+        let mut page = [0u8; SH_PAGE_SIZE];
+        body.read_at(off, &mut page)?;
+        let local_next = sh_page_next(sh_page_as_array(&page)?)?;
+        if local_next == 0 {
+            break;
+        }
+        let dest_next = local_next.saturating_add(delta);
+        let arr = sh_page_as_array_mut(&mut page)?;
+        sh_page_set_next(arr, dest_next)?;
+        body.write_at(off, &page)?;
+        off = dest_next;
+    }
+    Ok(())
 }
 
 /// Live-OA bulk writer for cold SH materialize.
@@ -3167,6 +3276,53 @@ mod tests {
             other => panic!("expected paged, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remap_sh_body() {
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
+        let src_dir = tmp();
+        let dst_dir = tmp();
+        let src = ScriptHashTable::create(&src_dir).unwrap();
+        let mut slab_key = [0u8; 32];
+        slab_key[0] = 0x11;
+        let mut mega_key = [0u8; 32];
+        mega_key[0] = 0x22;
+        let n_mega = SH_PAGE_STREAM_MAX + 10;
+        let mut session = src.bulk_session(2).unwrap();
+        for i in 1..=8u64 {
+            session.push_sorted_fk(slab_key, Fk(i)).unwrap();
+        }
+        session.finish_key().unwrap();
+        for i in 1..=n_mega as u64 {
+            session.push_sorted_fk(mega_key, Fk(i)).unwrap();
+        }
+        session.finish_key().unwrap();
+        let _ = session.finish().unwrap();
+        let slab_val = src.head_value(&slab_key).unwrap().unwrap();
+        let mega_val = src.head_value(&mega_key).unwrap().unwrap();
+        assert!(matches!(slab_val, ShHeadValue::Slab { .. }));
+        assert!(matches!(mega_val, ShHeadValue::Paged { .. }));
+        let src_lo = payload_start(FILE_HEADER_LEN);
+        let src_hi = src.alloc.lock().unwrap().bump;
+        let delta = 3 * SH_PAGE_SIZE as u64;
+        let dst = ScriptHashTable::create(&dst_dir).unwrap();
+        copy_sh_body_range(&src.body, src_lo, src_hi, &dst.body, src_lo + delta).unwrap();
+        let slab_r = remap_sh_head_value(&slab_val, delta);
+        let mega_r = remap_sh_head_value(&mega_val, delta);
+        if let ShHeadValue::Paged { first_page, .. } = mega_r {
+            remap_copied_page_chain(&dst.body, first_page, delta).unwrap();
+        }
+        let recs = vec![
+            (head_key_from_full(&slab_key), slab_r.encode()),
+            (head_key_from_full(&mega_key), mega_r.encode()),
+        ];
+        dst.publish_sorted_shard(0, &recs, 8 + n_mega as u64, src_hi + delta)
+            .unwrap();
+        assert_eq!(dst.entries(&slab_key).unwrap().len(), 8);
+        assert_eq!(dst.entries(&mega_key).unwrap().len(), n_mega);
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 
     #[test]

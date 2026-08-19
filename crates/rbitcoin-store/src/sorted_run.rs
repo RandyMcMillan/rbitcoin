@@ -672,6 +672,16 @@ struct RunCursor {
 
 impl RunCursor {
     fn open(run: &SortedRunPath, verify: bool) -> Result<Self, StoreError> {
+        Self::open_range(run, 0, run.count, verify)
+    }
+
+    /// Stream `[first_idx, first_idx + count)` using the same 256 KiB page refill.
+    fn open_range(
+        run: &SortedRunPath,
+        first_idx: u64,
+        count: u64,
+        verify: bool,
+    ) -> Result<Self, StoreError> {
         if verify {
             verify_run_body(run)?;
         }
@@ -679,8 +689,11 @@ impl RunCursor {
         if rec_len == 0 {
             return Err(StoreError::Corrupt("sorted run: zero rec_len"));
         }
+        let start = first_idx.min(run.count);
+        let remaining = count.min(run.count.saturating_sub(start));
         let mut file = File::open(&run.path).map_err(|e| io_err(&run.path, e))?;
-        file.seek(SeekFrom::Start(HEADER_LEN as u64))
+        let off = HEADER_LEN as u64 + start.saturating_mul(rec_len as u64);
+        file.seek(SeekFrom::Start(off))
             .map_err(|e| io_err(&run.path, e))?;
         let page_cap = RUN_CURSOR_PAGE
             .max(rec_len)
@@ -689,7 +702,7 @@ impl RunCursor {
         Ok(Self {
             file,
             path: run.path.clone(),
-            remaining: run.count,
+            remaining,
             rec_len,
             page: vec![0u8; page_cap],
             page_len: 0,
@@ -2424,6 +2437,23 @@ mod tests {
         let hit = lookup_key(&run, &rec(5, 0)[..32]).unwrap().unwrap();
         assert_eq!(hit[32], 50);
         assert!(lookup_key(&run, &rec(4, 0)[..32]).unwrap().is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_cursor_range() {
+        let d = tmp_dir();
+        let mut body = Vec::new();
+        for i in 0..100u8 {
+            body.extend_from_slice(&rec(i, i));
+        }
+        let run = write_sorted_run(&d.join("000001.run"), 32, 44, &body).unwrap();
+        let mut cursor = RunCursor::open_range(&run, 40, 10, false).unwrap();
+        let mut keys = Vec::new();
+        while cursor.fill_next().unwrap() {
+            keys.push(cursor.rec()[0]);
+        }
+        assert_eq!(keys, (40u8..50).collect::<Vec<_>>());
         let _ = fs::remove_dir_all(&d);
     }
 

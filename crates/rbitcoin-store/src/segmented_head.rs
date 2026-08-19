@@ -5,8 +5,8 @@
 //! store/
 //!   tx.head/
 //!     meta                       # segment descriptors
-//!     000000                     # fixed-bits 4 B relative create ids
-//!     000000.fuse8               # sealed binary fuse8 (absent while open)
+//!     000000                     # open OA only (unlinked after seal)
+//!     000000.mphf + .rel + .fuse8  # sealed: MPHF + u32 rel + fuse8
 //!     …
 //! ```
 //!
@@ -26,6 +26,7 @@
 use crate::address_head::{AddressHead, HeadLayout, HEAD_LOAD_START, MAINNET_BITS};
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, open_file, FuseFileOpen, SealedFuse8};
+use crate::tx_head_mphf::TxHeadMphf;
 use crate::tx_idx::DEFAULT_SOFT_SPAN;
 use rbitcoin_primitives::{Fk, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
@@ -85,10 +86,11 @@ struct Segment {
     count: AtomicU64,
     file_id: u32,
     sealed: bool,
-    head: Arc<AddressHead>,
+    head: Option<Arc<AddressHead>>,
+    pack: Option<Arc<TxHeadMphf>>,
     fuse: Option<SealedFuse8>,
-    /// Mixed fuse keys while open (for seal). Empty when sealed.
-    open_keys: Mutex<Vec<u64>>,
+    /// Mixed fuse key + rel while open (for seal). Empty when sealed.
+    open_keys: Mutex<Vec<(u64, u32)>>,
     /// Sealed fuse is always-probe (legacy v1 / unreadable body); rewrite as v2.
     fuse_needs_rewrite: bool,
 }
@@ -134,11 +136,21 @@ impl SegmentedTxHead {
         let mut max_id = 0u32;
         for d in descs {
             let path = segment_head_path(&dir, d.file_id);
-            let head = AddressHead::open(&path)?;
-            if head.bits() != bits || head.entry_bytes() != 4 {
-                return Err(StoreError::Corrupt("tx.head segment layout mismatch"));
-            }
             let sealed = d.flags & FLAG_SEALED != 0;
+            let (head, pack) = if sealed {
+                if !TxHeadMphf::exists(&path) {
+                    return Err(StoreError::Corrupt(
+                        "tx.head sealed segment missing mphf/rel",
+                    ));
+                }
+                (None, Some(Arc::new(TxHeadMphf::open(&path)?)))
+            } else {
+                let head = AddressHead::open(&path)?;
+                if head.bits() != bits || head.entry_bytes() != 4 {
+                    return Err(StoreError::Corrupt("tx.head segment layout mismatch"));
+                }
+                (Some(Arc::new(head)), None)
+            };
             let (fuse, fuse_needs_rewrite) = if sealed {
                 let fp = segment_fuse_path(&dir, d.file_id);
                 if !fp.exists() {
@@ -165,7 +177,8 @@ impl SegmentedTxHead {
                 count: AtomicU64::new(d.count),
                 file_id: d.file_id,
                 sealed,
-                head: Arc::new(head),
+                head,
+                pack,
                 fuse,
                 open_keys: Mutex::new(Vec::new()),
                 fuse_needs_rewrite,
@@ -298,7 +311,7 @@ impl SegmentedTxHead {
 
     /// Open-segment fuse-key Vec heap (`count × 8`).
     pub fn open_keys_resident_bytes(&self) -> u64 {
-        (self.open_keys_len() as u64).saturating_mul(8)
+        (self.open_keys_len() as u64).saturating_mul(12)
     }
 
     /// Open-tail page hop dump for leftover-miss diagnostics.
@@ -323,7 +336,10 @@ impl SegmentedTxHead {
                 },
             ));
         };
-        let dump = last.head.dump_page_hop(mixed)?;
+        let Some(head) = last.head.as_ref() else {
+            return Err(StoreError::Corrupt("tx.head leftover hop: tail sealed"));
+        };
+        let dump = head.dump_page_hop(mixed)?;
         Ok((last.file_id, last.first_fk, dump))
     }
 
@@ -382,7 +398,8 @@ impl SegmentedTxHead {
                 count: AtomicU64::new(s.count.load(Ordering::Relaxed)),
                 file_id: s.file_id,
                 sealed: true,
-                head: Arc::clone(&s.head),
+                head: s.head.clone(),
+                pack: s.pack.clone(),
                 fuse: Some(fuse),
                 open_keys: Mutex::new(Vec::new()),
                 fuse_needs_rewrite: false,
@@ -416,7 +433,12 @@ impl SegmentedTxHead {
                 "tx.head replace_open_keys: key count mismatch",
             ));
         }
-        *last.open_keys.lock().unwrap_or_else(|e| e.into_inner()) = keys;
+        let pairs: Vec<(u64, u32)> = keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (k, (i as u32).saturating_add(1)))
+            .collect();
+        *last.open_keys.lock().unwrap_or_else(|e| e.into_inner()) = pairs;
         Ok(())
     }
 
@@ -534,9 +556,12 @@ impl SegmentedTxHead {
                     return Err(StoreError::Corrupt("tx.head relative fk overflow"));
                 }
                 *fk = Fk(rel);
-                fuse_keys.push(fuse_key_from_mixed(mixed));
+                fuse_keys.push((fuse_key_from_mixed(mixed), rel as u32));
             }
-            last.head.insert_many_in_place(batch)?;
+            last.head
+                .as_ref()
+                .ok_or(StoreError::Corrupt("tx.head insert: open missing OA"))?
+                .insert_many_in_place(batch)?;
             last.open_keys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -709,7 +734,11 @@ impl SegmentedTxHead {
             }
             if !pass_keys.is_empty() {
                 LOOKUP_OPEN.fetch_add(pass_keys.len() as u64, Ordering::Relaxed);
-                let rel_lists = last.head.probe_fks_batch_ctx(&pass_keys, ctx)?;
+                let rel_lists = last
+                    .head
+                    .as_ref()
+                    .ok_or(StoreError::Corrupt("tx.head open probe: missing OA"))?
+                    .probe_fks_batch_ctx(&pass_keys, ctx)?;
                 for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                     for r in rels.into_iter().rev() {
                         if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
@@ -759,11 +788,28 @@ impl SegmentedTxHead {
             if pass_keys.is_empty() {
                 continue;
             }
-            let rel_lists = seg.head.probe_fks_batch_ctx(&pass_keys, ctx)?;
-            for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
-                for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
-                        out[orig_i].push(fk);
+            if let Some(pack) = seg.pack.as_ref() {
+                let mixed_u: Vec<u64> = pass_keys.iter().map(fuse_key_from_mixed).collect();
+                let slots = pack.slots_for(&mixed_u);
+                let rel_lists = pack.read_rels_batch(&slots, ctx)?;
+                for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                    for r in rels {
+                        if let Some(fk) = rel_to_abs(seg.first_fk, u64::from(r)) {
+                            out[orig_i].push(fk);
+                        }
+                    }
+                }
+            } else {
+                let rel_lists = seg
+                    .head
+                    .as_ref()
+                    .ok_or(StoreError::Corrupt("tx.head sealed probe: missing pack"))?
+                    .probe_fks_batch_ctx(&pass_keys, ctx)?;
+                for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                    for r in rels.into_iter().rev() {
+                        if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                            out[orig_i].push(fk);
+                        }
                     }
                 }
             }
@@ -774,7 +820,9 @@ impl SegmentedTxHead {
     pub fn flush(&self) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
         for s in segs.iter() {
-            s.head.flush()?;
+            if let Some(h) = s.head.as_ref() {
+                h.flush()?;
+            }
         }
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         self.persist_meta_locked()?;
@@ -784,7 +832,9 @@ impl SegmentedTxHead {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
         for s in segs.iter() {
-            s.head.flush_async()?;
+            if let Some(h) = s.head.as_ref() {
+                h.flush_async()?;
+            }
         }
         Ok(())
     }
@@ -814,7 +864,8 @@ impl SegmentedTxHead {
             count: AtomicU64::new(0),
             file_id,
             sealed: false,
-            head: Arc::new(head),
+            head: Some(Arc::new(head)),
+            pack: None,
             fuse: None,
             open_keys: Mutex::new(Vec::new()),
             fuse_needs_rewrite: false,
@@ -857,31 +908,36 @@ impl SegmentedTxHead {
             return Ok(());
         }
         let t0 = Instant::now();
-        let mut keys = last.open_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pairs = last.open_keys.lock().unwrap_or_else(|e| e.into_inner());
         // Completeness is on the raw append stream (one fuse key per create insert),
         // not unique keys — BIP30 same-txid pushes the same mixed key twice.
-        let raw_n = keys.len();
+        let raw_n = pairs.len();
         if raw_n as u64 != count {
             return Err(StoreError::Corrupt(
                 "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
             ));
         }
-        // Dedupe only for BinaryFuse8 construction (duplicate keys can fail build).
-        keys.sort_unstable();
-        keys.dedup();
-        let unique_n = keys.len();
+        let mut fuse_keys: Vec<u64> = pairs.iter().map(|(k, _)| *k).collect();
+        fuse_keys.sort_unstable();
+        fuse_keys.dedup();
+        let unique_n = fuse_keys.len();
         rbitcoin_log::info!(
             "store: tx.head seal begin file_id={} first_fk={} count={count} \
              fuse_keys_raw={raw_n} fuse_keys_unique={unique_n}",
             last.file_id,
             last.first_fk
         );
-        let fuse = SealedFuse8::build(&keys)?;
-        keys.clear();
-        drop(keys);
+        let fuse = SealedFuse8::build(&fuse_keys)?;
         let fuse_path = segment_fuse_path(&self.dir, last.file_id);
         fuse.write_to(&fuse_path)?;
-        last.head.flush()?;
+        if let Some(h) = last.head.as_ref() {
+            h.flush()?;
+        }
+        let base = segment_head_path(&self.dir, last.file_id);
+        let pack = TxHeadMphf::write(&base, &pairs)?;
+        pairs.clear();
+        drop(pairs);
+        let _ = std::fs::remove_file(&base);
         let fuse_bytes = fuse.fingerprint_bytes();
 
         {
@@ -893,7 +949,8 @@ impl SegmentedTxHead {
                 count: AtomicU64::new(count),
                 file_id: old.file_id,
                 sealed: true,
-                head: Arc::clone(&old.head),
+                head: None,
+                pack: Some(Arc::new(pack)),
                 fuse: Some(fuse),
                 open_keys: Mutex::new(Vec::new()),
                 fuse_needs_rewrite: false,
@@ -1332,6 +1389,36 @@ mod tests {
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seal_mphf_one_candidate_bip30_unlinks_oa() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let n = 820u64;
+        let mut entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many(&mut entries, false).unwrap();
+        assert!(h.sealed_segment_count() >= 1);
+        let sealed = dir.join("tx.head").join("000000");
+        assert!(!sealed.is_file(), "sealed OA file must be unlinked");
+        assert!(crate::tx_head_mphf::TxHeadMphf::exists(&sealed));
+        assert!(dir.join("tx.head").join("000000.fuse8").is_file());
+        let cands = h.probe_candidates(&mixed(1)).unwrap();
+        assert_eq!(cands.len(), 1, "cands={cands:?}");
+        assert_eq!(cands[0], Fk(1));
+
+        let k = mixed(0xB1B0);
+        h.insert_many(&mut [(k, Fk(821))], false).unwrap();
+        h.insert_many(&mut [(k, Fk(822))], true).unwrap();
+        let cands = h.probe_candidates(&k).unwrap();
+        assert_eq!(
+            cands.first().copied(),
+            Some(Fk(822)),
+            "newest first {cands:?}"
+        );
+        assert!(cands.iter().any(|f| f.0 == 821), "cands={cands:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

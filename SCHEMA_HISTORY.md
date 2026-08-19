@@ -40,7 +40,9 @@ RAM). Sealed ovf stays `SHSR`+fuse. `SH_INLINE_CAP = 1`; slab class 0 is 16 B.
 Megakey page header is 8 B (`LAST | index`). Confirm in Direct does not
 enqueue `scripthash.runs` or write the durable head — recollect + pack is tip
 finalize only. A 17 datadir with `tx.head` or `scripthash*` data is refused.
-Sealed `tx.head` MPHF is the rest of this version.
+Sealed `tx.head` is MPHF + `u32` rel + fuse8 (OA unlinked); open segment stays
+4 B OA. Lookup waves unchanged: open OA, sealed fuse then MPHF+rel on the same
+IoCtx SQE path. BIP30 extras live in optional `.mlt`.
 
 ## v17 (durable)
 

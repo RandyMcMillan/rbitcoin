@@ -144,7 +144,7 @@ itself changed.
     spent.body / spent.idx/                         # sole-spender 8 B × n_out
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
-    tx.head/                     # meta + NNNNNN + .fuse8 (segmented 25-bit)
+    tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.rel|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong

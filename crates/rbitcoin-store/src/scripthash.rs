@@ -1650,6 +1650,7 @@ impl ScriptHashTable {
             open_key: None,
             pack_body: None,
             pack_only: false,
+            max_fk: 0,
         })
     }
 
@@ -1689,6 +1690,7 @@ impl ScriptHashTable {
             open_key: None,
             pack_body: Some(temp),
             pack_only: true,
+            max_fk: 0,
         })
     }
 
@@ -1753,12 +1755,18 @@ impl ScriptHashTable {
             open_key: None,
             pack_body: None,
             pack_only: false,
+            max_fk: 0,
         })
     }
 
     /// Number of SH head shards (1 on Tiny, 64 on mainnet).
     pub fn head_shard_count(&self) -> usize {
         self.head.shard_count()
+    }
+
+    /// Current body bump (complete-shard HWM).
+    pub fn alloc_bump(&self) -> u64 {
+        self.alloc.lock().unwrap().bump
     }
 
     /// Seal `recs` as sorted main shard `shard` and publish alloc HWM.
@@ -1832,7 +1840,12 @@ impl ScriptHashTable {
             recs.push((k, remapped.encode()));
         }
         let new_bump = dest.saturating_add(len);
-        let live = self.alloc.lock().unwrap().live_count.saturating_add(pack.creates);
+        let live = self
+            .alloc
+            .lock()
+            .unwrap()
+            .live_count
+            .saturating_add(pack.creates);
         self.publish_sorted_shard(shard, &recs, live, new_bump)?;
         Ok(new_bump)
     }
@@ -1947,6 +1960,7 @@ pub struct ScriptHashBulkSession<'a> {
     pack_body: Option<TableFile>,
     /// When true, do not write SortedHead / ColdProgress (publisher does that).
     pack_only: bool,
+    max_fk: u64,
 }
 
 /// One shard packed at a local bump, ready to remap onto the live body.
@@ -1956,6 +1970,8 @@ pub struct ShShardPack {
     pub local_start: u64,
     pub local_end: u64,
     pub creates: u64,
+    pub max_fk: u64,
+    pub keys: u64,
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
@@ -2024,6 +2040,8 @@ impl<'a> ScriptHashBulkSession<'a> {
             local_start,
             local_end: self.bump,
             creates: self.live_count,
+            max_fk: self.max_fk,
+            keys: self.keys_written,
         };
         self.finished = true;
         Ok(pack)
@@ -2078,6 +2096,9 @@ impl<'a> ScriptHashBulkSession<'a> {
         open.buf.push(fk.0);
         open.last_fk = Some(fk.0);
         open.n_total = open.n_total.saturating_add(1);
+        if fk.0 > self.max_fk {
+            self.max_fk = fk.0;
+        }
         Ok(())
     }
 
@@ -2327,8 +2348,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let t0 = std::time::Instant::now();
         let end = self.body_write_off + self.body_buf.len() as u64;
         self.ensure_body_capacity(end)?;
-        self.body()
-            .write_at(self.body_write_off, &self.body_buf)?;
+        self.body().write_at(self.body_write_off, &self.body_buf)?;
         self.body_write_off = end;
         self.body_buf.clear();
         self.body_flush_ns = self
@@ -3491,6 +3511,85 @@ mod tests {
             assert_eq!(t.entries(&k0).unwrap().len(), 1);
             assert_eq!(t.entries(&k1).unwrap().len(), 1);
             assert!(t.head_value(&key(1, 0)).unwrap().is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    fn four_shard_table(dir: &std::path::Path) -> ScriptHashTable {
+        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        body.ensure_capacity(payload0).unwrap();
+        body.set_logical_len(payload0).unwrap();
+        let state = AllocState {
+            live_count: 0,
+            bump: payload0,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&body, &state).unwrap();
+        drop(body);
+        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256).unwrap();
+        ScriptHashTable::open(dir).unwrap()
+    }
+
+    #[test]
+    fn materialize_parallel_matches_serial() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let runs_dir = dir.join("runs");
+            std::fs::create_dir_all(&runs_dir).unwrap();
+            let key = |shard: u8, i: u8| {
+                let mut k = [0u8; 32];
+                k[0] = shard << 6 | (i & 0x3f);
+                k
+            };
+            let rec = |shard: u8, i: u8, fk: u64| {
+                let mut r = [0u8; 40];
+                r[..32].copy_from_slice(&key(shard, i));
+                r[32..40].copy_from_slice(&fk.to_le_bytes());
+                r
+            };
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for shard in 0..4u8 {
+                for i in 0..3u8 {
+                    let fk = u64::from(shard) * 10 + u64::from(i) + 1;
+                    if i % 2 == 0 {
+                        a.extend_from_slice(&rec(shard, i, fk));
+                    } else {
+                        b.extend_from_slice(&rec(shard, i, fk));
+                    }
+                }
+            }
+            crate::sorted_run::write_sorted_run(&runs_dir.join("000001.run"), 40, 40, &a).unwrap();
+            crate::sorted_run::write_sorted_run(&runs_dir.join("000002.run"), 40, 40, &b).unwrap();
+            let inputs = [
+                crate::sorted_run::open_run(&runs_dir.join("000001.run")).unwrap(),
+                crate::sorted_run::open_run(&runs_dir.join("000002.run")).unwrap(),
+            ];
+
+            let serial_dir = dir.join("serial");
+            std::fs::create_dir_all(&serial_dir).unwrap();
+            let serial = four_shard_table(&serial_dir);
+            let s = crate::materialize_sh_shards(&serial, &inputs, 0, 1, None).unwrap();
+
+            let par_dir = dir.join("par");
+            std::fs::create_dir_all(&par_dir).unwrap();
+            let par = four_shard_table(&par_dir);
+            let p = crate::materialize_sh_shards(&par, &inputs, 0, 2, None).unwrap();
+
+            assert_eq!(s.creates, p.creates);
+            assert_eq!(s.keys, p.keys);
+            assert_eq!(serial.entry_count(), par.entry_count());
+            for shard in 0..4u8 {
+                for i in 0..3u8 {
+                    let k = key(shard, i);
+                    assert_eq!(
+                        serial.entries(&k).unwrap().len(),
+                        par.entries(&k).unwrap().len(),
+                        "shard={shard} i={i}"
+                    );
+                }
+            }
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

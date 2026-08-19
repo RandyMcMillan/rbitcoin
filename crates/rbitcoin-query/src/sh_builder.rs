@@ -28,7 +28,7 @@ use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    merge_runs_with_policy, next_run_path, prefix_shard_of, reduce_runs_to_fanin_cancellable,
+    materialize_sh_shards, merge_runs_with_policy, next_run_path, reduce_runs_to_fanin_cancellable,
     set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
     RunWritePolicy, ScriptHashRecord, SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS,
     SH_RUN_SORT_KEY_LEN,
@@ -1148,7 +1148,7 @@ impl ShRunBuilder {
             _ => 0,
         };
         let t_reinit = Instant::now();
-        let mut session = match mode {
+        match mode {
             ShTipMaterializeMode::ColdResume { .. } => {
                 let p = progress.expect("ColdResume requires progress");
                 info!(
@@ -1162,7 +1162,6 @@ impl ShRunBuilder {
                     stream_inputs.len()
                 );
                 store.scripthash.prepare_cold_resume(&p)?;
-                store.scripthash.bulk_session_resume(0, &p)?
             }
             ShTipMaterializeMode::FullCold => {
                 info!(
@@ -1174,85 +1173,43 @@ impl ShRunBuilder {
                 store.scripthash.reinit_empty_for_cold_materialize()?;
                 debug_assert_eq!(store.scripthash.entry_count(), 0);
                 debug_assert!(store.scripthash.head_is_empty());
-                store.scripthash.bulk_session(0)?
             }
             ShTipMaterializeMode::WarmOnly => unreachable!("warm handled above"),
-        };
+        }
         let reinit_ns = t_reinit.elapsed().as_nanos() as u64;
         info!(
             "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true \
-             direct_kway={direct_kway} n_shards={n_shards} resume_from_shard={resume_from}",
+             direct_kway={direct_kway} n_shards={n_shards} resume_from_shard={resume_from} \
+             workers={workers}",
             stream_inputs.len()
         );
         let t0 = Instant::now();
-        let mut last_log: Option<Instant> = None;
-        let mut recs_this_key = 0u64;
-        let mut max_fk_seen = 0u64;
-
         let t_stream = Instant::now();
-        let stream_result = for_each_merged_rec_opts(&stream_inputs, false, |rec| {
-            if rec.len() < SH_RUN_REC_LEN as usize {
-                return Err(StoreError::Corrupt("sh run short record in merge stream"));
-            }
-            let (sh, tx_fk) = decode_rec_fixed(rec);
-            if tx_fk.is_null() {
-                return Ok(());
-            }
-            if prefix_shard_of(&sh, n_shards) < resume_from {
-                return Ok(());
-            }
-            if tx_fk.0 > max_fk_seen {
-                max_fk_seen = tx_fk.0;
-            }
-            session.push_sorted_fk(sh, tx_fk)?;
-            recs_this_key = recs_this_key.saturating_add(1);
-            if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-                return Err(StoreError::Cancelled("scripthash materialize stream"));
-            }
-            // Clock only on the stride — Instant::now every rec would add ~4% at 2 M rec/s.
-            if recs_this_key.is_multiple_of(MATERIALIZE_STATUS_CHECK_EVERY)
-                && materialize_status_should_emit(
-                    last_log,
-                    Instant::now(),
-                    MATERIALIZE_STATUS_INTERVAL,
-                    recs_this_key,
-                    false,
-                )
-            {
-                let pending = session
-                    .stream_creates_written()
-                    .saturating_sub(session.creates_written())
-                    as usize;
-                log_materialize_status(
-                    &mut last_log,
-                    session.keys_written(),
-                    session.creates_written(),
-                    pending,
-                    session.shards_flushed(),
-                    n_shards,
-                    total_recs,
-                    session.body_flush_ns,
-                    session.head_fill_ns,
-                    t0,
+        let mat = match materialize_sh_shards(
+            &store.scripthash,
+            &stream_inputs,
+            resume_from,
+            workers,
+            cancel,
+        ) {
+            Ok(m) => m,
+            Err(StoreError::Cancelled(msg)) => {
+                info!(
+                    "node: scripthash materialize cancelled ({msg}); complete shards kept — restart resumes"
                 );
+                return Err(StoreError::Cancelled(msg));
             }
-            Ok(())
-        });
-        if let Err(StoreError::Cancelled(msg)) = stream_result {
-            // Keep complete shards + cold_progress; leave stream_inputs for resume.
-            session.abandon_incomplete();
-            info!(
-                "node: scripthash materialize cancelled ({msg}); complete shards kept — restart resumes"
-            );
-            return Err(StoreError::Cancelled(msg));
-        }
-        stream_result?;
-        session.finish_key()?;
-        let unique_in = session.keys_written();
+            Err(e) => return Err(e),
+        };
+        let unique_in = mat.keys;
+        let max_fk_seen = mat.max_fk;
         let stream_ns = t_stream.elapsed().as_nanos() as u64;
 
         let t_finish = Instant::now();
-        let (n_total, n_keys, body_flush_ns, head_fill_ns) = session.finish()?;
+        let n_total = mat.creates;
+        let n_keys = mat.keys;
+        let body_flush_ns = mat.body_flush_ns;
+        let head_fill_ns = mat.head_fill_ns;
         store.scripthash.flush()?;
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
@@ -1723,11 +1680,17 @@ mod tests {
         // Mainnet shard 1: ~2 M more keys then one scripthash ate ~63 M creates
         // with no key-boundary — status went silent for ~6.5 min because the
         // heartbeat only ran after put_chain.
-        let interval = Duration::from_secs(10);
+        let interval = MATERIALIZE_STATUS_INTERVAL;
         let t0 = Instant::now();
         let t_due = t0 + interval;
         assert!(
-            !materialize_status_should_emit(Some(t0), t0, interval, 1 << 16, false),
+            !materialize_status_should_emit(
+                Some(t0),
+                t0,
+                interval,
+                MATERIALIZE_STATUS_CHECK_EVERY,
+                false
+            ),
             "must not emit before the wall interval"
         );
         assert!(
@@ -1735,11 +1698,23 @@ mod tests {
             "key close after interval still emits"
         );
         assert!(
-            !materialize_status_should_emit(Some(t0), t_due, interval, (1 << 16) - 1, false),
+            !materialize_status_should_emit(
+                Some(t0),
+                t_due,
+                interval,
+                MATERIALIZE_STATUS_CHECK_EVERY - 1,
+                false
+            ),
             "mid-key off-stride must not clock every rec"
         );
         assert!(
-            materialize_status_should_emit(Some(t0), t_due, interval, 1 << 16, false),
+            materialize_status_should_emit(
+                Some(t0),
+                t_due,
+                interval,
+                MATERIALIZE_STATUS_CHECK_EVERY,
+                false
+            ),
             "mid-key megakey after interval must heartbeat on the rec stride"
         );
         assert_eq!(
@@ -1747,6 +1722,9 @@ mod tests {
             155_568_193
         );
         assert_eq!(materialize_status_creates(u64::MAX, 8), u64::MAX);
+        let mut last = None;
+        log_materialize_status(&mut last, 1, 1, 0, 1, 4, 10, 0, 0, Instant::now());
+        assert!(last.is_some());
     }
 
     #[test]
@@ -1782,6 +1760,82 @@ mod tests {
         match store.scripthash.head_value(&sh).unwrap().unwrap() {
             rbitcoin_store::ShHeadValue::Paged { .. } => {}
             other => panic!("expected paged megakey, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_two_run_catalog(runs_dir: &std::path::Path) -> Vec<[u8; 32]> {
+        std::fs::create_dir_all(runs_dir).unwrap();
+        let mut body_a = Vec::new();
+        let mut body_b = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..16u32 {
+            let mut sh = [0u8; 32];
+            sh[0] = (i * 16) as u8;
+            keys.push(sh);
+            let rec = encode_rec(&sh, Fk(u64::from(i) + 1));
+            if i % 2 == 0 {
+                body_a.extend_from_slice(&rec);
+            } else {
+                body_b.extend_from_slice(&rec);
+            }
+        }
+        write_sorted_run(
+            &next_run_path(runs_dir, 1),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body_a,
+        )
+        .unwrap();
+        write_sorted_run(
+            &next_run_path(runs_dir, 2),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body_b,
+        )
+        .unwrap();
+        keys
+    }
+
+    #[test]
+    fn materialize_parallel_matches_serial() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-par-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let serial_dir = dir.join("serial");
+        std::fs::create_dir_all(&serial_dir).unwrap();
+        let keys = write_two_run_catalog(&serial_dir.join("scripthash.runs"));
+        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "1");
+        let store_s = Store::open_or_create(&serial_dir).unwrap();
+        let n_s = ShRunBuilder::new(&serial_dir)
+            .finalize_and_bulk_materialize(&store_s)
+            .unwrap();
+
+        let par_dir = dir.join("par");
+        std::fs::create_dir_all(&par_dir).unwrap();
+        write_two_run_catalog(&par_dir.join("scripthash.runs"));
+        std::env::set_var("RBITCOIN_SH_MERGE_WORKERS", "2");
+        let store_p = Store::open_or_create(&par_dir).unwrap();
+        let n_p = ShRunBuilder::new(&par_dir)
+            .finalize_and_bulk_materialize(&store_p)
+            .unwrap();
+        std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS");
+
+        assert_eq!(n_s, n_p);
+        assert_eq!(
+            store_s.scripthash.entry_count(),
+            store_p.scripthash.entry_count()
+        );
+        for sh in &keys {
+            assert_eq!(
+                store_s.scripthash.entries(sh).unwrap().len(),
+                store_p.scripthash.entries(sh).unwrap().len()
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

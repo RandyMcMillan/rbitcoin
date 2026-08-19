@@ -32,6 +32,7 @@ mod point_table;
 mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
+mod scripthash_materialize;
 mod scripthash_overflow;
 mod scripthash_pages;
 mod scripthash_slabs;
@@ -83,8 +84,7 @@ pub use scripthash::{
     copy_sh_body_range, has_sh_run_rebuild_source, load_include_hwm, remap_copied_page_chain,
     remap_sh_head_value, script_hash, sh_run_catalog_key_len_ok, store_include_hwm, ColdProgress,
     ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable, ShShardPack,
-    COLD_PROGRESS_NAME,
-    INCLUDE_HWM_NAME, SH_RUN_SORT_KEY_LEN,
+    COLD_PROGRESS_NAME, INCLUDE_HWM_NAME, SH_RUN_SORT_KEY_LEN,
 };
 pub use scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,
@@ -92,6 +92,7 @@ pub use scripthash_head::{
 };
 pub use scripthash_layout::ShHeadValue;
 pub use scripthash_layout::SH_MAX_SLAB_CLASS;
+pub use scripthash_materialize::{materialize_sh_shards, ShShardMaterialize};
 pub use scripthash_slabs::{
     decode_fk_delta_stream, decode_slab_payload, encode_fk_delta_stream, encode_slab_payload,
     page_alloc_bytes_for_n_fks, slab_alloc_bytes_for_n_fks, slab_class_for_n_fks,
@@ -111,13 +112,12 @@ pub use sorted_run::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, crc32, detach_run,
     dynamic_merge_fanin, dynamic_merge_fanin_for, fanin_passes_total, for_each_merged_rec,
     for_each_merged_rec_opts, for_each_merged_rec_shard, list_fanin_reduce_outputs,
-    list_materialize_claims, list_runs,
-    load_fanin_checkpoint, lookup_key, merge_runs, merge_runs_to_file,
-    merge_runs_to_file_with_policy, merge_runs_with_policy, next_run_path, open_run, read_run_body,
-    reduce_runs_to_fanin, reduce_runs_to_fanin_cancellable, remove_run,
+    list_materialize_claims, list_runs, load_fanin_checkpoint, lookup_key, merge_runs,
+    merge_runs_to_file, merge_runs_to_file_with_policy, merge_runs_with_policy, next_run_path,
+    open_run, read_run_body, reduce_runs_to_fanin, reduce_runs_to_fanin_cancellable, remove_run,
     set_thread_idle_io_priority, sh_merge_workers, shard_record_starts, verify_run_body,
-    write_fanin_checkpoint, write_sorted_run, write_sorted_run_file_with_policy,
-    MergeToFileResult, RunWritePolicy, SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME,
+    write_fanin_checkpoint, write_sorted_run, write_sorted_run_file_with_policy, MergeToFileResult,
+    RunWritePolicy, SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME,
     FANIN_TARGET_STREAM_RUNS,
 };
 pub use sp_tweaks::{SpTweaksTable, TWEAK_LEN};

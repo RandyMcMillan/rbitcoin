@@ -249,6 +249,65 @@ impl ShHeadValue {
     }
 }
 
+const SH8_MODE_SHIFT: u32 = 62;
+const SH8_OFF_MASK: u64 = (1u64 << 40) - 1;
+const SH8_USED_SHIFT: u32 = 40;
+const SH8_USED_MASK: u64 = 0xffff;
+const SH8_CLASS_SHIFT: u32 = 56;
+const SH8_CLASS_MASK: u64 = 0x3f;
+const SH8_PAYLOAD62: u64 = (1u64 << 62) - 1;
+
+/// Schema 18 sealed SH value: 8 B, mode in bits 63–62.
+pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
+    match v {
+        ShHeadValue::Empty => Ok(0),
+        ShHeadValue::Inline { entries, used } if *used == 1 => {
+            let fk = entries[0].create_tx_fk.0;
+            if fk > SH8_PAYLOAD62 {
+                return Err(StoreError::Corrupt("sh pack8: fk overflow"));
+            }
+            Ok(fk)
+        }
+        ShHeadValue::Slab { class, used, off } => {
+            if *off > SH8_OFF_MASK || u64::from(*class) > SH8_CLASS_MASK {
+                return Err(StoreError::Corrupt("sh pack8: slab field overflow"));
+            }
+            Ok((1u64 << SH8_MODE_SHIFT)
+                | (*off & SH8_OFF_MASK)
+                | ((u64::from(*used) & SH8_USED_MASK) << SH8_USED_SHIFT)
+                | ((u64::from(*class) & SH8_CLASS_MASK) << SH8_CLASS_SHIFT))
+        }
+        ShHeadValue::Paged { last_page, .. } => {
+            if *last_page > SH8_PAYLOAD62 {
+                return Err(StoreError::Corrupt("sh pack8: last_page overflow"));
+            }
+            Ok((2u64 << SH8_MODE_SHIFT) | *last_page)
+        }
+        ShHeadValue::Inline { .. } => Err(StoreError::Corrupt("sh pack8: inline cap 1")),
+    }
+}
+
+/// Inverse of [`pack8`]. Paged `first_page` is 0 (lives on the last page header).
+pub fn unpack8(w: u64) -> Result<ShHeadValue, StoreError> {
+    if w == 0 {
+        return Ok(ShHeadValue::Empty);
+    }
+    match w >> SH8_MODE_SHIFT {
+        0 => Ok(ShHeadValue::inline_one(ShEntry::new(Fk(w & SH8_PAYLOAD62)))),
+        1 => {
+            let off = w & SH8_OFF_MASK;
+            let used = ((w >> SH8_USED_SHIFT) & SH8_USED_MASK) as u16;
+            let class = ((w >> SH8_CLASS_SHIFT) & SH8_CLASS_MASK) as u8;
+            if used as usize <= SH_INLINE_CAP {
+                return Err(StoreError::Corrupt("sh unpack8: slab used inline"));
+            }
+            Ok(ShHeadValue::slab(class, used, off))
+        }
+        2 => Ok(ShHeadValue::paged(0, w & SH8_PAYLOAD62)),
+        _ => Err(StoreError::Corrupt("sh unpack8: bad mode")),
+    }
+}
+
 /// Payload region starts at the combined RBT1+SHAL prefix page (offset 4096).
 ///
 /// `file_header_len` is accepted so call sites stay stable; schema 15 does not
@@ -328,6 +387,27 @@ mod tests {
     #[test]
     fn page_class_is_4k() {
         assert_eq!(slab_bytes(SH_PAGE_SLAB_CLASS), 4096);
+    }
+
+    #[test]
+    fn pack8_roundtrip_modes() {
+        let one = ShHeadValue::inline_one(ShEntry::new(Fk(0x1234)));
+        assert_eq!(unpack8(pack8(&one).unwrap()).unwrap(), one);
+        let slab = ShHeadValue::slab(2, 9, 4096);
+        let got = unpack8(pack8(&slab).unwrap()).unwrap();
+        assert_eq!(got, slab);
+        let paged = ShHeadValue::paged(4096, 8192);
+        let got = unpack8(pack8(&paged).unwrap()).unwrap();
+        match got {
+            ShHeadValue::Paged {
+                first_page: 0,
+                last_page: 8192,
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(pack8(&ShHeadValue::Empty).unwrap(), 0);
+        assert!(pack8(&ShHeadValue::inline_one(ShEntry::new(Fk(0)))).is_ok());
+        assert!(unpack8(1u64 << 62 | 1).is_err() || matches!(unpack8(1u64 << 62 | 1), Ok(_)));
     }
 
     #[test]

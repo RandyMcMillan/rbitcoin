@@ -2,7 +2,9 @@
 //!
 //! Production: (1) [`try_for_each_parallel`] steals **chunks** of indices on
 //! the process-wide `rbtc-scripts-*` workers; (2) [`spawn_detached`] /
-//! [`run_detached_join`] for mempool accept. Confirm scripts phases run on
+//! [`run_detached_join`] for mempool accept; (3) [`try_for_each_parallel_idle`]
+//! publishes a **background** wave claimed only when no foreground wave and no
+//! detached job are waiting (sptweak CPU). Confirm scripts phases run on
 //! [`spawn_coordinator`], not on steal workers (a worker must not wait on
 //! this pool).
 //!
@@ -111,6 +113,8 @@ impl Wave {
 
 static WAVES: Mutex<Vec<Arc<Wave>>> = Mutex::new(Vec::new());
 static WAVES_SNAP: OnceLock<ArcSwap<Vec<Arc<Wave>>>> = OnceLock::new();
+static WAVES_BG: Mutex<Vec<Arc<Wave>>> = Mutex::new(Vec::new());
+static WAVES_BG_SNAP: OnceLock<ArcSwap<Vec<Arc<Wave>>>> = OnceLock::new();
 
 #[cfg(test)]
 static STEAL_WAVES_LOCKS: AtomicUsize = AtomicUsize::new(0);
@@ -128,20 +132,35 @@ fn waves_snap() -> &'static ArcSwap<Vec<Arc<Wave>>> {
     WAVES_SNAP.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
 }
 
+fn waves_bg_snap() -> &'static ArcSwap<Vec<Arc<Wave>>> {
+    WAVES_BG_SNAP.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
+}
+
 fn publish_waves(waves: &[Arc<Wave>]) {
     waves_snap().store(Arc::new(waves.to_vec()));
 }
 
+fn publish_waves_bg(waves: &[Arc<Wave>]) {
+    waves_bg_snap().store(Arc::new(waves.to_vec()));
+}
+
 /// Lock-free claim: load the published wave list. Must not lock [`WAVES`].
 /// [`STEAL_WAVES_LOCKS`] counts steal-path mutex takes only.
-fn steal_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
-    let snap = waves_snap().load();
-    for w in snap.iter() {
+fn steal_from(snap: &[Arc<Wave>]) -> Option<(Arc<Wave>, Range<usize>)> {
+    for w in snap {
         if let Some(range) = w.claim_chunk() {
             return Some((Arc::clone(w), range));
         }
     }
     None
+}
+
+fn steal_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
+    steal_from(&waves_snap().load())
+}
+
+fn steal_bg_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
+    steal_from(&waves_bg_snap().load())
 }
 
 /// Parallel map over `items` until the first error (or all succeed).
@@ -150,6 +169,24 @@ fn steal_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
 /// steal worker (hard refuse — same-pool wait would deadlock). On first error,
 /// workers stop claiming; in-flight units may still finish.
 pub(crate) fn try_for_each_parallel<T, F>(items: &[T], f: F) -> Result<(), ConsensusError>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<(), ConsensusError> + Sync,
+{
+    run_wave(items, f, false)
+}
+
+/// Like [`try_for_each_parallel`], but workers claim only when no foreground
+/// wave and no detached job are waiting (mempool / block scripts win).
+pub(crate) fn try_for_each_parallel_idle<T, F>(items: &[T], f: F) -> Result<(), ConsensusError>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<(), ConsensusError> + Sync,
+{
+    run_wave(items, f, true)
+}
+
+fn run_wave<T, F>(items: &[T], f: F, background: bool) -> Result<(), ConsensusError>
 where
     T: Sync,
     F: Fn(&T) -> Result<(), ConsensusError> + Sync,
@@ -192,7 +229,11 @@ where
         done: Mutex::new(false),
         done_cv: Condvar::new(),
     });
-    {
+    if background {
+        let mut g = WAVES_BG.lock().unwrap_or_else(|p| p.into_inner());
+        g.push(Arc::clone(&wave));
+        publish_waves_bg(&g);
+    } else {
         let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
         g.push(Arc::clone(&wave));
         publish_waves(&g);
@@ -201,7 +242,11 @@ where
     pool.cv.notify_all();
     wave.wait_done();
 
-    {
+    if background {
+        let mut g = WAVES_BG.lock().unwrap_or_else(|p| p.into_inner());
+        g.retain(|w| !Arc::ptr_eq(w, &wave));
+        publish_waves_bg(&g);
+    } else {
         let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
         g.retain(|w| !Arc::ptr_eq(w, &wave));
         publish_waves(&g);
@@ -277,6 +322,11 @@ fn workers() -> &'static ScriptWorkers {
                             continue;
                         }
                         if let Some((w, range)) = steal_chunk() {
+                            drop(g);
+                            w.run_chunk(range);
+                            continue;
+                        }
+                        if let Some((w, range)) = steal_bg_chunk() {
                             drop(g);
                             w.run_chunk(range);
                             continue;
@@ -381,7 +431,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -612,5 +662,169 @@ mod tests {
             format!("{err}").contains("try_for_each from a script worker"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn try_for_each_idle_all_ok() {
+        let items: Vec<u32> = (0..64).collect();
+        let hits = AtomicUsize::new(0);
+        try_for_each_parallel_idle(&items, |_| {
+            hits.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn try_for_each_idle_from_script_worker_is_refused() {
+        let got =
+            run_detached_join(|| try_for_each_parallel_idle(&[1u32, 2], |_| Ok(()))).expect("join");
+        let err = got.expect_err("must refuse nested wait");
+        assert!(
+            format!("{err}").contains("try_for_each from a script worker"),
+            "{err}"
+        );
+    }
+
+    /// Occupy every steal worker in a detached job, publish an idle wave whose
+    /// items wait on a later job, queue that job, then release. If idle stole
+    /// like a foreground wave, the job never runs (items wait on it).
+    #[test]
+    fn idle_wave_does_not_starve_detached_job() {
+        use std::time::{Duration, Instant};
+
+        let n = worker_spawn_count();
+        assert!(n >= 1);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..n {
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&gate);
+            spawn_detached(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*gate;
+                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while !*g {
+                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                }
+            });
+        }
+        let start = Instant::now();
+        while entered.load(Ordering::SeqCst) < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "failed to occupy steal workers"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let job2 = Arc::new(AtomicBool::new(false));
+        let idle_hits = Arc::new(AtomicUsize::new(0));
+        let items: Vec<u32> = (0..64).collect();
+        let idle_hits2 = Arc::clone(&idle_hits);
+        let job2_wait = Arc::clone(&job2);
+        let idle = thread::spawn(move || {
+            try_for_each_parallel_idle(&items, |_| {
+                let t0 = Instant::now();
+                while !job2_wait.load(Ordering::SeqCst) {
+                    assert!(
+                        t0.elapsed() < Duration::from_secs(2),
+                        "idle item waited for a starved detached job"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                idle_hits2.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        thread::sleep(Duration::from_millis(20));
+        let job2_flag = Arc::clone(&job2);
+        spawn_detached(move || {
+            job2_flag.store(true, Ordering::SeqCst);
+        });
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+        let start = Instant::now();
+        while !job2.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "idle wave starved the detached job"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        idle.join().expect("idle thread").expect("idle ok");
+        assert_eq!(idle_hits.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn idle_wave_does_not_starve_foreground_wave() {
+        use std::time::{Duration, Instant};
+
+        let n = worker_spawn_count();
+        assert!(n >= 1);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..n {
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&gate);
+            spawn_detached(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*gate;
+                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while !*g {
+                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                }
+            });
+        }
+        let start = Instant::now();
+        while entered.load(Ordering::SeqCst) < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "failed to occupy steal workers"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let fg_done = Arc::new(AtomicBool::new(false));
+        let items: Vec<u32> = (0..64).collect();
+        let fg_wait = Arc::clone(&fg_done);
+        let idle = thread::spawn(move || {
+            try_for_each_parallel_idle(&items, |_| {
+                let t0 = Instant::now();
+                while !fg_wait.load(Ordering::SeqCst) {
+                    assert!(
+                        t0.elapsed() < Duration::from_secs(2),
+                        "idle item waited for a starved foreground wave"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(())
+            })
+        });
+        thread::sleep(Duration::from_millis(20));
+        let fg_hits = Arc::new(AtomicUsize::new(0));
+        let fg_hits2 = Arc::clone(&fg_hits);
+        let fg_flag = Arc::clone(&fg_done);
+        let fg = thread::spawn(move || {
+            let items: Vec<u32> = (0..32).collect();
+            let r = try_for_each_parallel(&items, |_| {
+                fg_hits2.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+            fg_flag.store(true, Ordering::SeqCst);
+            r
+        });
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+        fg.join().expect("fg thread").expect("fg ok");
+        assert_eq!(fg_hits.load(Ordering::Relaxed), 32);
+        idle.join().expect("idle thread").expect("idle ok");
     }
 }

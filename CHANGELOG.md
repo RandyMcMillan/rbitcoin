@@ -31,6 +31,11 @@ before 1.0).
   script waves and mempool `run_detached_join` still take the pool
   first. The uring load machine stays one-core.
 
+- **`sp_tweaks` roll at u32 start:** a height blob may extend past 4 GiB
+  as long as its idx **start** fits in `u32`. `put_blocks` rolls a new
+  `NNNNNN` pair when the next start would overflow (including mid-batch)
+  instead of `Corrupt("sp_tweaks body exceeds u32 off")`.
+
 - **SH tip materialize is sliced k-way:** one worker per CPU core
   (clamped to shard count) k-way-merges one prefix shard's catalog
   slices with a loser tree of stable 256 KiB double-buffered cursors.

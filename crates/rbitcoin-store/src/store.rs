@@ -2490,6 +2490,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Open `tx.head` page is `page_base_for_txid(mix_txid(txid))`, not raw txid.
+    #[test]
+    fn open_head_page_uses_mix_txid_not_raw() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let bits = s.txs.head.bits();
+        let mut txid = [0x11u8; 32];
+        let mut found = false;
+        for i in 0u64..100_000 {
+            txid[24..32].copy_from_slice(&i.to_le_bytes());
+            let mixed = s.txs.secret.mix_txid(&txid);
+            let raw_page = crate::address_head::page_base_for_txid(&txid, bits);
+            let mix_page = crate::address_head::page_base_for_txid(&mixed, bits);
+            if raw_page != mix_page {
+                s.diagnose_leftover_probe(&txid);
+                let diag =
+                    crate::head_resolve_stats::take_leftover_probe_diag().expect("probe dump");
+                assert_eq!(diag.page_base, mix_page);
+                assert_ne!(diag.page_base, raw_page);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "need a txid whose mix moves the open-head page");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Lookup / BQ-ahead also use TipOnly `get_fk_by_txid_batch`. A miss there
     /// is routine (parent not published yet). Dump + WARN only on leftover.
     #[test]

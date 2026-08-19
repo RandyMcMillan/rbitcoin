@@ -6,7 +6,7 @@ use crate::point_table::{self, PointRecord};
 use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
 use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
-use rbitcoin_primitives::{Fk, Height, SCHEMA_VERSION, STORE_MAGIC, schema_file_openable};
+use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1585,10 +1585,9 @@ mod tests {
         s.rebuild_height_fence().unwrap();
         assert!(s.is_confirmed_strong(spend_fk).unwrap());
         assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
-        assert!(
-            s.has_confirmed_strong_spender_create(create_fk, 0, Some((soff, slen)))
-                .unwrap()
-        );
+        assert!(s
+            .has_confirmed_strong_spender_create(create_fk, 0, Some((soff, slen)))
+            .unwrap());
         assert!(s.has_confirmed_strong_spender(&[10u8; 32], 0).unwrap());
         let unspent = s
             .unspent_create_vouts(create_fk, &[0, 1], Some((soff, slen)))
@@ -1690,7 +1689,7 @@ mod tests {
         }
         // Real schema-13 stores have SHAL alloc v1 on scripthash.body.
         {
-            use crate::file::{FILE_HEADER_LEN, TableFile};
+            use crate::file::{TableFile, FILE_HEADER_LEN};
             use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
             use rbitcoin_primitives::TableKind;
             let body_path = dir.join("scripthash.body").join("00");
@@ -1750,7 +1749,7 @@ mod tests {
 
     #[test]
     fn open_schema14_packed_tx_body_with_creates_refused() {
-        use crate::file::{FILE_HEADER_LEN, TableFile};
+        use crate::file::{TableFile, FILE_HEADER_LEN};
         use rbitcoin_primitives::TableKind;
         let dir = tmp();
         {
@@ -1784,7 +1783,7 @@ mod tests {
         }
         // Real schema-14 stores have SHAL alloc v2 on scripthash.body.
         {
-            use crate::file::{FILE_HEADER_LEN, TableFile};
+            use crate::file::{TableFile, FILE_HEADER_LEN};
             use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
             use rbitcoin_primitives::TableKind;
             let body_path = dir.join("scripthash.body").join("00");
@@ -1900,7 +1899,7 @@ mod tests {
     /// Schema-15 16-byte Class A meta with creates cannot open under 17.
     #[test]
     fn open_legacy_class_a_with_creates_refused() {
-        use crate::file::{FILE_HEADER_LEN, TableFile};
+        use crate::file::{TableFile, FILE_HEADER_LEN};
         use rbitcoin_primitives::TableKind;
         let dir = tmp();
         {
@@ -2656,7 +2655,7 @@ mod tests {
     #[test]
     fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
         use crate::head_resolve_stats::sealed_age_for_fk;
-        use crate::segmented_head::{HEAD_PROBE_HOT_MAX_AGE, SegmentedTxHead};
+        use crate::segmented_head::{SegmentedTxHead, HEAD_PROBE_HOT_MAX_AGE};
         use crate::tx_table::OutputRecord;
 
         fn put_one(s: &Store, txid: [u8; 32], lock: u32) -> Fk {

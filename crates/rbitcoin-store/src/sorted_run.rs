@@ -706,7 +706,8 @@ fn read_page_at(
 
 /// Streaming cursor over a run (for merge).
 struct RunCursor {
-    file: File,
+    /// Owner of [`Self::handle`] (borrowed fd / HANDLE). Never close the handle.
+    _file: File,
     handle: IoHandle,
     path: PathBuf,
     remaining: u64,
@@ -761,7 +762,7 @@ impl RunCursor {
             .div_ceil(rec_len)
             .saturating_mul(rec_len);
         let cur = Self {
-            file,
+            _file: file,
             handle,
             path: run.path.clone(),
             remaining,
@@ -782,9 +783,8 @@ impl RunCursor {
     fn advise_willneed(&self) {
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::io::AsRawFd;
             let _ = unsafe {
-                libc::posix_fadvise(self.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
+                libc::posix_fadvise(self.handle.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
             };
         }
     }

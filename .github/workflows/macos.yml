@@ -106,7 +106,13 @@ jobs:
           set -euo pipefail
           ./dist/rbitcoin-node --smoke --network regtest --datadir ./mac-smoke \
             --no-seeds --log-level error
-          test -f ./mac-smoke/store/scripthash.body
+          body=./mac-smoke/store/scripthash.body
+          if [ -d "$body" ]; then
+            test -f "$body/00"
+            test -f ./mac-smoke/store/scripthash.ovf/body
+          else
+            test -f "$body"
+          fi
 
       - name: Upload Darwin binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

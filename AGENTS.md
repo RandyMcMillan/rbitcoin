@@ -174,6 +174,12 @@ GitHub App SSH key. The App token from `~/.config/rbitcoin-grok/gh-login.sh`
 here. Bot **push** must use an **explicit HTTPS URL**. Do **not**
 `git remote set-url origin`. Do **not** `git push origin` as the bot.
 
+The App token **cannot** create or update `.github/workflows/*` (GitHub
+`workflows` permission). If the commit set touches workflow YAML, **stop
+and ask the operator to push** that branch. Do not strip the workflow
+diff to sneak a push. Non-workflow commits on an already-pushed branch
+are fine.
+
 ```bash
 ~/.config/rbitcoin-grok/gh-login.sh
 git fetch origin
@@ -190,6 +196,7 @@ No `-u` on push (that would retarget the branch remote away from `origin`).
 | **Poll until green** | Do not walk away and call the plan done. |
 | **Done** | Required checks green **and** the PR is up for review. Do not merge unless asked. |
 | **Do not** | Force-push `master`, merge a red PR, collapse `origin` to a single URL, or skip polling because “tests passed locally.” |
+| **Workflow YAML** | App cannot push `.github/workflows/*`. Ask the operator to `git push`. |
 
 Coverage (≥90% LCOV `LH`/`LF`) is a required CI job — see
 [`TESTING.md`](TESTING.md). If CI `coverage` fails, add a pin and push.

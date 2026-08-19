@@ -56,7 +56,8 @@ xattr -d com.apple.quarantine rbitcoin-node rbitcoin-cli
 **Windows store files** are opened `FILE_FLAG_OVERLAPPED` (IOCP). Header
 create/open/grow use positional `ReadFile`/`WriteFile` +
 `SetFileInformationByHandle`, not std `Read`/`Write`/`Seek`. Mixed
-`./datadir\store\...` in logs is display only — not a path bug.
+Default `--datadir` is cwd-relative `datadir` via `Path::new(".").join("datadir")`
+(`./datadir` on Unix, `.\datadir` on Windows).
 
 ## CLI (operator-first)
 
@@ -68,7 +69,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 
 | Flag | Core-ish alias | Default |
 |------|----------------|---------|
-| `--datadir PATH` | same | `./datadir` |
+| `--datadir PATH` | same | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
 | `--datadir-cold PATH` | conf `datadir-cold=` | unset — Class A `inwit.body` / `inwit.idx/` under `{PATH}/store`; everything else stays in `--datadir` |
 | `--network NET` | `--chain` | `mainnet` |
 | `--signetchallenge HEX` | `--signet-challenge` | default global Signet challenge |

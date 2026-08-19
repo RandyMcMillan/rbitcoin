@@ -113,7 +113,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            datadir: PathBuf::from("./datadir"),
+            datadir: Self::default_datadir(),
             datadir_cold: None,
             network: Network::Mainnet,
             signet_challenge: None,
@@ -159,6 +159,15 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    /// Cwd-relative `datadir` using the host path separator.
+    ///
+    /// `PathBuf::from("./datadir")` keeps a `/` in the OsString on Windows, so
+    /// later `join` produces mixed `./datadir\store`. `.` + `join("datadir")`
+    /// is `./datadir` on Unix and `.\datadir` on Windows.
+    pub fn default_datadir() -> PathBuf {
+        PathBuf::from(".").join("datadir")
+    }
+
     /// `/rbitcoin:VERSION/` or `/rbitcoin:VERSION(comment; …)/`.
     pub fn subversion(&self) -> Result<String, crate::error::NodeError> {
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &self.uacomments)
@@ -655,6 +664,28 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-node-cfg-{n}"))
+    }
+
+    #[test]
+    fn default_datadir_is_native_cwd_relative() {
+        let p = NodeConfig::default_datadir();
+        assert_eq!(p, PathBuf::from(".").join("datadir"));
+        assert_eq!(NodeConfig::default().datadir, p);
+        let store = p.join("store");
+        #[cfg(windows)]
+        {
+            let s = store.to_string_lossy();
+            assert!(
+                !s.contains('/'),
+                "default datadir must use Windows separators, got {s}"
+            );
+            assert_eq!(p.to_str(), Some(r".\datadir"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(p.to_str(), Some("./datadir"));
+            assert_eq!(store.to_str(), Some("./datadir/store"));
+        }
     }
 
     #[test]

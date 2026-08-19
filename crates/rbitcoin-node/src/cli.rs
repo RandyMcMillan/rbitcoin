@@ -17,7 +17,7 @@ where
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     let mut i = 1usize;
-    let mut datadir = PathBuf::from("./datadir");
+    let mut datadir = NodeConfig::default_datadir();
     let mut datadir_set = false;
     let mut datadir_cold: Option<PathBuf> = None;
     let mut datadir_cold_set = false;

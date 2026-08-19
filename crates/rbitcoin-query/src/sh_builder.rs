@@ -58,9 +58,10 @@ pub fn select_sh_tip_materialize_mode(
     stream_run_count: usize,
 ) -> ShTipMaterializeMode {
     let n_shards = n_shards.max(1);
-    // Mid multi-shard cold resume (prior shards may already have entry_count > 0).
+    // Interrupted cold: progress is present and not past the last shard.
+    // `next_shard == 0` is a hole at shard 0 with later heads already sealed.
     if let Some(ns) = progress_next_shard {
-        if ns > 0 && ns < n_shards {
+        if ns < n_shards {
             return ShTipMaterializeMode::ColdResume { next_shard: ns };
         }
     }
@@ -2050,7 +2051,7 @@ mod tests {
         );
         assert_eq!(
             select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1),
-            ShTipMaterializeMode::WarmOnly
+            ShTipMaterializeMode::ColdResume { next_shard: 0 }
         );
         // Empty head + streams → FullCold (FORCE prep reinit's before this).
         assert_eq!(

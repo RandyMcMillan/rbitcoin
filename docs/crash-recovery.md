@@ -86,7 +86,9 @@ Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_sea
 - **Segmented `tx.head`:** directory `tx.head/` with `meta` + per-segment files (+ `.fuse8` when sealed). Flat `tx.head.meta` / `tx.head.NNNNNN` are **migrated into** `tx.head/` on open. Seal publishes fuse then marks sealed in meta. Kill mid-seal may require deleting incomplete segment files / meta and rebuilding from Class A (or reindex). Legacy mono `tx.head` file / `.new` / `.resize` are not opened — reindex.
 - Scripthash (Direct): thin creates → memtable → target-sized sorted spills + **SEAL** (`max_create_fk`). Memtable is not durable; resume re-enqueues Class A with `create_fk > SEAL`. Tip path:
   - **Full cold** when head empty (after catalog complete). **`RBITCOIN_SH_FORCE_REBUILD=1`:** empty head + usable catalog → reinit head only (keep runs/SEAL) then FullCold; empty head + unusable catalog → wipe + full Class A recollect; durable head → never wipe (WarmOnly / bootstrap). Empty catalog after recollect is fatal.
-  - **Cold resume** via `scripthash.cold_progress` (`next_shard` + body HWM).
+  - **Cold resume** via `scripthash.cold_progress`. Dir-variant: sealed
+    `scripthash.head/NN` is the commit (holes stay); `next_shard` is the
+    lowest unsealed shard. File-variant: prefix HWM + `body_bump`.
   - **Warm-only** when durable head exists + residual runs (**never** wipe for leftover mats or sticky FORCE).
   Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: empty/tiny residual runs are normal post-consume; missing `include_hwm` bootstraps from SEAL (never clamp SEAL→0); clamp SEAL to HWM only when `0 < hwm < SEAL`. Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Leftover live OA** at `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`): refuse — wipe `store/scripthash*` and restart with `--shindex`.
   **SH head open:** sealed **main** shards load `.idx` only (one entry per 128

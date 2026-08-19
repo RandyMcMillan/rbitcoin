@@ -1,12 +1,15 @@
-//! Sliced k-way SH tip materialize: one worker per prefix shard, ordered publish.
+//! Sliced k-way SH tip materialize: one worker per prefix shard.
+//!
+//! Sharded bodies: each worker packs `body/NN` and seals `head/NN` itself.
+//! Shared body: one writer, prefix `SHCOLDP1` HWM.
 
 use crate::error::StoreError;
 use crate::file::ensure_nofile_budget_at_least;
 use crate::scripthash::{ColdProgress, ScriptHashTable, ShBodyLayout, ShShardPack};
 use crate::sorted_run::{for_each_merged_rec_shard, shard_record_starts, SortedRunPath};
 use rbitcoin_primitives::Fk;
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,11 +20,6 @@ fn status_interval_due(last: Option<Instant>, now: Instant, interval: Duration) 
         None => true,
         Some(t) => now.saturating_duration_since(t) >= interval,
     }
-}
-
-/// Pack at most `cap` shards past the next unpublished prefix shard.
-fn pack_ahead_allowed(shard: usize, next_publish: usize, cap: usize) -> bool {
-    shard < next_publish.saturating_add(cap.max(1))
 }
 
 /// Global pack/publish counters. One observer thread samples these.
@@ -184,40 +182,36 @@ fn pack_shard(
     Ok(pack)
 }
 
-fn publish_next(
+fn seal_shard(
     table: &ScriptHashTable,
     shard: usize,
     pack: ShShardPack,
-    global_bump: u64,
-    live_keys: &mut u64,
-    live_creates: &mut u64,
-    max_fk: &mut u64,
+    max_fk: &AtomicU64,
     progress: &MaterializeProgress,
-) -> Result<u64, StoreError> {
-    *max_fk = (*max_fk).max(pack.max_fk);
-    *live_keys = live_keys.saturating_add(pack.keys);
-    *live_creates = live_creates.saturating_add(pack.creates);
+) -> Result<(), StoreError> {
+    max_fk.fetch_max(pack.max_fk, Ordering::Relaxed);
     let creates = pack.creates;
-    let new_bump = if pack.recs.is_empty() && pack.creates == 0 {
-        global_bump
-    } else {
-        table.publish_packed_shard(shard, pack)?
-    };
-    ColdProgress {
-        next_shard: (shard as u32).saturating_add(1),
-        body_bump: new_bump,
-        live_count: *live_creates,
-        keys_written: *live_keys,
-    }
-    .store(table.store_dir())?;
+    let bump = table.publish_packed_shard(shard, pack)?;
     progress
         .creates_published
         .fetch_add(creates, Ordering::Relaxed);
     progress.shards_published.fetch_add(1, Ordering::Relaxed);
-    Ok(new_bump)
+    match table.body_layout() {
+        ShBodyLayout::Shared => ColdProgress {
+            next_shard: (shard as u32).saturating_add(1),
+            body_bump: bump,
+            live_count: progress.creates_published.load(Ordering::Relaxed),
+            keys_written: progress.keys_packed.load(Ordering::Relaxed),
+        }
+        .store(table.store_dir())?,
+        ShBodyLayout::Sharded => {
+            table.store_sharded_cold_progress(progress.keys_packed.load(Ordering::Relaxed))?
+        }
+    }
+    Ok(())
 }
 
-/// Pack prefix shards in parallel; publish body + `scripthash.head/NN` in shard order.
+/// Pack prefix shards in parallel. Sharded: each worker seals its own `head/NN`.
 pub fn materialize_sh_shards(
     table: &ScriptHashTable,
     inputs: &[SortedRunPath],
@@ -226,7 +220,17 @@ pub fn materialize_sh_shards(
     cancel: Option<&AtomicBool>,
 ) -> Result<ShShardMaterialize, StoreError> {
     let n_shards = table.head_shard_count().max(1);
-    if resume_from >= n_shards {
+    let jobs: Vec<usize> = match table.body_layout() {
+        ShBodyLayout::Sharded => table.unsealed_main_shards(),
+        ShBodyLayout::Shared => {
+            if resume_from >= n_shards {
+                Vec::new()
+            } else {
+                (resume_from..n_shards).collect()
+            }
+        }
+    };
+    if jobs.is_empty() {
         return Ok(ShShardMaterialize {
             creates: table.entry_count(),
             keys: 0,
@@ -239,32 +243,35 @@ pub fn materialize_sh_shards(
         .iter()
         .map(|r| shard_record_starts(r, n_shards))
         .collect::<Result<Vec<_>, _>>()?;
-    let workers = resolve_workers(
-        workers,
-        n_shards - resume_from,
-        inputs.len(),
-        table.body_layout(),
-    );
+    let workers = resolve_workers(workers, jobs.len(), inputs.len(), table.body_layout());
     rbitcoin_log::info!(
         "store: scripthash shard-kway start resume_from={resume_from} n_shards={n_shards} \
-         workers={workers} runs={} fds≈{}",
+         jobs={} workers={workers} runs={} fds≈{}",
+        jobs.len(),
         inputs.len(),
         workers.saturating_mul(inputs.len().max(1))
     );
     let t0 = Instant::now();
     let progress = MaterializeProgress::new();
+    let already = (n_shards - jobs.len()) as u32;
+    progress.shards_published.store(already, Ordering::Relaxed);
+    progress
+        .recs_packed
+        .store(table.entry_count(), Ordering::Relaxed);
+    progress
+        .creates_published
+        .store(table.entry_count(), Ordering::Relaxed);
+    if let Some(p) = ColdProgress::load(table.store_dir()).ok().flatten() {
+        progress
+            .keys_packed
+            .store(p.keys_written, Ordering::Relaxed);
+    }
     let total_recs: u64 = inputs.iter().map(|r| r.count).sum();
-    let prior = ColdProgress::load(table.store_dir()).ok().flatten();
-    let mut bump = table.alloc_bump();
-    let mut live_creates = prior
-        .as_ref()
-        .map(|p| p.live_count)
-        .unwrap_or_else(|| table.entry_count());
-    let mut live_keys = prior.as_ref().map(|p| p.keys_written).unwrap_or(0);
-    let mut max_fk = 0u64;
+    let max_fk = AtomicU64::new(0);
 
     let out = std::thread::scope(|scope| {
         let progress = &progress;
+        let max_fk = &max_fk;
         let _stop = StopOnDrop(progress);
         scope.spawn(move || {
             let mut last = None;
@@ -296,102 +303,64 @@ pub fn materialize_sh_shards(
         });
 
         if workers <= 1 {
-            for shard in resume_from..n_shards {
+            for shard in jobs {
                 if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
                     return Err(StoreError::Cancelled("scripthash shard pack"));
                 }
                 let pack = pack_shard(table, inputs, &cuts, shard, cancel, progress)?;
-                bump = publish_next(
-                    table,
-                    shard,
-                    pack,
-                    bump,
-                    &mut live_keys,
-                    &mut live_creates,
-                    &mut max_fk,
-                    progress,
-                )?;
+                seal_shard(table, shard, pack, max_fk, progress)?;
             }
         } else {
-            let jobs: VecDeque<usize> = (resume_from..n_shards).collect();
             let shared = Arc::new(ShardPool {
-                jobs: Mutex::new(jobs),
-                done: Mutex::new(HashMap::new()),
+                jobs: Mutex::new(VecDeque::from(jobs)),
                 err: Mutex::new(None),
-                cv: Condvar::new(),
-                next_publish: AtomicUsize::new(resume_from),
-                inflight_cap: workers,
             });
+            let mut joins = Vec::with_capacity(workers);
             for _ in 0..workers {
                 let shared = Arc::clone(&shared);
                 let cuts = &cuts;
-                scope.spawn(move || loop {
-                    match shared.take_pack_job(cancel) {
-                        Ok(None) => break,
-                        Ok(Some(shard)) => {
-                            match pack_shard(table, inputs, cuts, shard, cancel, progress) {
-                                Ok(pack) => {
-                                    shared.done.lock().unwrap().insert(shard, pack);
-                                    shared.cv.notify_all();
-                                }
-                                Err(e) => {
-                                    *shared.err.lock().unwrap() = Some(e);
-                                    shared.cv.notify_all();
-                                    break;
-                                }
-                            }
+                joins.push(scope.spawn(move || loop {
+                    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+                        let mut g = shared.err.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(StoreError::Cancelled("scripthash shard pack"));
                         }
+                        break;
+                    }
+                    if shared.err.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let shard = shared.jobs.lock().unwrap().pop_front();
+                    let Some(shard) = shard else {
+                        break;
+                    };
+                    match pack_shard(table, inputs, cuts, shard, cancel, progress)
+                        .and_then(|pack| seal_shard(table, shard, pack, max_fk, progress))
+                    {
+                        Ok(()) => {}
                         Err(e) => {
-                            let mut g = shared.err.lock().unwrap();
-                            if g.is_none() {
-                                *g = Some(e);
-                            }
-                            shared.cv.notify_all();
+                            *shared.err.lock().unwrap() = Some(e);
                             break;
                         }
                     }
-                });
+                }));
             }
-
-            for shard in resume_from..n_shards {
-                let pack = loop {
-                    if let Some(e) = shared.err.lock().unwrap().take() {
-                        return Err(e);
-                    }
-                    if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-                        return Err(StoreError::Cancelled("scripthash shard publish"));
-                    }
-                    if let Some(p) = shared.done.lock().unwrap().remove(&shard) {
-                        break p;
-                    }
-                    let g = shared.done.lock().unwrap();
-                    let (_g, _) = shared
-                        .cv
-                        .wait_timeout(g, Duration::from_millis(100))
-                        .unwrap();
-                };
-                bump = publish_next(
-                    table,
-                    shard,
-                    pack,
-                    bump,
-                    &mut live_keys,
-                    &mut live_creates,
-                    &mut max_fk,
-                    progress,
-                )?;
-                shared
-                    .next_publish
-                    .store(shard.saturating_add(1), Ordering::Release);
-                shared.cv.notify_all();
+            for j in joins {
+                if j.join().is_err() {
+                    return Err(StoreError::Corrupt("scripthash shard pack worker panicked"));
+                }
+            }
+            let err = shared.err.lock().unwrap().take();
+            if let Some(e) = err {
+                return Err(e);
             }
         }
 
         progress.complete.store(true, Ordering::Release);
         Ok(ShShardMaterialize {
-            creates: live_creates,
-            keys: live_keys,
-            max_fk,
+            creates: progress.creates_published.load(Ordering::Relaxed),
+            keys: progress.keys_packed.load(Ordering::Relaxed),
+            max_fk: max_fk.load(Ordering::Relaxed),
             body_flush_ns: 0,
             head_fill_ns: t0.elapsed().as_nanos() as u64,
         })
@@ -401,41 +370,7 @@ pub fn materialize_sh_shards(
 
 struct ShardPool {
     jobs: Mutex<VecDeque<usize>>,
-    done: Mutex<HashMap<usize, ShShardPack>>,
     err: Mutex<Option<StoreError>>,
-    cv: Condvar,
-    next_publish: AtomicUsize,
-    inflight_cap: usize,
-}
-
-impl ShardPool {
-    fn take_pack_job(&self, cancel: Option<&AtomicBool>) -> Result<Option<usize>, StoreError> {
-        let mut q = self.jobs.lock().unwrap();
-        loop {
-            if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
-                return Err(StoreError::Cancelled("scripthash shard pack"));
-            }
-            if self.err.lock().unwrap().is_some() {
-                return Ok(None);
-            }
-            match q.front().copied() {
-                None => return Ok(None),
-                Some(shard)
-                    if pack_ahead_allowed(
-                        shard,
-                        self.next_publish.load(Ordering::Acquire),
-                        self.inflight_cap,
-                    ) =>
-                {
-                    return Ok(q.pop_front());
-                }
-                Some(_) => {
-                    let (g, _) = self.cv.wait_timeout(q, Duration::from_millis(100)).unwrap();
-                    q = g;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -482,25 +417,5 @@ mod tests {
         let mut last = None;
         log_materialize_status(&mut last, &s, 64, Instant::now());
         assert!(last.is_some());
-    }
-
-    #[test]
-    fn pack_ahead_stays_within_publish_window() {
-        assert!(pack_ahead_allowed(0, 0, 8));
-        assert!(pack_ahead_allowed(7, 0, 8));
-        assert!(
-            !pack_ahead_allowed(8, 0, 8),
-            "must not pack shard 8 before shard 0 is published"
-        );
-        assert!(pack_ahead_allowed(8, 1, 8));
-        assert!(
-            !pack_ahead_allowed(45, 1, 8),
-            "must not pack tens of shards ahead of a stuck publish prefix"
-        );
-        assert!(
-            pack_ahead_allowed(1, 1, 1),
-            "cap 1 packs only the next shard"
-        );
-        assert!(!pack_ahead_allowed(2, 1, 1));
     }
 }

@@ -30,12 +30,12 @@ before 1.0).
   Legacy file `scripthash.body` stays one writer (`workers=1` for pack).
   No temp `pack*.body`. No extra 64-file catalog pass.
   `RBITCOIN_SH_MERGE_WORKERS=1` stays the serial oracle.
-  Status is a 10 s observer of global pack/publish counters
-  (`keys` / `creates` / unpublished `pending` / `shards` published /
+  Status is a 10 s observer of global pack/seal counters
+  (`keys` / `creates` / unpublished `pending` / `shards` sealed /
   `rate`) rather than a per-worker session log.
-  Pack workers stay within `workers` shards of the published prefix
-  (a stuck megakey no longer lets the other cores pack the rest of
-  the table into unpublished RAM/`done` + idle-class IO). Pack
+  On the dir variant each pack worker seals its own `head/NN` (no
+  ordered publisher). SIGINT keeps sealed holes; resume packs only
+  unsealed shards. Shared file body stays prefix `SHCOLDP1`. Pack
   threads use default IO priority — tip materialize is the work.
 
 - **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the

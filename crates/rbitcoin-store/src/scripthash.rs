@@ -82,7 +82,11 @@ impl ColdProgress {
 
     pub fn store(&self, store_dir: &Path) -> Result<(), StoreError> {
         let p = Self::path(store_dir);
-        let tmp = store_dir.join(format!("{COLD_PROGRESS_NAME}.tmp"));
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = store_dir.join(format!(
+            "{COLD_PROGRESS_NAME}.{}.tmp",
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut buf = Vec::with_capacity(36);
         buf.extend_from_slice(COLD_PROGRESS_MAGIC);
         buf.extend_from_slice(&self.next_shard.to_le_bytes());
@@ -740,8 +744,10 @@ impl ScriptHashTable {
         Ok(())
     }
 
-    /// Prepare resume after SIGINT: keep complete shards, zero `progress.next_shard..`,
-    /// restore body HWM to the last complete-shard checkpoint.
+    /// Prepare resume after SIGINT: keep sealed main shards, reset the rest.
+    ///
+    /// Shared body: prefix HWM (`progress.next_shard..` + `body_bump`).
+    /// Sharded bodies: each sealed `scripthash.head/NN` is a commit; holes stay.
     pub fn prepare_cold_resume(&self, progress: &ColdProgress) -> Result<(), StoreError> {
         let n = self.head.shard_count();
         let start = progress.next_shard as usize;
@@ -750,10 +756,10 @@ impl ScriptHashTable {
                 "scripthash cold progress next_shard out of range",
             ));
         }
-        self.head.reinit_shards_from(start)?;
         let payload0 = payload_start(FILE_HEADER_LEN);
         match self.layout {
             ShBodyLayout::Shared => {
+                self.head.reinit_shards_from(start)?;
                 let bump = progress.body_bump.max(payload0);
                 let state = AllocState {
                     live_count: progress.live_count,
@@ -765,19 +771,64 @@ impl ScriptHashTable {
                 self.body().set_logical_len(bump)?;
             }
             ShBodyLayout::Sharded => {
+                let sealed: Vec<bool> = self
+                    .sorted_main
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.is_some())
+                    .collect();
                 let empty = AllocState {
                     live_count: 0,
                     bump: payload0,
                     free_head: [0; SH_MAX_CLASS as usize + 1],
                 };
-                for i in start..n {
+                for i in 0..n {
+                    if sealed.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    self.head.reinit_shard(i)?;
                     *self.allocs[i].lock().unwrap() = empty;
                     write_alloc_header(&self.bodies[i], &empty)?;
                     self.bodies[i].set_logical_len(payload0)?;
+                    let p = sorted_main_shard_path(&self.store_dir, i, n);
+                    let _ = std::fs::remove_file(&p);
+                    let mut idx = p.into_os_string();
+                    idx.push(".idx");
+                    let _ = std::fs::remove_file(idx);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Main shards with no sealed `scripthash.head/NN` yet.
+    pub fn unsealed_main_shards(&self) -> Vec<usize> {
+        self.sorted_main
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.is_none().then_some(i))
+            .collect()
+    }
+
+    pub(crate) fn store_sharded_cold_progress(&self, keys_written: u64) -> Result<(), StoreError> {
+        let n = self.head.shard_count();
+        let next = self
+            .sorted_main
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|s| s.is_none())
+            .unwrap_or(n) as u32;
+        ColdProgress {
+            next_shard: next,
+            body_bump: 0,
+            live_count: self.entry_count(),
+            keys_written,
+        }
+        .store(&self.store_dir)
     }
 
     /// Store directory containing `scripthash.body` / head (parent of body path).
@@ -2015,7 +2066,7 @@ impl ScriptHashTable {
     }
 
     /// Current body bump (complete-shard HWM). Shared file: the one bump.
-    /// Dir variant: shard 0's bump (publisher uses per-shard files).
+    /// Dir variant: shard 0's bump (each shard file has its own SHAL).
     pub fn alloc_bump(&self) -> u64 {
         self.allocs[0].lock().unwrap().bump
     }
@@ -2031,21 +2082,19 @@ impl ScriptHashTable {
         let mut recs = recs.to_vec();
         recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         recs.dedup_by(|a, b| a.0 == b.0);
-        if !recs.is_empty() {
-            let n_shards = self.head.shard_count();
-            let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
-            let mut g = self.sorted_main.lock().unwrap();
-            if g.len() < n_shards {
-                g.resize_with(n_shards, || None);
-            }
-            g[shard] = Some(sealed);
-            self.sorted_main_on
-                .store(true, std::sync::atomic::Ordering::Release);
+        let n_shards = self.head.shard_count();
+        let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
+        let mut g = self.sorted_main.lock().unwrap();
+        if g.len() < n_shards {
+            g.resize_with(n_shards, || None);
+        }
+        g[shard] = Some(sealed);
+        self.sorted_main_on
+            .store(true, std::sync::atomic::Ordering::Release);
         let body = self.shard_body(shard);
         if bump > body.logical_len() {
             body.set_logical_len(bump)?;
@@ -4093,6 +4142,69 @@ mod tests {
             crate::materialize_sh_shards(&t2, &inputs, 1, 2, None).unwrap();
             assert_eq!(t2.entries(&k0).unwrap()[0].1.create_tx_fk, Fk(1));
             assert_eq!(t2.entries(&key(3, 0)).unwrap().len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn materialize_sharded_resume_keeps_sealed_holes() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let runs_dir = dir.join("runs");
+            std::fs::create_dir_all(&runs_dir).unwrap();
+            let key = |shard: u8, i: u8| {
+                let mut k = [0u8; 32];
+                k[0] = shard << 6 | (i & 0x3f);
+                k
+            };
+            let rec = |shard: u8, i: u8, fk: u64| {
+                let mut r = [0u8; 40];
+                r[..32].copy_from_slice(&key(shard, i));
+                r[32..40].copy_from_slice(&fk.to_le_bytes());
+                r
+            };
+            let mut body = Vec::new();
+            for shard in 0..4u8 {
+                body.extend_from_slice(&rec(shard, 0, u64::from(shard) + 1));
+            }
+            crate::sorted_run::write_sorted_run(&runs_dir.join("000001.run"), 40, 40, &body)
+                .unwrap();
+            let inputs = [crate::sorted_run::open_run(&runs_dir.join("000001.run")).unwrap()];
+            let t = four_shard_dir_table(&dir);
+            for shard in [0usize, 2] {
+                let k = key(shard as u8, 0);
+                let mut session = t.pack_shard_session(shard).unwrap();
+                session
+                    .push_sorted_fk(k, Fk(u64::from(shard as u8) + 1))
+                    .unwrap();
+                let pack = session.finish_pack().unwrap();
+                t.publish_packed_shard(shard, pack).unwrap();
+            }
+            assert_eq!(t.entries(&key(0, 0)).unwrap().len(), 1);
+            assert_eq!(t.entries(&key(2, 0)).unwrap().len(), 1);
+            assert!(
+                dir.join("scripthash.head").join("02").is_file(),
+                "shard 2 head is the durable commit"
+            );
+            ColdProgress {
+                next_shard: 1,
+                body_bump: 0,
+                live_count: 2,
+                keys_written: 2,
+            }
+            .store(&dir)
+            .unwrap();
+            t.prepare_cold_resume(&ColdProgress::load(&dir).unwrap().unwrap())
+                .unwrap();
+            assert_eq!(
+                t.entries(&key(2, 0)).unwrap().len(),
+                1,
+                "sealed shard 2 must survive a hole at shard 1"
+            );
+            crate::materialize_sh_shards(&t, &inputs, 1, 2, None).unwrap();
+            for shard in 0..4u8 {
+                assert_eq!(t.entries(&key(shard, 0)).unwrap().len(), 1, "shard {shard}");
+            }
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

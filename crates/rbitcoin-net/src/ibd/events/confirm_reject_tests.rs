@@ -25,6 +25,7 @@ fn confirm_reject_blacklist_surface() {
         "consensus: prevout already spent on best chain",
         None,
         None,
+        None,
     );
     assert!(!st.body.is_rejected(&zero));
 
@@ -39,6 +40,7 @@ fn confirm_reject_blacklist_surface() {
         51,
         hash,
         "consensus: script verification failed: script false",
+        None,
         None,
         None,
     );
@@ -56,6 +58,7 @@ fn confirm_reject_blacklist_surface() {
         219_562,
         hash,
         "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs",
+        None,
         None,
         None,
     );
@@ -77,6 +80,7 @@ fn confirm_reject_blacklist_surface() {
         "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)",
         None,
         None,
+        None,
     );
     assert!(
         st.body.is_rejected(&hash),
@@ -90,6 +94,7 @@ fn confirm_reject_blacklist_surface() {
         961_468,
         hash,
         "consensus: store: corrupt record: tx put_full_batch fk mismatch (plan not committed in order)",
+        None,
         None,
         None,
     );
@@ -139,6 +144,7 @@ fn confirm_reject_blacklist_surface() {
         "consensus: bad block: merkle root mismatch",
         Some(&q),
         None,
+        None,
     );
     assert!(
         !st.body.is_rejected(&hash),
@@ -167,6 +173,7 @@ fn confirm_reject_blacklist_surface() {
         "consensus: unexpected previous header",
         None,
         None,
+        None,
     );
     assert!(
         !st.body.is_rejected(&hash),
@@ -183,6 +190,7 @@ fn confirm_reject_blacklist_surface() {
         42_285,
         hash,
         "consensus: bad header: missing retarget first header",
+        None,
         None,
         None,
     );
@@ -207,6 +215,7 @@ fn confirm_reject_blacklist_surface() {
         362_595,
         hash,
         "consensus: prevout already spent on best chain",
+        None,
         None,
         None,
     );
@@ -327,6 +336,7 @@ fn bad_prev_gathers_winner_via_bq_by_hash() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     assert_eq!(hub.tip_height(), Some(2));
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
@@ -573,6 +583,7 @@ fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     assert_eq!(
         hub.tip_hash().unwrap(),
@@ -702,6 +713,7 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     // Must await **both** mid bodies, not only wire_prev (W2).
     let need = st.reorg.need_getdata();
@@ -737,6 +749,7 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     assert!(
         st.reorg.is_awaiting_held_tip(&w3.block_hash()),
@@ -1061,6 +1074,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
             "consensus: unexpected previous header",
             Some(hub.query.as_ref()),
             Some(&hub),
+            None,
         );
         if hub.tip_hash() == Some(l2.block_hash()) {
             let _ = try_complete_awaiting_reorg(&mut st, &hub);
@@ -1383,6 +1397,7 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     assert_eq!(
         hub.tip_height(),
@@ -1503,6 +1518,7 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     assert_eq!(
         hub.tip_height(),
@@ -1528,10 +1544,133 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
         "consensus: unexpected previous header",
         Some(hub.query.as_ref()),
         Some(&hub),
+        None,
     );
     assert_eq!(hub.tip_height(), Some(2));
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
     assert!(st.reorg.awaiting().is_none() || st.reorg.need_getdata().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// After take_raw the BQ row is gone; Reject must still classify via the wire Arc.
+#[test]
+fn bad_prev_after_take_raw_classifies() {
+    use crate::chain::ChainHub;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::consensus::serialize;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+    };
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-badprev-taken-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let q = Query::open_or_create(dir.join("store")).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let coinbase = |height: u32| {
+        let mut ss = rbitcoin_consensus::bip34_height_script(height);
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    };
+    let mine = |prev: BlockHash, time: u32, height: u32| {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            },
+            txdata: vec![coinbase(height)],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    };
+    let lose = mine(gen, 1_300_000_100, 1);
+    let mut win = mine(gen, 1_300_000_101, 1);
+    if win.block_hash() == lose.block_hash() {
+        let target = Target::from_compact(win.header.bits);
+        for nonce in 0..u32::MAX {
+            win.header.nonce = nonce;
+            if win.header.validate_pow(target).is_ok() && win.block_hash() != lose.block_hash() {
+                break;
+            }
+        }
+    }
+    hub.accept_block(lose.clone()).unwrap();
+    hub.ensure_header(&win.header).unwrap();
+    let ext = mine(win.block_hash(), 1_300_000_300, 2);
+    hub.ensure_header(&ext.header).unwrap();
+    hub.query
+        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
+        .unwrap();
+    assert!(hub.query.block_queue_take_raw(2).is_some());
+    hub.query.set_lookup_taken_hi(Some(2));
+    assert!(
+        hub.query.block_queue_payload(2).ok().flatten().is_none(),
+        "take_raw must empty the BQ row"
+    );
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
+    st.reorg.hold_body(win.clone());
+    apply_confirm_reject(
+        &mut st,
+        2,
+        ext.block_hash(),
+        "consensus: unexpected previous header",
+        Some(hub.query.as_ref()),
+        Some(&hub),
+        Some(Arc::new(ext.clone())),
+    );
+    assert_eq!(
+        hub.tip_height(),
+        Some(2),
+        "take_raw must not force CorruptWire; wire Arc classifies CompetingPath"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+    assert!(!st.body.is_rejected(&ext.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
 

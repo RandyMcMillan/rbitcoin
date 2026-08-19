@@ -480,6 +480,7 @@ pub(crate) fn apply_confirm_reject(
     query: Option<&rbitcoin_query::Query>,
     // When set, BadPrev may trigger most-work reorg onto a competing path.
     hub: Option<&crate::chain::ChainHub>,
+    wire: Option<std::sync::Arc<bitcoin::Block>>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects).
@@ -497,7 +498,7 @@ pub(crate) fn apply_confirm_reject(
     if soft_wire {
         if super::reorg::is_bad_prev_err(err) {
             if let Some(h) = hub {
-                if try_reorg_on_bad_prev(st, h, height, hash) {
+                if try_reorg_on_bad_prev(st, h, height, hash, wire.as_deref()) {
                     return;
                 }
             }
@@ -593,6 +594,7 @@ fn try_reorg_on_bad_prev(
     hub: &crate::chain::ChainHub,
     height: u32,
     hash: BlockHash,
+    reject_wire: Option<&bitcoin::Block>,
 ) -> bool {
     use super::reorg::{
         classify_bad_prev, header_hashes_to_best_ancestor, try_apply_best_candidate, BadPrevClass,
@@ -614,10 +616,13 @@ fn try_reorg_on_bad_prev(
     let Some(tip) = hub.tip_hash() else {
         return false;
     };
-    let ext = hub
-        .query
-        .block_queue_resolved(height)
-        .map(|w| (*w.block).clone())
+    let ext = reject_wire
+        .cloned()
+        .or_else(|| {
+            hub.query
+                .block_queue_resolved(height)
+                .map(|w| (*w.block).clone())
+        })
         .or_else(|| {
             hub.query
                 .block_queue_payload(height)

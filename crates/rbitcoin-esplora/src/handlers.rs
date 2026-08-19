@@ -12,7 +12,7 @@ use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network};
-use rbitcoin_primitives::{Fk, Height};
+use rbitcoin_primitives::{median_time_past_times, Fk, Height};
 use rbitcoin_query::{HistoryFilter, Query};
 use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
@@ -118,8 +118,7 @@ fn median_time_past(query: &Query, height: Height) -> Result<u32, rbitcoin_query
             .ok_or(rbitcoin_store::StoreError::NotFound)?;
         times.push(rec.timestamp);
     }
-    times.sort_unstable();
-    Ok(times[times.len() / 2])
+    Ok(median_time_past_times(&times))
 }
 
 pub async fn block_json(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {

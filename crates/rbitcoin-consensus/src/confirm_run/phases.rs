@@ -396,13 +396,7 @@ pub(super) fn post_commit(
 }
 
 pub(super) fn check_bip34(block: &Block, height: u32) -> Result<(), ConsensusError> {
-    let coinbase = &block.txdata[0];
-    let bytes = coinbase.input[0].script_sig.as_bytes();
-    let expected = bip34_height_script(height);
-    if bytes.len() < expected.len() || &bytes[..expected.len()] != expected.as_slice() {
-        return Err(ConsensusError::BadBlock("bip34 height encoding"));
-    }
-    Ok(())
+    crate::block::check_bip34_coinbase(&block.txdata[0], height)
 }
 
 pub(super) fn expected_bits_extending(

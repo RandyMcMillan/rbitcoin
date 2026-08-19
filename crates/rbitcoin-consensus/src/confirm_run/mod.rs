@@ -21,8 +21,8 @@
 //! script coordinators stay fed across batch boundaries (one-batch lookahead).
 
 use crate::block::{
-    assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
-    ScriptCheckJob, ValidationContext,
+    assemble_block_prevouts, block_has_witness, structural_validate_spends, ScriptCheckJob,
+    ValidationContext,
 };
 use crate::confirm_phase_stats;
 use crate::error::ConsensusError;

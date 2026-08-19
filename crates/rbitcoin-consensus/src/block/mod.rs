@@ -280,38 +280,7 @@ pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
     n
 }
 
-pub(crate) fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
-    let mut n = 0u64;
-    let mut i = 0usize;
-    let mut last_opcode = 0xffu8;
-    while i < script.len() {
-        let opcode = script[i];
-        i += 1;
-        if opcode <= 0x4b {
-            let push = opcode as usize;
-            i = i.saturating_add(push);
-        } else if opcode == 0x4c && i < script.len() {
-            let push = script[i] as usize;
-            i = i.saturating_add(1 + push);
-        } else if opcode == 0x4d && i + 1 < script.len() {
-            let push = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
-            i = i.saturating_add(2 + push);
-        } else if opcode == 0x4e && i + 3 < script.len() {
-            let push = u32::from_le_bytes(script[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
-            i = i.saturating_add(4 + push);
-        } else if opcode == 0xac || opcode == 0xad {
-            n = n.saturating_add(1);
-        } else if opcode == 0xae || opcode == 0xaf {
-            if accurate && last_opcode >= 0x51 && last_opcode <= 0x60 {
-                n = n.saturating_add(u64::from(last_opcode - 0x50));
-            } else {
-                n = n.saturating_add(20);
-            }
-        }
-        last_opcode = opcode;
-    }
-    n
-}
+pub(crate) use rbitcoin_primitives::script_sigop_count;
 
 /// Last data push in a script (P2SH redeem / witness script).
 fn last_script_push(script: &[u8]) -> Option<&[u8]> {
@@ -481,29 +450,7 @@ fn check_witness_commitment_with_wtxids(
 
 /// Merkle root over 32-byte leaves (txid or wtxid tree). Public for tests.
 pub(crate) fn merkle_root_bytes(leaves: &[[u8; 32]]) -> [u8; 32] {
-    if leaves.is_empty() {
-        return [0u8; 32];
-    }
-    let mut layer: Vec<[u8; 32]> = leaves.to_vec();
-    while layer.len() > 1 {
-        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
-        let mut i = 0;
-        while i < layer.len() {
-            let left = layer[i];
-            let right = if i + 1 < layer.len() {
-                layer[i + 1]
-            } else {
-                left
-            };
-            let mut buf = [0u8; 64];
-            buf[0..32].copy_from_slice(&left);
-            buf[32..64].copy_from_slice(&right);
-            next.push(sha256d::Hash::hash(&buf).to_byte_array());
-            i += 2;
-        }
-        layer = next;
-    }
-    layer[0]
+    rbitcoin_store::merkle_root_from_txids(leaves)
 }
 
 /// BIP34: coinbase scriptSig must start with the block height, encoded as Bitcoin
@@ -513,7 +460,10 @@ pub(crate) fn merkle_root_bytes(leaves: &[[u8; 32]]) -> [u8; 32] {
 /// - 0 → `OP_0` (0x00)
 /// - 1..=16 → `OP_1`..=`OP_16` (0x51..=0x60)
 /// - else → minimal CScriptNum (`len || little-endian bytes`, sign-aware)
-fn check_bip34_coinbase(coinbase: &Transaction, height: u32) -> Result<(), ConsensusError> {
+pub(crate) fn check_bip34_coinbase(
+    coinbase: &Transaction,
+    height: u32,
+) -> Result<(), ConsensusError> {
     let script = &coinbase.input[0].script_sig;
     let bytes = script.as_bytes();
     if bytes.is_empty() {

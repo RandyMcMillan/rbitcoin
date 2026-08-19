@@ -4,8 +4,12 @@
 //! store and node newtypes that must stay stable across crates.
 
 mod hex;
+mod median_time;
+mod script_sigops;
 
 pub use hex::{decode as hex_decode, encode as hex_encode, HexError};
+pub use median_time::median_time_past_times;
+pub use script_sigops::script_sigop_count;
 
 use std::fmt;
 

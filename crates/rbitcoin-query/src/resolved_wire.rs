@@ -21,12 +21,3 @@ pub struct BlockQueueWaveIntake {
     pub raw: Vec<u32>,
     pub resolved: Vec<(u32, ResolvedWire)>,
 }
-
-/// One-lock load-pack view: stored hash + resolve-complete + promoted Arc.
-#[derive(Clone, Debug)]
-pub struct BlockQueuePackSnap {
-    pub height: u32,
-    pub hash: [u8; 32],
-    pub resolve_complete: bool,
-    pub block: Option<Arc<Block>>,
-}

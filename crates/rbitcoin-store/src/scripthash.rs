@@ -20,8 +20,9 @@ use crate::scripthash_layout::{
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
-    sh_page_init_empty, sh_page_last_fk, sh_page_next, sh_page_pack, sh_page_set_next,
-    sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
+    sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk, sh_page_next,
+    sh_page_pack, sh_page_set_last, sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE,
+    SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks_with_slack,
@@ -1767,6 +1768,9 @@ impl ScriptHashTable {
             let (start, end) = chunks[pi];
             let next = offs.get(pi + 1).copied().unwrap_or(0);
             sh_page_pack(&mut page, &live[start..end], next)?;
+            if next == 0 {
+                sh_page_set_last(&mut page, offs[0])?;
+            }
             body.write_at(off, &page)?;
         }
         Ok((offs[0], *offs.last().expect("n_pages >= 1")))
@@ -1781,19 +1785,31 @@ impl ScriptHashTable {
         last_page: u64,
         tail: &[ShEntry],
     ) -> Result<u64, StoreError> {
-        let _ = first_page;
         if tail.is_empty() {
             return Ok(last_page);
         }
         let mut last = last_page;
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(last, &mut page)?;
+        let chain_first = {
+            let f = if sh_page_is_last(&page)? {
+                sh_page_first_off(&page)?
+            } else {
+                0
+            };
+            if f == 0 {
+                first_page
+            } else {
+                f
+            }
+        };
         for e in tail {
             if !sh_page_try_append(&mut page, e.create_tx_fk)? {
                 let new_off = self.alloc_page(body, alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 body.write_at(last, &page)?;
                 sh_page_init_empty(&mut page);
+                sh_page_set_last(&mut page, chain_first)?;
                 assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
                 last = new_off;
             }
@@ -2274,7 +2290,20 @@ pub fn remap_copied_page_chain(
     while off != 0 {
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(off, &mut page)?;
-        let local_next = sh_page_next(sh_page_as_array(&page)?)?;
+        let arr = sh_page_as_array(&page)?;
+        if sh_page_is_last(arr)? {
+            let first = sh_page_first_off(arr)?;
+            let dest_first = if first == 0 {
+                first_dest
+            } else {
+                first.saturating_add(delta)
+            };
+            let arr = sh_page_as_array_mut(&mut page)?;
+            sh_page_set_last(arr, dest_first)?;
+            body.write_at(off, &page)?;
+            break;
+        }
+        let local_next = sh_page_next(arr)?;
         if local_next == 0 {
             break;
         }
@@ -2637,6 +2666,14 @@ impl<'a> ScriptHashBulkSession<'a> {
         let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
         sh_page_pack(&mut page, &ents, next)?;
+        if !has_next {
+            let first = self
+                .open_key
+                .as_ref()
+                .and_then(|o| o.first_page)
+                .unwrap_or(base);
+            sh_page_set_last(&mut page, first)?;
+        }
         self.body().write_at(base, &page)?;
         self.bump = end;
         self.body_write_off = end;

@@ -46,9 +46,9 @@ use rbitcoin_primitives::Fk;
 
 /// Disk page size for SH FK chains (aligned allocations).
 pub const SH_PAGE_SIZE: usize = 4096;
-/// Bytes before the FK array in a page.
-pub const SH_PAGE_HEADER_LEN: usize = 16;
-/// Max create_tx_fks that fit in one page after the header.
+/// Bytes before the FK stream in a page (`ver | n_fks | LAST|idx`).
+pub const SH_PAGE_HEADER_LEN: usize = 8;
+/// Max create_tx_fks that fit in one page after the header (raw-u64 historical).
 pub const SH_PAGE_FK_CAP: usize = (SH_PAGE_SIZE - SH_PAGE_HEADER_LEN) / SH_ENTRY_LEN;
 
 /// Bit 63: mode / reserved flag on head words and (must be clear on) offsets.
@@ -56,12 +56,14 @@ pub const SH_FLAG_BIT: u64 = 1u64 << 63;
 /// Payload bits for FK or page offset (`value & SH_PAYLOAD_MASK`).
 pub const SH_PAYLOAD_MASK: u64 = !SH_FLAG_BIT;
 
-/// Offset of `next_page_off` within a page.
-pub const SH_PAGE_OFF_NEXT: usize = 0;
+/// Offset of `ver` within a page.
+pub const SH_PAGE_OFF_VER: usize = 0;
 /// Offset of `n_fks` (u16 LE) within a page.
-pub const SH_PAGE_OFF_N_FKS: usize = 8;
-/// Offset of delta-stream version byte (`reserved[0]`).
-pub const SH_PAGE_OFF_VER: usize = 10;
+pub const SH_PAGE_OFF_N_FKS: usize = 1;
+/// Offset of packed `LAST | page_index` (u40 LE) within a page.
+pub const SH_PAGE_OFF_PACKED: usize = 3;
+/// Bit 0 of packed u40: this page is last (`off` is first page index).
+pub const SH_PAGE_LAST_BIT: u64 = 1;
 /// Schema-17 megakey pages: uleb fk0 + uleb deltas (not raw u64 slots).
 pub const SH_PAGE_DELTA_VER: u8 = 1;
 /// Max FKs if every stream byte is a 1-byte uleb.
@@ -70,9 +72,9 @@ pub const SH_PAGE_STREAM_MAX: usize = SH_PAGE_SIZE - SH_PAGE_HEADER_LEN;
 pub const SH_PAGE_OFF_FKS: usize = SH_PAGE_HEADER_LEN;
 
 const _: () = assert!(SH_PAGE_SIZE == 4096);
-const _: () = assert!(SH_PAGE_HEADER_LEN == 16);
+const _: () = assert!(SH_PAGE_HEADER_LEN == 8);
 const _: () = assert!(SH_ENTRY_LEN == 8);
-const _: () = assert!(SH_PAGE_FK_CAP == 510);
+const _: () = assert!(SH_PAGE_FK_CAP == 511);
 const _: () = assert!(SH_PAGE_OFF_FKS + SH_PAGE_FK_CAP * SH_ENTRY_LEN == SH_PAGE_SIZE);
 
 /// Require a full 4 KiB page buffer (rejects unaligned / short slices).
@@ -252,37 +254,81 @@ pub fn sh_decode_paged_head(buf: &[u8; 16]) -> Result<(u64, u64), StoreError> {
     }
 }
 
-/// Zero a page buffer and write header (`next=0`, `n_fks=0`).
+fn sh_page_write_packed(
+    page: &mut [u8; SH_PAGE_SIZE],
+    last: bool,
+    byte_off: u64,
+) -> Result<(), StoreError> {
+    if byte_off % SH_PAGE_SIZE as u64 != 0 {
+        return Err(StoreError::Corrupt("scripthash page off not 4 KiB aligned"));
+    }
+    let idx = byte_off / SH_PAGE_SIZE as u64;
+    if idx >= (1u64 << 39) {
+        return Err(StoreError::Corrupt("scripthash page index overflow"));
+    }
+    let v = (idx << 1) | u64::from(last);
+    let b = v.to_le_bytes();
+    page[SH_PAGE_OFF_PACKED..SH_PAGE_OFF_PACKED + 5].copy_from_slice(&b[..5]);
+    Ok(())
+}
+
+fn sh_page_read_packed(page: &[u8; SH_PAGE_SIZE]) -> Result<(bool, u64), StoreError> {
+    let mut b = [0u8; 8];
+    b[..5].copy_from_slice(&page[SH_PAGE_OFF_PACKED..SH_PAGE_OFF_PACKED + 5]);
+    let v = u64::from_le_bytes(b);
+    let last = v & SH_PAGE_LAST_BIT != 0;
+    let idx = v >> 1;
+    Ok((last, idx * SH_PAGE_SIZE as u64))
+}
+
+/// Zero a page buffer and write header (LAST, first=0, n_fks=0).
 #[inline]
 pub fn sh_page_init_empty(page: &mut [u8; SH_PAGE_SIZE]) {
-    // Ensure callers that pass unaligned slices go through mut view first.
     let _ = sh_page_as_array_mut(page);
     page.fill(0);
     page[SH_PAGE_OFF_VER] = SH_PAGE_DELTA_VER;
+    let _ = sh_page_write_packed(page, true, 0);
 }
 
-/// Read `next_page_off` from a page (0 = end).
+/// True when this page is the chain tail (`off` is first, not next).
 #[inline]
-pub fn sh_page_next(page: &[u8; SH_PAGE_SIZE]) -> Result<u64, StoreError> {
-    let next = u64::from_le_bytes(
-        page[SH_PAGE_OFF_NEXT..SH_PAGE_OFF_NEXT + 8]
-            .try_into()
-            .unwrap(),
-    );
-    if next & SH_FLAG_BIT != 0 {
+pub fn sh_page_is_last(page: &[u8; SH_PAGE_SIZE]) -> Result<bool, StoreError> {
+    Ok(sh_page_read_packed(page)?.0)
+}
+
+/// First page byte off when LAST; error if this page is not last.
+#[inline]
+pub fn sh_page_first_off(page: &[u8; SH_PAGE_SIZE]) -> Result<u64, StoreError> {
+    let (last, off) = sh_page_read_packed(page)?;
+    if !last {
         return Err(StoreError::Corrupt(
-            "scripthash page next_off has flag bit set",
+            "scripthash page: first_off on a non-last page",
         ));
     }
-    Ok(next)
+    Ok(off)
 }
 
-/// Set `next_page_off` (bit63 must be clear).
+/// Mark LAST with `first_off` (do not follow as next).
+#[inline]
+pub fn sh_page_set_last(page: &mut [u8; SH_PAGE_SIZE], first_off: u64) -> Result<(), StoreError> {
+    sh_page_write_packed(page, true, first_off)
+}
+
+/// Next page byte off (0 if this page is LAST).
+#[inline]
+pub fn sh_page_next(page: &[u8; SH_PAGE_SIZE]) -> Result<u64, StoreError> {
+    let (last, off) = sh_page_read_packed(page)?;
+    if last {
+        Ok(0)
+    } else {
+        Ok(off)
+    }
+}
+
+/// Set next page (clears LAST).
 #[inline]
 pub fn sh_page_set_next(page: &mut [u8; SH_PAGE_SIZE], next_off: u64) -> Result<(), StoreError> {
-    let w = sh_pack_clear(next_off)?;
-    page[SH_PAGE_OFF_NEXT..SH_PAGE_OFF_NEXT + 8].copy_from_slice(&w.to_le_bytes());
-    Ok(())
+    sh_page_write_packed(page, false, next_off)
 }
 
 /// Number of FKs stored in this page.
@@ -420,7 +466,11 @@ pub fn sh_page_pack(
         }
     }
     sh_page_init_empty(page);
-    sh_page_set_next(page, next_off)?;
+    if next_off == 0 {
+        sh_page_set_last(page, 0)?;
+    } else {
+        sh_page_set_next(page, next_off)?;
+    }
     for e in entries {
         if !sh_page_try_append_entry(page, *e)? {
             return Err(StoreError::Corrupt(
@@ -547,7 +597,8 @@ mod tests {
         assert_eq!(crate::scripthash_layout::SH_HEAD_SLOT_SIZE, 32);
         assert_eq!(crate::scripthash_layout::SH_HEAD_VALUE_LEN, 16);
         assert_eq!(SH_PAGE_SIZE, 4096);
-        assert_eq!(SH_PAGE_FK_CAP, 510);
+        assert_eq!(SH_PAGE_HEADER_LEN, 8);
+        assert_eq!(SH_PAGE_FK_CAP, 511);
         assert_eq!(SH_FLAG_BIT, 1u64 << 63);
         assert_eq!(SH_PAYLOAD_MASK, u64::MAX >> 1);
         // Flag bit matches historical slab marker bit position.
@@ -605,12 +656,34 @@ mod tests {
             b
         };
         assert!(sh_decode_paged_head(&inline).is_err());
-        // page next with flag bit
         let mut page = [0u8; SH_PAGE_SIZE];
         sh_page_init_empty(&mut page);
-        page[SH_PAGE_OFF_NEXT..SH_PAGE_OFF_NEXT + 8]
-            .copy_from_slice(&(SH_FLAG_BIT | 100).to_le_bytes());
-        assert!(sh_page_next(&page).is_err());
+        assert!(sh_page_is_last(&page).unwrap());
+        assert_eq!(sh_page_next(&page).unwrap(), 0);
+        assert_eq!(sh_page_first_off(&page).unwrap(), 0);
+        sh_page_set_next(&mut page, 8192).unwrap();
+        assert!(!sh_page_is_last(&page).unwrap());
+        assert_eq!(sh_page_next(&page).unwrap(), 8192);
+        assert!(sh_page_first_off(&page).is_err());
+        sh_page_set_last(&mut page, 4096).unwrap();
+        assert!(sh_page_is_last(&page).unwrap());
+        assert_eq!(sh_page_next(&page).unwrap(), 0);
+        assert_eq!(sh_page_first_off(&page).unwrap(), 4096);
+        assert!(sh_page_set_next(&mut page, 100).is_err());
+    }
+
+    #[test]
+    fn page_last_header_holds_first_off() {
+        let mut first = [0u8; SH_PAGE_SIZE];
+        let mut last = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut first);
+        sh_page_init_empty(&mut last);
+        sh_page_set_next(&mut first, 8192).unwrap();
+        sh_page_set_last(&mut last, 4096).unwrap();
+        assert_eq!(sh_page_next(&first).unwrap(), 8192);
+        assert_eq!(sh_page_next(&last).unwrap(), 0);
+        assert_eq!(sh_page_first_off(&last).unwrap(), 4096);
+        assert_eq!(SH_PAGE_HEADER_LEN, 8);
     }
 
     #[test]

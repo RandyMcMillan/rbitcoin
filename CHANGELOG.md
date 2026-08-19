@@ -44,6 +44,9 @@ before 1.0).
   pages on the pack thread's TLS completion session (`io_uring` /
   process-shared `pool` / IOCP) and waits only if that page is still
   inflight at promote; `RBITCOIN_IO=pread` stays blocking.
+  Bulk pack picks slab class from the ULEB payload size (not `n×8`
+  geometric cap) and carves 4 KiB page-align gaps onto the relocating
+  freelist so later slabs fill the hole.
 
 - **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the
   decode-time `pres` Arc; `confirm_wire_lookup_stamp` must not `from_tx`

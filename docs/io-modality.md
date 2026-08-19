@@ -37,7 +37,8 @@ with a NULL `OVERLAPPED` is os error 87 (`ERROR_INVALID_PARAMETER`).
 **kqueue is not a regular-file backend.** Darwin files report ready immediately;
 `read` still blocks. POSIX AIO (`EVFILT_AIO`) and `dispatch_io` are also
 thread pools (`kern.aiomax` default 16) — same class as `pool`, not an
-SQ/CQ. The pool session is the honest Darwin completion ring.
+SQ/CQ. The pool session is the honest Darwin completion ring. Pool
+**workers** are process-shared; each TLS session keeps its own CQE queue.
 
 Harvest invariants (TLS session): every SQE is tracked by packed
 `(kind, epoch, slot)`. A CQE that is unmatched, duplicate, or from a
@@ -80,9 +81,10 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 | Spend pure-write annotate | `RBITCOIN_IO` | uring/pwrite or pwrite on **`spent.body` FD** |
 | Class C create-height | (RAM fence) | no IO |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
+| SH k-way merge (sorted runs) | `RBITCOIN_IO` | TLS session positional pread on run files. 256 KiB double buffer: submit ahead, wait only if the page is still inflight at promote. Ring depth grows with k (cap 4096). `pread` fallback is blocking. |
 
 Default: Linux uring if the ring opens else pool; Darwin pool; Windows
-IOCP. Ring depth **128**. `RBITCOIN_IO=pread` forces libc.
+IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 
 ### Table transport (all fd)
 

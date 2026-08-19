@@ -40,7 +40,10 @@ before 1.0).
   Pack streams `head/NN.part` (no in-RAM rec vec). Class A recollect
   walks `txout` fk-spans, not per-fk get. Seal progress uses observer
   atomics (not `entry_count()`). Sealed-main lookup is per-shard
-  `RwLock` (not one process mutex).
+  `RwLock` (not one process mutex). k-way merge submits 256 KiB ahead
+  pages on the pack thread's TLS completion session (`io_uring` /
+  process-shared `pool` / IOCP) and waits only if that page is still
+  inflight at promote; `RBITCOIN_IO=pread` stays blocking.
 
 - **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the
   decode-time `pres` Arc; `confirm_wire_lookup_stamp` must not `from_tx`

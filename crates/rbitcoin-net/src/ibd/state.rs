@@ -235,6 +235,26 @@ impl IbdWorkState {
         self.height_to_hash.get(&ht) == Some(hash)
     }
 
+    /// Drop work-path slots strictly above `ht` (reorg apply suffix).
+    pub(crate) fn clear_path_above(&mut self, ht: u32) {
+        let drop: Vec<BlockHash> = self
+            .height_to_hash
+            .iter()
+            .filter(|(h, _)| **h > ht)
+            .map(|(_, hash)| *hash)
+            .collect();
+        self.height_to_hash.retain(|h, _| *h <= ht);
+        for hash in drop {
+            self.ordered_set.remove(&hash);
+        }
+        while let Some(front) = self.ordered.front().copied() {
+            if self.ordered_set.contains(&front) {
+                break;
+            }
+            self.ordered.pop_front();
+        }
+    }
+
     /// Cheap occupancy of work-path maps/deques (for `ibd: sizes`; all O(1) lens).
     pub(crate) fn structure_sizes(&self) -> WorkStructureSizes {
         let peer_inflight: usize = self.slots.iter().map(|s| s.in_flight.len()).sum();
@@ -400,6 +420,25 @@ mod tests {
             "prev must be store tip at tip+1"
         );
         assert_eq!(st.height_to_hash.get(&1), Some(&a));
+    }
+
+    #[test]
+    fn reorg_clears_path_suffix() {
+        let tip = h(0);
+        let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(1));
+        st.record_height(h(2), 2);
+        st.record_height(h(3), 3);
+        st.record_height(h(4), 4);
+        st.ordered_set.insert(h(3));
+        st.ordered.push_back(h(3));
+        st.ordered_set.insert(h(4));
+        st.ordered.push_back(h(4));
+        st.clear_path_above(2);
+        assert_eq!(st.height_to_hash.get(&2), Some(&h(2)));
+        assert!(st.height_to_hash.get(&3).is_none());
+        assert!(st.height_to_hash.get(&4).is_none());
+        assert!(!st.ordered_set.contains(&h(3)));
+        assert!(!st.ordered_set.contains(&h(4)));
     }
 
     /// InflightReq::default + known_headers prune when known ≫ live ordered set.

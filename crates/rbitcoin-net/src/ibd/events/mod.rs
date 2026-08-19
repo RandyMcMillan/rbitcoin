@@ -854,6 +854,9 @@ fn on_reorg_accepted(
     if let Some(l) = losing_tip {
         remove_from_ordered(&mut st.ordered, &mut st.ordered_set, l);
     }
+    if let Some(h) = hub.tip_height() {
+        st.clear_path_above(h);
+    }
     st.reorg.clear_awaiting();
     st.reorg.clear_explore();
 }

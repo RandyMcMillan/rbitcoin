@@ -2,8 +2,8 @@
 
 use crate::cache::BlockCache;
 use crate::chain::{
-    accept_block_header_nodos_log, ignoring_low_work_chain_log, synchronizing_blockheaders_log,
-    AcceptOutcome, ChainHub,
+    accept_block_header_nodos_log, ignoring_low_work_chain_log, received_getdata_wtx_log,
+    synchronizing_blockheaders_log, AcceptOutcome, ChainHub,
 };
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
@@ -674,7 +674,7 @@ pub async fn peer_session_with(
     writer_task.abort();
     let _ = writer_task.await;
     match &result {
-        Ok(()) => rbitcoin_log::info!("p2p: session {peer_s} closed"),
+        Ok(()) => rbitcoin_log::debug!("p2p: session {peer_s} closed"),
         Err(e) => rbitcoin_log::warn!("p2p: session {peer_s} ended: {e}"),
     }
     result
@@ -1083,7 +1083,7 @@ async fn handle_peer_frame(
                     }
                     Inventory::WTx(wtxid) => {
                         if let Some(s) = session {
-                            rbitcoin_log::info!("received getdata for: wtx {wtxid} peer={}", s.id);
+                            rbitcoin_log::debug!("{}", received_getdata_wtx_log(wtxid, s.id));
                         }
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {

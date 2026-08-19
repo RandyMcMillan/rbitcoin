@@ -827,7 +827,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             if let TipFollowWake::Tip(ev) = &wake {
                 let h = ev.height;
                 if h != last_tip {
-                    info!(
+                    debug!(
                         "node: tip={h} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                     );
                     window_blocks = window_blocks.saturating_add(h.saturating_sub(last_tip) as u64);
@@ -840,7 +840,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
 
             if tip != last_tip {
-                info!(
+                debug!(
                     "node: tip={tip} (+{delta} since start, elapsed {elapsed}s, follow_live={follow_live})"
                 );
                 window_blocks = window_blocks.saturating_add(tip.saturating_sub(last_tip) as u64);

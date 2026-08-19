@@ -268,11 +268,6 @@ impl SpTweaksTable {
         Ok(u32::from_le_bytes(buf))
     }
 
-    fn write_off(seg: &Seg, local: u64, off: u32) -> Result<(), StoreError> {
-        seg.idx
-            .write_at_pwrite(FILE_HEADER_LEN as u64 + local * SLOT, &off.to_le_bytes())
-    }
-
     fn locate(inner: &Inner, origin: u32, height: Height) -> Option<(usize, u64)> {
         if height.0 < origin {
             return None;
@@ -399,19 +394,32 @@ impl SpTweaksTable {
         height: Height,
         records: &[Option<[u8; 33]>],
     ) -> Result<(), StoreError> {
-        if height.0 < self.origin {
-            return Err(StoreError::Corrupt("sp_tweaks put below origin"));
+        self.put_blocks(&[(height, records)])
+    }
+
+    /// Append consecutive heights with **one** body pwrite + **one** idx pwrite
+    /// (not a pwrite per tx). `items[0].0` must be [`Self::next_height`].
+    pub fn put_blocks(&self, items: &[(Height, &[Option<[u8; 33]>])]) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
         }
-        if height != self.next_height() {
-            return Err(StoreError::Corrupt("sp_tweaks put not next height"));
+        let mut expect = self.next_height();
+        for (h, _) in items {
+            if h.0 < self.origin {
+                return Err(StoreError::Corrupt("sp_tweaks put below origin"));
+            }
+            if *h != expect {
+                return Err(StoreError::Corrupt("sp_tweaks put not next height"));
+            }
+            expect = Height(expect.0.saturating_add(1));
         }
         let mut inner = self.lock();
-        let start = inner
+        let start0 = inner
             .segs
             .last()
             .map(|s| s.body.logical_len())
             .unwrap_or(FILE_HEADER_LEN as u64);
-        if start > u32::MAX as u64 {
+        if start0 > u32::MAX as u64 {
             Self::roll(&self.dir, &mut inner)?;
         }
         let tail = inner
@@ -422,12 +430,27 @@ impl SpTweaksTable {
         if start > u32::MAX as u64 {
             return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
         }
-        let encoded = Self::encode_records(records);
-        if !encoded.is_empty() {
-            tail.body.write_at_pwrite(start, &encoded)?;
+        let mut body = Vec::new();
+        let mut offs: Vec<u32> = Vec::with_capacity(items.len());
+        for (_, recs) in items {
+            if start.saturating_add(body.len() as u64) > u32::MAX as u64 {
+                return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
+            }
+            offs.push((start + body.len() as u64) as u32);
+            body.extend_from_slice(&Self::encode_records(recs));
         }
-        Self::write_off(tail, tail.n_slots, start as u32)?;
-        tail.n_slots = tail.n_slots.saturating_add(1);
+        if !body.is_empty() {
+            tail.body.write_at_pwrite(start, &body)?;
+        }
+        let mut idx_blob = Vec::with_capacity(offs.len() * SLOT as usize);
+        for o in &offs {
+            idx_blob.extend_from_slice(&o.to_le_bytes());
+        }
+        let idx_at = FILE_HEADER_LEN as u64 + tail.n_slots * SLOT;
+        if !idx_blob.is_empty() {
+            tail.idx.write_at_pwrite(idx_at, &idx_blob)?;
+        }
+        tail.n_slots = tail.n_slots.saturating_add(items.len() as u64);
         Ok(())
     }
 
@@ -588,6 +611,71 @@ mod tests {
             ),
             FILE_HEADER_LEN as u32
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_blocks_concatenates_consecutive_heights() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        let mut a = [0u8; 33];
+        a[0] = 0x02;
+        a[32] = 0xaa;
+        let mut b = [0u8; 33];
+        b[0] = 0x03;
+        b[32] = 0xbb;
+        t.put_blocks(&[
+            (Height(0), &[None, Some(a)] as &[Option<[u8; 33]>]),
+            (Height(1), &[None]),
+            (Height(2), &[Some(b), None]),
+        ])
+        .unwrap();
+
+        assert_eq!(t.next_height(), Height(3));
+        assert_eq!(
+            t.get_block(Height(0), 2).unwrap().unwrap(),
+            vec![None, Some(a)]
+        );
+        assert_eq!(t.get_block(Height(1), 1).unwrap().unwrap(), vec![None]);
+        assert_eq!(
+            t.get_block(Height(2), 2).unwrap().unwrap(),
+            vec![Some(b), None]
+        );
+
+        let blob0 = SpTweaksTable::encode_records(&[None, Some(a)]);
+        let blob1 = SpTweaksTable::encode_records(&[None]);
+        let blob2 = SpTweaksTable::encode_records(&[Some(b), None]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&blob0);
+        want.extend_from_slice(&blob1);
+        want.extend_from_slice(&blob2);
+        let raw = fs::read(SpTweaksTable::seg_body_path(&dir, 0)).unwrap();
+        let pub_len = t.body_logical_len() as usize;
+        assert_eq!(pub_len, FILE_HEADER_LEN + want.len());
+        assert_eq!(&raw[FILE_HEADER_LEN..pub_len], want.as_slice());
+
+        let idx = fs::read(SpTweaksTable::seg_idx_path(&dir, 0)).unwrap();
+        let idx_hwm = u64::from_le_bytes(idx[8..16].try_into().unwrap()) as usize;
+        assert_eq!(idx_hwm, FILE_HEADER_LEN + 12);
+        let off0 = u32::from_le_bytes(
+            idx[FILE_HEADER_LEN..FILE_HEADER_LEN + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let off1 = u32::from_le_bytes(
+            idx[FILE_HEADER_LEN + 4..FILE_HEADER_LEN + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let off2 = u32::from_le_bytes(
+            idx[FILE_HEADER_LEN + 8..FILE_HEADER_LEN + 12]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(off0, FILE_HEADER_LEN as u32);
+        assert_eq!(off1, off0 + blob0.len() as u32);
+        assert_eq!(off2, off1 + blob1.len() as u32);
 
         let _ = fs::remove_dir_all(&dir);
     }

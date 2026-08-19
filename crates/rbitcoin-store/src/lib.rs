@@ -41,6 +41,7 @@ mod segmented_head;
 mod sharded_hashhead;
 mod sorted_run;
 mod sp_tweaks;
+mod sp_tweaks_uring;
 pub mod spend_annotate_uring;
 mod spender_table;
 mod store;
@@ -122,6 +123,7 @@ pub use sorted_run::{
     FANIN_TARGET_STREAM_RUNS,
 };
 pub use sp_tweaks::{SpTweaksTable, TWEAK_LEN};
+pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx, TweakWave};
 pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};
 pub use store::{Store, StoreLayout, TxidResolveMode, INWIT_RELOC_NAME};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};

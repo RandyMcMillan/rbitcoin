@@ -646,6 +646,12 @@ pub const KIND_RMW_READ: u8 = 9;
 pub const KIND_RMW_WRITE: u8 = 10;
 /// k-way merge cursor ahead pread (`sorted_run::RunCursor`).
 pub const KIND_MERGE_PREAD: u8 = 11;
+/// SP-tweak machine: `txout.body` pread.
+pub const KIND_SP_TXOUT: u8 = 12;
+/// SP-tweak machine: `inwit.body` pread (P2TR only).
+pub const KIND_SP_INWIT: u8 = 13;
+/// SP-tweak machine: parent `txout.body` pread.
+pub const KIND_SP_PARENT: u8 = 14;
 
 /// Pack `(kind, epoch, slot)` into `user_data`.
 ///
@@ -839,6 +845,9 @@ mod tests {
             KIND_RMW_READ,
             KIND_RMW_WRITE,
             KIND_MERGE_PREAD,
+            KIND_SP_TXOUT,
+            KIND_SP_INWIT,
+            KIND_SP_PARENT,
         ];
         let mut seen = std::collections::HashSet::new();
         for k in kinds {

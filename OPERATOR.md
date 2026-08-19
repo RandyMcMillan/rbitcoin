@@ -450,9 +450,13 @@ sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
 **not** parent-peek (~40–80 blk/s vs ~1.5–3 naive on that VM).
 
 Tip follow writes 65 B-class records from already-pinned parents when the
-cursor is caught up. Reorg truncates with tip. Post-IBD backfill is
-IO-bound (**hours** on SSD; 9p/spinning rust longer). Progress is the idx
-itself (kill-safe).
+cursor is caught up. Reorg truncates with tip. Post-IBD backfill is a
+**one-core** completion machine: `txout` wave, then `inwit`/parent `txout`
+only for P2TR creates, secp on the same thread, then **batched** height-blob
++ idx writes (one body pwrite + one idx pwrite per consecutive group — not
+per tx). IO-bound (**hours** on SSD; 9p/spinning rust longer). Kill-safe:
+`next_height` is the last complete put. INFO every 10 s:
+`sptweaks: backfill next=… tip=… rate=…/s remain=…`.
 
 Cake’s scan isolate may still hardcode `electrs.cakewallet.com` even after a
 successful probe — see `COMPAT.md`.

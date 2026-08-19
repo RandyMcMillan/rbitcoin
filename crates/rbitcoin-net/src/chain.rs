@@ -65,6 +65,8 @@ pub struct ChainHub {
     confirmed: Arc<RwLock<HashSet<BlockHash>>>,
     /// Serializes tip connect / reorg so multi-peer accept cannot double Class A+C.
     connect_lock: std::sync::Mutex<()>,
+    /// Serializes regtest generate so concurrent generateblock cannot race one tip.
+    generate_lock: std::sync::Mutex<()>,
     /// Optional cluster mempool (tip-mode tx relay + confirm remove).
     ///
     /// Attached once via [`Self::attach_mempool`] after the hub is in an `Arc`.
@@ -78,6 +80,10 @@ pub struct ChainHub {
     /// Never-confirmed side-branch bodies, keyed by hash. Small cap.
     /// Not a block index: once-confirmed losers stay in Class A.
     held_bodies: RwLock<HashMap<BlockHash, Block>>,
+    /// First-seen order for equal-work tip picks after invalidate
+    /// (`feature_chain_tiebreaks.py`: earlier-received B7 beats B8).
+    held_seq: RwLock<HashMap<BlockHash, u64>>,
+    next_held_seq: AtomicU64,
     precious: RwLock<Option<BlockHash>>,
     /// Losing tips after a most-work reorg (hashes only). Bodies via archive.
     fork_tips: RwLock<HashSet<BlockHash>>,
@@ -125,11 +131,14 @@ impl ChainHub {
             tip_tx,
             confirmed,
             connect_lock: std::sync::Mutex::new(()),
+            generate_lock: std::sync::Mutex::new(()),
             mempool: std::sync::OnceLock::new(),
             clock: rbitcoin_consensus::NodeClock::new(),
             invalidated: RwLock::new(HashSet::new()),
             invalidated_paths: RwLock::new(Vec::new()),
             held_bodies: RwLock::new(HashMap::new()),
+            held_seq: RwLock::new(HashMap::new()),
+            next_held_seq: AtomicU64::new(1),
             precious: RwLock::new(None),
             fork_tips: RwLock::new(HashSet::new()),
             header_tips: RwLock::new(HashMap::new()),
@@ -1009,6 +1018,9 @@ impl ChainHub {
         if nblocks > 10_000 {
             return Err(NetError::Consensus("nblocks too large (max 10000)".into()));
         }
+        // Serialize tip-read + mine + accept so concurrent generateblock
+        // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
+        let _guard = self.generate_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut hashes = Vec::with_capacity(nblocks as usize);
         let mut extras = extra_txs;
         for i in 0..nblocks {
@@ -1050,32 +1062,36 @@ impl ChainHub {
     /// next most-work non-invalid fork (production: invalidate is not "stay
     /// on the stump").
     pub fn invalidate_block(&self, hash: BlockHash) -> Result<(), NetError> {
-        let Some(h) = self
+        let tip = self.tip_height().unwrap_or(0);
+        let on_tip = self
             .query
             .height_of_hash(&hash.to_byte_array())
             .map_err(|e| NetError::Consensus(e.to_string()))?
-        else {
-            return Err(NetError::Consensus("Block not found".into()));
-        };
-        let tip = self.tip_height().unwrap_or(0);
-        if h.0 > tip {
-            return Err(NetError::Consensus("block not on tip path".into()));
-        }
-        let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut path = Vec::new();
-        for ht in h.0..=tip {
-            if let Some(b) = self.block_at_height(ht)? {
-                let bh = b.block_hash();
-                self.invalidated.write().unwrap().insert(bh);
-                path.push(bh);
+            .filter(|h| h.0 <= tip);
+        if let Some(h) = on_tip {
+            let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut path = Vec::new();
+            for ht in h.0..=tip {
+                if let Some(b) = self.block_at_height(ht)? {
+                    let bh = b.block_hash();
+                    self.invalidated.write().unwrap().insert(bh);
+                    path.push(bh);
+                }
             }
+            if !path.is_empty() {
+                self.invalidated_paths.write().unwrap().push(path);
+            }
+            let keep = h.0.saturating_sub(1);
+            self.disconnect_to(keep)?;
+            drop(_guard);
+        } else if self.knows_header(&hash) || self.held_body(&hash).is_some() {
+            // Side-branch / held header (feature_chain_tiebreaks B10): mark
+            // invalid without a tip disconnect.
+            self.invalidated.write().unwrap().insert(hash);
+            self.invalidated_paths.write().unwrap().push(vec![hash]);
+        } else {
+            return Err(NetError::Consensus("Block not found".into()));
         }
-        if !path.is_empty() {
-            self.invalidated_paths.write().unwrap().push(path);
-        }
-        let keep = h.0.saturating_sub(1);
-        self.disconnect_to(keep)?;
-        drop(_guard);
         let _ = self.try_apply_after_invalidate()?;
         if let Some(mp) = self.mempool() {
             mp.evict_after_reorg();
@@ -1093,7 +1109,9 @@ impl ChainHub {
                 starts.push(p);
             }
         }
-        let mut best: Option<(bitcoin::Work, Vec<Block>)> = None;
+        let seqs = self.held_seq.read().unwrap().clone();
+        let tip_seq = |tip: BlockHash| seqs.get(&tip).copied().unwrap_or(u64::MAX);
+        let mut best: Option<(bitcoin::Work, u64, Vec<Block>)> = None;
         for start in starts {
             if inv.contains(&start) {
                 continue;
@@ -1104,16 +1122,20 @@ impl ChainHub {
             if branch.iter().any(|b| inv.contains(&b.block_hash())) {
                 continue;
             }
+            let tip = branch.last().map(|b| b.block_hash()).unwrap_or(start);
             let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let seq = tip_seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, _)) => work_better(w, *bw),
+                Some((bw, bseq, _)) => {
+                    work_better(w, *bw) || (w.to_be_bytes() == bw.to_be_bytes() && seq < *bseq)
+                }
             };
             if take {
-                best = Some((w, branch));
+                best = Some((w, seq, branch));
             }
         }
-        let Some((_, branch)) = best else {
+        let Some((_, _, branch)) = best else {
             return Ok(None);
         };
         match self.accept_branch(&branch) {
@@ -1428,8 +1450,11 @@ impl ChainHub {
         let height = base + (blocks.len() as u32) - 1;
         {
             let mut held = self.held_bodies.write().unwrap();
+            let mut seqs = self.held_seq.write().unwrap();
             for b in blocks {
-                held.remove(&b.block_hash());
+                let h = b.block_hash();
+                held.remove(&h);
+                seqs.remove(&h);
             }
         }
         {
@@ -1456,10 +1481,12 @@ impl ChainHub {
         match self.accept_block(block.clone()) {
             Ok(AcceptOutcome::Accepted { height }) => {
                 self.held_bodies.write().unwrap().remove(&hash);
+                self.held_seq.write().unwrap().remove(&hash);
                 Ok(AcceptOutcome::Accepted { height })
             }
             Ok(AcceptOutcome::AlreadyHave) => {
                 self.held_bodies.write().unwrap().remove(&hash);
+                self.held_seq.write().unwrap().remove(&hash);
                 Ok(AcceptOutcome::AlreadyHave)
             }
             Ok(AcceptOutcome::IgnoredWeaker) => {
@@ -1514,10 +1541,14 @@ impl ChainHub {
             }
         };
         let mut held = self.held_bodies.write().unwrap();
+        let mut seqs = self.held_seq.write().unwrap();
         if let Some(k) = evict {
             held.remove(&k);
+            seqs.remove(&k);
         }
+        let seq = self.next_held_seq.fetch_add(1, Ordering::Relaxed);
         held.insert(hash, block);
+        seqs.insert(hash, seq);
     }
 
     /// Never-confirmed side-branch body in RAM. Once-confirmed disconnected
@@ -1600,7 +1631,9 @@ impl ChainHub {
             return Ok(None);
         }
         let precious = *self.precious.read().unwrap();
-        let mut best: Option<(Work, Vec<Block>, bool)> = None;
+        let seqs = self.held_seq.read().unwrap().clone();
+        let tip_seq = |tip: BlockHash| seqs.get(&tip).copied().unwrap_or(u64::MAX);
+        let mut best: Option<(Work, u64, Vec<Block>, bool)> = None;
         for start in starts {
             let Some(branch) = self.assemble_side_branch(start) else {
                 continue;
@@ -1608,17 +1641,20 @@ impl ChainHub {
             let w = sum_work(branch.iter().map(|b| b.header.work()));
             let tip = branch.last().map(Block::block_hash);
             let is_p = tip == precious;
+            let seq = tip.map(tip_seq).unwrap_or(u64::MAX);
             let take = match &best {
                 None => true,
-                Some((bw, _, was_p)) => {
-                    work_better(w, *bw) || (!work_better(*bw, w) && is_p && !*was_p)
+                Some((bw, bseq, _, was_p)) => {
+                    work_better(w, *bw)
+                        || (!work_better(*bw, w) && is_p && !*was_p)
+                        || (w.to_be_bytes() == bw.to_be_bytes() && !is_p && !*was_p && seq < *bseq)
                 }
             };
             if take {
-                best = Some((w, branch, is_p));
+                best = Some((w, seq, branch, is_p));
             }
         }
-        let Some((_, branch, _)) = best else {
+        let Some((_, _, branch, _)) = best else {
             return Ok(None);
         };
         match self.accept_branch(&branch) {
@@ -2832,6 +2868,62 @@ mod tests {
         assert!(!work_better(z, one));
         assert_eq!(sum_work(std::iter::empty()), z);
         assert_eq!(sum_work([one].into_iter()), one);
+    }
+
+    /// `feature_chain_tiebreaks.py`: after invalidate, equal-work held tips
+    /// pick first-seen (lower held_seq), not last-seen.
+    #[test]
+    fn invalidate_equal_work_picks_first_seen_held() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let main = mine(gen, 1_300_030_000, 1);
+        hub.accept_block(main.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(1));
+
+        let mut first = mine(gen, 1_300_030_001, 1);
+        if first.block_hash() == main.block_hash() {
+            let target = Target::from_compact(first.header.bits);
+            for nonce in 0..u32::MAX {
+                first.header.nonce = nonce;
+                if first.header.validate_pow(target).is_ok()
+                    && first.block_hash() != main.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        let mut second = mine(gen, 1_300_030_002, 1);
+        loop {
+            if second.block_hash() != main.block_hash() && second.block_hash() != first.block_hash()
+            {
+                break;
+            }
+            second.header.nonce = second.header.nonce.wrapping_add(1);
+            let target = Target::from_compact(second.header.bits);
+            if second.header.validate_pow(target).is_err() {
+                continue;
+            }
+        }
+
+        assert!(matches!(
+            hub.accept_received_block(first.clone()).unwrap(),
+            AcceptOutcome::IgnoredWeaker
+        ));
+        assert!(matches!(
+            hub.accept_received_block(second.clone()).unwrap(),
+            AcceptOutcome::IgnoredWeaker
+        ));
+        assert!(hub.held_body(&first.block_hash()).is_some());
+        assert!(hub.held_body(&second.block_hash()).is_some());
+
+        hub.invalidate_block(main.block_hash()).unwrap();
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            first.block_hash(),
+            "first-seen equal-work held tip must win after invalidate"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

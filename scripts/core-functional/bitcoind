@@ -65,6 +65,9 @@ IGNORE_FLAGS = frozenset(
     {
         "server",
         "disablewallet",
+        "blockmaxweight",
+        "blockreservedweight",
+        "stopatheight",
         "v2transport",
         "logtimemicros",
         "debugexclude",
@@ -87,6 +90,9 @@ IGNORE_FLAGS = frozenset(
         "wallet",
         "noserver",
         "disablewallet",
+        "blockmaxweight",
+        "blockreservedweight",
+        "stopatheight",
         # Test-only: refuse public outbound (we already --no-seeds + explicit
         # connect). Not an operator proxy implementation.
         "proxy",
@@ -241,6 +247,9 @@ def translate(
             "maxconnections",
             "minimumchainwork",
             "blockmintxfee",
+            "blockmaxweight",
+            "blockreservedweight",
+            "stopatheight",
             "blocksdir",
             "walletdir",
             "wallet",
@@ -253,6 +262,12 @@ def translate(
             datadir = Path(val or "")
         elif key == "blocksdir":
             blocksdir_arg = Path(val or "")
+            if not blocksdir_arg.is_dir():
+                print(
+                    f'Error: Specified blocks directory "{blocksdir_arg}" does not exist.',
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
         elif key == "walletdir":
             walletdir_arg = Path(val or "")
         elif key == "wallet":
@@ -344,13 +359,20 @@ def translate(
             marker.write_text("1\n")
         else:
             marker.unlink(missing_ok=True)
-    # Core-layout placeholder so rpc_getblockstats.py can rename blk00000.dat
-    # and expect "Block not found on disk". Product store/ is separate.
+    # Core-layout placeholders: default datadir/blocks for getblockstats rename;
+    # with -blocksdir, also blk under blocksdir/<network>/blocks (feature_blocksdir).
     blocks_dir = node_dir / "blocks"
     blocks_dir.mkdir(parents=True, exist_ok=True)
+    (blocks_dir / "index").mkdir(parents=True, exist_ok=True)
     blk0 = blocks_dir / "blk00000.dat"
     if not blk0.is_file():
         blk0.write_bytes(b"\x00" * 16)
+    if blocksdir_arg is not None:
+        bd_blocks = blocksdir_arg / network / "blocks"
+        bd_blocks.mkdir(parents=True, exist_ok=True)
+        bd_blk = bd_blocks / "blk00000.dat"
+        if not bd_blk.is_file():
+            bd_blk.write_bytes(b"\x00" * 16)
 
     node = find_node()
     cmd = [

@@ -1708,14 +1708,44 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["output", "transactions", "submit"])?;
     let miner = require_regtest_miner(ctx, "generateblock")?;
     let output = params.req_str(0, "output")?;
-    let script = parse_output_descriptor(ctx, output)?;
+    let script = parse_generateblock_output(ctx, output)?;
     let mut extra = Vec::new();
     if let Some(arr) = params.get_array(1, "transactions") {
+        let mp = ctx.mempool.as_ref();
         for v in arr {
-            let hex = v
-                .as_str()
-                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "transactions entries must be hex"))?;
-            extra.push(decode_tx_hex(hex)?);
+            let s = v.as_str().ok_or_else(|| {
+                rpc_error(
+                    ERR_INVALID_PARAMS,
+                    "transactions entries must be hex or txid",
+                )
+            })?;
+            // Core: 64-hex → Txid::FromHex first; miss → not in mempool (-5).
+            if s.len() == 64 {
+                if let Ok(tid) = parse_hash32_display(s) {
+                    let txid = Txid::from_byte_array(tid);
+                    if let Some(mp) = mp {
+                        if let Some(tx) = mp.get_tx(&txid) {
+                            extra.push(tx);
+                            continue;
+                        }
+                    }
+                    return Err(rpc_error(
+                        ERR_INVALID_ADDRESS_OR_KEY,
+                        format!("Transaction {s} not in mempool."),
+                    ));
+                }
+            }
+            match decode_tx_hex(s) {
+                Ok(tx) => extra.push(tx),
+                Err(_) => {
+                    return Err(rpc_error(
+                        ERR_DESERIALIZATION,
+                        format!(
+                            "Transaction decode failed for {s}. Make sure the tx has at least one input."
+                        ),
+                    ));
+                }
+            }
         }
     } else if params.get(1, "transactions").is_some() {
         return Err(rpc_error(
@@ -1729,7 +1759,7 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     if !submit {
         let block = miner
             .assemble_block_to_script(script, extra)
-            .map_err(|e| rpc_error(ERR_MISC, e))?;
+            .map_err(|e| generateblock_validity_error(&e))?;
         return Ok(json!({
             "hash": block.block_hash().to_string(),
             "hex": serialize_hex(&block),
@@ -1737,11 +1767,85 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
     let hashes = miner
         .generate_to_script(1, script, extra)
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
+        .map_err(|e| generateblock_validity_error(&e))?;
     let hash = hashes
         .first()
         .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
     Ok(json!({ "hash": hash.to_string() }))
+}
+
+/// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
+fn generateblock_validity_error(e: &str) -> Value {
+    let s = e.strip_prefix("consensus: ").unwrap_or(e);
+    let s = s.strip_prefix("protocol: ").unwrap_or(s);
+    for needle in [
+        "bad-txns-inputs-missingorspent",
+        "bad-txns-duplicate",
+        "bad-txns-nonfinal",
+        "bad-txns-in-belowout",
+        "bad-cb-missing",
+        "bad-blk-length",
+        "bad-diffbits",
+        "time-too-old",
+        "time-too-new",
+        "bad-txnmrklroot",
+    ] {
+        if s.contains(needle) {
+            return rpc_error(
+                ERR_VERIFY_ERROR,
+                format!("TestBlockValidity failed: {needle}"),
+            );
+        }
+    }
+    rpc_error(ERR_VERIFY_ERROR, format!("TestBlockValidity failed: {s}"))
+}
+
+/// Core `generateblock` output: descriptor first, then address (not bare hex).
+fn parse_generateblock_output(ctx: &RpcContext, output: &str) -> Result<ScriptBuf, Value> {
+    let invalid = || {
+        rpc_error(
+            ERR_INVALID_ADDRESS_OR_KEY,
+            "Error: Invalid address or descriptor",
+        )
+    };
+    if output.contains('(') {
+        if output.contains("/*") {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?",
+            ));
+        }
+        if let Some(s) = parse_raw_descriptor(output) {
+            return Ok(s);
+        }
+        if let Some(s) = parse_addr_descriptor(ctx, output) {
+            return Ok(s);
+        }
+        if let Some(s) = parse_combo_descriptor(ctx, output) {
+            return Ok(s);
+        }
+        if let Some(s) = parse_wrapped_multi(output) {
+            return Ok(s);
+        }
+        let has_xpub = output.contains("tpub")
+            || output.contains("xpub")
+            || output.contains("tprv")
+            || output.contains("xprv");
+        if has_xpub && (output.contains('\'') || output.contains("h/") || output.contains("h)")) {
+            return Err(rpc_error(
+                ERR_INVALID_ADDRESS_OR_KEY,
+                "Cannot derive script without private keys",
+            ));
+        }
+        return Err(invalid());
+    }
+    let btc_net = rpc_btc_network(ctx.network);
+    if let Ok(a) = output.parse::<Address<_>>() {
+        if let Ok(addr) = a.require_network(btc_net) {
+            return Ok(addr.script_pubkey());
+        }
+    }
+    Err(invalid())
 }
 
 const GENERATE_REPLACED: &str =
@@ -1782,6 +1886,22 @@ fn parse_addr_descriptor(ctx: &RpcContext, desc: &str) -> Option<ScriptBuf> {
     let bare = desc.split('#').next()?.trim();
     let inner = bare.strip_prefix("addr(")?.strip_suffix(")")?;
     decode_output_script(ctx, inner).ok()
+}
+
+/// Core `combo(pubkey)` for `generateblock`: compressed → P2WPKH, else P2PKH.
+fn parse_combo_descriptor(ctx: &RpcContext, desc: &str) -> Option<ScriptBuf> {
+    use bitcoin::key::CompressedPublicKey;
+    let bare = desc.split('#').next()?.trim();
+    let inner = bare.strip_prefix("combo(")?.strip_suffix(")")?;
+    let pk = PublicKey::from_str(inner).ok()?;
+    let btc_net = rpc_btc_network(ctx.network);
+    let spk = if pk.compressed {
+        let cpk = CompressedPublicKey(pk.inner);
+        Address::p2wpkh(&cpk, btc_net).script_pubkey()
+    } else {
+        Address::p2pkh(pk, btc_net).script_pubkey()
+    };
+    Some(spk)
 }
 
 /// `sh(multi(...))` / `wsh(multi(...))` / `sh(wsh(multi(...)))` → scriptPubKey.
@@ -1826,6 +1946,12 @@ fn parse_output_descriptor(ctx: &RpcContext, desc: &str) -> Result<ScriptBuf, Va
         return Ok(s);
     }
     if let Some(s) = parse_addr_descriptor(ctx, desc) {
+        return Ok(s);
+    }
+    if let Some(s) = parse_combo_descriptor(ctx, desc) {
+        return Ok(s);
+    }
+    if let Some(s) = parse_wrapped_multi(desc) {
         return Ok(s);
     }
     decode_output_script(ctx, desc)
@@ -3356,6 +3482,152 @@ mod tests {
         assert!(wsh.is_p2wsh());
         let sh = parse_wrapped_multi(&format!("sh(multi(1,{pk}))")).unwrap();
         assert!(sh.is_p2sh());
+    }
+
+    #[test]
+    fn parse_combo_compressed_is_p2wpkh_uncompressed_p2pkh() {
+        let (ctx, dir) = ctx_empty();
+        let compressed = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let spk = parse_combo_descriptor(&ctx, &format!("combo({compressed})")).expect("combo");
+        let want = Address::from_str("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
+            .unwrap()
+            .require_network(bitcoin::Network::Regtest)
+            .unwrap()
+            .script_pubkey();
+        assert_eq!(spk, want);
+        let uncompressed = "0408ef68c46d20596cc3f6ddf7c8794f71913add807f1dc55949fa805d764d191c0b7ce6894c126fce0babc6663042f3dde9b0cf76467ea315514e5a6731149c67";
+        let spk2 =
+            parse_combo_descriptor(&ctx, &format!("combo({uncompressed})")).expect("combo unc");
+        assert!(spk2.is_p2pkh());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Core `rpc_generate.py` generateblock reject strings / codes.
+    #[test]
+    fn generateblock_core_reject_shapes() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let op_true = "raw(51)";
+        dispatch(
+            &ctx,
+            "generatetodescriptor",
+            vec![json!(101), json!(op_true)],
+        )
+        .unwrap();
+
+        let missing = "0000000000000000000000000000000000000000000000000000000000000000";
+        let e = dispatch(
+            &ctx,
+            "generateblock",
+            vec![json!(op_true), json!([missing])],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        assert_eq!(
+            e["message"].as_str().unwrap(),
+            format!("Transaction {missing} not in mempool.")
+        );
+
+        let e = dispatch(&ctx, "generateblock", vec![json!(op_true), json!(["0000"])]).unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Transaction decode failed for 0000"),
+            "{e}"
+        );
+
+        let e = dispatch(&ctx, "generateblock", vec![json!("1234"), json!([])]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid address or descriptor"),
+            "{e}"
+        );
+
+        let ranged = "pkh(tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp/0/*)";
+        let e = dispatch(&ctx, "generateblock", vec![json!(ranged), json!([])]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+        assert_eq!(
+            e["message"].as_str().unwrap(),
+            "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
+        );
+
+        let child_desc = "pkh(tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp/0'/0)";
+        let e = dispatch(&ctx, "generateblock", vec![json!(child_desc), json!([])]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
+        assert_eq!(
+            e["message"].as_str().unwrap(),
+            "Cannot derive script without private keys"
+        );
+
+        let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+        let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+        let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
+        let cb_val =
+            (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+        let true_spk = ScriptBuf::from_bytes(vec![0x51]);
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(cb_val - 2_000),
+                script_pubkey: true_spk.clone(),
+            }],
+        };
+        let parent_id = dispatch(
+            &ctx,
+            "sendrawtransaction",
+            vec![json!(hex_encode(serialize(&parent)))],
+        )
+        .unwrap();
+        let parent_txid = parent_id.as_str().unwrap().to_string();
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(cb_val - 3_000),
+                script_pubkey: true_spk,
+            }],
+        };
+        let child_hex = hex_encode(serialize(&child));
+        let e = dispatch(
+            &ctx,
+            "generateblock",
+            vec![json!(op_true), json!([child_hex, parent_txid])],
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_VERIFY_ERROR);
+        assert_eq!(
+            e["message"].as_str().unwrap(),
+            "TestBlockValidity failed: bad-txns-inputs-missingorspent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

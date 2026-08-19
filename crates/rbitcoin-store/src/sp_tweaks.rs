@@ -397,8 +397,12 @@ impl SpTweaksTable {
         self.put_blocks(&[(height, records)])
     }
 
-    /// Append consecutive heights with **one** body pwrite + **one** idx pwrite
-    /// (not a pwrite per tx). `items[0].0` must be [`Self::next_height`].
+    /// Append consecutive heights. One body pwrite + one idx pwrite per
+    /// segment group (not a pwrite per tx). `items[0].0` must be
+    /// [`Self::next_height`].
+    ///
+    /// Idx `off` is the record **start**. A blob may extend past `u32::MAX`;
+    /// when the next start would not fit in `u32`, we roll a new segment.
     pub fn put_blocks(&self, items: &[(Height, &[Option<[u8; 33]>])]) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
@@ -414,43 +418,51 @@ impl SpTweaksTable {
             expect = Height(expect.0.saturating_add(1));
         }
         let mut inner = self.lock();
-        let start0 = inner
-            .segs
-            .last()
-            .map(|s| s.body.logical_len())
-            .unwrap_or(FILE_HEADER_LEN as u64);
-        if start0 > u32::MAX as u64 {
-            Self::roll(&self.dir, &mut inner)?;
-        }
-        let tail = inner
-            .segs
-            .last_mut()
-            .ok_or(StoreError::Corrupt("sp_tweaks no segments"))?;
-        let start = tail.body.logical_len();
-        if start > u32::MAX as u64 {
-            return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
-        }
-        let mut body = Vec::new();
-        let mut offs: Vec<u32> = Vec::with_capacity(items.len());
-        for (_, recs) in items {
-            if start.saturating_add(body.len() as u64) > u32::MAX as u64 {
+        let mut i = 0usize;
+        while i < items.len() {
+            let start0 = inner
+                .segs
+                .last()
+                .map(|s| s.body.logical_len())
+                .unwrap_or(FILE_HEADER_LEN as u64);
+            if start0 > u32::MAX as u64 {
+                Self::roll(&self.dir, &mut inner)?;
+            }
+            let tail = inner
+                .segs
+                .last_mut()
+                .ok_or(StoreError::Corrupt("sp_tweaks no segments"))?;
+            let start = tail.body.logical_len();
+            if start > u32::MAX as u64 {
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
-            offs.push((start + body.len() as u64) as u32);
-            body.extend_from_slice(&Self::encode_records(recs));
+            let mut body = Vec::new();
+            let mut offs: Vec<u32> = Vec::new();
+            while i < items.len() {
+                let rec_start = start.saturating_add(body.len() as u64);
+                if rec_start > u32::MAX as u64 {
+                    break;
+                }
+                offs.push(rec_start as u32);
+                body.extend_from_slice(&Self::encode_records(items[i].1));
+                i += 1;
+            }
+            if offs.is_empty() {
+                return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
+            }
+            if !body.is_empty() {
+                tail.body.write_at_pwrite(start, &body)?;
+            }
+            let mut idx_blob = Vec::with_capacity(offs.len() * SLOT as usize);
+            for o in &offs {
+                idx_blob.extend_from_slice(&o.to_le_bytes());
+            }
+            let idx_at = FILE_HEADER_LEN as u64 + tail.n_slots * SLOT;
+            if !idx_blob.is_empty() {
+                tail.idx.write_at_pwrite(idx_at, &idx_blob)?;
+            }
+            tail.n_slots = tail.n_slots.saturating_add(offs.len() as u64);
         }
-        if !body.is_empty() {
-            tail.body.write_at_pwrite(start, &body)?;
-        }
-        let mut idx_blob = Vec::with_capacity(offs.len() * SLOT as usize);
-        for o in &offs {
-            idx_blob.extend_from_slice(&o.to_le_bytes());
-        }
-        let idx_at = FILE_HEADER_LEN as u64 + tail.n_slots * SLOT;
-        if !idx_blob.is_empty() {
-            tail.idx.write_at_pwrite(idx_at, &idx_blob)?;
-        }
-        tail.n_slots = tail.n_slots.saturating_add(items.len() as u64);
         Ok(())
     }
 
@@ -714,6 +726,64 @@ mod tests {
             vec![None, None]
         );
         assert_eq!(t.get_block(Height(0), 1).unwrap().unwrap(), vec![None]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_block_body_may_pass_u32_if_start_fits() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        t.put_block(Height(0), &[None]).unwrap();
+        t.flush().unwrap();
+        drop(t);
+
+        let body = SpTweaksTable::seg_body_path(&dir, 0);
+        let near = u32::MAX - 8;
+        set_file_hwm(&body, u64::from(near));
+        let t = SpTweaksTable::open(&dir).unwrap();
+        let fat: Vec<Option<[u8; 33]>> = vec![None; 32];
+        t.put_block(Height(1), &fat)
+            .expect("start < 2^32 may extend body past u32::MAX");
+        assert!(
+            t.body_logical_len() > u32::MAX as u64,
+            "this height's blob must be allowed to pass 4 GiB"
+        );
+        assert_eq!(t.get_block(Height(1), 32).unwrap().unwrap(), fat);
+        t.put_block(Height(2), &[None])
+            .expect("next start > u32::MAX must roll, not Corrupt");
+        assert!(SpTweaksTable::seg_body_path(&dir, 1).is_file());
+        assert_eq!(t.get_block(Height(2), 1).unwrap().unwrap(), vec![None]);
+        assert_eq!(t.get_block(Height(1), 32).unwrap().unwrap(), fat);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_blocks_rolls_mid_batch_when_next_start_exceeds_u32() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        t.put_block(Height(0), &[None]).unwrap();
+        t.flush().unwrap();
+        drop(t);
+
+        let body = SpTweaksTable::seg_body_path(&dir, 0);
+        let near = u32::MAX - 4;
+        set_file_hwm(&body, u64::from(near));
+        let t = SpTweaksTable::open(&dir).unwrap();
+        let fat: Vec<Option<[u8; 33]>> = vec![None; 20];
+        t.put_blocks(&[
+            (Height(1), fat.as_slice()),
+            (Height(2), &[None] as &[Option<[u8; 33]>]),
+            (Height(3), &[None, None]),
+        ])
+        .expect("mid-batch start past u32 must roll, not Corrupt");
+        assert!(SpTweaksTable::seg_body_path(&dir, 1).is_file());
+        assert_eq!(t.get_block(Height(1), 20).unwrap().unwrap(), fat);
+        assert_eq!(t.get_block(Height(2), 1).unwrap().unwrap(), vec![None]);
+        assert_eq!(
+            t.get_block(Height(3), 2).unwrap().unwrap(),
+            vec![None, None]
+        );
+        assert_eq!(t.next_height(), Height(4));
         let _ = fs::remove_dir_all(&dir);
     }
 

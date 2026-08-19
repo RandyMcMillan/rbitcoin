@@ -53,7 +53,9 @@ The 2-wave split is sealed age, not an IO flag.
 | **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | durable write-through after bulk |
 
 Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
-(runs → fan-in reduce → durable tables); it does **not** rebuild `tx.head` or spend annotations.
+(runs → optional fan-in reduce → sliced k-way per prefix shard, n-cpu
+workers, ordered publish); it does **not** rebuild `tx.head` or spend
+annotations.
 
 ## Locks (exceptions only)
 

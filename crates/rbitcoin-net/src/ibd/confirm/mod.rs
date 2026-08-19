@@ -1810,6 +1810,13 @@ pub(crate) fn offer_confirm_ready(
         if hub.has_block(&hash) {
             continue;
         }
+        if ht == expect {
+            if let Ok(Some(prev)) = super::reorg::parent_hash_of(hub, hash) {
+                if hub.tip_hash() != Some(prev) {
+                    break;
+                }
+            }
+        }
         if body.is_rejected(&hash) {
             // Tip is frozen on a permanently rejected tip+1 (consensus blacklisted).
             // Without this log, status shows confirm_blks=0 + hole=0 and looks like

@@ -15,9 +15,9 @@ use crate::scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead,
 };
 use crate::scripthash_layout::{
-    head_key_from_full, payload_start, slab_bytes, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
-    SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS, SH_MAX_SLAB_CLASS,
-    SH_PAGE_SLAB_CLASS,
+    head_key_from_full, pack8_bytes, payload_start, slab_bytes, ShEntry, ShHeadValue,
+    SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_HEAD_VALUE_LEN, SH_INLINE_CAP,
+    SH_MAX_CLASS, SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
 use crate::scripthash_mphf::{self, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
@@ -344,7 +344,7 @@ fn ingest_path(dir: &Path) -> PathBuf {
 fn ingest_oa_slots() -> u64 {
     match HeadScale::from_env() {
         HeadScale::Tiny => 256,
-        HeadScale::Mainnet => 1 << 22,
+        HeadScale::Mainnet => 1 << 25,
     }
 }
 
@@ -994,11 +994,13 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
     ) -> Result<Option<(ShHeadValue, KeyHome)>, StoreError> {
         if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
+            let v = self.fill_paged_first(scripthash, v, KeyHome::Ingest)?;
             return Ok(Some((v, KeyHome::Ingest)));
         }
         let hk = head_key_from_full(scripthash);
         for h in self.sealed_ovf.lock().unwrap().iter().rev() {
             if let Some(v) = h.get(&hk)? {
+                let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
                 return Ok(Some((v, KeyHome::SealedOvf)));
             }
         }
@@ -1494,7 +1496,7 @@ impl ScriptHashTable {
             let g = self.ingest.lock().unwrap();
             let mut recs = Vec::new();
             g.for_each_occupied(|full, val| {
-                recs.push((head_key_from_full(&full), val.encode()));
+                recs.push((head_key_from_full(&full), pack8_bytes(&val)?));
                 Ok(())
             })?;
             recs
@@ -1540,7 +1542,8 @@ impl ScriptHashTable {
     /// K-way merge of sealed global ovf heads. Body offs unchanged. Readers
     /// keep the old `Vec` until this lock is released after rename.
     pub fn compact_sealed_ovf(&self) -> Result<(), StoreError> {
-        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])> = Vec::new();
+        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> =
+            Vec::new();
         let old_paths: Vec<PathBuf> = {
             let g = self.sealed_ovf.lock().unwrap();
             if g.len() < 2 {
@@ -1548,7 +1551,7 @@ impl ScriptHashTable {
             }
             for h in g.iter() {
                 h.for_each_occupied(|k, v| {
-                    recs.push((k, v.encode()));
+                    recs.push((k, pack8_bytes(&v)?));
                     Ok(())
                 })?;
             }
@@ -2224,7 +2227,7 @@ impl ScriptHashTable {
     pub fn publish_sorted_shard(
         &self,
         shard: usize,
-        recs: &[(crate::scripthash_layout::ShHeadKey, [u8; 16])],
+        recs: &[(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])],
         live_count: u64,
         bump: u64,
     ) -> Result<(), StoreError> {
@@ -2386,7 +2389,7 @@ pub struct ScriptHashBulkSession<'a> {
     resume_from_shard: u32,
     active_shard: Option<usize>,
     /// Packed recs for [`Self::bulk_session`] (sorted at shard seal; 16 B key order).
-    recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
+    recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
     body_buf: Vec<u8>,
@@ -2410,7 +2413,7 @@ pub struct ScriptHashBulkSession<'a> {
 
 /// One shard packed onto its live body, ready for ordered head publish.
 pub struct ShShardPack {
-    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
+    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])>,
     pub creates: u64,
     pub max_fk: u64,
     pub keys: u64,
@@ -2613,11 +2616,11 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
-        let rec = (head_key_from_full(&open.key), val.encode());
+        let rec = (head_key_from_full(&open.key), pack8_bytes(&val)?);
         self.recs.push(rec);
         self.peak_table_bytes = self
             .peak_table_bytes
-            .max(self.recs.len().saturating_mul(32));
+            .max(self.recs.len().saturating_mul(24));
         Ok(())
     }
 
@@ -2919,7 +2922,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             rbitcoin_log::info!(
                 "store: scripthash live shard done id={si} keys={keys} \
                  recs_MiB≈{:.1} write={elapsed:?} next_shard={next}",
-                (keys as f64 * 32.0) / (1024.0 * 1024.0)
+                (keys as f64 * 24.0) / (1024.0 * 1024.0)
             );
         }
         self.active_shard = None;
@@ -3596,6 +3599,15 @@ mod tests {
     }
 
     #[test]
+    fn ingest_oa_slots_mainnet_is_2_25() {
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(ingest_oa_slots(), 1 << 25);
+            assert_eq!(SH_HEAD_VALUE_LEN, 8);
+            assert_eq!(crate::scripthash_layout::SH_HEAD_SLOT_SIZE, 24);
+        });
+    }
+
+    #[test]
     fn create_does_not_write_oa_stub() {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
@@ -4164,8 +4176,8 @@ mod tests {
             remap_copied_page_chain(dst.body(), first_page, delta).unwrap();
         }
         let recs = vec![
-            (head_key_from_full(&slab_key), slab_r.encode()),
-            (head_key_from_full(&mega_key), mega_r.encode()),
+            (head_key_from_full(&slab_key), pack8_bytes(&slab_r).unwrap()),
+            (head_key_from_full(&mega_key), pack8_bytes(&mega_r).unwrap()),
         ];
         dst.publish_sorted_shard(0, &recs, 8 + n_mega as u64, src_hi + delta)
             .unwrap();
@@ -4755,7 +4767,7 @@ mod tests {
         assert_eq!(keys, u64::from(N));
         assert_eq!(t.entry_count(), u64::from(N));
         // Peak is packed recs (32 B/key), not a 2 GiB OA slot table.
-        assert_eq!(peak, (N as usize) * 32);
+        assert_eq!(peak, (N as usize) * 24);
         // Spot-check a few keys survive live install.
         for i in [0u32, 1, 65_535, 70_000, N - 1] {
             let ents = t.entries(&key(i)).unwrap();
@@ -4837,7 +4849,7 @@ mod tests {
         session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
         let peak = session.peak_table_bytes;
         let _ = session.finish().unwrap();
-        assert_eq!(peak, 32, "one streamed rec is 32 B, not an OA image");
+        assert_eq!(peak, 24, "one streamed rec is 24 B, not an OA image");
         assert!(
             peak < 16 * 1024 * 1024,
             "peak {peak} looks like create-count sizing"

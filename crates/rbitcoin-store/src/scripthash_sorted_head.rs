@@ -1,6 +1,6 @@
-//! Sealed sorted Class B head: packed `(key16 ‖ value16)` + `.idx`.
+//! Sealed sorted Class B head: packed `(key16 ‖ pack8)` + `.idx`.
 //!
-//! Record count is immutable after seal. Existing keys update `value16` in
+//! Record count is immutable after seal. Existing keys update pack8 in
 //! place. A key that is not on this file is **not inserted** (caller uses ovf).
 //!
 //! **Main shards** are idx-only (misses pay one 4 KiB data pread). **Sealed
@@ -9,7 +9,10 @@
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
 use crate::io_handle::IoHandle;
-use crate::scripthash_layout::{ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE};
+use crate::scripthash_layout::{
+    pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
+    SH_HEAD_VALUE_LEN,
+};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 #[cfg(test)]
@@ -17,11 +20,11 @@ use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Records per data page (128 × 32 B = 4 KiB).
-pub const SH_SORTED_RECS_PER_PAGE: usize = 128;
+/// Records per data page (170 × 24 B = 4080 B).
+pub const SH_SORTED_RECS_PER_PAGE: usize = 170;
 const DATA_MAGIC: &[u8; 4] = b"SHSR";
 const IDX_MAGIC: &[u8; 4] = b"SHIX";
-const FORMAT_VER: u16 = 1;
+const FORMAT_VER: u16 = 2;
 const DATA_HEADER_LEN: u64 = 32;
 const IDX_HEADER_LEN: usize = 16;
 const IDX_ENT_LEN: usize = SH_HEAD_KEY_LEN + 8;
@@ -81,7 +84,7 @@ impl SortedHead {
     /// Write a sealed sorted head. `recs` must be unique and sorted by key16.
     pub fn write(
         path: impl AsRef<Path>,
-        recs: &[(ShHeadKey, [u8; 16])],
+        recs: &[(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])],
         filter: SortedHeadFilter,
     ) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -177,9 +180,9 @@ impl SortedHead {
         let Some((_slot, rec)) = self.locate_rec(key)? else {
             return Ok(None);
         };
-        let mut val = [0u8; 16];
+        let mut val = [0u8; SH_HEAD_VALUE_LEN];
         val.copy_from_slice(&rec[SH_HEAD_KEY_LEN..]);
-        Ok(Some(ShHeadValue::decode(&val)?))
+        Ok(Some(unpack8_bytes(&val)?))
     }
 
     /// In-place `value16` update. `Ok(false)` if the key is not on this file.
@@ -192,7 +195,7 @@ impl SortedHead {
         let Some(slot) = self.locate_rec(key)?.map(|(s, _)| s) else {
             return Ok(false);
         };
-        let enc = value.encode();
+        let enc = pack8_bytes(value)?;
         let off = DATA_HEADER_LEN + slot * SH_HEAD_SLOT_SIZE as u64 + SH_HEAD_KEY_LEN as u64;
         pwrite_file(&self.file, off, &enc).map_err(|e| StoreError::io(&self.path, e))?;
         Ok(true)
@@ -209,7 +212,7 @@ impl SortedHead {
             pread_file_exact(&self.file, off, &mut rec)
                 .map_err(|e| StoreError::io(&self.path, e))?;
             let k: ShHeadKey = rec[0..SH_HEAD_KEY_LEN].try_into().unwrap();
-            let val = ShHeadValue::decode(&rec[SH_HEAD_KEY_LEN..])?;
+            let val = unpack8_bytes(&rec[SH_HEAD_KEY_LEN..].try_into().unwrap())?;
             if !val.is_empty() {
                 f(k, val)?;
             }
@@ -302,7 +305,7 @@ impl SortedHeadWriter {
         })
     }
 
-    pub fn push(&mut self, key: ShHeadKey, val: [u8; 16]) -> Result<(), StoreError> {
+    pub fn push(&mut self, key: ShHeadKey, val: [u8; SH_HEAD_VALUE_LEN]) -> Result<(), StoreError> {
         if let Some(prev) = self.last_key {
             if key < prev {
                 return Err(StoreError::Corrupt(
@@ -505,11 +508,11 @@ mod tests {
         k
     }
 
-    fn recs(n: u32) -> Vec<(ShHeadKey, [u8; 16])> {
+    fn recs(n: u32) -> Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> {
         (0..n)
             .map(|i| {
                 let v = ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1)));
-                (key_of(i), v.encode())
+                (key_of(i), pack8_bytes(&v).unwrap())
             })
             .collect()
     }

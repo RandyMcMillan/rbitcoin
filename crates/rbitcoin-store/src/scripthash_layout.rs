@@ -1,6 +1,6 @@
-//! Scripthash layout: 8 B create_tx_fk entries, **32 B head slots** (fixed).
+//! Scripthash layout: 8 B create_tx_fk entries, **24 B head slots** (key16 + pack8).
 //!
-//! Head key = first 16 B of SHA256(spk). Value = two u64s.
+//! Head key = first 16 B of SHA256(spk). Value = pack8 (8 B).
 //!
 //! **Schema 15:** Empty / Inline (≤2 FKs) / **Slab** `{class,used,off}` /
 //! **Paged** (megakey first+last 4 KiB page offs).
@@ -23,8 +23,8 @@ pub const SH_ENTRY_LEN: usize = 8;
 pub const SH_INLINE_CAP: usize = 1;
 /// Head key length (prefix of Electrum SHA256(spk)).
 pub const SH_HEAD_KEY_LEN: usize = 16;
-/// Head value: two u64s.
-pub const SH_HEAD_VALUE_LEN: usize = 16;
+/// Head value: pack8 word.
+pub const SH_HEAD_VALUE_LEN: usize = 8;
 /// On-disk head slot size.
 pub const SH_HEAD_SLOT_SIZE: usize = SH_HEAD_KEY_LEN + SH_HEAD_VALUE_LEN;
 /// High bit marks non-inline head value (paged). Same value as [`SH_FLAG_BIT`].
@@ -140,8 +140,8 @@ impl ShHeadValue {
         matches!(self, ShHeadValue::Slab { .. })
     }
 
-    pub fn encode(&self) -> [u8; SH_HEAD_VALUE_LEN] {
-        let mut out = [0u8; SH_HEAD_VALUE_LEN];
+    pub fn encode(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
         match self {
             ShHeadValue::Empty => {}
             ShHeadValue::Inline { entries, used } => {
@@ -170,7 +170,7 @@ impl ShHeadValue {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < SH_HEAD_VALUE_LEN {
+        if buf.len() < 16 {
             return Err(StoreError::Corrupt("short scripthash head value"));
         }
         let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -288,6 +288,14 @@ pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
 }
 
 /// Inverse of [`pack8`]. Paged `first_page` is 0 (lives on the last page header).
+pub fn pack8_bytes(v: &ShHeadValue) -> Result<[u8; SH_HEAD_VALUE_LEN], StoreError> {
+    Ok(pack8(v)?.to_le_bytes())
+}
+
+pub fn unpack8_bytes(buf: &[u8; SH_HEAD_VALUE_LEN]) -> Result<ShHeadValue, StoreError> {
+    unpack8(u64::from_le_bytes(*buf))
+}
+
 pub fn unpack8(w: u64) -> Result<ShHeadValue, StoreError> {
     if w == 0 {
         return Ok(ShHeadValue::Empty);

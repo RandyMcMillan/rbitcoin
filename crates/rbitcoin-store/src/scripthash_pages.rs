@@ -594,8 +594,8 @@ mod tests {
     #[test]
     fn layout_constants_pin_32b_slot_and_4k_page() {
         // Full OA slot stays 32 B (documented contract; head module owns key len).
-        assert_eq!(crate::scripthash_layout::SH_HEAD_SLOT_SIZE, 32);
-        assert_eq!(crate::scripthash_layout::SH_HEAD_VALUE_LEN, 16);
+        assert_eq!(crate::scripthash_layout::SH_HEAD_SLOT_SIZE, 24);
+        assert_eq!(crate::scripthash_layout::SH_HEAD_VALUE_LEN, 8);
         assert_eq!(SH_PAGE_SIZE, 4096);
         assert_eq!(SH_PAGE_HEADER_LEN, 8);
         assert_eq!(SH_PAGE_FK_CAP, 511);

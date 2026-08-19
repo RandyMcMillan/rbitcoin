@@ -15,8 +15,8 @@ use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
 use crate::scripthash_layout::{
-    head_key_from_full, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
-    SH_HEAD_VALUE_LEN,
+    head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
+    SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
 #[cfg(test)]
 use crate::sharded_hashhead::initial_slots_per_shard;
@@ -321,7 +321,7 @@ impl ScriptHashHead {
                 return Ok((None, cache.chunk_loads));
             }
             if k == key {
-                let val = ShHeadValue::decode(&v)?;
+                let val = unpack8_bytes(&v)?;
                 if val.is_empty() {
                     return Ok((None, cache.chunk_loads));
                 }
@@ -373,7 +373,7 @@ impl ScriptHashHead {
                     break;
                 }
                 if k == key {
-                    let val = ShHeadValue::decode(&v)?;
+                    let val = unpack8_bytes(&v)?;
                     if !val.is_empty() {
                         out[i] = Some(val);
                     }
@@ -452,7 +452,7 @@ impl ScriptHashHead {
             let mut need_rehash = false;
             while i < work.len() {
                 let (key, ref val) = work[i];
-                let enc = val.encode();
+                let enc = pack8_bytes(val)?;
                 match cache.try_insert(&key, &enc, true)? {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
@@ -581,7 +581,7 @@ impl ScriptHashHead {
             let mut cache = SlotPageCache::new(self, slots);
             while i < work.len() {
                 let (key, ref val, _) = work[i];
-                let enc = val.encode();
+                let enc = pack8_bytes(val)?;
                 match cache.try_insert(&key, &enc, allow_new)? {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
@@ -628,7 +628,7 @@ impl ScriptHashHead {
         let mut table = vec![0u8; nbytes];
         let mut occupied = 0u64;
         for (key, val) in entries {
-            let enc = val.encode();
+            let enc = pack8_bytes(val)?;
             let mut slot = Self::hash_slot(key, slots);
             let mut placed = false;
             for _ in 0..slots {
@@ -873,7 +873,7 @@ impl ScriptHashHead {
                 if is_empty_slot(&k, &v) {
                     continue;
                 }
-                let val = ShHeadValue::decode(&v)?;
+                let val = unpack8_bytes(&v)?;
                 if !val.is_empty() {
                     let mut full = [0u8; 32];
                     full[0..SH_HEAD_KEY_LEN].copy_from_slice(&k);
@@ -1092,7 +1092,7 @@ impl LiveShardTable {
             self.rehash_double()?;
         }
         let key = head_key_from_full(full);
-        let enc = val.encode();
+        let enc = pack8_bytes(val)?;
         self.place(key, &enc)?;
         self.keys = self.keys.saturating_add(1);
         Ok(())

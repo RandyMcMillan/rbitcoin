@@ -8,7 +8,8 @@ use crate::error::StoreError;
 use crate::fuse8_filter::fuse_key_from_mixed;
 use crate::io_handle::IoHandle;
 use crate::scripthash_layout::{
-    pack8, unpack8, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_VALUE_LEN,
+    pack8, pack8_bytes, unpack8, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
+    SH_HEAD_VALUE_LEN,
 };
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -81,7 +82,7 @@ impl MphfHead {
     ) -> Result<Self, StoreError> {
         let mut packed = Vec::with_capacity(recs.len());
         for (k, raw) in recs {
-            packed.push((*k, pack8(&ShHeadValue::decode(raw)?)?));
+            packed.push((*k, pack8(&unpack8_bytes(raw)?)?));
         }
         Self::write_pack8(base, &packed)
     }
@@ -297,7 +298,10 @@ mod tests {
         let base = dir.join("00");
         let a = ShHeadValue::inline_one(ShEntry::new(Fk(11)));
         let b = ShHeadValue::inline_one(ShEntry::new(Fk(22)));
-        let recs = [(key(1), a.encode()), (key(2), b.encode())];
+        let recs = [
+            (key(1), pack8_bytes(&a).unwrap()),
+            (key(2), pack8_bytes(&b).unwrap()),
+        ];
         let h = MphfHead::write(&base, &recs).unwrap();
         assert_eq!(h.get(&key(1)).unwrap().unwrap(), a);
         assert_eq!(h.get(&key(2)).unwrap().unwrap(), b);
@@ -317,7 +321,7 @@ mod tests {
         let dir = tmp();
         let base = dir.join("00");
         let one = ShHeadValue::inline_one(ShEntry::new(Fk(3)));
-        let h = MphfHead::write(&base, &[(key(4), one.encode())]).unwrap();
+        let h = MphfHead::write(&base, &[(key(4), pack8_bytes(&one).unwrap())]).unwrap();
         let slab = ShHeadValue::slab(0, 2, 4096);
         assert!(h.update_value(&key(4), &slab).unwrap());
         assert!(!h.update_value(&key(5), &slab).unwrap());
@@ -340,7 +344,7 @@ mod tests {
         assert!(h.is_empty());
         assert!(h.get(&key(1)).unwrap().is_none());
         let paged = ShHeadValue::paged(4096, 8192);
-        let h = MphfHead::write(&base, &[(key(1), paged.encode())]).unwrap();
+        let h = MphfHead::write(&base, &[(key(1), pack8_bytes(&paged).unwrap())]).unwrap();
         match h.get(&key(1)).unwrap().unwrap() {
             ShHeadValue::Paged {
                 first_page: 0,

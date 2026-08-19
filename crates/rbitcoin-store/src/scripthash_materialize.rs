@@ -1,12 +1,12 @@
 //! Sliced k-way SH tip materialize: one worker per prefix shard, ordered publish.
 
 use crate::error::StoreError;
-use crate::file::{ensure_nofile_budget_at_least, TableFile};
-use crate::scripthash::{ColdProgress, ScriptHashTable, ShShardPack};
+use crate::file::ensure_nofile_budget_at_least;
+use crate::scripthash::{ColdProgress, ScriptHashTable, ShBodyLayout, ShShardPack};
 use crate::sorted_run::{
-    for_each_merged_rec_shard, set_thread_idle_io_priority, shard_record_starts, SortedRunPath,
+    SortedRunPath, for_each_merged_rec_shard, set_thread_idle_io_priority, shard_record_starts,
 };
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -90,7 +90,12 @@ fn decode_sh_run_rec(rec: &[u8]) -> Result<([u8; 32], Fk), StoreError> {
     Ok((sh, fk))
 }
 
-fn resolve_workers(requested: usize, n_shards: usize, n_runs: usize) -> usize {
+fn resolve_workers(
+    requested: usize,
+    n_shards: usize,
+    n_runs: usize,
+    layout: ShBodyLayout,
+) -> usize {
     let n_shards = n_shards.max(1);
     let mut workers = requested.max(1).min(n_shards);
     let k = n_runs.max(1);
@@ -107,6 +112,9 @@ fn resolve_workers(requested: usize, n_shards: usize, n_runs: usize) -> usize {
             workers = clamped;
         }
     }
+    if layout == ShBodyLayout::Shared && workers > 1 {
+        workers = 1;
+    }
     workers
 }
 
@@ -122,12 +130,7 @@ fn pack_shard(
     last_log: &Mutex<Option<Instant>>,
     t0: Instant,
 ) -> Result<ShShardPack, StoreError> {
-    let temp_path = table
-        .store_dir()
-        .join(format!("scripthash.pack.{shard:02x}.body"));
-    let _ = std::fs::remove_file(&temp_path);
-    let temp = TableFile::create(&temp_path, TableKind::ScriptHash)?;
-    let mut session = table.pack_shard_session(temp)?;
+    let mut session = table.pack_shard_session(shard)?;
     let mut recs_this_key = 0u64;
     for_each_merged_rec_shard(inputs, cuts, shard, false, |rec| {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
@@ -185,13 +188,10 @@ fn publish_next(
     *max_fk = (*max_fk).max(pack.max_fk);
     *live_keys = live_keys.saturating_add(pack.keys);
     *live_creates = live_creates.saturating_add(pack.creates);
-    let temp_path = table
-        .store_dir()
-        .join(format!("scripthash.pack.{shard:02x}.body"));
     let new_bump = if pack.recs.is_empty() && pack.creates == 0 {
         global_bump
     } else {
-        table.publish_packed_shard(shard, pack, global_bump)?
+        table.publish_packed_shard(shard, pack)?
     };
     ColdProgress {
         next_shard: (shard as u32).saturating_add(1),
@@ -200,7 +200,6 @@ fn publish_next(
         keys_written: *live_keys,
     }
     .store(table.store_dir())?;
-    let _ = std::fs::remove_file(&temp_path);
     Ok(new_bump)
 }
 
@@ -226,7 +225,12 @@ pub fn materialize_sh_shards(
         .iter()
         .map(|r| shard_record_starts(r, n_shards))
         .collect::<Result<Vec<_>, _>>()?;
-    let workers = resolve_workers(workers, n_shards - resume_from, inputs.len());
+    let workers = resolve_workers(
+        workers,
+        n_shards - resume_from,
+        inputs.len(),
+        table.body_layout(),
+    );
     rbitcoin_log::info!(
         "store: scripthash shard-kway start resume_from={resume_from} n_shards={n_shards} \
          workers={workers} runs={} fds≈{}",
@@ -416,14 +420,6 @@ pub fn materialize_sh_shards(
         }
         Ok(())
     })?;
-
-    // Drop any leftover unpublished temps (cancel / error already returned).
-    for shard in resume_from..n_shards {
-        let p = table
-            .store_dir()
-            .join(format!("scripthash.pack.{shard:02x}.body"));
-        let _ = std::fs::remove_file(&p);
-    }
 
     Ok(ShShardMaterialize {
         creates: live_creates,

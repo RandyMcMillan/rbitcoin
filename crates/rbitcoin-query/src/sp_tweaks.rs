@@ -102,6 +102,41 @@ impl Query {
         t.put_block(height, records)
     }
 
+    /// Consecutive heights: one body pwrite + one idx pwrite. Same checks as
+    /// [`Self::put_sp_tweaks_block`] on each item; no-op if the first is not next.
+    pub fn put_sp_tweaks_blocks(
+        &self,
+        items: &[(Height, Fk, Vec<Option<[u8; 33]>>)],
+    ) -> Result<(), QueryError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        if !self.sptweaks_enabled() {
+            return Ok(());
+        }
+        let g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(t) = g.as_ref() else {
+            return Ok(());
+        };
+        if items[0].0 != t.next_height() {
+            return Ok(());
+        }
+        for (height, header_fk, _) in items {
+            match self.store.confirmed.get(*height)? {
+                None => return Ok(()),
+                Some(fk) if fk != *header_fk => {
+                    return Err(
+                        StoreError::Corrupt("sp_tweaks put header is not confirmed tip").into(),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        let refs: Vec<(Height, &[Option<[u8; 33]>])> =
+            items.iter().map(|(h, _, r)| (*h, r.as_slice())).collect();
+        t.put_blocks(&refs).map_err(Into::into)
+    }
+
     pub fn truncate_sp_tweaks_through_tip(&self, tip: Option<Height>) -> Result<(), QueryError> {
         let g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = g.as_ref() else {
@@ -284,6 +319,35 @@ mod tests {
         q.put_sp_tweaks_block(Height(3), Fk(1), &[None]).unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
         q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_blocks_advances_next_by_batch() {
+        let (dir, q) = tmp_q();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let h0 = header(0, Fk::NULL, None);
+        let cb = |tid: u8| TxApply {
+            tx: TxRecord {
+                txid: [tid; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let fk0 = q.connect_block(Height(0), &h0, &[cb(1)]).unwrap();
+        let h1 = header(1, fk0, Some(h0.hash));
+        let fk1 = q.connect_block(Height(1), &h1, &[cb(2)]).unwrap();
+        q.put_sp_tweaks_blocks(&[(Height(0), fk0, vec![None]), (Height(1), fk1, vec![None])])
+            .unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
+        assert!(q.load_thin_tweaks(Height(0)).unwrap().is_some());
+        assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

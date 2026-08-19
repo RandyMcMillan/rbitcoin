@@ -660,14 +660,14 @@ struct RunCursor {
     path: PathBuf,
     remaining: u64,
     rec_len: usize,
-    /// Read-ahead page; current record is `page[cur..cur+rec_len]`.
+    /// Current page; record is `page[cur..cur+rec_len]`.
     page: Vec<u8>,
-    /// Valid byte length of `page`.
     page_len: usize,
-    /// Start of current record within `page` (set by last successful fill).
     cur: usize,
-    /// Next unread byte in `page` (after current record).
     next: usize,
+    /// Next file page, filled when the current page is first consumed.
+    ahead: Vec<u8>,
+    ahead_len: usize,
 }
 
 impl RunCursor {
@@ -682,6 +682,16 @@ impl RunCursor {
         count: u64,
         verify: bool,
     ) -> Result<Self, StoreError> {
+        Self::open_range_paged(run, first_idx, count, verify, RUN_CURSOR_PAGE)
+    }
+
+    fn open_range_paged(
+        run: &SortedRunPath,
+        first_idx: u64,
+        count: u64,
+        verify: bool,
+        page_bytes: usize,
+    ) -> Result<Self, StoreError> {
         if verify {
             verify_run_body(run)?;
         }
@@ -695,7 +705,7 @@ impl RunCursor {
         let off = HEADER_LEN as u64 + start.saturating_mul(rec_len as u64);
         file.seek(SeekFrom::Start(off))
             .map_err(|e| io_err(&run.path, e))?;
-        let page_cap = RUN_CURSOR_PAGE
+        let page_cap = page_bytes
             .max(rec_len)
             .div_ceil(rec_len)
             .saturating_mul(rec_len);
@@ -708,11 +718,67 @@ impl RunCursor {
             page_len: 0,
             cur: 0,
             next: 0,
+            ahead: vec![0u8; page_cap],
+            ahead_len: 0,
         })
     }
 
-    /// Pull more bytes from the file into `page` (preserving any leftover).
-    fn refill(&mut self) -> Result<(), StoreError> {
+    fn read_page_buf(
+        file: &mut File,
+        path: &Path,
+        buf: &mut [u8],
+        remaining: u64,
+        rec_len: usize,
+    ) -> Result<usize, StoreError> {
+        let max_from_file = (remaining as usize).saturating_mul(rec_len);
+        let to_read = (buf.len().min(max_from_file) / rec_len).saturating_mul(rec_len);
+        if to_read == 0 {
+            return Ok(0);
+        }
+        file.read_exact(&mut buf[..to_read])
+            .map_err(|e| io_err(path, e))?;
+        Ok(to_read)
+    }
+
+    fn advise_willneed(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = unsafe {
+                libc::posix_fadvise(self.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED)
+            };
+        }
+    }
+
+    fn prefetch_ahead(&mut self) -> Result<(), StoreError> {
+        if self.ahead_len > 0 {
+            return Ok(());
+        }
+        let unread_in_page = (self.page_len.saturating_sub(self.next)) / self.rec_len;
+        let file_left = self.remaining.saturating_sub(unread_in_page as u64);
+        if file_left == 0 {
+            return Ok(());
+        }
+        self.advise_willneed();
+        self.ahead_len = Self::read_page_buf(
+            &mut self.file,
+            &self.path,
+            &mut self.ahead,
+            file_left,
+            self.rec_len,
+        )?;
+        Ok(())
+    }
+
+    fn promote_ahead(&mut self) -> Result<(), StoreError> {
+        if self.ahead_len >= self.rec_len {
+            std::mem::swap(&mut self.page, &mut self.ahead);
+            self.page_len = self.ahead_len;
+            self.ahead_len = 0;
+            self.next = 0;
+            self.cur = 0;
+            return Ok(());
+        }
         let leftover = self.page_len.saturating_sub(self.next);
         if leftover > 0 && self.next > 0 {
             self.page.copy_within(self.next..self.page_len, 0);
@@ -720,18 +786,15 @@ impl RunCursor {
         self.page_len = leftover;
         self.next = 0;
         self.cur = 0;
-        let space = self.page.len().saturating_sub(self.page_len);
-        let max_from_file = (self.remaining as usize).saturating_mul(self.rec_len);
-
-        let to_read = (space.min(max_from_file) / self.rec_len).saturating_mul(self.rec_len);
-        if to_read == 0 {
-            return Ok(());
-        }
         let start = self.page_len;
-        self.file
-            .read_exact(&mut self.page[start..start + to_read])
-            .map_err(|e| io_err(&self.path, e))?;
-        self.page_len = start + to_read;
+        let n = Self::read_page_buf(
+            &mut self.file,
+            &self.path,
+            &mut self.page[start..],
+            self.remaining,
+            self.rec_len,
+        )?;
+        self.page_len = start + n;
         Ok(())
     }
 
@@ -741,12 +804,13 @@ impl RunCursor {
             return Ok(false);
         }
         if self.next + self.rec_len > self.page_len {
-            self.refill()?;
+            self.promote_ahead()?;
             if self.next + self.rec_len > self.page_len {
                 return Err(StoreError::Corrupt(
                     "sorted run: short read on merge cursor",
                 ));
             }
+            self.prefetch_ahead()?;
         }
         self.cur = self.next;
         self.next += self.rec_len;
@@ -2688,6 +2752,32 @@ mod tests {
             keys.push(cursor.rec()[0]);
         }
         assert_eq!(keys, (40u8..50).collect::<Vec<_>>());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_cursor_prefetches_ahead() {
+        let d = tmp_dir();
+        let mut body = Vec::new();
+        for i in 0..100u8 {
+            body.extend_from_slice(&rec(i, i));
+        }
+        let run = write_sorted_run(&d.join("000001.run"), 32, 44, &body).unwrap();
+        let rec_len = 44usize;
+        let mut cursor = RunCursor::open_range_paged(&run, 0, 100, false, rec_len * 3).unwrap();
+        for i in 0..3u8 {
+            assert!(cursor.fill_next().unwrap());
+            assert_eq!(cursor.rec()[0], i);
+        }
+        assert!(
+            cursor.ahead_len >= rec_len,
+            "next page must be in ahead after the first page is consumed"
+        );
+        let mut keys = vec![0u8, 1, 2];
+        while cursor.fill_next().unwrap() {
+            keys.push(cursor.rec()[0]);
+        }
+        assert_eq!(keys, (0u8..100).collect::<Vec<_>>());
         let _ = fs::remove_dir_all(&d);
     }
 

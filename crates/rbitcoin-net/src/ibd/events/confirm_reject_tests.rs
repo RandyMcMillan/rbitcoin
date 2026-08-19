@@ -338,8 +338,10 @@ fn bad_prev_gathers_winner_via_bq_by_hash() {
         Some(&hub),
         None,
     );
-    assert_eq!(hub.tip_height(), Some(2));
-    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+    assert_eq!(hub.tip_height(), Some(0));
+    assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
+    assert!(st.reorg.need_getdata().is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -586,10 +588,12 @@ fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
         None,
     );
     assert_eq!(
-        hub.tip_hash().unwrap(),
-        w3.block_hash(),
-        "full path ready → reorg without await"
+        hub.tip_height(),
+        Some(0),
+        "rewind to LCA, do not accept_branch"
     );
+    assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
+    assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
     assert!(st.reorg.awaiting().is_none());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -599,7 +603,6 @@ fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
 /// full LCA path then reorg.
 #[test]
 fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
-    use super::try_complete_awaiting_reorg;
     use crate::chain::ChainHub;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version};
@@ -715,66 +718,16 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
         Some(&hub),
         None,
     );
-    // Must await **both** mid bodies, not only wire_prev (W2).
-    let need = st.reorg.need_getdata();
+    assert_eq!(hub.tip_height(), Some(0), "rewind to LCA");
+    assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&w2.block_hash()));
+    assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
+    assert!(st.reorg.awaiting().is_none());
+    assert!(st.reorg.need_getdata().is_empty());
     assert!(
-        need.contains(&w1.block_hash()),
-        "must densify fork-height mid W1; need={need:?}"
+        !st.body.is_missing(&w3.block_hash()),
+        "must not mark_missing the winning-path hash"
     );
-    assert!(
-        need.contains(&w2.block_hash()),
-        "must densify wire_prev W2; need={need:?}"
-    );
-    assert_eq!(
-        hub.tip_hash().unwrap(),
-        l2.block_hash(),
-        "tip unchanged while awaiting"
-    );
-    // Handled without soft re-get of tip+1 (mainnet livelock class).
-    assert!(
-        st.reorg.is_awaiting_held_tip(&w3.block_hash()),
-        "must await held tip+1 W3"
-    );
-    assert!(
-        !st.body.skip_download(&hub, &w1.block_hash())
-            || st.reorg.need_getdata().contains(&w1.block_hash()),
-        "mids must remain densify targets"
-    );
-    // Second BadPrev while awaiting must not soft mark_missing tip+1
-    // (that re-getdatas tip+1 forever while mids starve).
-    apply_confirm_reject(
-        &mut st,
-        3,
-        w3.block_hash(),
-        "consensus: unexpected previous header",
-        Some(hub.query.as_ref()),
-        Some(&hub),
-        None,
-    );
-    assert!(
-        st.reorg.is_awaiting_held_tip(&w3.block_hash()),
-        "still awaiting after re-reject"
-    );
-    // tip+1 stays pending (held), not demoted to missing for densify re-get.
-    assert!(
-        st.body.is_pending(&w3.block_hash()) || st.reorg.get_held(&w3.block_hash()).is_some(),
-        "tip+1 must stay held/pending while awaiting mids, not soft-missing"
-    );
-    assert!(
-        st.reorg.need_getdata().contains(&w1.block_hash())
-            && st.reorg.need_getdata().contains(&w2.block_hash()),
-        "mids still densify targets after re-reject"
-    );
-
-    // Bodies arrive → complete reorg.
-    st.reorg.hold_body(w1.clone());
-    st.reorg.hold_body(w2.clone());
-    assert!(
-        try_complete_awaiting_reorg(&mut st, &hub),
-        "full path bodies must apply reorg"
-    );
-    assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
-    assert_eq!(hub.tip_height(), Some(3));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -793,10 +746,10 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     use super::super::assign::{assign_work_ordered, AssignDepth};
     use super::super::path::seed_work_path_from_store;
     use super::super::peer_io::{PeerEvent, PeerSlot};
-    use super::super::progress::{claim_ready, tip_fetch_hole};
+    use super::super::progress::tip_fetch_hole;
     use super::super::status::LoopStats;
     use super::super::IbdConfig;
-    use super::{apply_peer_event, try_complete_awaiting_reorg};
+    use super::apply_peer_event;
     use crate::chain::ChainHub;
     use crate::seeds::AddrMan;
     use bitcoin::absolute::LockTime;
@@ -939,119 +892,49 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     let mut st = IbdWorkState::new(vec![slot], hub.tip_hash(), hub.tip_height());
     seed_work_path_from_store(&mut st, &hub);
 
-    assert!(
-        st.ordered_set.contains(&w1.block_hash()) && st.ordered_set.contains(&w2.block_hash()),
-        "seed must order winner mids at confirmed heights"
-    );
     assert_eq!(
-        st.height_to_hash.get(&1),
-        Some(&w1.block_hash()),
-        "height map must track winner W1 at already-confirmed height 1 (not L1)"
+        hub.tip_hash(),
+        Some(gen),
+        "resume seed must rewind the loser tip to the LCA"
     );
-    assert_eq!(
-        st.height_to_hash.get(&2),
-        Some(&w2.block_hash()),
-        "height map must track winner W2 at already-confirmed height 2 (not L2)"
-    );
+    assert_eq!(hub.tip_height(), Some(0));
+    assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&w2.block_hash()));
     assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
-
-    let need = st.reorg.need_getdata();
+    assert_eq!(st.height_to_hash.get(&4), Some(&w4.block_hash()));
+    assert_eq!(st.height_to_hash.get(&5), Some(&w5.block_hash()));
     assert!(
-        need.contains(&w1.block_hash()) && need.contains(&w2.block_hash()),
-        "explore/reorg densify must still need mids at confirmed heights; need={need:?}"
+        st.reorg.need_getdata().is_empty(),
+        "after rewind the winner is a linear extension; need={:?}",
+        st.reorg.need_getdata()
     );
-    // skip_download must not treat "height already confirmed" as done for the
-    // *winner* hash — only hub.has_block(that hash).
     assert!(
         !st.body.skip_download(&hub, &w1.block_hash()),
-        "W1 must remain downloadable despite height 1 being confirmed as L1"
-    );
-    assert!(
-        !st.body.skip_download(&hub, &w2.block_hash()),
-        "W2 must remain downloadable despite height 2 being confirmed as L2"
+        "W1 must be downloadable as the new tip+1"
     );
 
-    // Densify-ahead shape (mainnet): only a *far* winner body lands in BQ
-    // (tip+3), leaving a contiguous hole at tip+1..tip+2. Far payload alone
-    // must not reorg; explore_tip is W5 without a full contiguous body path.
-    hub.query
-        .block_queue_offer(5, w5.block_hash().to_byte_array(), 0, &serialize(&w5))
-        .unwrap();
-    st.body.mark_pending(w5.block_hash());
-
-    assert!(
-        !claim_ready(&hub, &mut st.body, 3, &w3.block_hash()),
-        "tip+1 W3 must not be claim-ready when only far densify is in BQ"
-    );
     let hole = tip_fetch_hole(&hub, &st.height_to_hash, &mut st.body);
-    assert!(
-        hole >= 2,
-        "must leave tip+1.. hole while densify is only far ahead; hole={hole}"
-    );
-    assert!(
-        !try_complete_awaiting_reorg(&mut st, &hub),
-        "far non-contiguous BQ alone must not reorg off loser tip"
-    );
-    assert_eq!(hub.tip_hash().unwrap(), l2.block_hash());
+    assert!(hole >= 1, "new tip+1 W1 is a fetch hole; hole={hole}");
 
-    // Assign must still getdata mids at confirmed heights + tip hole — not
-    // only densify further past the hole.
     let stats = LoopStats::default();
     let cfg = IbdConfig::for_test();
     assign_work_ordered(&mut st, &hub, &cfg, &stats, 3, AssignDepth::Full, None);
     assert!(
-        st.inflight.contains_key(&w1.block_hash()) && st.inflight.contains_key(&w2.block_hash()),
-        "assign reorg need (1b) must getdata both mids at confirmed heights; inflight={:?}",
-        st.inflight.keys().collect::<Vec<_>>()
-    );
-    assert!(
-        st.inflight.contains_key(&w3.block_hash()),
-        "assign tip-hole race must also getdata tip+1 W3; inflight={:?}",
+        st.inflight.contains_key(&w1.block_hash()),
+        "assign must getdata new tip+1 W1; inflight={:?}",
         st.inflight.keys().collect::<Vec<_>>()
     );
 
-    // Production BlockFramed path for height≤tip mids: hold by hash (BQ
-    // first-wins cannot store same-height competitors of confirmed tip).
-    let write_next = AtomicU32::new(3);
+    let write_next = AtomicU32::new(1);
     let mut book = AddrMan::new();
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-    for b in [&w1, &w2] {
-        apply_peer_event(
-            &mut st,
-            &hub,
-            PeerEvent::BlockFramed {
-                peer: 0,
-                hash: b.block_hash(),
-                payload: serialize(b),
-            },
-            &write_next,
-            &mut book,
-            local,
-            None,
-        );
-        assert!(
-            st.reorg.get_held(&b.block_hash()).is_some(),
-            "BlockFramed mid at confirmed height must hold by hash for reorg; hash={}",
-            b.block_hash()
-        );
-        // Still on loser: exploration tip is far (W5) and W3/W4 not loadable yet.
-        assert_eq!(
-            hub.tip_hash().unwrap(),
-            l2.block_hash(),
-            "holding mids alone must not reorg without contiguous path to a tip"
-        );
-    }
-
-    // Tip+1 body arrives into BQ (height > tip). Exploration may still fail
-    // (explore_need includes W4; explore_tip=W5 needs full path). Confirm
-    // BadPrev is the production path that densifies LCA→tip+1 and applies.
     apply_peer_event(
         &mut st,
         &hub,
         PeerEvent::BlockFramed {
             peer: 0,
-            hash: w3.block_hash(),
-            payload: serialize(&w3),
+            hash: w1.block_hash(),
+            payload: serialize(&w1),
         },
         &write_next,
         &mut book,
@@ -1059,50 +942,13 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
         None,
     );
     assert!(
-        hub.query.block_queue_has_height(3) || st.reorg.get_held(&w3.block_hash()).is_some(),
-        "W3 tip+1 must land in BQ or held"
+        hub.query.block_queue_has_height(1)
+            || hub
+                .query
+                .block_queue_has_hash(&w1.block_hash().to_byte_array()),
+        "W1 must land in the body queue as a linear tip+1"
     );
-
-    // Exploration may apply if a full path is loadable; else BadPrev densify
-    // to LCA must reorg using held mids at confirmed heights.
-    let _ = try_complete_awaiting_reorg(&mut st, &hub);
-    if hub.tip_hash() == Some(l2.block_hash()) {
-        apply_confirm_reject(
-            &mut st,
-            3,
-            w3.block_hash(),
-            "consensus: unexpected previous header",
-            Some(hub.query.as_ref()),
-            Some(&hub),
-            None,
-        );
-        if hub.tip_hash() == Some(l2.block_hash()) {
-            let _ = try_complete_awaiting_reorg(&mut st, &hub);
-        }
-    }
-
-    // Contract: with mids held at already-confirmed heights + tip+1 wire,
-    // tip must leave the loser fork. Failure here is the mainnet stall class.
-    let tip = hub.tip_hash().unwrap();
-    assert_ne!(
-        tip,
-        l2.block_hash(),
-        "must reorg off loser once mid bodies at confirmed heights are held + tip+1 wire; \
-         tip={tip} need={:?} held_w1={} held_w2={} bq3={}",
-        st.reorg.need_getdata(),
-        st.reorg.get_held(&w1.block_hash()).is_some(),
-        st.reorg.get_held(&w2.block_hash()).is_some(),
-        hub.query.block_queue_has_height(3)
-    );
-    assert!(
-        tip == w3.block_hash() || tip == w4.block_hash() || tip == w5.block_hash(),
-        "tip must be on winner path; tip={tip}"
-    );
-    assert!(
-        hub.tip_height().unwrap() >= 3,
-        "winner tip height must be ≥3; got {:?}",
-        hub.tip_height()
-    );
+    assert_ne!(hub.tip_hash().unwrap(), l2.block_hash());
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1242,10 +1088,10 @@ fn zombie_pending_mid_at_confirmed_height_never_reget() {
     };
     let mut st = IbdWorkState::new(vec![slot], hub.tip_hash(), hub.tip_height());
     seed_work_path_from_store(&mut st, &hub);
-    assert!(st.reorg.need_getdata().contains(&w1.block_hash()));
+    assert_eq!(hub.tip_height(), Some(0));
+    assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
 
-    // Zombie: pending flag without held body and without BQ wire — same class
-    // as tip+1 zombie, but at height ≤ tip so cover_tip_holes never demotes it.
+    // Zombie: pending flag without BQ wire at the new tip+1.
     st.body.mark_pending(w1.block_hash());
     assert!(st.body.is_pending(&w1.block_hash()));
     assert!(st.reorg.get_held(&w1.block_hash()).is_none());
@@ -1254,11 +1100,6 @@ fn zombie_pending_mid_at_confirmed_height_never_reget() {
         st.body.skip_download(&hub, &w1.block_hash()),
         "precondition: pending mid is skip_download"
     );
-    assert!(
-        st.reorg.need_getdata().contains(&w1.block_hash()),
-        "need_getdata still lists mid (not held)"
-    );
-
     let stats = LoopStats::default();
     let cfg = IbdConfig::for_test();
     assign_work_ordered(&mut st, &hub, &cfg, &stats, 3, AssignDepth::Full, None);
@@ -1401,14 +1242,11 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
     );
     assert_eq!(
         hub.tip_height(),
-        Some(2),
-        "apply_confirm_reject alone must reorg when winner body is held"
+        Some(0),
+        "rewind to LCA even if winner body is held"
     );
-    assert_eq!(
-        hub.tip_hash().unwrap(),
-        ext.block_hash(),
-        "tip must be winning path tip+1 after BadPrev reorg"
-    );
+    assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
     assert_ne!(hub.tip_hash().unwrap(), pre_tip);
     assert!(!st.body.is_rejected(&ext.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
@@ -1522,33 +1360,13 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
     );
     assert_eq!(
         hub.tip_height(),
-        Some(1),
-        "must not reorg without winner body"
+        Some(0),
+        "rewind does not wait for winner body"
     );
-    let need = st.reorg.need_getdata();
-    assert!(
-        need.contains(&win.block_hash()),
-        "must densify-request winning sibling: {need:?}"
-    );
-    assert!(st.reorg.awaiting().is_some());
-    // Winner body arrives (BlockFramed path holds by hash).
-    st.reorg.hold_body(win.clone());
-    // Re-offer ext wire (soft path may have dequeued BQ).
-    hub.query
-        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
-        .unwrap();
-    apply_confirm_reject(
-        &mut st,
-        2,
-        ext.block_hash(),
-        "consensus: unexpected previous header",
-        Some(hub.query.as_ref()),
-        Some(&hub),
-        None,
-    );
-    assert_eq!(hub.tip_height(), Some(2));
-    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
-    assert!(st.reorg.awaiting().is_none() || st.reorg.need_getdata().is_empty());
+    assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
+    assert!(st.reorg.awaiting().is_none());
+    assert!(st.reorg.need_getdata().is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1665,11 +1483,15 @@ fn bad_prev_after_take_raw_classifies() {
         Some(Arc::new(ext.clone())),
     );
     assert_eq!(
-        hub.tip_height(),
-        Some(2),
-        "take_raw must not force CorruptWire; wire Arc classifies CompetingPath"
+        hub.tip_hash(),
+        Some(gen),
+        "CompetingPath must rewind to the LCA, not accept_branch the winner"
     );
-    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+    assert_eq!(hub.tip_height(), Some(0));
+    assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
+    assert!(st.reorg.awaiting().is_none());
+    assert!(st.reorg.need_getdata().is_empty());
     assert!(!st.body.is_rejected(&ext.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1781,20 +1603,18 @@ fn bad_prev_evicts_slot_rewinds_taken() {
     );
     assert_eq!(
         hub.query.lookup_taken_hi(),
-        Some(1),
-        "taken_hi must rewind to tip so have_body(tip+1) is false"
+        Some(0),
+        "taken_hi must rewind to the LCA so have_body(new tip+1) is false"
     );
-    assert_ne!(
-        st.height_to_hash.get(&2).copied(),
-        Some(ext.block_hash()),
-        "losing slot identity must be evicted (do not re-getdata the same hash)"
-    );
+    assert_eq!(hub.tip_height(), Some(0));
+    assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
+    assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
     assert!(
         !st.body.is_missing(&ext.block_hash()),
-        "BadPrev must not mark_missing the losing hash"
+        "BadPrev must not mark_missing the winning-path hash"
     );
-    assert!(!st.ordered_set.contains(&ext.block_hash()));
-    assert!(st.reorg.awaiting().is_some() || hub.tip_height() == Some(2));
+    assert!(st.reorg.awaiting().is_none());
+    assert!(st.reorg.need_getdata().is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 

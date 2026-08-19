@@ -14,6 +14,7 @@ use rbitcoin_primitives::Height;
 use std::collections::HashMap;
 
 /// Classification of tip+1 `unexpected previous header` (BadPrev).
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BadPrevClass {
     /// Wire prev is not a known header — soft re-get only.
@@ -31,6 +32,7 @@ pub enum BadPrevClass {
 ///
 /// `wire_prev` is the previous-block hash from the rejected block header.
 /// `tip_hash` is the current best tip hash.
+#[cfg(test)]
 pub fn classify_bad_prev(
     hub: &ChainHub,
     wire_prev: BlockHash,
@@ -358,6 +360,9 @@ pub fn try_apply_best_candidate(
 /// whole gap is CPU + RAM for no reorg.
 const ANCESTOR_WALK_MAX: usize = 10_000;
 
+/// Max confirmed blocks disconnected in one header-driven rewind.
+const REWIND_MAX_DEPTH: u32 = 1_024;
+
 /// Header hashes from `tip` back to (not including) a best-chain / confirmed
 /// ancestor, **oldest-first**. Used so BadPrev densify requests every mid-path
 /// body to the LCA (mainnet: d1e0 + 02022e + tip+1, not wire_prev alone).
@@ -432,7 +437,10 @@ fn gather_path_to_best_parent(
     None
 }
 
-fn parent_hash_of(hub: &ChainHub, hash: BlockHash) -> Result<Option<BlockHash>, NetError> {
+pub(crate) fn parent_hash_of(
+    hub: &ChainHub,
+    hash: BlockHash,
+) -> Result<Option<BlockHash>, NetError> {
     let Some((_, rec)) = hub
         .query
         .get_header_by_hash(&hash.to_byte_array())
@@ -582,6 +590,7 @@ fn connecting_hashes_heavier_disconnected_n(
 /// Register a connecting-hash search for a heavier header path that does not
 /// meet the current tip. Explore tip is the **shortest** prefix that beats
 /// current tip work — not the header horizon.
+#[cfg(test)]
 pub fn note_disconnected_heavier(
     reorg: &mut IbdReorgState,
     hub: &ChainHub,
@@ -628,27 +637,118 @@ pub(crate) fn connecting_search_candidates(
 }
 
 /// Scan a competing work-path tip+1 for a heavier disconnected fork and
-/// register connecting getdata.
+/// rewind the confirmed tip to the LCA so the normal pipeline confirms it.
 pub fn consider_disconnected_heavier(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
-    // Already searching connecting hashes — do not re-walk a long header path.
-    if !st.reorg.explore_need_hashes().is_empty() {
-        return Ok(false);
-    }
-    // No fetch hole: confirm can advance. Do not race a linear extension.
-    if super::progress::tip_fetch_hole(hub, &st.height_to_hash, &mut st.body) == 0 {
-        return Ok(false);
-    }
-    let mut any = false;
     for h in connecting_search_candidates(st, hub)? {
-        if note_disconnected_heavier(&mut st.reorg, hub, h)? {
-            any = true;
-            break;
+        if let Some(path) = connecting_hashes_heavier_disconnected(hub, h)? {
+            return apply_header_rewind(st, hub, &path);
         }
     }
-    Ok(any)
+    Ok(false)
+}
+
+/// If a strictly heavier header branch is known, disconnect to its LCA and
+/// plant that branch as the linear work path. No side-channel body gather.
+pub(crate) fn maybe_rewind_to_best_work(
+    st: &mut super::state::IbdWorkState,
+    hub: &ChainHub,
+) -> Result<bool, NetError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut cands = Vec::new();
+    for t in st.reorg.explore_tips() {
+        if seen.insert(*t) {
+            cands.push(*t);
+        }
+    }
+    for h in connecting_search_candidates(st, hub)? {
+        if seen.insert(h) {
+            cands.push(h);
+        }
+    }
+    if let Some(a) = st.reorg.awaiting() {
+        let h = a.held_tip.block_hash();
+        if seen.insert(h) {
+            cands.push(h);
+        }
+    }
+    for cand in cands {
+        if let Some(path) = connecting_hashes_heavier_disconnected(hub, cand)? {
+            return apply_header_rewind(st, hub, &path);
+        }
+    }
+    Ok(false)
+}
+
+/// Disconnect to the path's LCA and re-point height slots at `path`
+/// (oldest-first, unconfirmed hashes after the LCA).
+pub(crate) fn apply_header_rewind(
+    st: &mut super::state::IbdWorkState,
+    hub: &ChainHub,
+    path: &[BlockHash],
+) -> Result<bool, NetError> {
+    if path.is_empty() {
+        return Ok(false);
+    }
+    let Some(lca) = parent_hash_of(hub, path[0])? else {
+        return Ok(false);
+    };
+    let Some(lca_h) = hub
+        .query
+        .height_of_hash(&lca.to_byte_array())
+        .map_err(|e| NetError::Consensus(e.to_string()))?
+        .map(|h| h.0)
+    else {
+        return Ok(false);
+    };
+    let tip_h = hub.tip_height().unwrap_or(0);
+    if tip_h.saturating_sub(lca_h) > REWIND_MAX_DEPTH {
+        warn!(
+            "ibd: heavier fork rewind depth {} exceeds cap {REWIND_MAX_DEPTH} (lca={lca_h} tip={tip_h})",
+            tip_h.saturating_sub(lca_h)
+        );
+        return Ok(false);
+    }
+    if tip_h <= lca_h {
+        return Ok(false);
+    }
+    hub.rewind_to_height(lca_h)?;
+    info!(
+        "ibd: most-work header rewind tip {tip_h} → {lca_h} (winning path {} header(s))",
+        path.len()
+    );
+    st.clear_path_above(lca_h);
+    hub.query.set_lookup_taken_hi(Some(lca_h));
+    st.headers_done = false;
+    let tip = hub.tip_height().zip(hub.tip_hash());
+    let mut prev = lca;
+    for (i, hash) in path.iter().enumerate() {
+        let ht = lca_h.saturating_add(1).saturating_add(i as u32);
+        let _ = st.try_set_path_slot(*hash, ht, prev, tip);
+        st.known_headers.insert(*hash);
+        st.max_ordered_height = st.max_ordered_height.max(ht);
+        if !hub.has_block(hash) && st.ordered_set.insert(*hash) {
+            st.ordered.push_front(*hash);
+        }
+        if hub
+            .query
+            .is_block_archived(&hash.to_byte_array())
+            .unwrap_or(false)
+        {
+            st.body.mark_archived(*hash);
+        }
+        prev = *hash;
+    }
+    for h in hub.query.block_queue_queued_heights() {
+        if h > lca_h {
+            let _ = hub.query.block_queue_dequeue_height(h);
+        }
+    }
+    st.reorg.clear_awaiting();
+    st.reorg.clear_explore();
+    Ok(true)
 }
 
 /// True if candidate tip work (header) is strictly better than our tip path
@@ -1435,10 +1535,17 @@ mod tests {
         st.record_height(w4.block_hash(), 4);
         st.max_ordered_height = 4;
         assert!(consider_disconnected_heavier(&mut st, &hub).unwrap());
-        let need = st.reorg.need_getdata();
+        assert_eq!(
+            hub.tip_height(),
+            Some(0),
+            "competing tip+1 must rewind to the LCA"
+        );
+        assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
+        assert_eq!(st.height_to_hash.get(&2), Some(&w2.block_hash()));
         assert!(
-            need.contains(&w1.block_hash()) && need.contains(&w2.block_hash()),
-            "live consider must search connecting mids without resume seed; need={need:?}"
+            st.reorg.need_getdata().is_empty(),
+            "winner is a linear extension after rewind; need={:?}",
+            st.reorg.need_getdata()
         );
         let _ = std::fs::remove_dir_all(dir);
     }

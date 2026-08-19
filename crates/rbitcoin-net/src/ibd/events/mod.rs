@@ -492,7 +492,7 @@ pub(crate) fn apply_confirm_reject(
     query: Option<&rbitcoin_query::Query>,
     // When set, BadPrev may trigger most-work reorg onto a competing path.
     hub: Option<&crate::chain::ChainHub>,
-    wire: Option<std::sync::Arc<bitcoin::Block>>,
+    _wire: Option<std::sync::Arc<bitcoin::Block>>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects).
@@ -509,25 +509,23 @@ pub(crate) fn apply_confirm_reject(
         || err.contains("merkle root mismatch");
     let bad_prev = super::reorg::is_bad_prev_err(err);
     if bad_prev {
-        let tip_h = hub.and_then(|h| h.tip_height());
-        if tip_h.map(|t| t.saturating_add(1)) == Some(height) {
-            if let Some(q) = query {
-                q.set_lookup_taken_hi(tip_h);
-            }
-            st.headers_done = false;
+        if let Some(q) = query {
+            q.set_lookup_taken_hi(hub.and_then(|h| h.tip_height()));
         }
+        st.headers_done = false;
     }
     if soft_wire {
         if bad_prev {
             if let Some(h) = hub {
-                let applied = try_reorg_on_bad_prev(st, h, height, hash, wire.as_deref());
-                let still_tip_plus = h.tip_height().map(|t| t.saturating_add(1)) == Some(height);
-                if still_tip_plus && st.height_to_hash.get(&height) == Some(&hash) {
+                st.reorg
+                    .register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(hash));
+                let rewound = super::reorg::maybe_rewind_to_best_work(st, h).unwrap_or(false);
+                if rewound {
+                    return;
+                }
+                if st.height_to_hash.get(&height) == Some(&hash) {
                     st.height_to_hash.remove(&height);
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
-                }
-                if applied {
-                    return;
                 }
             } else if st.height_to_hash.get(&height) == Some(&hash) {
                 st.height_to_hash.remove(&height);
@@ -616,133 +614,6 @@ fn load_reorg_body(
         return Some(b);
     }
     None
-}
-
-/// On BadPrev, if the rejected body's prev is a known competing header, try
-/// most-work reorg onto the **full** header path from best-chain LCA to the
-/// rejected hash (every mid body, not wire_prev alone).
-///
-/// Returns **true** when the reject is **handled** (reorg applied **or** mid
-/// bodies are awaited). Caller must **not** soft re-getdata tip+1 in those
-/// cases — that livelocked mainnet (re-download tip+1 forever while mids never
-/// densify). Returns false only for corrupt wire / apply failure → soft re-get.
-fn try_reorg_on_bad_prev(
-    st: &mut IbdWorkState,
-    hub: &crate::chain::ChainHub,
-    height: u32,
-    hash: BlockHash,
-    reject_wire: Option<&bitcoin::Block>,
-) -> bool {
-    use super::reorg::{
-        classify_bad_prev, header_hashes_to_best_ancestor, try_apply_best_candidate, BadPrevClass,
-    };
-    use crate::chain::AcceptOutcome;
-    use bitcoin::consensus::deserialize;
-    use rbitcoin_log::info;
-    use std::collections::HashMap;
-
-    // Already gathering mids for this tip+1 — do not soft re-get / re-log spam.
-    // Still try complete (mids may have been held since the last BadPrev).
-    if st.reorg.is_awaiting_held_tip(&hash) {
-        let _ = hub.query.block_queue_dequeue_height(height);
-        clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-        let _ = try_complete_awaiting_reorg(st, hub);
-        return true;
-    }
-
-    let Some(tip) = hub.tip_hash() else {
-        return false;
-    };
-    let ext = reject_wire
-        .cloned()
-        .or_else(|| {
-            hub.query
-                .block_queue_resolved(height)
-                .map(|w| (*w.block).clone())
-        })
-        .or_else(|| {
-            hub.query
-                .block_queue_payload(height)
-                .ok()
-                .flatten()
-                .filter(|wire| !wire.is_empty())
-                .and_then(|wire| deserialize::<bitcoin::Block>(&wire).ok())
-        })
-        .or_else(|| load_reorg_body(st, hub, hash));
-    let Some(ext) = ext else {
-        return false;
-    };
-    // Always hold tip+1 for gather retries (BQ height slot is fragile under soft-reget).
-    st.reorg.hold_body(ext.clone());
-    let wire_prev = ext.header.prev_blockhash;
-    match classify_bad_prev(hub, wire_prev, tip) {
-        BadPrevClass::CorruptWire { .. } => false,
-        BadPrevClass::CompetingPath {
-            winning_prev,
-            losing_tip,
-        } => {
-            info!(
-                "ibd: BadPrev competing path @{height}: tip={losing_tip} wire_prev={winning_prev} — trying most-work reorg"
-            );
-            let path = match header_hashes_to_best_ancestor(hub, hash) {
-                Ok(p) if !p.is_empty() => p,
-                Ok(_) => vec![winning_prev, hash],
-                Err(e) => {
-                    warn!("ibd: BadPrev path-to-LCA failed: {e}");
-                    vec![winning_prev, hash]
-                }
-            };
-            let mut bodies: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
-            bodies.insert(hash, ext.clone());
-            let mut need = Vec::new();
-            for (i, h) in path.iter().enumerate() {
-                let hgt = height.saturating_sub((path.len() - 1 - i) as u32);
-                st.record_height(*h, hgt);
-                st.known_headers.insert(*h);
-                if *h == hash {
-                    continue;
-                }
-                if let Some(b) = load_reorg_body(st, hub, *h) {
-                    st.reorg.hold_body(b.clone());
-                    bodies.insert(*h, b);
-                } else {
-                    need.push(*h);
-                    st.body.mark_missing(*h);
-                    if st.ordered_set.insert(*h) {
-                        st.ordered.push_front(*h);
-                    }
-                }
-            }
-            if !need.is_empty() {
-                // Return true so soft path does not mark_missing/re-get tip+1 (livelock).
-                st.reorg.set_awaiting(ext.clone(), need.clone());
-                let _ = hub.query.block_queue_dequeue_height(height);
-                clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-                st.body.mark_pending(hash);
-                warn!(
-                    "ibd: competing reorg awaiting {} body/bodies on path to LCA (held tip+1 {hash}) need={need:?}",
-                    need.len()
-                );
-                return true;
-            }
-            match try_apply_best_candidate(hub, &bodies, &[hash], &mut st.reorg) {
-                Ok(Some(AcceptOutcome::Accepted { height: new_h })) => {
-                    info!("ibd: most-work reorg after BadPrev → tip_h={new_h}");
-                    let _ = hub.query.block_queue_dequeue_height(height);
-                    on_reorg_accepted(st, hub, hash, path.iter().copied(), Some(losing_tip));
-                    true
-                }
-                Ok(other) => {
-                    warn!("ibd: competing reorg not applied: {other:?}");
-                    false
-                }
-                Err(e) => {
-                    warn!("ibd: competing reorg failed: {e}");
-                    false
-                }
-            }
-        }
-    }
 }
 
 /// Proactive most-work apply for exploration tips (seeded sibling fork) when

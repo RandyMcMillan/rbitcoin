@@ -31,35 +31,69 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
     if path.is_empty() {
         return;
     }
-    let mut with_body = 0u32;
-    let mut ready_prefix_to = tip_h;
-    let mut ready_prefix = true;
-    let mut explore_need = Vec::new();
     let mut explore_is_sibling_fork = false;
+    let mut explore_need = Vec::new();
     for e in &path {
         let hash = BlockHash::from_byte_array(e.hash);
         st.known_headers.insert(hash);
-        st.record_height(hash, e.height);
+        st.hash_height.insert(hash, e.height);
         st.header_fks.insert(hash, e.header_fk);
-        st.max_ordered_height = st.max_ordered_height.max(e.height);
-        if st.ordered_set.insert(hash) {
-            st.ordered.push_back(hash);
-        }
         if e.height <= tip_h && hash != tip_hash {
             explore_is_sibling_fork = true;
             if !e.has_body {
                 explore_need.push(hash);
             }
-        } else if !e.has_body {
-            if explore_is_sibling_fork && explore_need.len() < 4 {
-                explore_need.push(hash);
+        } else if explore_is_sibling_fork && !e.has_body && explore_need.len() < 4 {
+            explore_need.push(hash);
+        }
+    }
+    if explore_is_sibling_fork {
+        let explore_tip = path.last().map(|e| BlockHash::from_byte_array(e.hash));
+        st.reorg.register_explore(explore_need, explore_tip);
+        match super::reorg::maybe_rewind_to_best_work(st, hub) {
+            Ok(true) => {
+                info!(
+                    "ibd: resume seed rewound to most-work header path (store walk {:?})",
+                    t0.elapsed()
+                );
+                return;
+            }
+            Ok(false) => {
+                info!(
+                    "ibd: resume seed greater-work sibling fork explore_need={} explore_tip={:?}",
+                    st.reorg.need_getdata().len(),
+                    explore_tip
+                );
+            }
+            Err(e) => {
+                warn!("ibd: resume seed most-work rewind failed: {e}");
             }
         }
+    }
+    let mut with_body = 0u32;
+    let mut ready_prefix_to = tip_h;
+    let mut ready_prefix = true;
+    let tip = hub.tip_height().zip(hub.tip_hash());
+    for e in &path {
+        let hash = BlockHash::from_byte_array(e.hash);
+        let prev = if e.height == 0 {
+            BlockHash::from_byte_array([0u8; 32])
+        } else {
+            st.height_to_hash
+                .get(&e.height.saturating_sub(1))
+                .copied()
+                .or_else(|| {
+                    tip.filter(|(th, _)| e.height == th.saturating_add(1))
+                        .map(|(_, h)| h)
+                })
+                .unwrap_or(BlockHash::from_byte_array([0u8; 32]))
+        };
+        let on_path = st.try_set_path_slot(hash, e.height, prev, tip);
+        st.max_ordered_height = st.max_ordered_height.max(e.height);
+        if on_path && st.ordered_set.insert(hash) {
+            st.ordered.push_back(hash);
+        }
         if e.has_body {
-            // Class A on disk: densify may skip re-walking the whole band via
-            // `is_known_archived`. Confirm needs BQ wire — startup rehydrates
-            // tip-batch Class A via reconstruct (`rehydrate_class_a_into_body_queue`);
-            // tip-hole race re-getdatas only if rehydrate fails / no Class A.
             st.body.mark_archived(hash);
             with_body = with_body.saturating_add(1);
             if ready_prefix {
@@ -69,17 +103,7 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             ready_prefix = false;
         }
     }
-    if explore_is_sibling_fork {
-        let explore_tip = path.last().map(|e| BlockHash::from_byte_array(e.hash));
-        st.reorg.register_explore(explore_need, explore_tip);
-        info!(
-            "ibd: resume seed greater-work sibling fork explore_need={} explore_tip={:?}",
-            st.reorg.need_getdata().len(),
-            explore_tip
-        );
-    }
     st.max_ready_height = st.max_ready_height.max(ready_prefix_to);
-    // Peers may still advertise a higher tip; keep header sync open.
     st.headers_done = false;
     info!(
         "ibd: resume seed ordered={} class_a_bodies={} ready_to={} (store walk {:?})",
@@ -346,9 +370,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Tip on short loser; heavier sibling headers in store → seed ordered + explore need.
+    /// Tip on a short loser; heavier sibling headers in the store → rewind
+    /// confirmed tip to the LCA and plant the winner as the linear work path.
     #[test]
-    fn seed_work_path_registers_greater_work_sibling_explore() {
+    fn seed_rewinds_tip_to_lca_on_heavier_sibling() {
         use super::seed_work_path_from_store;
         use bitcoin::absolute::LockTime;
         use bitcoin::block::{Header, Version};
@@ -444,26 +469,27 @@ mod tests {
 
         let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
         seed_work_path_from_store(&mut st, &hub);
-        assert!(
-            st.ordered_set.contains(&win.block_hash()),
-            "seed must place winning sibling on ordered"
+        assert_eq!(
+            hub.tip_hash(),
+            Some(gen),
+            "must disconnect the loser so the winner is a linear tip+1"
         );
+        assert_eq!(hub.tip_height(), Some(0));
+        assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
+        assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
+        assert!(st.ordered_set.contains(&win.block_hash()));
+        assert!(st.ordered_set.contains(&ext.block_hash()));
         assert!(
-            st.ordered_set.contains(&ext.block_hash()),
-            "seed must place winner extension on ordered"
+            st.reorg.need_getdata().is_empty(),
+            "winner is above the new tip — no side-channel gather; need={:?}",
+            st.reorg.need_getdata()
         );
-        assert!(
-            !st.reorg.need_getdata().is_empty() || !st.reorg.explore_tips().is_empty(),
-            "must register explore densify needs or tips"
-        );
-        assert!(
-            st.reorg.explore_tips().contains(&ext.block_hash())
-                || st.reorg.need_getdata().contains(&win.block_hash())
-        );
+        assert!(st.reorg.awaiting().is_none());
+        assert_eq!(hub.query.lookup_taken_hi(), Some(0));
         let tips = work_path_tips(&st);
         assert!(
             tips.contains(&ext.block_hash()) || tips.contains(&win.block_hash()),
-            "locator tips must include exploration path"
+            "locator tips must include the winning path"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

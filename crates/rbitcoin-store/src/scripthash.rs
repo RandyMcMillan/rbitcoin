@@ -1648,6 +1648,47 @@ impl ScriptHashTable {
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
+            pack_body: None,
+            pack_only: false,
+        })
+    }
+
+    /// Pack one shard into `temp` (local bump from payload start). Publisher remaps.
+    pub fn pack_shard_session(
+        &self,
+        temp: TableFile,
+    ) -> Result<ScriptHashBulkSession<'_>, StoreError> {
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        temp.ensure_capacity(payload0)?;
+        if payload0 > temp.logical_len() {
+            temp.set_logical_len(payload0)?;
+        }
+        let n_shards = self.head.shard_count().max(1);
+        let hint = sh_unique_hint_default();
+        let key_budget = sh_per_shard_key_budget(hint, n_shards);
+        Ok(ScriptHashBulkSession {
+            table: self,
+            progress_dir: self.store_dir().to_path_buf(),
+            bump: payload0,
+            live_count: 0,
+            committed_bump: payload0,
+            committed_live_count: 0,
+            committed_keys: 0,
+            resume_from_shard: 0,
+            active_shard: None,
+            recs: Vec::new(),
+            key_budget,
+            body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
+            body_write_off: payload0,
+            finished: false,
+            keys_written: 0,
+            shards_flushed: 0,
+            body_flush_ns: 0,
+            head_fill_ns: 0,
+            peak_table_bytes: 0,
+            open_key: None,
+            pack_body: Some(temp),
+            pack_only: true,
         })
     }
 
@@ -1710,6 +1751,8 @@ impl ScriptHashTable {
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
+            pack_body: None,
+            pack_only: false,
         })
     }
 
@@ -1755,6 +1798,43 @@ impl ScriptHashTable {
         write_alloc_header(&self.body, &state)?;
         *self.alloc.lock().unwrap() = state;
         Ok(())
+    }
+
+    /// Append a locally packed shard at `global_bump` (4 KiB aligned) and seal its head.
+    pub fn publish_packed_shard(
+        &self,
+        shard: usize,
+        pack: ShShardPack,
+        global_bump: u64,
+    ) -> Result<u64, StoreError> {
+        let local_start = pack.local_start;
+        let local_end = pack.local_end;
+        if local_end < local_start {
+            return Err(StoreError::Corrupt("scripthash pack range inverted"));
+        }
+        let len = local_end - local_start;
+        let dest = if len == 0 {
+            global_bump
+        } else {
+            (global_bump + 4095) & !4095
+        };
+        if len > 0 {
+            copy_sh_body_range(&pack.body, local_start, local_end, &self.body, dest)?;
+        }
+        let delta = dest.saturating_sub(local_start);
+        let mut recs = Vec::with_capacity(pack.recs.len());
+        for (k, raw) in pack.recs {
+            let val = ShHeadValue::decode(&raw)?;
+            let remapped = remap_sh_head_value(&val, delta);
+            if let ShHeadValue::Paged { first_page, .. } = &remapped {
+                remap_copied_page_chain(&self.body, *first_page, delta)?;
+            }
+            recs.push((k, remapped.encode()));
+        }
+        let new_bump = dest.saturating_add(len);
+        let live = self.alloc.lock().unwrap().live_count.saturating_add(pack.creates);
+        self.publish_sorted_shard(shard, &recs, live, new_bump)?;
+        Ok(new_bump)
     }
 }
 
@@ -1863,6 +1943,19 @@ pub struct ScriptHashBulkSession<'a> {
     pub peak_table_bytes: usize,
     /// In-flight key: at most one page of FKs (streaming megakey).
     open_key: Option<BulkOpenKey>,
+    /// Private temp body when packing a shard off the live file.
+    pack_body: Option<TableFile>,
+    /// When true, do not write SortedHead / ColdProgress (publisher does that).
+    pack_only: bool,
+}
+
+/// One shard packed at a local bump, ready to remap onto the live body.
+pub struct ShShardPack {
+    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
+    pub body: TableFile,
+    pub local_start: u64,
+    pub local_end: u64,
+    pub creates: u64,
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
@@ -1905,6 +1998,35 @@ impl<'a> ScriptHashBulkSession<'a> {
     /// FKs buffered for the open key (never more than one page).
     pub fn buffered_fks(&self) -> usize {
         self.open_key.as_ref().map(|k| k.buf.len()).unwrap_or(0)
+    }
+
+    fn body(&self) -> &TableFile {
+        self.pack_body.as_ref().unwrap_or(&self.table.body)
+    }
+
+    /// Seal the pack-only session into a remappable blob (no live head write).
+    pub fn finish_pack(mut self) -> Result<ShShardPack, StoreError> {
+        if !self.pack_only {
+            return Err(StoreError::Corrupt(
+                "scripthash finish_pack requires pack_shard_session",
+            ));
+        }
+        self.finish_key()?;
+        self.flush_body()?;
+        let body = self
+            .pack_body
+            .take()
+            .ok_or(StoreError::Corrupt("scripthash pack missing temp body"))?;
+        let local_start = payload_start(FILE_HEADER_LEN);
+        let pack = ShShardPack {
+            recs: std::mem::take(&mut self.recs),
+            body,
+            local_start,
+            local_end: self.bump,
+            creates: self.live_count,
+        };
+        self.finished = true;
+        Ok(pack)
     }
 
     /// Stream one **strictly increasing** create_fk for `key`.
@@ -1978,7 +2100,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 }
             } else {
                 self.flush_body()?;
-                let (val, new_bump) = Self::bulk_write_slab(&self.table.body, self.bump, &ents)?;
+                let (val, new_bump) = Self::bulk_write_slab(self.body(), self.bump, &ents)?;
                 self.bump = new_bump;
                 self.body_write_off = new_bump;
                 val
@@ -2076,7 +2198,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
         sh_page_pack(&mut page, &ents, next)?;
-        self.table.body.write_at(base, &page)?;
+        self.body().write_at(base, &page)?;
         self.bump = end;
         self.body_write_off = end;
         Ok(base)
@@ -2190,9 +2312,10 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn ensure_body_capacity(&self, need: u64) -> Result<(), StoreError> {
-        self.table.body.ensure_capacity(need)?;
-        if need > self.table.body.logical_len() {
-            self.table.body.set_logical_len(need)?;
+        let body = self.body();
+        body.ensure_capacity(need)?;
+        if need > body.logical_len() {
+            body.set_logical_len(need)?;
         }
         Ok(())
     }
@@ -2204,8 +2327,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let t0 = std::time::Instant::now();
         let end = self.body_write_off + self.body_buf.len() as u64;
         self.ensure_body_capacity(end)?;
-        self.table
-            .body
+        self.body()
             .write_at(self.body_write_off, &self.body_buf)?;
         self.body_write_off = end;
         self.body_buf.clear();
@@ -2221,8 +2343,10 @@ impl<'a> ScriptHashBulkSession<'a> {
         let Some(si) = self.active_shard else {
             return Ok(());
         };
-        // Body slabs for this shard's keys must be durable before head points at them.
         self.flush_body()?;
+        if self.pack_only {
+            return Ok(());
+        }
         if self.active_shard.is_some() {
             let t0 = std::time::Instant::now();
             let mut recs = std::mem::take(&mut self.recs);
@@ -2289,6 +2413,10 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.active_shard = None;
         self.body_buf.clear();
         self.open_key = None;
+        if self.pack_only {
+            self.finished = true;
+            return;
+        }
         self.bump = self.committed_bump;
         self.live_count = self.committed_live_count;
         self.keys_written = self.committed_keys;
@@ -2340,10 +2468,9 @@ impl<'a> ScriptHashBulkSession<'a> {
 
 impl Drop for ScriptHashBulkSession<'_> {
     fn drop(&mut self) {
-        if self.finished {
+        if self.finished || self.pack_only {
             return;
         }
-        // Panic / cancel without abandon: do **not** install a partial shard.
         self.recs.clear();
         self.active_shard = None;
         self.body_buf.clear();
@@ -3323,6 +3450,49 @@ mod tests {
         assert_eq!(dst.entries(&mega_key).unwrap().len(), n_mega);
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn pack_one_shard() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let body =
+                TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
+            let payload0 = payload_start(FILE_HEADER_LEN);
+            body.ensure_capacity(payload0).unwrap();
+            body.set_logical_len(payload0).unwrap();
+            let state = AllocState {
+                live_count: 0,
+                bump: payload0,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(&body, &state).unwrap();
+            drop(body);
+            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256)
+                .unwrap();
+            let t = ScriptHashTable::open(&dir).unwrap();
+            assert_eq!(t.head_shard_count(), 4);
+            let key = |shard: u8, i: u8| {
+                let mut k = [0u8; 32];
+                k[0] = shard << 6 | (i & 0x3f);
+                k
+            };
+            let k0 = key(0, 0);
+            let k1 = key(0, 1);
+            let temp = TableFile::create(dir.join("pack0.body"), TableKind::ScriptHash).unwrap();
+            let mut session = t.pack_shard_session(temp).unwrap();
+            session.push_sorted_fk(k0, Fk(1)).unwrap();
+            session.push_sorted_fk(k1, Fk(2)).unwrap();
+            let pack = session.finish_pack().unwrap();
+            assert_eq!(pack.recs.len(), 2);
+            let bump0 = t.alloc.lock().unwrap().bump;
+            let new_bump = t.publish_packed_shard(0, pack, bump0).unwrap();
+            assert!(new_bump >= bump0);
+            assert_eq!(t.entries(&k0).unwrap().len(), 1);
+            assert_eq!(t.entries(&k1).unwrap().len(), 1);
+            assert!(t.head_value(&key(1, 0)).unwrap().is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

@@ -1284,6 +1284,59 @@ impl TxTable {
         Ok((tx, outs))
     }
 
+    /// Walk create_fks `first..=last` from a coalesced `txout.body` span (one idx
+    /// walk, sequential body pread), not per-fk get.
+    pub fn for_each_outs_in_fk_span(
+        &self,
+        first: u64,
+        last: u64,
+        mut f: impl FnMut(Fk, &[OutputRecord]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        if last < first {
+            return Ok(());
+        }
+        let ranges = match self.body.record_ranges(first, last) {
+            Ok(r) => r,
+            Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        const MAX_SPAN: u64 = 16 * 1024 * 1024;
+        let mut i = 0usize;
+        while i < ranges.len() {
+            let span_lo = ranges[i].0;
+            let mut span_hi = ranges[i].0.saturating_add(ranges[i].1);
+            let mut j = i + 1;
+            while j < ranges.len() {
+                let (off, len) = ranges[j];
+                if off != span_hi || span_hi.saturating_sub(span_lo).saturating_add(len) > MAX_SPAN
+                {
+                    break;
+                }
+                span_hi = span_hi.saturating_add(len);
+                j += 1;
+            }
+            let span_len = span_hi.saturating_sub(span_lo);
+            self.body.with_bytes_at(span_lo, span_len, |buf| {
+                for k in i..j {
+                    let (off, len) = ranges[k];
+                    let rel = (off.saturating_sub(span_lo)) as usize;
+                    let end = rel.saturating_add(len as usize);
+                    if end > buf.len() {
+                        return Err(StoreError::Corrupt("txout span short for fk range"));
+                    }
+                    let (_, outs, _) = decode_packed_tx_outs_with_spender_rels_secret(
+                        &buf[rel..end],
+                        Some(&self.secret),
+                    )?;
+                    f(Fk(first.saturating_add(k as u64)), &outs)?;
+                }
+                Ok(())
+            })?;
+            i = j;
+        }
+        Ok(())
+    }
+
     /// Append Class A rows: `txout` + `inwit` + zero `spent` + `txid.body`.
     pub fn put_full_batch_indexed(
         &self,

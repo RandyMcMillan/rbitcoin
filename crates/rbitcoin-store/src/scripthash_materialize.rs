@@ -204,9 +204,10 @@ fn seal_shard(
             keys_written: progress.keys_packed.load(Ordering::Relaxed),
         }
         .store(table.store_dir())?,
-        ShBodyLayout::Sharded => {
-            table.store_sharded_cold_progress(progress.keys_packed.load(Ordering::Relaxed))?
-        }
+        ShBodyLayout::Sharded => table.store_sharded_cold_progress(
+            progress.keys_packed.load(Ordering::Relaxed),
+            progress.creates_published.load(Ordering::Relaxed),
+        )?,
     }
     Ok(())
 }

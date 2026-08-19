@@ -27,7 +27,9 @@ use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks,
     slab_class_for_n_fks_with_slack, SH_MEGAKEY_MIN_FKS,
 };
-use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
+use crate::scripthash_sorted_head::{
+    install_head_part, SortedHead, SortedHeadFilter, SortedHeadWriter,
+};
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
@@ -36,7 +38,7 @@ use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// Durable cold-materialize resume marker (next to `scripthash.head`).
 pub const COLD_PROGRESS_NAME: &str = "scripthash.cold_progress";
@@ -208,7 +210,8 @@ pub struct ScriptHashTable {
     ovf_body: Option<TableFile>,
     head: ShardedScriptHashHead,
     /// Sealed sorted main shards (set when a cold bulk shard is installed).
-    sorted_main: Mutex<Vec<Option<SortedHead>>>,
+    /// Per-shard slot so Electrum `get` does not take a process-wide mutex.
+    sorted_main: Box<[RwLock<Option<SortedHead>>]>,
     /// Global ingest OA for keys first seen after main seal (`scripthash.ovf/ingest`).
     ingest: Mutex<ScriptHashHead>,
     /// Sealed global ovf (sorted+fuse+idx), newest last.
@@ -323,6 +326,10 @@ fn open_sorted_main_shards(
         }
     }
     Ok(out)
+}
+
+fn wrap_sorted_slots(v: Vec<Option<SortedHead>>) -> Box<[RwLock<Option<SortedHead>>]> {
+    v.into_iter().map(RwLock::new).collect()
 }
 
 fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError> {
@@ -454,7 +461,7 @@ impl ScriptHashTable {
             bodies,
             ovf_body: Some(ovf),
             head,
-            sorted_main: Mutex::new((0..n_shards).map(|_| None).collect()),
+            sorted_main: wrap_sorted_slots((0..n_shards).map(|_| None).collect()),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(Vec::new()),
             sorted_main_on: std::sync::atomic::AtomicBool::new(false),
@@ -518,7 +525,7 @@ impl ScriptHashTable {
             bodies,
             ovf_body,
             head,
-            sorted_main: Mutex::new(sorted_main),
+            sorted_main: wrap_sorted_slots(sorted_main),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(sealed_ovf),
             sorted_main_on: std::sync::atomic::AtomicBool::new(sorted_on),
@@ -710,13 +717,13 @@ impl ScriptHashTable {
 
     /// True when sorted main, ingest, and sealed ovf report no occupied keys.
     pub fn head_is_empty(&self) -> bool {
-        if self
-            .sorted_main
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|s| s.as_ref().map(|h| !h.is_empty()).unwrap_or(false))
-        {
+        if self.sorted_main.iter().any(|s| {
+            s.read()
+                .unwrap()
+                .as_ref()
+                .map(|h| !h.is_empty())
+                .unwrap_or(false)
+        }) {
             return false;
         }
         if !self.sealed_ovf.lock().unwrap().is_empty() {
@@ -737,7 +744,9 @@ impl ScriptHashTable {
     pub fn reinit_empty_for_cold_materialize(&self) -> Result<(), StoreError> {
         self.reset_all_bodies()?;
         self.head.reinit_empty()?;
-        *self.sorted_main.lock().unwrap() = (0..self.head.shard_count()).map(|_| None).collect();
+        for slot in self.sorted_main.iter() {
+            *slot.write().unwrap() = None;
+        }
         self.sorted_main_on
             .store(false, std::sync::atomic::Ordering::Release);
         debug_assert!(self.head.is_empty());
@@ -773,10 +782,8 @@ impl ScriptHashTable {
             ShBodyLayout::Sharded => {
                 let sealed: Vec<bool> = self
                     .sorted_main
-                    .lock()
-                    .unwrap()
                     .iter()
-                    .map(|s| s.is_some())
+                    .map(|s| s.read().unwrap().is_some())
                     .collect();
                 let empty = AllocState {
                     live_count: 0,
@@ -793,9 +800,16 @@ impl ScriptHashTable {
                     self.bodies[i].set_logical_len(payload0)?;
                     let p = sorted_main_shard_path(&self.store_dir, i, n);
                     let _ = std::fs::remove_file(&p);
-                    let mut idx = p.into_os_string();
+                    let mut idx = p.clone().into_os_string();
                     idx.push(".idx");
                     let _ = std::fs::remove_file(idx);
+                    let mut part = p.into_os_string();
+                    part.push(".part");
+                    let part = PathBuf::from(part);
+                    let _ = std::fs::remove_file(&part);
+                    let mut part_idx = part.into_os_string();
+                    part_idx.push(".idx");
+                    let _ = std::fs::remove_file(part_idx);
                 }
             }
         }
@@ -805,27 +819,27 @@ impl ScriptHashTable {
     /// Main shards with no sealed `scripthash.head/NN` yet.
     pub fn unsealed_main_shards(&self) -> Vec<usize> {
         self.sorted_main
-            .lock()
-            .unwrap()
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.is_none().then_some(i))
+            .filter_map(|(i, s)| s.read().unwrap().is_none().then_some(i))
             .collect()
     }
 
-    pub(crate) fn store_sharded_cold_progress(&self, keys_written: u64) -> Result<(), StoreError> {
+    pub(crate) fn store_sharded_cold_progress(
+        &self,
+        keys_written: u64,
+        live_count: u64,
+    ) -> Result<(), StoreError> {
         let n = self.head.shard_count();
         let next = self
             .sorted_main
-            .lock()
-            .unwrap()
             .iter()
-            .position(|s| s.is_none())
+            .position(|s| s.read().unwrap().is_none())
             .unwrap_or(n) as u32;
         ColdProgress {
             next_shard: next,
             body_bump: 0,
-            live_count: self.entry_count(),
+            live_count,
             keys_written,
         }
         .store(&self.store_dir)
@@ -851,13 +865,13 @@ impl ScriptHashTable {
         if self.entry_count() > 0 || !self.head_is_empty() {
             return true;
         }
-        if self
-            .sorted_main
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|s| s.as_ref().map(|h| !h.is_empty()).unwrap_or(false))
-        {
+        if self.sorted_main.iter().any(|s| {
+            s.read()
+                .unwrap()
+                .as_ref()
+                .map(|h| !h.is_empty())
+                .unwrap_or(false)
+        }) {
             return true;
         }
         if self.ingest.lock().unwrap().occupied() > 0 {
@@ -902,11 +916,13 @@ impl ScriptHashTable {
             }
         }
         if self.has_sorted_main() {
-            let g = self.sorted_main.lock().unwrap();
             let si = self.head.shard_index(scripthash);
-            if let Some(Some(h)) = g.get(si) {
-                if let Some(v) = h.get(&hk)? {
-                    return Ok(Some((v, KeyHome::Main)));
+            if let Some(slot) = self.sorted_main.get(si) {
+                let g = slot.read().unwrap();
+                if let Some(h) = g.as_ref() {
+                    if let Some(v) = h.get(&hk)? {
+                        return Ok(Some((v, KeyHome::Main)));
+                    }
                 }
             }
         }
@@ -918,21 +934,28 @@ impl ScriptHashTable {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn install_sorted_main(&self, shard: usize, sealed: SortedHead) {
+        if let Some(slot) = self.sorted_main.get(shard) {
+            *slot.write().unwrap() = Some(sealed);
+            self.sorted_main_on
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     #[cfg(test)]
     fn sorted_main_pread_count(&self, shard: usize) -> u64 {
         self.sorted_main
-            .lock()
-            .unwrap()
             .get(shard)
-            .and_then(|s| s.as_ref())
-            .map(|h| h.pread_count())
+            .and_then(|s| s.read().unwrap().as_ref().map(|h| h.pread_count()))
             .unwrap_or(0)
     }
 
     #[cfg(test)]
     fn reset_sorted_main_preads(&self) {
-        for h in self.sorted_main.lock().unwrap().iter().flatten() {
-            h.reset_pread_count();
+        for slot in self.sorted_main.iter() {
+            if let Some(h) = slot.read().unwrap().as_ref() {
+                h.reset_pread_count();
+            }
         }
     }
 
@@ -959,9 +982,9 @@ impl ScriptHashTable {
     /// Visit every live create_tx_fk across all keys (main + overflow occupancy walk).
     pub fn for_each_live_create(&self, mut f: impl FnMut(Fk)) -> Result<(), StoreError> {
         {
-            let g = self.sorted_main.lock().unwrap();
-            for (si, h) in g.iter().enumerate() {
-                let Some(h) = h else {
+            for (si, slot) in self.sorted_main.iter().enumerate() {
+                let g = slot.read().unwrap();
+                let Some(h) = g.as_ref() else {
                     continue;
                 };
                 let body = match self.layout {
@@ -1306,11 +1329,17 @@ impl ScriptHashTable {
                 KeyHome::Main => {
                     let hk = head_key_from_full(key);
                     let si = self.head.shard_index(key);
-                    let g = self.sorted_main.lock().unwrap();
-                    if let Some(Some(h)) = g.get(si) {
-                        if h.update_value(&hk, val)? {
-                            continue;
+                    let updated = if let Some(slot) = self.sorted_main.get(si) {
+                        let g = slot.read().unwrap();
+                        match g.as_ref() {
+                            Some(h) => h.update_value(&hk, val)?,
+                            None => false,
                         }
+                    } else {
+                        false
+                    };
+                    if updated {
+                        continue;
                     }
                     ingest_ups.push((*key, val.clone()));
                 }
@@ -1826,12 +1855,14 @@ impl ScriptHashTable {
             KeyHome::Main | KeyHome::Absent => {
                 let hk = head_key_from_full(scripthash);
                 let si = self.head.shard_index(scripthash);
-                let updated_sorted = {
-                    let g = self.sorted_main.lock().unwrap();
-                    match g.get(si).and_then(|s| s.as_ref()) {
+                let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
+                    let g = slot.read().unwrap();
+                    match g.as_ref() {
                         Some(h) => h.update_value(&hk, &new_val)?,
                         None => false,
                     }
+                } else {
+                    false
                 };
                 if !updated_sorted {
                     let g = self.ingest.lock().unwrap();
@@ -1934,6 +1965,7 @@ impl ScriptHashTable {
             committed_keys: 0,
             resume_from_shard: 0,
             active_shard: None,
+            head_out: None,
             recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
@@ -1979,6 +2011,11 @@ impl ScriptHashTable {
             committed_keys: 0,
             resume_from_shard: 0,
             active_shard: Some(shard),
+            head_out: Some(SortedHeadWriter::create(sorted_main_shard_path(
+                self.store_dir(),
+                shard,
+                n_shards,
+            ))?),
             recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
@@ -2044,6 +2081,7 @@ impl ScriptHashTable {
             committed_keys: progress.keys_written,
             resume_from_shard: progress.next_shard,
             active_shard: None,
+            head_out: None,
             recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
@@ -2088,13 +2126,7 @@ impl ScriptHashTable {
             let _ = std::fs::create_dir_all(parent);
         }
         let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
-        let mut g = self.sorted_main.lock().unwrap();
-        if g.len() < n_shards {
-            g.resize_with(n_shards, || None);
-        }
-        g[shard] = Some(sealed);
-        self.sorted_main_on
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.install_sorted_main(shard, sealed);
         let body = self.shard_body(shard);
         if bump > body.logical_len() {
             body.set_logical_len(bump)?;
@@ -2112,8 +2144,27 @@ impl ScriptHashTable {
     /// Seal the already-written shard body and install `scripthash.head/NN`.
     pub fn publish_packed_shard(&self, shard: usize, pack: ShShardPack) -> Result<u64, StoreError> {
         let live = self.shard_alloc(shard).lock().unwrap().live_count;
-        self.publish_sorted_shard(shard, &pack.recs, live, pack.bump)?;
-        Ok(pack.bump)
+        let bump = pack.bump;
+        if let Some(part) = pack.head_part {
+            let n_shards = self.head.shard_count();
+            let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
+            let sealed = install_head_part(&part, &path)?;
+            self.install_sorted_main(shard, sealed);
+            let body = self.shard_body(shard);
+            if bump > body.logical_len() {
+                body.set_logical_len(bump)?;
+            }
+            let state = AllocState {
+                live_count: live,
+                bump,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(body, &state)?;
+            *self.shard_alloc(shard).lock().unwrap() = state;
+        } else {
+            self.publish_sorted_shard(shard, &pack.recs, live, bump)?;
+        }
+        Ok(bump)
     }
 }
 
@@ -2207,7 +2258,9 @@ pub struct ScriptHashBulkSession<'a> {
     /// Skip installing keys for shards `< resume_from_shard` (stream may still deliver them).
     resume_from_shard: u32,
     active_shard: Option<usize>,
-    /// Packed sorted recs for the active shard (not an OA image).
+    /// Streaming sealed-main writer for pack-only sessions (`.part` until publish).
+    head_out: Option<SortedHeadWriter>,
+    /// Packed recs for [`Self::bulk_session`] (sorted at shard seal; 16 B key order).
     recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
@@ -2224,7 +2277,7 @@ pub struct ScriptHashBulkSession<'a> {
     pub peak_table_bytes: usize,
     /// In-flight key: at most one page of FKs (streaming megakey).
     open_key: Option<BulkOpenKey>,
-    /// When true, do not write SortedHead / ColdProgress (publisher does that).
+    /// When true, head is streamed to `.part` and installed at `publish_packed_shard`.
     pack_only: bool,
     max_fk: u64,
 }
@@ -2232,6 +2285,8 @@ pub struct ScriptHashBulkSession<'a> {
 /// One shard packed onto its live body, ready for ordered head publish.
 pub struct ShShardPack {
     pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
+    /// Finished `.part` from [`SortedHeadWriter`] (preferred over `recs`).
+    pub head_part: Option<PathBuf>,
     pub creates: u64,
     pub max_fk: u64,
     pub keys: u64,
@@ -2320,8 +2375,13 @@ impl<'a> ScriptHashBulkSession<'a> {
             ShBodyLayout::Sharded => self.live_count,
         };
         self.persist_session_alloc(persist_live, self.bump)?;
+        let head_part = match self.head_out.take() {
+            Some(w) => Some(w.finish()?),
+            None => None,
+        };
         let pack = ShShardPack {
-            recs: std::mem::take(&mut self.recs),
+            recs: Vec::new(),
+            head_part,
             creates: self.live_count,
             max_fk: self.max_fk,
             keys: self.keys_written,
@@ -2433,11 +2493,15 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
-        self.recs
-            .push((head_key_from_full(&open.key), val.encode()));
-        self.peak_table_bytes = self
-            .peak_table_bytes
-            .max(self.recs.len().saturating_mul(32));
+        let rec = (head_key_from_full(&open.key), val.encode());
+        if let Some(w) = self.head_out.as_mut() {
+            w.push(rec.0, rec.1)?;
+        } else {
+            self.recs.push(rec);
+            self.peak_table_bytes = self
+                .peak_table_bytes
+                .max(self.recs.len().saturating_mul(32));
+        }
         Ok(())
     }
 
@@ -2529,6 +2593,7 @@ impl<'a> ScriptHashBulkSession<'a> {
 
     fn start_live_shard(&mut self, si: usize) -> Result<(), StoreError> {
         self.recs.clear();
+        self.head_out = None;
         rbitcoin_log::info!(
             "store: scripthash live shard start id={si} key_budget={} (stream recs)",
             self.key_budget
@@ -2697,14 +2762,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
-                let mut g = self.table.sorted_main.lock().unwrap();
-                if g.len() < n_shards {
-                    g.resize_with(n_shards, || None);
-                }
-                g[si] = Some(sealed);
-                self.table
-                    .sorted_main_on
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.table.install_sorted_main(si, sealed);
             }
             let shard_live = match self.table.layout {
                 ShBodyLayout::Shared => self.live_count,
@@ -2740,6 +2798,7 @@ impl<'a> ScriptHashBulkSession<'a> {
     ///
     /// Call on cooperative cancel so Drop does not install a partial shard.
     pub fn abandon_incomplete(mut self) {
+        self.head_out = None;
         self.recs.clear();
         self.body_buf.clear();
         self.open_key = None;
@@ -2794,6 +2853,7 @@ impl Drop for ScriptHashBulkSession<'_> {
         if self.finished || self.pack_only {
             return;
         }
+        self.head_out = None;
         self.recs.clear();
         self.body_buf.clear();
         self.open_key = None;
@@ -3983,7 +4043,7 @@ mod tests {
             session.push_sorted_fk(k0, Fk(1)).unwrap();
             session.push_sorted_fk(k1, Fk(2)).unwrap();
             let pack = session.finish_pack().unwrap();
-            assert_eq!(pack.recs.len(), 2);
+            assert_eq!(pack.keys, 2);
             let bump0 = t.alloc_bump();
             let new_bump = t.publish_packed_shard(0, pack).unwrap();
             assert!(new_bump >= bump0);

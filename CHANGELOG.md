@@ -37,6 +37,10 @@ before 1.0).
   ordered publisher). SIGINT keeps sealed holes; resume packs only
   unsealed shards. Shared file body stays prefix `SHCOLDP1`. Pack
   threads use default IO priority — tip materialize is the work.
+  Pack streams `head/NN.part` (no in-RAM rec vec). Class A recollect
+  walks `txout` fk-spans, not per-fk get. Seal progress uses observer
+  atomics (not `entry_count()`). Sealed-main lookup is per-shard
+  `RwLock` (not one process mutex).
 
 - **Load stamp reuses lookup `TxPrecompute`:** `LoadBatch` carries the
   decode-time `pres` Arc; `confirm_wire_lookup_stamp` must not `from_tx`

@@ -4,7 +4,6 @@
 //! SH uses append-only target-sized runs + SEAL during Direct; bulk-loads at tip.
 
 use super::*;
-use rbitcoin_primitives::Fk;
 use std::sync::atomic::Ordering;
 
 /// Index / spentness mode.
@@ -606,60 +605,47 @@ impl Query {
 
                         let mut chunk_txs = 0u64;
                         let mut chunk_max = sealed0;
-                        let mut fk = lo;
                         let mut chunk_ok = true;
-                        while fk <= hi {
-                            if cancel
-                                .map(|c| c.load(AtomicOrdering::Relaxed))
-                                .unwrap_or(false)
-                                || stop.load(AtomicOrdering::Relaxed)
-                            {
-                                stop.store(true, AtomicOrdering::Relaxed);
-                                chunk_ok = false;
-                                break;
-                            }
-                            match store.get_tx_meta_and_outputs(Fk(fk)) {
-                                Ok((_tx, outputs)) => {
-                                    chunk_txs = chunk_txs.saturating_add(1);
-                                    chunk_max = chunk_max.max(fk);
-                                    for o in &outputs {
-                                        local.push(ScriptHashRecord::from_fk(
-                                            script_hash(&o.script),
-                                            Fk(fk),
-                                        ));
-                                    }
-                                    if local.len() >= thread_spill_recs {
-                                        // Current chunk not finished → do not put `i` in
-                                        // pending yet; only commit earlier full chunks.
-                                        if let Err(e) = spill_local(
-                                            sh_run,
-                                            &mut local,
-                                            &n_spills,
-                                            &n_creates,
-                                            &max_fk_seen,
-                                        ) {
-                                            *first_err.lock().unwrap() = Some(e);
-                                            stop.store(true, AtomicOrdering::Relaxed);
-                                            chunk_ok = false;
-                                            break;
-                                        }
-                                        if let Err(e) = flush_pending_done(&mut pending_done) {
-                                            *first_err.lock().unwrap() = Some(e);
-                                            stop.store(true, AtomicOrdering::Relaxed);
-                                            chunk_ok = false;
-                                            break;
-                                        }
-                                    }
+                        if cancel
+                            .map(|c| c.load(AtomicOrdering::Relaxed))
+                            .unwrap_or(false)
+                            || stop.load(AtomicOrdering::Relaxed)
+                        {
+                            stop.store(true, AtomicOrdering::Relaxed);
+                            chunk_ok = false;
+                        } else {
+                            match store.for_each_create_outs_in_fk_span(lo, hi, |fk, outputs| {
+                                chunk_txs = chunk_txs.saturating_add(1);
+                                chunk_max = chunk_max.max(fk.0);
+                                for o in outputs {
+                                    local.push(ScriptHashRecord::from_fk(
+                                        script_hash(&o.script),
+                                        fk,
+                                    ));
                                 }
-                                Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {}
+                                if local.len() >= thread_spill_recs {
+                                    spill_local(
+                                        sh_run,
+                                        &mut local,
+                                        &n_spills,
+                                        &n_creates,
+                                        &max_fk_seen,
+                                    )?;
+                                    flush_pending_done(&mut pending_done)?;
+                                }
+                                Ok(())
+                            }) {
+                                Ok(()) => {}
+                                Err(StoreError::Cancelled(_)) => {
+                                    stop.store(true, AtomicOrdering::Relaxed);
+                                    chunk_ok = false;
+                                }
                                 Err(e) => {
                                     *first_err.lock().unwrap() = Some(e);
                                     stop.store(true, AtomicOrdering::Relaxed);
                                     chunk_ok = false;
-                                    break;
                                 }
                             }
-                            fk = fk.saturating_add(1);
                         }
 
                         if !chunk_ok {

@@ -2977,6 +2977,77 @@ mod tests {
     }
 
     #[test]
+    fn scripthash_touched_at_height_skips_class_a_expand() {
+        let (dir, q) = temp_query("sh-touch-h");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut create_fks = Vec::new();
+        let mut create_txids = Vec::new();
+        for h in 0..2u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            create_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            create_fks.push(q.block_tx_fks(Height(h)).unwrap()[0]);
+        }
+        let sh = script_hash(&[0x51]);
+
+        let (header, mut miss) = coinbase_block(2, prev, parent_hash);
+        miss.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x00])];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(2), &header, &[miss]).unwrap();
+
+        reset_body_ok_reads();
+        assert!(!q.scripthash_touched_at_height(&sh, Height(2)).unwrap());
+        assert_eq!(
+            body_ok_reads(),
+            0,
+            "untouched height must not load_creates_once"
+        );
+
+        reset_body_ok_reads();
+        assert!(q.scripthash_touched_at_height(&sh, Height(0)).unwrap());
+        assert_eq!(body_ok_reads(), 0, "create-in-block probe is posting list");
+
+        let (header, mut cb) = coinbase_block(3, prev, parent_hash);
+        cb.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x00])];
+        let spend = TxApply {
+            tx: TxRecord {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[0] = 0x5e;
+                    t
+                },
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: create_txids[0],
+                create_fk: create_fks[0],
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x00])],
+        };
+        q.connect_block(Height(3), &header, &[cb, spend]).unwrap();
+        reset_body_ok_reads();
+        assert!(q.scripthash_touched_at_height(&sh, Height(3)).unwrap());
+        assert_eq!(
+            body_ok_reads(),
+            0,
+            "spend-in-block probe is prevout create_fk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn connect_chain_query_surface() {
         let (dir, q) = temp_query("connect");
         // Default Tip mode: durable SH on confirm so Electrum-style APIs work.

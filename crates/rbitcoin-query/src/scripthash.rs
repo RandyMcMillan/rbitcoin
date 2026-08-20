@@ -567,6 +567,44 @@ impl Query {
         Ok(apply_history_filter(&items, filter))
     }
 
+    /// True when `height` creates or spends a confirmed outpoint for `scripthash`.
+    ///
+    /// Intersects the SH posting list with the block's tx fks and input
+    /// `create_fk`s. Does not expand packed `txout`.
+    pub fn scripthash_touched_at_height(
+        &self,
+        scripthash: &[u8; 32],
+        height: Height,
+    ) -> Result<bool, QueryError> {
+        let entries = self.store.scripthash.entries(scripthash)?;
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        let mut posting: Vec<u64> = entries
+            .iter()
+            .filter_map(|(_, r)| r.create_tx_fk.get())
+            .collect();
+        posting.sort_unstable();
+        posting.dedup();
+        let block_fks = self.block_tx_fks(height)?;
+        for fk in &block_fks {
+            if let Some(id) = fk.get() {
+                if posting.binary_search(&id).is_ok() {
+                    return Ok(true);
+                }
+            }
+            let (_, prevs) = self.store.get_tx_meta_and_prevouts(*fk)?;
+            for (create_fk, _) in prevs {
+                if let Some(id) = create_fk.get() {
+                    if posting.binary_search(&id).is_ok() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Confirmed balance for a scripthash.
     pub fn scripthash_balance(
         &self,

@@ -109,7 +109,7 @@ impl MphfHead {
         let mut tags = vec![0u8; n.saturating_mul(8)];
         for (i, (_k, w)) in recs.iter().enumerate() {
             let ku = keys[i];
-            let slot = mphf.index(ku) as usize;
+            let slot = mphf.index(ku)? as usize;
             tags[slot * 8..slot * 8 + 8].copy_from_slice(&ku.to_le_bytes());
             val[slot * 8..slot * 8 + 8].copy_from_slice(&w.to_le_bytes());
         }
@@ -207,7 +207,7 @@ impl MphfHead {
             return Ok(None);
         }
         let ku = mix_key16(key);
-        let slot = u64::from(self.mphf.index(ku));
+        let slot = u64::from(self.mphf.index(ku)?);
         let mut tag = [0u8; 8];
         self.preads.fetch_add(1, Ordering::Relaxed);
         pread_file_exact(&self.mphf_file, self.tags_off + slot * 8, &mut tag)

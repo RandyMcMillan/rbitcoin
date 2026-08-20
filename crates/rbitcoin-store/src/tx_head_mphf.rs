@@ -61,7 +61,7 @@ impl TxHeadMphf {
         let mut mlt: HashMap<u32, Vec<u32>> = HashMap::new();
         for (k, mut rs) in by_key {
             let newest = rs.pop().unwrap();
-            let slot = mphf.index(k);
+            let slot = mphf.index(k)?;
             rels[slot as usize] = newest;
             if !rs.is_empty() {
                 rs.reverse();
@@ -109,8 +109,12 @@ impl TxHeadMphf {
         })
     }
 
-    pub fn slots_for(&self, mixed_u64: &[u64]) -> Vec<u32> {
-        mixed_u64.iter().map(|&k| self.mphf.index(k)).collect()
+    pub fn slots_for(&self, mixed_u64: &[u64]) -> Result<Vec<u32>, StoreError> {
+        let mut out = Vec::with_capacity(mixed_u64.len());
+        for &k in mixed_u64 {
+            out.push(self.mphf.index(k)?);
+        }
+        Ok(out)
     }
 
     pub fn read_rels_batch(

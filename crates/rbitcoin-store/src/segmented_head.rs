@@ -809,7 +809,7 @@ impl SegmentedTxHead {
             }
             if let Some(pack) = seg.pack.as_ref() {
                 let mixed_u: Vec<u64> = pass_keys.iter().map(fuse_key_from_mixed).collect();
-                let slots = pack.slots_for(&mixed_u);
+                let slots = pack.slots_for(&mixed_u)?;
                 let rel_lists = pack.read_rels_batch(&slots, ctx)?;
                 for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                     for r in rels {

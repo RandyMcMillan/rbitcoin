@@ -55,6 +55,11 @@ before 1.0).
   Packed `txout` expand is unchanged (no schema bump). Re-run Casa on
   the operator host; do not treat VM times as product numbers.
 
+- **Esplora fat-SH join:** REST reuses one last-scripthash outs+spent join
+  until tip height changes (`/scripthash` stats + mempool_stats, `/txs`
+  pages, `/utxo`). WS `block-transactions` probes the posting list against
+  the new block instead of a full history window.
+
 - **Per-item `received getdata for: wtx` is TRACE:** one line per peer
   `MSG_WTX` getdata is too noisy at DEBUG. Counts stay on `tip: perf`.
   Core functional still sees the needle: the bitcoind shim maps

@@ -4,7 +4,7 @@
 
 use crate::handlers::resolve_address_sh;
 use crate::server::AppState;
-use crate::tx_json::{build_tx_json, history_items_to_tx_json, tx_status_json};
+use crate::tx_json::{build_tx_json, tx_status_json};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -14,8 +14,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
 use futures_util::{SinkExt, StreamExt};
 use rbitcoin_net::{MempoolAnnounce, TipEvent};
-use rbitcoin_primitives::hex_encode;
-use rbitcoin_query::{HistoryFilter, Query};
+use rbitcoin_primitives::{hex_encode, Height};
+use rbitcoin_query::Query;
 use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -619,14 +619,15 @@ async fn on_tip(
     ev: &TipEvent,
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), ()> {
-    // Confirmed address activity: height window on SH history (index written on connect).
     if !conn.addresses.is_empty() {
-        let filter = HistoryFilter::height_window(ev.height, Some(i64::from(ev.height) + 1));
         let mut txs = Vec::new();
         for sh in conn.addresses.keys() {
-            if let Ok(items) = st.query.scripthash_history_filtered(sh, &filter) {
-                if let Ok(mut page) = history_items_to_tx_json(&st.query, &items, st.network) {
-                    txs.append(&mut page);
+            let Ok(fks) = st.query.scripthash_tx_fks_at_height(sh, Height(ev.height)) else {
+                continue;
+            };
+            for fk in fks {
+                if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
+                    txs.push(v);
                 }
             }
         }

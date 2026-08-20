@@ -364,9 +364,8 @@ fn witness_p2wsh_and_nested_p2sh() {
 
 #[test]
 fn verify_scripts_pool_empty_and_anyone_can_spend() {
-    use super::{verify_scripts_pool, verify_scripts_pool_jobs, ScriptCheckJob};
+    use super::{verify_scripts_pool, ScriptCheckJob};
     assert!(verify_scripts_pool(&[]).is_ok());
-    assert!(verify_scripts_pool_jobs(&[]).is_ok());
     let job = ScriptCheckJob::new(
         vec![TxOut {
             value: Amount::from_sat(1),
@@ -396,36 +395,6 @@ fn verify_scripts_pool_empty_and_anyone_can_spend() {
         true,
     );
     assert!(verify_scripts_pool(&[job]).is_ok());
-    // Borrowed job list path with one ACS job.
-    let job2 = ScriptCheckJob::new(
-        vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-        Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([8; 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        },
-        true,
-        true,
-        true,
-        true,
-        true,
-    );
-    assert!(verify_scripts_pool_jobs(&[&job2]).is_ok());
 }
 
 #[test]

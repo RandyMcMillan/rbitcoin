@@ -1769,14 +1769,9 @@ fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32,
 ///
 /// Uses the in-crate [`crate::script_pool`] (not rayon). One job = one
 /// non-coinbase tx (shared [`bitcoin::sighash::SighashCache`] across its inputs).
-/// Pool threads (`rbtc-scripts-*`) steal jobs; the phase coordinator does not.
+/// Pool threads (`rbtc-scripts-*`) steal jobs; the publisher does not wait on the pool.
 pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
     crate::script_pool::try_for_each_parallel(jobs, verify_one_script_job)
-}
-
-/// Parallel script checks across borrowed jobs (multi-block wave).
-pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
-    crate::script_pool::try_for_each_parallel(jobs, |job| verify_one_script_job(*job))
 }
 
 /// Whether this job can skip `verify_job_all_inputs`.
@@ -1802,7 +1797,7 @@ fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
 }
 
 #[inline]
-fn verify_one_script_job(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
+pub(crate) fn verify_one_script_job(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
     if job_needs_script_check(job) {
         crate::script::verify_job_all_inputs(job)
     } else {

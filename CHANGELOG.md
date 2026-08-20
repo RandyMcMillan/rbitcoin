@@ -9,12 +9,6 @@ before 1.0).
 
 ## [Unreleased]
 
-### Changed
-
-- **tx.head drain thread:** confirm write-behind insert runs on a process-wide
-  `ibd-confirm-head` OS thread overlapping structural + Class C, instead of a
-  per-batch `thread::scope` spawn.
-
 ### Fixed
 
 - **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
@@ -45,6 +39,16 @@ before 1.0).
   label. Linux musl stays Nix; Darwin/Windows are native runners.
 
 ### Changed
+
+- **tx.head drain thread:** confirm write-behind insert runs on a process-wide
+  `ibd-confirm-head` OS thread overlapping structural + Class C, instead of a
+  per-batch `thread::scope` spawn.
+
+- **Script coordinators removed:** `ibd-confirm` publishes script waves itself
+  (lock-free `next` / `in_wave` / `failed`), writes completed batches in
+  height order, and feeds `scriptq` when steal is empty (up to 8 in-flight).
+  Steal workers unpark the publisher on wave complete; load unparks on
+  `scriptq` send. No `rbtc-script-coord-*` threads.
 
 - **Query-path `api:` / `sh_join` / tweaks timing are TRACE:** one line per
   Electrum/Esplora/RPC call (and per slow SH join) flooded DEBUG during

@@ -214,10 +214,8 @@ fn scripts_feed_ahead_single_batch() {
     assert!(outs[0].batch.is_empty());
 }
 
-/// `confirm_scripts_phase_async` must not occupy a steal worker (`rbtc-scripts-*`).
-///
-/// Thread name is recorded on the handle so a parallel scripts phase
-/// cannot overwrite it.
+/// `confirm_scripts_phase_async` publishes on the caller (no coordinator
+/// thread, no steal worker).
 #[test]
 fn scripts_phase_does_not_run_on_steal_worker() {
     use super::confirm_scripts_phase_async;
@@ -226,13 +224,67 @@ fn scripts_phase_does_not_run_on_steal_worker() {
         .expect("empty phase");
     assert!(ok.batch.is_empty());
     assert!(
-        name.starts_with("rbtc-script-coord-"),
-        "scripts phase must run on a coordinator, got {name:?}"
+        !name.starts_with("rbtc-script-coord-"),
+        "coordinator threads are gone, got {name:?}"
     );
     assert!(
         !name.starts_with("rbtc-scripts-"),
         "scripts phase ran on steal worker {name:?}"
     );
+}
+
+fn linux_thread_comms() -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| {
+        let p = e.ok()?.path().join("comm");
+        std::fs::read_to_string(p).ok()
+    })
+    .map(|s| s.trim().to_string())
+    .collect()
+}
+
+/// IBD `drive_script_waves` writes in input order and never starts
+/// `rbtc-script-coord-*` threads.
+#[test]
+fn drive_script_waves_ordered_without_coordinator_threads() {
+    use super::drive_script_waves;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let (tx, rx) = mpsc::sync_channel(4);
+    let heights = Arc::new(Mutex::new(Vec::new()));
+    let heights_w = Arc::clone(&heights);
+    let stage = thread::Builder::new()
+        .name("ibd-confirm".into())
+        .spawn(move || {
+            drive_script_waves(
+                &rx,
+                |ok, meta| {
+                    heights_w.lock().unwrap().push(meta.first_h);
+                    assert!(ok.batch.is_empty());
+                    true
+                },
+                |_e, _meta| false,
+                || false,
+            );
+        })
+        .expect("spawn publisher");
+    for _ in 0..3 {
+        tx.send((empty_loaded_batch(), 0)).expect("send");
+    }
+    drop(tx);
+    crate::unpark_script_publisher();
+    stage.join().expect("publisher");
+    assert_eq!(heights.lock().unwrap().len(), 3);
+    for comm in linux_thread_comms() {
+        assert!(
+            !comm.starts_with("rbtc-script-coord"),
+            "coordinator thread still live: {comm}"
+        );
+    }
 }
 
 /// Two ready batches: both verify on the real async path; write order preserved.

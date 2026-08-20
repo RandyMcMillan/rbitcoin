@@ -977,7 +977,7 @@ pub(crate) mod confirm_thr_stats {
         add(&LOAD_SEND_WAIT_NS, d);
     }
 
-    /// Script occupancy is coordinator verify ns, never submit-to-join wall.
+    /// Script occupancy is per-batch wave wall on `ibd-confirm`, not steal-pool join.
     #[inline]
     pub fn script_work_from_verify_ns(work_ns: u64) -> Duration {
         Duration::from_nanos(work_ns)
@@ -1227,7 +1227,6 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-write");
 
-    // Feed-ahead: submit N+1 while joining N (blocking join left the pool idle).
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
     let event_tx_sc = event_tx.clone();
@@ -1236,157 +1235,73 @@ pub(crate) fn spawn_confirm_engine(
     let scripts = std::thread::Builder::new()
         .name("ibd-confirm".into())
         .spawn(move || {
-            info!(
-                "ibd: confirm scripts on dedicated OS thread (pure CPU; coordinator feed-ahead)"
+            info!("ibd: confirm scripts on dedicated OS thread (publish waves; steal pool verifies)");
+            rbitcoin_consensus::drive_script_waves_with(
+                &mat_rx,
+                |batch, wait| {
+                    confirm_thr_stats::add_script_recv_wait(wait);
+                    q_sc.note_script_recv(
+                        batch.len(),
+                        batch.approx_wire_bytes(),
+                        batch.parent_count(),
+                    );
+                },
+                |outcome, meta| {
+                    loop_stats_sc
+                        .confirm_ns
+                        .fetch_add(outcome.work_ns, Ordering::Relaxed);
+                    confirm_thr_stats::add_script_work(
+                        confirm_thr_stats::script_work_from_verify_ns(outcome.work_ns),
+                    );
+                    let script_ms = outcome.work_ns / 1_000_000;
+                    let mat_ms = meta.mat_ns / 1_000_000;
+                    let wb = outcome.batch.len();
+                    let ww = outcome.batch.approx_wire_bytes();
+                    let parents = outcome.batch.parent_count();
+                    let t_send = Instant::now();
+                    if write_tx.send(outcome.batch).is_err() {
+                        info!("ibd: confirm write channel closed");
+                        return false;
+                    }
+                    confirm_thr_stats::add_script_send_wait(t_send.elapsed());
+                    q_sc.note_write_send(wb, ww, parents);
+                    if script_ms > 2_000 || mat_ms > 2_000 {
+                        info!(
+                            "ibd: confirm scripts slow batch={} first={} load_ms={mat_ms} script_ms={script_ms} wall_ms={}",
+                            meta.n,
+                            meta.first_h,
+                            meta.t0.elapsed().as_millis()
+                        );
+                    }
+                    !feed_sc.stopped() && !hub_sc.query.confirm_cancelled()
+                },
+                |e, meta| {
+                    confirm_thr_stats::add_script_work(Duration::ZERO);
+                    let msg = e.to_string();
+                    if msg.contains("confirm cancelled") || feed_sc.stopped() {
+                        info!("ibd: confirm scripts aborted: {msg}");
+                        return false;
+                    }
+                    let (height, hash) = meta
+                        .heights_hashes
+                        .first()
+                        .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
+                        .unwrap_or((meta.first_h, BlockHash::from_byte_array([0u8; 32])));
+                    feed_sc.finish(meta.heights_hashes.iter().map(|(h, _)| *h));
+                    loop_stats_sc
+                        .confirm_reject_stops
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!("ibd: confirm scripts reject @ {height} (batch first {hash}): {e}");
+                    let _ = event_tx_sc.send(ConfirmEvent::Reject {
+                        height,
+                        hash,
+                        err: msg,
+                        wire: None,
+                    });
+                    false
+                },
+                || feed_sc.stopped() || hub_sc.query.confirm_cancelled(),
             );
-            /// One scripts wave started on a coordinator (not yet joined / written).
-            struct Inflight {
-                handle: rbitcoin_consensus::ScriptsPhaseHandle,
-                meta: rbitcoin_consensus::ScriptsBatchMeta,
-            }
-            fn start_inflight(
-                mat_batch: rbitcoin_consensus::LoadedBatch,
-                mat_ns: u64,
-                q_sc: &ConfirmQueueDepths,
-            ) -> Inflight {
-                let n = mat_batch.len();
-                let load_wire = mat_batch.approx_wire_bytes();
-                let script_parents = mat_batch.parent_count();
-                q_sc.note_script_recv(n, load_wire, script_parents);
-                let meta =
-                    rbitcoin_consensus::ScriptsBatchMeta::from_batch(&mat_batch, mat_ns);
-                let handle = rbitcoin_consensus::confirm_scripts_phase_async(mat_batch);
-                Inflight { handle, meta }
-            }
-
-            let mut current: Option<Inflight> = None;
-            let mut lookahead: Option<Inflight> = None;
-            loop {
-                if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
-                    break;
-                }
-                if current.is_none() {
-                    let t_recv = Instant::now();
-                    let (mat_batch, mat_ns) = match mat_rx.recv() {
-                        Ok(x) => x,
-                        Err(_) => break,
-                    };
-                    confirm_thr_stats::add_script_recv_wait(t_recv.elapsed());
-                    if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
-                        break;
-                    }
-                    current = Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
-                }
-                let inflight = match current.take() {
-                    Some(i) => i,
-                    None => break,
-                };
-                let result = rbitcoin_consensus::join_scripts_polling(
-                    &inflight.handle,
-                    std::time::Duration::from_micros(200),
-                    || {
-                        if lookahead.is_some()
-                            || feed_sc.stopped()
-                            || hub_sc.query.confirm_cancelled()
-                        {
-                            return false;
-                        }
-                        let t_try = Instant::now();
-                        match mat_rx.try_recv() {
-                            Ok((mat_batch, mat_ns)) => {
-                                confirm_thr_stats::add_script_recv_wait(t_try.elapsed());
-                                lookahead =
-                                    Some(start_inflight(mat_batch, mat_ns, q_sc.as_ref()));
-                                false
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
-                        }
-                    },
-                );
-                match result {
-                    Ok(outcome) => {
-                        loop_stats_sc
-                            .confirm_ns
-                            .fetch_add(outcome.work_ns, Ordering::Relaxed);
-                        confirm_thr_stats::add_script_work(
-                            confirm_thr_stats::script_work_from_verify_ns(outcome.work_ns),
-                        );
-                        let script_ms = outcome.work_ns / 1_000_000;
-                        let mat_ms = inflight.meta.mat_ns / 1_000_000;
-                        let wb = outcome.batch.len();
-                        let ww = outcome.batch.approx_wire_bytes();
-                        let parents = outcome.batch.parent_count();
-                        let t_send = Instant::now();
-                        if write_tx.send(outcome.batch).is_err() {
-                            info!("ibd: confirm write channel closed");
-                            if let Some(la) = lookahead.take() {
-                                let _ = la.handle.join();
-                                feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
-                            }
-                            break;
-                        }
-                        confirm_thr_stats::add_script_send_wait(t_send.elapsed());
-                        q_sc.note_write_send(wb, ww, parents);
-                        if script_ms > 2_000 || mat_ms > 2_000 {
-                            info!(
-                                "ibd: confirm scripts slow batch={} first={} load_ms={mat_ms} script_ms={script_ms} wall_ms={}",
-                                inflight.meta.n,
-                                inflight.meta.first_h,
-                                inflight.meta.t0.elapsed().as_millis()
-                            );
-                        }
-                        current = lookahead.take();
-                    }
-                    Err(e) => {
-                        confirm_thr_stats::add_script_work(Duration::ZERO);
-                        let msg = e.to_string();
-                        if msg.contains("confirm cancelled") || feed_sc.stopped() {
-                            info!("ibd: confirm scripts aborted: {msg}");
-                            if let Some(la) = lookahead.take() {
-                                let _ = la.handle.join();
-                                feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
-                            }
-                            break;
-                        }
-                        let (height, hash) = inflight
-                            .meta
-                            .heights_hashes
-                            .first()
-                            .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
-                            .unwrap_or((
-                                inflight.meta.first_h,
-                                BlockHash::from_byte_array([0u8; 32]),
-                            ));
-                        feed_sc.finish(inflight.meta.heights_hashes.iter().map(|(h, _)| *h));
-                        if let Some(la) = lookahead.take() {
-                            let _ = la.handle.join();
-                            feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
-                        }
-                        loop_stats_sc
-                            .confirm_reject_stops
-                            .fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "ibd: confirm scripts reject @ {height} (batch first {hash}): {e}"
-                        );
-                        let _ = event_tx_sc.send(ConfirmEvent::Reject {
-                            height,
-                            hash,
-                            err: msg,
-                            wire: None,
-                        });
-                        current = None;
-                    }
-                }
-            }
-            if let Some(i) = current.take() {
-                let _ = i.handle.join();
-                feed_sc.finish(i.meta.heights_hashes.iter().map(|(h, _)| *h));
-            }
-            if let Some(la) = lookahead.take() {
-                let _ = la.handle.join();
-                feed_sc.finish(la.meta.heights_hashes.iter().map(|(h, _)| *h));
-            }
             drop(write_tx);
             let _ = write_thr.join();
             info!("ibd: confirm scripts exit");
@@ -1418,6 +1333,7 @@ pub(crate) fn spawn_confirm_engine(
                 confirm_thr_stats::add_load_prune(t_hygiene.elapsed());
                 if feed_load.stopped() {
                     drop(mat_tx);
+                    rbitcoin_consensus::unpark_script_publisher();
                     let _ = scripts.join();
                     return;
                 }
@@ -1466,6 +1382,7 @@ pub(crate) fn spawn_confirm_engine(
                         .collect();
                     feed_load.requeue_wire(&req);
                     drop(mat_tx);
+                    rbitcoin_consensus::unpark_script_publisher();
                     let _ = scripts.join();
                     return;
                 }
@@ -1501,6 +1418,7 @@ pub(crate) fn spawn_confirm_engine(
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") || feed_load.stopped() {
                             drop(mat_tx);
+                            rbitcoin_consensus::unpark_script_publisher();
                             let _ = scripts.join();
                             return;
                         }
@@ -1592,6 +1510,7 @@ pub(crate) fn spawn_confirm_engine(
 
                 if feed_load.stopped() || hub_load.query.confirm_cancelled() {
                     drop(mat_tx);
+                    rbitcoin_consensus::unpark_script_publisher();
                     let _ = scripts.join();
                     return;
                 }
@@ -1608,8 +1527,11 @@ pub(crate) fn spawn_confirm_engine(
                             .is_err()
                         {
                             info!("ibd: confirm scripts channel closed");
+                            rbitcoin_consensus::unpark_script_publisher();
+                            let _ = scripts.join();
                             return;
                         }
+                        rbitcoin_consensus::unpark_script_publisher();
                         confirm_thr_stats::add_load_send_wait(t_send.elapsed());
                         queues_load.note_script_send(prepared_n, wire, parents);
                         if work_ms > 2_000 {
@@ -1638,6 +1560,7 @@ pub(crate) fn spawn_confirm_engine(
                         if msg.contains("confirm cancelled") {
                             info!("ibd: confirm load cancelled @ {expect_h}");
                             drop(mat_tx);
+                            rbitcoin_consensus::unpark_script_publisher();
                             let _ = scripts.join();
                             return;
                         }
@@ -1676,6 +1599,7 @@ pub(crate) fn spawn_confirm_engine(
                 confirm_thr_stats::add_load_prune(t_prune.elapsed());
             }
             drop(mat_tx);
+            rbitcoin_consensus::unpark_script_publisher();
             let _ = scripts.join();
             info!("ibd: confirm load exit");
         })

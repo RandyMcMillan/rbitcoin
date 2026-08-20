@@ -259,39 +259,6 @@ pub(super) fn structural_run(
     Ok(tot)
 }
 
-/// Verify script jobs in `prepared` (CPU only). Skips jobs whose txid is in
-/// `preverified` (mempool already consensus-checked at accept).
-pub(super) fn script_wave(
-    prepared: &[Prepared],
-    preverified: &ScriptPreverified,
-) -> Result<(), ConsensusError> {
-    let t_script = Instant::now();
-    let mut all_jobs: Vec<&ScriptCheckJob> = Vec::new();
-    let mut n_skip = 0u64;
-    for p in prepared {
-        if !p.check_scripts {
-            continue;
-        }
-        for job in &p.jobs {
-            if preverified.contains(&job.txid) {
-                n_skip = n_skip.saturating_add(1);
-                continue;
-            }
-            all_jobs.push(job);
-        }
-    }
-    if n_skip > 0 {
-        confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.fetch_add(n_skip, Ordering::Relaxed);
-    }
-    confirm_phase_stats::SCRIPT_JOBS.fetch_add(all_jobs.len() as u64, Ordering::Relaxed);
-    if !all_jobs.is_empty() {
-        crate::block::verify_scripts_pool_jobs(&all_jobs)?;
-    }
-    confirm_phase_stats::SCRIPT_NS
-        .fetch_add(t_script.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(())
-}
-
 pub(super) fn class_c_commit(
     query: &Query,
     prepared: &mut [Prepared],

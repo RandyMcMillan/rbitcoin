@@ -24,8 +24,9 @@
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp,
 //!   clone, and post-scriptq prune (`load_thr pack/stamp/pin/asm/prune`).
-//! - **script=** = `SCRIPT_NS` (verify / skip-loop only). `thr script work`
-//!   is that same ns. Recv/send are wait. Feed-ahead join of N is not script.
+//! - **script=** = `SCRIPT_NS` (per-batch wave wall on `ibd-confirm`). `thr script work`
+//!   is that same ns. Recv/send are wait. Publisher parks; it does not `wait_done`
+//!   on steal workers.
 //! - **write** = Class A + ensure + structural + class_c + spend + tweaks + tip GC
 //!   + `recent_pub=` / `drain_join=` / `dequeue=`. `other=` is write-thread work
 //!   minus that inventory.

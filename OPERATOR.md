@@ -565,6 +565,9 @@ cargo run -p rbitcoin-bench --features cli --release -- \
 printf '%s\n' bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq > /tmp/sh.txt
 cargo run -p rbitcoin-bench --features cli --release -- \
   --electrum 127.0.0.1:50001 --targets /tmp/sh.txt --suite casa
+# per-key CSV (casa/hot): heights, tx/utxo counts, warm times for each query
+cargo run -p rbitcoin-bench --features cli --release -- \
+  --electrum 127.0.0.1:50001 --suite casa --out /tmp/casa.csv
 ```
 
 | `--suite` | What it measures |
@@ -587,6 +590,13 @@ the reverse proxy’s job — point the client at plain `127.0.0.1`.
 Progress goes to **stderr** (stdout stays the p50/p95 table): about one line
 per 5% plus at most one extra line every 15s, with elapsed and ETA. Sparrow
 relabels load → refresh (→ txs if `--fetch-txs`).
+
+`--out FILE` (casa/hot) writes one CSV row per key: `oldest_tx` / `newest_tx`
+(confirmed history heights), `oldest_utxo` / `newest_utxo`, `txs`, `utxos`,
+then `get_balance_us_1..N`, `get_history_us_1..N`, `listunspent_us_1..N` for
+the counted warm passes (default N=9; warmup omitted). Blank height cells mean
+no confirmed item. Esplora `oldest_tx`/`newest_tx` are from the returned
+`/txs` page, while `txs` uses `chain_stats.tx_count` when present.
 
 ## Esplora REST
 

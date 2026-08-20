@@ -379,8 +379,8 @@ async fn tx_status(State(st): State<AppState>, Path(txid_hex): Path<String>) -> 
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match tx_status_json(&st.query, fk) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match tx_status_json(&st.query, fk) {
                 Ok(v) => Json(v).into_response(),
                 Err(e) => store_err(e),
             },
@@ -840,6 +840,7 @@ mod tests {
     #[tokio::test]
     async fn block_raw_summary_status_and_mempool_routes() {
         use bitcoin::consensus::encode::deserialize;
+        use bitcoin::hashes::Hash;
         use bitcoin::{Block, MerkleBlock};
 
         let (dir, q) = temp_query("p0-block");
@@ -951,8 +952,14 @@ mod tests {
         let hex_bytes = rbitcoin_primitives::hex_decode(&hex_body).unwrap();
         assert_eq!(raw_tx, hex_bytes.as_slice());
 
+        let _ = q.sample_reset_reconstruct_archived();
         let (st, body) = http_get(addr, &format!("/tx/{txid0}/merkleblock-proof")).await;
         assert_eq!(st, 200, "{body}");
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "merkleblock-proof uses txid.body + header, not full reconstruct"
+        );
         let mb_bytes = rbitcoin_primitives::hex_decode(&body).unwrap();
         let mb: MerkleBlock = deserialize(&mb_bytes).expect("merkleblock");
         let mut matches = Vec::new();
@@ -960,6 +967,10 @@ mod tests {
         mb.extract_matches(&mut matches, &mut indexes).unwrap();
         assert_eq!(indexes, vec![0]); // coinbase at pos 0
         assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0],
+            bitcoin::Txid::from_byte_array(coinbase_txids[0])
+        );
 
         let (st, body) = http_get(addr, "/mempool/txids").await;
         assert_eq!(st, 200, "{body}");

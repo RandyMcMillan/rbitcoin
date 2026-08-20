@@ -325,7 +325,7 @@ fn tx_merkle_proof_sync(st: AppState, txid_hex: String) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
         return not_found();
     };
-    let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) else {
+    let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) else {
         return not_found();
     };
     let height = match st.query.store().tx_height_get(fk) {
@@ -385,7 +385,7 @@ fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
         return not_found();
     };
-    let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) else {
+    let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) else {
         return not_found();
     };
     let height = match st.query.store().tx_height_get(fk) {
@@ -400,28 +400,27 @@ fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
         Ok(p) => p,
         Err(e) => return store_err(e),
     };
-    let Some((_fk, rec)) = (match st.query.header_at_height(Height(height)) {
+    let ids = match st.query.block_txids(Height(height)) {
         Ok(v) => v,
         Err(e) => return store_err(e),
-    }) else {
-        return not_found();
     };
-    let mut block = match st.query.reconstruct_archived_block(&rec.hash) {
-        Ok(Some(b)) => b,
-        Ok(None) => return not_found(),
-        Err(e) => return store_err(e),
-    };
-    // Ensure header merkle root matches wire tx tree (lab fixtures use synthetic roots).
-    if let Some(root) = block.compute_merkle_root() {
-        block.header.merkle_root = root;
-    }
     let pos = proof.pos as usize;
-    if pos >= block.txdata.len() {
+    if pos >= ids.len() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "merkle pos out of range").into_response();
     }
-    // Match wire txid at store proof position (works when store id ≠ recomputed id).
-    let want = block.txdata[pos].compute_txid();
-    let mb = MerkleBlock::from_block_with_predicate(&block, |t| *t == want);
+    let mut header = match st.query.wire_header_at_height(Height(height)) {
+        Ok(h) => h,
+        Err(e) => return store_err(e),
+    };
+    header.merkle_root =
+        bitcoin::TxMerkleNode::from_byte_array(rbitcoin_store::merkle_root_from_txids(&ids));
+    let txids: Vec<bitcoin::Txid> = ids
+        .iter()
+        .copied()
+        .map(bitcoin::Txid::from_byte_array)
+        .collect();
+    let want = bitcoin::Txid::from_byte_array(txid);
+    let mb = MerkleBlock::from_header_txids_with_predicate(&header, &txids, |t| *t == want);
     let mut raw = Vec::new();
     if mb.consensus_encode(&mut raw).is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "merkleblock encode").into_response();
@@ -437,7 +436,7 @@ pub async fn tx_outspend(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        if st.query.get_tx_by_txid(&txid).ok().flatten().is_none() {
+        if st.query.tx_fk_by_txid(&txid).ok().flatten().is_none() {
             return not_found();
         }
         match outspend_json(&st.query, &txid, vout) {
@@ -453,14 +452,18 @@ pub async fn tx_outspends(State(st): State<AppState>, Path(txid_hex): Path<Strin
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        let Some((_fk, rec)) = (match st.query.get_tx_by_txid(&txid) {
+        let Some(fk) = (match st.query.tx_fk_by_txid(&txid) {
             Ok(v) => v,
             Err(e) => return store_err(e),
         }) else {
             return not_found();
         };
-        let mut arr = Vec::with_capacity(rec.output_count as usize);
-        for vout in 0..rec.output_count {
+        let (meta, _) = match st.query.store().get_tx_meta_and_outputs(fk) {
+            Ok(v) => v,
+            Err(e) => return store_err(e),
+        };
+        let mut arr = Vec::with_capacity(meta.output_count as usize);
+        for vout in 0..meta.output_count {
             match outspend_json(&st.query, &txid, vout) {
                 Ok(v) => arr.push(v),
                 Err(e) => return store_err(e),
@@ -481,20 +484,12 @@ fn outspend_json(
         return Ok(json!({ "spent": false }));
     }
     let p = &spenders[0];
-    let spend_tx = query.get_tx(p.spending_tx_fk)?;
+    let spend_txid = query.store().txs.body_txid(p.spending_tx_fk)?;
     let status = tx_status_json(query, p.spending_tx_fk)?;
-    let mut vin = p.spending_input_index;
-    if let Ok(wire) = query.reconstruct_tx(p.spending_tx_fk) {
-        if let Some(i) = wire.input.iter().position(|inp| {
-            inp.previous_output.txid.to_byte_array() == *txid && inp.previous_output.vout == vout
-        }) {
-            vin = i as u32;
-        }
-    }
     Ok(json!({
         "spent": true,
-        "txid": block_hash_hex(&spend_tx.txid),
-        "vin": vin,
+        "txid": block_hash_hex(&spend_txid),
+        "vin": p.spending_input_index,
         "status": status,
     }))
 }

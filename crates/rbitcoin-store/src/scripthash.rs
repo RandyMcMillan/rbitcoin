@@ -7,6 +7,7 @@
 use crate::compact::uleb128_len;
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
 #[cfg(test)]
@@ -19,7 +20,7 @@ use crate::scripthash_layout::{
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_HEAD_VALUE_LEN, SH_INLINE_CAP,
     SH_MAX_CLASS, SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
-use crate::scripthash_mphf::{self, MphfHead};
+use crate::scripthash_mphf::{self, mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
@@ -40,6 +41,7 @@ use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 
 /// Durable cold-materialize resume marker (next to `scripthash.head`).
@@ -273,8 +275,11 @@ pub struct ScriptHashTable {
     sorted_main: Box<[RwLock<Option<MphfHead>>]>,
     /// Global ingest OA for keys first seen after main seal (`scripthash.ovf/ingest`).
     ingest: Mutex<ScriptHashHead>,
-    /// Sealed global ovf (sorted+fuse+idx), newest last.
+    /// L0 sealed global ovf (`SHSR`+fuse), newest last.
     sealed_ovf: Mutex<Vec<SortedHead>>,
+    /// L1 promoted ovf (at most one MPHF+fuse per rematerialize lifetime).
+    ovf_l1: Mutex<Option<OvfL1>>,
+    l1_frozen_warned: AtomicBool,
     /// At least one sealed sorted main shard is installed.
     sorted_main_on: std::sync::atomic::AtomicBool,
     /// One alloc per `bodies` entry (Shared: len 1).
@@ -282,6 +287,14 @@ pub struct ScriptHashTable {
     /// Dir-variant ovf alloc. Shared: `None` (ovf uses `allocs[0]`).
     ovf_alloc: Option<Mutex<AllocState>>,
 }
+
+struct OvfL1 {
+    head: MphfHead,
+    fuse: SealedFuse8,
+}
+
+const SH_L1_FROZEN_WARN: &str =
+    "scripthash ovf L1 MPHF is frozen; wipe store/scripthash* and rematerialize (--shindex)";
 
 /// How `scripthash.body` is oriented on disk (schema 17 variant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +402,39 @@ fn open_sorted_main_shards(
 
 fn wrap_sorted_slots(v: Vec<Option<MphfHead>>) -> Box<[RwLock<Option<MphfHead>>]> {
     v.into_iter().map(RwLock::new).collect()
+}
+
+fn open_ovf_l1(dir: &Path) -> Result<Option<OvfL1>, StoreError> {
+    let ovf = dir.join("scripthash.ovf");
+    if !ovf.is_dir() {
+        return Ok(None);
+    }
+    let mut ids: Vec<u32> = std::fs::read_dir(&ovf)
+        .map_err(|e| StoreError::io(&ovf, e))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            name.strip_suffix(".mphf")?
+                .parse::<u32>()
+                .ok()
+                .filter(|_| name.len() == 6 + ".mphf".len())
+        })
+        .collect();
+    ids.sort_unstable();
+    let Some(&id) = ids.last() else {
+        return Ok(None);
+    };
+    let base = sealed_ovf_path(dir, id);
+    if !MphfHead::exists(&base) {
+        return Ok(None);
+    }
+    let head = MphfHead::open(&base)?;
+    let fuse = SealedFuse8::read_from(&{
+        let mut p = base.as_os_str().to_os_string();
+        p.push(".fuse8");
+        PathBuf::from(p)
+    })?;
+    Ok(Some(OvfL1 { head, fuse }))
 }
 
 fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError> {
@@ -544,6 +590,8 @@ impl ScriptHashTable {
             sorted_main: wrap_sorted_slots((0..n_shards).map(|_| None).collect()),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(Vec::new()),
+            ovf_l1: Mutex::new(None),
+            l1_frozen_warned: AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(false),
             allocs,
             ovf_alloc: Some(Mutex::new(ovf_st)),
@@ -601,6 +649,7 @@ impl ScriptHashTable {
         wipe_legacy_fullsize_overflow(dir)?;
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
         let sealed_ovf = open_sealed_sorted_ovf(dir)?;
+        let ovf_l1 = open_ovf_l1(dir)?;
         let sorted_on = sorted_main.iter().any(|s| s.is_some());
         let table = Self {
             store_dir: dir.to_path_buf(),
@@ -611,6 +660,8 @@ impl ScriptHashTable {
             sorted_main: wrap_sorted_slots(sorted_main),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(sealed_ovf),
+            ovf_l1: Mutex::new(ovf_l1),
+            l1_frozen_warned: AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(sorted_on),
             allocs,
             ovf_alloc,
@@ -817,6 +868,9 @@ impl ScriptHashTable {
         if !self.sealed_ovf.lock().unwrap().is_empty() {
             return false;
         }
+        if self.ovf_l1.lock().unwrap().is_some() {
+            return false;
+        }
         self.ingest.lock().unwrap().is_known_empty()
     }
 
@@ -967,6 +1021,9 @@ impl ScriptHashTable {
         if !self.sealed_ovf.lock().unwrap().is_empty() {
             return true;
         }
+        if self.ovf_l1.lock().unwrap().is_some() {
+            return true;
+        }
         false
     }
 
@@ -1002,6 +1059,14 @@ impl ScriptHashTable {
             if let Some(v) = h.get(&hk)? {
                 let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
                 return Ok(Some((v, KeyHome::SealedOvf)));
+            }
+        }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            if l1.fuse.contains(mix_key16(&hk)) {
+                if let Some(v) = l1.head.get(&hk)? {
+                    let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
+                    return Ok(Some((v, KeyHome::SealedOvf)));
+                }
             }
         }
         if self.has_sorted_main() {
@@ -1455,18 +1520,31 @@ impl ScriptHashTable {
         }
 
         if !sealed_ovf_ups.is_empty() {
-            let g = self.sealed_ovf.lock().unwrap();
-            for (key, val) in &sealed_ovf_ups {
-                let hk = head_key_from_full(key);
-                let mut hit = false;
-                for h in g.iter().rev() {
-                    if h.update_value(&hk, val)? {
-                        hit = true;
-                        break;
+            let mut missed: Vec<([u8; 32], ShHeadValue)> = Vec::new();
+            {
+                let g = self.sealed_ovf.lock().unwrap();
+                for (key, val) in &sealed_ovf_ups {
+                    let hk = head_key_from_full(key);
+                    let mut hit = false;
+                    for h in g.iter().rev() {
+                        if h.update_value(&hk, val)? {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if !hit {
+                        missed.push((*key, val.clone()));
                     }
                 }
+            }
+            for (key, val) in missed {
+                let hk = head_key_from_full(&key);
+                let mut hit = false;
+                if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                    hit = l1.head.update_value(&hk, &val)?;
+                }
                 if !hit {
-                    ingest_ups.push((*key, val.clone()));
+                    ingest_ups.push((key, val));
                 }
             }
         }
@@ -1532,6 +1610,13 @@ impl ScriptHashTable {
     const SEALED_OVF_COMPACT_FILES: usize = 8;
 
     fn maybe_compact_sealed_ovf(&self) -> Result<(), StoreError> {
+        if self.ovf_l1.lock().unwrap().is_some() {
+            let n = self.sealed_ovf.lock().unwrap().len();
+            if n >= Self::SEALED_OVF_COMPACT_FILES {
+                self.warn_l1_frozen();
+            }
+            return Ok(());
+        }
         let n = self.sealed_ovf.lock().unwrap().len();
         if n >= Self::SEALED_OVF_COMPACT_FILES {
             self.compact_sealed_ovf()?;
@@ -1539,9 +1624,23 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    fn warn_l1_frozen(&self) {
+        if self
+            .l1_frozen_warned
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            rbitcoin_log::warn!("store: {SH_L1_FROZEN_WARN}");
+        }
+    }
+
     /// K-way merge of sealed global ovf heads. Body offs unchanged. Readers
     /// keep the old `Vec` until this lock is released after rename.
     pub fn compact_sealed_ovf(&self) -> Result<(), StoreError> {
+        if self.ovf_l1.lock().unwrap().is_some() {
+            self.warn_l1_frozen();
+            return Ok(());
+        }
         let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> =
             Vec::new();
         let old_paths: Vec<PathBuf> = {
@@ -1579,12 +1678,26 @@ impl ScriptHashTable {
                 .saturating_add(1)
         };
         let path = sealed_ovf_path(&self.store_dir, id);
-        let merged = SortedHead::write(&path, &recs, SortedHeadFilter::Fuse8)?;
+        let packed: Vec<(crate::scripthash_layout::ShHeadKey, u64)> = recs
+            .iter()
+            .map(|(k, raw)| (*k, u64::from_le_bytes(*raw)))
+            .collect();
+        let head = MphfHead::write_pack8(&path, &packed)?;
+        let mut fuse_keys: Vec<u64> = packed.iter().map(|(k, _)| mix_key16(k)).collect();
+        fuse_keys.sort_unstable();
+        fuse_keys.dedup();
+        let fuse = SealedFuse8::build(&fuse_keys)?;
+        {
+            let mut fp = path.as_os_str().to_os_string();
+            fp.push(".fuse8");
+            fuse.write_to(&PathBuf::from(fp))?;
+        }
         let old = {
             let mut g = self.sealed_ovf.lock().unwrap();
-            std::mem::replace(&mut *g, vec![merged])
+            std::mem::take(&mut *g)
         };
         drop(old);
+        *self.ovf_l1.lock().unwrap() = Some(OvfL1 { head, fuse });
         for p in old_paths {
             let _ = std::fs::remove_file(&p);
             let mut idx = p.as_os_str().to_os_string();
@@ -2012,6 +2125,14 @@ impl ScriptHashTable {
                         break;
                     }
                 }
+                drop(g);
+                if !hit {
+                    if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                        if l1.head.update_value(&hk, &new_val)? {
+                            hit = true;
+                        }
+                    }
+                }
                 if !hit {
                     return Err(StoreError::Corrupt(
                         "scripthash: sealed ovf unlink missed home",
@@ -2034,6 +2155,9 @@ impl ScriptHashTable {
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
         }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            l1.head.flush()?;
+        }
         Ok(())
     }
 
@@ -2043,6 +2167,9 @@ impl ScriptHashTable {
         self.ingest.lock().unwrap().flush_async()?;
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
+        }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            l1.head.flush()?;
         }
         Ok(())
     }
@@ -3993,11 +4120,37 @@ mod tests {
             assert_eq!(t.sealed_ovf.lock().unwrap().len(), 2, "second ingest seal");
 
             t.compact_sealed_ovf().unwrap();
-            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+            assert_eq!(
+                t.sealed_ovf.lock().unwrap().len(),
+                0,
+                "L0 unlinked after promote"
+            );
+            assert!(
+                t.ovf_l1.lock().unwrap().is_some(),
+                "compact promotes L1 MPHF"
+            );
             assert_eq!(t.entries(&first_new).unwrap().len(), 1);
             assert_eq!(t.entries(&second_new).unwrap().len(), 1);
             assert_eq!(t.entries(&sh_main).unwrap().len(), 1);
             assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+            assert!(matches!(
+                t.key_home(&first_new).unwrap(),
+                KeyHome::SealedOvf
+            ));
+
+            t.compact_sealed_ovf().unwrap();
+            assert!(t.ovf_l1.lock().unwrap().is_some());
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 0);
+            assert_eq!(t.entries(&first_new).unwrap().len(), 1);
+
+            for i in 0..210u32 {
+                let sh = script_hash(&[0xa3, (i & 0xff) as u8, (i >> 8) as u8, 0x03]);
+                t.put_create(&rec(sh, 3000 + u64::from(i), 0)).unwrap();
+            }
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+            t.compact_sealed_ovf().unwrap();
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "L1 frozen: L0 stays");
+            assert_eq!(t.entries(&first_new).unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }

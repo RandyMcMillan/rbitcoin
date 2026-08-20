@@ -1868,7 +1868,7 @@ pub fn headers_timeout_noban_log(peer: u64) -> String {
     format!("Timeout downloading headers from noban peer, not disconnecting peer={peer}")
 }
 
-/// Core `p2p_blocksonly.py` debug.log needle. Per-item; emit at **debug**.
+/// Core `p2p_blocksonly.py` debug.log needle. Per-item; emit at **trace**.
 pub fn received_getdata_wtx_log(wtxid: impl std::fmt::Display, peer: u64) -> String {
     format!("received getdata for: wtx {wtxid} peer={peer}")
 }

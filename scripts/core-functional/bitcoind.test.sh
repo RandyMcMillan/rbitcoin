@@ -87,6 +87,16 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# TestNode always passes -debug and -loglevel=trace; take the more verbose.
+OUTT="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -debug -loglevel=trace 2>/dev/null)"
+if printf '%s' "$OUTT" | grep -q -- "--log-level trace"; then
+  echo "ok - print-cmd maps -debug -loglevel=trace to --log-level trace"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - print-cmd maps -debug -loglevel=trace (got: $OUTT)"
+  FAIL=$((FAIL + 1))
+fi
+
 # CLI -rpcport / -port override conf; -v2transport=0 ignored (we force v2).
 OUT2="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -rpcport=19111 -port=19222 -v2transport=0 -disablewallet -server \

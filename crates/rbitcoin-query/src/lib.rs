@@ -2835,6 +2835,15 @@ mod tests {
             hist.iter().find(|i| i.txid == spend_txid).unwrap().height,
             1
         );
+        assert_eq!(
+            hist.iter().find(|i| i.txid == create_txid).unwrap().tx_fk,
+            create_fk
+        );
+        let spend_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+        assert_eq!(
+            hist.iter().find(|i| i.txid == spend_txid).unwrap().tx_fk,
+            spend_fk
+        );
 
         let utxos = q.scripthash_listunspent(&sh).unwrap();
         assert_eq!(utxos.len(), 1);

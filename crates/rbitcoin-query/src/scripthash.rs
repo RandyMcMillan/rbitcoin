@@ -32,6 +32,8 @@ pub struct ScriptHashOutpoint {
 pub struct ScriptHashHistoryItem {
     pub height: i64,
     pub txid: [u8; 32],
+    /// Class A create fk when known (confirmed SH join). `NULL` for mempool-only rows.
+    pub tx_fk: rbitcoin_primitives::Fk,
 }
 
 /// Sort order for [`apply_history_filter`].
@@ -188,6 +190,7 @@ pub struct ScriptHashChainStats {
 }
 
 pub(crate) struct ShSpender {
+    fk: Fk,
     txid: [u8; 32],
     height: u32,
 }
@@ -452,7 +455,11 @@ impl Query {
                     let Some((txid, height)) = id_by_fk.get(fk).copied() else {
                         return Err(StoreError::Corrupt("invariant: SH spender identity miss"));
                     };
-                    spenders.push(ShSpender { txid, height });
+                    spenders.push(ShSpender {
+                        fk: *fk,
+                        txid,
+                        height,
+                    });
                 }
             }
             out.push(ShJoinedOut {
@@ -488,7 +495,7 @@ impl Query {
         filter: &HistoryFilter,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
         let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY)?;
-        let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+        let mut by_txid: BTreeMap<[u8; 32], (i64, Fk)> = BTreeMap::new();
         let to_excl = filter.to_height;
         for rec in joined {
             if let Some(to) = to_excl {
@@ -496,25 +503,41 @@ impl Query {
                     continue;
                 }
             }
+            let ch = i64::from(rec.out.create_height);
             by_txid
                 .entry(rec.out.txid)
-                .and_modify(|h| *h = (*h).min(i64::from(rec.out.create_height)))
-                .or_insert(i64::from(rec.out.create_height));
+                .and_modify(|(h, fk)| {
+                    if ch < *h {
+                        *h = ch;
+                        *fk = rec.out.create_tx_fk;
+                    }
+                })
+                .or_insert((ch, rec.out.create_tx_fk));
             for sp in rec.spenders {
                 if let Some(to) = to_excl {
                     if i64::from(sp.height) >= to {
                         continue;
                     }
                 }
+                let sh = i64::from(sp.height);
                 by_txid
                     .entry(sp.txid)
-                    .and_modify(|h| *h = (*h).min(i64::from(sp.height)))
-                    .or_insert(i64::from(sp.height));
+                    .and_modify(|(h, fk)| {
+                        if sh < *h {
+                            *h = sh;
+                            *fk = sp.fk;
+                        }
+                    })
+                    .or_insert((sh, sp.fk));
             }
         }
         let items: Vec<ScriptHashHistoryItem> = by_txid
             .into_iter()
-            .map(|(txid, height)| ScriptHashHistoryItem { height, txid })
+            .map(|(txid, (height, tx_fk))| ScriptHashHistoryItem {
+                height,
+                txid,
+                tx_fk,
+            })
             .collect();
         Ok(apply_history_filter(&items, filter))
     }
@@ -690,7 +713,11 @@ mod history_filter_tests {
     fn item(height: i64, txid0: u8) -> ScriptHashHistoryItem {
         let mut txid = [0u8; 32];
         txid[0] = txid0;
-        ScriptHashHistoryItem { height, txid }
+        ScriptHashHistoryItem {
+            height,
+            txid,
+            tx_fk: Fk::NULL,
+        }
     }
 
     #[test]

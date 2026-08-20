@@ -5,7 +5,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::Network;
 use rbitcoin_primitives::hex_encode;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{Query, QueryError, ScriptHashUtxo};
+use rbitcoin_query::{Query, QueryError, ScriptHashHistoryItem, ScriptHashUtxo};
 use rbitcoin_store::InputRecord;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -89,6 +89,22 @@ pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, Q
         .collect();
     serde_json::to_value(rows)
         .map_err(|_| rbitcoin_store::StoreError::Corrupt("invariant: utxo json").into())
+}
+
+/// Confirmed history rows → Esplora tx JSON using join fks (no `tx.head`).
+pub fn history_items_to_tx_json(
+    query: &Query,
+    items: &[ScriptHashHistoryItem],
+    network: Network,
+) -> Result<Vec<Value>, QueryError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.tx_fk.is_null() {
+            continue;
+        }
+        out.push(build_tx_json(query, item.tx_fk, network)?);
+    }
+    Ok(out)
 }
 
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).

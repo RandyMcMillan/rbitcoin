@@ -7,7 +7,7 @@ use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::MempoolHub;
-use rbitcoin_primitives::Height;
+use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::{HistoryFilter, Query};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
@@ -813,6 +813,7 @@ fn dispatch(
                         hist.push(rbitcoin_query::ScriptHashHistoryItem {
                             height: item.height,
                             txid: item.txid,
+                            tx_fk: Fk::NULL,
                         });
                     }
                 }
@@ -1166,6 +1167,7 @@ fn scripthash_status_full(query: &Query, mp: &MempoolHub, sh: &[u8; 32]) -> Resu
         hist.push(rbitcoin_query::ScriptHashHistoryItem {
             height: item.height,
             txid: item.txid,
+            tx_fk: Fk::NULL,
         });
     }
     hist.sort_by_key(|i| i.height);
@@ -1257,6 +1259,7 @@ mod tests {
         let status = scripthash_status(&[rbitcoin_query::ScriptHashHistoryItem {
             height: 1,
             txid: [1u8; 32],
+            tx_fk: Fk::NULL,
         }]);
         assert_eq!(status.len(), 64);
 

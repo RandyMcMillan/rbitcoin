@@ -1,7 +1,7 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{block_hash_hex, not_found, parse_hash32, plain_ok, store_err, AppState};
-use crate::tx_json::{build_tx_json, tx_status_json, utxo_list_json};
+use crate::tx_json::{build_tx_json, history_items_to_tx_json, tx_status_json, utxo_list_json};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -649,7 +649,10 @@ fn chain_page(st: &AppState, sh_hex: &str, after: Option<[u8; 32]>) -> Response 
 fn chain_page_sh(st: &AppState, sh: &[u8; 32], after: Option<[u8; 32]>) -> Response {
     let filter = HistoryFilter::esplora_chain_page(after);
     match st.query.scripthash_history_filtered(sh, &filter) {
-        Ok(items) => hist_to_tx_json(st, &items),
+        Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
         Err(e) => store_err(e),
     }
 }
@@ -675,33 +678,15 @@ fn combined_txs(st: &AppState, sh: &[u8; 32]) -> Response {
     }
     let filter = HistoryFilter::esplora_chain_page(None);
     match st.query.scripthash_history_filtered(sh, &filter) {
-        Ok(items) => {
-            for item in items {
-                if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&item.txid) {
-                    if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
-                        out.push(v);
-                    }
-                }
+        Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
+            Ok(chain) => {
+                out.extend(chain);
+                Json(out).into_response()
             }
-            Json(out).into_response()
-        }
+            Err(e) => store_err(e),
+        },
         Err(e) => store_err(e),
     }
-}
-
-fn hist_to_tx_json(st: &AppState, items: &[rbitcoin_query::ScriptHashHistoryItem]) -> Response {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match st.query.get_tx_by_txid(&item.txid) {
-            Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network) {
-                Ok(v) => out.push(v),
-                Err(e) => return store_err(e),
-            },
-            Ok(None) => continue,
-            Err(e) => return store_err(e),
-        }
-    }
-    Json(out).into_response()
 }
 
 pub async fn mempool_info(State(st): State<AppState>) -> Response {

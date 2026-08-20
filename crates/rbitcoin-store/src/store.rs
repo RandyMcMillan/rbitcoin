@@ -279,14 +279,14 @@ impl Store {
         if meta_ver == 16 && SCHEMA_VERSION >= 17 {
             rewrite_meta_current(&path)?;
         }
-        let inwit_dir = resolve_inwit_dir(&layout)?;
-        let txs = TxTable::open_inwit(&path, &inwit_dir)?;
         if meta_ver == 17 {
             if schema17_index_data_present(&path) {
                 return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
             }
             rewrite_meta_current(&path)?;
         }
+        let inwit_dir = resolve_inwit_dir(&layout)?;
+        let txs = TxTable::open_inwit(&path, &inwit_dir)?;
         if layout.is_split() {
             write_inwit_reloc(&path)?;
         }
@@ -2030,6 +2030,26 @@ mod tests {
         }
         assert_eq!(read_store_meta_ver(&dir), 17);
         assert!(dir.join("txout.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wiped 17 indexes + Class A: bump meta to 18 *before* head rebuild.
+    /// Occupancy after rebuild must not trip the 17-index refuse.
+    #[test]
+    fn open_schema17_wiped_indexes_rebuilds_head_and_bumps_meta() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+        write_store_meta_ver(&dir, 17);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.get_fk_by_txid(&[0x22u8; 32]).unwrap(), Some(Fk(1)));
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

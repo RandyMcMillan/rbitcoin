@@ -432,7 +432,62 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    static OCCUPY: Mutex<()> = Mutex::new(());
+
+    struct OccupyGate {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        _occupy: MutexGuard<'static, ()>,
+    }
+
+    impl OccupyGate {
+        fn occupy_all() -> Self {
+            let occupy = OCCUPY.lock().unwrap_or_else(|p| p.into_inner());
+            let n = worker_spawn_count();
+            assert!(n >= 1);
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let me = Self {
+                gate: Arc::clone(&gate),
+                _occupy: occupy,
+            };
+            let entered = Arc::new(AtomicUsize::new(0));
+            for _ in 0..n {
+                let entered = Arc::clone(&entered);
+                let gate = Arc::clone(&gate);
+                spawn_detached(move || {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    let (lock, cv) = &*gate;
+                    let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    while !*g {
+                        g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                    }
+                });
+            }
+            let start = Instant::now();
+            while entered.load(Ordering::SeqCst) < n {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "failed to occupy steal workers"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            me
+        }
+
+        fn release(&self) {
+            let (lock, cv) = &*self.gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+    }
+
+    impl Drop for OccupyGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     #[test]
     fn parallel_all_ok_and_counts() {
@@ -500,9 +555,6 @@ mod tests {
     /// waiter is in recv; the rest block on `lock()` and do not count as idle.
     #[test]
     fn pool_waiters_run_concurrently() {
-        use std::sync::{Arc, Condvar, Mutex};
-        use std::time::{Duration, Instant};
-
         let n = worker_spawn_count();
         assert!(n >= 1);
         let start = Instant::now();
@@ -514,39 +566,10 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
-        let inside = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let done = Arc::new(AtomicUsize::new(0));
-        for _ in 0..n {
-            let inside = Arc::clone(&inside);
-            let gate = Arc::clone(&gate);
-            let done = Arc::clone(&done);
-            spawn_detached(move || {
-                inside.fetch_add(1, Ordering::SeqCst);
-                let (lock, cv) = &*gate;
-                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
-                while !*g {
-                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
-                }
-                done.fetch_add(1, Ordering::SeqCst);
-            });
-        }
+        let occupy = OccupyGate::occupy_all();
+        occupy.release();
         let start = Instant::now();
-        while inside.load(Ordering::SeqCst) < n {
-            assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "only {} of {n} workers entered a job (recv mutex serializes waiters)",
-                inside.load(Ordering::SeqCst)
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        {
-            let (lock, cv) = &*gate;
-            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
-            cv.notify_all();
-        }
-        let start = Instant::now();
-        while done.load(Ordering::SeqCst) < n {
+        while idle_waiter_count() < n {
             assert!(
                 start.elapsed() < Duration::from_secs(1),
                 "workers did not finish after release"
@@ -692,32 +715,7 @@ mod tests {
     /// like a foreground wave, the job never runs (items wait on it).
     #[test]
     fn idle_wave_does_not_starve_detached_job() {
-        use std::time::{Duration, Instant};
-
-        let n = worker_spawn_count();
-        assert!(n >= 1);
-        let entered = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..n {
-            let entered = Arc::clone(&entered);
-            let gate = Arc::clone(&gate);
-            spawn_detached(move || {
-                entered.fetch_add(1, Ordering::SeqCst);
-                let (lock, cv) = &*gate;
-                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
-                while !*g {
-                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
-                }
-            });
-        }
-        let start = Instant::now();
-        while entered.load(Ordering::SeqCst) < n {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "failed to occupy steal workers"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        let occupy = OccupyGate::occupy_all();
 
         let job2 = Arc::new(AtomicBool::new(false));
         let idle_hits = Arc::new(AtomicUsize::new(0));
@@ -743,11 +741,7 @@ mod tests {
         spawn_detached(move || {
             job2_flag.store(true, Ordering::SeqCst);
         });
-        {
-            let (lock, cv) = &*gate;
-            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
-            cv.notify_all();
-        }
+        occupy.release();
         let start = Instant::now();
         while !job2.load(Ordering::SeqCst) {
             assert!(
@@ -762,32 +756,7 @@ mod tests {
 
     #[test]
     fn idle_wave_does_not_starve_foreground_wave() {
-        use std::time::{Duration, Instant};
-
-        let n = worker_spawn_count();
-        assert!(n >= 1);
-        let entered = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..n {
-            let entered = Arc::clone(&entered);
-            let gate = Arc::clone(&gate);
-            spawn_detached(move || {
-                entered.fetch_add(1, Ordering::SeqCst);
-                let (lock, cv) = &*gate;
-                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
-                while !*g {
-                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
-                }
-            });
-        }
-        let start = Instant::now();
-        while entered.load(Ordering::SeqCst) < n {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "failed to occupy steal workers"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        let occupy = OccupyGate::occupy_all();
 
         let fg_done = Arc::new(AtomicBool::new(false));
         let items: Vec<u32> = (0..64).collect();
@@ -818,13 +787,22 @@ mod tests {
             fg_flag.store(true, Ordering::SeqCst);
             r
         });
-        {
-            let (lock, cv) = &*gate;
-            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
-            cv.notify_all();
-        }
+        occupy.release();
         fg.join().expect("fg thread").expect("fg ok");
         assert_eq!(fg_hits.load(Ordering::Relaxed), 32);
         idle.join().expect("idle thread").expect("idle ok");
+    }
+
+    #[test]
+    fn panic_while_workers_occupied_does_not_deadlock_pool() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gate = OccupyGate::occupy_all();
+            panic!("occupy test boom");
+        }));
+        std::panic::set_hook(prev);
+        assert!(panicked.is_err());
+        try_for_each_parallel(&[1u32, 2, 3, 4], |_| Ok(())).unwrap();
     }
 }

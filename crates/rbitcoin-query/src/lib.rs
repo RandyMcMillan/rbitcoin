@@ -2870,6 +2870,16 @@ mod tests {
         assert_eq!(stats.spent_txo_count, 1);
         assert_eq!(stats.spent_txo_sum, 10_0000_0000);
         assert_eq!(body_ok_reads(), 1);
+        let stats_join = q
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS)
+            .unwrap();
+        assert!(
+            stats_join.iter().all(|r| r.spenders.is_empty()),
+            "chain_stats join must skip spender identity"
+        );
+        assert!(stats_join
+            .iter()
+            .any(|r| r.spent && !r.spender_fks.is_empty()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

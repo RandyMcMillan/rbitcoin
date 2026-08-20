@@ -195,6 +195,7 @@ pub(crate) struct ShSpender {
 pub(crate) struct ShJoinedOut {
     pub(crate) out: ScriptHashOutpoint,
     pub(crate) spent: bool,
+    pub(crate) spender_fks: Vec<Fk>,
     pub(crate) spenders: Vec<ShSpender>,
 }
 
@@ -218,10 +219,7 @@ impl ShJoinNeed {
         create_identity: false,
         spender_identity: false,
     };
-    pub(crate) const CHAIN_STATS: Self = Self {
-        create_identity: true,
-        spender_identity: true,
-    };
+    pub(crate) const CHAIN_STATS: Self = Self::BALANCE;
 }
 
 impl std::fmt::Display for ShJoinNeed {
@@ -374,6 +372,7 @@ impl Query {
                 .map(|out| ShJoinedOut {
                     out,
                     spent: false,
+                    spender_fks: Vec::new(),
                     spenders: Vec::new(),
                 })
                 .collect());
@@ -459,6 +458,7 @@ impl Query {
             out.push(ShJoinedOut {
                 out: c.clone(),
                 spent,
+                spender_fks: per_out[i].clone(),
                 spenders,
             });
         }
@@ -644,21 +644,21 @@ impl Query {
         let mut funded_sum = 0i64;
         let mut spent_n = 0u32;
         let mut spent_sum = 0i64;
-        let mut txids: HashSet<[u8; 32]> = HashSet::new();
+        let mut txs: HashSet<Fk> = HashSet::new();
         for rec in joined {
             funded_n = funded_n.saturating_add(1);
             funded_sum = funded_sum.saturating_add(rec.out.value);
-            txids.insert(rec.out.txid);
+            txs.insert(rec.out.create_tx_fk);
             if self.join_out_spent(&rec)? {
                 spent_n = spent_n.saturating_add(1);
                 spent_sum = spent_sum.saturating_add(rec.out.value);
-                for sp in rec.spenders {
-                    txids.insert(sp.txid);
+                for fk in rec.spender_fks {
+                    txs.insert(fk);
                 }
             }
         }
         Ok(ScriptHashChainStats {
-            tx_count: txids.len() as u32,
+            tx_count: txs.len() as u32,
             funded_txo_count: funded_n,
             funded_txo_sum: funded_sum,
             spent_txo_count: spent_n,
@@ -684,7 +684,7 @@ mod history_filter_tests {
         assert_eq!(ShJoinNeed::HISTORY.to_string(), "cs");
         assert_eq!(ShJoinNeed::LISTUNSPENT.to_string(), "c");
         assert_eq!(ShJoinNeed::BALANCE.to_string(), "-");
-        assert_eq!(ShJoinNeed::CHAIN_STATS.to_string(), "cs");
+        assert_eq!(ShJoinNeed::CHAIN_STATS.to_string(), "-");
     }
 
     fn item(height: i64, txid0: u8) -> ScriptHashHistoryItem {

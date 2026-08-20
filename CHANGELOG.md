@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
+  `unpark` permit (wave publish / detached job). A worker that misses steal
+  and parks after the wake still runs the work. Jobs mutex stays the
+  detached-job queue only.
+
 ### Added
 
 - **`rbitcoin-bench`:** optional Electrum/Esplora **client** benchmark (not

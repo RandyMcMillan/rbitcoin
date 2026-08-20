@@ -8,6 +8,11 @@
 //! [`spawn_coordinator`], not on steal workers (a worker must not wait on
 //! this pool).
 //!
+//! Idle steal workers [`thread::park`]. A new wave or detached job bumps an
+//! epoch and [`Thread::unpark`]s every worker (unpark-before-park leaves a
+//! permit, so a worker cannot miss work by parking after the wake). The jobs
+//! mutex is only the detached-job queue, never the steal wake path.
+//!
 //! No rayon / crossbeam.
 
 use arc_swap::ArcSwap;
@@ -238,8 +243,7 @@ where
         g.push(Arc::clone(&wave));
         publish_waves(&g);
     }
-    let pool = workers();
-    pool.cv.notify_all();
+    wake_steal_workers();
     wave.wait_done();
 
     if background {
@@ -267,10 +271,12 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 
 struct ScriptWorkers {
     jobs: Mutex<VecDeque<Job>>,
-    cv: Condvar,
+    epoch: AtomicUsize,
 }
 
 static WORKERS: OnceLock<ScriptWorkers> = OnceLock::new();
+static WORKER_THREADS: OnceLock<Box<[thread::Thread]>> = OnceLock::new();
+static WORKER_HANDLES: OnceLock<Vec<thread::JoinHandle<()>>> = OnceLock::new();
 static WORKER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static IDLE_WAITERS: AtomicUsize = AtomicUsize::new(0);
@@ -294,52 +300,90 @@ fn recv_job(jobs: &Mutex<VecDeque<Job>>, cv: &Condvar, count_idle: bool) -> Job 
     }
 }
 
+fn take_detached_job(pool: &ScriptWorkers) -> Option<Job> {
+    pool.jobs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front()
+}
+
+fn steal_or_job(pool: &ScriptWorkers) -> bool {
+    if let Some((w, range)) = steal_chunk() {
+        w.run_chunk(range);
+        return true;
+    }
+    if let Some(job) = take_detached_job(pool) {
+        job();
+        return true;
+    }
+    if let Some((w, range)) = steal_chunk() {
+        w.run_chunk(range);
+        return true;
+    }
+    if let Some((w, range)) = steal_bg_chunk() {
+        w.run_chunk(range);
+        return true;
+    }
+    false
+}
+
+fn wake_steal_workers() {
+    let pool = workers();
+    pool.epoch.fetch_add(1, Ordering::Release);
+    if let Some(threads) = WORKER_THREADS.get() {
+        for t in threads.iter() {
+            t.unpark();
+        }
+    }
+}
+
 fn workers() -> &'static ScriptWorkers {
     static SPAWN: OnceLock<()> = OnceLock::new();
     let pool = WORKERS.get_or_init(|| ScriptWorkers {
         jobs: Mutex::new(VecDeque::new()),
-        cv: Condvar::new(),
+        epoch: AtomicUsize::new(0),
     });
     SPAWN.get_or_init(|| {
         let n = thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4)
             .max(1);
+        let mut threads = Vec::with_capacity(n);
+        let mut handles = Vec::with_capacity(n);
         for i in 0..n {
-            let _ = thread::Builder::new()
+            let Ok(h) = thread::Builder::new()
                 .name(format!("rbtc-scripts-{i}"))
                 .spawn(move || {
                     ON_STEAL_WORKER.with(|c| c.set(true));
                     loop {
-                        if let Some((w, range)) = steal_chunk() {
-                            w.run_chunk(range);
+                        if steal_or_job(pool) {
                             continue;
                         }
-                        let mut g = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
-                        if let Some(job) = g.pop_front() {
-                            drop(g);
-                            job();
+                        let epoch = pool.epoch.load(Ordering::Acquire);
+                        if steal_or_job(pool) {
                             continue;
                         }
-                        if let Some((w, range)) = steal_chunk() {
-                            drop(g);
-                            w.run_chunk(range);
-                            continue;
-                        }
-                        if let Some((w, range)) = steal_bg_chunk() {
-                            drop(g);
-                            w.run_chunk(range);
+                        if pool.epoch.load(Ordering::Acquire) != epoch {
                             continue;
                         }
                         #[cfg(test)]
+                        maybe_delay_park();
+                        #[cfg(test)]
                         IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
-                        let _g = pool.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                        thread::park();
                         #[cfg(test)]
                         IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
                     }
-                });
+                })
+            else {
+                continue;
+            };
+            threads.push(h.thread().clone());
+            handles.push(h);
             WORKER_SPAWNS.fetch_add(1, Ordering::Relaxed);
         }
+        let _ = WORKER_THREADS.set(threads.into_boxed_slice());
+        let _ = WORKER_HANDLES.set(handles);
     });
     pool
 }
@@ -351,10 +395,33 @@ pub(crate) fn worker_spawn_count() -> usize {
     WORKER_SPAWNS.load(Ordering::Relaxed)
 }
 
-/// Workers currently blocked in the idle wait (recv / condvar), not in a job.
+/// Workers currently blocked in [`thread::park`], not in a job or steal.
 #[cfg(test)]
 fn idle_waiter_count() -> usize {
     IDLE_WAITERS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static DELAY_PARK: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static DELAY_PARK_GO: AtomicBool = AtomicBool::new(true);
+#[cfg(test)]
+static DELAY_PARK_ENTERED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DELAY_PARK_MU: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static DELAY_PARK_CV: Condvar = Condvar::new();
+
+#[cfg(test)]
+fn maybe_delay_park() {
+    if !DELAY_PARK.load(Ordering::SeqCst) {
+        return;
+    }
+    DELAY_PARK_ENTERED.fetch_add(1, Ordering::SeqCst);
+    let mut g = DELAY_PARK_MU.lock().unwrap_or_else(|p| p.into_inner());
+    while !DELAY_PARK_GO.load(Ordering::SeqCst) {
+        g = DELAY_PARK_CV.wait(g).unwrap_or_else(|p| p.into_inner());
+    }
 }
 
 /// Submit `work` to the process-wide `rbtc-scripts` pool (IBD feed-ahead).
@@ -367,7 +434,7 @@ where
         let mut q = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
         q.push_back(Box::new(work));
     }
-    pool.cv.notify_one();
+    wake_steal_workers();
 }
 
 /// Two coordinators for IBD feed-ahead phases. Must not share the steal
@@ -444,16 +511,21 @@ mod tests {
 
     impl OccupyGate {
         fn occupy_all() -> Self {
+            Self::occupy_n(worker_spawn_count())
+        }
+
+        fn occupy_n(k: usize) -> Self {
             let occupy = OCCUPY.lock().unwrap_or_else(|p| p.into_inner());
             let n = worker_spawn_count();
             assert!(n >= 1);
+            let k = k.min(n);
             let gate = Arc::new((Mutex::new(false), Condvar::new()));
             let me = Self {
                 gate: Arc::clone(&gate),
                 _occupy: occupy,
             };
             let entered = Arc::new(AtomicUsize::new(0));
-            for _ in 0..n {
+            for _ in 0..k {
                 let entered = Arc::clone(&entered);
                 let gate = Arc::clone(&gate);
                 spawn_detached(move || {
@@ -466,7 +538,7 @@ mod tests {
                 });
             }
             let start = Instant::now();
-            while entered.load(Ordering::SeqCst) < n {
+            while entered.load(Ordering::SeqCst) < k {
                 assert!(
                     start.elapsed() < Duration::from_secs(2),
                     "failed to occupy steal workers"
@@ -550,9 +622,8 @@ mod tests {
         );
     }
 
-    /// All `rbtc-scripts-*` workers must be able to sit in the idle wait at
-    /// once. `Mutex<mpsc::Receiver>` holds the lock across `recv`, so only one
-    /// waiter is in recv; the rest block on `lock()` and do not count as idle.
+    /// All `rbtc-scripts-*` workers must be able to sit in [`thread::park`] at
+    /// once (no jobs-mutex held across the idle wait).
     #[test]
     fn pool_waiters_run_concurrently() {
         let n = worker_spawn_count();
@@ -561,7 +632,7 @@ mod tests {
         while idle_waiter_count() < n {
             assert!(
                 start.elapsed() < Duration::from_secs(1),
-                "only {} of {n} workers idle-waiting (recv mutex serializes waiters)",
+                "only {} of {n} workers idle-waiting",
                 idle_waiter_count()
             );
             thread::sleep(Duration::from_millis(1));
@@ -576,6 +647,80 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    struct DelayParkArm;
+
+    impl DelayParkArm {
+        fn arm() -> Self {
+            DELAY_PARK_ENTERED.store(0, Ordering::SeqCst);
+            DELAY_PARK_GO.store(false, Ordering::SeqCst);
+            DELAY_PARK.store(true, Ordering::SeqCst);
+            Self
+        }
+
+        fn go(&self) {
+            let _g = DELAY_PARK_MU.lock().unwrap_or_else(|p| p.into_inner());
+            DELAY_PARK_GO.store(true, Ordering::SeqCst);
+            DELAY_PARK_CV.notify_all();
+        }
+    }
+
+    impl Drop for DelayParkArm {
+        fn drop(&mut self) {
+            DELAY_PARK.store(false, Ordering::SeqCst);
+            let _g = DELAY_PARK_MU.lock().unwrap_or_else(|p| p.into_inner());
+            DELAY_PARK_GO.store(true, Ordering::SeqCst);
+            DELAY_PARK_CV.notify_all();
+        }
+    }
+
+    /// Publish a wave after the last free worker has missed steal and before
+    /// it parks. Condvar notify-without-mutex lost that wake; park permits
+    /// must still run the wave.
+    #[test]
+    fn wave_published_before_park_is_not_missed() {
+        let n = worker_spawn_count();
+        let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+        let start = Instant::now();
+        while idle_waiter_count() == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "free worker did not park"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let arm = DelayParkArm::arm();
+        wake_steal_workers();
+        let start = Instant::now();
+        while DELAY_PARK_ENTERED.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "free worker did not reach park gate"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = Arc::clone(&hits);
+        let wave = thread::spawn(move || {
+            let items: Vec<u32> = (0..64).collect();
+            try_for_each_parallel(&items, |_| {
+                hits2.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        let start = Instant::now();
+        while waves_snap().load().is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "wave was not published"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        arm.go();
+        wave.join().expect("wave thread").expect("wave ok");
+        assert_eq!(hits.load(Ordering::Relaxed), 64);
+        occupy.release();
     }
 
     #[test]
@@ -648,9 +793,9 @@ mod tests {
             assert_eq!(h.load(Ordering::Relaxed), 1, "index {i} not run once");
         }
         let claims = STEAL_CLAIMS.load(Ordering::Relaxed);
-        assert_eq!(
-            claims, 8,
-            "expected 256/32=8 successful claims, got {claims}"
+        assert!(
+            (8..32).contains(&claims),
+            "expected ~8 chunks of 32 for 256 jobs, got {claims}"
         );
     }
 

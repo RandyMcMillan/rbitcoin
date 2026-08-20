@@ -428,7 +428,7 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
-| Capacity | Segment ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`** → open next OA, seal previous on a sidecar |
+| Capacity | Segment ends at **80% of head slots** (`max_keys`) → open next OA, seal previous on a sidecar. Idx 16 GiB soft-span does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode (open migrates to v2 from Class A; does **not** wipe head) |
 | Probe | Open OA: page-local double-hash (1024 slots/page); one 4 KiB load. Sealed: RAM fuse skip, then unique 4 KiB BDZ `g` pages (not loaded into process heap) + `.rel` pread |
@@ -450,9 +450,9 @@ non-tails is **Corrupt**.
 
 **Wipe / empty-head rebuild:** writes MPHF+fuse8 **directly** from `txid.body` on the
 open thread (no historical OA). Default range **2²⁶ keys** (`RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS=26`);
-**25** is low-RAM. Soft-span may shorten a range. Remainder is sealed; an empty
-open tail is created. Live IBD still rolls OA at 80% slots — a rebuilt datadir
-may mix 2²⁶ historical seals with later 26.8 M live seals.
+**25** is low-RAM. Remainder is sealed; an empty open tail is created. Live IBD
+still rolls OA at 80% slots — a rebuilt datadir may mix 2²⁶ historical seals
+with later 26.8 M live seals.
 
 ---
 

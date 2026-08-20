@@ -322,9 +322,9 @@ full-size `scripthash.ovf.head` is removed on open. Existing main keys update
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
 256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
 heads (`tx.head/meta` + open `NNNNNN` OA, sealed `NNNNNN.mphf|.rel|.fuse8`).
-Capacity ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`**: seal
+Capacity ends at **80% of head slots** (~26.8 M creates at 25-bit): seal
 builds MPHF + dense rel + **binary fuse8**, unlinks OA, then opens a new
-segment. Open segment has **no** filter (always probed); sealed segments are
+segment. Idx 16 GiB soft-span does not cut `tx.head`. Open segment has **no** filter (always probed); sealed segments are
 fuse-gated then one MPHF+rel pread. Legacy monolithic `tx.head` / `.new` /
 `.resize` / `.overflow` are **refused** — reindex. Schema **18** with populated
 17 `tx.head` or `scripthash*` is refused: wipe `store/tx.head` and

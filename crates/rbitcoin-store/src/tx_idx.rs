@@ -1239,8 +1239,8 @@ fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
     Ok(out)
 }
 
-// Thread-local soft-span override (bytes). Shared with SegmentedTxHead.
-// Non-zero wins over env so parallel tests cannot steal each other's window.
+// Thread-local soft-span override (bytes). Non-zero wins over env so parallel
+// idx tests cannot steal each other's window. `tx.head` does not read this.
 #[cfg(test)]
 thread_local! {
     static TEST_SOFT_SPAN_OVERRIDE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1256,13 +1256,6 @@ pub(crate) fn tests_soft_span_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 pub(crate) fn test_soft_span_override() -> u64 {
     TEST_SOFT_SPAN_OVERRIDE.with(std::cell::Cell::get)
-}
-
-/// Test-only soft-span override (`0` = use env/default). Thread-local.
-/// Prefer [`test_with_soft_span_bytes`] so panic/restore cannot leak.
-#[cfg(test)]
-pub(crate) fn test_set_soft_span_bytes(bytes: u64) {
-    TEST_SOFT_SPAN_OVERRIDE.with(|c| c.set(bytes));
 }
 
 /// Hold this thread's soft-span override for `f`, then restore.
@@ -1288,6 +1281,19 @@ pub(crate) fn test_soft_span() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soft_span_override_is_thread_local() {
+        test_with_soft_span_bytes(48, || {
+            assert_eq!(test_soft_span(), 48);
+            let other = std::thread::spawn(test_soft_span).join().expect("join");
+            assert_eq!(test_soft_span(), 48, "holding thread keeps its override");
+            assert_ne!(
+                other, 48,
+                "sibling thread must not inherit this test's override (got {other})"
+            );
+        });
+    }
 
     /// Re-appending the same absolute starts after count advanced must fail
     /// (mainnet double-write of 3330 idx slots).

@@ -16,10 +16,9 @@
 //! **Relative fks:** slot stores `rel` where `0` = empty and
 //! `fk = first_fk + rel - 1` (1-based relative within the segment).
 //!
-//! **Capacity:** open segment ends at
-//! `MIN(body soft-span, floor(slots × HEAD_LOAD_START))`; then open a new head
-//! and seal the previous OA on a sidecar (MPHF + fuse8). Lookup probes every
-//! unsealed OA until publish. Soft-span is supplied by the caller ([`force_roll`]).
+//! **Capacity:** open segment ends at `floor(slots × HEAD_LOAD_START)` (80%);
+//! then open a new head and seal the previous OA on a sidecar (MPHF + fuse8).
+//! Lookup probes every unsealed OA until publish.
 //!
 //! **Lookup:** unsealed OAs newest-first; then sealed newest→oldest gated by fuse8;
 //! candidates are absolute fks for body-verify by the caller.
@@ -28,7 +27,6 @@ use crate::address_head::{AddressHead, HeadLayout, HEAD_LOAD_START, MAINNET_BITS
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, open_file, FuseFileOpen, SealedFuse8};
 use crate::tx_head_mphf::TxHeadMphf;
-use crate::tx_idx::DEFAULT_SOFT_SPAN;
 use rbitcoin_primitives::{Fk, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -490,43 +488,6 @@ impl SegmentedTxHead {
         n
     }
 
-    /// Body soft-span roll threshold (bytes). Same default as `tx.idx`.
-    ///
-    /// Production: env `RBITCOIN_TX_IDX_SOFT_SPAN` (min 8). Under test,
-    /// [`test_with_soft_span_bytes`] overrides env when non-zero (thread-local
-    /// so parallel store tests cannot steal each other's roll window).
-    pub fn soft_span_bytes() -> u64 {
-        #[cfg(test)]
-        {
-            let o = crate::tx_idx::test_soft_span_override();
-            if o > 0 {
-                return o;
-            }
-        }
-        if let Some(v) = std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&v: &u64| v >= 8)
-        {
-            return v;
-        }
-        DEFAULT_SOFT_SPAN
-    }
-
-    /// Test-only soft-span override (`0` = use env/default). Thread-local.
-    /// Same cell as `tx.idx` so head and idx tests cannot steal each other.
-    /// Prefer [`test_with_soft_span_bytes`] so panic/restore cannot leak.
-    #[cfg(test)]
-    pub fn test_set_soft_span_bytes(bytes: u64) {
-        crate::tx_idx::test_set_soft_span_bytes(bytes);
-    }
-
-    /// Hold this thread's soft-span override for `f`, then restore.
-    #[cfg(test)]
-    pub fn test_with_soft_span_bytes<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
-        crate::tx_idx::test_with_soft_span_bytes(bytes, f)
-    }
-
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
         Arc::clone(&self.segments.read().unwrap_or_else(|e| e.into_inner()))
     }
@@ -536,30 +497,16 @@ impl SegmentedTxHead {
     /// Relativizes `entries` fks in place (absolute → segment-relative) then
     /// sorts that same buffer in the open HashHead — no extra pair copy.
     ///
-    /// When `force_roll` is true (body soft-span), roll the open segment first
-    /// if it has any creates (next OA opens immediately; previous seals on a
-    /// sidecar). Also rolls when open count reaches `max_keys`. Publish drains
+    /// Rolls when open count reaches `max_keys` (80% of slots). Publish drains
     /// on the next `insert_many`, [`Self::flush`], or `Drop` — not joined on
     /// the roll that started it.
-    pub fn insert_many(
-        &self,
-        entries: &mut [([u8; 32], Fk)],
-        force_roll: bool,
-    ) -> Result<(), StoreError> {
+    pub fn insert_many(&self, entries: &mut [([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
 
         self.try_publish_seal_locked()?;
-        if force_roll {
-            let segs = self.segments_snapshot();
-            if let Some(last) = segs.last() {
-                if !last.sealed && last.count.load(Ordering::Relaxed) > 0 {
-                    self.roll_tail_background_locked()?;
-                }
-            }
-        }
 
         let mut i = 0usize;
         while i < entries.len() {
@@ -1482,44 +1429,6 @@ mod tests {
         m
     }
 
-    /// Sibling tests used to `test_set_soft_span_bytes(0)` on a process-global
-    /// Atomic and steal the 48-byte roll window from
-    /// `tip_then_any_connected_in_cold_beats_unconnected_hot` (stuck at age=2).
-    #[test]
-    fn soft_span_override_is_thread_local() {
-        SegmentedTxHead::test_with_soft_span_bytes(48, || {
-            assert_eq!(SegmentedTxHead::soft_span_bytes(), 48);
-            assert_eq!(
-                crate::tx_idx::test_soft_span(),
-                48,
-                "idx must share this thread's head override"
-            );
-            let other = std::thread::spawn(|| {
-                (
-                    SegmentedTxHead::soft_span_bytes(),
-                    crate::tx_idx::test_soft_span(),
-                )
-            })
-            .join()
-            .expect("join");
-            assert_eq!(
-                SegmentedTxHead::soft_span_bytes(),
-                48,
-                "holding thread keeps its override"
-            );
-            assert_ne!(
-                other.0, 48,
-                "sibling thread must not inherit this test's override (got {})",
-                other.0
-            );
-            assert_ne!(
-                other.1, 48,
-                "sibling idx must not inherit this test's override (got {})",
-                other.1
-            );
-        });
-    }
-
     #[test]
     fn lookup_stats_sample_and_snapshot_surface() {
         // Clear then snapshot zeros; sample swaps to zero again.
@@ -1538,7 +1447,7 @@ mod tests {
         let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
         let h = SegmentedTxHead::create(&dir, layout).unwrap();
         let mut one = [(mixed(1), Fk(1))];
-        h.insert_many(&mut one, false).unwrap();
+        h.insert_many(&mut one).unwrap();
         let _ = h.probe_candidates(&mixed(1)).unwrap();
         let snap = snapshot_lookup_stats();
         // At least one of the probe counters should be non-zero after probe.
@@ -1567,7 +1476,7 @@ mod tests {
             for i in 0..50u64 {
                 entries.push((mixed(i + 1), Fk(i + 1)));
             }
-            h.insert_many(&mut entries, false).unwrap();
+            h.insert_many(&mut entries).unwrap();
             h.flush().unwrap();
         }
         assert!(dir.join("tx.head").join("meta").is_file());
@@ -1608,7 +1517,7 @@ mod tests {
         for i in 0..n {
             entries.push((mixed(i + 1), Fk(i + 1)));
         }
-        h.insert_many(&mut entries, false).unwrap();
+        h.insert_many(&mut entries).unwrap();
         assert!(h.segment_count() >= 2, "segs={}", h.segment_count());
         h.flush().unwrap();
         assert!(h.sealed_segment_count() >= 1);
@@ -1646,7 +1555,7 @@ mod tests {
         let h = SegmentedTxHead::create(&dir, layout).unwrap();
         let n = 820u64;
         let mut entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h.insert_many(&mut entries, false).unwrap();
+        h.insert_many(&mut entries).unwrap();
         h.flush().unwrap();
         assert!(h.sealed_segment_count() >= 1);
         let sealed = dir.join("tx.head").join("000000");
@@ -1669,12 +1578,14 @@ mod tests {
         assert!(fuse_skip, "fuse miss must not pread g pages");
 
         let k = mixed(0xB1B0);
-        h.insert_many(&mut [(k, Fk(821))], false).unwrap();
-        h.insert_many(&mut [(k, Fk(822))], true).unwrap();
+        h.insert_many(&mut [(k, Fk(821))]).unwrap();
+        let mut fill: Vec<_> = (822..1639).map(|i| (mixed(i), Fk(i))).collect();
+        h.insert_many(&mut fill).unwrap();
+        h.insert_many(&mut [(k, Fk(1639))]).unwrap();
         let cands = h.probe_candidates(&k).unwrap();
         assert_eq!(
             cands.first().copied(),
-            Some(Fk(822)),
+            Some(Fk(1639)),
             "newest first {cands:?}"
         );
         assert!(cands.iter().any(|f| f.0 == 821), "cands={cands:?}");
@@ -1692,7 +1603,7 @@ mod tests {
         {
             let h = SegmentedTxHead::create(&dir, layout).unwrap();
             let mut entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-            h.insert_many(&mut entries, false).unwrap();
+            h.insert_many(&mut entries).unwrap();
             h.flush().unwrap();
             assert!(h.sealed_segment_count() >= 1);
             let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
@@ -1740,15 +1651,15 @@ mod tests {
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1));
 
-        // Same suite budget: force roll + mono refuse without extra full pads.
+        // Same suite budget: count-only roll + mono refuse without extra full pads.
         let dir_roll = tmp();
-        let layout_roll = HeadLayout::with_entry_bytes(12, 4).unwrap(); // 4096 slots
+        let layout_roll = HeadLayout::with_entry_bytes(8, 4).unwrap();
         let h_roll = SegmentedTxHead::create(&dir_roll, layout_roll).unwrap();
-        let mut batch1: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h_roll.insert_many(&mut batch1, false).unwrap();
+        let mut batch1: Vec<_> = (0..203u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h_roll.insert_many(&mut batch1).unwrap();
         assert_eq!(h_roll.segment_count(), 1);
-        let mut batch2: Vec<_> = (100..150u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h_roll.insert_many(&mut batch2, true).unwrap(); // force roll
+        let mut batch2: Vec<_> = (203..254u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h_roll.insert_many(&mut batch2).unwrap();
         assert!(h_roll.segment_count() >= 2);
         h_roll.flush().unwrap();
         assert!(h_roll.sealed_segment_count() >= 1);
@@ -1758,10 +1669,10 @@ mod tests {
             .iter()
             .any(|f| f.0 == 50));
         assert!(h_roll
-            .probe_candidates(&mixed(120))
+            .probe_candidates(&mixed(220))
             .unwrap()
             .iter()
-            .any(|f| f.0 == 120));
+            .any(|f| f.0 == 220));
 
         let dir_mono = tmp();
         std::fs::write(dir_mono.join("tx.head"), b"legacy").unwrap();
@@ -1787,7 +1698,7 @@ mod tests {
         let h = SegmentedTxHead::create(&dir, layout).unwrap();
         let n = 205u64;
         let mut entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h.insert_many(&mut entries, false).unwrap();
+        h.insert_many(&mut entries).unwrap();
         assert!(h.segment_count() >= 2, "segs={}", h.segment_count());
         assert_eq!(
             h.sealed_segment_count(),

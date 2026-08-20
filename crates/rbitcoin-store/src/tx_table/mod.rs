@@ -1675,45 +1675,23 @@ impl TxTable {
         1u64 << Self::rebuild_seal_bits()
     }
 
-    /// Greedy Class A cuts for a cold MPHF rebuild (`MIN(2^bits, body soft-span)`).
+    /// Class A cuts for a cold MPHF rebuild (`2^bits` keys, last range short).
     ///
-    /// Independent of live OA 80% load. Last range may be short.
+    /// Independent of live OA 80% load and of idx body soft-span.
     pub fn plan_head_rebuild_ranges(&self) -> Result<Vec<(u64, u64)>, StoreError> {
         let n = self.count();
         if n == 0 {
             return Ok(Vec::new());
         }
-        let t = Self::rebuild_seal_keys();
-        let soft = SegmentedTxHead::soft_span_bytes();
+        let t = Self::rebuild_seal_keys().min(u64::from(u32::MAX));
         let mut out = Vec::new();
         let mut first = 1u64;
         while first <= n {
-            let max_last = first.saturating_add(t).saturating_sub(1).min(n);
-            let last = self.rebuild_cut_last(first, max_last, soft)?;
-            out.push((first, last - first + 1));
-            first = last + 1;
+            let count = (n - first + 1).min(t);
+            out.push((first, count));
+            first += count;
         }
         Ok(out)
-    }
-
-    fn rebuild_cut_last(&self, first: u64, max_last: u64, soft: u64) -> Result<u64, StoreError> {
-        if first == max_last {
-            return Ok(first);
-        }
-        if self.body_span_bytes(first, max_last)? <= soft {
-            return Ok(max_last);
-        }
-        let mut lo = first;
-        let mut hi = max_last;
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.body_span_bytes(first, mid)? <= soft {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(lo)
     }
 
     fn backfill_head_inner(
@@ -1853,9 +1831,8 @@ impl TxTable {
 
     /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
     ///
-    /// Splits the batch so each open segment respects
-    /// `MIN(body soft span, 80% head slots)` — soft-span is measured from the
-    /// **open segment's first_fk** (not only the first segment in the store).
+    /// Rolls the open OA at 80% slots (`max_keys`). Idx body soft-span does
+    /// not cut `tx.head` shards.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -1864,66 +1841,7 @@ impl TxTable {
             .iter()
             .map(|(txid, fk)| (self.secret.mix_txid(txid), *fk))
             .collect();
-        let soft = SegmentedTxHead::soft_span_bytes();
-        let mut i = 0usize;
-        while i < mixed.len() {
-            // Seal open tail first if it already soft-overflows for the next create.
-            let force_roll = self.open_soft_span_exceeded(mixed[i].1 .0)?;
-            // After an optional seal, the open first_fk for this wave is either
-            // the existing open first_fk or the first fk of this sub-batch.
-            let wave_first = if force_roll {
-                mixed[i].1 .0
-            } else {
-                self.head
-                    .open_tail_range()
-                    .map(|(f, _)| f)
-                    .unwrap_or(mixed[i].1 .0)
-            };
-
-            let mut j = i;
-            while j < mixed.len() {
-                if j > i && self.body_span_bytes(wave_first, mixed[j].1 .0)? > soft {
-                    break;
-                }
-                j += 1;
-            }
-            if j == i {
-                j = i + 1; // always make progress (single oversized create)
-            }
-            self.head.insert_many(&mut mixed[i..j], force_roll)?;
-            i = j;
-        }
-        Ok(())
-    }
-
-    /// True when open segment body span from `open.first_fk` to `next_fk` exceeds soft span.
-    fn open_soft_span_exceeded(&self, next_fk: u64) -> Result<bool, StoreError> {
-        let soft = SegmentedTxHead::soft_span_bytes();
-        let Some((first_fk, count)) = self.head.open_tail_range() else {
-            return Ok(false);
-        };
-        if count == 0 {
-            return Ok(false);
-        }
-        if next_fk < first_fk {
-            return Ok(false);
-        }
-        Ok(self.body_span_bytes(first_fk, next_fk)? > soft)
-    }
-
-    fn body_span_bytes(&self, first_fk: u64, last_fk: u64) -> Result<u64, StoreError> {
-        if first_fk == 0 || last_fk < first_fk {
-            return Ok(0);
-        }
-        let span = |t: &VarTable| -> Result<u64, StoreError> {
-            let (off0, _) = t.record_range(Fk(first_fk))?;
-            let (off1, len1) = t.record_range(Fk(last_fk))?;
-            Ok(off1.saturating_add(len1).saturating_sub(off0))
-        };
-        // Coupled stems: roll/seal when any of txout / inwit / spent exceeds soft.
-        Ok(span(&self.body)?
-            .max(span(&self.inwit)?)
-            .max(span(&self.spent)?))
+        self.head.insert_many(&mut mixed)
     }
 
     pub fn head_resize_size_snapshot(&self) -> HeadResizeSizeSnapshot {

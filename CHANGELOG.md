@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **`tx.head` shards by create count:** live OA rolls at 80% of slots
+  (~26.8 M at 25-bit); wipe-rebuild ranges are `2^bits` (default 2²⁶).
+  Idx `RBITCOIN_TX_IDX_SOFT_SPAN` (16 GiB) no longer cuts head shards.
+  `.rel` stays `n×4` 1-based relative to `first_fk` in `tx.head/meta`.
+
 - **Sealed MPHF `g` is FdOnly:** `Store::open` no longer copies BDZ
   graphs into process heap (~4.92 B/key). Lookup streams unique 4 KiB
   `g` pages on the held uring session (`KIND_MPHF_G`), same shape as

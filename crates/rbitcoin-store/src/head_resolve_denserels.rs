@@ -1019,40 +1019,38 @@ mod tests {
     /// via `first_fks` and only require the process counters moved for age 0.
     #[test]
     fn resolve_records_winner_age_open_segment() {
-        crate::segmented_head::SegmentedTxHead::test_with_soft_span_bytes(0, || {
-            let _ = crate::head_resolve_stats::sample_and_reset();
-            let (dir, t, txids) = seed_table(16);
-            assert_eq!(
-                t.head.segment_count(),
-                1,
-                "unexpected segs={}",
-                t.head.segment_count()
-            );
-            let first = t.head.first_fks_snapshot();
-            assert_eq!(first, vec![1]);
-            let got = resolve_fk_and_range_batch(&t, &txids).unwrap();
-            let hits = got.iter().filter(|(_, r)| r.is_some()).count() as u64;
-            assert_eq!(hits, txids.len() as u64);
-            for (_tid, row) in &got {
-                if let Some((fk, _)) = row {
-                    assert_eq!(
-                        crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0),
-                        Some(0),
-                        "fk={}",
-                        fk.0
-                    );
-                }
+        let _ = crate::head_resolve_stats::sample_and_reset();
+        let (dir, t, txids) = seed_table(16);
+        assert_eq!(
+            t.head.segment_count(),
+            1,
+            "unexpected segs={}",
+            t.head.segment_count()
+        );
+        let first = t.head.first_fks_snapshot();
+        assert_eq!(first, vec![1]);
+        let got = resolve_fk_and_range_batch(&t, &txids).unwrap();
+        let hits = got.iter().filter(|(_, r)| r.is_some()).count() as u64;
+        assert_eq!(hits, txids.len() as u64);
+        for (_tid, row) in &got {
+            if let Some((fk, _)) = row {
+                assert_eq!(
+                    crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0),
+                    Some(0),
+                    "fk={}",
+                    fk.0
+                );
             }
-            let s = crate::head_resolve_stats::sample_and_reset();
-            // Our hits are age 0; concurrent resolve tests may add more age-0 counts.
-            assert!(
-                s.age_hit[0] >= hits,
-                "age0={} hits={hits} age_hit={:?}",
-                s.age_hit[0],
-                &s.age_hit[..8]
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        });
+        }
+        let s = crate::head_resolve_stats::sample_and_reset();
+        // Our hits are age 0; concurrent resolve tests may add more age-0 counts.
+        assert!(
+            s.age_hit[0] >= hits,
+            "age0={} hits={hits} age_hit={:?}",
+            s.age_hit[0],
+            &s.age_hit[..8]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn merge_cands(parts: &[Vec<Vec<Fk>>]) -> Vec<Vec<Fk>> {

@@ -2133,6 +2133,7 @@ impl ScriptHashTable {
         let mut last = last_page;
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(last, &mut page)?;
+        let mut extent = sh_page_extent(&page)?;
         let chain_first = {
             let f = if sh_page_is_last(&page)? {
                 sh_page_first_off(&page)?
@@ -2150,9 +2151,16 @@ impl ScriptHashTable {
                 let new_off = self.alloc_page(body, alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 body.write_at(last, &page)?;
-                sh_page_init_empty(&mut page);
-                sh_page_set_last(&mut page, chain_first)?;
-                assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
+                if let Some((base, n)) = extent {
+                    let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
+                    let new_n = if glued { n.saturating_add(1) } else { n };
+                    sh_page_pack_extent_last(&mut page, &[*e], base, new_n, 0)?;
+                    extent = Some((base, new_n));
+                } else {
+                    sh_page_init_empty(&mut page);
+                    sh_page_set_last(&mut page, chain_first)?;
+                    assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
+                }
                 last = new_off;
             }
         }
@@ -3417,6 +3425,10 @@ fn read_alloc_version_on_disk(body: &TableFile) -> Result<u16, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scripthash_pages::{
+        sh_page_as_array, sh_page_extent, SH_PAGE_EXTENT_STREAM_MAX, SH_PAGE_SIZE,
+        SH_PAGE_STREAM_MAX,
+    };
     use std::sync::atomic::AtomicBool;
 
     fn tmp() -> std::path::PathBuf {
@@ -4465,9 +4477,7 @@ mod tests {
 
     #[test]
     fn bulk_session_stream_megakey_caps_buf_at_page() {
-        use crate::scripthash_pages::{
-            sh_page_as_array, sh_page_extent, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
-        };
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         let n = SH_PAGE_STREAM_MAX + 10;
@@ -4509,9 +4519,7 @@ mod tests {
 
     #[test]
     fn remap_sh_body() {
-        use crate::scripthash_pages::{
-            sh_page_as_array, sh_page_extent, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
-        };
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         let src_dir = tmp();
         let dst_dir = tmp();
         let src = ScriptHashTable::create(&src_dir).unwrap();
@@ -4916,9 +4924,7 @@ mod tests {
 
     #[test]
     fn materialize_no_temp_body() {
-        use crate::scripthash_pages::{
-            sh_page_as_array, sh_page_extent, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
-        };
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         HeadScale::test_with(HeadScale::Tiny, || {
             let dir = tmp();
             let runs_dir = dir.join("runs");
@@ -5014,9 +5020,7 @@ mod tests {
     /// writes next links on first write — no previous-page RMW).
     #[test]
     fn bulk_session_megakey_page_chain_contiguous_once() {
-        use crate::scripthash_pages::{
-            sh_page_as_array, sh_page_extent, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
-        };
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         // Sequential FKs fill ~4080/page; this n spans two pages.
@@ -5095,6 +5099,97 @@ mod tests {
             }
             other => panic!("expected extent, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn extent_meta(t: &ScriptHashTable, sh: &[u8; 32]) -> (u64, u64, u32) {
+        match t.head_value(sh).unwrap().unwrap() {
+            ShHeadValue::Extent { last_page } => {
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                let (base, n) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .expect("ver=2 last page");
+                (base, last_page, n)
+            }
+            other => panic!("expected extent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extent_append_links_tail_when_bump_moved() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX - 1;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x21;
+        sh[1] = 0xaa;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut sh_gap = [0u8; 32];
+        sh_gap[0] = 0x21;
+        sh_gap[1] = 0xab;
+        let mut session = t.bulk_session(2).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        session
+            .put_chain(sh_gap, &[ShEntry::new(Fk(1)), ShEntry::new(Fk(2))])
+            .unwrap();
+        let _ = session.finish().unwrap();
+        let (base, last0, n0) = extent_meta(&t, &sh);
+        assert_eq!(n0, 2);
+        t.put_create(&rec(sh, n as u64 + 1, 0)).unwrap();
+        let (base2, last1, n1) = extent_meta(&t, &sh);
+        assert_eq!(base2, base);
+        assert_eq!(n1, 2, "tail must not bump extent_n");
+        assert_ne!(
+            last1,
+            base + (u64::from(n1) - 1) * SH_PAGE_SIZE as u64,
+            "overflow last_page is a linked tail"
+        );
+        assert_ne!(last1, last0);
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        reset_sh_page_chain_ios();
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        assert!(
+            sh_page_chain_ios() >= 3,
+            "span + tail read, ios={}",
+            sh_page_chain_ios()
+        );
+        let extra2: Vec<_> = ((n as u64 + 2)..=(n as u64 + 1 + SH_PAGE_EXTENT_STREAM_MAX as u64))
+            .map(|i| rec(sh, i, 0))
+            .collect();
+        assert_eq!(t.put_create_batch(&extra2).unwrap(), extra2.len());
+        let (_, last2, n2) = extent_meta(&t, &sh);
+        assert_eq!(n2, 2);
+        assert_ne!(last2, last1, "second overflow adds another linked page");
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1 + extra2.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extent_append_glued_bumps_extent_n() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX - 1;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x22;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut session = t.bulk_session(1).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        let _ = session.finish().unwrap();
+        let (base, _, n0) = extent_meta(&t, &sh);
+        assert_eq!(n0, 2);
+        t.put_create(&rec(sh, n as u64 + 1, 0)).unwrap();
+        let (_, last, n1) = extent_meta(&t, &sh);
+        assert_eq!(n1, 3, "glued HWM grows extent_n in place");
+        assert_eq!(last, base + 2 * SH_PAGE_SIZE as u64);
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        reset_sh_page_chain_ios();
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        assert!(
+            sh_page_chain_ios() <= 2,
+            "glued grow stays one span, ios={}",
+            sh_page_chain_ios()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

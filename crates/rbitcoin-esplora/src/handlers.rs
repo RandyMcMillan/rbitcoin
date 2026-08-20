@@ -1,7 +1,7 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{block_hash_hex, not_found, parse_hash32, plain_ok, store_err, AppState};
-use crate::tx_json::{build_tx_json, tx_status_json};
+use crate::tx_json::{build_tx_json, tx_status_json, utxo_list_json};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -494,12 +494,24 @@ fn outspend_json(
     }))
 }
 
+async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(r) => r,
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 pub async fn address_info(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => match sh_stats_json(&st, &sh, Some(addr_s.as_str()), None) {
-            Ok(v) => Json(v).into_response(),
-            Err(e) => store_err(e),
-        },
+        Ok(sh) => {
+            spawn_join(
+                move || match sh_stats_json(&st, &sh, Some(addr_s.as_str()), None) {
+                    Ok(v) => Json(v).into_response(),
+                    Err(e) => store_err(e),
+                },
+            )
+            .await
+        }
         Err(_) => not_found(),
     }
 }
@@ -508,15 +520,18 @@ pub async fn scripthash_info(State(st): State<AppState>, Path(sh_hex): Path<Stri
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    match sh_stats_json(&st, &sh, None, Some(sh_hex.as_str())) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => store_err(e),
-    }
+    spawn_join(
+        move || match sh_stats_json(&st, &sh, None, Some(sh_hex.as_str())) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
+    )
+    .await
 }
 
 pub async fn address_utxo(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => utxo_response(&st, &sh),
+        Ok(sh) => spawn_join(move || utxo_response(&st, &sh)).await,
         Err(_) => not_found(),
     }
 }
@@ -525,29 +540,15 @@ pub async fn scripthash_utxo(State(st): State<AppState>, Path(sh_hex): Path<Stri
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    utxo_response(&st, &sh)
+    spawn_join(move || utxo_response(&st, &sh)).await
 }
 
 fn utxo_response(st: &AppState, sh: &[u8; 32]) -> Response {
     match st.query.scripthash_listunspent(sh) {
-        Ok(list) => {
-            let mut arr = Vec::new();
-            for u in list {
-                let status = match st.query.get_tx_by_txid(&u.tx_hash) {
-                    Ok(Some((fk, _))) => {
-                        tx_status_json(&st.query, fk).unwrap_or(json!({"confirmed": true}))
-                    }
-                    _ => json!({"confirmed": true, "block_height": u.height}),
-                };
-                arr.push(json!({
-                    "txid": block_hash_hex(&u.tx_hash),
-                    "vout": u.tx_pos,
-                    "value": u.value,
-                    "status": status,
-                }));
-            }
-            Json(arr).into_response()
-        }
+        Ok(list) => match utxo_list_json(&st.query, &list) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
         Err(e) => store_err(e),
     }
 }

@@ -5,9 +5,11 @@ use bitcoin::hashes::Hash;
 use bitcoin::Network;
 use rbitcoin_primitives::hex_encode;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{Query, QueryError};
+use rbitcoin_query::{Query, QueryError, ScriptHashUtxo};
 use rbitcoin_store::InputRecord;
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// Esplora `status` object for a Class A tx fk (confirmed or not).
 pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
@@ -25,6 +27,68 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
         out["block_time"] = json!(rec.timestamp);
     }
     Ok(out)
+}
+
+#[derive(Serialize)]
+struct EsploraUtxoStatus {
+    confirmed: bool,
+    block_height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_time: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct EsploraUtxo {
+    txid: String,
+    vout: u32,
+    value: i64,
+    status: EsploraUtxoStatus,
+}
+
+/// Unique create-height → `(block_hash, block_time)` for Esplora `/utxo` status.
+pub fn utxo_status_by_height(
+    query: &Query,
+    heights: impl IntoIterator<Item = u32>,
+) -> Result<HashMap<u32, (String, u32)>, QueryError> {
+    let mut map = HashMap::new();
+    for h in heights {
+        if map.contains_key(&h) {
+            continue;
+        }
+        if let Some((_fk, rec)) = query.header_at_height(Height(h))? {
+            map.insert(h, (block_hash_hex(&rec.hash), rec.timestamp));
+        }
+    }
+    Ok(map)
+}
+
+/// Confirmed Esplora `/utxo` array from join rows (status from height, not `tx.head`).
+pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, QueryError> {
+    let by_h = utxo_status_by_height(query, list.iter().map(|u| u.height))?;
+    let rows: Vec<EsploraUtxo> = list
+        .iter()
+        .map(|u| {
+            let (block_hash, block_time) = match by_h.get(&u.height) {
+                Some((h, t)) => (Some(h.clone()), Some(*t)),
+                None => (None, None),
+            };
+            EsploraUtxo {
+                txid: block_hash_hex(&u.tx_hash),
+                vout: u.tx_pos,
+                value: u.value,
+                status: EsploraUtxoStatus {
+                    confirmed: true,
+                    block_height: u.height,
+                    block_hash,
+                    block_time,
+                },
+            }
+        })
+        .collect();
+    serde_json::to_value(rows)
+        .map_err(|_| rbitcoin_store::StoreError::Corrupt("invariant: utxo json").into())
 }
 
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).
@@ -305,6 +369,129 @@ mod tests {
         assert_eq!(s.len(), 64);
         assert!(s.starts_with("cd"));
         assert!(s.ends_with("ab"));
+    }
+
+    #[test]
+    fn utxo_list_json_status_from_join_height_without_tx_head() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{script_hash, HeaderRecord, InputRecord, OutputRecord, TxRecord};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-esplora-utxo-json-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..2u32 {
+            let version = 1;
+            let timestamp = h + 1;
+            let bits = 0x207fffff;
+            let nonce = h;
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xab;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+                }
+            };
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version,
+                timestamp,
+                bits,
+                nonce,
+                merkle_root: merkle,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            let outputs = if h == 1 {
+                vec![
+                    OutputRecord::unspent(50_0000_0000, vec![0x51]),
+                    OutputRecord::unspent(1_0000_0000, vec![0x51]),
+                ]
+            } else {
+                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])]
+            };
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: outputs.len() as u32,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![h as u8],
+                    witness: vec![],
+                }],
+                outputs,
+            };
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            parent_hash = Some(hash);
+        }
+
+        let sh = script_hash(&[0x51]);
+        let list = q.scripthash_listunspent(&sh).unwrap();
+        assert_eq!(list.len(), 3);
+        let at0 = list.iter().filter(|u| u.height == 0).count();
+        let at1 = list.iter().filter(|u| u.height == 1).count();
+        assert_eq!(at0, 1);
+        assert_eq!(at1, 2);
+
+        let arr = utxo_list_json(&q, &list).unwrap();
+        let rows = arr.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for u in &list {
+            let row = rows
+                .iter()
+                .find(|r| {
+                    r["vout"] == u.tx_pos
+                        && r["status"]["block_height"].as_u64() == Some(u64::from(u.height))
+                        && r["value"] == u.value
+                })
+                .expect("row");
+            let (_fk, rec) = q.header_at_height(Height(u.height)).unwrap().unwrap();
+            assert_eq!(row["status"]["confirmed"], true);
+            assert_eq!(row["status"]["block_hash"], block_hash_hex(&rec.hash));
+            assert_eq!(row["status"]["block_time"], rec.timestamp);
+            assert_eq!(row["txid"], block_hash_hex(&u.tx_hash));
+        }
+
+        // Status comes from join height, not tx.head: a txid that is not in the
+        // store still gets block_hash / block_time from header_at_height.
+        let orphan = rbitcoin_query::ScriptHashUtxo {
+            tx_hash: [0xee; 32],
+            tx_pos: 7,
+            height: 1,
+            value: 42,
+        };
+        let miss = utxo_list_json(&q, &[orphan]).unwrap();
+        let row = &miss.as_array().unwrap()[0];
+        let (_fk, rec1) = q.header_at_height(Height(1)).unwrap().unwrap();
+        assert_eq!(row["status"]["confirmed"], true);
+        assert_eq!(row["status"]["block_height"], 1);
+        assert_eq!(row["status"]["block_hash"], block_hash_hex(&rec1.hash));
+        assert_eq!(row["status"]["block_time"], rec1.timestamp);
+        assert_eq!(row["txid"], block_hash_hex(&[0xee; 32]));
+        assert_eq!(row["vout"], 7);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

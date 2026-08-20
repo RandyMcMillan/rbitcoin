@@ -6,10 +6,11 @@
 
 use crate::compact::uleb128_len;
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
+use crate::io_backend::ReadIoBackend;
 #[cfg(test)]
 use crate::scripthash_head::ShardedScriptHashHead;
 use crate::scripthash_head::{
@@ -24,9 +25,9 @@ use crate::scripthash_mphf::{self, mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
-    sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk, sh_page_next,
-    sh_page_pack, sh_page_set_last, sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE,
-    SH_PAGE_STREAM_MAX,
+    sh_page_extent, sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk,
+    sh_page_next, sh_page_pack, sh_page_pack_extent_last, sh_page_set_extent, sh_page_set_last,
+    sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks_with_slack,
@@ -317,6 +318,10 @@ fn sh_shard_body_path(dir: &Path, shard: usize) -> PathBuf {
     sh_body_path(dir).join(format!("{shard:02x}"))
 }
 
+fn sh_set_body_grow(body: &TableFile) {
+    body.set_grow_policy(GrowPolicy::Align64k);
+}
+
 fn sh_body_layout_wipe_msg() -> String {
     "scripthash body layout mixed or incomplete; wipe store/scripthash* (head, body, ovf, \
      runs, include_hwm, cold_progress) and rematerialize"
@@ -546,9 +551,184 @@ fn paged_first_from_last(body: &TableFile, last_page: u64) -> Result<u64, StoreE
     if last_page == 0 {
         return Ok(0);
     }
+    note_sh_page_chain_io();
     let mut page = [0u8; SH_PAGE_SIZE];
     body.read_at(last_page, &mut page)?;
     sh_page_first_off(sh_page_as_array(&page)?)
+}
+
+/// Cap on a contiguous megakey span pread (64 MiB ≈ 16k pages).
+const SH_PAGE_SPAN_MAX: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static SH_PAGE_CHAIN_IOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_sh_page_chain_io() {
+    SH_PAGE_CHAIN_IOS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn note_sh_page_chain_io() {}
+
+#[cfg(test)]
+fn reset_sh_page_chain_ios() {
+    SH_PAGE_CHAIN_IOS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn sh_page_chain_ios() -> u64 {
+    SH_PAGE_CHAIN_IOS.with(|c| c.get())
+}
+
+fn read_sh_page_bytes(body: &TableFile, off: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+    note_sh_page_chain_io();
+    if buf.is_empty() {
+        return Ok(());
+    }
+    match crate::io_backend::read_io_backend() {
+        ReadIoBackend::Pread => body.pread_at(off, buf),
+        ReadIoBackend::Uring => {
+            let end = off.saturating_add(buf.len() as u64);
+            if end > body.logical_len() {
+                return Err(StoreError::Corrupt("pread past logical end"));
+            }
+            use crate::bulk_io::{self, ReadOp};
+            let fd = body.read_fd();
+            let mut ops = [ReadOp {
+                fd,
+                offset: off,
+                buf,
+                result: i32::MIN,
+            }];
+            bulk_io::pread_batch(&mut ops);
+            if ops[0].result < 0 {
+                return Err(StoreError::io(
+                    body.path(),
+                    std::io::Error::from_raw_os_error(-ops[0].result),
+                ));
+            }
+            if ops[0].result as usize != ops[0].buf.len() {
+                return Err(StoreError::Corrupt("scripthash page read short"));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn extend_page_entries(
+    out: &mut Vec<ShEntry>,
+    prev_last: &mut Option<u64>,
+    ents: Vec<ShEntry>,
+) -> Result<(), StoreError> {
+    if let (Some(pl), Some(first)) = (*prev_last, ents.first()) {
+        if first.create_tx_fk.0 <= pl {
+            return Err(StoreError::Corrupt(
+                "invariant: scripthash page chain create_fks not strictly increasing",
+            ));
+        }
+    }
+    if let Some(last) = ents.last() {
+        *prev_last = Some(last.create_tx_fk.0);
+    }
+    out.extend(ents);
+    Ok(())
+}
+
+fn collect_page_chain_span(
+    body: &TableFile,
+    first_page: u64,
+    n_pages: usize,
+) -> Result<Option<(Vec<ShEntry>, u64)>, StoreError> {
+    let mut buf = vec![0u8; n_pages.saturating_mul(SH_PAGE_SIZE)];
+    read_sh_page_bytes(body, first_page, &mut buf)?;
+    let mut out = Vec::new();
+    let mut prev_last = None;
+    let mut last_next = 0u64;
+    for i in 0..n_pages {
+        let start = i.saturating_mul(SH_PAGE_SIZE);
+        let page = &buf[start..start.saturating_add(SH_PAGE_SIZE)];
+        let (next, ents) = sh_page_decode_slice(page)?;
+        if i + 1 == n_pages {
+            last_next = next;
+        } else {
+            let expect = first_page.saturating_add(((i + 1) * SH_PAGE_SIZE) as u64);
+            if next != expect {
+                return Ok(None);
+            }
+        }
+        extend_page_entries(&mut out, &mut prev_last, ents)?;
+    }
+    Ok(Some((out, last_next)))
+}
+
+fn collect_page_chain_linked(
+    body: &TableFile,
+    first_page: u64,
+) -> Result<Vec<ShEntry>, StoreError> {
+    let mut out = Vec::new();
+    let mut prev_last: Option<u64> = None;
+    let mut cur = [0u8; SH_PAGE_SIZE];
+    let mut nxt = [0u8; SH_PAGE_SIZE];
+    if first_page == 0 {
+        return Ok(out);
+    }
+    read_sh_page_bytes(body, first_page, &mut cur)?;
+    loop {
+        let (next, ents) = sh_page_decode_slice(&cur)?;
+        extend_page_entries(&mut out, &mut prev_last, ents)?;
+        if next == 0 {
+            break;
+        }
+        read_sh_page_bytes(body, next, &mut nxt)?;
+        cur = nxt;
+    }
+    Ok(out)
+}
+
+fn collect_extent_then_tail(body: &TableFile, last_page: u64) -> Result<Vec<ShEntry>, StoreError> {
+    if last_page == 0 {
+        return Err(StoreError::Corrupt("scripthash extent: null last_page"));
+    }
+    let mut last_buf = [0u8; SH_PAGE_SIZE];
+    read_sh_page_bytes(body, last_page, &mut last_buf)?;
+    let last_arr = sh_page_as_array(&last_buf)?;
+    let Some((base, n)) = sh_page_extent(last_arr)? else {
+        return Err(StoreError::Corrupt("scripthash extent last page not ver=2"));
+    };
+    let n = n as usize;
+    let bytes = (n as u64).saturating_mul(SH_PAGE_SIZE as u64);
+    if n == 0 || bytes > SH_PAGE_SPAN_MAX || base.saturating_add(bytes) > body.logical_len() {
+        return Err(StoreError::Corrupt("scripthash extent span overflow"));
+    }
+    let last_in_ext = base.saturating_add(((n - 1) as u64).saturating_mul(SH_PAGE_SIZE as u64));
+    let (mut out, tail_off) = collect_page_chain_span(body, base, n)?.ok_or(
+        StoreError::Corrupt("scripthash extent prefix next links broken"),
+    )?;
+    if last_page == last_in_ext {
+        return Ok(out);
+    }
+    if tail_off == 0 {
+        return Err(StoreError::Corrupt(
+            "scripthash extent last_page beyond extent with no tail",
+        ));
+    }
+    let mut prev_last = out.last().map(|e| e.create_tx_fk.0);
+    let mut cur = [0u8; SH_PAGE_SIZE];
+    let mut nxt = [0u8; SH_PAGE_SIZE];
+    read_sh_page_bytes(body, tail_off, &mut cur)?;
+    loop {
+        let (next, ents) = sh_page_decode_slice(&cur)?;
+        extend_page_entries(&mut out, &mut prev_last, ents)?;
+        if next == 0 {
+            break;
+        }
+        read_sh_page_bytes(body, next, &mut nxt)?;
+        cur = nxt;
+    }
+    Ok(out)
 }
 
 /// Where a scripthash key lives for head upsert routing.
@@ -573,6 +753,7 @@ impl ScriptHashTable {
         let mut allocs = Vec::with_capacity(n_shards);
         for i in 0..n_shards {
             let f = TableFile::create(sh_shard_body_path(dir, i), TableKind::ScriptHash)?;
+            sh_set_body_grow(&f);
             let st = init_empty_body(&f)?;
             bodies.push(f);
             allocs.push(Mutex::new(st));
@@ -580,6 +761,7 @@ impl ScriptHashTable {
         let ovf_dir = dir.join("scripthash.ovf");
         std::fs::create_dir_all(&ovf_dir).map_err(|e| StoreError::io(&ovf_dir, e))?;
         let ovf = TableFile::create(sh_ovf_body_path(dir), TableKind::ScriptHash)?;
+        sh_set_body_grow(&ovf);
         let ovf_st = init_empty_body(&ovf)?;
         Ok(Self {
             store_dir: dir.to_path_buf(),
@@ -625,6 +807,7 @@ impl ScriptHashTable {
         let (bodies, ovf_body, allocs, ovf_alloc, alloc_ver) = match layout {
             ShBodyLayout::Shared => {
                 let f = TableFile::open(sh_body_path(dir), TableKind::ScriptHash)?;
+                sh_set_body_grow(&f);
                 let (state, ver) = read_alloc_header(&f)?;
                 (vec![f], None, vec![Mutex::new(state)], None, ver)
             }
@@ -634,6 +817,7 @@ impl ScriptHashTable {
                 let mut ver = SH_ALLOC_VERSION;
                 for i in 0..n_shards {
                     let f = TableFile::open(sh_shard_body_path(dir, i), TableKind::ScriptHash)?;
+                    sh_set_body_grow(&f);
                     let (state, v) = read_alloc_header(&f)?;
                     if i == 0 {
                         ver = v;
@@ -642,6 +826,7 @@ impl ScriptHashTable {
                     allocs.push(Mutex::new(state));
                 }
                 let ovf = TableFile::open(sh_ovf_body_path(dir), TableKind::ScriptHash)?;
+                sh_set_body_grow(&ovf);
                 let (ost, _) = read_alloc_header(&ovf)?;
                 (bodies, Some(ovf), allocs, Some(Mutex::new(ost)), ver)
             }
@@ -1221,26 +1406,14 @@ impl ScriptHashTable {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<(Fk, ScriptHashRecord)>, StoreError> {
-        let Some(val) = self.head_value(scripthash)? else {
+        let Some((val, home)) = self.locate_head(scripthash)? else {
             return Ok(Vec::new());
         };
-        let list = self.collect_entries(scripthash, &val)?;
+        let list = self.collect_entries_from(self.body_for(scripthash, home), &val)?;
         Ok(list
             .into_iter()
-            .map(|e| {
-                // Synthetic fk = create_tx_fk for API compat (no body row id).
-                (e.create_tx_fk, ScriptHashRecord::from_entry(*scripthash, e))
-            })
+            .map(|e| (e.create_tx_fk, ScriptHashRecord::from_entry(*scripthash, e)))
             .collect())
-    }
-
-    fn collect_entries(
-        &self,
-        scripthash: &[u8; 32],
-        val: &ShHeadValue,
-    ) -> Result<Vec<ShEntry>, StoreError> {
-        let home = self.key_home(scripthash)?;
-        self.collect_entries_from(self.body_for(scripthash, home), val)
     }
 
     fn collect_page_chain(
@@ -1248,27 +1421,10 @@ impl ScriptHashTable {
         body: &TableFile,
         first_page: u64,
     ) -> Result<Vec<ShEntry>, StoreError> {
-        let mut out = Vec::new();
-        let mut off = first_page;
-        let mut prev_last: Option<u64> = None;
-        while off != 0 {
-            let mut page = [0u8; SH_PAGE_SIZE];
-            body.read_at(off, &mut page)?;
-            let (next, ents) = sh_page_decode_slice(&page)?;
-            if let (Some(pl), Some(first)) = (prev_last, ents.first()) {
-                if first.create_tx_fk.0 <= pl {
-                    return Err(StoreError::Corrupt(
-                        "invariant: scripthash page chain create_fks not strictly increasing",
-                    ));
-                }
-            }
-            if let Some(last) = ents.last() {
-                prev_last = Some(last.create_tx_fk.0);
-            }
-            out.extend(ents);
-            off = next;
+        if first_page == 0 {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        collect_page_chain_linked(body, first_page)
     }
 
     /// Max durable create_tx_fk for a head value (**last page only** when paged).
@@ -1299,7 +1455,7 @@ impl ScriptHashTable {
                 let ents = self.read_slab(body, *class, *off)?;
                 Ok(ents.last().map(|e| e.create_tx_fk))
             }
-            ShHeadValue::Paged { last_page, .. } => {
+            ShHeadValue::Paged { last_page, .. } | ShHeadValue::Extent { last_page } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
                 body.read_at(*last_page, &mut page)?;
                 sh_page_last_fk(&page)
@@ -1759,6 +1915,7 @@ impl ScriptHashTable {
                 };
                 self.collect_page_chain(body, first)
             }
+            ShHeadValue::Extent { last_page } => collect_extent_then_tail(body, *last_page),
         }
     }
 
@@ -1854,6 +2011,11 @@ impl ScriptHashTable {
                     self.append_fks_to_pages(body, alloc, *first_page, *last_page, new_ents)?;
                 Ok(ShHeadValue::paged(*first_page, last))
             }
+            ShHeadValue::Extent { last_page } => {
+                let first = paged_first_from_last(body, *last_page)?;
+                let last = self.append_fks_to_pages(body, alloc, first, *last_page, new_ents)?;
+                Ok(ShHeadValue::extent(last))
+            }
         }
     }
 
@@ -1885,16 +2047,16 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::inline_one(live[0]));
         }
         if n >= SH_MEGAKEY_MIN_FKS {
-            let (first, last) = self.write_new_page_chain(body, alloc, live)?;
-            return Ok(ShHeadValue::paged(first, last));
+            let last = self.write_new_page_chain(body, alloc, live)?;
+            return Ok(ShHeadValue::extent(last));
         }
         let fks: Vec<Fk> = live.iter().map(|e| e.create_tx_fk).collect();
         let payload = encode_slab_payload(&fks)?;
         let class = match Self::slab_class_fitting(n, payload.len(), slack) {
             Some(c) => c,
             None => {
-                let (first, last) = self.write_new_page_chain(body, alloc, live)?;
-                return Ok(ShHeadValue::paged(first, last));
+                let last = self.write_new_page_chain(body, alloc, live)?;
+                return Ok(ShHeadValue::extent(last));
             }
         };
         let cap = slab_bytes(class) as usize;
@@ -1941,31 +2103,26 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         live: &[ShEntry],
-    ) -> Result<(u64, u64), StoreError> {
+    ) -> Result<u64, StoreError> {
         if live.is_empty() {
             return Err(StoreError::Corrupt("scripthash empty page chain"));
         }
-        // Pre-allocate all pages, then pack each with next known — one write per page
-        // (no RMW of the previous page to fix up next). Offsets may be non-contiguous
-        // when freelist reuses slabs.
         let fks: Vec<Fk> = live.iter().map(|e| e.create_tx_fk).collect();
         let chunks = sh_page_chunk_ranges(&fks)?;
         let n_pages = chunks.len();
-        let mut offs = Vec::with_capacity(n_pages);
-        for _ in 0..n_pages {
-            offs.push(self.alloc_page(body, alloc)?);
-        }
+        let base = self.alloc_extent(body, alloc, n_pages)?;
         let mut page = [0u8; SH_PAGE_SIZE];
-        for (pi, &off) in offs.iter().enumerate() {
-            let (start, end) = chunks[pi];
-            let next = offs.get(pi + 1).copied().unwrap_or(0);
-            sh_page_pack(&mut page, &live[start..end], next)?;
-            if next == 0 {
-                sh_page_set_last(&mut page, offs[0])?;
+        for (pi, &(start, end)) in chunks.iter().enumerate() {
+            let off = base.saturating_add((pi as u64).saturating_mul(SH_PAGE_SIZE as u64));
+            if pi + 1 == n_pages {
+                sh_page_pack_extent_last(&mut page, &live[start..end], base, n_pages as u32, 0)?;
+            } else {
+                let next = off.saturating_add(SH_PAGE_SIZE as u64);
+                sh_page_pack(&mut page, &live[start..end], next)?;
             }
             body.write_at(off, &page)?;
         }
-        Ok((offs[0], *offs.last().expect("n_pages >= 1")))
+        Ok(base.saturating_add(((n_pages - 1) as u64).saturating_mul(SH_PAGE_SIZE as u64)))
     }
 
     /// Append `tail` FKs onto an existing chain ending at `last_page`.
@@ -1983,6 +2140,7 @@ impl ScriptHashTable {
         let mut last = last_page;
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(last, &mut page)?;
+        let mut extent = sh_page_extent(&page)?;
         let chain_first = {
             let f = if sh_page_is_last(&page)? {
                 sh_page_first_off(&page)?
@@ -2000,9 +2158,16 @@ impl ScriptHashTable {
                 let new_off = self.alloc_page(body, alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 body.write_at(last, &page)?;
-                sh_page_init_empty(&mut page);
-                sh_page_set_last(&mut page, chain_first)?;
-                assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
+                if let Some((base, n)) = extent {
+                    let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
+                    let new_n = if glued { n.saturating_add(1) } else { n };
+                    sh_page_pack_extent_last(&mut page, &[*e], base, new_n, 0)?;
+                    extent = Some((base, new_n));
+                } else {
+                    sh_page_init_empty(&mut page);
+                    sh_page_set_last(&mut page, chain_first)?;
+                    assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
+                }
                 last = new_off;
             }
         }
@@ -2012,6 +2177,31 @@ impl ScriptHashTable {
 
     fn alloc_page(&self, body: &TableFile, alloc: &mut AllocState) -> Result<u64, StoreError> {
         self.alloc_slab(body, alloc, SH_PAGE_SLAB_CLASS)
+    }
+
+    fn alloc_extent(
+        &self,
+        body: &TableFile,
+        alloc: &mut AllocState,
+        n_pages: usize,
+    ) -> Result<u64, StoreError> {
+        if n_pages == 0 {
+            return Err(StoreError::Corrupt("scripthash empty extent"));
+        }
+        let mut off = alloc.bump;
+        let aligned = (off + 4095) & !4095;
+        if aligned != off {
+            carve_gap_into_freelist(body, &mut alloc.free_head, off, aligned)?;
+            alloc.bump = aligned;
+            off = aligned;
+        }
+        let need = (n_pages as u64).saturating_mul(SH_PAGE_SIZE as u64);
+        alloc.bump = alloc.bump.saturating_add(need);
+        body.ensure_capacity(alloc.bump)?;
+        if alloc.bump > body.logical_len() {
+            body.set_logical_len(alloc.bump)?;
+        }
+        Ok(off)
     }
 
     fn alloc_slab(
@@ -2053,6 +2243,16 @@ impl ScriptHashTable {
         match old {
             ShHeadValue::Paged { first_page, .. } => {
                 let mut off = *first_page;
+                while off != 0 {
+                    let mut page = [0u8; SH_PAGE_SIZE];
+                    body.read_at(off, &mut page)?;
+                    let (next, _) = sh_page_decode_slice(&page)?;
+                    self.free_slab(body, alloc, SH_PAGE_SLAB_CLASS, off)?;
+                    off = next;
+                }
+            }
+            ShHeadValue::Extent { last_page } => {
+                let mut off = paged_first_from_last(body, *last_page)?;
                 while off != 0 {
                     let mut page = [0u8; SH_PAGE_SIZE];
                     body.read_at(off, &mut page)?;
@@ -2444,6 +2644,7 @@ pub fn remap_sh_head_value(val: &ShHeadValue, delta: u64) -> ShHeadValue {
             first_page.saturating_add(delta),
             last_page.saturating_add(delta),
         ),
+        ShHeadValue::Extent { last_page } => ShHeadValue::extent(last_page.saturating_add(delta)),
     }
 }
 
@@ -2496,6 +2697,9 @@ pub fn remap_copied_page_chain(
             };
             let arr = sh_page_as_array_mut(&mut page)?;
             sh_page_set_last(arr, dest_first)?;
+            if let Some((base, n)) = sh_page_extent(arr)? {
+                sh_page_set_extent(arr, base.saturating_add(delta), n)?;
+            }
             body.write_at(off, &page)?;
             break;
         }
@@ -2756,8 +2960,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             } else {
                 self.write_page(&open.buf, false, open.first_page)?
             };
-            let first = open.first_page.unwrap_or(last);
-            ShHeadValue::paged(first, last)
+            ShHeadValue::extent(last)
         };
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
@@ -2853,9 +3056,12 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.ensure_body_capacity(end)?;
         let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_pack(&mut page, &ents, next)?;
-        if !has_next {
-            sh_page_set_last(&mut page, chain_first.unwrap_or(base))?;
+        if has_next {
+            sh_page_pack(&mut page, &ents, next)?;
+        } else {
+            let first = chain_first.unwrap_or(base);
+            let n = ((base.saturating_sub(first) / SH_PAGE_SIZE as u64).saturating_add(1)) as u32;
+            sh_page_pack_extent_last(&mut page, &ents, first, n, 0)?;
         }
         self.body().write_at(base, &page)?;
         self.bump = end;
@@ -2953,8 +3159,8 @@ impl<'a> ScriptHashBulkSession<'a> {
         let fks: Vec<Fk> = entries.iter().map(|e| e.create_tx_fk).collect();
         let payload = encode_slab_payload(&fks)?;
         let Some(class) = slab_class_for_packed_len(payload.len()) else {
-            let (first, last) = self.bulk_write_page_chain(entries)?;
-            return Ok(ShHeadValue::paged(first, last));
+            let last = self.bulk_write_page_chain(entries)?;
+            return Ok(ShHeadValue::extent(last));
         };
         let off = self.alloc_reloc_class(class)?;
         let need = slab_bytes(class) as usize;
@@ -2965,7 +3171,7 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     /// Write a full page chain at the aligned bump. Returns (first, last).
-    fn bulk_write_page_chain(&mut self, entries: &[ShEntry]) -> Result<(u64, u64), StoreError> {
+    fn bulk_write_page_chain(&mut self, entries: &[ShEntry]) -> Result<u64, StoreError> {
         if entries.is_empty() {
             return Err(StoreError::Corrupt("scripthash bulk page chain empty"));
         }
@@ -2978,21 +3184,23 @@ impl<'a> ScriptHashBulkSession<'a> {
         let mut page = [0u8; SH_PAGE_SIZE];
         for (pi, &(start, end_i)) in chunks.iter().enumerate() {
             let off = base + (pi as u64) * (SH_PAGE_SIZE as u64);
-            let next = if pi + 1 < n_pages {
-                off + SH_PAGE_SIZE as u64
+            if pi + 1 < n_pages {
+                let next = off + SH_PAGE_SIZE as u64;
+                sh_page_pack(&mut page, &entries[start..end_i], next)?;
             } else {
-                0
-            };
-            sh_page_pack(&mut page, &entries[start..end_i], next)?;
-            if next == 0 {
-                sh_page_set_last(&mut page, base)?;
+                sh_page_pack_extent_last(
+                    &mut page,
+                    &entries[start..end_i],
+                    base,
+                    n_pages as u32,
+                    0,
+                )?;
             }
             self.body().write_at(off, &page)?;
         }
         self.bump = end;
         self.body_write_off = end;
-        let last = base + ((n_pages - 1) as u64) * (SH_PAGE_SIZE as u64);
-        Ok((base, last))
+        Ok(base + ((n_pages - 1) as u64) * (SH_PAGE_SIZE as u64))
     }
 
     fn ensure_body_capacity(&self, need: u64) -> Result<(), StoreError> {
@@ -3224,6 +3432,10 @@ fn read_alloc_version_on_disk(body: &TableFile) -> Result<u16, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scripthash_pages::{
+        sh_page_as_array, sh_page_extent, SH_PAGE_EXTENT_STREAM_MAX, SH_PAGE_SIZE,
+        SH_PAGE_STREAM_MAX,
+    };
     use std::sync::atomic::AtomicBool;
 
     fn tmp() -> std::path::PathBuf {
@@ -3283,6 +3495,39 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = shard << 6 | (i & 0x3f);
         k
+    }
+
+    #[test]
+    fn sh_body_create_grows_64k_not_slab() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let t = ScriptHashTable::create(&dir).unwrap();
+            let sh = script_hash(&[0x01]);
+            t.put_create(&rec(sh, 1, 0)).unwrap();
+            t.put_create(&rec(sh, 2, 0)).unwrap();
+            t.flush().unwrap();
+            drop(t);
+            for e in std::fs::read_dir(dir.join("scripthash.body")).unwrap() {
+                let p = e.unwrap().path();
+                if !p.is_file() {
+                    continue;
+                }
+                let on_disk = std::fs::metadata(&p).unwrap().len();
+                assert!(
+                    on_disk < 128 * 1024,
+                    "{} len {on_disk} must stay under 128 KiB after one slab",
+                    p.display()
+                );
+            }
+            let ovf_len = std::fs::metadata(dir.join("scripthash.ovf").join("body"))
+                .unwrap()
+                .len();
+            assert!(
+                ovf_len < 128 * 1024,
+                "ovf body {ovf_len} must stay under 128 KiB"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
@@ -3542,12 +3787,8 @@ mod tests {
         let rest: Vec<_> = (10..=257u64).map(|i| rec(sh, i, 0)).collect();
         assert_eq!(t.put_create_batch(&rest).unwrap(), 248);
         match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert!(first_page > 0);
-                assert_eq!(first_page, last_page, "257 fks fit one megakey page");
+            ShHeadValue::Extent { last_page } => {
+                assert!(last_page > 0);
             }
             other => panic!("expected page chain at 257, got {other:?}"),
         }
@@ -3716,8 +3957,8 @@ mod tests {
         let (nm, _) = t.put_create_batch_append(&many, &mut heads2).unwrap();
         assert_eq!(nm, 600);
         match t.head_value(&sh2).unwrap().unwrap() {
-            ShHeadValue::Paged { .. } => {}
-            other => panic!("expected paged megakey, got {other:?}"),
+            ShHeadValue::Extent { .. } => {}
+            other => panic!("expected extent megakey, got {other:?}"),
         }
         assert_eq!(t.entries(&sh2).unwrap().len(), 600);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4276,7 +4517,7 @@ mod tests {
 
     #[test]
     fn bulk_session_stream_megakey_caps_buf_at_page() {
-        use crate::scripthash_pages::{SH_PAGE_SIZE, SH_PAGE_STREAM_MAX};
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         let n = SH_PAGE_STREAM_MAX + 10;
@@ -4300,13 +4541,18 @@ mod tests {
         assert_eq!(creates, n as u64);
         assert_eq!(t.entries(&sh).unwrap().len(), n);
         match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert_eq!(last_page, first_page + SH_PAGE_SIZE as u64);
+            ShHeadValue::Extent { last_page } => {
+                let w = u64::from_le_bytes(pack8_bytes(&ShHeadValue::extent(last_page)).unwrap());
+                assert_eq!(w >> 62, 3);
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                let (base, n) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .expect("ver=2 last page");
+                assert_eq!(n, 2);
+                assert_eq!(last_page, base + SH_PAGE_SIZE as u64);
             }
-            other => panic!("expected paged, got {other:?}"),
+            other => panic!("expected extent, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4335,7 +4581,7 @@ mod tests {
         let slab_val = src.head_value(&slab_key).unwrap().unwrap();
         let mega_val = src.head_value(&mega_key).unwrap().unwrap();
         assert!(matches!(slab_val, ShHeadValue::Slab { .. }));
-        assert!(matches!(mega_val, ShHeadValue::Paged { .. }));
+        assert!(matches!(mega_val, ShHeadValue::Extent { .. }));
         let src_lo = payload_start(FILE_HEADER_LEN);
         let src_hi = src.alloc_bump();
         let delta = 3 * SH_PAGE_SIZE as u64;
@@ -4343,8 +4589,13 @@ mod tests {
         copy_sh_body_range(src.body(), src_lo, src_hi, dst.body(), src_lo + delta).unwrap();
         let slab_r = remap_sh_head_value(&slab_val, delta);
         let mega_r = remap_sh_head_value(&mega_val, delta);
-        if let ShHeadValue::Paged { first_page, .. } = mega_r {
-            remap_copied_page_chain(dst.body(), first_page, delta).unwrap();
+        if let ShHeadValue::Extent { last_page } = mega_r {
+            let mut page = [0u8; SH_PAGE_SIZE];
+            dst.body().read_at(last_page, &mut page).unwrap();
+            let (base, _) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                .unwrap()
+                .expect("ver=2 last page");
+            remap_copied_page_chain(dst.body(), base.saturating_add(delta), delta).unwrap();
         }
         let recs = vec![
             (head_key_from_full(&slab_key), pack8_bytes(&slab_r).unwrap()),
@@ -4713,7 +4964,7 @@ mod tests {
 
     #[test]
     fn materialize_no_temp_body() {
-        use crate::scripthash_pages::{SH_PAGE_SIZE, SH_PAGE_STREAM_MAX};
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         HeadScale::test_with(HeadScale::Tiny, || {
             let dir = tmp();
             let runs_dir = dir.join("runs");
@@ -4769,13 +5020,16 @@ mod tests {
             assert_eq!(t.entries(&sh_prefix_key(0, 0)).unwrap().len(), 1);
             assert_eq!(t.entries(&mega_key).unwrap().len(), n_mega);
             match t.head_value(&mega_key).unwrap().unwrap() {
-                ShHeadValue::Paged {
-                    first_page,
-                    last_page,
-                } => {
-                    assert_eq!(last_page, first_page + SH_PAGE_SIZE as u64);
+                ShHeadValue::Extent { last_page } => {
+                    let mut page = [0u8; SH_PAGE_SIZE];
+                    t.body().read_at(last_page, &mut page).unwrap();
+                    let (base, n) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                        .unwrap()
+                        .expect("ver=2 last page");
+                    assert_eq!(n, 2);
+                    assert_eq!(last_page, base + SH_PAGE_SIZE as u64);
                 }
-                other => panic!("expected paged megakey, got {other:?}"),
+                other => panic!("expected extent megakey, got {other:?}"),
             }
             let _ = std::fs::remove_dir_all(&dir);
         });
@@ -4806,7 +5060,7 @@ mod tests {
     /// writes next links on first write — no previous-page RMW).
     #[test]
     fn bulk_session_megakey_page_chain_contiguous_once() {
-        use crate::scripthash_pages::{SH_PAGE_SIZE, SH_PAGE_STREAM_MAX};
+        use crate::scripthash_pages::SH_PAGE_STREAM_MAX;
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         // Sequential FKs fill ~4080/page; this n spans two pages.
@@ -4815,44 +5069,167 @@ mod tests {
         sh[0] = 0x10;
         sh[1] = 0xee;
         let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
-        let mut session = t.bulk_session(1).unwrap();
+        let mut sh_next = [0u8; 32];
+        sh_next[0] = 0x10;
+        sh_next[1] = 0xef;
+        let next_ents = vec![ShEntry::new(Fk(1)), ShEntry::new(Fk(2))];
+        let mut session = t.bulk_session(2).unwrap();
         session.put_chain(sh, &ents).unwrap();
+        session.put_chain(sh_next, &next_ents).unwrap();
         let (creates, keys, _, _) = session.finish().unwrap();
-        assert_eq!(keys, 1);
-        assert_eq!(creates, n as u64);
+        assert_eq!(keys, 2);
+        assert_eq!(creates, n as u64 + 2);
         let got = t.entries(&sh).unwrap();
         assert_eq!(got.len(), n);
         for (i, (_, e)) in got.iter().enumerate() {
             assert_eq!(e.create_tx_fk, Fk(i as u64 + 1));
         }
-        let (first, last) = match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => (first_page, last_page),
-            other => panic!("expected paged, got {other:?}"),
+        reset_sh_page_chain_ios();
+        let got2 = t.entries(&sh).unwrap();
+        assert_eq!(got2.len(), n);
+        assert!(
+            sh_page_chain_ios() <= 2,
+            "contiguous two-page chain should span-read, ios={}",
+            sh_page_chain_ios()
+        );
+        let (first, last, extent_n) = match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Extent { last_page } => {
+                let w = u64::from_le_bytes(pack8_bytes(&ShHeadValue::extent(last_page)).unwrap());
+                assert_eq!(w >> 62, 3, "pack8 mode 11");
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                let (base, n) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .expect("ver=2 last page");
+                (base, last_page, n)
+            }
+            other => panic!("expected extent, got {other:?}"),
         };
-        // Contiguous bump layout: last = first + (n_pages-1)*4096.
+        assert_eq!(extent_n, 2);
         assert_eq!(
             last,
             first + SH_PAGE_SIZE as u64,
-            "bulk chain pages must be contiguous at bump"
+            "tight extent: last = base + (n-1)*4096"
         );
         assert!(first > 0 && first % (SH_PAGE_SIZE as u64) == 0);
+        match t.head_value(&sh_next).unwrap().unwrap() {
+            ShHeadValue::Slab { off, .. } => {
+                assert_eq!(
+                    off,
+                    last + SH_PAGE_SIZE as u64,
+                    "next key must pack at extent_end (no slack hole)"
+                );
+            }
+            other => panic!("expected slab after megakey, got {other:?}"),
+        }
         // Tip-path multi-page (write_new_page_chain) also round-trips same size.
         let sh2 = script_hash(&[0xef]);
         let recs: Vec<_> = (1..=n as u32).map(|v| rec(sh2, u64::from(v), v)).collect();
         assert_eq!(t.put_create_batch(&recs).unwrap(), n);
         assert_eq!(t.entries(&sh2).unwrap().len(), n);
         match t.head_value(&sh2).unwrap().unwrap() {
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                assert_ne!(first_page, last_page);
+            ShHeadValue::Extent { last_page } => {
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                let (base, n_ext) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .expect("ver=2 last page");
+                assert_eq!(n_ext, 2);
+                assert_ne!(base, last_page);
             }
-            other => panic!("expected paged, got {other:?}"),
+            other => panic!("expected extent, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn extent_meta(t: &ScriptHashTable, sh: &[u8; 32]) -> (u64, u64, u32) {
+        match t.head_value(sh).unwrap().unwrap() {
+            ShHeadValue::Extent { last_page } => {
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                let (base, n) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .expect("ver=2 last page");
+                (base, last_page, n)
+            }
+            other => panic!("expected extent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extent_append_links_tail_when_bump_moved() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX - 1;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x21;
+        sh[1] = 0xaa;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut sh_gap = [0u8; 32];
+        sh_gap[0] = 0x21;
+        sh_gap[1] = 0xab;
+        let mut session = t.bulk_session(2).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        session
+            .put_chain(sh_gap, &[ShEntry::new(Fk(1)), ShEntry::new(Fk(2))])
+            .unwrap();
+        let _ = session.finish().unwrap();
+        let (base, last0, n0) = extent_meta(&t, &sh);
+        assert_eq!(n0, 2);
+        t.put_create(&rec(sh, n as u64 + 1, 0)).unwrap();
+        let (base2, last1, n1) = extent_meta(&t, &sh);
+        assert_eq!(base2, base);
+        assert_eq!(n1, 2, "tail must not bump extent_n");
+        assert_ne!(
+            last1,
+            base + (u64::from(n1) - 1) * SH_PAGE_SIZE as u64,
+            "overflow last_page is a linked tail"
+        );
+        assert_ne!(last1, last0);
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        reset_sh_page_chain_ios();
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        assert!(
+            sh_page_chain_ios() >= 3,
+            "span + tail read, ios={}",
+            sh_page_chain_ios()
+        );
+        let extra2: Vec<_> = ((n as u64 + 2)..=(n as u64 + 1 + SH_PAGE_EXTENT_STREAM_MAX as u64))
+            .map(|i| rec(sh, i, 0))
+            .collect();
+        assert_eq!(t.put_create_batch(&extra2).unwrap(), extra2.len());
+        let (_, last2, n2) = extent_meta(&t, &sh);
+        assert_eq!(n2, 2);
+        assert_ne!(last2, last1, "second overflow adds another linked page");
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1 + extra2.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extent_append_glued_bumps_extent_n() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX - 1;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x22;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut session = t.bulk_session(1).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        let _ = session.finish().unwrap();
+        let (base, _, n0) = extent_meta(&t, &sh);
+        assert_eq!(n0, 2);
+        t.put_create(&rec(sh, n as u64 + 1, 0)).unwrap();
+        let (_, last, n1) = extent_meta(&t, &sh);
+        assert_eq!(n1, 3, "glued HWM grows extent_n in place");
+        assert_eq!(last, base + 2 * SH_PAGE_SIZE as u64);
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        reset_sh_page_chain_ios();
+        assert_eq!(t.entries(&sh).unwrap().len(), n + 1);
+        assert!(
+            sh_page_chain_ios() <= 2,
+            "glued grow stays one span, ios={}",
+            sh_page_chain_ios()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

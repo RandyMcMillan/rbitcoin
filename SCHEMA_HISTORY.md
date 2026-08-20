@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 18`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 19`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | **Current** |
+| **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | **Current** |
+| **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | Prior |
 | **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Prior |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
@@ -31,6 +32,13 @@ Versions below are listed **newest → oldest** after the summary table.
 | **≤3** | Early mmap store; fat heads; mixed prev encoding | Mostly gone |
 
 ---
+
+## v19 (megakey extent)
+
+Soft-open 18. Pack8 bits 63–62 value `11` is last-page off; that page’s `ver=2`
+header stores `extent_base` + `extent_n` (tight used count, no slack). Query
+span-reads the extent then linked-walks a 4 KiB tail. Mode 10 / `ver=1` stays
+a linked walk. SH body/ovf grow in 64 KiB steps. Class A unchanged.
 
 ## v18 (indexes)
 

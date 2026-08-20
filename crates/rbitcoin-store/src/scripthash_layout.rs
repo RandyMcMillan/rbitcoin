@@ -115,6 +115,10 @@ pub enum ShHeadValue {
         first_page: u64,
         last_page: u64,
     },
+    /// Schema 19 megakey: pack8 mode 11 last page; that page holds extent_base/n.
+    Extent {
+        last_page: u64,
+    },
 }
 
 impl ShHeadValue {
@@ -124,7 +128,7 @@ impl ShHeadValue {
             ShHeadValue::Inline { used, .. } => u32::from(*used),
             ShHeadValue::Slab { used, .. } => u32::from(*used),
             // Count not stored in head; callers that need n walk pages.
-            ShHeadValue::Paged { .. } => u32::MAX,
+            ShHeadValue::Paged { .. } | ShHeadValue::Extent { .. } => u32::MAX,
         }
     }
 
@@ -133,7 +137,7 @@ impl ShHeadValue {
     }
 
     pub fn is_paged(&self) -> bool {
-        matches!(self, ShHeadValue::Paged { .. })
+        matches!(self, ShHeadValue::Paged { .. } | ShHeadValue::Extent { .. })
     }
 
     pub fn is_slab(&self) -> bool {
@@ -164,6 +168,10 @@ impl ShHeadValue {
             } => {
                 out = sh_encode_paged_head(*first_page, *last_page)
                     .expect("paged head encode (offs validated at write)");
+            }
+            ShHeadValue::Extent { last_page } => {
+                out = sh_encode_paged_head(*last_page, *last_page)
+                    .expect("extent 16 B encode uses last as first (durable path is pack8)");
             }
         }
         out
@@ -228,6 +236,10 @@ impl ShHeadValue {
         }
     }
 
+    pub fn extent(last_page: u64) -> Self {
+        ShHeadValue::Extent { last_page }
+    }
+
     pub fn slab(class: u8, used: u16, off: u64) -> Self {
         ShHeadValue::Slab { class, used, off }
     }
@@ -278,10 +290,16 @@ pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
                 | ((u64::from(*class) & SH8_CLASS_MASK) << SH8_CLASS_SHIFT))
         }
         ShHeadValue::Paged { last_page, .. } => {
-            if *last_page > SH8_PAYLOAD62 {
+            if *last_page > SH8_PAYLOAD62 || *last_page == 0 {
                 return Err(StoreError::Corrupt("sh pack8: last_page overflow"));
             }
             Ok((2u64 << SH8_MODE_SHIFT) | *last_page)
+        }
+        ShHeadValue::Extent { last_page } => {
+            if *last_page > SH8_PAYLOAD62 || *last_page == 0 {
+                return Err(StoreError::Corrupt("sh pack8: last_page overflow"));
+            }
+            Ok((3u64 << SH8_MODE_SHIFT) | *last_page)
         }
         ShHeadValue::Inline { .. } => Err(StoreError::Corrupt("sh pack8: inline cap 1")),
     }
@@ -311,7 +329,20 @@ pub fn unpack8(w: u64) -> Result<ShHeadValue, StoreError> {
             }
             Ok(ShHeadValue::slab(class, used, off))
         }
-        2 => Ok(ShHeadValue::paged(0, w & SH8_PAYLOAD62)),
+        2 => {
+            let last = w & SH8_PAYLOAD62;
+            if last == 0 {
+                return Err(StoreError::Corrupt("sh unpack8: null last_page"));
+            }
+            Ok(ShHeadValue::paged(0, last))
+        }
+        3 => {
+            let last = w & SH8_PAYLOAD62;
+            if last == 0 {
+                return Err(StoreError::Corrupt("sh unpack8: null last_page"));
+            }
+            Ok(ShHeadValue::extent(last))
+        }
         _ => Err(StoreError::Corrupt("sh unpack8: bad mode")),
     }
 }
@@ -416,6 +447,26 @@ mod tests {
         assert_eq!(pack8(&ShHeadValue::Empty).unwrap(), 0);
         assert!(pack8(&ShHeadValue::inline_one(ShEntry::new(Fk(0)))).is_ok());
         assert!(unpack8(1u64 << 62 | 1).is_err() || matches!(unpack8(1u64 << 62 | 1), Ok(_)));
+    }
+
+    #[test]
+    fn pack8_mode_11_extent_roundtrip() {
+        let v = ShHeadValue::extent(8192);
+        let w = pack8(&v).unwrap();
+        assert_eq!(w >> SH8_MODE_SHIFT, 3);
+        assert_eq!(w & SH8_PAYLOAD62, 8192);
+        match unpack8(w).unwrap() {
+            ShHeadValue::Extent { last_page: 8192 } => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            pack8(&ShHeadValue::extent(0)),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            unpack8(3u64 << SH8_MODE_SHIFT),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]

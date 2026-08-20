@@ -59,6 +59,8 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **19:** Megakey SH extent pack8 mode 11 (`ver=2` last page). Soft-open **18**
+///         with occupied indexes (rewrite `meta`). 18 binary refuses 19 `meta`.
 /// **18:** MPHF SH main + sealed `tx.head`; no IBD SH runs. Soft-open **17**
 ///         only when `tx.head` occupancy and `scripthash*` data are absent
 ///         (rewrite `meta`); otherwise refuse (wipe those indexes, keep Class A).
@@ -70,16 +72,17 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 18;
+pub const SCHEMA_VERSION: u16 = 19;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **18** is current. Schema **17** reaches `Store::open` so it can
-/// refuse populated `tx.head` / `scripthash*` or rewrite empty indexes.
-/// Schema **13**–**16** still soft-open empty Class A / empty SH (meta rewrite).
+/// Schema **19** is current. Schema **18** reaches `Store::open` and rewrites
+/// `meta` even with populated indexes. Schema **17** still refuses populated
+/// `tx.head` / `scripthash*` or rewrites empty indexes. Schema **13**–**16**
+/// still soft-open empty Class A / empty SH (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 18 && matches!(ver, 13..=17))
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 19 && matches!(ver, 13..=18))
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -305,8 +308,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 18);
+        assert_eq!(SCHEMA_VERSION, 19);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(19));
         assert!(schema_file_openable(18));
         assert!(schema_file_openable(17));
         assert!(schema_file_openable(16));

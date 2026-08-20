@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **Esplora `/utxo`:** status comes from the SH join height plus unique
+  headers (`block_hash` / `block_time`). No per-coin `tx.head` or
+  Class A `get`. Balance / `/address` stats skip `txid.body`; listunspent
+  still loads create identity. `sh_join` debug adds `need=`.
+
 - **Per-item `received getdata for: wtx` is TRACE:** one line per peer
   `MSG_WTX` getdata is too noisy at DEBUG. Counts stay on `tip: perf`.
   Core functional still sees the needle: the bitcoind shim maps

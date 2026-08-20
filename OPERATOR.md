@@ -519,9 +519,11 @@ Use this to see whether Cake is hitting tweaks vs only scripthash history, and w
 `wall_ms` is the full handler (including JSON). Scripthash history / balance /
 UTXO / Esplora address stats share one waved Class A + spend join on the
 process `RBITCOIN_IO` session. `--log-level debug` emits
-`sh_join: creates=… pages_us=… class_a_us=… spends_us=…` when that join
-exceeds 10 ms. That split is not an `ibd: perf` line and is not extra JSONL
-fields.
+`sh_join: creates=… outs=… need=… pages_us=… class_a_us=… spends_us=…` when
+that join exceeds 10 ms (`need=` is `cs` / `c` / `-`: create and/or spender
+`txid.body`). That split is not an `ibd: perf` line and is not extra JSONL
+fields. Esplora `/address/{addr}/utxo` status (`block_hash` / `block_time`)
+comes from join height plus unique headers — not a per-coin `tx.head` probe.
 
 ### App DoS floor (always on)
 

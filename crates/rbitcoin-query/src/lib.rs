@@ -161,7 +161,7 @@ pub use recent_creates::{
 };
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
-    ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
+    ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
 };
 pub use stamp::{fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp};
 pub use wave_prevout::ThinInput;
@@ -2903,6 +2903,196 @@ mod tests {
         assert!(stats_join
             .iter()
             .any(|r| r.spent && !r.spender_fks.is_empty()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripthash_listunspent_identity_skips_spent_creates() {
+        let (dir, q) = temp_query("sh-lu-id-spent");
+        assert!(q.index_mode().is_tip());
+
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut create_fks = Vec::new();
+        let mut create_txids = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            create_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            create_fks.push(q.block_tx_fks(Height(h)).unwrap()[0]);
+        }
+
+        for (i, spent_h) in [0u32, 1].into_iter().enumerate() {
+            let h = 3 + i as u32;
+            let (header, mut cb) = coinbase_block(h, prev, parent_hash);
+            cb.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x00])];
+            parent_hash = Some(header.hash);
+            let mut spend_txid = [0u8; 32];
+            spend_txid[0] = 0x5e;
+            spend_txid[31] = spent_h as u8;
+            let spend = TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: create_txids[spent_h as usize],
+                    create_fk: create_fks[spent_h as usize],
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x00])],
+            };
+            prev = q.connect_block(Height(h), &header, &[cb, spend]).unwrap();
+        }
+
+        let sh = script_hash(&[0x51]);
+        let keep = create_fks[2];
+        rbitcoin_store::reset_txid_get_many();
+        let utxos = q.scripthash_listunspent(&sh).unwrap();
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].tx_hash, create_txids[2]);
+        let ids = rbitcoin_store::txid_get_many_fks();
+        assert!(
+            ids.iter().all(|fk| *fk == keep.0),
+            "listunspent txid.body only for unspent create, not spent {:?}: {:?}",
+            [create_fks[0].0, create_fks[1].0],
+            ids
+        );
+        assert!(
+            ids.contains(&keep.0),
+            "unspent create must load txid.body: {ids:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripthash_touched_at_height_skips_class_a_expand() {
+        let (dir, q) = temp_query("sh-touch-h");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut create_fks = Vec::new();
+        let mut create_txids = Vec::new();
+        for h in 0..2u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            create_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            create_fks.push(q.block_tx_fks(Height(h)).unwrap()[0]);
+        }
+        let sh = script_hash(&[0x51]);
+
+        let (header, mut miss) = coinbase_block(2, prev, parent_hash);
+        miss.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x00])];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(2), &header, &[miss]).unwrap();
+
+        reset_body_ok_reads();
+        assert!(!q.scripthash_touched_at_height(&sh, Height(2)).unwrap());
+        assert_eq!(
+            body_ok_reads(),
+            0,
+            "untouched height must not load_creates_once"
+        );
+
+        reset_body_ok_reads();
+        assert!(q.scripthash_touched_at_height(&sh, Height(0)).unwrap());
+        assert_eq!(body_ok_reads(), 0, "create-in-block probe is posting list");
+
+        let (header, mut cb) = coinbase_block(3, prev, parent_hash);
+        cb.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x00])];
+        let spend = TxApply {
+            tx: TxRecord {
+                txid: {
+                    let mut t = [0u8; 32];
+                    t[0] = 0x5e;
+                    t
+                },
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: create_txids[0],
+                create_fk: create_fks[0],
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x00])],
+        };
+        q.connect_block(Height(3), &header, &[cb, spend]).unwrap();
+        reset_body_ok_reads();
+        assert!(q.scripthash_touched_at_height(&sh, Height(3)).unwrap());
+        assert_eq!(
+            body_ok_reads(),
+            0,
+            "spend-in-block probe is prevout create_fk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripthash_join_slot_reuses_class_a_until_tip() {
+        let (dir, q) = temp_query("sh-slot-reuse");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut create_txids = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            create_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let sh = script_hash(&[0x51]);
+        let mut slot = None;
+        reset_body_ok_reads();
+        let bal = q.scripthash_balance_slot(&sh, &mut slot).unwrap();
+        assert_eq!(bal.confirmed, 150_0000_0000);
+        let after_bal = body_ok_reads();
+        assert_eq!(after_bal, 3, "first join expands each create once");
+
+        let hist = q.scripthash_history_slot(&sh, &mut slot).unwrap();
+        assert_eq!(hist.len(), 3);
+        assert_eq!(body_ok_reads(), after_bal, "history must reuse packed outs");
+        let hist_txids: Vec<_> = hist.iter().map(|i| i.txid).collect();
+        for txid in &create_txids {
+            assert!(
+                hist_txids.contains(txid),
+                "history identity from slot enrich"
+            );
+        }
+
+        let utxos = q.scripthash_listunspent_slot(&sh, &mut slot).unwrap();
+        assert_eq!(utxos.len(), 3);
+        assert_eq!(
+            body_ok_reads(),
+            after_bal,
+            "listunspent must reuse packed outs"
+        );
+
+        let (header, ta) = coinbase_block(3, prev, parent_hash);
+        q.connect_block(Height(3), &header, &[ta]).unwrap();
+        q.scripthash_balance_slot(&sh, &mut slot).unwrap();
+        assert!(
+            body_ok_reads() > after_bal,
+            "new tip must invalidate the slot"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

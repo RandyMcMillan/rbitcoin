@@ -4,7 +4,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::OutPoint;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Fk;
-use rbitcoin_query::{Query, QueryError, ScriptHashUtxo};
+use rbitcoin_query::{Query, QueryError, ScriptHashUtxo, ShJoinSlot};
 use rbitcoin_store::script_hash;
 
 /// Confirmed SH UTXOs plus mempool funding, minus mempool spends (Electrum rules).
@@ -13,7 +13,18 @@ pub fn scripthash_utxos_with_mempool(
     mempool: Option<&MempoolHub>,
     sh: &[u8; 32],
 ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
-    let mut out = query.scripthash_listunspent(sh)?;
+    let mut slot = None;
+    scripthash_utxos_with_mempool_slot(query, mempool, sh, &mut slot)
+}
+
+/// [`scripthash_utxos_with_mempool`] using a connection-local join slot.
+pub(crate) fn scripthash_utxos_with_mempool_slot(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    sh: &[u8; 32],
+    slot: &mut Option<ShJoinSlot>,
+) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+    let mut out = query.scripthash_listunspent_slot(sh, slot)?;
     let Some(mp) = mempool else {
         return Ok(out);
     };

@@ -214,7 +214,7 @@ pub fn subscribe(query: &Query, params: &Value, chain: &ChainParams) -> Result<V
     let req = parse_req(params)?;
     let t0 = Instant::now();
     let map = height_map(query, chain, req.start)?;
-    rbitcoin_log::debug!(
+    rbitcoin_log::trace!(
         "electrum: tweaks h={} count={} result_keys={} wall_ms={}",
         req.start,
         req.count,

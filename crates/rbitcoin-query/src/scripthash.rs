@@ -344,7 +344,7 @@ impl Query {
             .saturating_add(class_a_us)
             .saturating_add(spends_us);
         if total_us >= 10_000 {
-            rbitcoin_log::debug!(
+            rbitcoin_log::trace!(
                 "sh_join: creates={} outs={} need={} pages_us={} class_a_us={} spends_us={}",
                 fks.len(),
                 out.len(),

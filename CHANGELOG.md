@@ -28,6 +28,11 @@ before 1.0).
 
 ### Changed
 
+- **Query-path `api:` / `sh_join` / tweaks timing are TRACE:** one line per
+  Electrum/Esplora/RPC call (and per slow SH join) flooded DEBUG during
+  wallet/bench load. `--api-log` JSONL is unchanged. Connect/disconnect
+  stay INFO.
+
 - **Esplora `/utxo`:** status comes from the SH join height plus unique
   headers (`block_hash` / `block_time`). No per-coin `tx.head` or
   Class A `get`. Balance / `/address` stats skip `txid.body`; listunspent

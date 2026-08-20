@@ -7,6 +7,10 @@
 //!   batched `get_history` (refresh); optional `transaction.get`.
 //! - **hot**: fat-history keys (e.g. well-known high-fanout scripts).
 //!
+//! Default `--corpus` matches `--suite`. Packed lists live in `corpora/`:
+//! `hot` is public fat keys; `casa`/`sparrow` are unique output scripts from
+//! heights spaced genesis→tip (so height-list servers cannot cache one window).
+//!
 //! Not a product binary. Build: `cargo run -p rbitcoin-bench --features cli --release`.
 
 mod electrum;
@@ -21,7 +25,7 @@ use crate::electrum::ElectrumClient;
 use crate::esplora::EsploraClient;
 use crate::stats::format_report;
 use crate::suite::{electrum_casa, electrum_hot, electrum_sparrow, esplora_casa, CasaOpts, Suite};
-use crate::targets::load_targets;
+use crate::targets::{load_corpus, load_targets};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -45,9 +49,12 @@ fn usage() -> String {
            cargo run -p rbitcoin-bench --features cli --release -- [OPTIONS]\n\
          \n\
          Required:\n\
-           --targets FILE         scripthash hex (64) or addresses, one per line\n\
            --electrum HOST:PORT   Electrum TCP (e.g. 127.0.0.1:50001)\n\
            --esplora http://HOST:PORT\n\
+         \n\
+         Targets (default: embedded corpus matching --suite):\n\
+           --corpus casa|sparrow|hot  packed-in keys (see corpora/)\n\
+           --targets FILE             scripthash hex (64) or addresses, one per line\n\
          \n\
          Options:\n\
            --suite casa|sparrow|hot   default casa (casa=Lopp/Casa; sparrow=wallet\n\
@@ -62,7 +69,8 @@ fn usage() -> String {
          \n\
          Casa: sequential balance/history/utxo; throw away warmup; median of passes.\n\
          Sparrow: subscribe all (load) then get_history all (refresh), batch 50.\n\
-         Compare the same --targets file against rbitcoin, Fulcrum, electrs, ElectrumX.",
+         Embedded casa/sparrow keys are spread genesis→tip (not one 200-block window).\n\
+         Compare the same corpus against rbitcoin, Fulcrum, electrs, ElectrumX.",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -70,6 +78,7 @@ fn usage() -> String {
 #[derive(Debug)]
 struct Cfg {
     targets: Option<PathBuf>,
+    corpus: Option<String>,
     electrum: Option<String>,
     esplora: Option<String>,
     suite: Suite,
@@ -84,6 +93,7 @@ impl Default for Cfg {
     fn default() -> Self {
         Self {
             targets: None,
+            corpus: None,
             electrum: None,
             esplora: None,
             suite: Suite::Casa,
@@ -114,6 +124,7 @@ fn parse_args(args: &[OsString]) -> Result<Cfg, String> {
                 return Err(format!("rbitcoin-bench {}", env!("CARGO_PKG_VERSION")));
             }
             "--targets" => cfg.targets = Some(PathBuf::from(take(args, &mut i, "--targets")?)),
+            "--corpus" => cfg.corpus = Some(take(args, &mut i, "--corpus")?),
             "--electrum" => cfg.electrum = Some(take(args, &mut i, "--electrum")?),
             "--esplora" => cfg.esplora = Some(take(args, &mut i, "--esplora")?),
             "--suite" => cfg.suite = Suite::parse(&take(args, &mut i, "--suite")?)?,
@@ -168,11 +179,18 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     }) {
         return Ok(());
     }
-    let path = cfg
-        .targets
-        .clone()
-        .ok_or_else(|| "need --targets FILE (see --help)".to_string())?;
-    let targets = load_targets(&path)?;
+    let targets = match (&cfg.targets, &cfg.corpus) {
+        (Some(path), _) => load_targets(path)?,
+        (None, Some(name)) => load_corpus(name)?,
+        (None, None) => {
+            let name = match cfg.suite {
+                Suite::Casa => "casa",
+                Suite::Sparrow => "sparrow",
+                Suite::Hot => "hot",
+            };
+            load_corpus(name)?
+        }
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -270,6 +288,16 @@ mod tests {
         let c = parse_args(&args).unwrap();
         assert_eq!(c.batch, 25);
         assert_eq!(c.suite, Suite::Sparrow);
+        let args = vec![
+            OsString::from("rbitcoin-bench"),
+            OsString::from("--corpus"),
+            OsString::from("hot"),
+            OsString::from("--electrum"),
+            OsString::from("127.0.0.1:1"),
+        ];
+        let c = parse_args(&args).unwrap();
+        assert_eq!(c.corpus.as_deref(), Some("hot"));
+        assert!(c.targets.is_none());
     }
 
     #[test]

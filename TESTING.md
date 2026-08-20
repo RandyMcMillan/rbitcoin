@@ -36,8 +36,8 @@ Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
 Host forensics and `cargo bench` one-offs are **not** in the default compile
 graph (`scripts/check_default_targets.test.sh`). Optional **client** comparison
 is `rbitcoin-bench` (`cargo run -p rbitcoin-bench --features cli --release`);
-not a musl product bin. Suites: [`OPERATOR.md`](./OPERATOR.md) (Client
-benchmark). IBD progress/rejects belong in node logs (`ibd: confirm reject`,
+not a musl product bin. Suites and packed `--corpus` lists:
+[`OPERATOR.md`](./OPERATOR.md) (Client benchmark). IBD progress/rejects belong in node logs (`ibd: confirm reject`,
 `ibd: archive reject`); host A/B is musl + `ibd: perf`.
 
 ## Running tests

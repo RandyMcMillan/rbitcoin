@@ -1,4 +1,4 @@
-//! One scripthash or Bitcoin address per line.
+//! One scripthash or Bitcoin address per line. Embedded corpora in `corpora/`.
 
 use crate::hex;
 use bitcoin::address::NetworkUnchecked;
@@ -13,6 +13,19 @@ pub fn electrum_scripthash_hex(spk: &[u8]) -> String {
     let mut rev = h;
     rev.reverse();
     hex::encode(&rev)
+}
+
+pub const CORPUS_HOT: &str = include_str!("../corpora/hot.txt");
+pub const CORPUS_CASA: &str = include_str!("../corpora/casa.txt");
+pub const CORPUS_SPARROW: &str = include_str!("../corpora/sparrow.txt");
+
+pub fn corpus_text(name: &str) -> Result<&'static str, String> {
+    match name {
+        "hot" => Ok(CORPUS_HOT),
+        "casa" => Ok(CORPUS_CASA),
+        "sparrow" => Ok(CORPUS_SPARROW),
+        other => Err(format!("unknown corpus {other} (hot|casa|sparrow)")),
+    }
 }
 
 pub fn parse_target_line(line: &str) -> Result<Option<String>, String> {
@@ -30,12 +43,14 @@ pub fn parse_target_line(line: &str) -> Result<Option<String>, String> {
     )))
 }
 
-pub fn load_targets(path: &Path) -> Result<Vec<String>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+pub fn parse_targets_text(text: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (i, line) in text.lines().enumerate() {
         if let Some(sh) = parse_target_line(line)? {
-            out.push(sh);
+            if seen.insert(sh.clone()) {
+                out.push(sh);
+            }
         }
         if i > 1_000_000 {
             return Err("target file too large".into());
@@ -45,6 +60,15 @@ pub fn load_targets(path: &Path) -> Result<Vec<String>, String> {
         return Err("no scripthashes or addresses in target file".into());
     }
     Ok(out)
+}
+
+pub fn load_targets(path: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    parse_targets_text(&text)
+}
+
+pub fn load_corpus(name: &str) -> Result<Vec<String>, String> {
+    parse_targets_text(corpus_text(name)?)
 }
 
 #[cfg(test)]
@@ -98,5 +122,43 @@ mod tests {
         std::fs::write(&p, "# only\n").unwrap();
         assert!(load_targets(&p).unwrap_err().contains("no scripthashes"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hot_corpus_includes_p2a() {
+        let got = load_corpus("hot").unwrap();
+        assert!(got.len() >= 16);
+        let from_addr = parse_target_line("bc1pfeessrawgf").unwrap().unwrap();
+        assert_eq!(
+            from_addr,
+            "c5d0fb3863474a90cfe5b26801e66cb45fdc046b40e6829788eaf1b8770ffea6"
+        );
+        assert!(got.iter().any(|s| s == &from_addr));
+    }
+
+    #[test]
+    fn casa_corpus_is_spread_and_sized() {
+        let got = load_corpus("casa").unwrap();
+        assert!(got.len() >= 4096, "len={}", got.len());
+        let mut prefixes: Vec<_> = got.iter().map(|s| &s[..2]).collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        assert!(
+            prefixes.len() >= 64,
+            "scripthash prefixes too clustered: {}",
+            prefixes.len()
+        );
+    }
+
+    #[test]
+    fn sparrow_corpus_is_wallet_sized() {
+        let got = load_corpus("sparrow").unwrap();
+        assert_eq!(got.len(), 3000);
+        assert!(got.iter().all(|s| s.len() == 64));
+    }
+
+    #[test]
+    fn unknown_corpus_errors() {
+        assert!(load_corpus("lopp").unwrap_err().contains("unknown corpus"));
     }
 }

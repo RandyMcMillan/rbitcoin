@@ -547,12 +547,15 @@ server (rbitcoin, Fulcrum, electrs, ElectrumX, Blockstream electrs, …). It is
 **not** in `default-members` and **not** in the musl product package.
 
 ```bash
-# one scripthash hex or address per line
+# embedded corpus matching --suite (no --targets needed)
+cargo run -p rbitcoin-bench --features cli --release -- \
+  --electrum 127.0.0.1:50001 --suite casa
+cargo run -p rbitcoin-bench --features cli --release -- \
+  --esplora http://127.0.0.1:3000 --suite casa --corpus hot
+# or your own list: one scripthash hex or address per line
 printf '%s\n' bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq > /tmp/sh.txt
 cargo run -p rbitcoin-bench --features cli --release -- \
   --electrum 127.0.0.1:50001 --targets /tmp/sh.txt --suite casa
-cargo run -p rbitcoin-bench --features cli --release -- \
-  --esplora http://127.0.0.1:3000 --targets /tmp/sh.txt --suite casa
 ```
 
 | `--suite` | What it measures |
@@ -561,10 +564,16 @@ cargo run -p rbitcoin-bench --features cli --release -- \
 | `sparrow` | Sparrow 2022 wallet load (`subscribe` batches of `--batch`, default 50) then refresh (`get_history` batches). `--fetch-txs` also pulls `blockchain.transaction.get`. Electrum only. |
 | `hot` | Fat-history keys (one-shot history + UTXO). Use for high-fanout scripts. |
 
-Same `--targets` file against two servers is the comparison. First pass is
-usually cache-cold; Casa’s published numbers drop that pass. Sequential by
-default (Casa did not test multi-thread load). TLS is the reverse proxy’s job —
-point the client at plain `127.0.0.1`.
+| `--corpus` | Packed-in keys (default = `--suite`) |
+|------------|--------------------------------------|
+| `hot` | Public fat keys: P2A `bc1pfeessrawgf` (portlandhodl electrs stress), genesis P2PKH, burns, high-tx exchange/mining addresses. |
+| `casa` | ~4k unique output scripts from **77 heights spaced genesis→tip** (plus segwit / taproot / Casa-window pins) on a synced rbitcoin store, plus a few known mid-history addresses. Not Casa’s 103k dump from blocks 599900–600100 — that 200-block window makes height-list servers (electrs) look artificially fast because every key hits the same few blocks. |
+| `sparrow` | 3000 keys, same spread-height source (Sparrow’s published run used a ~3000-address wallet). |
+
+`--targets FILE` overrides the embedded list. Same corpus against two servers is
+the comparison. First pass is usually cache-cold; Casa’s published numbers drop
+that pass. Sequential by default (Casa did not test multi-thread load). TLS is
+the reverse proxy’s job — point the client at plain `127.0.0.1`.
 
 ## Esplora REST
 

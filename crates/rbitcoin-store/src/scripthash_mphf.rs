@@ -8,8 +8,7 @@ use crate::error::StoreError;
 use crate::fuse8_filter::fuse_key_from_mixed;
 use crate::io_handle::IoHandle;
 use crate::scripthash_layout::{
-    pack8, pack8_bytes, unpack8, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
-    SH_HEAD_VALUE_LEN,
+    pack8, unpack8, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_VALUE_LEN,
 };
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -269,7 +268,7 @@ fn pwrite_file(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripthash_layout::ShEntry;
+    use crate::scripthash_layout::{pack8_bytes, ShEntry};
     use rbitcoin_primitives::Fk;
 
     fn tmp() -> PathBuf {

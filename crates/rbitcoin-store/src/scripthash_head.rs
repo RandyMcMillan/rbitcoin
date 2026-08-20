@@ -13,13 +13,16 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
+use crate::hashhead::HeadScale;
+#[cfg(test)]
+use crate::hashhead::{initial_slots_for, HeadRole};
 use crate::scripthash_layout::{
     head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
     SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
 #[cfg(test)]
 use crate::sharded_hashhead::initial_slots_per_shard;
+#[cfg(test)]
 use crate::sharded_hashhead::shard_count_for_role;
 use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
@@ -38,6 +41,7 @@ const SLOTS_PER_CHUNK: u64 = 128;
 const CHUNK_CACHE_MAX: usize = 256;
 
 /// Corrupt message when on-disk SH head shard count ≠ current layout (e.g. 16-way vs 64-way).
+#[cfg(test)]
 pub const SH_HEAD_SHARD_COUNT_MISMATCH: &str =
     "scripthash head shard count mismatch (reindex; expected 64-way mainnet layout)";
 
@@ -1159,10 +1163,12 @@ impl LiveShardTable {
 }
 
 /// Sharded facade (64-way mainnet) over [`ScriptHashHead`].
+#[cfg(test)]
 pub struct ShardedScriptHashHead {
     shards: Vec<ScriptHashHead>,
 }
 
+#[cfg(test)]
 impl ShardedScriptHashHead {
     #[cfg(test)]
     pub fn create_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {

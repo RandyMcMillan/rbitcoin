@@ -75,12 +75,64 @@ pub fn format_csv(rows: &[KeyRow], passes: usize) -> String {
 }
 
 pub fn write_csv(path: &Path, rows: &[KeyRow], passes: usize) -> Result<(), String> {
+    write_body(path, &format_csv(rows, passes))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientRow {
+    pub client: u32,
+    pub n_keys: usize,
+    pub txs: u64,
+    pub utxos: u64,
+    pub wallet_load_us: Vec<u64>,
+}
+
+pub fn clients_csv_header(passes: usize) -> String {
+    let passes = passes.max(1);
+    let mut cols = vec![
+        "client".to_string(),
+        "n_keys".to_string(),
+        "txs".to_string(),
+        "utxos".to_string(),
+    ];
+    for i in 1..=passes {
+        cols.push(format!("wallet_load_us_{i}"));
+    }
+    cols.join(",")
+}
+
+pub fn clients_csv_row(row: &ClientRow, passes: usize) -> String {
+    let mut cols = vec![
+        row.client.to_string(),
+        row.n_keys.to_string(),
+        row.txs.to_string(),
+        row.utxos.to_string(),
+    ];
+    cols.extend(pad_times(&row.wallet_load_us, passes));
+    cols.join(",")
+}
+
+pub fn format_clients_csv(rows: &[ClientRow], passes: usize) -> String {
+    let mut out = clients_csv_header(passes);
+    out.push('\n');
+    for row in rows {
+        out.push_str(&clients_csv_row(row, passes));
+        out.push('\n');
+    }
+    out
+}
+
+pub fn write_clients_csv(path: &Path, rows: &[ClientRow], passes: usize) -> Result<(), String> {
+    write_body(path, &format_clients_csv(rows, passes))
+}
+
+fn write_body(path: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
     }
-    std::fs::write(path, format_csv(rows, passes)).map_err(|e| e.to_string())
+    std::fs::write(path, body).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -153,5 +205,24 @@ mod tests {
         assert!(body.contains("oldest_tx"));
         assert!(body.contains(",1,2,,,2,0,"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clients_csv_has_load_times() {
+        let row = ClientRow {
+            client: 3,
+            n_keys: 8,
+            txs: 12,
+            utxos: 4,
+            wallet_load_us: vec![100, 90],
+        };
+        let h = clients_csv_header(2);
+        assert_eq!(
+            h,
+            "client,n_keys,txs,utxos,wallet_load_us_1,wallet_load_us_2"
+        );
+        assert_eq!(clients_csv_row(&row, 2), "3,8,12,4,100,90");
+        let csv = format_clients_csv(&[row], 2);
+        assert_eq!(csv.lines().count(), 2);
     }
 }

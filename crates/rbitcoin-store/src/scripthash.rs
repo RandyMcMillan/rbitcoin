@@ -1027,6 +1027,24 @@ impl ScriptHashTable {
         false
     }
 
+    pub fn mphf_g_resident_bytes(&self) -> u64 {
+        let mut n = 0u64;
+        for slot in self.sorted_main.iter() {
+            if let Some(h) = slot.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                n = n.saturating_add(h.g_bytes_resident() as u64);
+            }
+        }
+        if let Some(l1) = self
+            .ovf_l1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            n = n.saturating_add(l1.head.g_bytes_resident() as u64);
+        }
+        n
+    }
+
     /// Head value for a key (process-cache seed / disconnect refresh).
     pub fn head_value(&self, scripthash: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         Ok(self.locate_head(scripthash)?.map(|(v, _)| v))

@@ -13,6 +13,7 @@ header.hash ──► header.head          HashHead (often 1 shard)
 
 txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead
                     open: 4 B rel, page-local mix_txid; seal: MPHF+rel+fuse8
+                    (fuse in RAM; BDZ g FdOnly 4 KiB pages)
 
 spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no fuse)
             ──► scripthash.body/NN     dir-variant main slabs/pages (file variant: scripthash.body)
@@ -26,8 +27,8 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no 
 | Module | On disk | Key → value | Who reads it |
 |--------|---------|-------------|--------------|
 | `HashHead` + `ShardedHashHead` | `header.head` | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
-| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.rel|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁶** keys/range (no OA). | Confirm **lookup** stamp after live pin miss |
-| Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators | After tip bulk |
+| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.rel|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁶** keys/range (no OA). Open keeps fuse8 in RAM; BDZ `g` is FdOnly (4 KiB page stream). | Confirm **lookup** stamp after live pin miss |
+| Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators. BDZ `g` FdOnly; tags/val already FdOnly. | After tip bulk |
 | Ingest + L0/L1 ovf | `scripthash.ovf/ingest`, L0 `SHSR`, L1 MPHF, `ovf/body` | Same pack8 key for incremental / post-seal new keys | Tip; lookup ingest → L0 → L1 → main |
 
 `tx.head` is **not** a `HashHead`. `HeadRole` is only Header and ScriptHash.

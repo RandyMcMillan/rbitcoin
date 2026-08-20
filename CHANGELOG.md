@@ -20,6 +20,12 @@ before 1.0).
 
 ### Changed
 
+- **Sealed MPHF `g` is FdOnly:** `Store::open` no longer copies BDZ
+  graphs into process heap (~4.92 B/key). Lookup streams unique 4 KiB
+  `g` pages on the held uring session (`KIND_MPHF_G`), same shape as
+  open `tx.head` OA page probes. Fuse8 fingerprints stay in RAM (~9
+  bits/key). `ibd: sizes` adds `mphf_g=` (0 after open).
+
 - **Tip-follow INV tick:** `queue_due_tx_invs` no longer `list_live()`
   (clone every mempool body + `compute_wtxid`) on the 50 ms session
   poll. Idle ticks return after a cheap due-check; flushes walk stored

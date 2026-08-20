@@ -808,6 +808,8 @@ pub struct HeadResizeSizeSnapshot {
     pub sealed_segments: u64,
     /// In-RAM sealed fuse8 fingerprints (process heap).
     pub fuse8_bytes: u64,
+    /// In-RAM BDZ `g` arrays (0 after FdOnly open).
+    pub mphf_g_bytes: u64,
     /// Open-segment fuse-key Vec (`count × 8`).
     pub open_keys_bytes: u64,
     /// Class C L2 images (strong_tx + confirmed + header_txs).

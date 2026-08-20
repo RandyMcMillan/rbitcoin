@@ -431,7 +431,7 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 | Capacity | Segment ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`** → open next OA, seal previous on a sidecar |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode (open migrates to v2 from Class A; does **not** wipe head) |
-| Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B); max depth 1024 |
+| Probe | Open OA: page-local double-hash (1024 slots/page); one 4 KiB load. Sealed: RAM fuse skip, then unique 4 KiB BDZ `g` pages (not loaded into process heap) + `.rel` pread |
 | Insert | First empty in-page (or same relative id idempotent); second same-txid goes **deeper** |
 | Lookup | Pin by txid → **hot** (open + ages ≤3) → ID/idx → **cold** (ages ≥4) if needed; fuse-gate sealed; body-verify ([`docs/heads.md`](./docs/heads.md)) |
 | Legacy | Monolithic `tx.head` / `tx.head.new` / `tx.head.resize` / `tx.head.overflow` **refused on open** — reindex |

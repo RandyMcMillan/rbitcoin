@@ -1824,6 +1824,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(script_wire_mib)
         .saturating_add(write_wire_mib)) as u64;
     let fuse8_mib = h.fuse8_bytes / (1024 * 1024);
+    let mphf_g_mib = h.mphf_g_bytes / (1024 * 1024);
     let open_keys_mib = h.open_keys_bytes / (1024 * 1024);
     let class_c_l2_mib = h.class_c_l2_bytes / (1024 * 1024);
     let accounted_mib = bq_mib
@@ -1836,6 +1837,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(sh_mt_mib)
         .saturating_add(conf_wire_mib)
         .saturating_add(fuse8_mib)
+        .saturating_add(mphf_g_mib)
         .saturating_add(open_keys_mib)
         .saturating_add(class_c_l2_mib);
     let anon_mib = kb_mib(s.rss_anon_kb);
@@ -1851,7 +1853,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h live={}k/pub={}k/ov={} fifo={}k≈{}MiB \
            union={}L/{}k≈{}MiB h2h={}k≈{}MiB fence={}≈{}MiB \
            pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
-           wire={}MiB fuse8={}MiB open_keys={}MiB class_c_l2={}MiB \
+           wire={}MiB fuse8={}MiB mphf_g={}MiB open_keys={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
          | sh runs={} memtable={} heads={}",
@@ -1916,6 +1918,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         sh_mt_mib,
         conf_wire_mib,
         fuse8_mib,
+        mphf_g_mib,
         open_keys_mib,
         class_c_l2_mib,
         accounted_mib,
@@ -2595,6 +2598,7 @@ mod tests {
         assert!(line.contains("accounted≈"), "{line}");
         assert!(line.contains("residual≈"), "{line}");
         assert!(line.contains("fuse8="), "{line}");
+        assert!(line.contains("mphf_g="), "{line}");
         assert!(line.contains("class_c_l2="), "{line}");
         assert!(line.contains("open_keys="), "{line}");
         assert!(!line.contains("shadow"), "{line}");

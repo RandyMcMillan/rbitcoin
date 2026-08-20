@@ -1843,6 +1843,9 @@ impl Query {
             .len();
         let mut head = self.store.txs.head_resize_size_snapshot();
         head.class_c_l2_bytes = self.store.class_c_l2_resident_bytes();
+        head.mphf_g_bytes = head
+            .mphf_g_bytes
+            .saturating_add(self.store.scripthash.mphf_g_resident_bytes());
         ProcessOwnedSizes {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),

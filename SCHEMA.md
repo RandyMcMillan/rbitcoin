@@ -155,8 +155,9 @@ itself changed.
     scripthash.body/NN               # 17 dir variant: one TableFile per main shard
     scripthash.ovf/body              # dir variant: ingest + all sealed ovf
     scripthash.head/NN.mphf + NN.val # Class B sealed MPHF main (8 B pack8; no fuse)
-    scripthash.ovf/ingest                                # global OA ingest
-    scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
+    scripthash.ovf/ingest                                # global OA ingest (key16+pack8, 2^25)
+    scripthash.ovf/NNNNNN[.fuse8][.idx]                  # L0 SHSR pack8
+    scripthash.ovf/NNNNNN.mphf|.val|.fuse8               # L1 promoted ovf (at most one)
     scripthash.runs              # recollect spill only (key_len=40); unlinked after seal
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
 
@@ -495,19 +496,23 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 - pack8 (LE u64): bits 63–62 mode; `00` = 1-fk `create_fk`; `01` = slab
   `off:u40 \| used:u16 \| class:u6`; `10` = paged `last_page_off` (first page
   lives in the LAST page header). `SH_INLINE_CAP = 1`.
-- Ingest OA and sealed ovf still use 16 B `ShHeadValue` slots (`SHSR` + fuse on
-  ovf). **Do not fold ovf into main.**
-- Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
-  one shard band at a time). Cold load writes packed locators (no OA image).
+- Ingest OA, L0 `SHSR`, L1 ovf MPHF, and main MPHF all store **pack8**.
+- Sharded **64-way** on mainnet (prefix of `scripthash[0]`). Cold load writes
+  packed locators (no OA image). No `scripthash.head.oa_stub`.
 - **Overflow:** one **global** ingest OA (`scripthash.ovf/ingest`, 256 slots tiny /
-  2²² slots mainnet). Load ≥ ~0.80 **seals** ingest to sorted+fuse+idx
-  (`scripthash.ovf/NNNNNN`). ≥8 sealed files **compact** (k-way merge of
-  disjoint records). Body offs are not copied.
-- Lookup (always): **ingest OA → sealed ovf newest→oldest (fuse skip) →
-  main MPHF+val**. Incremental creates (no bulk yet) live on ingest. A leftover
-  live OA or schema-17 `SHSR` at `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`)
-  is **refused** — wipe `store/scripthash*` and restart with `--shindex` to
-  rematerialize. A key has **exactly one** home.
+  **2²⁵ slots mainnet = 768 MiB** at 24 B). Load ≥ ~0.80 **seals** to L0
+  `SHSR`+fuse (`scripthash.ovf/NNNNNN`, FORMAT_VER=2, rec = key16‖pack8).
+  ≥8 L0 files **compact once** to L1 MPHF+val+fuse8. L1 is **never rewritten**.
+  A later L0 stack of 8 **warns** (`wipe store/scripthash*` + rematerialize).
+  Body offs are not copied. Do not fold ovf locators into `scripthash.body/NN`
+  except via rematerialize.
+- Lookup: **ingest OA → L0 SHSR newest→oldest (fuse) → L1 MPHF (fuse) →
+  main MPHF+val (tags)**. A leftover live OA or schema-17 `SHSR` at
+  `scripthash.head` (or non-`SHSR` six-digit `ovf/NNNNNN`) is **refused**.
+  A key has **exactly one** home.
+
+At ~2.5×10⁵ new unique scripts/day, first L1 is ~2.3 years after rematerialize
+and the frozen-L1 warning is ~4.7 years. That is not a calendar guarantee.
 
 | Mode | When | pack8 |
 |------|------|-------|
@@ -544,9 +549,9 @@ compact still merges **heads only** — all ovf keys share
   that alloc only.
 - Geometric slabs class 0–7 (`16 B`–`2 KiB`; `slab_bytes(c) = 16 << c`). Payload:
   `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
-- Megakey **pages** (4 KiB): `next:u64` | `n_fks:u16` | `ver:u8=1` | pad 5 B
-  | ULEB128 `fk0` + ULEB128 gaps. Page is full when the next uleb does not
-  fit (often well above 510 sequential FKs). `ver=0` with `n_fks>0` is a
+- Megakey **pages** (4 KiB): 8 B header `ver:u8 | n_fks:u16 | LAST|page_index u40`
+  then ULEB128 `fk0` + ULEB128 gaps. LAST=1 → index is **first** page; LAST=0 →
+  **next**. Head pack8 paged mode stores **last** page off. `ver=0` with `n_fks>0` is a
   leftover raw-u64 page — rematerialize. Chain first→last; last-page append only.
 - Size-class freelist on SHAL. Grow relocates O(log n) times; megakeys never relocate.
 

@@ -275,7 +275,7 @@ megakey pages write as they fill — ≤510 FKs buffered). Schema-16
 `key_len=32` leftover `scripthash.runs` are refused (wipe that dir and
 rematerialize). Class A with creates in the pre-pack 16-byte meta /
 9-byte spent layout is refused (wipe datadir and redo IBD). New keys after seal go
-to one **global ingest OA** (mainnet 2²² slots ≈ 128 MiB). Fan-in reduce is
+to one **global ingest OA** (mainnet 2²⁵ slots × 24 B ≈ 768 MiB). Fan-in reduce is
 **fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
 only at ≥75% of target run size (default target **512 MiB**) and compacts tiny
 catalog runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs

@@ -318,10 +318,14 @@ impl Query {
     }
 
     /// Confirmed-strong create outpoints plus confirmed spenders (create_fk join).
+    ///
+    /// When `to_height` is set, creates with Class C height `>= to_height` are not
+    /// expanded (their spends cannot fall in the window).
     pub(crate) fn join_creates_and_spends(
         &self,
         scripthash: &[u8; 32],
         need: ShJoinNeed,
+        to_height: Option<i64>,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.entries(scripthash)?;
@@ -331,6 +335,25 @@ impl Query {
             if self.store.is_confirmed_strong(thin.create_tx_fk)? {
                 fks.push(thin.create_tx_fk);
             }
+        }
+        if let Some(to) = to_height {
+            let heights = self.store.tx_height_get_batch(&fks)?;
+            if heights.len() != fks.len() {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH create height batch length",
+                ));
+            }
+            fks = fks
+                .into_iter()
+                .zip(heights)
+                .filter_map(|(fk, h)| {
+                    if i64::from(h.unwrap_or(0)) >= to {
+                        None
+                    } else {
+                        Some(fk)
+                    }
+                })
+                .collect();
         }
         let mut out = Vec::new();
         let mut class_a_us = 0u128;
@@ -494,7 +517,8 @@ impl Query {
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY)?;
+        let joined =
+            self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY, filter.to_height)?;
         let mut by_txid: BTreeMap<[u8; 32], (i64, Fk)> = BTreeMap::new();
         let to_excl = filter.to_height;
         for rec in joined {
@@ -548,7 +572,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
         let mut confirmed = 0i64;
-        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE)? {
+        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)? {
             if !self.join_out_spent(&rec)? {
                 confirmed = confirmed.saturating_add(rec.out.value);
             }
@@ -565,7 +589,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let mut out = Vec::new();
-        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT)? {
+        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None)? {
             if self.join_out_spent(&rec)? {
                 continue;
             }
@@ -662,7 +686,7 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS)?;
+        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS, None)?;
         let mut funded_n = 0u32;
         let mut funded_sum = 0i64;
         let mut spent_n = 0u32;

@@ -2696,6 +2696,8 @@ mod tests {
         assert_eq!(open, full);
 
         // Inclusive from, exclusive to: heights 1 and 2 only.
+        // Creates at height >= 3 are not Class-A expanded (spend height ≥ create).
+        reset_body_ok_reads();
         let window = q
             .scripthash_history_filtered(&sh, &HistoryFilter::height_window(1, Some(3)))
             .unwrap();
@@ -2704,6 +2706,11 @@ mod tests {
             vec![1, 2]
         );
         assert!(window.len() < full.len());
+        assert_eq!(
+            body_ok_reads(),
+            3,
+            "expand heights 0..=2; skip create at exclusive to_height 3"
+        );
 
         // Open upper bound from height 2.
         let from_only = q
@@ -2852,7 +2859,7 @@ mod tests {
         assert_eq!(utxos[0].value, 20_0000_0000);
 
         let list_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None)
             .unwrap();
         assert!(
             list_join.iter().any(|r| r.spent && r.spenders.is_empty()),
@@ -2860,7 +2867,7 @@ mod tests {
         );
         assert!(list_join.iter().any(|r| !r.spent));
         let hist_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY, None)
             .unwrap();
         assert!(
             hist_join.iter().any(|r| r.spent && !r.spenders.is_empty()),
@@ -2880,7 +2887,7 @@ mod tests {
         assert_eq!(stats.spent_txo_sum, 10_0000_0000);
         assert_eq!(body_ok_reads(), 1);
         let stats_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS, None)
             .unwrap();
         assert!(
             stats_join.iter().all(|r| r.spenders.is_empty()),

@@ -529,8 +529,17 @@ fields. Esplora `/address/{addr}/utxo` status (`block_hash` / `block_time`)
 comes from join height plus unique headers — not a per-coin `tx.head` probe.
 Confirmed `/txs` uses join `tx_fk` (no second `tx.head`). `getblock` verbosity 1
 lists `txid.body`. Esplora `/utxo` applies the same mempool overlay as Electrum
-`listunspent`. `sh_join` with a history `to_height` skips Class A expand for
-creates at or past that exclusive bound.
+`listunspent`. `listunspent` loads `txid.body` only for unspent creates.
+`sh_join` with a history `to_height` skips Class A expand for creates at or
+past that exclusive bound. Electrum subscribe tip restatus intersects the SH
+posting list with the new block's tx fks and prevout `create_fk`s; a miss
+does not expand packed `txout`. Full status still runs on a hit. Each Electrum
+TCP connection keeps one last-scripthash join (outs + spentness) until tip
+height changes, so Casa `get_balance` → `get_history` → `listunspent` on the
+same socket pays Class A once. Not a process-global cache.
+
+Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
+--passes 1 --warmup 1`). Do not treat agent-VM times as product numbers.
 
 ### App DoS floor (always on)
 
@@ -572,7 +581,7 @@ cargo run -p rbitcoin-bench --features cli --release -- \
 
 | `--suite` | What it measures |
 |-----------|------------------|
-| `casa` | Lopp/Casa 2020–2022: sequential `get_balance`, `get_history`, `listunspent` per key. Discard `--warmup` (default 1), keep `--passes` (default 9), report p50/p95 and history-size buckets. |
+| `casa` | Lopp/Casa 2020–2022: sequential `get_balance`, `get_history`, `listunspent` per key on one TCP connection (the node reuses that connection's last SH join). Discard `--warmup` (default 1), keep `--passes` (default 9), report p50/p95 and history-size buckets. |
 | `sparrow` | Sparrow 2022 wallet load (`subscribe` batches of `--batch`, default 50) then refresh (`get_history` batches). `--fetch-txs` also pulls `blockchain.transaction.get`. Electrum only. |
 | `hot` | Fat-history keys (one-shot history + UTXO). Use for high-fanout scripts. |
 

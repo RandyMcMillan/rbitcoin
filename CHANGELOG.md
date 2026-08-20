@@ -39,12 +39,21 @@ before 1.0).
   `getblock` verbosity 1 read `txid.body` (no packed `txout`). Esplora `/txs`
   uses SH join fks. `/utxo` matches Electrum mempool listunspent. History
   `to_height` skips Class A expand for later creates. Parent prevouts are
-  outs-only. Electrum scripthash subscribe restatuses on confirming tip.
+  outs-only. Electrum scripthash subscribe restatuses on confirming tip
+  when the block creates or spends that hash (posting-list probe).
 
 - **Esplora `/utxo`:** status comes from the SH join height plus unique
   headers (`block_hash` / `block_time`). No per-coin `tx.head` or
   Class A `get`. Balance / `/address` stats skip `txid.body`; listunspent
-  still loads create identity. `sh_join` debug adds `need=`.
+  loads create identity for unspent creates only. `sh_join` debug adds
+  `need=`.
+
+- **Electrum fat-SH join:** `listunspent` identity is unspent-only. Tip
+  subscribe no longer full-joins every subscribed hash on each block.
+  Each TCP connection reuses the last scripthash outs+spent join until
+  tip height changes (`get_balance` → `get_history` → `listunspent`).
+  Packed `txout` expand is unchanged (no schema bump). Re-run Casa on
+  the operator host; do not treat VM times as product numbers.
 
 - **Per-item `received getdata for: wtx` is TRACE:** one line per peer
   `MSG_WTX` getdata is too noisy at DEBUG. Counts stay on `tip: perf`.

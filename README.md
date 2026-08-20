@@ -156,6 +156,7 @@ Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
 | `rbitcoin-rpc` | Documented Core-class JSON-RPC subset (not full Core) |
 | `rbitcoin-cli` | CLI client |
 | `rbitcoin-node` | Node binary |
+| `rbitcoin-bench` | Optional Electrum/Esplora **client** benchmark (`--features cli`; not a default/musl product bin) |
 | `rbitcoin-test` | High-level test harness |
 
 ## Documentation

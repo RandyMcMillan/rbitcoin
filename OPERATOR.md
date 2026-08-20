@@ -540,6 +540,32 @@ and idle clients fail closed.
 Edge rate-limits, auth, and TLS cipher policy stay on the proxy. See
 [`SECURITY.md`](./SECURITY.md).
 
+## Client benchmark (Electrum / Esplora)
+
+Optional crate `rbitcoin-bench` talks to **any** Electrum TCP or Esplora HTTP
+server (rbitcoin, Fulcrum, electrs, ElectrumX, Blockstream electrs, …). It is
+**not** in `default-members` and **not** in the musl product package.
+
+```bash
+# one scripthash hex or address per line
+printf '%s\n' bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq > /tmp/sh.txt
+cargo run -p rbitcoin-bench --features cli --release -- \
+  --electrum 127.0.0.1:50001 --targets /tmp/sh.txt --suite casa
+cargo run -p rbitcoin-bench --features cli --release -- \
+  --esplora http://127.0.0.1:3000 --targets /tmp/sh.txt --suite casa
+```
+
+| `--suite` | What it measures |
+|-----------|------------------|
+| `casa` | Lopp/Casa 2020–2022: sequential `get_balance`, `get_history`, `listunspent` per key. Discard `--warmup` (default 1), keep `--passes` (default 9), report p50/p95 and history-size buckets. |
+| `sparrow` | Sparrow 2022 wallet load (`subscribe` batches of `--batch`, default 50) then refresh (`get_history` batches). `--fetch-txs` also pulls `blockchain.transaction.get`. Electrum only. |
+| `hot` | Fat-history keys (one-shot history + UTXO). Use for high-fanout scripts. |
+
+Same `--targets` file against two servers is the comparison. First pass is
+usually cache-cold; Casa’s published numbers drop that pass. Sequential by
+default (Casa did not test multi-thread load). TLS is the reverse proxy’s job —
+point the client at plain `127.0.0.1`.
+
 ## Esplora REST
 
 Blockstream-**compatible** **plain HTTP** API for **wallet clients and APIs**

@@ -11,6 +11,11 @@ before 1.0).
 
 ### Added
 
+- **`rbitcoin-bench`:** optional Electrum/Esplora **client** benchmark (not
+  default-members, not musl). Casa sequential median (`get_balance` /
+  `get_history` / `listunspent`), Sparrow batched subscribe+history, fat-key
+  `hot` suite. `cargo run -p rbitcoin-bench --features cli --release`.
+
 - **CI Windows / Darwin snapshots:** after a green `ci` run on
   `master`/`main` (and on `workflow_dispatch`, and on PRs labeled
   `static-binaries`), workflows `windows` and `macos` upload CRT-static

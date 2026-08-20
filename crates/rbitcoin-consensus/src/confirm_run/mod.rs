@@ -9,7 +9,9 @@
 //! SCRIPTS STAGE (ibd-confirm OS thread + script coordinators):
 //!   pure CPU verify — no Query, no disk
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
-//!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC
+//!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC.
+//!   `tx.head` write-behind drain runs on process-wide `ibd-confirm-head`
+//!   (overlap with structural + Class C; not a per-batch spawn).
 //! ```
 //! IBD pipelines lookup(N+1) ∥ load(N) ∥ scripts(N−1) ∥ write(N−2). One Class A appender.
 //!
@@ -40,6 +42,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod bq_resolve;
+mod head_drain;
 mod lookup;
 mod phases;
 mod pin;
@@ -50,6 +53,8 @@ pub use bq_resolve::{
     confirm_bq_resolve_wave, confirm_bq_resolve_wave_with_ids, BqResolveWave, BqResolveWaveStats,
     BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS, BQ_RESOLVE_WAVE_MIN_INPUTS,
 };
+#[cfg(test)]
+use head_drain::{submit_head_drain, HEAD_DRAIN_THREAD_NAME};
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
 pub use lookup::{

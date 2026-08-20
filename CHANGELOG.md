@@ -9,6 +9,12 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **tx.head drain thread:** confirm write-behind insert runs on a process-wide
+  `ibd-confirm-head` OS thread overlapping structural + Class C, instead of a
+  per-batch `thread::scope` spawn.
+
 ### Fixed
 
 - **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +

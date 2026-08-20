@@ -197,75 +197,65 @@ pub fn confirm_write_phase(
     }
 
     // Drain write-behind tx.head overlapping structural + Class C (one inserter).
-    let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns, tip_gc_ns) =
-        std::thread::scope(|scope| -> Result<_, ConsensusError> {
-            let queued = query.store().txs.take_pending_queued();
-            let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
-            let drain = scope.spawn(move || query.store().txs.head_insert_queued(&queued));
+    let queued = query.store().txs.take_pending_queued();
+    let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
+    let drain = super::head_drain::submit_head_insert(query.store(), queued);
 
-            // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
-            let mut meta_by_abs: rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)> =
-                rbitcoin_query::U64Map::default();
-            let t_struct = Instant::now();
-            let struct_ph = structural_run(
-                query,
-                params,
-                milestone,
-                &batch.prepared,
-                &batch.wire_blocks,
-                &batch.batch_parents,
-                &mut meta_by_abs,
-            )?;
-            let structural_ns = t_struct.elapsed().as_nanos() as u64;
+    let overlap = (|| -> Result<_, ConsensusError> {
+        // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
+        let mut meta_by_abs: rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)> =
+            rbitcoin_query::U64Map::default();
+        let t_struct = Instant::now();
+        let struct_ph = structural_run(
+            query,
+            params,
+            milestone,
+            &batch.prepared,
+            &batch.wire_blocks,
+            &batch.batch_parents,
+            &mut meta_by_abs,
+        )?;
+        let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
-            let n_blocks = batch.prepared.len();
-            let cc0 = confirm_phase_stats::CLASS_C_NS.load(Ordering::Relaxed);
-            let t_cc = Instant::now();
-            let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
-            let class_c_wall_ns = t_cc.elapsed().as_nanos() as u64;
-            // Tables only (strong+tip), matching CLASS_C_NS — not join wall / SH.
-            let class_c_ns = confirm_phase_stats::CLASS_C_NS
-                .load(Ordering::Relaxed)
-                .saturating_sub(cc0);
-            let class_c_join_ns = class_c_wall_ns.saturating_sub(class_c_ns);
-            if class_c_join_ns > 0 {
-                confirm_phase_stats::WRITE_CLASS_C_JOIN_NS
-                    .fetch_add(class_c_join_ns, Ordering::Relaxed);
-            }
+        let n_blocks = batch.prepared.len();
+        let cc0 = confirm_phase_stats::CLASS_C_NS.load(Ordering::Relaxed);
+        let t_cc = Instant::now();
+        let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
+        let class_c_wall_ns = t_cc.elapsed().as_nanos() as u64;
+        // Tables only (strong+tip), matching CLASS_C_NS — not join wall / SH.
+        let class_c_ns = confirm_phase_stats::CLASS_C_NS
+            .load(Ordering::Relaxed)
+            .saturating_sub(cc0);
+        let class_c_join_ns = class_c_wall_ns.saturating_sub(class_c_ns);
+        if class_c_join_ns > 0 {
+            confirm_phase_stats::WRITE_CLASS_C_JOIN_NS
+                .fetch_add(class_c_join_ns, Ordering::Relaxed);
+        }
 
-            let (spend_ann_ns, tip_gc_ns) =
-                post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
+        let (spend_ann_ns, tip_gc_ns) =
+            post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
+        Ok((
+            out,
+            n_blocks,
+            structural_ns,
+            struct_ph,
+            class_c_ns,
+            spend_ann_ns,
+            tip_gc_ns,
+        ))
+    })();
 
-            let t_join = Instant::now();
-            match drain.join() {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(ConsensusError::from(e)),
-                Err(_) => {
-                    return Err(ConsensusError::from(rbitcoin_store::StoreError::Corrupt(
-                        "tx.head write-behind drain thread panicked",
-                    )));
-                }
-            }
-            let drain_join_ns = t_join.elapsed().as_nanos() as u64;
-            if drain_join_ns > 0 {
-                confirm_phase_stats::WRITE_DRAIN_JOIN_NS
-                    .fetch_add(drain_join_ns, Ordering::Relaxed);
-            }
-            // Insert finished. Load polls this fk HWM (not tip/fence — 67438).
-            if let Some(fk) = drain_max_fk {
-                query.note_head_drain_fk(fk);
-            }
-
-            Ok((
-                out,
-                n_blocks,
-                structural_ns,
-                struct_ph,
-                class_c_ns,
-                spend_ann_ns,
-                tip_gc_ns,
-            ))
-        })?;
+    let t_join = Instant::now();
+    let drain_res = drain.join();
+    let drain_join_ns = t_join.elapsed().as_nanos() as u64;
+    if drain_join_ns > 0 {
+        confirm_phase_stats::WRITE_DRAIN_JOIN_NS.fetch_add(drain_join_ns, Ordering::Relaxed);
+    }
+    let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns, tip_gc_ns) = overlap?;
+    drain_res.map_err(ConsensusError::from)?;
+    if let Some(fk) = drain_max_fk {
+        query.note_head_drain_fk(fk);
+    }
 
     let t_tweak = Instant::now();
     if query.sptweaks_enabled() && query.index_mode().is_tip() {

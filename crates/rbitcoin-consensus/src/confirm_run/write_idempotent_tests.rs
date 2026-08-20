@@ -3,6 +3,18 @@
 use super::{recent_create_height_slices, recent_create_rows_for_slices, write_height_needed};
 
 #[test]
+fn tx_head_drain_thread_is_named_and_reused() {
+    use super::{submit_head_drain, HEAD_DRAIN_THREAD_NAME};
+    let (r1, id1, n1) = submit_head_drain(|| Ok(1)).join_named();
+    let (r2, id2, n2) = submit_head_drain(|| Ok(2)).join_named();
+    assert_eq!(r1.unwrap(), 1);
+    assert_eq!(r2.unwrap(), 2);
+    assert_eq!(n1, HEAD_DRAIN_THREAD_NAME);
+    assert_eq!(n2, HEAD_DRAIN_THREAD_NAME);
+    assert_eq!(id1, id2, "drain must keep one OS thread across batches");
+}
+
+#[test]
 fn recent_create_height_slices_two_heights_and_remainder() {
     assert_eq!(
         recent_create_height_slices(&[(10, 2), (11, 3)], 5),

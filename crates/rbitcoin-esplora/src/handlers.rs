@@ -204,17 +204,8 @@ pub async fn block_txid_at(
     }) else {
         return not_found();
     };
-    match st.query.block_tx_fks(height) {
-        Ok(fks) => {
-            let i = index as usize;
-            if i >= fks.len() {
-                return not_found();
-            }
-            match st.query.get_tx(fks[i]) {
-                Ok(tx) => plain_ok(block_hash_hex(&tx.txid)),
-                Err(e) => store_err(e),
-            }
-        }
+    match st.query.block_txid_at(height, index as usize) {
+        Ok(txid) => plain_ok(block_hash_hex(&txid)),
         Err(e) => store_err(e),
     }
 }
@@ -269,17 +260,8 @@ pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String
     }) else {
         return not_found();
     };
-    match st.query.block_tx_fks(h) {
-        Ok(fks) => {
-            let mut ids = Vec::with_capacity(fks.len());
-            for fk in fks {
-                match st.query.get_tx(fk) {
-                    Ok(tx) => ids.push(block_hash_hex(&tx.txid)),
-                    Err(e) => return store_err(e),
-                }
-            }
-            Json(ids).into_response()
-        }
+    match st.query.block_txids(h) {
+        Ok(ids) => Json(ids.iter().map(block_hash_hex).collect::<Vec<_>>()).into_response(),
         Err(e) => store_err(e),
     }
 }

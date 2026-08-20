@@ -2951,6 +2951,12 @@ mod tests {
         assert_eq!(proof.pos, 0);
         assert_eq!(proof.block_height, 0);
 
+        // Identity list is `txid.body`, not packed `txout` (`get_tx`).
+        let side = q.store().txs.body_txid(fks[0]).unwrap();
+        assert_eq!(q.block_txids(Height(0)).unwrap(), vec![side]);
+        assert_eq!(q.block_txid_at(Height(0), 0).unwrap(), side);
+        assert_eq!(tx.txid, side);
+
         // Scripthash history/balance/utxo for OP_TRUE (durable SH in tip mode).
         let sh = script_hash(&[0x51]);
         let hist = q.scripthash_history(&sh).unwrap();
@@ -3043,6 +3049,8 @@ mod tests {
         assert!(q.tx_output_at_fk(fks[0], &tx, 99).is_err());
         assert!(q.merkle_proof(Height(0), &[0xff; 32]).is_err());
         assert!(q.block_tx_fks(Height(50)).is_err());
+        assert!(q.block_txids(Height(50)).is_err());
+        assert!(q.block_txid_at(Height(0), 99).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3257,8 +3265,13 @@ mod tests {
 
         // Merkle multi-tx (odd leaf count pads).
         let fks1 = q.block_tx_fks(Height(1)).unwrap();
-        let t1 = q.get_tx(fks1[0]).unwrap();
-        let proof = q.merkle_proof(Height(1), &t1.txid).unwrap();
+        let ids1 = q.block_txids(Height(1)).unwrap();
+        assert_eq!(ids1.len(), fks1.len());
+        for (i, fk) in fks1.iter().enumerate() {
+            assert_eq!(ids1[i], q.store().txs.body_txid(*fk).unwrap());
+            assert_eq!(q.block_txid_at(Height(1), i).unwrap(), ids1[i]);
+        }
+        let proof = q.merkle_proof(Height(1), &ids1[0]).unwrap();
         assert_eq!(proof.pos, 0);
         assert!(!proof.merkle.is_empty() || fks1.len() == 1);
 

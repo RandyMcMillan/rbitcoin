@@ -9,7 +9,7 @@ use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{HistoryFilter, Query};
-use rbitcoin_store::script_hash;
+use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -990,14 +990,14 @@ fn dispatch(
         "blockchain.transaction.id_from_pos" => {
             let height = param_u32(params, 0)?;
             let tx_pos = param_u32(params, 1)? as usize;
-            let fks = query
-                .block_tx_fks(Height(height))
-                .map_err(|e| e.to_string())?;
-            let fk = fks
-                .get(tx_pos)
-                .ok_or_else(|| "pos out of range".to_string())?;
-            let tx = query.get_tx(*fk).map_err(|e| e.to_string())?;
-            Ok(json!(txid_hex(&tx.txid)))
+            let txid = query.block_txid_at(Height(height), tx_pos).map_err(|e| {
+                if matches!(e, StoreError::NotFound) {
+                    "pos out of range".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+            Ok(json!(txid_hex(&txid)))
         }
         "blockchain.estimatefee" => {
             let target = param_u32(params, 0).unwrap_or(2);

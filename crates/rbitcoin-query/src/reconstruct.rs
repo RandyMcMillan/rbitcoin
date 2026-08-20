@@ -25,20 +25,44 @@ impl Query {
         Ok((tx, outs, inputs))
     }
 
+    /// Create txids in block order from `txid.body` (no packed `txout` decode).
+    pub fn block_txids(&self, height: Height) -> Result<Vec<[u8; 32]>, QueryError> {
+        let header_fk = self
+            .store
+            .confirmed
+            .get(height)?
+            .ok_or(StoreError::NotFound)?;
+        let (first, n) = self
+            .store
+            .header_txs
+            .get_range(header_fk)?
+            .ok_or(StoreError::Corrupt("confirmed header missing body list"))?;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let last = first.0.saturating_add(u64::from(n.saturating_sub(1)));
+        let ids = self.store.txs.body_txid_range(first.0, last)?;
+        if ids.len() != n as usize {
+            return Err(StoreError::Corrupt("invariant: block txid.body length"));
+        }
+        Ok(ids)
+    }
+
+    /// One create identity at `index` in the block (`txid.body` only).
+    pub fn block_txid_at(&self, height: Height, index: usize) -> Result<[u8; 32], QueryError> {
+        let fks = self.block_tx_fks(height)?;
+        let fk = *fks.get(index).ok_or(StoreError::NotFound)?;
+        Ok(self.store.txs.body_txid(fk)?)
+    }
+
     pub fn merkle_proof(&self, height: Height, txid: &[u8; 32]) -> Result<MerkleProof, QueryError> {
         use bitcoin::hashes::{sha256d, Hash as _};
 
-        let fks = self.block_tx_fks(height)?;
-        let mut txids = Vec::with_capacity(fks.len());
-        let mut pos = None;
-        for (i, fk) in fks.iter().enumerate() {
-            let tx = self.get_tx_class_a(*fk)?;
-            if &tx.txid == txid {
-                pos = Some(i);
-            }
-            txids.push(tx.txid);
-        }
-        let pos = pos.ok_or(StoreError::NotFound)?;
+        let txids = self.block_txids(height)?;
+        let pos = txids
+            .iter()
+            .position(|t| t == txid)
+            .ok_or(StoreError::NotFound)?;
         let mut branch = Vec::new();
         let mut idx = pos;
         let mut layer: Vec<[u8; 32]> = txids;

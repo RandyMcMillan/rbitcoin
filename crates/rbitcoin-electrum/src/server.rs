@@ -355,15 +355,55 @@ where
             } => break,
             tip = tip_rx.recv() => {
                 match tip {
-                    Ok(t) if header_sub => {
-                        let msg = json!({
-                            "jsonrpc": "2.0",
-                            "method": "blockchain.headers.subscribe",
-                            "params": [{ "hex": t.header_hex, "height": t.height }]
-                        });
-                        write_line(&mut writer, &msg).await?;
+                    Ok(t) => {
+                        if header_sub {
+                            let msg = json!({
+                                "jsonrpc": "2.0",
+                                "method": "blockchain.headers.subscribe",
+                                "params": [{ "hex": t.header_hex, "height": t.height }]
+                            });
+                            write_line(&mut writer, &msg).await?;
+                        }
+                        if !sh_subs.is_empty() {
+                            let q = Arc::clone(&query);
+                            let mp = mempool.clone();
+                            let subs: Vec<[u8; 32]> = sh_subs.iter().copied().collect();
+                            let height = t.height;
+                            let notes = tokio::task::spawn_blocking(move || {
+                                let mut out = Vec::new();
+                                let to = i64::from(height).saturating_add(1);
+                                let filter = HistoryFilter::height_window(height, Some(to));
+                                for sh in subs {
+                                    let hit = q
+                                        .scripthash_history_filtered(&sh, &filter)
+                                        .ok()
+                                        .is_some_and(|h| !h.is_empty());
+                                    if !hit {
+                                        continue;
+                                    }
+                                    let status = if let Some(mp) = &mp {
+                                        scripthash_status_full(&q, mp, &sh).ok()
+                                    } else {
+                                        q.scripthash_history(&sh).ok().map(|h| scripthash_status(&h))
+                                    };
+                                    if let Some(status) = status {
+                                        out.push((sh, status));
+                                    }
+                                }
+                                out
+                            })
+                            .await
+                            .unwrap_or_default();
+                            for (sh, status) in notes {
+                                let msg = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "blockchain.scripthash.subscribe",
+                                    "params": [hash_hex_rev(&sh), status]
+                                });
+                                write_line(&mut writer, &msg).await?;
+                            }
+                        }
                     }
-                    Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -2191,6 +2231,130 @@ mod tests {
         assert_eq!(
             push["method"].as_str(),
             Some("blockchain.headers.subscribe")
+        );
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn scripthash_subscribe_notifies_on_tip_confirm() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let mut hash = [0u8; 32];
+        hash[0] = 0x42;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let hfk0 = q.connect_block(Height(0), &header, &[ta]).unwrap();
+        let sh = electrum_scripthash_hex(&[0x51]);
+
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(2);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, std::sync::Arc::clone(&q), params, tip_tx.clone(), None)
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let mut line = serde_json::to_string(&json!({
+            "jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[sh]
+        }))
+        .unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut resp = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let hash1 = rbitcoin_store::block_header_hash(1, &hash, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let mut txid1 = [0u8; 32];
+        txid1[0] = 0x11;
+        txid1[31] = 0xcd;
+        let ta1 = TxApply {
+            tx: TxRecord {
+                txid: txid1,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![1],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+        tip_tx
+            .send(TipNotify {
+                height: 1,
+                header_hex: "aa".repeat(80),
+            })
+            .unwrap();
+        resp.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let push: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            push["method"].as_str(),
+            Some("blockchain.scripthash.subscribe")
         );
 
         handle.shutdown().await;

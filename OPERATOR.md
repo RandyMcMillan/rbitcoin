@@ -582,6 +582,9 @@ cargo run -p rbitcoin-bench --features cli --release -- \
 # per-key CSV (casa/hot): heights, tx/utxo counts, warm times for each query
 cargo run -p rbitcoin-bench --features cli --release -- \
   --electrum 127.0.0.1:50001 --suite casa --out /tmp/casa.csv
+# many concurrent small wallets (one OS thread in the bench process)
+cargo run -p rbitcoin-bench --features cli --release -- \
+  --electrum 127.0.0.1:50001 --suite clients --clients 32
 ```
 
 | `--suite` | What it measures |
@@ -589,8 +592,9 @@ cargo run -p rbitcoin-bench --features cli --release -- \
 | `casa` | Lopp/Casa 2020–2022: sequential `get_balance`, `get_history`, `listunspent` per key on one TCP connection (the node reuses that connection's last SH join). Discard `--warmup` (default 1), keep `--passes` (default 9), report p50/p95 and history-size buckets. |
 | `sparrow` | Sparrow 2022 wallet load (`subscribe` batches of `--batch`, default 50) then refresh (`get_history` batches). `--fetch-txs` also pulls `blockchain.transaction.get`. Electrum only. |
 | `hot` | Fat-history keys (one-shot history + UTXO). Use for high-fanout scripts. |
+| `clients` | N concurrent Electrum TCP or Esplora HTTP sessions (`--clients`, default 8) on **one OS thread**, each reloading a small wallet sliced from `--corpus` (default `sparrow`). Wallet sizes mix 8/16/32 keys unless `--wallet-keys N`. Keys that would push a wallet over `--max-txs` (1000) or `--max-utxos` (100) are dropped so megakeys do not dominate. Primary sample is `wallet_load` wall time under concurrency. |
 
-| `--corpus` | Packed-in keys (default = `--suite`) |
+| `--corpus` | Packed-in keys (default = `--suite`; `clients` uses `sparrow`) |
 |------------|--------------------------------------|
 | `hot` | Public fat keys: P2A `bc1pfeessrawgf` (portlandhodl electrs stress), genesis P2PKH, burns, high-tx exchange/mining addresses. |
 | `casa` | ~4k unique output scripts from **77 heights spaced genesis→tip** (plus segwit / taproot / Casa-window pins) on a synced rbitcoin store, plus a few known mid-history addresses. Not Casa’s 103k dump from blocks 599900–600100 — that 200-block window makes height-list servers (electrs) look artificially fast because every key hits the same few blocks. |
@@ -598,8 +602,11 @@ cargo run -p rbitcoin-bench --features cli --release -- \
 
 `--targets FILE` overrides the embedded list. Same corpus against two servers is
 the comparison. First pass is usually cache-cold; Casa’s published numbers drop
-that pass. Sequential by default (Casa did not test multi-thread load). TLS is
-the reverse proxy’s job — point the client at plain `127.0.0.1`.
+that pass. Sequential by default (Casa did not test multi-thread load). `--suite clients`
+is concurrent connections multiplexed on the bench’s current-thread runtime
+(light next to a node on the same host; raise `--clients` to add sessions, not
+threads). TLS is the reverse proxy’s job — point the client at plain
+`127.0.0.1`.
 
 Progress goes to **stderr** (stdout stays the p50/p95 table): about one line
 per 5% plus at most one extra line every 15s, with elapsed and ETA. Sparrow
@@ -610,7 +617,9 @@ relabels load → refresh (→ txs if `--fetch-txs`).
 then `get_balance_us_1..N`, `get_history_us_1..N`, `listunspent_us_1..N` for
 the counted warm passes (default N=9; warmup omitted). Blank height cells mean
 no confirmed item. Esplora `oldest_tx`/`newest_tx` are from the returned
-`/txs` page, while `txs` uses `chain_stats.tx_count` when present.
+`/txs` page, while `txs` uses `chain_stats.tx_count` when present. For
+`--suite clients`, `--out` is one row per connection:
+`client,n_keys,txs,utxos,wallet_load_us_1..N`.
 
 ## Esplora REST
 

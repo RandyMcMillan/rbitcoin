@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Optional Electrum/Esplora client benchmark (Casa + Sparrow-style suites)"
+description = "Optional Electrum/Esplora client benchmark (Casa, Sparrow, concurrent wallets)"
 publish = false
 
 [[bin]]

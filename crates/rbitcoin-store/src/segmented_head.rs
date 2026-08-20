@@ -97,7 +97,7 @@ struct Segment {
     fuse_needs_rewrite: bool,
 }
 
-struct SealPublish {
+pub(crate) struct SealPublish {
     file_id: u32,
     pack: crate::tx_head_mphf::TxHeadMphf,
     fuse: SealedFuse8,
@@ -1113,6 +1113,50 @@ impl SegmentedTxHead {
             .map(|(i, k)| (k, (i as u32).saturating_add(1)))
             .collect();
         *seg.open_keys.lock().unwrap_or_else(|e| e.into_inner()) = pairs;
+        Ok(())
+    }
+
+    pub(crate) fn write_sealed_pairs(
+        &self,
+        file_id: u32,
+        first_fk: u64,
+        count: u64,
+        pairs: &[(u64, u32)],
+    ) -> Result<SealPublish, StoreError> {
+        build_seal_publish(&self.dir, file_id, first_fk, count, pairs)
+    }
+
+    /// Replace the segment list with sealed MPHF ranges and an empty open tail.
+    pub(crate) fn install_rebuild_sealed(
+        &self,
+        sealed: Vec<(u64, u64, SealPublish)>,
+        tail_first_fk: u64,
+    ) -> Result<(), StoreError> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        self.wait_seal_locked()?;
+        let mut max_id = 0u32;
+        let mut list = Vec::with_capacity(sealed.len().saturating_add(1));
+        for (first_fk, count, p) in sealed {
+            max_id = max_id.max(p.file_id);
+            list.push(Arc::new(Segment {
+                first_fk,
+                count: AtomicU64::new(count),
+                file_id: p.file_id,
+                sealed: true,
+                head: None,
+                pack: Some(Arc::new(p.pack)),
+                fuse: Some(p.fuse),
+                open_keys: Mutex::new(Vec::new()),
+                fuse_needs_rewrite: false,
+            }));
+        }
+        {
+            let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Arc::new(list);
+        }
+        self.next_file_id
+            .store(max_id.saturating_add(1), Ordering::Relaxed);
+        self.open_new_locked(tail_first_fk)?;
         Ok(())
     }
 

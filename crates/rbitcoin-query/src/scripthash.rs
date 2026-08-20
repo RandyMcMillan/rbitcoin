@@ -268,7 +268,9 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.entries(scripthash)?;
+        let pages_us = t_pages.elapsed().as_micros();
         let mut fks = Vec::new();
         for (_fk, thin) in entries {
             if self.store.is_confirmed_strong(thin.create_tx_fk)? {
@@ -276,9 +278,28 @@ impl Query {
             }
         }
         let mut out = Vec::new();
+        let mut class_a_us = 0u128;
+        let mut spends_us = 0u128;
         for wave in sh_join_waves(&fks, SH_JOIN_WAVE) {
+            let t_a = std::time::Instant::now();
             let creates = self.expand_create_fks_wave(scripthash, wave)?;
+            class_a_us = class_a_us.saturating_add(t_a.elapsed().as_micros());
+            let t_s = std::time::Instant::now();
             out.extend(self.join_spends_wave(&creates)?);
+            spends_us = spends_us.saturating_add(t_s.elapsed().as_micros());
+        }
+        let total_us = pages_us
+            .saturating_add(class_a_us)
+            .saturating_add(spends_us);
+        if total_us >= 10_000 {
+            rbitcoin_log::debug!(
+                "sh_join: creates={} outs={} pages_us={} class_a_us={} spends_us={}",
+                fks.len(),
+                out.len(),
+                pages_us,
+                class_a_us,
+                spends_us
+            );
         }
         Ok(out)
     }

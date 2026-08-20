@@ -573,9 +573,13 @@ IBD may stage creates in **sorted runs** (`key_len=40`, unique
 entry (slab/page packer, sliced k-way onto each shard body — no temp
 pack files). Schema-16 `key_len=32` catalogs are refused.
 
-**Decision:** inline for 1–2-use scripts (~95 % of keys); geometric slabs for
-typical multi-use; page chains only for megakeys. Query cost for busy wallets is
-dominated by Class A + spend joins, not SH pointer chasing.
+**Decision:** inline for 1-use scripts (`SH_INLINE_CAP = 1`, ~95 % of keys); geometric slabs for
+typical multi-use; page chains only for megakeys. Query expand is waved
+`idx_body_pipeline` (`txout` outs) + `txid.body` page-grouped identity +
+`spent.body` 8 B batch peeks on the process `RBITCOIN_IO` session (not one
+serial pread per create). Contiguous megakey page chains span-read when
+`last = first + (n−1)×4096`. Cost for busy wallets is still dominated by
+Class A + spend joins, not SH pointer chasing.
 
 ---
 

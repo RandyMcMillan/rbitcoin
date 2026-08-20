@@ -516,6 +516,12 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 `tail -f` that file. The same line is also emitted at **DEBUG** as `api: …` (so `--log-level debug` shows methods in `mainnet.log`). Params are truncated (~384 bytes) so broadcast hex does not fill the disk.
 
 Use this to see whether Cake is hitting tweaks vs only scripthash history, and which calls take seconds.
+`wall_ms` is the full handler (including JSON). Scripthash history / balance /
+UTXO / Esplora address stats share one waved Class A + spend join on the
+process `RBITCOIN_IO` session. `--log-level debug` emits
+`sh_join: creates=… pages_us=… class_a_us=… spends_us=…` when that join
+exceeds 10 ms. That split is not an `ibd: perf` line and is not extra JSONL
+fields.
 
 ### App DoS floor (always on)
 

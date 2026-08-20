@@ -160,6 +160,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(body.contains("\"method\":\"blockchain.tweaks.subscribe\""));
         assert!(body.contains("\"params\":\"[0,1,false]\""));
+        assert!(body.contains("\"wall_ms\":12"));
+        assert!(!body.contains("join_ms"));
         assert!(body.contains("\"ok\":true"));
         assert!(body.contains("\"ok\":false"));
         assert!(body.contains("unknown method"));

@@ -424,7 +424,7 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head/meta` + `tx.head/NNNNNN` (+ `tx.head/NNNNNN.fuse8` when sealed) |
+| Files | `tx.head/meta` + open `tx.head/NNNNNN`; sealed `NNNNNN.mphf` + `.rel` + `.fuse8` |
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
@@ -441,10 +441,11 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 previous segment sealed in meta → unlink the OA. Insert does not join the
 sidecar. Lookup Open-wave probes every unsealed OA until publish.
 
-**Probe note:** all candidates for a key share one page (single IO). Keyless
-slots cannot Robin-Hood. Kill mid-seal leaves at most one unsealed non-tail
-OA; open rebuilds its fuse keys from Class A and seals it. Two unsealed
-non-tails is **Corrupt**.
+**Probe note:** open OA candidates for a key share one page (single IO).
+Keyless slots cannot Robin-Hood. Sealed: RAM fuse skip, then unique 4 KiB
+BDZ `g` pages (`KIND_MPHF_G`) + `.rel` pread. Kill mid-seal leaves at most
+one unsealed non-tail OA; open rebuilds its fuse keys from Class A and
+seals it. Two unsealed non-tails is **Corrupt**.
 
 **Capacity @ 0.80 load (25-bit):** ≈ **26.8 M creates/segment**, ~29 MiB fuse8 when sealed (~6.1 B total sealed storage per create including head slots).
 

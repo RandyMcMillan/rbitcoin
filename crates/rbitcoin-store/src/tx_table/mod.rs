@@ -9,6 +9,12 @@ use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_REBUILD_SEAL_BITS: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Class A tx row (no wire blob — reconstruct from txout + inwit).
 ///
 /// On-disk `txout.body` (schema **17**): thin LAYOUT17 meta then outputs (no spender).
@@ -1663,12 +1669,31 @@ impl TxTable {
     /// Rebuild MPHF range width: `2^bits` keys. Default **26**; **25** is low-RAM.
     ///
     /// Env `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS`. Operator: 25 or 26. Tests may
-    /// use 6..=26.
+    /// pin 6..=26 on the calling thread without mutating process env.
     pub fn rebuild_seal_bits() -> u32 {
+        #[cfg(test)]
+        if let Some(b) = TEST_REBUILD_SEAL_BITS.with(std::cell::Cell::get) {
+            return b;
+        }
         match std::env::var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS") {
             Ok(s) => s.parse::<u32>().ok().map(|b| b.clamp(6, 26)).unwrap_or(26),
             Err(_) => 26,
         }
+    }
+
+    /// Hold this thread's rebuild seal bits for `f` (does not mutate process env).
+    #[cfg(test)]
+    pub fn test_with_rebuild_seal_bits<R>(bits: u32, f: impl FnOnce() -> R) -> R {
+        let bits = bits.clamp(6, 26);
+        let prev = TEST_REBUILD_SEAL_BITS.with(|c| c.replace(Some(bits)));
+        struct Restore(Option<u32>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_REBUILD_SEAL_BITS.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(prev);
+        f()
     }
 
     pub fn rebuild_seal_keys() -> u64 {

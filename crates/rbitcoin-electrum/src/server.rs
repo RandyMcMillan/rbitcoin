@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{HistoryFilter, Query};
+use rbitcoin_query::{HistoryFilter, Query, ShJoinSlot};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -337,6 +337,7 @@ where
     let mut reader = BufReader::new(reader);
     let mut header_sub = false;
     let mut sh_subs: HashSet<[u8; 32]> = HashSet::new();
+    let mut sh_join: Option<ShJoinSlot> = None;
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
     let idle = config.idle_timeout();
@@ -488,7 +489,7 @@ where
                 }
                 let t0 = Instant::now();
                 let result = if method_stays_on_worker(method) {
-                    dispatch(
+                    dispatch_with_join(
                         method,
                         &params_v,
                         &query,
@@ -497,6 +498,7 @@ where
                         mempool.as_deref(),
                         &mut header_sub,
                         &mut sh_subs,
+                        &mut sh_join,
                     )
                 } else {
                     let q = Arc::clone(&query);
@@ -507,8 +509,9 @@ where
                     let params_owned = params_v.clone();
                     let mut hs = header_sub;
                     let mut shs = sh_subs.clone();
+                    let mut slot = sh_join.take();
                     match tokio::task::spawn_blocking(move || {
-                        let r = dispatch(
+                        let r = dispatch_with_join(
                             &method_owned,
                             &params_owned,
                             &q,
@@ -517,14 +520,16 @@ where
                             mp.as_deref(),
                             &mut hs,
                             &mut shs,
+                            &mut slot,
                         );
-                        (r, hs, shs)
+                        (r, hs, shs, slot)
                     })
                     .await
                     {
-                        Ok((r, hs, shs)) => {
+                        Ok((r, hs, shs, slot)) => {
                             header_sub = hs;
                             sh_subs = shs;
+                            sh_join = slot;
                             r
                         }
                         Err(e) => {
@@ -790,6 +795,23 @@ fn dispatch(
     header_sub: &mut bool,
     sh_subs: &mut HashSet<[u8; 32]>,
 ) -> Result<Value, String> {
+    let mut slot = None;
+    dispatch_with_join(
+        method, params, query, config, chain, mempool, header_sub, sh_subs, &mut slot,
+    )
+}
+
+fn dispatch_with_join(
+    method: &str,
+    params: &Value,
+    query: &Query,
+    config: &ElectrumConfig,
+    chain: &ChainParams,
+    mempool: Option<&MempoolHub>,
+    header_sub: &mut bool,
+    sh_subs: &mut HashSet<[u8; 32]>,
+    sh_join: &mut Option<ShJoinSlot>,
+) -> Result<Value, String> {
     match method {
         "server.version" => Ok(json!([SERVER_VERSION, PROTOCOL_MAX])),
         "server.ping" => Ok(Value::Null),
@@ -841,7 +863,7 @@ fn dispatch(
             let sh = param_scripthash(params, 0)?;
             let (filter, include_mempool) = parse_get_history_window(params)?;
             let mut hist = query
-                .scripthash_history_filtered(&sh, &filter)
+                .scripthash_history_filtered_slot(&sh, &filter, sh_join)
                 .map_err(|e| e.to_string())?;
             // Confirmed rows are height-asc from the filter. Mempool (if any) is
             // appended as a tail — Electrum Cash: only when to_height is -1/omitted.
@@ -869,7 +891,9 @@ fn dispatch(
         }
         "blockchain.scripthash.get_balance" => {
             let sh = param_scripthash(params, 0)?;
-            let mut b = query.scripthash_balance(&sh).map_err(|e| e.to_string())?;
+            let mut b = query
+                .scripthash_balance_slot(&sh, sh_join)
+                .map_err(|e| e.to_string())?;
             if let Some(mp) = mempool {
                 b.unconfirmed = mp.scripthash_unconfirmed_delta(&sh);
             }
@@ -877,7 +901,7 @@ fn dispatch(
         }
         "blockchain.scripthash.listunspent" => {
             let sh = param_scripthash(params, 0)?;
-            let u = crate::scripthash_utxos_with_mempool(query, mempool, &sh)
+            let u = crate::unspent::scripthash_utxos_with_mempool_slot(query, mempool, &sh, sh_join)
                 .map_err(|e| e.to_string())?;
             let arr: Vec<Value> = u
                 .iter()
@@ -902,9 +926,11 @@ fn dispatch(
             }
             sh_subs.insert(sh);
             let status = if let Some(mp) = mempool {
-                scripthash_status_full(query, mp, &sh)?
+                scripthash_status_full_slot(query, mp, &sh, sh_join)?
             } else {
-                let hist = query.scripthash_history(&sh).map_err(|e| e.to_string())?;
+                let hist = query
+                    .scripthash_history_slot(&sh, sh_join)
+                    .map_err(|e| e.to_string())?;
                 scripthash_status(&hist)
             };
             Ok(json!(status))
@@ -1168,7 +1194,19 @@ fn scripthash_status(hist: &[rbitcoin_query::ScriptHashHistoryItem]) -> String {
 }
 
 fn scripthash_status_full(query: &Query, mp: &MempoolHub, sh: &[u8; 32]) -> Result<String, String> {
-    let mut hist = query.scripthash_history(sh).map_err(|e| e.to_string())?;
+    let mut slot = None;
+    scripthash_status_full_slot(query, mp, sh, &mut slot)
+}
+
+fn scripthash_status_full_slot(
+    query: &Query,
+    mp: &MempoolHub,
+    sh: &[u8; 32],
+    slot: &mut Option<ShJoinSlot>,
+) -> Result<String, String> {
+    let mut hist = query
+        .scripthash_history_slot(sh, slot)
+        .map_err(|e| e.to_string())?;
     for item in mp.scripthash_mempool(sh) {
         hist.push(rbitcoin_query::ScriptHashHistoryItem {
             height: item.height,
@@ -2000,6 +2038,129 @@ mod tests {
         assert!(!status.as_str().unwrap().is_empty());
 
         let _ = hashes;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_casa_sequence_reuses_sh_join_slot() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::{body_ok_reads, reset_body_ok_reads, TxApply};
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..3u32 {
+            let version = 1;
+            let timestamp = h + 1;
+            let bits = 0x207fffff;
+            let nonce = h;
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xec;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+                }
+            };
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version,
+                timestamp,
+                bits,
+                nonce,
+                merkle_root: merkle,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![h as u8],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let mut sh_join = None;
+        let sh = electrum_scripthash_hex(&[0x51]);
+        reset_body_ok_reads();
+        let bal = dispatch_with_join(
+            "blockchain.scripthash.get_balance",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+        )
+        .unwrap();
+        assert_eq!(bal["confirmed"].as_i64().unwrap(), 150_0000_0000);
+        let after_bal = body_ok_reads();
+        assert_eq!(after_bal, 3);
+
+        let hist = dispatch_with_join(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+        )
+        .unwrap();
+        assert_eq!(hist.as_array().unwrap().len(), 3);
+        assert_eq!(
+            body_ok_reads(),
+            after_bal,
+            "get_history must reuse the connection join slot"
+        );
+
+        let unspent = dispatch_with_join(
+            "blockchain.scripthash.listunspent",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+        )
+        .unwrap();
+        assert_eq!(unspent.as_array().unwrap().len(), 3);
+        assert_eq!(
+            body_ok_reads(),
+            after_bal,
+            "listunspent must reuse the connection join slot"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

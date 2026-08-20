@@ -785,6 +785,7 @@ fn method_stays_on_worker(method: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn dispatch(
     method: &str,
     params: &Value,

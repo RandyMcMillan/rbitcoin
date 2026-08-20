@@ -499,7 +499,7 @@ wrote them; inserting a later block before an earlier one can leave permanent ho
 Cold bulk: pick the **exact** geometric class from the run-group length (or emit
 pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 
-### Head (schema 18)
+### Head (schema 18 / 19)
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
 - **Main (sealed):** `scripthash.head/NN.mphf` (BDZ 3-graph, then `n` mix64(key16)
@@ -507,8 +507,9 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
   tag check (no main `.fuse8`). Record count is immutable after seal. Existing
   keys pwrite pack8 at `i×8`. New keys are **not** punched into main.
 - pack8 (LE u64): bits 63–62 mode; `00` = 1-fk `create_fk`; `01` = slab
-  `off:u40 \| used:u16 \| class:u6`; `10` = paged `last_page_off` (first page
-  lives in the LAST page header). `SH_INLINE_CAP = 1`.
+  `off:u40 \| used:u16 \| class:u6`; `10` = paged `last_page_off` (schema 18;
+  first page lives in the LAST page header); `11` = **extent** `last_page_off`
+  (schema 19). `SH_INLINE_CAP = 1`.
 - Ingest OA, L0 `SHSR`, L1 ovf MPHF, and main MPHF all store **pack8**.
 - Sharded **64-way** on mainnet (prefix of `scripthash[0]`). Cold load writes
   packed locators (no OA image). No `scripthash.head.oa_stub`.
@@ -532,7 +533,8 @@ and the frozen-L1 warning is ~4.7 years. That is not a calendar guarantee.
 | Empty | no creates | `0` |
 | Inline | 1 create_tx_fk | mode `00`, fk |
 | **Slab** | 2–256 fks | mode `01`, off/used/class |
-| **Paged** | ≥257 fks (megakey) | mode `10`, last page off |
+| **Paged** | schema-18 megakey leftover | mode `10`, last page off |
+| **Extent** | ≥257 fks (new megakeys) | mode `11`, last page off |
 
 Schema-13 slab packing (`w0` flagged, `w1` clear) still decodes as paged;
 store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as slabs).
@@ -562,10 +564,16 @@ compact still merges **heads only** — all ovf keys share
   that alloc only.
 - Geometric slabs class 0–7 (`16 B`–`2 KiB`; `slab_bytes(c) = 16 << c`). Payload:
   `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
-- Megakey **pages** (4 KiB): 8 B header `ver:u8 | n_fks:u16 | LAST|page_index u40`
+- Megakey **pages** (4 KiB): `ver=1` header is 8 B `ver:u8 | n_fks:u16 | LAST|page_index u40`
   then ULEB128 `fk0` + ULEB128 gaps. LAST=1 → index is **first** page; LAST=0 →
-  **next**. Head pack8 paged mode stores **last** page off. `ver=0` with `n_fks>0` is a
-  leftover raw-u64 page — rematerialize. Chain first→last; last-page append only.
+  **next**. `ver=2` last-in-extent / chain-last adds 16 B: `extent_base:u64` +
+  `extent_n:u32` + reserved (stream starts at 24). Mode 11 pack8 stores **last**
+  page off; that page holds `(extent_base, extent_n)`. Query span-reads `extent_n`
+  pages then linked-walks a 4 KiB tail. Mode 10 / `ver=1` is a linked walk only.
+  `ver=0` with `n_fks>0` is a leftover raw-u64 page — rematerialize. Last-page
+  append only. Megakeys never relocate.
+- SH shard bodies and `scripthash.ovf/body` grow in **64 KiB** steps (`GrowPolicy::Align64k`).
+  Class A stems keep 64–256 MiB slabs.
 - Size-class freelist on SHAL. Grow relocates O(log n) times; megakeys never relocate.
 
 ### Query join
@@ -580,8 +588,10 @@ pack files). Schema-16 `key_len=32` catalogs are refused.
 typical multi-use; page chains only for megakeys. Query expand is waved
 `idx_body_pipeline` (`txout` outs) + `txid.body` page-grouped identity +
 `spent.body` 8 B batch peeks on the process `RBITCOIN_IO` session (not one
-serial pread per create). Contiguous megakey page chains span-read when
-`last = first + (n−1)×4096`. Cost for busy wallets is still dominated by
+serial pread per create). Megakey **extent** (`pack8` mode 11): span-read
+`extent_n` pages from `extent_base` on the last page, then linked-walk any
+4 KiB tail. Mode 10 leftovers are a linked walk (no `last = first + (n−1)×4096`
+guess). Cost for busy wallets is still dominated by
 Class A + spend joins, not SH pointer chasing.
 
 ---

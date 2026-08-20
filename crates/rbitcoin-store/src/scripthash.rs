@@ -1402,29 +1402,9 @@ impl ScriptHashTable {
         &self,
         body: &TableFile,
         first_page: u64,
-        last_page: u64,
     ) -> Result<Vec<ShEntry>, StoreError> {
         if first_page == 0 {
             return Ok(Vec::new());
-        }
-        if last_page >= first_page {
-            let span = last_page.saturating_sub(first_page);
-            if span.is_multiple_of(SH_PAGE_SIZE as u64) {
-                let n_pages = (span / SH_PAGE_SIZE as u64).saturating_add(1);
-                let bytes = n_pages.saturating_mul(SH_PAGE_SIZE as u64);
-                if n_pages >= 2
-                    && bytes <= SH_PAGE_SPAN_MAX
-                    && first_page.saturating_add(bytes) <= body.logical_len()
-                {
-                    if let Some((out, last_next)) =
-                        collect_page_chain_span(body, first_page, n_pages as usize)?
-                    {
-                        if last_next == 0 {
-                            return Ok(out);
-                        }
-                    }
-                }
-            }
         }
         collect_page_chain_linked(body, first_page)
     }
@@ -1915,7 +1895,7 @@ impl ScriptHashTable {
                 } else {
                     paged_first_from_last(body, *last_page)?
                 };
-                self.collect_page_chain(body, first, *last_page)
+                self.collect_page_chain(body, first)
             }
             ShHeadValue::Extent { last_page } => collect_extent_then_tail(body, *last_page),
         }

@@ -33,10 +33,12 @@ Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
 | **xorf + bincode + serde** removed from store | Sealed fuse8 is in-tree (`binary_fuse8` + hand LE layout **v2**). Drops a serde-heavy path from store rebuilds. |
 | **fuse8 v1 → v2 on open** | Legacy fuse files soft-migrate (always-probe + rewrite from Class A); **do not** wipe `tx.head` for fuse payload-only changes. |
 
-Host forensics and `cargo bench` one-offs are **not** in the tree. IBD
-progress/rejects belong in node logs (`ibd: confirm reject`, `ibd: archive
-reject`); host A/B is musl + `ibd: perf`. Default compile graph is pinned
-by `scripts/check_default_targets.test.sh`.
+Host forensics and `cargo bench` one-offs are **not** in the default compile
+graph (`scripts/check_default_targets.test.sh`). Optional **client** comparison
+is `rbitcoin-bench` (`cargo run -p rbitcoin-bench --features cli --release`);
+not a musl product bin. Suites and packed `--corpus` lists:
+[`OPERATOR.md`](./OPERATOR.md) (Client benchmark). IBD progress/rejects belong in node logs (`ibd: confirm reject`,
+`ibd: archive reject`); host A/B is musl + `ibd: perf`.
 
 ## Running tests
 
@@ -149,6 +151,7 @@ All workspace members that contain production code:
 - `rbitcoin-consensus`, `rbitcoin-mempool`, `rbitcoin-net`
 - `rbitcoin-electrum`, `rbitcoin-esplora`, `rbitcoin-log`
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
+- `rbitcoin-bench` (lib only; bin is `--features cli`)
 
 **Excluded by default:** third-party crates and `src/main.rs` trampolines.
 Dependencies are not attributed to us.

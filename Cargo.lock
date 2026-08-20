@@ -708,6 +708,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbitcoin-bench"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rbitcoin-cli"
 version = "0.1.0"
 dependencies = [

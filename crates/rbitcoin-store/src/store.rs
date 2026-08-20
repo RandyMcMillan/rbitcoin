@@ -165,7 +165,22 @@ impl Store {
         Self::create_layout(StoreLayout::single(path.into()))
     }
 
+    /// Create with an explicit `tx.head` geometry (tests / recovery).
+    pub fn create_with_head_layout(
+        path: impl Into<PathBuf>,
+        head: crate::address_head::HeadLayout,
+    ) -> Result<Self, StoreError> {
+        Self::create_layout_with_head(StoreLayout::single(path.into()), head)
+    }
+
     pub fn create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
+        Self::create_layout_with_head(layout, crate::address_head::default_layout())
+    }
+
+    fn create_layout_with_head(
+        layout: StoreLayout,
+        head: crate::address_head::HeadLayout,
+    ) -> Result<Self, StoreError> {
         // SH open-address shards open many FDs; raise soft nofile before create.
         crate::file::ensure_nofile_budget();
         let path = layout.dir.clone();
@@ -178,11 +193,7 @@ impl Store {
         }
         write_meta(&path)?;
         let inwit_dir = resolve_inwit_dir(&layout)?;
-        let txs = TxTable::create_with_head_layout_inwit(
-            &path,
-            &inwit_dir,
-            crate::address_head::default_layout(),
-        )?;
+        let txs = TxTable::create_with_head_layout_inwit(&path, &inwit_dir, head)?;
         if layout.is_split() {
             write_inwit_reloc(&path)?;
         }
@@ -2839,8 +2850,9 @@ mod tests {
     /// wave 2 after an unconnected hot cand would regress to the newer row.
     #[test]
     fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
+        use crate::address_head::HeadLayout;
         use crate::head_resolve_stats::sealed_age_for_fk;
-        use crate::segmented_head::{SegmentedTxHead, HEAD_PROBE_HOT_MAX_AGE};
+        use crate::segmented_head::HEAD_PROBE_HOT_MAX_AGE;
         use crate::tx_table::OutputRecord;
 
         fn put_one(s: &Store, txid: [u8; 32], lock: u32) -> Fk {
@@ -2853,131 +2865,135 @@ mod tests {
                 output_start_fk: Fk::NULL,
                 output_count: 1,
             };
-            let out = vec![OutputRecord::unspent(1, vec![0x51; 96])];
+            let out = vec![OutputRecord::unspent(1, vec![0x51])];
             s.put_tx_full_batch_indexed(&[(rec, vec![], out)], true)
                 .unwrap()[0]
         }
 
-        SegmentedTxHead::test_with_soft_span_bytes(48, || {
-            let dir = tmp();
-            let s = Store::create(&dir).unwrap();
-            let txid = [0xCDu8; 32];
-            let old = put_one(&s, txid, 1);
-            let mut n = 10u64;
-            let mut guard = 0u32;
-            loop {
-                assert_eq!(
-                    SegmentedTxHead::soft_span_bytes(),
-                    48,
-                    "this thread's 48-byte roll window must not be stolen"
-                );
-                let first = s.txs.head.first_fks_snapshot();
-                let age = sealed_age_for_fk(&first, old.0).unwrap_or(0);
-                if age > HEAD_PROBE_HOT_MAX_AGE && s.txs.head.sealed_segment_count() >= 4 {
-                    break;
-                }
-                let mut dummy = [0u8; 32];
-                dummy[0..8].copy_from_slice(&n.to_le_bytes());
-                dummy[15] = 0xee;
-                let _ = put_one(&s, dummy, n as u32);
-                n += 1;
-                guard += 1;
-                assert!(
-                    guard < 80,
-                    "could not roll oldest create into cold age (age={age} segs={} span={})",
-                    s.txs.head.segment_count(),
-                    SegmentedTxHead::soft_span_bytes()
-                );
-            }
-            let new = put_one(&s, txid, 2);
-            assert_ne!(old, new);
-            let first = s.txs.head.first_fks_snapshot();
-            let age_old = sealed_age_for_fk(&first, old.0).unwrap();
-            let age_new = sealed_age_for_fk(&first, new.0).unwrap();
-            assert!(
-                age_old > HEAD_PROBE_HOT_MAX_AGE,
-                "old fk must sit in cold age={age_old}"
-            );
-            assert!(
-                age_new <= HEAD_PROBE_HOT_MAX_AGE,
-                "new fk must sit in hot age={age_new}"
-            );
+        let dir = tmp();
+        // bits=8 → 256 slots, seal ~204 keys. Five segments ⇒ oldest age ≥4.
+        let s = Store::create_with_head_layout(&dir, HeadLayout::with_entry_bytes(8, 4).unwrap())
+            .unwrap();
+        let txid = [0xCDu8; 32];
+        let old = put_one(&s, txid, 1);
+        let n = 204u32.saturating_mul(5);
+        let mut items = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let mut dummy = [0u8; 32];
+            dummy[0..8].copy_from_slice(&(u64::from(i) + 10).to_le_bytes());
+            dummy[15] = 0xee;
+            items.push((
+                TxRecord {
+                    txid: dummy,
+                    version: 1,
+                    locktime: i,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ));
+        }
+        s.put_tx_full_batch_indexed(&items, true).unwrap();
+        s.txs.flush_head().unwrap();
+        let first = s.txs.head.first_fks_snapshot();
+        let age = sealed_age_for_fk(&first, old.0).unwrap_or(0);
+        assert!(
+            age > HEAD_PROBE_HOT_MAX_AGE && s.txs.head.sealed_segment_count() >= 4,
+            "oldest must be cold after count-only rolls age={age} segs={} sealed={}",
+            s.txs.head.segment_count(),
+            s.txs.head.sealed_segment_count()
+        );
+        let new = put_one(&s, txid, 2);
+        assert_ne!(old, new);
+        let first = s.txs.head.first_fks_snapshot();
+        let age_old = sealed_age_for_fk(&first, old.0).unwrap();
+        let age_new = sealed_age_for_fk(&first, new.0).unwrap();
+        assert!(
+            age_old > HEAD_PROBE_HOT_MAX_AGE,
+            "old fk must sit in cold age={age_old}"
+        );
+        assert!(
+            age_new <= HEAD_PROBE_HOT_MAX_AGE,
+            "new fk must sit in hot age={age_new}"
+        );
 
-            let mixed = [s.txs.secret.mix_txid(&txid)];
-            let open = s.txs.head.probe_candidates_batch_open(&mixed).unwrap();
-            let mid = s
-                .txs
-                .head
-                .probe_candidates_batch_sealed_hot(&mixed, &[true])
-                .unwrap();
-            let mut hot = open;
-            hot[0].extend(mid[0].iter().copied());
-            let cold = s
-                .txs
-                .head
-                .probe_candidates_batch_cold(&mixed, &[true])
-                .unwrap();
-            assert!(
-                hot[0].iter().any(|f| *f == new) && !hot[0].iter().any(|f| *f == old),
-                "open∪sealed_hot={:?} new={new:?} old={old:?}",
-                hot[0]
-            );
-            assert!(
-                cold[0].iter().any(|f| *f == old) && !cold[0].iter().any(|f| *f == new),
-                "cold={:?} old={old:?} new={new:?}",
-                cold[0]
-            );
+        let mixed = [s.txs.secret.mix_txid(&txid)];
+        let open = s.txs.head.probe_candidates_batch_open(&mixed).unwrap();
+        let mid = s
+            .txs
+            .head
+            .probe_candidates_batch_sealed_hot(&mixed, &[true])
+            .unwrap();
+        let mut hot = open;
+        hot[0].extend(mid[0].iter().copied());
+        let cold = s
+            .txs
+            .head
+            .probe_candidates_batch_cold(&mixed, &[true])
+            .unwrap();
+        assert!(
+            hot[0].iter().any(|f| *f == new) && !hot[0].iter().any(|f| *f == old),
+            "open∪sealed_hot={:?} new={new:?} old={old:?}",
+            hot[0]
+        );
+        assert!(
+            cold[0].iter().any(|f| *f == old) && !cold[0].iter().any(|f| *f == new),
+            "cold={:?} old={old:?} new={new:?}",
+            cold[0]
+        );
 
-            // Neither connected yet: newest unconnected (hot) for TipThenAny.
-            assert_eq!(
-                s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-                Some(new)
-            );
-            assert_eq!(
-                s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
-                    .unwrap()[0]
-                    .1
-                    .map(|(f, _)| f),
-                Some(new),
-                "batch TipThenAny must keep newer unconnected when cold has no connected"
-            );
-            assert_eq!(
-                s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
-                    .unwrap()[0]
-                    .1,
-                None
-            );
+        // Neither connected yet: newest unconnected (hot) for TipThenAny.
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
+            Some(new)
+        );
+        assert_eq!(
+            s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
+                .unwrap()[0]
+                .1
+                .map(|(f, _)| f),
+            Some(new),
+            "batch TipThenAny must keep newer unconnected when cold has no connected"
+        );
+        assert_eq!(
+            s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
+                .unwrap()[0]
+                .1,
+            None
+        );
 
-            s.header_txs.put_range(Fk(1), old, 1).unwrap();
-            s.confirmed.set(Height(0), Fk(1)).unwrap();
-            s.rebuild_height_fence().unwrap();
+        s.header_txs.put_range(Fk(1), old, 1).unwrap();
+        s.confirmed.set(Height(0), Fk(1)).unwrap();
+        s.rebuild_height_fence().unwrap();
 
-            assert_eq!(
-                s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
-                Some(old)
-            );
-            assert_eq!(
-                s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-                Some(old)
-            );
-            let batch_tip = s
-                .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
-                .unwrap();
-            assert_eq!(
-                batch_tip[0].1.map(|(f, _)| f),
-                Some(old),
-                "TipOnly must take connected cold sibling, not unconnected hot"
-            );
-            let batch_any = s
-                .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
-                .unwrap();
-            assert_eq!(
-                batch_any[0].1.map(|(f, _)| f),
-                Some(old),
-                "TipThenAny must take connected cold sibling over newer unconnected hot"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        });
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
+            Some(old)
+        );
+        assert_eq!(
+            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
+            Some(old)
+        );
+        let batch_tip = s
+            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
+            .unwrap();
+        assert_eq!(
+            batch_tip[0].1.map(|(f, _)| f),
+            Some(old),
+            "TipOnly must take connected cold sibling, not unconnected hot"
+        );
+        let batch_any = s
+            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
+            .unwrap();
+        assert_eq!(
+            batch_any[0].1.map(|(f, _)| f),
+            Some(old),
+            "TipThenAny must take connected cold sibling over newer unconnected hot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -61,7 +61,7 @@ impl TxHeadMphf {
         let mut mlt: HashMap<u32, Vec<u32>> = HashMap::new();
         for (k, mut rs) in by_key {
             let newest = rs.pop().unwrap();
-            let slot = mphf.index(k);
+            let slot = mphf.index(k)?;
             rels[slot as usize] = newest;
             if !rs.is_empty() {
                 rs.reverse();
@@ -109,8 +109,26 @@ impl TxHeadMphf {
         })
     }
 
-    pub fn slots_for(&self, mixed_u64: &[u64]) -> Vec<u32> {
-        mixed_u64.iter().map(|&k| self.mphf.index(k)).collect()
+    #[cfg(test)]
+    pub fn slots_for(&self, mixed_u64: &[u64]) -> Result<Vec<u32>, StoreError> {
+        self.slots_for_ctx(mixed_u64, &mut crate::IoCtx::none())
+    }
+
+    pub fn slots_for_ctx(
+        &self,
+        mixed_u64: &[u64],
+        ctx: &mut crate::IoCtx<'_>,
+    ) -> Result<Vec<u32>, StoreError> {
+        self.mphf.index_batch(mixed_u64, ctx)
+    }
+
+    #[cfg(test)]
+    pub fn take_g_page_preads(&self) -> u64 {
+        self.mphf.take_g_page_preads()
+    }
+
+    pub fn g_bytes_resident(&self) -> u64 {
+        self.mphf.g_bytes_resident() as u64
     }
 
     pub fn read_rels_batch(
@@ -210,4 +228,107 @@ fn read_mlt(path: &Path) -> Result<HashMap<u32, Vec<u32>>, StoreError> {
         out.insert(slot, rels);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bdz::BdzMphf;
+    use crate::uring_session::{IoCtx, SessionKind, UringSession};
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rbitcoin-tx-mphf-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn shared_g_page_is_one_pread() {
+        let dir = tmp("share");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys: Vec<u64> = (0..4_000u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(3))
+            .collect();
+        let ram = BdzMphf::build(&keys).unwrap();
+        let p = dir.join("t.mphf");
+        ram.write_to(&p).unwrap();
+        let fd = BdzMphf::read_from(&p).unwrap();
+        let page_of = |k: u64| {
+            fd.vertices(k)
+                .into_iter()
+                .map(|v| v / 1024)
+                .collect::<Vec<_>>()
+        };
+        let k0 = keys[0];
+        let p0 = page_of(k0);
+        let k1 = keys
+            .iter()
+            .copied()
+            .find(|&k| k != k0 && page_of(k).iter().any(|p| p0.contains(p)))
+            .expect("two keys sharing a g page");
+        let _ = fd.take_g_page_preads();
+        let a = fd.index(k0).unwrap();
+        let b = fd.index(k1).unwrap();
+        let serial_pages = fd.take_g_page_preads();
+        let batch = fd.index_batch(&[k0, k1], &mut IoCtx::none()).unwrap();
+        let batch_pages = fd.take_g_page_preads();
+        assert_eq!(batch, vec![a, b]);
+        let mut uniq = page_of(k0);
+        uniq.extend(page_of(k1));
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(batch_pages, uniq.len() as u64);
+        assert!(batch_pages <= serial_pages);
+        assert!(batch_pages >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_batch_held_session_submits_g_pages() {
+        let dir = tmp("held");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
+        let ram = BdzMphf::build(&keys).unwrap();
+        let p = dir.join("t.mphf");
+        ram.write_to(&p).unwrap();
+        let fd = BdzMphf::read_from(&p).unwrap();
+        let serial = fd.index_batch(&keys[..8], &mut IoCtx::none()).unwrap();
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let _ = crate::uring_session::test_take_last_sqe_lens();
+        let mut ctx = IoCtx::held(&mut session);
+        let batch = fd.index_batch(&keys[..8], &mut ctx).unwrap();
+        session.drain_all().unwrap();
+        assert_eq!(batch, serial);
+        let sqes = crate::uring_session::test_take_last_sqe_lens();
+        assert!(
+            !sqes.is_empty(),
+            "index_batch(held) must submit g pages on the held session"
+        );
+        assert!(sqes.iter().all(|&len| len > 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tx_head_mphf_open_is_header_only() {
+        let dir = tmp("open");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("000000");
+        let pairs: Vec<(u64, u32)> = (1..64u32)
+            .map(|i| (u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15), i))
+            .collect();
+        let h = TxHeadMphf::write(&base, &pairs).unwrap();
+        assert_eq!(h.mphf.g_bytes_resident(), 0);
+        let slots = h.slots_for(&[pairs[0].0]).unwrap();
+        assert_eq!(slots.len(), 1);
+        let rels = h
+            .read_rels_batch(&slots, &mut crate::IoCtx::none())
+            .unwrap();
+        assert_eq!(rels[0][0], pairs[0].1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

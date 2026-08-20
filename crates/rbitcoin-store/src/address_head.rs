@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_default_bits_is_26() {
+    fn mainnet_default_bits_is_25() {
         assert_eq!(MAINNET_BITS, 25);
         assert_eq!(entry_bytes_for_bits(MAINNET_BITS), 4);
         // 4 B × 1024 = 4 KiB pages at mainnet default.

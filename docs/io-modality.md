@@ -95,10 +95,10 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 8 B×n_out sole-spender; annotate RMW |
 | **`txout.idx` / `inwit.idx` / `spent.idx`** | L0 | Append pwrite; reads pread; **grow-tight** (~1 MiB) |
-| **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (fd pread/pwrite) |
+| **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: RAM fuse8; BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); `.rel` pread batch |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
-| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed main: page idx in RAM, data FdOnly, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf: idx+fuse8. Body slabs L0 |
+| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed MPHF main: BDZ `g` FdOnly + tag/val pread, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf L0 SHSR: idx+fuse8. L1 ovf: RAM fuse + FdOnly `g`. Body slabs L0 |
 | **Spenders** | L0 | Linear append |
 | `confirmed` / `header_txs_*` / `strong_tx` | **L2** | InRam write-behind; barrier = `Store::flush_class_c_tip` |
 | Create-height fence | RAM | Built from confirmed + header_txs; no `tx_height.body` |

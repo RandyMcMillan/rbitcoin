@@ -56,6 +56,10 @@ impl MphfHead {
         self.mphf.n() == 0
     }
 
+    pub fn g_bytes_resident(&self) -> usize {
+        self.mphf.g_bytes_resident()
+    }
+
     #[cfg(test)]
     pub fn pread_count(&self) -> u64 {
         self.preads.load(Ordering::Relaxed)
@@ -109,7 +113,7 @@ impl MphfHead {
         let mut tags = vec![0u8; n.saturating_mul(8)];
         for (i, (_k, w)) in recs.iter().enumerate() {
             let ku = keys[i];
-            let slot = mphf.index(ku) as usize;
+            let slot = mphf.index(ku)? as usize;
             tags[slot * 8..slot * 8 + 8].copy_from_slice(&ku.to_le_bytes());
             val[slot * 8..slot * 8 + 8].copy_from_slice(&w.to_le_bytes());
         }
@@ -207,7 +211,7 @@ impl MphfHead {
             return Ok(None);
         }
         let ku = mix_key16(key);
-        let slot = u64::from(self.mphf.index(ku));
+        let slot = u64::from(self.mphf.index(ku)?);
         let mut tag = [0u8; 8];
         self.preads.fetch_add(1, Ordering::Relaxed);
         pread_file_exact(&self.mphf_file, self.tags_off + slot * 8, &mut tag)
@@ -310,6 +314,7 @@ mod tests {
         assert!(val_path(&base).is_file());
         assert_eq!(std::fs::metadata(val_path(&base)).unwrap().len(), 16);
         let h2 = MphfHead::open(&base).unwrap();
+        assert_eq!(h2.g_bytes_resident(), 0);
         assert_eq!(h2.get(&key(1)).unwrap().unwrap(), a);
         assert!(h2.get(&key(7)).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);

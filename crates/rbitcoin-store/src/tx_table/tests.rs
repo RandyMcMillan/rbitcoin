@@ -7,7 +7,6 @@ use crate::compact::{
     SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH, SCRIPT_KIND_V17_P2TR,
     SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
 };
-use crate::segmented_head::SegmentedTxHead;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 
@@ -2190,37 +2189,90 @@ fn put_full_aligns_record_starts_and_txid_prefix() {
 /// BIP30 same-txid twice → duplicate fuse keys; seal must still succeed (dedup for build only).
 #[test]
 fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
-    with_env_lock(|| {
-        SegmentedTxHead::test_with_soft_span_bytes(0, || {
-            std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
-            let dir = tempfile_dir("bip30-seal");
-            // 10-bit: max_keys = 819
-            let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
-            let mut shared = [0u8; 32];
-            shared[0..8].copy_from_slice(&1u64.to_le_bytes());
-            // Two Class A creates with the same txid (BIP30-shaped).
-            let r1 = TxRecord {
-                txid: shared,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 0,
-                output_start_fk: Fk::NULL,
-                output_count: 0,
-            };
-            let r2 = r1.clone();
-            let fks = t
-                .put_full_batch_indexed(&meta_only_items(&[r1, r2]), true)
-                .unwrap();
-            assert_eq!(fks.len(), 2);
-            assert_ne!(fks[0], fks[1]);
-            // Fill remaining to force seal of first segment (819 creates).
-            let mut rest = Vec::new();
-            for i in 3..=819u64 {
+    let dir = tempfile_dir("bip30-seal");
+    // 10-bit: max_keys = 819
+    let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+    let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+    let mut shared = [0u8; 32];
+    shared[0..8].copy_from_slice(&1u64.to_le_bytes());
+    // Two Class A creates with the same txid (BIP30-shaped).
+    let r1 = TxRecord {
+        txid: shared,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 0,
+        output_start_fk: Fk::NULL,
+        output_count: 0,
+    };
+    let r2 = r1.clone();
+    let fks = t
+        .put_full_batch_indexed(&meta_only_items(&[r1, r2]), true)
+        .unwrap();
+    assert_eq!(fks.len(), 2);
+    assert_ne!(fks[0], fks[1]);
+    // Fill remaining to force seal of first segment (819 creates).
+    let mut rest = Vec::new();
+    for i in 3..=819u64 {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        rest.push(TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        });
+    }
+    t.put_full_batch_indexed(&meta_only_items(&rest), true)
+        .unwrap();
+    // Next create forces roll/seal of the full segment.
+    let mut more = [0u8; 32];
+    more[0..8].copy_from_slice(&820u64.to_le_bytes());
+    t.put_full_batch_indexed(
+        &meta_only_items(&[TxRecord {
+            txid: more,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        }]),
+        true,
+    )
+    .unwrap();
+    t.flush_head().unwrap();
+    assert!(
+        t.head.sealed_segment_count() >= 1,
+        "seal must succeed despite BIP30 duplicate fuse keys"
+    );
+    // Newest BIP30 create wins (deeper probe).
+    let hit = t.get_fk_by_txid(&shared).unwrap();
+    assert_eq!(hit, Some(fks[1]), "newest same-txid create");
+    let all = t.get_all_by_txid(&shared).unwrap();
+    assert_eq!(all.len(), 2, "both BIP30 creates body-verify");
+    assert_eq!(all[0].0, fks[1]);
+    assert_eq!(all[1].0, fks[0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reopen mid-open-segment, then fill to seal: pre-reopen creates must not FN.
+#[test]
+fn reopen_mid_segment_then_seal_no_fuse_fn() {
+    let dir = tempfile_dir("reopen-seal-fn");
+    // 10-bit: max_keys = floor(0.8*1024) = 819
+    let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+    let half = 400u64;
+    {
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let recs: Vec<TxRecord> = (0..half)
+            .map(|i| {
                 let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                rest.push(TxRecord {
+                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                TxRecord {
                     txid,
                     version: 1,
                     locktime: 0,
@@ -2228,187 +2280,118 @@ fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
                     input_count: 0,
                     output_start_fk: Fk::NULL,
                     output_count: 0,
-                });
+                }
+            })
+            .collect();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
+            .unwrap();
+        assert_eq!(t.head_segment_count(), 1);
+        assert_eq!(t.head.sealed_segment_count(), 0);
+        assert_eq!(t.head.open_keys_len() as u64, half);
+        t.flush().unwrap();
+    }
+    // Reopen: open_keys must rebuild from Class A.
+    let t = TxTable::open(&dir).unwrap();
+    assert_eq!(t.head.open_keys_len() as u64, half, "open keys rebuilt");
+    // Fill past 819 so first segment seals.
+    let more: Vec<TxRecord> = (half..900)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
             }
-            t.put_full_batch_indexed(&meta_only_items(&rest), true)
-                .unwrap();
-            // Next create forces roll/seal of the full segment.
-            let mut more = [0u8; 32];
-            more[0..8].copy_from_slice(&820u64.to_le_bytes());
-            t.put_full_batch_indexed(
-                &meta_only_items(&[TxRecord {
-                    txid: more,
+        })
+        .collect();
+    t.put_full_batch_indexed(&meta_only_items(&more), true)
+        .unwrap();
+    t.flush_head().unwrap();
+    assert!(t.head.sealed_segment_count() >= 1, "must have sealed");
+    // Pre-reopen members must resolve through sealed fuse (no FN).
+    for i in [1u64, 50, 200, 400] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(
+            t.get_fk_by_txid(&txid).unwrap(),
+            Some(Fk(i)),
+            "pre-reopen fk={i} FN after seal"
+        );
+    }
+    for i in [401u64, 820, 900] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Legacy fuse8 v1 → v2 rewrite on open (minimal seal: 820 creates @ bits=10).
+#[test]
+fn reopen_rewrites_legacy_v1_sealed_fuse_to_v2() {
+    let dir = tempfile_dir("fuse-v1-rewrite");
+    let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+    {
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        // 0.8 * 1024 slots = 819 → one seal at 820.
+        let recs: Vec<TxRecord> = (0..820u64)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                TxRecord {
+                    txid,
                     version: 1,
                     locktime: 0,
                     input_start_fk: Fk::NULL,
                     input_count: 0,
                     output_start_fk: Fk::NULL,
                     output_count: 0,
-                }]),
-                true,
-            )
+                }
+            })
+            .collect();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
             .unwrap();
-            t.flush_head().unwrap();
-            assert!(
-                t.head.sealed_segment_count() >= 1,
-                "seal must succeed despite BIP30 duplicate fuse keys"
-            );
-            // Newest BIP30 create wins (deeper probe).
-            let hit = t.get_fk_by_txid(&shared).unwrap();
-            assert_eq!(hit, Some(fks[1]), "newest same-txid create");
-            let all = t.get_all_by_txid(&shared).unwrap();
-            assert_eq!(all.len(), 2, "both BIP30 creates body-verify");
-            assert_eq!(all[0].0, fks[1]);
-            assert_eq!(all[1].0, fks[0]);
-            let _ = std::fs::remove_dir_all(&dir);
-        });
-    });
+        t.flush().unwrap();
+        assert!(t.head.sealed_segment_count() >= 1);
+    }
+    let fuse_path = dir.join("tx.head").join("000000.fuse8");
+    assert!(fuse_path.is_file());
+    let mut raw = Vec::from(*b"BF8R");
+    raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
+    raw.extend_from_slice(&0u64.to_le_bytes());
+    std::fs::write(&fuse_path, &raw).unwrap();
+
+    let t = TxTable::open(&dir).unwrap();
+    assert!(
+        t.head.sealed_fuse_rewrite_queue().is_empty(),
+        "open must rewrite legacy fuses before returning"
+    );
+    let bytes = std::fs::read(&fuse_path).unwrap();
+    assert_eq!(&bytes[0..4], b"BF8R");
+    let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    assert_eq!(ver, 2, "fuse must be rewritten as v2");
+    for i in [1u64, 100, 400, 819] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(
+            t.get_fk_by_txid(&txid).unwrap(),
+            Some(Fk(i)),
+            "fk={i} after fuse migrate"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Reopen mid-open-segment, then fill to seal: pre-reopen creates must not FN.
+/// Fat Class A bodies must not roll `tx.head` (idx soft-span is not a head cut).
 #[test]
-fn reopen_mid_segment_then_seal_no_fuse_fn() {
+fn fat_creates_do_not_roll_head_on_body_soft_span() {
     with_env_lock(|| {
-        // Only load@80% rolls — scoped override so we cannot leak onto this thread.
-        SegmentedTxHead::test_with_soft_span_bytes(0, || {
-            std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
-            let dir = tempfile_dir("reopen-seal-fn");
-            // 10-bit: max_keys = floor(0.8*1024) = 819
-            let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-            let half = 400u64;
-            {
-                let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
-                let recs: Vec<TxRecord> = (0..half)
-                    .map(|i| {
-                        let mut txid = [0u8; 32];
-                        txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                        TxRecord {
-                            txid,
-                            version: 1,
-                            locktime: 0,
-                            input_start_fk: Fk::NULL,
-                            input_count: 0,
-                            output_start_fk: Fk::NULL,
-                            output_count: 0,
-                        }
-                    })
-                    .collect();
-                t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                    .unwrap();
-                assert_eq!(t.head_segment_count(), 1);
-                assert_eq!(t.head.sealed_segment_count(), 0);
-                assert_eq!(t.head.open_keys_len() as u64, half);
-                t.flush().unwrap();
-            }
-            // Reopen: open_keys must rebuild from Class A.
-            let t = TxTable::open(&dir).unwrap();
-            assert_eq!(t.head.open_keys_len() as u64, half, "open keys rebuilt");
-            // Fill past 819 so first segment seals.
-            let more: Vec<TxRecord> = (half..900)
-                .map(|i| {
-                    let mut txid = [0u8; 32];
-                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                    TxRecord {
-                        txid,
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 0,
-                        output_start_fk: Fk::NULL,
-                        output_count: 0,
-                    }
-                })
-                .collect();
-            t.put_full_batch_indexed(&meta_only_items(&more), true)
-                .unwrap();
-            t.flush_head().unwrap();
-            assert!(t.head.sealed_segment_count() >= 1, "must have sealed");
-            // Pre-reopen members must resolve through sealed fuse (no FN).
-            for i in [1u64, 50, 200, 400] {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                assert_eq!(
-                    t.get_fk_by_txid(&txid).unwrap(),
-                    Some(Fk(i)),
-                    "pre-reopen fk={i} FN after seal"
-                );
-            }
-            for i in [401u64, 820, 900] {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-        });
-    });
-}
-
-/// Legacy fuse8 v1 → v2 rewrite on open (minimal seal: 820 creates @ bits=10).
-#[test]
-fn reopen_rewrites_legacy_v1_sealed_fuse_to_v2() {
-    with_env_lock(|| {
-        SegmentedTxHead::test_with_soft_span_bytes(0, || {
-            std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
-            let dir = tempfile_dir("fuse-v1-rewrite");
-            let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-            {
-                let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
-                // 0.8 * 1024 slots = 819 → one seal at 820.
-                let recs: Vec<TxRecord> = (0..820u64)
-                    .map(|i| {
-                        let mut txid = [0u8; 32];
-                        txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                        TxRecord {
-                            txid,
-                            version: 1,
-                            locktime: 0,
-                            input_start_fk: Fk::NULL,
-                            input_count: 0,
-                            output_start_fk: Fk::NULL,
-                            output_count: 0,
-                        }
-                    })
-                    .collect();
-                t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                    .unwrap();
-                t.flush().unwrap();
-                assert!(t.head.sealed_segment_count() >= 1);
-            }
-            let fuse_path = dir.join("tx.head").join("000000.fuse8");
-            assert!(fuse_path.is_file());
-            let mut raw = Vec::from(*b"BF8R");
-            raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
-            raw.extend_from_slice(&0u64.to_le_bytes());
-            std::fs::write(&fuse_path, &raw).unwrap();
-
-            let t = TxTable::open(&dir).unwrap();
-            assert!(
-                t.head.sealed_fuse_rewrite_queue().is_empty(),
-                "open must rewrite legacy fuses before returning"
-            );
-            let bytes = std::fs::read(&fuse_path).unwrap();
-            assert_eq!(&bytes[0..4], b"BF8R");
-            let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-            assert_eq!(ver, 2, "fuse must be rewritten as v2");
-            for i in [1u64, 100, 400, 819] {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                assert_eq!(
-                    t.get_fk_by_txid(&txid).unwrap(),
-                    Some(Fk(i)),
-                    "fk={i} after fuse migrate"
-                );
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-        });
-    });
-}
-
-/// Soft-span force_roll uses **open** segment first_fk (after a prior roll).
-#[test]
-fn soft_span_roll_on_open_segment_not_only_first() {
-    with_env_lock(|| {
-        let dir = tempfile_dir("soft-span-open");
+        let dir = tempfile_dir("no-body-span-roll");
         let layout = HeadLayout::with_entry_bytes(14, 4).unwrap();
         let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
         let mk = |i: u64| {
@@ -2434,28 +2417,18 @@ fn soft_span_roll_on_open_segment_not_only_first() {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51; 32])];
             (tx, inputs, outputs)
         };
-        // ~2 fat creates per soft window (thread-local override).
-        SegmentedTxHead::test_with_soft_span_bytes(800, || {
-            for i in 1..=6u64 {
+        crate::tx_idx::test_with_soft_span_bytes(800, || {
+            for i in 1..=12u64 {
                 t.put_full_batch_indexed(&[mk(i)], true).unwrap();
             }
             t.flush_head().unwrap();
-            let segs_mid = t.head_segment_count();
-            let sealed_mid = t.head.sealed_segment_count();
-            assert!(
-                segs_mid >= 2 && sealed_mid >= 1,
-                "first soft rolls segs={segs_mid} sealed={sealed_mid}"
-            );
-            for i in 7..=12u64 {
-                t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-            }
-            t.flush_head().unwrap();
-            let sealed = t.head.sealed_segment_count();
-            assert!(
-                sealed > sealed_mid,
-                "open-segment soft-span must seal again sealed={sealed} mid={sealed_mid} segs={}",
+            assert_eq!(
+                t.head.sealed_segment_count(),
+                0,
+                "body soft-span must not seal tx.head segs={}",
                 t.head_segment_count()
             );
+            assert_eq!(t.head_segment_count(), 1);
             for i in [1u64, 6, 9, 12] {
                 let mut txid = [0u8; 32];
                 txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -2529,8 +2502,7 @@ fn segmented_head_roll_and_lookup_via_tx_table() {
 
 #[test]
 fn empty_occupancy_head_open_rebuilds_mphf_not_oa_backfill() {
-    with_env_lock(|| {
-        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+    TxTable::test_with_rebuild_seal_bits(6, || {
         let dir = tempfile_dir("empty-occ-rebuild");
         let layout = crate::address_head::default_layout();
         {
@@ -2567,15 +2539,13 @@ fn empty_occupancy_head_open_rebuilds_mphf_not_oa_backfill() {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&65u64.to_le_bytes());
         assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(65)));
-        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
 #[test]
 fn rebuild_head_direct_mphf_empty_tail() {
-    with_env_lock(|| {
-        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+    TxTable::test_with_rebuild_seal_bits(6, || {
         let dir = tempfile_dir("rebuild-direct-mphf");
         {
             let t = create_tiny(&dir);
@@ -2630,15 +2600,13 @@ fn rebuild_head_direct_mphf_empty_tail() {
             txid[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
         }
-        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
 #[test]
 fn rebuild_head_direct_mphf_bip30_newest_first() {
-    with_env_lock(|| {
-        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+    TxTable::test_with_rebuild_seal_bits(6, || {
         let dir = tempfile_dir("rebuild-direct-bip30");
         {
             let t = create_tiny(&dir);
@@ -2683,56 +2651,54 @@ fn rebuild_head_direct_mphf_bip30_newest_first() {
         assert_eq!(all.len(), 2, "both BIP30 creates");
         assert_eq!(all[0].0, Fk(2), "newest first {all:?}");
         assert_eq!(all[1].0, Fk(1));
-        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
 #[test]
 fn plan_head_rebuild_ranges_chunks_seal_bits_not_oa_load() {
-    with_env_lock(|| {
-        let dir = tempfile_dir("plan-seal-bits");
-        let t = create_tiny(&dir);
-        let recs: Vec<TxRecord> = (0..200u64)
-            .map(|i| {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                TxRecord {
-                    txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 0,
-                    output_start_fk: Fk::NULL,
-                    output_count: 0,
-                }
-            })
-            .collect();
-        t.put_full_batch_indexed(&meta_only_items(&recs), true)
-            .unwrap();
-        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+    let dir = tempfile_dir("plan-seal-bits");
+    let t = create_tiny(&dir);
+    let recs: Vec<TxRecord> = (0..200u64)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }
+        })
+        .collect();
+    t.put_full_batch_indexed(&meta_only_items(&recs), true)
+        .unwrap();
+    TxTable::test_with_rebuild_seal_bits(6, || {
         let ranges6 = t.plan_head_rebuild_ranges().unwrap();
         assert_eq!(
             ranges6,
             vec![(1, 64), (65, 64), (129, 64), (193, 8)],
             "bits=6 → T=64"
         );
-        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "7");
+    });
+    TxTable::test_with_rebuild_seal_bits(7, || {
         let ranges7 = t.plan_head_rebuild_ranges().unwrap();
         assert_eq!(
             ranges7,
             vec![(1, 128), (129, 72)],
             "bits=7 → T=128 (knob is seal bits, not OA 80%)"
         );
-        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
-        let _ = std::fs::remove_dir_all(&dir);
     });
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn plan_head_rebuild_ranges_soft_span_cuts_before_t() {
-    with_env_lock(|| {
-        let dir = tempfile_dir("plan-soft-span");
+fn plan_head_rebuild_ranges_ignores_body_soft_span() {
+    TxTable::test_with_rebuild_seal_bits(8, || {
+        let dir = tempfile_dir("plan-no-body-span");
         let t = create_tiny(&dir);
         let mk = |i: u64| {
             let mut txid = [0u8; 32];
@@ -2757,30 +2723,41 @@ fn plan_head_rebuild_ranges_soft_span_cuts_before_t() {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51; 32])];
             (tx, inputs, outputs)
         };
-        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "8");
-        SegmentedTxHead::test_with_soft_span_bytes(800, || {
+        crate::tx_idx::test_with_soft_span_bytes(800, || {
             for i in 1..=6u64 {
                 t.put_full_batch_indexed(&[mk(i)], true).unwrap();
             }
             let ranges = t.plan_head_rebuild_ranges().unwrap();
-            assert!(
-                ranges.len() >= 2,
-                "soft-span must cut before T=256, ranges={ranges:?}"
+            assert_eq!(
+                ranges,
+                vec![(1, 6)],
+                "rebuild cuts are 2^bits only, not body span, ranges={ranges:?}"
             );
-            assert!(
-                ranges.iter().all(|(_, c)| *c < 256),
-                "no range should reach T, ranges={ranges:?}"
-            );
-            let covered: u64 = ranges.iter().map(|(_, c)| *c).sum();
-            assert_eq!(covered, 6);
-            let mut next = 1u64;
-            for (first, count) in &ranges {
-                assert_eq!(*first, next);
-                next = first + count;
-            }
         });
-        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
         let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn rebuild_seal_bits_override_is_thread_local() {
+    TxTable::test_with_rebuild_seal_bits(6, || {
+        assert_eq!(TxTable::rebuild_seal_bits(), 6);
+        let other = std::thread::spawn(TxTable::rebuild_seal_bits)
+            .join()
+            .expect("join");
+        assert_eq!(TxTable::rebuild_seal_bits(), 6);
+        assert_ne!(other, 6);
+    });
+}
+
+#[test]
+fn rebuild_seal_bits_override_restores_after_panic() {
+    TxTable::test_with_rebuild_seal_bits(7, || {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TxTable::test_with_rebuild_seal_bits(8, || panic!("rebuild-bits boom"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(TxTable::rebuild_seal_bits(), 7);
     });
 }
 

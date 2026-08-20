@@ -473,6 +473,11 @@ impl Store {
         self.txs.get_meta_and_outputs(fk)
     }
 
+    /// Page-grouped `txid.body` identity for scattered create fks.
+    pub fn txids_get_many(&self, fks: &[Fk]) -> Result<Vec<Option<[u8; 32]>>, StoreError> {
+        self.txs.txid_sidefile().get_many(fks)
+    }
+
     /// Class A outputs for create_fks `first..=last` from a coalesced body span.
     pub fn for_each_create_outs_in_fk_span(
         &self,

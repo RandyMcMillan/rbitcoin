@@ -5,7 +5,14 @@
 //! Spentness/heights from spends + Class C.
 
 use super::*;
-use rbitcoin_store::script_hash;
+use rbitcoin_store::{script_hash, IdxBodyMode};
+
+/// Class A expand / spend-join wave. Bounds decoded `txout` pages in RAM.
+const SH_JOIN_WAVE: usize = 4096;
+
+fn sh_join_waves<T>(items: &[T], wave: usize) -> impl Iterator<Item = &[T]> {
+    items.chunks(wave.max(1))
+}
 
 /// Expanded Electrum create outpoint (Class A + height joins).
 ///
@@ -181,27 +188,59 @@ pub struct ScriptHashChainStats {
 }
 
 impl Query {
-    /// Expand one create_tx_fk into outpoints for each output matching `scripthash`.
-    fn expand_create_to_outpoints(
+    /// Expand confirmed-strong create fks in one idx→body wave (`load_creates_once`).
+    fn expand_create_fks_wave(
         &self,
         scripthash: &[u8; 32],
-        create_tx_fk: rbitcoin_primitives::Fk,
+        fks: &[Fk],
     ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
-        let (create, outs) = self.store.get_tx_meta_and_outputs(create_tx_fk)?;
-        let height = self.store.tx_height_get(create_tx_fk)?.unwrap_or(0);
+        if fks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let loaded = super::load_creates_once(&self.store, fks, IdxBodyMode::Outs)?;
+        if loaded.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH create body missing after load",
+            ));
+        }
+        let txids = self.store.txids_get_many(fks)?;
+        let heights = self.store.tx_height_get_batch(fks)?;
+        if txids.len() != fks.len() || heights.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH create identity/height batch length",
+            ));
+        }
         let mut out = Vec::new();
-        for (vout, o) in outs.into_iter().enumerate() {
-            if script_hash(&o.script) != *scripthash {
-                continue;
+        for (i, create) in loaded.iter().enumerate() {
+            if create.fk != fks[i] {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH create load order mismatch",
+                ));
             }
-            out.push(ScriptHashOutpoint {
-                scripthash: *scripthash,
-                create_tx_fk,
-                vout: vout as u32,
-                txid: create.txid,
-                value: o.value,
-                create_height: height,
-            });
+            let Some((_tx, outs, _rels)) = &create.decoded_outs else {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH create missing decoded outs",
+                ));
+            };
+            let Some(txid) = txids[i] else {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH create missing txid.body",
+                ));
+            };
+            let height = heights[i].unwrap_or(0);
+            for (vout, o) in outs.iter().enumerate() {
+                if script_hash(&o.script) != *scripthash {
+                    continue;
+                }
+                out.push(ScriptHashOutpoint {
+                    scripthash: *scripthash,
+                    create_tx_fk: create.fk,
+                    vout: vout as u32,
+                    txid,
+                    value: o.value,
+                    create_height: height,
+                });
+            }
         }
         Ok(out)
     }
@@ -212,12 +251,15 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
         let entries = self.store.scripthash.entries(scripthash)?;
-        let mut out = Vec::new();
+        let mut fks = Vec::new();
         for (_fk, thin) in entries {
-            if !self.store.is_confirmed_strong(thin.create_tx_fk)? {
-                continue;
+            if self.store.is_confirmed_strong(thin.create_tx_fk)? {
+                fks.push(thin.create_tx_fk);
             }
-            out.extend(self.expand_create_to_outpoints(scripthash, thin.create_tx_fk)?);
+        }
+        let mut out = Vec::new();
+        for wave in sh_join_waves(&fks, SH_JOIN_WAVE) {
+            out.extend(self.expand_create_fks_wave(scripthash, wave)?);
         }
         Ok(out)
     }
@@ -459,6 +501,14 @@ impl Query {
 #[cfg(test)]
 mod history_filter_tests {
     use super::*;
+
+    #[test]
+    fn sh_join_waves_splits_on_wave() {
+        let v = [1u8, 2, 3, 4, 5];
+        let got: Vec<&[u8]> = sh_join_waves(&v, 2).collect();
+        assert_eq!(got, vec![&[1, 2][..], &[3, 4][..], &[5][..]]);
+        assert!(sh_join_waves(&v, 0).next().is_some());
+    }
 
     fn item(height: i64, txid0: u8) -> ScriptHashHistoryItem {
         let mut txid = [0u8; 32];

@@ -2732,6 +2732,43 @@ mod tests {
     }
 
     #[test]
+    fn scripthash_history_expands_creates_via_load_creates_once() {
+        let (dir, q) = temp_query("sh-hist-load-once");
+        assert!(q.index_mode().is_tip());
+
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..4u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        let sh = script_hash(&[0x51]);
+        reset_body_ok_reads();
+        let full = q.scripthash_history(&sh).unwrap();
+        assert_eq!(full.len(), 4);
+        assert_eq!(body_ok_reads(), 4);
+
+        let (header, mut ta) = coinbase_block(4, prev, parent_hash);
+        ta.tx.output_count = 2;
+        ta.outputs = vec![
+            OutputRecord::unspent(1_0000_0000, vec![0x51]),
+            OutputRecord::unspent(2_0000_0000, vec![0x00]),
+        ];
+        q.connect_block(Height(4), &header, &[ta]).unwrap();
+        reset_body_ok_reads();
+        let hist = q.scripthash_history(&sh).unwrap();
+        assert_eq!(hist.len(), 5);
+        assert_eq!(body_ok_reads(), 5);
+        let utxos = q.scripthash_listunspent(&sh).unwrap();
+        assert_eq!(utxos.len(), 5);
+        assert!(utxos.iter().all(|u| u.tx_pos == 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn connect_chain_query_surface() {
         let (dir, q) = temp_query("connect");
         // Default Tip mode: durable SH on confirm so Electrum-style APIs work.

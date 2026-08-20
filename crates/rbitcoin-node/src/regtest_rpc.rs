@@ -53,7 +53,7 @@ fn cheap_submit_tx_reject(query: &rbitcoin_query::Query, block: &Block) -> Optio
                     return Some("bad-txns-inputs-missingorspent".into());
                 };
                 let Some(out) = query
-                    .tx_output_at_fk(fk, &rec, op.vout)
+                    .tx_output_at_fk(fk, op.vout)
                     .ok()
                     .or_else(|| query.tx_output(&rec, op.vout).ok())
                 else {

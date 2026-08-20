@@ -32,6 +32,8 @@ pub struct ScriptHashOutpoint {
 pub struct ScriptHashHistoryItem {
     pub height: i64,
     pub txid: [u8; 32],
+    /// Class A create fk when known (confirmed SH join). `NULL` for mempool-only rows.
+    pub tx_fk: rbitcoin_primitives::Fk,
 }
 
 /// Sort order for [`apply_history_filter`].
@@ -164,6 +166,7 @@ pub struct ScriptHashUtxo {
     pub tx_pos: u32,
     pub height: u32,
     pub value: i64,
+    pub create_tx_fk: rbitcoin_primitives::Fk,
 }
 
 /// One confirmed unspent from [`Query::scan_unspent_scripts`].
@@ -188,6 +191,7 @@ pub struct ScriptHashChainStats {
 }
 
 pub(crate) struct ShSpender {
+    fk: Fk,
     txid: [u8; 32],
     height: u32,
 }
@@ -315,10 +319,14 @@ impl Query {
     }
 
     /// Confirmed-strong create outpoints plus confirmed spenders (create_fk join).
+    ///
+    /// When `to_height` is set, creates with Class C height `>= to_height` are not
+    /// expanded (their spends cannot fall in the window).
     pub(crate) fn join_creates_and_spends(
         &self,
         scripthash: &[u8; 32],
         need: ShJoinNeed,
+        to_height: Option<i64>,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.entries(scripthash)?;
@@ -328,6 +336,25 @@ impl Query {
             if self.store.is_confirmed_strong(thin.create_tx_fk)? {
                 fks.push(thin.create_tx_fk);
             }
+        }
+        if let Some(to) = to_height {
+            let heights = self.store.tx_height_get_batch(&fks)?;
+            if heights.len() != fks.len() {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH create height batch length",
+                ));
+            }
+            fks = fks
+                .into_iter()
+                .zip(heights)
+                .filter_map(|(fk, h)| {
+                    if i64::from(h.unwrap_or(0)) >= to {
+                        None
+                    } else {
+                        Some(fk)
+                    }
+                })
+                .collect();
         }
         let mut out = Vec::new();
         let mut class_a_us = 0u128;
@@ -452,7 +479,11 @@ impl Query {
                     let Some((txid, height)) = id_by_fk.get(fk).copied() else {
                         return Err(StoreError::Corrupt("invariant: SH spender identity miss"));
                     };
-                    spenders.push(ShSpender { txid, height });
+                    spenders.push(ShSpender {
+                        fk: *fk,
+                        txid,
+                        height,
+                    });
                 }
             }
             out.push(ShJoinedOut {
@@ -487,8 +518,9 @@ impl Query {
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY)?;
-        let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+        let joined =
+            self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY, filter.to_height)?;
+        let mut by_txid: BTreeMap<[u8; 32], (i64, Fk)> = BTreeMap::new();
         let to_excl = filter.to_height;
         for rec in joined {
             if let Some(to) = to_excl {
@@ -496,25 +528,41 @@ impl Query {
                     continue;
                 }
             }
+            let ch = i64::from(rec.out.create_height);
             by_txid
                 .entry(rec.out.txid)
-                .and_modify(|h| *h = (*h).min(i64::from(rec.out.create_height)))
-                .or_insert(i64::from(rec.out.create_height));
+                .and_modify(|(h, fk)| {
+                    if ch < *h {
+                        *h = ch;
+                        *fk = rec.out.create_tx_fk;
+                    }
+                })
+                .or_insert((ch, rec.out.create_tx_fk));
             for sp in rec.spenders {
                 if let Some(to) = to_excl {
                     if i64::from(sp.height) >= to {
                         continue;
                     }
                 }
+                let sh = i64::from(sp.height);
                 by_txid
                     .entry(sp.txid)
-                    .and_modify(|h| *h = (*h).min(i64::from(sp.height)))
-                    .or_insert(i64::from(sp.height));
+                    .and_modify(|(h, fk)| {
+                        if sh < *h {
+                            *h = sh;
+                            *fk = sp.fk;
+                        }
+                    })
+                    .or_insert((sh, sp.fk));
             }
         }
         let items: Vec<ScriptHashHistoryItem> = by_txid
             .into_iter()
-            .map(|(txid, height)| ScriptHashHistoryItem { height, txid })
+            .map(|(txid, (height, tx_fk))| ScriptHashHistoryItem {
+                height,
+                txid,
+                tx_fk,
+            })
             .collect();
         Ok(apply_history_filter(&items, filter))
     }
@@ -525,7 +573,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
         let mut confirmed = 0i64;
-        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE)? {
+        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)? {
             if !self.join_out_spent(&rec)? {
                 confirmed = confirmed.saturating_add(rec.out.value);
             }
@@ -542,7 +590,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let mut out = Vec::new();
-        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT)? {
+        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None)? {
             if self.join_out_spent(&rec)? {
                 continue;
             }
@@ -551,6 +599,7 @@ impl Query {
                 tx_pos: rec.out.vout,
                 height: rec.out.create_height,
                 value: rec.out.value,
+                create_tx_fk: rec.out.create_tx_fk,
             });
         }
         out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
@@ -575,12 +624,9 @@ impl Query {
         for spk in scripts {
             let sh = script_hash(spk);
             for u in self.scripthash_listunspent(&sh)? {
-                let coinbase = match self.get_tx_by_txid(&u.tx_hash)? {
-                    Some((fk, _)) => {
-                        let (_, ins, _) = self.store.get_tx_full(fk)?;
-                        ins.first().is_some_and(|i| i.is_coinbase())
-                    }
-                    None => false,
+                let coinbase = {
+                    let fks = self.block_tx_fks(Height(u.height))?;
+                    fks.first().copied() == Some(u.create_tx_fk)
                 };
                 if u.value < 0 {
                     continue;
@@ -639,7 +685,7 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS)?;
+        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS, None)?;
         let mut funded_n = 0u32;
         let mut funded_sum = 0i64;
         let mut spent_n = 0u32;
@@ -690,7 +736,11 @@ mod history_filter_tests {
     fn item(height: i64, txid0: u8) -> ScriptHashHistoryItem {
         let mut txid = [0u8; 32];
         txid[0] = txid0;
-        ScriptHashHistoryItem { height, txid }
+        ScriptHashHistoryItem {
+            height,
+            txid,
+            tx_fk: Fk::NULL,
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use crate::handlers::resolve_address_sh;
 use crate::server::AppState;
-use crate::tx_json::{build_tx_json, tx_status_json};
+use crate::tx_json::{build_tx_json, history_items_to_tx_json, tx_status_json};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -625,15 +625,8 @@ async fn on_tip(
         let mut txs = Vec::new();
         for sh in conn.addresses.keys() {
             if let Ok(items) = st.query.scripthash_history_filtered(sh, &filter) {
-                for it in items {
-                    if it.height < 0 {
-                        continue;
-                    }
-                    if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&it.txid) {
-                        if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
-                            txs.push(v);
-                        }
-                    }
+                if let Ok(mut page) = history_items_to_tx_json(&st.query, &items, st.network) {
+                    txs.append(&mut page);
                 }
             }
         }

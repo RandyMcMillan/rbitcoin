@@ -905,6 +905,43 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
             return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"));
         }
     };
+    let prev = if height.0 > 0 {
+        ctx.query
+            .header_at_height(Height(height.0 - 1))
+            .ok()
+            .flatten()
+            .map(|(_, r)| hash_hex_display(&r.hash))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if verbosity == 1 {
+        let (_, rec) = ctx
+            .query
+            .header_at_height(height)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+            .ok_or_else(|| rpc_error(ERR_MISC, "header missing"))?;
+        let ids = ctx
+            .query
+            .block_txids(height)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        let txids: Vec<String> = ids.iter().map(hash_hex_display).collect();
+        return Ok(json!({
+            "hash": hash_hex_display(&hash),
+            "confirmations": confirmations(ctx, height),
+            "height": height.0,
+            "version": rec.version,
+            "merkleroot": hash_hex_display(&rec.merkle_root),
+            "time": rec.timestamp,
+            "mediantime": rbitcoin_consensus::median_time_past(ctx.query.as_ref(), height)
+                .unwrap_or(rec.timestamp),
+            "nonce": rec.nonce,
+            "bits": format!("{:08x}", rec.bits),
+            "previousblockhash": prev,
+            "nTx": txids.len(),
+            "tx": txids,
+        }));
+    }
     let block = ctx
         .query
         .reconstruct_block_at_height(height)
@@ -921,16 +958,6 @@ fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         .iter()
         .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
         .collect();
-    let prev = if height.0 > 0 {
-        ctx.query
-            .header_at_height(Height(height.0 - 1))
-            .ok()
-            .flatten()
-            .map(|(_, r)| hash_hex_display(&r.hash))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
     let mut obj = json!({
         "hash": hash_hex_display(&hash),
         "confirmations": confirmations(ctx, height),
@@ -2094,7 +2121,7 @@ fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
     let out = ctx
         .query
-        .tx_output_at_fk(fk, &rec, n)
+        .tx_output_at_fk(fk, n)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let height = ctx
         .query
@@ -2772,7 +2799,7 @@ fn gbt_chain_txout(ctx: &RpcContext, op: &OutPoint) -> Option<bitcoin::TxOut> {
     let (fk, rec) = ctx.query.get_tx_by_txid(&tid).ok().flatten()?;
     let out = ctx
         .query
-        .tx_output_at_fk(fk, &rec, op.vout)
+        .tx_output_at_fk(fk, op.vout)
         .ok()
         .or_else(|| ctx.query.tx_output(&rec, op.vout).ok())?;
     let value = if out.value < 0 {
@@ -4465,6 +4492,26 @@ mod tests {
     }
 
     #[test]
+    fn getblock_verbosity_1_txids_skip_reconstruct() {
+        let (ctx, dir, _hub) = ctx_regtest_hub();
+        let hashes = dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let best = hashes.as_array().unwrap()[0].clone();
+        rbitcoin_store::reset_tx_full_gets();
+        let v1 = dispatch(&ctx, "getblock", vec![best.clone(), json!(1)]).unwrap();
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "verbosity 1 must not zip inwit: {:?}",
+            rbitcoin_store::tx_full_gets()
+        );
+        let txs = v1["tx"].as_array().unwrap();
+        assert_eq!(txs.len(), 1);
+        assert!(txs[0].as_str().unwrap().len() == 64);
+        let v2 = dispatch(&ctx, "getblock", vec![best, json!(2)]).unwrap();
+        assert!(v2["tx"][0]["vin"][0].get("txid").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn generateblock_submit_false_returns_hex_without_connecting() {
         let (ctx, dir, hub) = ctx_regtest_hub();
         let tip_before = hub.tip_height();
@@ -4487,7 +4534,13 @@ mod tests {
         assert_eq!(hashes.as_array().unwrap().len(), 2);
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
 
+        rbitcoin_store::reset_tx_full_gets();
         let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "scantxoutset shindex must not zip inwit: {:?}",
+            rbitcoin_store::tx_full_gets()
+        );
         assert_eq!(scan["success"], true);
         assert_eq!(scan["height"], 2);
         let uns = scan["unspents"].as_array().unwrap();
@@ -5394,6 +5447,21 @@ mod tests {
         )
         .unwrap();
         dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        let tip_hash = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+        rbitcoin_store::reset_tx_full_gets();
+        let v1 = dispatch(&ctx, "getblock", vec![tip_hash.clone(), json!(1)]).unwrap();
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "verbosity 1 2-tx block: {:?}",
+            rbitcoin_store::tx_full_gets()
+        );
+        let v1txs = v1["tx"].as_array().unwrap();
+        assert_eq!(v1txs.len(), 2);
+        assert!(v1txs
+            .iter()
+            .all(|t| t.as_str().is_some_and(|s| s.len() == 64)));
+        let v2 = dispatch(&ctx, "getblock", vec![tip_hash, json!(2)]).unwrap();
+        assert!(v2["tx"][1]["vin"][0].get("txid").is_some());
         let tip_h = dispatch(&ctx, "getblockcount", vec![]).unwrap();
         let got = dispatch(&ctx, "getblockstats", vec![tip_h.clone()]).unwrap();
         let h = tip_h.as_u64().unwrap() as u32;
@@ -5410,8 +5478,8 @@ mod tests {
                         return tx.output.get(op.vout as usize).cloned();
                     }
                 }
-                let (fk, rec) = hub.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
-                let out = hub.query.tx_output_at_fk(fk, &rec, op.vout).ok()?;
+                let (fk, _rec) = hub.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
+                let out = hub.query.tx_output_at_fk(fk, op.vout).ok()?;
                 Some(TxOut {
                     value: Amount::from_sat(out.value.max(0) as u64),
                     script_pubkey: ScriptBuf::from_bytes(out.script),

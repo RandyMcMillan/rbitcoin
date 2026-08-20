@@ -5,7 +5,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::Network;
 use rbitcoin_primitives::hex_encode;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{Query, QueryError, ScriptHashUtxo};
+use rbitcoin_query::{Query, QueryError, ScriptHashHistoryItem, ScriptHashUtxo};
 use rbitcoin_store::InputRecord;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -32,7 +32,8 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
 #[derive(Serialize)]
 struct EsploraUtxoStatus {
     confirmed: bool,
-    block_height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,12 +65,32 @@ pub fn utxo_status_by_height(
     Ok(map)
 }
 
-/// Confirmed Esplora `/utxo` array from join rows (status from height, not `tx.head`).
+/// Confirmed (and optional mempool) Esplora `/utxo` array.
+///
+/// Mempool rows (`create_tx_fk` null) are `{ confirmed: false }` with no block_*.
 pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, QueryError> {
-    let by_h = utxo_status_by_height(query, list.iter().map(|u| u.height))?;
+    let by_h = utxo_status_by_height(
+        query,
+        list.iter()
+            .filter(|u| !u.create_tx_fk.is_null())
+            .map(|u| u.height),
+    )?;
     let rows: Vec<EsploraUtxo> = list
         .iter()
         .map(|u| {
+            if u.create_tx_fk.is_null() {
+                return EsploraUtxo {
+                    txid: block_hash_hex(&u.tx_hash),
+                    vout: u.tx_pos,
+                    value: u.value,
+                    status: EsploraUtxoStatus {
+                        confirmed: false,
+                        block_height: None,
+                        block_hash: None,
+                        block_time: None,
+                    },
+                };
+            }
             let (block_hash, block_time) = match by_h.get(&u.height) {
                 Some((h, t)) => (Some(h.clone()), Some(*t)),
                 None => (None, None),
@@ -80,7 +101,7 @@ pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, Q
                 value: u.value,
                 status: EsploraUtxoStatus {
                     confirmed: true,
-                    block_height: u.height,
+                    block_height: Some(u.height),
                     block_hash,
                     block_time,
                 },
@@ -89,6 +110,22 @@ pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, Q
         .collect();
     serde_json::to_value(rows)
         .map_err(|_| rbitcoin_store::StoreError::Corrupt("invariant: utxo json").into())
+}
+
+/// Confirmed history rows → Esplora tx JSON using join fks (no `tx.head`).
+pub fn history_items_to_tx_json(
+    query: &Query,
+    items: &[ScriptHashHistoryItem],
+    network: Network,
+) -> Result<Vec<Value>, QueryError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.tx_fk.is_null() {
+            continue;
+        }
+        out.push(build_tx_json(query, item.tx_fk, network)?);
+    }
+    Ok(out)
 }
 
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).
@@ -168,8 +205,9 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
     // Prefer Class A stored txid so history cursors and /tx routes share identity
     // (reconstructed wire hash matches in production; fixtures may differ).
     let stored_txid = query
-        .get_tx(tx_fk)
-        .map(|t| t.txid)
+        .store()
+        .txs
+        .body_txid(tx_fk)
         .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
     let mut obj = json!({
         "txid": block_hash_hex(&stored_txid),
@@ -202,15 +240,14 @@ fn prevout_json(
 ) -> Result<Option<Value>, QueryError> {
     if let Some(inp) = stored_inputs.get(idx) {
         if !inp.create_fk.is_null() {
-            let parent = query.get_tx(inp.create_fk)?;
-            if let Ok(out) = query.tx_output_at_fk(inp.create_fk, &parent, inp.prev_index) {
+            if let Ok(out) = query.tx_output_at_fk(inp.create_fk, inp.prev_index) {
                 return Ok(Some(vout_fields(&out.script, out.value, network)));
             }
         }
     }
     let prev_txid = tin.previous_output.txid.to_byte_array();
-    if let Some((pfk, prec)) = query.get_tx_by_txid(&prev_txid)? {
-        if let Ok(out) = query.tx_output_at_fk(pfk, &prec, tin.previous_output.vout) {
+    if let Some(pfk) = query.tx_fk_by_txid(&prev_txid)? {
+        if let Ok(out) = query.tx_output_at_fk(pfk, tin.previous_output.vout) {
             return Ok(Some(vout_fields(&out.script, out.value, network)));
         }
     }
@@ -480,6 +517,7 @@ mod tests {
             tx_pos: 7,
             height: 1,
             value: 42,
+            create_tx_fk: Fk(1),
         };
         let miss = utxo_list_json(&q, &[orphan]).unwrap();
         let row = &miss.as_array().unwrap()[0];
@@ -490,6 +528,19 @@ mod tests {
         assert_eq!(row["status"]["block_time"], rec1.timestamp);
         assert_eq!(row["txid"], block_hash_hex(&[0xee; 32]));
         assert_eq!(row["vout"], 7);
+
+        let mempool_row = rbitcoin_query::ScriptHashUtxo {
+            tx_hash: [0x11; 32],
+            tx_pos: 0,
+            height: 0,
+            value: 99,
+            create_tx_fk: Fk::NULL,
+        };
+        let mem = utxo_list_json(&q, &[mempool_row]).unwrap();
+        let mrow = &mem.as_array().unwrap()[0];
+        assert_eq!(mrow["status"]["confirmed"], false);
+        assert!(mrow["status"].get("block_height").is_none());
+        assert!(mrow["status"].get("block_hash").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -504,5 +555,145 @@ mod tests {
         assert_eq!(v["scriptpubkey_type"], "v0_p2wpkh");
         assert!(v["scriptpubkey"].as_str().unwrap().len() > 0);
         assert!(v.get("scriptpubkey_address").is_some());
+    }
+
+    #[test]
+    fn build_tx_json_prevout_is_outs_only_and_txid_from_body() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{
+            reset_tx_full_gets, tx_full_gets, HeaderRecord, InputRecord, OutputRecord, TxRecord,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-esplora-prevout-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+
+        let mut merkle0 = [0u8; 32];
+        merkle0[0] = 0xaa;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle0,
+            hash: merkle0,
+        };
+        let mut create_txid = [0u8; 32];
+        create_txid[31] = 0xcb;
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid: create_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+        let hash1 = rbitcoin_store::block_header_hash(1, &h0.hash, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let mut spend1_txid = [0u8; 32];
+        spend1_txid[0] = 0x11;
+        spend1_txid[31] = 0xcd;
+        let ta1 = TxApply {
+            tx: TxRecord {
+                txid: spend1_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: create_txid,
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+        };
+        let hfk1 = q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+        let spend1_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+
+        let hash2 = rbitcoin_store::block_header_hash(1, &h1.hash, &[0x22; 32], 3, 0x207fffff, 2);
+        let h2 = HeaderRecord {
+            prev_fk: hfk1,
+            version: 1,
+            timestamp: 3,
+            bits: 0x207fffff,
+            nonce: 2,
+            merkle_root: [0x22; 32],
+            hash: hash2,
+        };
+        let mut spend2_txid = [0u8; 32];
+        spend2_txid[0] = 0x22;
+        spend2_txid[31] = 0xce;
+        let ta2 = TxApply {
+            tx: TxRecord {
+                txid: spend2_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: spend1_txid,
+                create_fk: spend1_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(48_0000_0000, vec![0x00])],
+        };
+        q.connect_block(Height(2), &h2, &[ta2]).unwrap();
+        let spend2_fk = q.block_tx_fks(Height(2)).unwrap()[0];
+
+        reset_tx_full_gets();
+        let v = build_tx_json(&q, spend2_fk, Network::Regtest).unwrap();
+        let parent_id = spend1_fk.get().unwrap();
+        assert!(
+            !tx_full_gets().contains(&parent_id),
+            "parent prevout must not zip inwit: {:?}",
+            tx_full_gets()
+        );
+        assert_eq!(v["txid"], block_hash_hex(&spend2_txid));
+        assert_eq!(v["vin"][0]["prevout"]["value"].as_i64(), Some(49_0000_0000));
+        assert_eq!(q.store().txs.body_txid(spend2_fk).unwrap(), spend2_txid);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

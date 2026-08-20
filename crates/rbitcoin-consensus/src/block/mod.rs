@@ -2219,7 +2219,7 @@ fn find_output(
         return Err(ConsensusError::MissingPrevout);
     }
     query
-        .tx_output_at_fk(prev_fk, prev_rec, vout)
+        .tx_output_at_fk(prev_fk, vout)
         .map_err(ConsensusError::from)
 }
 

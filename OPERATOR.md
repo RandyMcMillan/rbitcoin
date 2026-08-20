@@ -527,6 +527,10 @@ that join exceeds 10 ms (`need=` is `cs` / `c` / `-`: create and/or spender
 `txid.body`). That split is not an `ibd: perf` line and is not extra JSONL
 fields. Esplora `/address/{addr}/utxo` status (`block_hash` / `block_time`)
 comes from join height plus unique headers — not a per-coin `tx.head` probe.
+Confirmed `/txs` uses join `tx_fk` (no second `tx.head`). `getblock` verbosity 1
+lists `txid.body`. Esplora `/utxo` applies the same mempool overlay as Electrum
+`listunspent`. `sh_join` with a history `to_height` skips Class A expand for
+creates at or past that exclusive bound.
 
 ### App DoS floor (always on)
 

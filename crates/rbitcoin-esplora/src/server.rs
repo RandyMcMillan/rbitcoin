@@ -339,47 +339,56 @@ async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<String>) 
 
 /// `GET /tx/:txid` → full Esplora transaction JSON (incl. asm/type/address).
 async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network) {
-            Ok(v) => Json(v).into_response(),
+    handlers::spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.get_tx_by_txid(&txid) {
+            Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 /// `GET /tx/:txid/hex` → raw consensus-encoded transaction hex.
 async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
-            Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(raw)),
+    handlers::spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.get_tx_by_txid(&txid) {
+            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+                Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(raw)),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 /// `GET /tx/:txid/status` → Esplora confirmation status JSON.
 async fn tx_status(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match tx_status_json(&st.query, fk) {
-            Ok(v) => Json(v).into_response(),
+    handlers::spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match tx_status_json(&st.query, fk) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 async fn fallback_404() -> Response {
@@ -831,6 +840,7 @@ mod tests {
     #[tokio::test]
     async fn block_raw_summary_status_and_mempool_routes() {
         use bitcoin::consensus::encode::deserialize;
+        use bitcoin::hashes::Hash;
         use bitcoin::{Block, MerkleBlock};
 
         let (dir, q) = temp_query("p0-block");
@@ -942,8 +952,14 @@ mod tests {
         let hex_bytes = rbitcoin_primitives::hex_decode(&hex_body).unwrap();
         assert_eq!(raw_tx, hex_bytes.as_slice());
 
+        let _ = q.sample_reset_reconstruct_archived();
         let (st, body) = http_get(addr, &format!("/tx/{txid0}/merkleblock-proof")).await;
         assert_eq!(st, 200, "{body}");
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "merkleblock-proof uses txid.body + header, not full reconstruct"
+        );
         let mb_bytes = rbitcoin_primitives::hex_decode(&body).unwrap();
         let mb: MerkleBlock = deserialize(&mb_bytes).expect("merkleblock");
         let mut matches = Vec::new();
@@ -951,6 +967,10 @@ mod tests {
         mb.extract_matches(&mut matches, &mut indexes).unwrap();
         assert_eq!(indexes, vec![0]); // coinbase at pos 0
         assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0],
+            bitcoin::Txid::from_byte_array(coinbase_txids[0])
+        );
 
         let (st, body) = http_get(addr, "/mempool/txids").await;
         assert_eq!(st, 200, "{body}");
@@ -964,6 +984,44 @@ mod tests {
         let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
         assert_eq!(st, 200, "{body}");
         assert_eq!(body, "[]");
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Packed SH `/txs` runs on `spawn_blocking` so tip height stays on the worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tip_height_overlaps_scripthash_txs_on_one_worker() {
+        use rbitcoin_store::script_hash;
+        use std::time::Instant;
+
+        let (dir, q) = temp_query("spawn-join");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..8u32 {
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+
+        let t0 = Instant::now();
+        let txs_path = format!("/scripthash/{sh_hex}/txs");
+        let h_txs = tokio::spawn(async move { http_get(addr, &txs_path).await });
+        let h_tip = tokio::spawn(async move { http_get(addr, "/blocks/tip/height").await });
+        let (txs, tip) = tokio::join!(h_txs, h_tip);
+        let (st_txs, _) = txs.unwrap();
+        let (st_tip, body_tip) = tip.unwrap();
+        assert_eq!(st_txs, 200);
+        assert_eq!(st_tip, 200, "{body_tip}");
+        assert_eq!(body_tip, "7");
+        assert!(t0.elapsed().as_secs() < 2);
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -1226,6 +1284,33 @@ mod tests {
         };
         let mem_hex = display_txid(mem_pay.compute_txid());
         hub.accept_tx(&mem_pay).expect("mempool accept to watch");
+
+        let (st, body) = http_get(addr, &format!("/address/{watch_addr}/utxo")).await;
+        assert_eq!(st, 200, "{body}");
+        let utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(
+            utxos.iter().any(|u| u["status"]["confirmed"] == false),
+            "mempool funding: {utxos:?}"
+        );
+        assert!(
+            utxos.iter().any(|u| u["status"]["confirmed"] == true),
+            "confirmed watch utxo: {utxos:?}"
+        );
+        let (st, body) = http_get(addr, &format!("/address/{watch_addr}")).await;
+        assert_eq!(st, 200, "{body}");
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(info["mempool_stats"]["funded_txo_count"].as_u64().unwrap() >= 1);
+        assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 1);
+
+        let true_sh = block_hash_hex(&rbitcoin_store::script_hash(&[0x51]));
+        let (st, body) = http_get(addr, &format!("/scripthash/{true_sh}/utxo")).await;
+        assert_eq!(st, 200, "{body}");
+        let true_utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let spent = block_hash_hex(&coinbase_txids[1]);
+        assert!(
+            true_utxos.iter().all(|u| u["txid"] != spent),
+            "mempool spend drops confirmed coin: {true_utxos:?}"
+        );
 
         let mut saw_addr_mp = false;
         for _ in 0..12 {

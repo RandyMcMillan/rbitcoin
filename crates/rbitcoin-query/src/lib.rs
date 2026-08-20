@@ -2079,22 +2079,19 @@ impl Query {
             return Err(StoreError::NotFound);
         }
         if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            return self.tx_output_at_fk(fk, tx, vout);
+            return self.tx_output_at_fk(fk, vout);
         }
         Err(StoreError::NotFound)
     }
 
     /// Output at `vout` for a known create fk (packed Class A works without head).
-    pub fn tx_output_at_fk(
-        &self,
-        create_fk: Fk,
-        tx: &TxRecord,
-        vout: u32,
-    ) -> Result<OutputRecord, QueryError> {
-        if vout >= tx.output_count {
+    ///
+    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `inwit`.
+    pub fn tx_output_at_fk(&self, create_fk: Fk, vout: u32) -> Result<OutputRecord, QueryError> {
+        let (meta, outs) = self.store.get_tx_meta_and_outputs(create_fk)?;
+        if vout >= meta.output_count {
             return Err(StoreError::NotFound);
         }
-        let (_, _, outs) = self.store.get_tx_full(create_fk)?;
         outs.get(vout as usize).cloned().ok_or(StoreError::NotFound)
     }
 
@@ -2696,6 +2693,8 @@ mod tests {
         assert_eq!(open, full);
 
         // Inclusive from, exclusive to: heights 1 and 2 only.
+        // Creates at height >= 3 are not Class-A expanded (spend height ≥ create).
+        reset_body_ok_reads();
         let window = q
             .scripthash_history_filtered(&sh, &HistoryFilter::height_window(1, Some(3)))
             .unwrap();
@@ -2704,6 +2703,11 @@ mod tests {
             vec![1, 2]
         );
         assert!(window.len() < full.len());
+        assert_eq!(
+            body_ok_reads(),
+            3,
+            "expand heights 0..=2; skip create at exclusive to_height 3"
+        );
 
         // Open upper bound from height 2.
         let from_only = q
@@ -2767,6 +2771,16 @@ mod tests {
         let utxos = q.scripthash_listunspent(&sh).unwrap();
         assert_eq!(utxos.len(), 5);
         assert!(utxos.iter().all(|u| u.tx_pos == 0));
+
+        rbitcoin_store::reset_tx_full_gets();
+        let scanned = q.scan_unspent_scripts(&[vec![0x51]]).unwrap();
+        assert_eq!(scanned.len(), 5);
+        assert!(scanned.iter().all(|u| u.coinbase));
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "shindex coinbase from create fk, not get_tx_full: {:?}",
+            rbitcoin_store::tx_full_gets()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2835,6 +2849,15 @@ mod tests {
             hist.iter().find(|i| i.txid == spend_txid).unwrap().height,
             1
         );
+        assert_eq!(
+            hist.iter().find(|i| i.txid == create_txid).unwrap().tx_fk,
+            create_fk
+        );
+        let spend_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+        assert_eq!(
+            hist.iter().find(|i| i.txid == spend_txid).unwrap().tx_fk,
+            spend_fk
+        );
 
         let utxos = q.scripthash_listunspent(&sh).unwrap();
         assert_eq!(utxos.len(), 1);
@@ -2843,7 +2866,7 @@ mod tests {
         assert_eq!(utxos[0].value, 20_0000_0000);
 
         let list_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None)
             .unwrap();
         assert!(
             list_join.iter().any(|r| r.spent && r.spenders.is_empty()),
@@ -2851,7 +2874,7 @@ mod tests {
         );
         assert!(list_join.iter().any(|r| !r.spent));
         let hist_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY, None)
             .unwrap();
         assert!(
             hist_join.iter().any(|r| r.spent && !r.spenders.is_empty()),
@@ -2871,7 +2894,7 @@ mod tests {
         assert_eq!(stats.spent_txo_sum, 10_0000_0000);
         assert_eq!(body_ok_reads(), 1);
         let stats_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS, None)
             .unwrap();
         assert!(
             stats_join.iter().all(|r| r.spenders.is_empty()),
@@ -2940,7 +2963,12 @@ mod tests {
         assert!(q.tx_fk_by_txid(&tx.txid).unwrap().is_some());
         let inp = q.tx_input_at_fk(fks[0], &tx, 0).unwrap();
         assert!(inp.is_coinbase());
-        let out = q.tx_output_at_fk(fks[0], &tx, 0).unwrap();
+        rbitcoin_store::reset_tx_full_gets();
+        let out = q.tx_output_at_fk(fks[0], 0).unwrap();
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "tx_output_at_fk is outs-only (no inwit zip)"
+        );
         assert_eq!(out.value, 50_0000_0000);
         assert!(!q.is_outpoint_spent(&tx.txid, 0).unwrap());
         assert!(!q.is_outpoint_spent_create(fks[0], 0).unwrap());
@@ -2950,6 +2978,12 @@ mod tests {
         let proof = q.merkle_proof(Height(0), &tx.txid).unwrap();
         assert_eq!(proof.pos, 0);
         assert_eq!(proof.block_height, 0);
+
+        // Identity list is `txid.body`, not packed `txout` (`get_tx`).
+        let side = q.store().txs.body_txid(fks[0]).unwrap();
+        assert_eq!(q.block_txids(Height(0)).unwrap(), vec![side]);
+        assert_eq!(q.block_txid_at(Height(0), 0).unwrap(), side);
+        assert_eq!(tx.txid, side);
 
         // Scripthash history/balance/utxo for OP_TRUE (durable SH in tip mode).
         let sh = script_hash(&[0x51]);
@@ -3040,9 +3074,11 @@ mod tests {
             }])
             .is_err());
         assert!(q.tx_input_at_fk(fks[0], &tx, 99).is_err());
-        assert!(q.tx_output_at_fk(fks[0], &tx, 99).is_err());
+        assert!(q.tx_output_at_fk(fks[0], 99).is_err());
         assert!(q.merkle_proof(Height(0), &[0xff; 32]).is_err());
         assert!(q.block_tx_fks(Height(50)).is_err());
+        assert!(q.block_txids(Height(50)).is_err());
+        assert!(q.block_txid_at(Height(0), 99).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3257,8 +3293,13 @@ mod tests {
 
         // Merkle multi-tx (odd leaf count pads).
         let fks1 = q.block_tx_fks(Height(1)).unwrap();
-        let t1 = q.get_tx(fks1[0]).unwrap();
-        let proof = q.merkle_proof(Height(1), &t1.txid).unwrap();
+        let ids1 = q.block_txids(Height(1)).unwrap();
+        assert_eq!(ids1.len(), fks1.len());
+        for (i, fk) in fks1.iter().enumerate() {
+            assert_eq!(ids1[i], q.store().txs.body_txid(*fk).unwrap());
+            assert_eq!(q.block_txid_at(Height(1), i).unwrap(), ids1[i]);
+        }
+        let proof = q.merkle_proof(Height(1), &ids1[0]).unwrap();
         assert_eq!(proof.pos, 0);
         assert!(!proof.merkle.is_empty() || fks1.len() == 1);
 

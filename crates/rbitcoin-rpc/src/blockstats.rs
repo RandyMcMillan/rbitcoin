@@ -371,12 +371,62 @@ fn prevout_from_block_or_query(ctx: &RpcContext, block: &Block, op: &OutPoint) -
             return tx.output.get(op.vout as usize).cloned();
         }
     }
-    let (fk, rec) = ctx.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
-    let out = ctx.query.tx_output_at_fk(fk, &rec, op.vout).ok()?;
+    let fk = ctx.query.tx_fk_by_txid(&op.txid.to_byte_array()).ok()??;
+    let out = ctx.query.tx_output_at_fk(fk, op.vout).ok()?;
     Some(TxOut {
         value: Amount::from_sat(out.value.max(0) as u64),
         script_pubkey: ScriptBuf::from_bytes(out.script),
     })
+}
+
+fn prevout_map_for_block(
+    ctx: &RpcContext,
+    height: Height,
+    block: &Block,
+) -> std::collections::HashMap<OutPoint, TxOut> {
+    let mut map = std::collections::HashMap::new();
+    for tx in &block.txdata {
+        let tid = tx.compute_txid();
+        for (vout, o) in tx.output.iter().enumerate() {
+            map.insert(
+                OutPoint {
+                    txid: tid,
+                    vout: vout as u32,
+                },
+                o.clone(),
+            );
+        }
+    }
+    let Ok(fks) = ctx.query.block_tx_fks(height) else {
+        return map;
+    };
+    for (tx, fk) in block.txdata.iter().zip(fks) {
+        let Ok((_, prevs)) = ctx.query.store().get_tx_meta_and_prevouts(fk) else {
+            continue;
+        };
+        for (i, (create_fk, vout)) in prevs.iter().enumerate() {
+            if create_fk.is_null() {
+                continue;
+            }
+            let Some(inp) = tx.input.get(i) else {
+                continue;
+            };
+            let op = inp.previous_output;
+            if map.contains_key(&op) {
+                continue;
+            }
+            if let Ok(out) = ctx.query.tx_output_at_fk(*create_fk, *vout) {
+                map.insert(
+                    op,
+                    TxOut {
+                        value: Amount::from_sat(out.value.max(0) as u64),
+                        script_pubkey: ScriptBuf::from_bytes(out.script),
+                    },
+                );
+            }
+        }
+    }
+    map
 }
 
 fn stats_for_connected(
@@ -391,8 +441,12 @@ fn stats_for_connected(
         None => rbitcoin_consensus::ChainParams::for_network(ctx.network),
     };
     let subsidy = rbitcoin_consensus::block_subsidy(height.0, &params);
+    let parents = prevout_map_for_block(ctx, height, block);
     compute_block_stats(height.0, block, mediantime, subsidy, |op| {
-        prevout_from_block_or_query(ctx, block, op)
+        parents
+            .get(op)
+            .cloned()
+            .or_else(|| prevout_from_block_or_query(ctx, block, op))
     })
     .map_err(|e| rpc_error(ERR_MISC, e))
 }

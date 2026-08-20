@@ -2842,6 +2842,22 @@ mod tests {
         assert_eq!(utxos[0].tx_pos, 1);
         assert_eq!(utxos[0].value, 20_0000_0000);
 
+        let list_join = q
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT)
+            .unwrap();
+        assert!(
+            list_join.iter().any(|r| r.spent && r.spenders.is_empty()),
+            "listunspent join must skip spender identity"
+        );
+        assert!(list_join.iter().any(|r| !r.spent));
+        let hist_join = q
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY)
+            .unwrap();
+        assert!(
+            hist_join.iter().any(|r| r.spent && !r.spenders.is_empty()),
+            "history join still loads spender identity"
+        );
+
         let bal = q.scripthash_balance(&sh).unwrap();
         assert_eq!(bal.confirmed, 20_0000_0000);
         assert_eq!(bal.unconfirmed, 0);

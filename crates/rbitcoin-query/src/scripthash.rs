@@ -570,6 +570,36 @@ impl Query {
         Ok(out)
     }
 
+    fn chain_stats_from_joined(
+        &self,
+        recs: &[ShJoinedOut],
+    ) -> Result<ScriptHashChainStats, QueryError> {
+        let mut funded_n = 0u32;
+        let mut funded_sum = 0i64;
+        let mut spent_n = 0u32;
+        let mut spent_sum = 0i64;
+        let mut txs: HashSet<Fk> = HashSet::new();
+        for rec in recs {
+            funded_n = funded_n.saturating_add(1);
+            funded_sum = funded_sum.saturating_add(rec.out.value);
+            txs.insert(rec.out.create_tx_fk);
+            if self.join_out_spent(rec)? {
+                spent_n = spent_n.saturating_add(1);
+                spent_sum = spent_sum.saturating_add(rec.out.value);
+                for fk in &rec.spender_fks {
+                    txs.insert(*fk);
+                }
+            }
+        }
+        Ok(ScriptHashChainStats {
+            tx_count: txs.len() as u32,
+            funded_txo_count: funded_n,
+            funded_txo_sum: funded_sum,
+            spent_txo_count: spent_n,
+            spent_txo_sum: spent_sum,
+        })
+    }
+
     fn join_spends_wave(
         &self,
         creates: &[ScriptHashOutpoint],
@@ -742,18 +772,18 @@ impl Query {
         Ok(history_items_from_joined(recs, filter))
     }
 
-    /// True when `height` creates or spends a confirmed outpoint for `scripthash`.
+    /// Confirmed txs in `height` that create or spend a posting-list out for `scripthash`.
     ///
     /// Intersects the SH posting list with the block's tx fks and input
     /// `create_fk`s. Does not expand packed `txout`.
-    pub fn scripthash_touched_at_height(
+    pub fn scripthash_tx_fks_at_height(
         &self,
         scripthash: &[u8; 32],
         height: Height,
-    ) -> Result<bool, QueryError> {
+    ) -> Result<Vec<Fk>, QueryError> {
         let entries = self.store.scripthash.entries(scripthash)?;
         if entries.is_empty() {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         let mut posting: Vec<u64> = entries
             .iter()
@@ -762,22 +792,41 @@ impl Query {
         posting.sort_unstable();
         posting.dedup();
         let block_fks = self.block_tx_fks(height)?;
+        let mut out = Vec::new();
         for fk in &block_fks {
+            let mut hit = false;
             if let Some(id) = fk.get() {
                 if posting.binary_search(&id).is_ok() {
-                    return Ok(true);
+                    hit = true;
                 }
             }
-            let (_, prevs) = self.store.get_tx_meta_and_prevouts(*fk)?;
-            for (create_fk, _) in prevs {
-                if let Some(id) = create_fk.get() {
-                    if posting.binary_search(&id).is_ok() {
-                        return Ok(true);
+            if !hit {
+                let (_, prevs) = self.store.get_tx_meta_and_prevouts(*fk)?;
+                for (create_fk, _) in prevs {
+                    if let Some(id) = create_fk.get() {
+                        if posting.binary_search(&id).is_ok() {
+                            hit = true;
+                            break;
+                        }
                     }
                 }
             }
+            if hit {
+                out.push(*fk);
+            }
         }
-        Ok(false)
+        Ok(out)
+    }
+
+    /// True when [`Self::scripthash_tx_fks_at_height`] is non-empty.
+    pub fn scripthash_touched_at_height(
+        &self,
+        scripthash: &[u8; 32],
+        height: Height,
+    ) -> Result<bool, QueryError> {
+        Ok(!self
+            .scripthash_tx_fks_at_height(scripthash, height)?
+            .is_empty())
     }
 
     /// Confirmed balance for a scripthash.
@@ -959,30 +1008,21 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
         let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS, None)?;
-        let mut funded_n = 0u32;
-        let mut funded_sum = 0i64;
-        let mut spent_n = 0u32;
-        let mut spent_sum = 0i64;
-        let mut txs: HashSet<Fk> = HashSet::new();
-        for rec in joined {
-            funded_n = funded_n.saturating_add(1);
-            funded_sum = funded_sum.saturating_add(rec.out.value);
-            txs.insert(rec.out.create_tx_fk);
-            if self.join_out_spent(&rec)? {
-                spent_n = spent_n.saturating_add(1);
-                spent_sum = spent_sum.saturating_add(rec.out.value);
-                for fk in rec.spender_fks {
-                    txs.insert(fk);
-                }
-            }
-        }
-        Ok(ScriptHashChainStats {
-            tx_count: txs.len() as u32,
-            funded_txo_count: funded_n,
-            funded_txo_sum: funded_sum,
-            spent_txo_count: spent_n,
-            spent_txo_sum: spent_sum,
-        })
+        self.chain_stats_from_joined(&joined)
+    }
+
+    /// Slot-aware [`Self::scripthash_chain_stats`].
+    pub fn scripthash_chain_stats_slot(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<ScriptHashChainStats, QueryError> {
+        self.ensure_sh_join_slot(scripthash, slot)?;
+        let recs = &slot
+            .as_ref()
+            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
+            .joined;
+        self.chain_stats_from_joined(recs)
     }
 }
 

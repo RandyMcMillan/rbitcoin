@@ -2999,6 +2999,10 @@ mod tests {
 
         reset_body_ok_reads();
         assert!(!q.scripthash_touched_at_height(&sh, Height(2)).unwrap());
+        assert!(q
+            .scripthash_tx_fks_at_height(&sh, Height(2))
+            .unwrap()
+            .is_empty());
         assert_eq!(
             body_ok_reads(),
             0,
@@ -3007,6 +3011,8 @@ mod tests {
 
         reset_body_ok_reads();
         assert!(q.scripthash_touched_at_height(&sh, Height(0)).unwrap());
+        let create_hit = q.scripthash_tx_fks_at_height(&sh, Height(0)).unwrap();
+        assert_eq!(create_hit, vec![create_fks[0]]);
         assert_eq!(body_ok_reads(), 0, "create-in-block probe is posting list");
 
         let (header, mut cb) = coinbase_block(3, prev, parent_hash);
@@ -3038,6 +3044,9 @@ mod tests {
         q.connect_block(Height(3), &header, &[cb, spend]).unwrap();
         reset_body_ok_reads();
         assert!(q.scripthash_touched_at_height(&sh, Height(3)).unwrap());
+        let spend_fk = q.block_tx_fks(Height(3)).unwrap()[1];
+        let spend_hit = q.scripthash_tx_fks_at_height(&sh, Height(3)).unwrap();
+        assert_eq!(spend_hit, vec![spend_fk]);
         assert_eq!(
             body_ok_reads(),
             0,
@@ -3084,6 +3093,15 @@ mod tests {
             body_ok_reads(),
             after_bal,
             "listunspent must reuse packed outs"
+        );
+
+        let stats = q.scripthash_chain_stats_slot(&sh, &mut slot).unwrap();
+        assert_eq!(stats.tx_count, 3);
+        assert_eq!(stats.funded_txo_count, 3);
+        assert_eq!(
+            body_ok_reads(),
+            after_bal,
+            "chain_stats must reuse packed outs"
         );
 
         let (header, ta) = coinbase_block(3, prev, parent_hash);

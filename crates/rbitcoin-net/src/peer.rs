@@ -1078,7 +1078,7 @@ async fn handle_peer_frame(
                     }
                     Inventory::WTx(wtxid) => {
                         if let Some(s) = session {
-                            rbitcoin_log::debug!("{}", received_getdata_wtx_log(wtxid, s.id));
+                            rbitcoin_log::trace!("{}", received_getdata_wtx_log(wtxid, s.id));
                         }
                         if let Some(mp) = hub.mempool() {
                             if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {

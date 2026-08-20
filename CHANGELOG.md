@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **Per-item `received getdata for: wtx` is TRACE:** one line per peer
+  `MSG_WTX` getdata is too noisy at DEBUG. Counts stay on `tip: perf`.
+  Core functional still sees the needle: the bitcoind shim maps
+  `-loglevel=trace` (TestNode always passes it) to `--log-level trace`.
+
 - **`tx.head` shards by create count:** live OA rolls at 80% of slots
   (~26.8 M at 25-bit); wipe-rebuild ranges are `2^bits` (default 2²⁶).
   Idx `RBITCOIN_TX_IDX_SOFT_SPAN` (16 GiB) no longer cuts head shards.

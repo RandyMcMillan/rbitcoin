@@ -196,6 +196,24 @@ def find_node() -> Path:
     )
 
 
+_LOG_RANK = {
+    "error": 1,
+    "warn": 2,
+    "warning": 2,
+    "info": 3,
+    "debug": 4,
+    "trace": 5,
+}
+
+
+def _more_verbose_log_level(cur: str | None, new: str) -> str | None:
+    if new not in _LOG_RANK:
+        return cur
+    if cur is None or _LOG_RANK[new] > _LOG_RANK.get(cur, 0):
+        return new
+    return cur
+
+
 def translate(
     argv: list[str],
 ) -> tuple[list[str], Path, int, Path | None, Path | None, str | None]:
@@ -204,7 +222,7 @@ def translate(
     rpcport: str | None = None
     p2pport: str | None = None
     network = "regtest"
-    debug = False
+    log_level: str | None = None
     want_help = False
     want_version = False
     uacomments: list[str] = []
@@ -292,8 +310,10 @@ def translate(
             want_help = True
         elif key == "version":
             want_version = True
-        elif key in ("debug",) or (key == "loglevel" and val):
-            debug = True
+        elif key == "debug":
+            log_level = _more_verbose_log_level(log_level, "debug")
+        elif key == "loglevel" and val and ":" not in val:
+            log_level = _more_verbose_log_level(log_level, val.lower())
         elif key == "txindex":
             # Class A always looks up by txid. `-txindex` / `=1` is already true.
             # `-txindex=0` cannot be honored.
@@ -390,8 +410,8 @@ def translate(
         "--esplora-listen",
         f"127.0.0.1:{esplora_port(int(rpcport))}",
     ]
-    if debug:
-        cmd += ["--log-level", "debug"]
+    if log_level:
+        cmd += ["--log-level", log_level]
     for c in uacomments:
         cmd += [f"--uacomment={c}"]
     cmd += extra_node_args

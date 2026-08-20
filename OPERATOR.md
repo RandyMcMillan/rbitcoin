@@ -513,12 +513,15 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 {"ts":"…Z","surface":"electrum","peer":"192.168.88.20:51122","method":"blockchain.tweaks.subscribe","params":"[850000,8,false]","wall_ms":2410,"ok":true,"err":null}
 ```
 
-`tail -f` that file. The same line is also emitted at **DEBUG** as `api: …` (so `--log-level debug` shows methods in `mainnet.log`). Params are truncated (~384 bytes) so broadcast hex does not fill the disk.
+`tail -f` that file. The same line is also emitted at **TRACE** as `api: …`
+(so `--log-level trace` shows methods in `mainnet.log`; DEBUG stays usable
+during a wallet/bench query storm). Params are truncated (~384 bytes) so
+broadcast hex does not fill the disk.
 
 Use this to see whether Cake is hitting tweaks vs only scripthash history, and which calls take seconds.
 `wall_ms` is the full handler (including JSON). Scripthash history / balance /
 UTXO / Esplora address stats share one waved Class A + spend join on the
-process `RBITCOIN_IO` session. `--log-level debug` emits
+process `RBITCOIN_IO` session. `--log-level trace` emits
 `sh_join: creates=… outs=… need=… pages_us=… class_a_us=… spends_us=…` when
 that join exceeds 10 ms (`need=` is `cs` / `c` / `-`: create and/or spender
 `txid.body`). That split is not an `ibd: perf` line and is not extra JSONL

@@ -89,7 +89,7 @@ where
 Networks: mainnet|testnet|signet|regtest\n\
 Custom Signet: --signetchallenge HEX [--signetblocktime SECONDS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
-API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also DEBUG `api:`).\n\
+API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
 Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\

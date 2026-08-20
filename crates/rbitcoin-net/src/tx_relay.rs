@@ -631,6 +631,26 @@ impl MempoolHub {
             .is_some_and(|at| now.saturating_sub(*at) >= 30)
     }
 
+    /// Any live wtxid has passed the 30s mocktime age gate. False when mocktime
+    /// is off (production) — does not clone bodies.
+    pub fn any_tx_inv_due(&self) -> bool {
+        let now = self.mock_now.load(Ordering::Relaxed);
+        if now == 0 {
+            return false;
+        }
+        self.accept_at
+            .lock()
+            .unwrap()
+            .values()
+            .any(|at| now.saturating_sub(*at) >= 30)
+    }
+
+    /// Live txid + wtxid from the graph (no body clone).
+    pub fn list_live_wtxids(&self) -> Vec<(Txid, Wtxid)> {
+        let g = self.inner.read().unwrap();
+        g.graph.iter().map(|(txid, e)| (*txid, e.wtxid)).collect()
+    }
+
     /// Drop every live mempool entry whose create is confirmed-strong on tip.
     ///
     /// Used once when enabling relay after catch-up. Compacts durable slots if

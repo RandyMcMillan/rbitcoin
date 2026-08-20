@@ -4534,7 +4534,13 @@ mod tests {
         assert_eq!(hashes.as_array().unwrap().len(), 2);
         assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
 
+        rbitcoin_store::reset_tx_full_gets();
         let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "scantxoutset shindex must not zip inwit: {:?}",
+            rbitcoin_store::tx_full_gets()
+        );
         assert_eq!(scan["success"], true);
         assert_eq!(scan["height"], 2);
         let uns = scan["unspents"].as_array().unwrap();

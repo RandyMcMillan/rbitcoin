@@ -2772,6 +2772,16 @@ mod tests {
         assert_eq!(utxos.len(), 5);
         assert!(utxos.iter().all(|u| u.tx_pos == 0));
 
+        rbitcoin_store::reset_tx_full_gets();
+        let scanned = q.scan_unspent_scripts(&[vec![0x51]]).unwrap();
+        assert_eq!(scanned.len(), 5);
+        assert!(scanned.iter().all(|u| u.coinbase));
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "shindex coinbase from create fk, not get_tx_full: {:?}",
+            rbitcoin_store::tx_full_gets()
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -166,6 +166,7 @@ pub struct ScriptHashUtxo {
     pub tx_pos: u32,
     pub height: u32,
     pub value: i64,
+    pub create_tx_fk: rbitcoin_primitives::Fk,
 }
 
 /// One confirmed unspent from [`Query::scan_unspent_scripts`].
@@ -598,6 +599,7 @@ impl Query {
                 tx_pos: rec.out.vout,
                 height: rec.out.create_height,
                 value: rec.out.value,
+                create_tx_fk: rec.out.create_tx_fk,
             });
         }
         out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
@@ -622,12 +624,9 @@ impl Query {
         for spk in scripts {
             let sh = script_hash(spk);
             for u in self.scripthash_listunspent(&sh)? {
-                let coinbase = match self.get_tx_by_txid(&u.tx_hash)? {
-                    Some((fk, _)) => {
-                        let (_, ins, _) = self.store.get_tx_full(fk)?;
-                        ins.first().is_some_and(|i| i.is_coinbase())
-                    }
-                    None => false,
+                let coinbase = {
+                    let fks = self.block_tx_fks(Height(u.height))?;
+                    fks.first().copied() == Some(u.create_tx_fk)
                 };
                 if u.value < 0 {
                     continue;

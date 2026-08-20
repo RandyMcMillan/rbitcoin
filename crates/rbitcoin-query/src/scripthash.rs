@@ -255,23 +255,12 @@ impl Query {
         Ok(out)
     }
 
-    /// All confirmed-strong create outpoints for a scripthash (expanded).
-    fn scripthash_create_outpoints(
-        &self,
-        scripthash: &[u8; 32],
-    ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
-        let entries = self.store.scripthash.entries(scripthash)?;
-        let mut fks = Vec::new();
-        for (_fk, thin) in entries {
-            if self.store.is_confirmed_strong(thin.create_tx_fk)? {
-                fks.push(thin.create_tx_fk);
-            }
+    fn join_out_spent(&self, rec: &ShJoinedOut) -> Result<bool, QueryError> {
+        if self.spend_index_enabled() {
+            Ok(!rec.spenders.is_empty())
+        } else {
+            self.is_outpoint_spent(&rec.out.txid, rec.out.vout)
         }
-        let mut out = Vec::new();
-        for wave in sh_join_waves(&fks, SH_JOIN_WAVE) {
-            out.extend(self.expand_create_fks_wave(scripthash, wave)?);
-        }
-        Ok(out)
     }
 
     /// Confirmed-strong create outpoints plus confirmed spenders (create_fk join).
@@ -452,15 +441,9 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
         let mut confirmed = 0i64;
-        for rec in self.scripthash_create_outpoints(scripthash)? {
-            let spent = if self.spend_index_enabled() {
-                self.store
-                    .has_confirmed_strong_spender(&rec.txid, rec.vout)?
-            } else {
-                self.is_outpoint_spent(&rec.txid, rec.vout)?
-            };
-            if !spent {
-                confirmed = confirmed.saturating_add(rec.value);
+        for rec in self.join_creates_and_spends(scripthash)? {
+            if !self.join_out_spent(&rec)? {
+                confirmed = confirmed.saturating_add(rec.out.value);
             }
         }
         Ok(ScriptHashBalance {
@@ -475,21 +458,16 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let mut out = Vec::new();
-        for rec in self.scripthash_create_outpoints(scripthash)? {
-            let spent = if self.spend_index_enabled() {
-                self.store
-                    .has_confirmed_strong_spender(&rec.txid, rec.vout)?
-            } else {
-                self.is_outpoint_spent(&rec.txid, rec.vout)?
-            };
-            if !spent {
-                out.push(ScriptHashUtxo {
-                    tx_hash: rec.txid,
-                    tx_pos: rec.vout,
-                    height: rec.create_height,
-                    value: rec.value,
-                });
+        for rec in self.join_creates_and_spends(scripthash)? {
+            if self.join_out_spent(&rec)? {
+                continue;
             }
+            out.push(ScriptHashUtxo {
+                tx_hash: rec.out.txid,
+                tx_pos: rec.out.vout,
+                height: rec.out.create_height,
+                value: rec.out.value,
+            });
         }
         out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
         Ok(out)
@@ -572,38 +550,26 @@ impl Query {
 
     /// Confirmed chain_stats for Esplora address/scripthash routes.
     ///
-    /// Single expand of creates (avoids a second full history walk).
+    /// One expand+spend join (same walk as history / balance / listunspent).
     pub fn scripthash_chain_stats(
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
-        use std::collections::HashSet;
-        let creates = self.scripthash_create_outpoints(scripthash)?;
+        let joined = self.join_creates_and_spends(scripthash)?;
         let mut funded_n = 0u32;
         let mut funded_sum = 0i64;
         let mut spent_n = 0u32;
         let mut spent_sum = 0i64;
         let mut txids: HashSet<[u8; 32]> = HashSet::new();
-        for rec in &creates {
+        for rec in joined {
             funded_n = funded_n.saturating_add(1);
-            funded_sum = funded_sum.saturating_add(rec.value);
-            txids.insert(rec.txid);
-            let spent = if self.spend_index_enabled() {
-                self.store
-                    .has_confirmed_strong_spender(&rec.txid, rec.vout)?
-            } else {
-                self.is_outpoint_spent(&rec.txid, rec.vout)?
-            };
-            if spent {
+            funded_sum = funded_sum.saturating_add(rec.out.value);
+            txids.insert(rec.out.txid);
+            if self.join_out_spent(&rec)? {
                 spent_n = spent_n.saturating_add(1);
-                spent_sum = spent_sum.saturating_add(rec.value);
-                if self.spend_index_enabled() {
-                    for p in self.store.spenders(&rec.txid, rec.vout)? {
-                        if self.store.is_confirmed_strong(p.spending_tx_fk)? {
-                            let spend_tx = self.store.get_tx(p.spending_tx_fk)?;
-                            txids.insert(spend_tx.txid);
-                        }
-                    }
+                spent_sum = spent_sum.saturating_add(rec.out.value);
+                for sp in rec.spenders {
+                    txids.insert(sp.txid);
                 }
             }
         }

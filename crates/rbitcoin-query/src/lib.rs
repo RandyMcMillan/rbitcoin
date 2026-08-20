@@ -2843,6 +2843,15 @@ mod tests {
         assert_eq!(bal.confirmed, 20_0000_0000);
         assert_eq!(bal.unconfirmed, 0);
 
+        reset_body_ok_reads();
+        let stats = q.scripthash_chain_stats(&sh).unwrap();
+        assert_eq!(stats.tx_count, hist.len() as u32);
+        assert_eq!(stats.funded_txo_count, 2);
+        assert_eq!(stats.funded_txo_sum, 30_0000_0000);
+        assert_eq!(stats.spent_txo_count, 1);
+        assert_eq!(stats.spent_txo_sum, 10_0000_0000);
+        assert_eq!(body_ok_reads(), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

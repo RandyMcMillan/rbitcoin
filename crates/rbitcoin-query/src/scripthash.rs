@@ -5,7 +5,7 @@
 //! Spentness/heights from spends + Class C.
 
 use super::*;
-use rbitcoin_store::{script_hash, IdxBodyMode};
+use rbitcoin_store::{output_flags, script_hash, spent_abs, IdxBodyMode};
 
 /// Class A expand / spend-join wave. Bounds decoded `txout` pages in RAM.
 const SH_JOIN_WAVE: usize = 4096;
@@ -187,6 +187,16 @@ pub struct ScriptHashChainStats {
     pub spent_txo_sum: i64,
 }
 
+struct ShSpender {
+    txid: [u8; 32],
+    height: u32,
+}
+
+struct ShJoinedOut {
+    out: ScriptHashOutpoint,
+    spenders: Vec<ShSpender>,
+}
+
 impl Query {
     /// Expand confirmed-strong create fks in one idx→body wave (`load_creates_once`).
     fn expand_create_fks_wave(
@@ -264,6 +274,124 @@ impl Query {
         Ok(out)
     }
 
+    /// Confirmed-strong create outpoints plus confirmed spenders (create_fk join).
+    fn join_creates_and_spends(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        let entries = self.store.scripthash.entries(scripthash)?;
+        let mut fks = Vec::new();
+        for (_fk, thin) in entries {
+            if self.store.is_confirmed_strong(thin.create_tx_fk)? {
+                fks.push(thin.create_tx_fk);
+            }
+        }
+        let mut out = Vec::new();
+        for wave in sh_join_waves(&fks, SH_JOIN_WAVE) {
+            let creates = self.expand_create_fks_wave(scripthash, wave)?;
+            out.extend(self.join_spends_wave(&creates)?);
+        }
+        Ok(out)
+    }
+
+    fn join_spends_wave(
+        &self,
+        creates: &[ScriptHashOutpoint],
+    ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        if creates.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.spend_index_enabled() {
+            return Ok(creates
+                .iter()
+                .cloned()
+                .map(|out| ShJoinedOut {
+                    out,
+                    spenders: Vec::new(),
+                })
+                .collect());
+        }
+        let mut uniq = Vec::new();
+        let mut seen = HashSet::new();
+        for c in creates {
+            if seen.insert(c.create_tx_fk) {
+                uniq.push(c.create_tx_fk);
+            }
+        }
+        let ranges = self.store.tx_spent_range_batch(&uniq)?;
+        let mut range_by_fk = HashMap::new();
+        for (fk, range) in uniq.iter().zip(ranges.into_iter()) {
+            if let Some(range) = range {
+                range_by_fk.insert(*fk, range);
+            }
+        }
+        let mut abs_offs = Vec::with_capacity(creates.len());
+        let mut abs_at = vec![None; creates.len()];
+        for (i, c) in creates.iter().enumerate() {
+            let Some((off, _)) = range_by_fk.get(&c.create_tx_fk) else {
+                continue;
+            };
+            abs_at[i] = Some(abs_offs.len());
+            abs_offs.push(spent_abs(*off, c.vout));
+        }
+        let metas = self.store.get_spender_meta_at_abs_batch(&abs_offs)?;
+        let mut spender_fks = Vec::new();
+        let mut per_out: Vec<Vec<Fk>> = vec![Vec::new(); creates.len()];
+        for (i, c) in creates.iter().enumerate() {
+            let Some(mi) = abs_at[i] else {
+                continue;
+            };
+            let Some((field, flags)) = metas.get(mi).copied().flatten() else {
+                continue;
+            };
+            if field.is_null() {
+                continue;
+            }
+            if flags & output_flags::MULTI_SPENDER != 0 {
+                for fk in self.store.spenders_create(c.create_tx_fk, c.vout)? {
+                    if self.store.is_confirmed_strong(fk)? {
+                        per_out[i].push(fk);
+                        spender_fks.push(fk);
+                    }
+                }
+            } else if self.store.is_confirmed_strong(field)? {
+                per_out[i].push(field);
+                spender_fks.push(field);
+            }
+        }
+        let txids = self.store.txids_get_many(&spender_fks)?;
+        let heights = self.store.tx_height_get_batch(&spender_fks)?;
+        if txids.len() != spender_fks.len() || heights.len() != spender_fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH spender identity/height batch length",
+            ));
+        }
+        let mut id_by_fk = HashMap::new();
+        for (i, fk) in spender_fks.iter().enumerate() {
+            let Some(txid) = txids[i] else {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH spender missing txid.body",
+                ));
+            };
+            id_by_fk.insert(*fk, (txid, heights[i].unwrap_or(0)));
+        }
+        let mut out = Vec::with_capacity(creates.len());
+        for (i, c) in creates.iter().enumerate() {
+            let mut spenders = Vec::new();
+            for fk in &per_out[i] {
+                let Some((txid, height)) = id_by_fk.get(fk).copied() else {
+                    return Err(StoreError::Corrupt("invariant: SH spender identity miss"));
+                };
+                spenders.push(ShSpender { txid, height });
+            }
+            out.push(ShJoinedOut {
+                out: c.clone(),
+                spenders,
+            });
+        }
+        Ok(out)
+    }
+
     /// Confirmed Electrum-style history for a scripthash: (height, txid) pairs.
     ///
     /// Equivalent to [`Self::scripthash_history_filtered`] with [`HistoryFilter::open`].
@@ -286,38 +414,29 @@ impl Query {
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let creates = self.scripthash_create_outpoints(scripthash)?;
+        let joined = self.join_creates_and_spends(scripthash)?;
         let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
         let to_excl = filter.to_height;
-        for rec in creates {
+        for rec in joined {
             if let Some(to) = to_excl {
-                if i64::from(rec.create_height) >= to {
+                if i64::from(rec.out.create_height) >= to {
                     continue;
                 }
             }
             by_txid
-                .entry(rec.txid)
-                .and_modify(|h| *h = (*h).min(i64::from(rec.create_height)))
-                .or_insert(i64::from(rec.create_height));
-
-            if self.spend_index_enabled() {
-                let spenders = self.store.spenders(&rec.txid, rec.vout)?;
-                for p in spenders {
-                    if !self.store.is_confirmed_strong(p.spending_tx_fk)? {
+                .entry(rec.out.txid)
+                .and_modify(|h| *h = (*h).min(i64::from(rec.out.create_height)))
+                .or_insert(i64::from(rec.out.create_height));
+            for sp in rec.spenders {
+                if let Some(to) = to_excl {
+                    if i64::from(sp.height) >= to {
                         continue;
                     }
-                    let spend_tx = self.store.get_tx(p.spending_tx_fk)?;
-                    let spend_h = self.store.tx_height_get(p.spending_tx_fk)?.unwrap_or(0);
-                    if let Some(to) = to_excl {
-                        if i64::from(spend_h) >= to {
-                            continue;
-                        }
-                    }
-                    by_txid
-                        .entry(spend_tx.txid)
-                        .and_modify(|h| *h = (*h).min(i64::from(spend_h)))
-                        .or_insert(i64::from(spend_h));
                 }
+                by_txid
+                    .entry(sp.txid)
+                    .and_modify(|h| *h = (*h).min(i64::from(sp.height)))
+                    .or_insert(i64::from(sp.height));
             }
         }
         let items: Vec<ScriptHashHistoryItem> = by_txid

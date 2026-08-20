@@ -2769,6 +2769,84 @@ mod tests {
     }
 
     #[test]
+    fn scripthash_join_includes_spend_and_keeps_sibling_utxo() {
+        let (dir, q) = temp_query("sh-join-spend");
+        assert!(q.index_mode().is_tip());
+
+        let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
+        ta0.tx.output_count = 2;
+        ta0.outputs = vec![
+            OutputRecord::unspent(10_0000_0000, vec![0x51]),
+            OutputRecord::unspent(20_0000_0000, vec![0x51]),
+        ];
+        let create_txid = ta0.tx.txid;
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let hash1 = rbitcoin_store::block_header_hash(1, &h0.hash, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let ta1 = TxApply {
+            tx: TxRecord {
+                txid: spend_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: create_txid,
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
+        };
+        q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+
+        let sh = script_hash(&[0x51]);
+        let hist = q.scripthash_history(&sh).unwrap();
+        assert_eq!(hist.len(), 2);
+        let hist_txids: Vec<_> = hist.iter().map(|i| i.txid).collect();
+        assert!(hist_txids.contains(&create_txid));
+        assert!(hist_txids.contains(&spend_txid));
+        assert_eq!(
+            hist.iter().find(|i| i.txid == create_txid).unwrap().height,
+            0
+        );
+        assert_eq!(
+            hist.iter().find(|i| i.txid == spend_txid).unwrap().height,
+            1
+        );
+
+        let utxos = q.scripthash_listunspent(&sh).unwrap();
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].tx_hash, create_txid);
+        assert_eq!(utxos[0].tx_pos, 1);
+        assert_eq!(utxos[0].value, 20_0000_0000);
+
+        let bal = q.scripthash_balance(&sh).unwrap();
+        assert_eq!(bal.confirmed, 20_0000_0000);
+        assert_eq!(bal.unconfirmed, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn connect_chain_query_surface() {
         let (dir, q) = temp_query("connect");
         // Default Tip mode: durable SH on confirm so Electrum-style APIs work.

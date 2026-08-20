@@ -901,8 +901,9 @@ fn dispatch_with_join(
         }
         "blockchain.scripthash.listunspent" => {
             let sh = param_scripthash(params, 0)?;
-            let u = crate::unspent::scripthash_utxos_with_mempool_slot(query, mempool, &sh, sh_join)
-                .map_err(|e| e.to_string())?;
+            let u =
+                crate::unspent::scripthash_utxos_with_mempool_slot(query, mempool, &sh, sh_join)
+                    .map_err(|e| e.to_string())?;
             let arr: Vec<Value> = u
                 .iter()
                 .map(|x| {

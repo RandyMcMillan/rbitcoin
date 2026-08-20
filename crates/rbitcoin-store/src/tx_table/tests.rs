@@ -2528,6 +2528,263 @@ fn segmented_head_roll_and_lookup_via_tx_table() {
 }
 
 #[test]
+fn empty_occupancy_head_open_rebuilds_mphf_not_oa_backfill() {
+    with_env_lock(|| {
+        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+        let dir = tempfile_dir("empty-occ-rebuild");
+        let layout = crate::address_head::default_layout();
+        {
+            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+            let recs: Vec<TxRecord> = (0..65u64)
+                .map(|i| {
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    }
+                })
+                .collect();
+            t.put_full_batch_indexed(&meta_only_items(&recs), true)
+                .unwrap();
+            t.flush().unwrap();
+        }
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+        crate::segmented_head::SegmentedTxHead::create(&dir, layout).unwrap();
+        assert!(crate::segmented_head::head_meta_exists(&dir));
+        let t = TxTable::open(&dir).unwrap();
+        assert!(
+            t.head.sealed_segment_count() >= 2,
+            "empty occupancy must full-rebuild, sealed={}",
+            t.head.sealed_segment_count()
+        );
+        assert!(!dir.join("tx.head").join("000000").is_file());
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&65u64.to_le_bytes());
+        assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(65)));
+        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn rebuild_head_direct_mphf_empty_tail() {
+    with_env_lock(|| {
+        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+        let dir = tempfile_dir("rebuild-direct-mphf");
+        {
+            let t = create_tiny(&dir);
+            let recs: Vec<TxRecord> = (0..65u64)
+                .map(|i| {
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    }
+                })
+                .collect();
+            t.put_full_batch_indexed(&meta_only_items(&recs), true)
+                .unwrap();
+            t.flush().unwrap();
+        }
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+        let t = TxTable::open(&dir).unwrap();
+        assert!(
+            t.head.sealed_segment_count() >= 2,
+            "T=64, n=65 must seal two MPHF ranges, sealed={} segs={}",
+            t.head.sealed_segment_count(),
+            t.head.segment_count()
+        );
+        let root = dir.join("tx.head");
+        assert!(
+            !root.join("000000").is_file(),
+            "sealed range must not keep an OA file"
+        );
+        assert!(
+            !root.join("000001").is_file(),
+            "remainder must seal, not stay OA"
+        );
+        assert!(crate::tx_head_mphf::TxHeadMphf::exists(
+            &root.join("000000")
+        ));
+        assert!(crate::tx_head_mphf::TxHeadMphf::exists(
+            &root.join("000001")
+        ));
+        match t.head.open_tail_range() {
+            Some((_, 0)) => {}
+            other => panic!("expected empty open tail, got {other:?}"),
+        }
+        for i in [1u64, 64, 65] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+        }
+        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn rebuild_head_direct_mphf_bip30_newest_first() {
+    with_env_lock(|| {
+        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+        let dir = tempfile_dir("rebuild-direct-bip30");
+        {
+            let t = create_tiny(&dir);
+            let mut shared = [0u8; 32];
+            shared[0..8].copy_from_slice(&1u64.to_le_bytes());
+            let r1 = TxRecord {
+                txid: shared,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            };
+            let r2 = r1.clone();
+            let mut rest: Vec<TxRecord> = (3..=65u64)
+                .map(|i| {
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&i.to_le_bytes());
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    }
+                })
+                .collect();
+            let mut recs = vec![r1, r2];
+            recs.append(&mut rest);
+            t.put_full_batch_indexed(&meta_only_items(&recs), true)
+                .unwrap();
+            t.flush().unwrap();
+        }
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+        let t = TxTable::open(&dir).unwrap();
+        let mut shared = [0u8; 32];
+        shared[0..8].copy_from_slice(&1u64.to_le_bytes());
+        let all = t.get_all_by_txid(&shared).unwrap();
+        assert_eq!(all.len(), 2, "both BIP30 creates");
+        assert_eq!(all[0].0, Fk(2), "newest first {all:?}");
+        assert_eq!(all[1].0, Fk(1));
+        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn plan_head_rebuild_ranges_chunks_seal_bits_not_oa_load() {
+    with_env_lock(|| {
+        let dir = tempfile_dir("plan-seal-bits");
+        let t = create_tiny(&dir);
+        let recs: Vec<TxRecord> = (0..200u64)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                }
+            })
+            .collect();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
+            .unwrap();
+        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "6");
+        let ranges6 = t.plan_head_rebuild_ranges().unwrap();
+        assert_eq!(
+            ranges6,
+            vec![(1, 64), (65, 64), (129, 64), (193, 8)],
+            "bits=6 → T=64"
+        );
+        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "7");
+        let ranges7 = t.plan_head_rebuild_ranges().unwrap();
+        assert_eq!(
+            ranges7,
+            vec![(1, 128), (129, 72)],
+            "bits=7 → T=128 (knob is seal bits, not OA 80%)"
+        );
+        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn plan_head_rebuild_ranges_soft_span_cuts_before_t() {
+    with_env_lock(|| {
+        let dir = tempfile_dir("plan-soft-span");
+        let t = create_tiny(&dir);
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let tx = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0xab; 64],
+                witness: vec![vec![0xcd; 400]],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51; 32])];
+            (tx, inputs, outputs)
+        };
+        std::env::set_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS", "8");
+        SegmentedTxHead::test_with_soft_span_bytes(800, || {
+            for i in 1..=6u64 {
+                t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            }
+            let ranges = t.plan_head_rebuild_ranges().unwrap();
+            assert!(
+                ranges.len() >= 2,
+                "soft-span must cut before T=256, ranges={ranges:?}"
+            );
+            assert!(
+                ranges.iter().all(|(_, c)| *c < 256),
+                "no range should reach T, ranges={ranges:?}"
+            );
+            let covered: u64 = ranges.iter().map(|(_, c)| *c).sum();
+            assert_eq!(covered, 6);
+            let mut next = 1u64;
+            for (first, count) in &ranges {
+                assert_eq!(*first, next);
+                next = first + count;
+            }
+        });
+        std::env::remove_var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
 fn refuse_legacy_mono_head_on_create() {
     let dir = tempfile_dir("legacy-mono");
     std::fs::write(dir.join("tx.head"), b"mono").unwrap();

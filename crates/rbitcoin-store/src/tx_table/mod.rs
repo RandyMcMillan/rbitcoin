@@ -474,7 +474,12 @@ impl TxTable {
             SegmentedTxHead::create(dir, crate::address_head::default_layout())?
         } else {
             match SegmentedTxHead::open(dir) {
-                Ok(h) => h,
+                Ok(h) => {
+                    if n_bodies > 0 && h.occupied() == 0 {
+                        need_rebuild = true;
+                    }
+                    h
+                }
                 Err(e) => {
                     if n_bodies > 0 {
                         rbitcoin_log::warn!(
@@ -504,7 +509,9 @@ impl TxTable {
             let bits = t.head_bits();
             let slots = t.head_slots();
             rbitcoin_log::info!(
-                "store: tx.head rebuild begin n={n_bodies} bits={bits} slots={slots} (segmented)"
+                "store: tx.head rebuild begin n={n_bodies} bits={bits} slots={slots} \
+                 seal_bits={} (segmented)",
+                Self::rebuild_seal_bits()
             );
             let inserted = t.rebuild_head_from_bodies(|done, total, ins| {
                 if done == total || done % 1_000_000 == 0 {
@@ -1559,6 +1566,9 @@ impl TxTable {
     ///
     /// `on_progress(done_bodies, total_bodies, inserted)` is invoked periodically.
     pub fn backfill_head(&self, on_progress: impl FnMut(u64, u64, u64)) -> Result<u64, StoreError> {
+        if self.head.occupied() == 0 && self.count() > 0 {
+            return self.rebuild_head_from_bodies(on_progress);
+        }
         self.backfill_head_inner(/* force_all */ false, on_progress)
     }
 
@@ -1593,15 +1603,117 @@ impl TxTable {
         Ok(inserted)
     }
 
-    /// Insert **every** Class A body into `tx.head` without presence probes.
+    /// Rebuild sealed MPHF+fuse8 from Class A (`txid.body`), no historical OA.
     ///
-    /// Used when the head was just created empty (missing-file recovery on open).
-    /// Assumes the head is empty or overwrite-safe (same fk re-insert is a no-op).
+    /// Range width is [`Self::rebuild_seal_keys`] (default 2²⁶). Remainder is
+    /// sealed too; an empty open tail is created for later inserts.
     pub fn rebuild_head_from_bodies(
         &self,
-        on_progress: impl FnMut(u64, u64, u64),
+        mut on_progress: impl FnMut(u64, u64, u64),
     ) -> Result<u64, StoreError> {
-        self.backfill_head_inner(/* force_all */ true, on_progress)
+        let n = self.count();
+        if n == 0 {
+            return Ok(0);
+        }
+        let ranges = self.plan_head_rebuild_ranges()?;
+        let seal_bits = Self::rebuild_seal_bits();
+        rbitcoin_log::info!(
+            "store: tx.head rebuild mphf n={n} seal_bits={seal_bits} ranges={}",
+            ranges.len()
+        );
+        const CHUNK: u64 = 65_536;
+        let mut sealed = Vec::with_capacity(ranges.len());
+        let mut inserted = 0u64;
+        for (file_id, (first, count)) in ranges.into_iter().enumerate() {
+            if count == 0 {
+                return Err(StoreError::Corrupt("tx.head rebuild empty range"));
+            }
+            let last = first.saturating_add(count).saturating_sub(1);
+            let mut pairs = Vec::with_capacity(count as usize);
+            let mut rel = 1u32;
+            let mut cur = first;
+            while cur <= last {
+                let end = (cur + CHUNK - 1).min(last);
+                let txids = self.body_txid_range(cur, end)?;
+                for txid in txids {
+                    pairs.push((
+                        crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(&txid)),
+                        rel,
+                    ));
+                    rel = rel.saturating_add(1);
+                }
+                cur = end + 1;
+            }
+            if pairs.len() as u64 != count {
+                return Err(StoreError::Corrupt("tx.head rebuild pair count"));
+            }
+            let pubd = self
+                .head
+                .write_sealed_pairs(file_id as u32, first, count, &pairs)?;
+            drop(pairs);
+            sealed.push((first, count, pubd));
+            inserted += count;
+            on_progress(last, n, inserted);
+        }
+        self.head
+            .install_rebuild_sealed(sealed, n.saturating_add(1))?;
+        Ok(inserted)
+    }
+
+    /// Rebuild MPHF range width: `2^bits` keys. Default **26**; **25** is low-RAM.
+    ///
+    /// Env `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS`. Operator: 25 or 26. Tests may
+    /// use 6..=26.
+    pub fn rebuild_seal_bits() -> u32 {
+        match std::env::var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS") {
+            Ok(s) => s.parse::<u32>().ok().map(|b| b.clamp(6, 26)).unwrap_or(26),
+            Err(_) => 26,
+        }
+    }
+
+    pub fn rebuild_seal_keys() -> u64 {
+        1u64 << Self::rebuild_seal_bits()
+    }
+
+    /// Greedy Class A cuts for a cold MPHF rebuild (`MIN(2^bits, body soft-span)`).
+    ///
+    /// Independent of live OA 80% load. Last range may be short.
+    pub fn plan_head_rebuild_ranges(&self) -> Result<Vec<(u64, u64)>, StoreError> {
+        let n = self.count();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let t = Self::rebuild_seal_keys();
+        let soft = SegmentedTxHead::soft_span_bytes();
+        let mut out = Vec::new();
+        let mut first = 1u64;
+        while first <= n {
+            let max_last = first.saturating_add(t).saturating_sub(1).min(n);
+            let last = self.rebuild_cut_last(first, max_last, soft)?;
+            out.push((first, last - first + 1));
+            first = last + 1;
+        }
+        Ok(out)
+    }
+
+    fn rebuild_cut_last(&self, first: u64, max_last: u64, soft: u64) -> Result<u64, StoreError> {
+        if first == max_last {
+            return Ok(first);
+        }
+        if self.body_span_bytes(first, max_last)? <= soft {
+            return Ok(max_last);
+        }
+        let mut lo = first;
+        let mut hi = max_last;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.body_span_bytes(first, mid)? <= soft {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
     }
 
     fn backfill_head_inner(

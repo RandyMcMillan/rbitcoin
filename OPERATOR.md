@@ -236,7 +236,7 @@ pages after annotate does not protect `txout`. See
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
-| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads. Open segment is 4 B OA; roll opens the next OA immediately and seals the previous (**MPHF + u32 rel + fuse8**) on a sidecar. Legacy mono-head datadirs require reindex |
+| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads. Open segment is 4 B OA; roll opens the next OA immediately and seals the previous (**MPHF + u32 rel + fuse8**) on a sidecar. Wipe/empty rebuild writes MPHF directly (default **2²⁶** keys; `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS=25` for low RAM). Legacy mono-head datadirs require reindex |
 | Confirm stages | **lookup · load · scripts · write** | Real queues **loadq=14 · scriptq=4 · writeq=14**. Lookup takes BQ in height order (stops at a hole after `lookup_taken_hi`), dequeues raw, and fills loadq with load-sized batches (8000 inputs / 144 blocks). IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights; hard **min 8000** when more unresolved heights remain. Wave table: [`docs/concurrency.md`](docs/concurrency.md). |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |

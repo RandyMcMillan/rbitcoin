@@ -1401,7 +1401,7 @@ impl ScriptHashTable {
                 let ents = self.read_slab(body, *class, *off)?;
                 Ok(ents.last().map(|e| e.create_tx_fk))
             }
-            ShHeadValue::Paged { last_page, .. } => {
+            ShHeadValue::Paged { last_page, .. } | ShHeadValue::Extent { last_page } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
                 body.read_at(*last_page, &mut page)?;
                 sh_page_last_fk(&page)
@@ -1861,6 +1861,10 @@ impl ScriptHashTable {
                 };
                 self.collect_page_chain(body, first, *last_page)
             }
+            ShHeadValue::Extent { last_page } => {
+                let first = paged_first_from_last(body, *last_page)?;
+                self.collect_page_chain(body, first, *last_page)
+            }
         }
     }
 
@@ -1955,6 +1959,11 @@ impl ScriptHashTable {
                 let last =
                     self.append_fks_to_pages(body, alloc, *first_page, *last_page, new_ents)?;
                 Ok(ShHeadValue::paged(*first_page, last))
+            }
+            ShHeadValue::Extent { last_page } => {
+                let first = paged_first_from_last(body, *last_page)?;
+                let last = self.append_fks_to_pages(body, alloc, first, *last_page, new_ents)?;
+                Ok(ShHeadValue::extent(last))
             }
         }
     }
@@ -2155,6 +2164,16 @@ impl ScriptHashTable {
         match old {
             ShHeadValue::Paged { first_page, .. } => {
                 let mut off = *first_page;
+                while off != 0 {
+                    let mut page = [0u8; SH_PAGE_SIZE];
+                    body.read_at(off, &mut page)?;
+                    let (next, _) = sh_page_decode_slice(&page)?;
+                    self.free_slab(body, alloc, SH_PAGE_SLAB_CLASS, off)?;
+                    off = next;
+                }
+            }
+            ShHeadValue::Extent { last_page } => {
+                let mut off = paged_first_from_last(body, *last_page)?;
                 while off != 0 {
                     let mut page = [0u8; SH_PAGE_SIZE];
                     body.read_at(off, &mut page)?;
@@ -2546,6 +2565,7 @@ pub fn remap_sh_head_value(val: &ShHeadValue, delta: u64) -> ShHeadValue {
             first_page.saturating_add(delta),
             last_page.saturating_add(delta),
         ),
+        ShHeadValue::Extent { last_page } => ShHeadValue::extent(last_page.saturating_add(delta)),
     }
 }
 

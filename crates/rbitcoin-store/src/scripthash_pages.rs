@@ -66,16 +66,26 @@ pub const SH_PAGE_OFF_PACKED: usize = 3;
 pub const SH_PAGE_LAST_BIT: u64 = 1;
 /// Schema-17 megakey pages: uleb fk0 + uleb deltas (not raw u64 slots).
 pub const SH_PAGE_DELTA_VER: u8 = 1;
-/// Max FKs if every stream byte is a 1-byte uleb.
+/// Schema-19 last-in-extent / chain-last page: header also holds extent_base + extent_n.
+pub const SH_PAGE_EXTENT_VER: u8 = 2;
+/// Max FKs if every stream byte is a 1-byte uleb (`ver=1` header).
 pub const SH_PAGE_STREAM_MAX: usize = SH_PAGE_SIZE - SH_PAGE_HEADER_LEN;
-/// Offset of first FK / delta stream within a page.
+/// Offset of first FK / delta stream within a `ver=1` page.
 pub const SH_PAGE_OFF_FKS: usize = SH_PAGE_HEADER_LEN;
+/// `ver=2` header: 8 B packed + 8 B extent_base + 4 B extent_n + 4 B reserved.
+pub const SH_PAGE_EXTENT_HEADER_LEN: usize = 24;
+pub const SH_PAGE_OFF_EXTENT_BASE: usize = 8;
+pub const SH_PAGE_OFF_EXTENT_N: usize = 16;
+/// Max stream bytes on a `ver=2` page.
+pub const SH_PAGE_EXTENT_STREAM_MAX: usize = SH_PAGE_SIZE - SH_PAGE_EXTENT_HEADER_LEN;
 
 const _: () = assert!(SH_PAGE_SIZE == 4096);
 const _: () = assert!(SH_PAGE_HEADER_LEN == 8);
 const _: () = assert!(SH_ENTRY_LEN == 8);
 const _: () = assert!(SH_PAGE_FK_CAP == 511);
 const _: () = assert!(SH_PAGE_OFF_FKS + SH_PAGE_FK_CAP * SH_ENTRY_LEN == SH_PAGE_SIZE);
+const _: () = assert!(SH_PAGE_EXTENT_HEADER_LEN == 24);
+const _: () = assert!(SH_PAGE_EXTENT_STREAM_MAX == 4072);
 
 /// Require a full 4 KiB page buffer (rejects unaligned / short slices).
 #[inline]
@@ -331,6 +341,92 @@ pub fn sh_page_set_next(page: &mut [u8; SH_PAGE_SIZE], next_off: u64) -> Result<
     sh_page_write_packed(page, false, next_off)
 }
 
+#[inline]
+fn sh_page_stream_off(page: &[u8; SH_PAGE_SIZE]) -> usize {
+    if page[SH_PAGE_OFF_VER] == SH_PAGE_EXTENT_VER {
+        SH_PAGE_EXTENT_HEADER_LEN
+    } else {
+        SH_PAGE_HEADER_LEN
+    }
+}
+
+#[inline]
+fn sh_page_stream_cap(page: &[u8; SH_PAGE_SIZE]) -> usize {
+    SH_PAGE_SIZE - sh_page_stream_off(page)
+}
+
+/// `(extent_base, extent_n)` when `ver=2`; `None` on `ver=1`.
+pub fn sh_page_extent(page: &[u8; SH_PAGE_SIZE]) -> Result<Option<(u64, u32)>, StoreError> {
+    if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
+        return Ok(None);
+    }
+    let base = u64::from_le_bytes(
+        page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let n = u32::from_le_bytes(
+        page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if n == 0 {
+        return Err(StoreError::Corrupt("scripthash page: extent_n is 0"));
+    }
+    if !base.is_multiple_of(SH_PAGE_SIZE as u64) || base == 0 {
+        return Err(StoreError::Corrupt(
+            "scripthash page: extent_base not 4 KiB aligned",
+        ));
+    }
+    Ok(Some((base, n)))
+}
+
+/// Stamp `ver=2` extent fields. Packed next/LAST is unchanged.
+pub fn sh_page_set_extent(
+    page: &mut [u8; SH_PAGE_SIZE],
+    extent_base: u64,
+    extent_n: u32,
+) -> Result<(), StoreError> {
+    if extent_n == 0 {
+        return Err(StoreError::Corrupt("scripthash page: extent_n is 0"));
+    }
+    if !extent_base.is_multiple_of(SH_PAGE_SIZE as u64) || extent_base == 0 {
+        return Err(StoreError::Corrupt(
+            "scripthash page: extent_base not 4 KiB aligned",
+        ));
+    }
+    page[SH_PAGE_OFF_VER] = SH_PAGE_EXTENT_VER;
+    page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8]
+        .copy_from_slice(&extent_base.to_le_bytes());
+    page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4].copy_from_slice(&extent_n.to_le_bytes());
+    Ok(())
+}
+
+/// Pack a last-in-extent (or chain-last) `ver=2` page.
+pub fn sh_page_pack_extent_last(
+    page: &mut [u8; SH_PAGE_SIZE],
+    entries: &[ShEntry],
+    extent_base: u64,
+    extent_n: u32,
+    next_off: u64,
+) -> Result<(), StoreError> {
+    sh_page_init_empty(page);
+    if next_off == 0 {
+        sh_page_set_last(page, extent_base)?;
+    } else {
+        sh_page_set_next(page, next_off)?;
+    }
+    sh_page_set_extent(page, extent_base, extent_n)?;
+    for e in entries {
+        if !sh_page_try_append_entry(page, *e)? {
+            return Err(StoreError::Corrupt(
+                "scripthash page pack: entries exceed page capacity",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Number of FKs stored in this page.
 #[inline]
 pub fn sh_page_n_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<u16, StoreError> {
@@ -339,7 +435,7 @@ pub fn sh_page_n_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<u16, StoreError> {
             .try_into()
             .unwrap(),
     );
-    if n as usize > SH_PAGE_STREAM_MAX {
+    if n as usize > sh_page_stream_cap(page) {
         return Err(StoreError::Corrupt("scripthash page n_fks > capacity"));
     }
     Ok(n)
@@ -348,7 +444,7 @@ pub fn sh_page_n_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<u16, StoreError> {
 fn sh_page_require_delta(page: &[u8; SH_PAGE_SIZE]) -> Result<(), StoreError> {
     let ver = page[SH_PAGE_OFF_VER];
     let n = sh_page_n_fks(page)?;
-    if ver == SH_PAGE_DELTA_VER {
+    if ver == SH_PAGE_DELTA_VER || ver == SH_PAGE_EXTENT_VER {
         return Ok(());
     }
     if ver == 0 && n == 0 {
@@ -360,7 +456,7 @@ fn sh_page_require_delta(page: &[u8; SH_PAGE_SIZE]) -> Result<(), StoreError> {
 }
 
 fn sh_page_stream(page: &[u8; SH_PAGE_SIZE]) -> &[u8] {
-    &page[SH_PAGE_OFF_FKS..]
+    &page[sh_page_stream_off(page)..]
 }
 
 fn sh_page_stream_used(page: &[u8; SH_PAGE_SIZE]) -> Result<usize, StoreError> {
@@ -373,7 +469,7 @@ fn sh_page_stream_used(page: &[u8; SH_PAGE_SIZE]) -> Result<usize, StoreError> {
     for _ in 0..n {
         let (_, used) = read_uleb128(buf.get(off..).unwrap_or(&[]))?;
         off += used;
-        if off > SH_PAGE_STREAM_MAX {
+        if off > sh_page_stream_cap(page) {
             return Err(StoreError::Corrupt("scripthash page stream overrun"));
         }
     }
@@ -517,7 +613,7 @@ pub fn sh_page_try_append_entry(
         }
         uleb128_len(entry.create_tx_fk.0 - last.0)
     };
-    if used + add > SH_PAGE_STREAM_MAX {
+    if used + add > sh_page_stream_cap(page) {
         return Ok(false);
     }
     let mut tmp = Vec::with_capacity(add);
@@ -528,9 +624,11 @@ pub fn sh_page_try_append_entry(
         write_uleb128(&mut tmp, entry.create_tx_fk.0 - last.0);
     }
     debug_assert_eq!(tmp.len(), add);
-    let off = SH_PAGE_OFF_FKS + used;
+    let off = sh_page_stream_off(page) + used;
     page[off..off + tmp.len()].copy_from_slice(&tmp);
-    page[SH_PAGE_OFF_VER] = SH_PAGE_DELTA_VER;
+    if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
+        page[SH_PAGE_OFF_VER] = SH_PAGE_DELTA_VER;
+    }
     sh_page_set_n_fks(page, (n + 1) as u16);
     Ok(true)
 }
@@ -684,6 +782,42 @@ mod tests {
         assert_eq!(sh_page_next(&last).unwrap(), 0);
         assert_eq!(sh_page_first_off(&last).unwrap(), 4096);
         assert_eq!(SH_PAGE_HEADER_LEN, 8);
+    }
+
+    #[test]
+    fn sh_page_ver2_extent_roundtrip() {
+        let ents: Vec<_> = (1u64..=3).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_pack_extent_last(&mut page, &ents, 4096, 2, 0).unwrap();
+        assert_eq!(page[SH_PAGE_OFF_VER], SH_PAGE_EXTENT_VER);
+        assert_eq!(sh_page_extent(&page).unwrap(), Some((4096, 2)));
+        assert_eq!(sh_page_next(&page).unwrap(), 0);
+        assert_eq!(sh_page_first_off(&page).unwrap(), 4096);
+        assert_eq!(sh_page_entries(&page).unwrap(), ents);
+        let mut tailed = [0u8; SH_PAGE_SIZE];
+        sh_page_pack_extent_last(&mut tailed, &ents, 4096, 2, 12288).unwrap();
+        assert_eq!(sh_page_next(&tailed).unwrap(), 12288);
+        assert_eq!(sh_page_extent(&tailed).unwrap(), Some((4096, 2)));
+        assert!(!sh_page_is_last(&tailed).unwrap());
+    }
+
+    #[test]
+    fn sh_page_ver2_rejects_bad_extent() {
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut page);
+        assert!(sh_page_set_extent(&mut page, 4096, 0).is_err());
+        assert!(sh_page_set_extent(&mut page, 4097, 1).is_err());
+        assert!(sh_page_set_extent(&mut page, 0, 1).is_err());
+        sh_page_set_extent(&mut page, 8192, 3).unwrap();
+        page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(sh_page_extent(&page).is_err());
+        sh_page_set_extent(&mut page, 8192, 3).unwrap();
+        page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8]
+            .copy_from_slice(&100u64.to_le_bytes());
+        assert!(sh_page_extent(&page).is_err());
+        let mut v1 = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut v1);
+        assert_eq!(sh_page_extent(&v1).unwrap(), None);
     }
 
     #[test]

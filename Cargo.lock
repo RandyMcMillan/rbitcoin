@@ -760,6 +760,7 @@ dependencies = [
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

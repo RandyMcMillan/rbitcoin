@@ -32,7 +32,8 @@ pub fn tx_status_json(query: &Query, tx_fk: Fk) -> Result<Value, QueryError> {
 #[derive(Serialize)]
 struct EsploraUtxoStatus {
     confirmed: bool,
-    block_height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,12 +65,32 @@ pub fn utxo_status_by_height(
     Ok(map)
 }
 
-/// Confirmed Esplora `/utxo` array from join rows (status from height, not `tx.head`).
+/// Confirmed (and optional mempool) Esplora `/utxo` array.
+///
+/// Mempool rows (`create_tx_fk` null) are `{ confirmed: false }` with no block_*.
 pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, QueryError> {
-    let by_h = utxo_status_by_height(query, list.iter().map(|u| u.height))?;
+    let by_h = utxo_status_by_height(
+        query,
+        list.iter()
+            .filter(|u| !u.create_tx_fk.is_null())
+            .map(|u| u.height),
+    )?;
     let rows: Vec<EsploraUtxo> = list
         .iter()
         .map(|u| {
+            if u.create_tx_fk.is_null() {
+                return EsploraUtxo {
+                    txid: block_hash_hex(&u.tx_hash),
+                    vout: u.tx_pos,
+                    value: u.value,
+                    status: EsploraUtxoStatus {
+                        confirmed: false,
+                        block_height: None,
+                        block_hash: None,
+                        block_time: None,
+                    },
+                };
+            }
             let (block_hash, block_time) = match by_h.get(&u.height) {
                 Some((h, t)) => (Some(h.clone()), Some(*t)),
                 None => (None, None),
@@ -80,7 +101,7 @@ pub fn utxo_list_json(query: &Query, list: &[ScriptHashUtxo]) -> Result<Value, Q
                 value: u.value,
                 status: EsploraUtxoStatus {
                     confirmed: true,
-                    block_height: u.height,
+                    block_height: Some(u.height),
                     block_hash,
                     block_time,
                 },
@@ -496,6 +517,7 @@ mod tests {
             tx_pos: 7,
             height: 1,
             value: 42,
+            create_tx_fk: Fk(1),
         };
         let miss = utxo_list_json(&q, &[orphan]).unwrap();
         let row = &miss.as_array().unwrap()[0];
@@ -506,6 +528,19 @@ mod tests {
         assert_eq!(row["status"]["block_time"], rec1.timestamp);
         assert_eq!(row["txid"], block_hash_hex(&[0xee; 32]));
         assert_eq!(row["vout"], 7);
+
+        let mempool_row = rbitcoin_query::ScriptHashUtxo {
+            tx_hash: [0x11; 32],
+            tx_pos: 0,
+            height: 0,
+            value: 99,
+            create_tx_fk: Fk::NULL,
+        };
+        let mem = utxo_list_json(&q, &[mempool_row]).unwrap();
+        let mrow = &mem.as_array().unwrap()[0];
+        assert_eq!(mrow["status"]["confirmed"], false);
+        assert!(mrow["status"].get("block_height").is_none());
+        assert!(mrow["status"].get("block_hash").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

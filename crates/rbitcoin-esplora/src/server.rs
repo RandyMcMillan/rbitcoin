@@ -1285,6 +1285,33 @@ mod tests {
         let mem_hex = display_txid(mem_pay.compute_txid());
         hub.accept_tx(&mem_pay).expect("mempool accept to watch");
 
+        let (st, body) = http_get(addr, &format!("/address/{watch_addr}/utxo")).await;
+        assert_eq!(st, 200, "{body}");
+        let utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(
+            utxos.iter().any(|u| u["status"]["confirmed"] == false),
+            "mempool funding: {utxos:?}"
+        );
+        assert!(
+            utxos.iter().any(|u| u["status"]["confirmed"] == true),
+            "confirmed watch utxo: {utxos:?}"
+        );
+        let (st, body) = http_get(addr, &format!("/address/{watch_addr}")).await;
+        assert_eq!(st, 200, "{body}");
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(info["mempool_stats"]["funded_txo_count"].as_u64().unwrap() >= 1);
+        assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 1);
+
+        let true_sh = block_hash_hex(&rbitcoin_store::script_hash(&[0x51]));
+        let (st, body) = http_get(addr, &format!("/scripthash/{true_sh}/utxo")).await;
+        assert_eq!(st, 200, "{body}");
+        let true_utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let spent = block_hash_hex(&coinbase_txids[1]);
+        assert!(
+            true_utxos.iter().all(|u| u["txid"] != spent),
+            "mempool spend drops confirmed coin: {true_utxos:?}"
+        );
+
         let mut saw_addr_mp = false;
         for _ in 0..12 {
             let v = ws_recv_json(&mut ws, 3).await;

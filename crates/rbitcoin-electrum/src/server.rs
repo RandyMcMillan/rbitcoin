@@ -839,18 +839,10 @@ fn dispatch(
         }
         "blockchain.scripthash.listunspent" => {
             let sh = param_scripthash(params, 0)?;
-            let u = query
-                .scripthash_listunspent(&sh)
+            let u = crate::scripthash_utxos_with_mempool(query, mempool, &sh)
                 .map_err(|e| e.to_string())?;
-            let mut arr: Vec<Value> = u
+            let arr: Vec<Value> = u
                 .iter()
-                .filter(|x| {
-                    let op = bitcoin::OutPoint {
-                        txid: bitcoin::Txid::from_byte_array(x.tx_hash),
-                        vout: x.tx_pos,
-                    };
-                    !mempool.map(|m| m.spends_outpoint(&op)).unwrap_or(false)
-                })
                 .map(|x| {
                     json!({
                         "tx_hash": txid_hex(&x.tx_hash),
@@ -860,30 +852,6 @@ fn dispatch(
                     })
                 })
                 .collect();
-            if let Some(mp) = mempool {
-                for item in mp.scripthash_mempool(&sh) {
-                    let tid = bitcoin::Txid::from_byte_array(item.txid);
-                    let Some(tx) = mp.get_tx(&tid) else { continue };
-                    for (vout, o) in tx.output.iter().enumerate() {
-                        if script_hash(o.script_pubkey.as_bytes()) != sh {
-                            continue;
-                        }
-                        let op = bitcoin::OutPoint {
-                            txid: tid,
-                            vout: vout as u32,
-                        };
-                        if mp.spends_outpoint(&op) {
-                            continue;
-                        }
-                        arr.push(json!({
-                            "tx_hash": format!("{tid}"),
-                            "tx_pos": vout,
-                            "height": 0,
-                            "value": o.value.to_sat() as i64,
-                        }));
-                    }
-                }
-            }
             Ok(Value::Array(arr))
         }
         "blockchain.scripthash.subscribe" => {

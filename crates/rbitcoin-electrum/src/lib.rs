@@ -10,6 +10,7 @@
 
 mod server;
 mod tweaks;
+mod unspent;
 
 pub use server::{
     electrum_scripthash_hex, read_line_capped, run_electrum, sample_reset_perf, ElectrumConfig,
@@ -17,3 +18,4 @@ pub use server::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_SCRIPTHASH_SUBS,
 };
+pub use unspent::{scripthash_mempool_stats, scripthash_utxos_with_mempool, MempoolShStats};

@@ -544,7 +544,7 @@ pub async fn scripthash_utxo(State(st): State<AppState>, Path(sh_hex): Path<Stri
 }
 
 fn utxo_response(st: &AppState, sh: &[u8; 32]) -> Response {
-    match st.query.scripthash_listunspent(sh) {
+    match rbitcoin_electrum::scripthash_utxos_with_mempool(&st.query, st.mempool.as_deref(), sh) {
         Ok(list) => match utxo_list_json(&st.query, &list) {
             Ok(v) => Json(v).into_response(),
             Err(e) => store_err(e),
@@ -581,14 +581,16 @@ fn sh_stats_json(
         "spent_txo_sum": 0,
     });
     let mempool_stats = if let Some(mp) = st.mempool.as_ref() {
-        let items = mp.scripthash_mempool(sh);
-        json!({
-            "tx_count": items.len() as u32,
-            "funded_txo_count": 0,
-            "funded_txo_sum": 0,
-            "spent_txo_count": 0,
-            "spent_txo_sum": 0,
-        })
+        match rbitcoin_electrum::scripthash_mempool_stats(&st.query, mp, sh) {
+            Ok(s) => json!({
+                "tx_count": s.tx_count,
+                "funded_txo_count": s.funded_txo_count,
+                "funded_txo_sum": s.funded_txo_sum,
+                "spent_txo_count": s.spent_txo_count,
+                "spent_txo_sum": s.spent_txo_sum,
+            }),
+            Err(e) => return Err(e),
+        }
     } else {
         mempool_stats
     };

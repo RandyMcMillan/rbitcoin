@@ -285,6 +285,9 @@ impl Store {
             }
             rewrite_meta_current(&path)?;
         }
+        if meta_ver == 18 && SCHEMA_VERSION >= 19 {
+            rewrite_meta_current(&path)?;
+        }
         let inwit_dir = resolve_inwit_dir(&layout)?;
         let txs = TxTable::open_inwit(&path, &inwit_dir)?;
         if layout.is_split() {
@@ -1989,6 +1992,28 @@ mod tests {
         }
         assert_eq!(read_store_meta_ver(&dir), 16);
         assert!(dir.join("scripthash.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema18_occupied_scripthash_upgrades_meta_to_19() {
+        let dir = tmp();
+        let sh = [0xabu8; 32];
+        {
+            let s = Store::create(&dir).unwrap();
+            s.scripthash
+                .put_create(&crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)))
+                .unwrap();
+            s.flush().unwrap();
+            assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
+        }
+        write_store_meta_ver(&dir, 18);
+        assert_eq!(read_store_meta_ver(&dir), 18);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 19);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

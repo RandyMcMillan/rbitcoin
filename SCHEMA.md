@@ -1,10 +1,11 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 18` (`rbitcoin_primitives`).  
-**Status:** 18 changes **indexes only** (`tx.head`, `scripthash*`). Class A / C
-stay 17 bytes. A 17 datadir with populated `tx.head` or `scripthash*` is
-**refused** (wipe those dirs, keep Class A, restart to rebuild). Empty 17
-indexes rewrite `meta` to 18.
+**Version:** `SCHEMA_VERSION = 19` (`rbitcoin_primitives`).  
+**Status:** 19 adds megakey SH **extent** pack8 mode 11 (`ver=2` last page).
+Class A / C stay 17 bytes. An 18 datadir (occupied or empty) rewrites `meta`
+to 19. An 18 binary refuses 19 `meta`. A 17 datadir with populated `tx.head`
+or `scripthash*` is **refused** (wipe those dirs, keep Class A, restart to
+rebuild). Empty 17 indexes rewrite `meta` to 19.
 
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
@@ -20,10 +21,12 @@ rematerialize). Sealed SH head/body kept only if pages are already delta
 (`ver=1`). Class A with 16-layout creates is refused the same as 15→17.
 Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
-**17→18 open:** If `tx.head` occupancy or any `scripthash*` data exists:
+**17→18/19 open:** If `tx.head` occupancy or any `scripthash*` data exists:
 `schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
-Empty 17 indexes rewrite `meta` to 18 **before** `TxTable::open` (so a following
+Empty 17 indexes rewrite `meta` to 19 **before** `TxTable::open` (so a following
 head rebuild cannot trip the refuse).  
+**18→19 open:** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
+Mode 10 paged heads stay readable; new megakeys write mode 11.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).

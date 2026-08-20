@@ -54,7 +54,7 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 | Method group | Status | Notes |
 |--------------|--------|-------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
-| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `chainwork` is real. `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers` (see [`docs/rpc.md`](./docs/rpc.md)) |
+| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `getblock` verbosity **1** is `txid.body` identities (no packed reconstruct). v0/v2 share one prev_txid cache. `chainwork` is real. `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers` (see [`docs/rpc.md`](./docs/rpc.md)) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire. Learned `addr`/`addrv2` must advertise `P2P_V2` |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy. `maxmempool` is the hub weight budget |
 | Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done | Class A unspent walk — **not** a coins-DB / HD-range scan |
@@ -77,8 +77,8 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 | server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below |
 | blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; outs from `txout`). Isolate may still hardcode `electrs.cakewallet.com` |
 | headers / block headers | done | Tip push on subscribe |
-| scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full** |
-| scripthash.get_mempool / subscribe | done | Status on mempool announce |
+| scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full**; tip advance restatuses hashes that appear in that block |
+| scripthash.get_mempool / subscribe | done | Status on mempool announce **and** on confirming tip |
 | transaction.get / get_merkle | done | get falls back to mempool |
 | transaction.broadcast | done | Mempool accept + P2P inv |
 | relayfee / estimatefee / histogram | done | Libre min + live median |
@@ -105,7 +105,7 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | Blocks list | done | `/blocks`, `/blocks/:start_height` (10 summaries, newest-first) |
 | Block | done | `/block/:hash` JSON, `/raw`, `/status`, `/header`, `/txids`, `/txid/:i`, `/txs[/:start]` |
 | Tx | done | `/tx/:txid` full JSON, `/hex`, `/raw`, `/status`, Electrum `/merkle-proof`, BIP37 `/merkleblock-proof`, `/outspend(s)` |
-| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]`; needs SH finalize |
+| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]`; `/utxo` matches Electrum listunspent (mempool funding + drop mempool-spent confirmed); `/txs` from SH join fks; needs SH finalize |
 | Mempool / fees | done | `/mempool`, `/mempool/txids`, `/mempool/recent` (accept-order ring), `/fee-estimates` |
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |

@@ -34,6 +34,12 @@ before 1.0).
   wallet/bench load. `--api-log` JSONL is unchanged. Connect/disconnect
   stay INFO.
 
+- **Serve lean (Electrum / Esplora / RPC):** block txids, merkle proofs, and
+  `getblock` verbosity 1 read `txid.body` (no packed `txout`). Esplora `/txs`
+  uses SH join fks. `/utxo` matches Electrum mempool listunspent. History
+  `to_height` skips Class A expand for later creates. Parent prevouts are
+  outs-only. Electrum scripthash subscribe restatuses on confirming tip.
+
 - **Esplora `/utxo`:** status comes from the SH join height plus unique
   headers (`block_hash` / `block_time`). No per-coin `tx.head` or
   Class A `get`. Balance / `/address` stats skip `txid.body`; listunspent

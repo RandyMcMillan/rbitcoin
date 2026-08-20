@@ -652,6 +652,7 @@ pub const KIND_SP_TXOUT: u8 = 12;
 pub const KIND_SP_INWIT: u8 = 13;
 /// SP-tweak machine: parent `txout.body` pread.
 pub const KIND_SP_PARENT: u8 = 14;
+pub const KIND_MPHF_G: u8 = 15;
 
 /// Pack `(kind, epoch, slot)` into `user_data`.
 ///
@@ -848,6 +849,7 @@ mod tests {
             KIND_SP_TXOUT,
             KIND_SP_INWIT,
             KIND_SP_PARENT,
+            KIND_MPHF_G,
         ];
         let mut seen = std::collections::HashSet::new();
         for k in kinds {

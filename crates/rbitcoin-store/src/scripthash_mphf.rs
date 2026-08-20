@@ -56,6 +56,10 @@ impl MphfHead {
         self.mphf.n() == 0
     }
 
+    pub fn g_bytes_resident(&self) -> usize {
+        self.mphf.g_bytes_resident()
+    }
+
     #[cfg(test)]
     pub fn pread_count(&self) -> u64 {
         self.preads.load(Ordering::Relaxed)
@@ -310,6 +314,7 @@ mod tests {
         assert!(val_path(&base).is_file());
         assert_eq!(std::fs::metadata(val_path(&base)).unwrap().len(), 16);
         let h2 = MphfHead::open(&base).unwrap();
+        assert_eq!(h2.g_bytes_resident(), 0);
         assert_eq!(h2.get(&key(1)).unwrap().unwrap(), a);
         assert!(h2.get(&key(7)).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);

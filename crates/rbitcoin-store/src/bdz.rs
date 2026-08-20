@@ -6,6 +6,7 @@ use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"BDZ1";
 const VERSION: u32 = 1;
@@ -24,6 +25,7 @@ enum GStore {
         path: PathBuf,
         off: u64,
         n_words: u32,
+        page_preads: AtomicU64,
     },
 }
 
@@ -93,6 +95,7 @@ impl BdzMphf {
         }
     }
 
+    #[cfg(test)]
     pub fn vertices(&self, key: u64) -> [u32; 3] {
         if self.n <= 1 {
             return [0, 0, 0];
@@ -101,26 +104,104 @@ impl BdzMphf {
     }
 
     pub fn index(&self, key: u64) -> Result<u32, StoreError> {
-        if self.n == 0 || self.n == 1 {
-            return Ok(0);
-        }
-        let [a, b, c] = self.vertices(key);
-        let ga = self.g_word(a)?;
-        let gb = self.g_word(b)?;
-        let gc = self.g_word(c)?;
-        Ok(ga.wrapping_add(gb).wrapping_add(gc) % self.n)
+        Ok(self.index_batch(&[key], &mut crate::IoCtx::none())?[0])
     }
 
-    fn g_word(&self, vertex: u32) -> Result<u32, StoreError> {
+    #[cfg(test)]
+    pub fn take_g_page_preads(&self) -> u64 {
         match &self.g {
-            GStore::Ram(g) => Ok(g[vertex as usize]),
-            GStore::Fd {
-                file,
-                path,
-                off,
-                n_words,
-            } => pread_g_word(file, path, *off, *n_words, vertex),
+            GStore::Fd { page_preads, .. } => page_preads.swap(0, Ordering::Relaxed),
+            GStore::Ram(_) => 0,
         }
+    }
+
+    pub fn index_batch(
+        &self,
+        keys: &[u64],
+        ctx: &mut crate::IoCtx<'_>,
+    ) -> Result<Vec<u32>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.n == 0 || self.n == 1 {
+            return Ok(vec![0; keys.len()]);
+        }
+        match &self.g {
+            GStore::Ram(g) => Ok(keys
+                .iter()
+                .map(|&k| {
+                    let [a, b, c] = hash3(k, self.seed, self.m);
+                    g[a as usize]
+                        .wrapping_add(g[b as usize])
+                        .wrapping_add(g[c as usize])
+                        % self.n
+                })
+                .collect()),
+            GStore::Fd { .. } => self.index_batch_fd(keys, ctx),
+        }
+    }
+
+    fn index_batch_fd(
+        &self,
+        keys: &[u64],
+        ctx: &mut crate::IoCtx<'_>,
+    ) -> Result<Vec<u32>, StoreError> {
+        let GStore::Fd {
+            file,
+            path,
+            off,
+            n_words,
+            page_preads,
+        } = &self.g
+        else {
+            return Err(StoreError::Corrupt("bdz mphf: fd batch"));
+        };
+        let verts: Vec<[u32; 3]> = keys.iter().map(|&k| hash3(k, self.seed, self.m)).collect();
+        let mut page_ids: Vec<u32> = verts
+            .iter()
+            .flat_map(|v| v.iter().map(|&vert| vert / G_PAGE_WORDS))
+            .collect();
+        page_ids.sort_unstable();
+        page_ids.dedup();
+        let mut words = vec![[0u32; 3]; keys.len()];
+        let mut fill = |page: u32, buf: &[u8]| {
+            let page_base = page * G_PAGE_WORDS;
+            for (ki, v) in verts.iter().enumerate() {
+                for (j, &vert) in v.iter().enumerate() {
+                    if vert / G_PAGE_WORDS != page {
+                        continue;
+                    }
+                    let rel = ((vert - page_base) as usize) * 4;
+                    words[ki][j] = u32::from_le_bytes(buf[rel..rel + 4].try_into().unwrap());
+                }
+            }
+        };
+        match ctx.session() {
+            Some(session) => {
+                stream_g_pages(
+                    session,
+                    file,
+                    path,
+                    *off,
+                    *n_words,
+                    &page_ids,
+                    page_preads,
+                    &mut fill,
+                )?;
+            }
+            None => {
+                for &page in &page_ids {
+                    let mut buf = [0u8; G_PAGE_BYTES];
+                    let n = load_g_page(file, path, *off, *n_words, page, &mut buf)?;
+                    page_preads.fetch_add(1, Ordering::Relaxed);
+                    fill(page, &buf[..n]);
+                }
+            }
+        }
+        Ok(words
+            .iter()
+            .map(|[a, b, c]| a.wrapping_add(*b).wrapping_add(*c) % self.n)
+            .collect())
     }
 
     pub fn build(keys: &[u64]) -> Result<Self, StoreError> {
@@ -213,6 +294,7 @@ impl BdzMphf {
                 path: path.to_path_buf(),
                 off: HEADER_LEN,
                 n_words,
+                page_preads: AtomicU64::new(0),
             },
         })
     }
@@ -234,28 +316,133 @@ fn pread_exact(file: &File, path: &Path, offset: u64, buf: &mut [u8]) -> Result<
     Ok(())
 }
 
-fn pread_g_word(
+fn g_page_need(n_words: u32, page: u32) -> usize {
+    let page_base = page * G_PAGE_WORDS;
+    if page_base >= n_words {
+        return 0;
+    }
+    (n_words - page_base).min(G_PAGE_WORDS) as usize * 4
+}
+
+fn load_g_page(
     file: &File,
     path: &Path,
     g_off: u64,
     n_words: u32,
-    vertex: u32,
-) -> Result<u32, StoreError> {
-    if vertex >= n_words {
-        return Err(StoreError::Corrupt("bdz mphf: vertex"));
+    page: u32,
+    buf: &mut [u8; G_PAGE_BYTES],
+) -> Result<usize, StoreError> {
+    let need = g_page_need(n_words, page);
+    if need == 0 {
+        return Ok(0);
     }
-    let page = vertex / G_PAGE_WORDS;
-    let rel = ((vertex % G_PAGE_WORDS) as usize) * 4;
     let page_base = page * G_PAGE_WORDS;
-    let page_words = (n_words - page_base).min(G_PAGE_WORDS) as usize;
-    let mut buf = [0u8; G_PAGE_BYTES];
     pread_exact(
         file,
         path,
         g_off + u64::from(page_base) * 4,
-        &mut buf[..page_words * 4],
+        &mut buf[..need],
     )?;
-    Ok(u32::from_le_bytes(buf[rel..rel + 4].try_into().unwrap()))
+    Ok(need)
+}
+
+fn stream_g_pages(
+    session: &mut crate::uring_session::UringSession,
+    file: &File,
+    path: &Path,
+    g_off: u64,
+    n_words: u32,
+    page_ids: &[u32],
+    page_preads: &AtomicU64,
+    fill: &mut impl FnMut(u32, &[u8]),
+) -> Result<(), StoreError> {
+    let n_pages = page_ids.len();
+    if n_pages == 0 {
+        return Ok(());
+    }
+    let fd = IoHandle::from_file(file);
+    let pool_n = (crate::uring_session::DEFAULT_ENTRIES as usize)
+        .min(n_pages)
+        .max(1);
+    let mut bufs: Vec<[u8; G_PAGE_BYTES]> = vec![[0u8; G_PAGE_BYTES]; pool_n];
+    let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
+    let mut free_slots: Vec<usize> = (0..pool_n).collect();
+    let mut next_page = 0usize;
+    let mut in_flight = 0usize;
+    session.begin_batch();
+    let epoch = session.epoch();
+    let run = (|| -> Result<(), StoreError> {
+        loop {
+            while next_page < n_pages
+                && !free_slots.is_empty()
+                && session.free_sq() > 0
+                && in_flight < pool_n
+            {
+                let slot = free_slots.pop().unwrap();
+                let pi = next_page;
+                next_page += 1;
+                let page = page_ids[pi];
+                let need = g_page_need(n_words, page);
+                if need == 0 {
+                    free_slots.push(slot);
+                    continue;
+                }
+                let off = g_off + u64::from(page * G_PAGE_WORDS) * 4;
+                let buf = &mut bufs[slot][..need];
+                buf.fill(0);
+                let ud = crate::uring_session::pack_ud(
+                    crate::uring_session::KIND_MPHF_G,
+                    epoch,
+                    slot as u32,
+                );
+                session.push_pread_flags(fd, off, buf, ud, 0)?;
+                slot_page[slot] = Some(pi);
+                in_flight += 1;
+            }
+            session.sync_submission();
+            let _ = session.submit();
+            if in_flight == 0 {
+                break;
+            }
+            let mut cqes = session.harvest_ready()?;
+            if cqes.is_empty() {
+                session.submit_and_wait_one()?;
+                cqes = session.harvest_ready()?;
+            }
+            for (ud, res) in cqes {
+                let (kind, _ep, slot) = crate::uring_session::unpack_ud(ud);
+                let slot = slot as usize;
+                if kind != crate::uring_session::KIND_MPHF_G
+                    || slot >= pool_n
+                    || slot_page[slot].is_none()
+                {
+                    return Err(StoreError::Corrupt("bdz g page bad slot"));
+                }
+                in_flight = in_flight.saturating_sub(1);
+                let pi = slot_page[slot].take().unwrap();
+                let page = page_ids[pi];
+                let need = g_page_need(n_words, page);
+                if res < 0 {
+                    return Err(StoreError::io(
+                        path,
+                        std::io::Error::from_raw_os_error(-res),
+                    ));
+                }
+                let mut n = res as usize;
+                if n < need {
+                    load_g_page(file, path, g_off, n_words, page, &mut bufs[slot])?;
+                    n = need;
+                }
+                n = n.min(need);
+                page_preads.fetch_add(1, Ordering::Relaxed);
+                fill(page, &bufs[slot][..n]);
+                free_slots.push(slot);
+            }
+        }
+        Ok(())
+    })();
+    session.drain_all()?;
+    run
 }
 
 fn try_peel(keys: &[u64], seed: u64, m: u32, n: u32) -> Option<Vec<u32>> {

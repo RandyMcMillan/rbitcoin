@@ -312,6 +312,13 @@ impl SegmentedTxHead {
         0
     }
 
+    pub fn sealed_mphf_g_resident_bytes(&self) -> u64 {
+        self.segments_snapshot()
+            .iter()
+            .map(|s| s.pack.as_ref().map(|p| p.g_bytes_resident()).unwrap_or(0))
+            .sum()
+    }
+
     /// In-RAM sealed fuse8 fingerprints (process heap, not file RSS).
     pub fn sealed_fuse_resident_bytes(&self) -> u64 {
         self.segments_snapshot()
@@ -322,6 +329,14 @@ impl SegmentedTxHead {
                     .map(|f| f.fingerprint_bytes() as u64)
                     .unwrap_or(0)
             })
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_sealed_g_page_preads(&self) -> u64 {
+        self.segments_snapshot()
+            .iter()
+            .map(|s| s.pack.as_ref().map(|p| p.take_g_page_preads()).unwrap_or(0))
             .sum()
     }
 
@@ -809,7 +824,7 @@ impl SegmentedTxHead {
             }
             if let Some(pack) = seg.pack.as_ref() {
                 let mixed_u: Vec<u64> = pass_keys.iter().map(fuse_key_from_mixed).collect();
-                let slots = pack.slots_for(&mixed_u)?;
+                let slots = pack.slots_for_ctx(&mixed_u, ctx)?;
                 let rel_lists = pack.read_rels_batch(&slots, ctx)?;
                 for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                     for r in rels {
@@ -1641,6 +1656,17 @@ mod tests {
         let cands = h.probe_candidates(&mixed(1)).unwrap();
         assert_eq!(cands.len(), 1, "cands={cands:?}");
         assert_eq!(cands[0], Fk(1));
+        let mut fuse_skip = false;
+        for i in 0..32u64 {
+            let _ = h.take_sealed_g_page_preads();
+            let miss = h.probe_candidates(&mixed(0xDEAD_BEEF + i)).unwrap();
+            let g_pages = h.take_sealed_g_page_preads();
+            if miss.is_empty() && g_pages == 0 {
+                fuse_skip = true;
+                break;
+            }
+        }
+        assert!(fuse_skip, "fuse miss must not pread g pages");
 
         let k = mixed(0xB1B0);
         h.insert_many(&mut [(k, Fk(821))], false).unwrap();

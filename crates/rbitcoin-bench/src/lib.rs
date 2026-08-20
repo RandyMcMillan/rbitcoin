@@ -17,6 +17,7 @@ mod electrum;
 mod esplora;
 mod hex;
 mod jsonrpc;
+mod out;
 mod progress;
 mod stats;
 mod suite;
@@ -24,9 +25,12 @@ mod targets;
 
 use crate::electrum::ElectrumClient;
 use crate::esplora::EsploraClient;
+use crate::out::write_csv;
 use crate::progress::Progress;
 use crate::stats::format_report;
-use crate::suite::{electrum_casa, electrum_hot, electrum_sparrow, esplora_casa, CasaOpts, Suite};
+use crate::suite::{
+    electrum_casa, electrum_hot, electrum_sparrow, esplora_casa, CasaOpts, RunOutcome, Suite,
+};
 use crate::targets::{load_corpus, load_targets};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -66,6 +70,8 @@ fn usage() -> String {
            --batch N                  sparrow page size (default 50)\n\
            --fetch-txs                sparrow: also blockchain.transaction.get\n\
            --timeout-secs N           per request (default 30)\n\
+           --out FILE                 per-key CSV (casa/hot): heights, counts,\n\
+                                      warm times per query (default 9 passes)\n\
            -h, --help\n\
            -V, --version\n\
          \n\
@@ -90,6 +96,7 @@ struct Cfg {
     batch: usize,
     fetch_txs: bool,
     timeout: Duration,
+    out: Option<PathBuf>,
 }
 
 impl Default for Cfg {
@@ -105,6 +112,7 @@ impl Default for Cfg {
             batch: 50,
             fetch_txs: false,
             timeout: Duration::from_secs(30),
+            out: None,
         }
     }
 }
@@ -153,6 +161,7 @@ fn parse_args(args: &[OsString]) -> Result<Cfg, String> {
                 cfg.timeout = Duration::from_secs(n.max(1));
             }
             "--fetch-txs" => cfg.fetch_txs = true,
+            "--out" => cfg.out = Some(PathBuf::from(take(args, &mut i, "--out")?)),
             other => return Err(format!("unknown argument {other}")),
         }
         i += 1;
@@ -181,6 +190,9 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         s == "--help" || s == "-h" || s == "--version" || s == "-V"
     }) {
         return Ok(());
+    }
+    if cfg.out.is_some() && cfg.suite == Suite::Sparrow {
+        return Err("--out is casa/hot only (per-key warm passes)".into());
     }
     let targets = match (&cfg.targets, &cfg.corpus) {
         (Some(path), _) => load_targets(path)?,
@@ -213,13 +225,13 @@ fn sparrow_units(n_keys: usize, batch: usize) -> u64 {
 }
 
 async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
-    let samples;
+    let outcome: RunOutcome;
     let backend;
     match (&cfg.electrum, &cfg.esplora) {
         (Some(addr), None) => {
             backend = "electrum";
             let mut c = ElectrumClient::connect(addr, cfg.timeout).await?;
-            samples = match cfg.suite {
+            outcome = match cfg.suite {
                 Suite::Casa => {
                     let mut progress = Progress::start(
                         format!("casa {backend}"),
@@ -255,7 +267,7 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
                 return Err("sparrow suite is Electrum-only (subscribe)".into());
             }
             let mut c = EsploraClient::connect(url, cfg.timeout).await?;
-            samples = match cfg.suite {
+            outcome = match cfg.suite {
                 Suite::Casa | Suite::Hot => {
                     let (warmup, passes, label) = if cfg.suite == Suite::Hot {
                         (0, 1, format!("hot {backend}"))
@@ -285,7 +297,20 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
         Suite::Sparrow => "sparrow",
         Suite::Hot => "hot",
     };
-    println!("{}", format_report(name, backend, &samples));
+    println!("{}", format_report(name, backend, &outcome.samples));
+    if let Some(path) = &cfg.out {
+        let passes = if cfg.suite == Suite::Hot {
+            1
+        } else {
+            cfg.passes.max(1) as usize
+        };
+        write_csv(path, &outcome.keys, passes)?;
+        eprintln!(
+            "rbitcoin-bench: wrote {} keys to {}",
+            outcome.keys.len(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -307,10 +332,16 @@ mod tests {
             OsString::from("/tmp/x"),
             OsString::from("--electrum"),
             OsString::from("127.0.0.1:1"),
+            OsString::from("--out"),
+            OsString::from("/tmp/casa.csv"),
         ];
         let c = parse_args(&args).unwrap();
         assert_eq!(c.batch, 25);
         assert_eq!(c.suite, Suite::Sparrow);
+        assert_eq!(
+            c.out.as_deref().map(|p| p.to_str().unwrap()),
+            Some("/tmp/casa.csv")
+        );
         let args = vec![
             OsString::from("rbitcoin-bench"),
             OsString::from("--corpus"),
@@ -327,6 +358,20 @@ mod tests {
     fn parse_unknown() {
         let args = vec![OsString::from("b"), OsString::from("--nope")];
         assert!(parse_args(&args).unwrap_err().contains("unknown"));
+    }
+
+    #[test]
+    fn sparrow_out_is_rejected() {
+        let code = cli_main([
+            OsString::from("rbitcoin-bench"),
+            OsString::from("--suite"),
+            OsString::from("sparrow"),
+            OsString::from("--out"),
+            OsString::from("/tmp/x.csv"),
+            OsString::from("--electrum"),
+            OsString::from("127.0.0.1:1"),
+        ]);
+        assert_eq!(code, ExitCode::from(1));
     }
 
     #[test]

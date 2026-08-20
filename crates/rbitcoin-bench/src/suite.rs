@@ -3,10 +3,31 @@
 use crate::electrum::ElectrumClient;
 use crate::esplora::EsploraClient;
 use crate::jsonrpc;
+use crate::out::KeyRow;
 use crate::progress::Progress;
 use crate::stats::Sample;
 use serde_json::{json, Value};
 use std::time::Duration;
+
+pub struct RunOutcome {
+    pub samples: Vec<Sample>,
+    pub keys: Vec<KeyRow>,
+}
+
+fn us(nanos: u64) -> u64 {
+    nanos / 1000
+}
+
+fn fill_key_meta(row: &mut KeyRow, hist: &Value, utxo: &Value, txs: u64, utxos: u64) {
+    let (lo, hi) = jsonrpc::height_span(hist);
+    row.oldest_tx = lo;
+    row.newest_tx = hi;
+    let (ulo, uhi) = jsonrpc::height_span(utxo);
+    row.oldest_utxo = ulo;
+    row.newest_utxo = uhi;
+    row.txs = txs;
+    row.utxos = utxos;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Suite {
@@ -45,12 +66,17 @@ pub async fn electrum_casa(
     targets: &[String],
     opts: &CasaOpts,
     progress: &mut Progress,
-) -> Result<Vec<Sample>, String> {
+) -> Result<RunOutcome, String> {
     let keep = opts.passes.max(1);
     let total = opts.warmup.saturating_add(keep);
     let mut samples = Vec::new();
+    let mut keys = Vec::new();
     for sh in targets {
         let params = json!([sh]);
+        let mut row = KeyRow {
+            scripthash: sh.clone(),
+            ..KeyRow::default()
+        };
         for pass in 0..total {
             let (bal, bns) = client
                 .call("blockchain.scripthash.get_balance", params.clone())
@@ -65,6 +91,10 @@ pub async fn electrum_casa(
             let utxo_n = jsonrpc::utxo_len(&utxo);
             let _ = bal;
             if pass >= opts.warmup {
+                fill_key_meta(&mut row, &hist, &utxo, history_n, utxo_n);
+                row.get_balance_us.push(us(bns));
+                row.get_history_us.push(us(hns));
+                row.listunspent_us.push(us(uns));
                 samples.push(Sample {
                     query: "get_balance",
                     nanos: bns,
@@ -86,9 +116,10 @@ pub async fn electrum_casa(
             }
             progress.tick();
         }
+        keys.push(row);
     }
     progress.finish();
-    Ok(samples)
+    Ok(RunOutcome { samples, keys })
 }
 
 pub async fn esplora_casa(
@@ -96,11 +127,16 @@ pub async fn esplora_casa(
     targets: &[String],
     opts: &CasaOpts,
     progress: &mut Progress,
-) -> Result<Vec<Sample>, String> {
+) -> Result<RunOutcome, String> {
     let keep = opts.passes.max(1);
     let total = opts.warmup.saturating_add(keep);
     let mut samples = Vec::new();
+    let mut keys = Vec::new();
     for sh in targets {
+        let mut row = KeyRow {
+            scripthash: sh.clone(),
+            ..KeyRow::default()
+        };
         for pass in 0..total {
             let (info, ins) = client.get_json(&format!("/scripthash/{sh}")).await?;
             let (txs, tns) = client.get_json(&format!("/scripthash/{sh}/txs")).await?;
@@ -111,6 +147,10 @@ pub async fn esplora_casa(
                 .unwrap_or_else(|| jsonrpc::history_len(&txs));
             let utxo_n = jsonrpc::utxo_len(&utxo);
             if pass >= opts.warmup {
+                fill_key_meta(&mut row, &txs, &utxo, history_n, utxo_n);
+                row.get_balance_us.push(us(ins));
+                row.get_history_us.push(us(tns));
+                row.listunspent_us.push(us(uns));
                 samples.push(Sample {
                     query: "get_balance",
                     nanos: ins,
@@ -132,9 +172,10 @@ pub async fn esplora_casa(
             }
             progress.tick();
         }
+        keys.push(row);
     }
     progress.finish();
-    Ok(samples)
+    Ok(RunOutcome { samples, keys })
 }
 
 pub async fn electrum_sparrow(
@@ -143,7 +184,7 @@ pub async fn electrum_sparrow(
     batch: usize,
     fetch_txs: bool,
     progress: &mut Progress,
-) -> Result<Vec<Sample>, String> {
+) -> Result<RunOutcome, String> {
     let batch = batch.max(1);
     let mut samples = Vec::new();
     let mut i = 0;
@@ -220,7 +261,10 @@ pub async fn electrum_sparrow(
         }
     }
     progress.finish();
-    Ok(samples)
+    Ok(RunOutcome {
+        samples,
+        keys: Vec::new(),
+    })
 }
 
 pub async fn electrum_hot(
@@ -228,11 +272,16 @@ pub async fn electrum_hot(
     targets: &[String],
     timeout: Duration,
     progress: &mut Progress,
-) -> Result<Vec<Sample>, String> {
+) -> Result<RunOutcome, String> {
     let _ = timeout;
     let mut samples = Vec::new();
+    let mut keys = Vec::new();
     for sh in targets {
         let params = json!([sh]);
+        let mut row = KeyRow {
+            scripthash: sh.clone(),
+            ..KeyRow::default()
+        };
         let (hist, hns) = client
             .call("blockchain.scripthash.get_history", params.clone())
             .await?;
@@ -246,16 +295,21 @@ pub async fn electrum_hot(
         let (utxo, uns) = client
             .call("blockchain.scripthash.listunspent", params)
             .await?;
+        let utxo_n = jsonrpc::utxo_len(&utxo);
+        fill_key_meta(&mut row, &hist, &utxo, history_n, utxo_n);
+        row.get_history_us.push(us(hns));
+        row.listunspent_us.push(us(uns));
         samples.push(Sample {
             query: "listunspent",
             nanos: uns,
             history_n,
-            utxo_n: jsonrpc::utxo_len(&utxo),
+            utxo_n,
         });
+        keys.push(row);
         progress.tick();
     }
     progress.finish();
-    Ok(samples)
+    Ok(RunOutcome { samples, keys })
 }
 
 #[cfg(test)]
@@ -291,9 +345,11 @@ mod tests {
                     "blockchain.scripthash.get_balance" => {
                         json!({"confirmed": 1, "unconfirmed": 0})
                     }
-                    "blockchain.scripthash.get_history" => json!([{"height":1,"tx_hash":"aa"}]),
+                    "blockchain.scripthash.get_history" => {
+                        json!([{"height":10,"tx_hash":"aa"},{"height":800000,"tx_hash":"bb"}])
+                    }
                     "blockchain.scripthash.listunspent" => {
-                        json!([{"tx_hash":"aa","tx_pos":0,"height":1,"value":1}])
+                        json!([{"tx_hash":"bb","tx_pos":0,"height":800000,"value":1}])
                     }
                     _ => json!(null),
                 };
@@ -307,9 +363,9 @@ mod tests {
             .unwrap();
         let sh = "ab".repeat(32);
         let mut progress = Progress::start("casa test", 3);
-        let samples = electrum_casa(
+        let out = electrum_casa(
             &mut c,
-            &[sh],
+            &[sh.clone()],
             &CasaOpts {
                 warmup: 1,
                 passes: 2,
@@ -318,9 +374,21 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(samples.len(), 6);
-        assert_eq!(samples[0].query, "get_balance");
-        assert_eq!(samples[0].history_n, 1);
+        assert_eq!(out.samples.len(), 6);
+        assert_eq!(out.samples[0].query, "get_balance");
+        assert_eq!(out.samples[0].history_n, 2);
+        assert_eq!(out.keys.len(), 1);
+        let k = &out.keys[0];
+        assert_eq!(k.scripthash, sh);
+        assert_eq!(k.oldest_tx, Some(10));
+        assert_eq!(k.newest_tx, Some(800_000));
+        assert_eq!(k.oldest_utxo, Some(800_000));
+        assert_eq!(k.newest_utxo, Some(800_000));
+        assert_eq!(k.txs, 2);
+        assert_eq!(k.utxos, 1);
+        assert_eq!(k.get_balance_us.len(), 2);
+        assert_eq!(k.get_history_us.len(), 2);
+        assert_eq!(k.listunspent_us.len(), 2);
     }
 
     #[tokio::test]
@@ -350,10 +418,11 @@ mod tests {
         let a = "ab".repeat(32);
         let b = "cd".repeat(32);
         let mut progress = Progress::start("sparrow test", 2);
-        let samples = electrum_sparrow(&mut c, &[a, b], 2, false, &mut progress)
+        let out = electrum_sparrow(&mut c, &[a, b], 2, false, &mut progress)
             .await
             .unwrap();
-        assert!(samples.iter().any(|s| s.query == "subscribe_batch"));
-        assert!(samples.iter().any(|s| s.query == "get_history_batch"));
+        assert!(out.samples.iter().any(|s| s.query == "subscribe_batch"));
+        assert!(out.samples.iter().any(|s| s.query == "get_history_batch"));
+        assert!(out.keys.is_empty());
     }
 }

@@ -216,7 +216,7 @@ impl ShJoinNeed {
         spender_identity: true,
     };
     pub(crate) const LISTUNSPENT: Self = Self {
-        create_identity: true,
+        create_identity: false,
         spender_identity: false,
     };
     pub(crate) const BALANCE: Self = Self {
@@ -584,13 +584,66 @@ impl Query {
         })
     }
 
+    fn fill_create_txids(
+        &self,
+        recs: &mut [ShJoinedOut],
+        unspent_only: bool,
+    ) -> Result<(), QueryError> {
+        let mut fks = Vec::new();
+        let mut seen = HashSet::new();
+        for rec in recs.iter() {
+            if unspent_only && rec.spent {
+                continue;
+            }
+            if rec.out.txid != [0u8; 32] {
+                continue;
+            }
+            if seen.insert(rec.out.create_tx_fk) {
+                fks.push(rec.out.create_tx_fk);
+            }
+        }
+        if fks.is_empty() {
+            return Ok(());
+        }
+        let txids = self.store.txids_get_many(&fks)?;
+        if txids.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH unspent identity batch length",
+            ));
+        }
+        let mut by_fk = HashMap::new();
+        for (fk, txid) in fks.iter().zip(txids.into_iter()) {
+            let Some(txid) = txid else {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH create missing txid.body",
+                ));
+            };
+            by_fk.insert(*fk, txid);
+        }
+        for rec in recs.iter_mut() {
+            if unspent_only && rec.spent {
+                continue;
+            }
+            if rec.out.txid != [0u8; 32] {
+                continue;
+            }
+            let Some(txid) = by_fk.get(&rec.out.create_tx_fk).copied() else {
+                return Err(StoreError::Corrupt("invariant: SH create identity miss"));
+            };
+            rec.out.txid = txid;
+        }
+        Ok(())
+    }
+
     /// Confirmed UTXOs for a scripthash.
     pub fn scripthash_listunspent(
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+        let mut joined = self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None)?;
+        self.fill_create_txids(&mut joined, true)?;
         let mut out = Vec::new();
-        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None)? {
+        for rec in joined {
             if self.join_out_spent(&rec)? {
                 continue;
             }
@@ -728,7 +781,7 @@ mod history_filter_tests {
     #[test]
     fn sh_join_need_display() {
         assert_eq!(ShJoinNeed::HISTORY.to_string(), "cs");
-        assert_eq!(ShJoinNeed::LISTUNSPENT.to_string(), "c");
+        assert_eq!(ShJoinNeed::LISTUNSPENT.to_string(), "-");
         assert_eq!(ShJoinNeed::BALANCE.to_string(), "-");
         assert_eq!(ShJoinNeed::CHAIN_STATS.to_string(), "-");
     }

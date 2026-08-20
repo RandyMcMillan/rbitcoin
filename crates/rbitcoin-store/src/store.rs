@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 thread_local! {
     static TX_FULL_GETS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    static TXID_GET_MANY: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Clear this-thread `get_tx_full` fk log (tests).
@@ -24,6 +25,16 @@ pub fn reset_tx_full_gets() {
 /// Fks that called `get_tx_full` on this thread since the last reset (tests).
 pub fn tx_full_gets() -> Vec<u64> {
     TX_FULL_GETS.with(|c| c.borrow().clone())
+}
+
+/// Clear this-thread `txids_get_many` fk log (tests).
+pub fn reset_txid_get_many() {
+    TXID_GET_MANY.with(|c| c.borrow_mut().clear());
+}
+
+/// Create fks passed to `txids_get_many` on this thread since the last reset (tests).
+pub fn txid_get_many_fks() -> Vec<u64> {
+    TXID_GET_MANY.with(|c| c.borrow().clone())
 }
 
 /// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.idx/` live under
@@ -507,6 +518,14 @@ impl Store {
 
     /// Page-grouped `txid.body` identity for scattered create fks.
     pub fn txids_get_many(&self, fks: &[Fk]) -> Result<Vec<Option<[u8; 32]>>, StoreError> {
+        TXID_GET_MANY.with(|c| {
+            let mut log = c.borrow_mut();
+            for fk in fks {
+                if let Some(id) = fk.get() {
+                    log.push(id);
+                }
+            }
+        });
         self.txs.txid_sidefile().get_many(fks)
     }
 

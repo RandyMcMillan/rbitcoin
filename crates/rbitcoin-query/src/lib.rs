@@ -2908,6 +2908,75 @@ mod tests {
     }
 
     #[test]
+    fn scripthash_listunspent_identity_skips_spent_creates() {
+        let (dir, q) = temp_query("sh-lu-id-spent");
+        assert!(q.index_mode().is_tip());
+
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut create_fks = Vec::new();
+        let mut create_txids = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            create_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            create_fks.push(q.block_tx_fks(Height(h)).unwrap()[0]);
+        }
+
+        for (i, spent_h) in [0u32, 1].into_iter().enumerate() {
+            let h = 3 + i as u32;
+            let (header, mut cb) = coinbase_block(h, prev, parent_hash);
+            cb.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x00])];
+            parent_hash = Some(header.hash);
+            let mut spend_txid = [0u8; 32];
+            spend_txid[0] = 0x5e;
+            spend_txid[31] = spent_h as u8;
+            let spend = TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: create_txids[spent_h as usize],
+                    create_fk: create_fks[spent_h as usize],
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x00])],
+            };
+            prev = q.connect_block(Height(h), &header, &[cb, spend]).unwrap();
+        }
+
+        let sh = script_hash(&[0x51]);
+        let keep = create_fks[2];
+        rbitcoin_store::reset_txid_get_many();
+        let utxos = q.scripthash_listunspent(&sh).unwrap();
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].tx_hash, create_txids[2]);
+        let ids = rbitcoin_store::txid_get_many_fks();
+        assert!(
+            ids.iter().all(|fk| *fk == keep.0),
+            "listunspent txid.body only for unspent create, not spent {:?}: {:?}",
+            [create_fks[0].0, create_fks[1].0],
+            ids
+        );
+        assert!(
+            ids.contains(&keep.0),
+            "unspent create must load txid.body: {ids:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn connect_chain_query_surface() {
         let (dir, q) = temp_query("connect");
         // Default Tip mode: durable SH on confirm so Electrum-style APIs work.

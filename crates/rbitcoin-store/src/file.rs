@@ -33,7 +33,7 @@ use crate::io_handle::IoHandle;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 // needs_sync: set on durable-payload writes; cleared after sync_data.
@@ -63,8 +63,20 @@ pub struct TableFile {
     kind: TableKind,
     /// Payload/HWM written since last successful `sync_data` (Class C barrier skip).
     needs_sync: AtomicBool,
-    /// When true, grow to `need + 1 MiB` instead of 64–256 MiB slabs (idx files).
-    grow_tight: AtomicBool,
+    /// [`GrowPolicy`] as u8. Idx uses 1 MiB; SH body uses 64 KiB; Class A slabs.
+    grow_policy: AtomicU8,
+}
+
+/// File capacity growth. SH body must not inherit Class A 64–256 MiB slabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GrowPolicy {
+    /// Double until 64 MiB, then 256 MiB headroom / 64 MiB steps.
+    Slab = 0,
+    /// `need + 1 MiB` (idx / dense u32).
+    Tight1MiB = 1,
+    /// Round `need` up to 64 KiB (SH shard / ovf body).
+    Align64k = 2,
 }
 
 fn table_open_opts() -> OpenOptions {
@@ -182,7 +194,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
-            grow_tight: AtomicBool::new(false),
+            grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
     }
 
@@ -210,7 +222,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
-            grow_tight: AtomicBool::new(false),
+            grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         };
         s.write_trailer(initial)?;
         Ok(s)
@@ -261,7 +273,7 @@ impl TableFile {
                 trailing_ext,
                 kind,
                 needs_sync: AtomicBool::new(false),
-                grow_tight: AtomicBool::new(false),
+                grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
             },
             trailing_ext,
         ))
@@ -385,7 +397,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
-            grow_tight: AtomicBool::new(false),
+            grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
     }
 
@@ -538,7 +550,15 @@ impl TableFile {
     /// Ensure the file covers at least `need` bytes (fallocate / set_len only).
     /// Idx / dense u32 tables: grow in ~1 MiB steps, not 256 MiB slabs.
     pub fn set_grow_tight(&self, tight: bool) {
-        self.grow_tight.store(tight, Ordering::Release);
+        self.set_grow_policy(if tight {
+            GrowPolicy::Tight1MiB
+        } else {
+            GrowPolicy::Slab
+        });
+    }
+
+    pub fn set_grow_policy(&self, policy: GrowPolicy) {
+        self.grow_policy.store(policy as u8, Ordering::Release);
     }
 
     pub fn ensure_capacity(&self, need: u64) -> Result<(), StoreError> {
@@ -554,8 +574,14 @@ impl TableFile {
         if need <= cur {
             return Ok(());
         }
-        if self.grow_tight.load(Ordering::Acquire) {
+        let policy = self.grow_policy.load(Ordering::Acquire);
+        if policy == GrowPolicy::Tight1MiB as u8 {
             let target = need.saturating_add(1 << 20).max(need);
+            return self.grow_to(target);
+        }
+        if policy == GrowPolicy::Align64k as u8 {
+            const STEP: u64 = 64 * 1024;
+            let target = need.div_ceil(STEP).saturating_mul(STEP).max(need);
             return self.grow_to(target);
         }
         let (headroom, step) = if cur >= 8 * 1024 * 1024 * 1024 {
@@ -741,6 +767,30 @@ mod advise_tests {
         assert!(
             on_disk < 2 * 1024 * 1024,
             "tight grow should stay near 1 MiB, got {on_disk}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn grow_align_64k_not_slab() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-grow-64k-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::ArrayLink).unwrap();
+        f.set_grow_policy(GrowPolicy::Align64k);
+        let payload = vec![0x11u8; 16];
+        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
+        let need = FILE_HEADER_LEN as u64 + 16;
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(on_disk >= need);
+        assert!(
+            on_disk < need + 128 * 1024,
+            "64 KiB grow must stay < 128 KiB above need, got {on_disk}"
+        );
+        assert!(
+            on_disk < 64 * 1024 * 1024,
+            "SH-style grow must not punch a 64 MiB slab, got {on_disk}"
         );
         let _ = std::fs::remove_file(&path);
     }

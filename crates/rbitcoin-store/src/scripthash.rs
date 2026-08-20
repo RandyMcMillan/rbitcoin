@@ -6,7 +6,7 @@
 
 use crate::compact::uleb128_len;
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
@@ -316,6 +316,10 @@ fn sh_ovf_body_path(dir: &Path) -> PathBuf {
 
 fn sh_shard_body_path(dir: &Path, shard: usize) -> PathBuf {
     sh_body_path(dir).join(format!("{shard:02x}"))
+}
+
+fn sh_set_body_grow(body: &TableFile) {
+    body.set_grow_policy(GrowPolicy::Align64k);
 }
 
 fn sh_body_layout_wipe_msg() -> String {
@@ -749,6 +753,7 @@ impl ScriptHashTable {
         let mut allocs = Vec::with_capacity(n_shards);
         for i in 0..n_shards {
             let f = TableFile::create(sh_shard_body_path(dir, i), TableKind::ScriptHash)?;
+            sh_set_body_grow(&f);
             let st = init_empty_body(&f)?;
             bodies.push(f);
             allocs.push(Mutex::new(st));
@@ -756,6 +761,7 @@ impl ScriptHashTable {
         let ovf_dir = dir.join("scripthash.ovf");
         std::fs::create_dir_all(&ovf_dir).map_err(|e| StoreError::io(&ovf_dir, e))?;
         let ovf = TableFile::create(sh_ovf_body_path(dir), TableKind::ScriptHash)?;
+        sh_set_body_grow(&ovf);
         let ovf_st = init_empty_body(&ovf)?;
         Ok(Self {
             store_dir: dir.to_path_buf(),
@@ -801,6 +807,7 @@ impl ScriptHashTable {
         let (bodies, ovf_body, allocs, ovf_alloc, alloc_ver) = match layout {
             ShBodyLayout::Shared => {
                 let f = TableFile::open(sh_body_path(dir), TableKind::ScriptHash)?;
+                sh_set_body_grow(&f);
                 let (state, ver) = read_alloc_header(&f)?;
                 (vec![f], None, vec![Mutex::new(state)], None, ver)
             }
@@ -810,6 +817,7 @@ impl ScriptHashTable {
                 let mut ver = SH_ALLOC_VERSION;
                 for i in 0..n_shards {
                     let f = TableFile::open(sh_shard_body_path(dir, i), TableKind::ScriptHash)?;
+                    sh_set_body_grow(&f);
                     let (state, v) = read_alloc_header(&f)?;
                     if i == 0 {
                         ver = v;
@@ -818,6 +826,7 @@ impl ScriptHashTable {
                     allocs.push(Mutex::new(state));
                 }
                 let ovf = TableFile::open(sh_ovf_body_path(dir), TableKind::ScriptHash)?;
+                sh_set_body_grow(&ovf);
                 let (ost, _) = read_alloc_header(&ovf)?;
                 (bodies, Some(ovf), allocs, Some(Mutex::new(ost)), ver)
             }
@@ -3488,6 +3497,39 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = shard << 6 | (i & 0x3f);
         k
+    }
+
+    #[test]
+    fn sh_body_create_grows_64k_not_slab() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let t = ScriptHashTable::create(&dir).unwrap();
+            let sh = script_hash(&[0x01]);
+            t.put_create(&rec(sh, 1, 0)).unwrap();
+            t.put_create(&rec(sh, 2, 0)).unwrap();
+            t.flush().unwrap();
+            drop(t);
+            for e in std::fs::read_dir(dir.join("scripthash.body")).unwrap() {
+                let p = e.unwrap().path();
+                if !p.is_file() {
+                    continue;
+                }
+                let on_disk = std::fs::metadata(&p).unwrap().len();
+                assert!(
+                    on_disk < 128 * 1024,
+                    "{} len {on_disk} must stay under 128 KiB after one slab",
+                    p.display()
+                );
+            }
+            let ovf_len = std::fs::metadata(dir.join("scripthash.ovf").join("body"))
+                .unwrap()
+                .len();
+            assert!(
+                ovf_len < 128 * 1024,
+                "ovf body {ovf_len} must stay under 128 KiB"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

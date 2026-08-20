@@ -371,8 +371,8 @@ fn prevout_from_block_or_query(ctx: &RpcContext, block: &Block, op: &OutPoint) -
             return tx.output.get(op.vout as usize).cloned();
         }
     }
-    let (fk, rec) = ctx.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
-    let out = ctx.query.tx_output_at_fk(fk, &rec, op.vout).ok()?;
+    let (fk, _rec) = ctx.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
+    let out = ctx.query.tx_output_at_fk(fk, op.vout).ok()?;
     Some(TxOut {
         value: Amount::from_sat(out.value.max(0) as u64),
         script_pubkey: ScriptBuf::from_bytes(out.script),

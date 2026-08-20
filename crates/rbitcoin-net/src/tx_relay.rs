@@ -107,7 +107,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         }
         let out: OutputRecord = self
             .query
-            .tx_output_at_fk(fk, &rec, op.vout)
+            .tx_output_at_fk(fk, op.vout)
             .ok()
             .or_else(|| self.query.tx_output(&rec, op.vout).ok())?;
         let value = if out.value < 0 {

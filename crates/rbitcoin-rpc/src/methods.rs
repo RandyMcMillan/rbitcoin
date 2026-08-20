@@ -2094,7 +2094,7 @@ fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     }
     let out = ctx
         .query
-        .tx_output_at_fk(fk, &rec, n)
+        .tx_output_at_fk(fk, n)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let height = ctx
         .query
@@ -2772,7 +2772,7 @@ fn gbt_chain_txout(ctx: &RpcContext, op: &OutPoint) -> Option<bitcoin::TxOut> {
     let (fk, rec) = ctx.query.get_tx_by_txid(&tid).ok().flatten()?;
     let out = ctx
         .query
-        .tx_output_at_fk(fk, &rec, op.vout)
+        .tx_output_at_fk(fk, op.vout)
         .ok()
         .or_else(|| ctx.query.tx_output(&rec, op.vout).ok())?;
     let value = if out.value < 0 {
@@ -5410,8 +5410,8 @@ mod tests {
                         return tx.output.get(op.vout as usize).cloned();
                     }
                 }
-                let (fk, rec) = hub.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
-                let out = hub.query.tx_output_at_fk(fk, &rec, op.vout).ok()?;
+                let (fk, _rec) = hub.query.get_tx_by_txid(&op.txid.to_byte_array()).ok()??;
+                let out = hub.query.tx_output_at_fk(fk, op.vout).ok()?;
                 Some(TxOut {
                     value: Amount::from_sat(out.value.max(0) as u64),
                     script_pubkey: ScriptBuf::from_bytes(out.script),

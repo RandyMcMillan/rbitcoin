@@ -184,8 +184,9 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
     // Prefer Class A stored txid so history cursors and /tx routes share identity
     // (reconstructed wire hash matches in production; fixtures may differ).
     let stored_txid = query
-        .get_tx(tx_fk)
-        .map(|t| t.txid)
+        .store()
+        .txs
+        .body_txid(tx_fk)
         .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
     let mut obj = json!({
         "txid": block_hash_hex(&stored_txid),
@@ -218,15 +219,14 @@ fn prevout_json(
 ) -> Result<Option<Value>, QueryError> {
     if let Some(inp) = stored_inputs.get(idx) {
         if !inp.create_fk.is_null() {
-            let parent = query.get_tx(inp.create_fk)?;
-            if let Ok(out) = query.tx_output_at_fk(inp.create_fk, &parent, inp.prev_index) {
+            if let Ok(out) = query.tx_output_at_fk(inp.create_fk, inp.prev_index) {
                 return Ok(Some(vout_fields(&out.script, out.value, network)));
             }
         }
     }
     let prev_txid = tin.previous_output.txid.to_byte_array();
-    if let Some((pfk, prec)) = query.get_tx_by_txid(&prev_txid)? {
-        if let Ok(out) = query.tx_output_at_fk(pfk, &prec, tin.previous_output.vout) {
+    if let Some(pfk) = query.tx_fk_by_txid(&prev_txid)? {
+        if let Ok(out) = query.tx_output_at_fk(pfk, tin.previous_output.vout) {
             return Ok(Some(vout_fields(&out.script, out.value, network)));
         }
     }
@@ -520,5 +520,145 @@ mod tests {
         assert_eq!(v["scriptpubkey_type"], "v0_p2wpkh");
         assert!(v["scriptpubkey"].as_str().unwrap().len() > 0);
         assert!(v.get("scriptpubkey_address").is_some());
+    }
+
+    #[test]
+    fn build_tx_json_prevout_is_outs_only_and_txid_from_body() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{
+            reset_tx_full_gets, tx_full_gets, HeaderRecord, InputRecord, OutputRecord, TxRecord,
+        };
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-esplora-prevout-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+
+        let mut merkle0 = [0u8; 32];
+        merkle0[0] = 0xaa;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle0,
+            hash: merkle0,
+        };
+        let mut create_txid = [0u8; 32];
+        create_txid[31] = 0xcb;
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid: create_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+        let hash1 = rbitcoin_store::block_header_hash(1, &h0.hash, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let mut spend1_txid = [0u8; 32];
+        spend1_txid[0] = 0x11;
+        spend1_txid[31] = 0xcd;
+        let ta1 = TxApply {
+            tx: TxRecord {
+                txid: spend1_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: create_txid,
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+        };
+        let hfk1 = q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+        let spend1_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+
+        let hash2 = rbitcoin_store::block_header_hash(1, &h1.hash, &[0x22; 32], 3, 0x207fffff, 2);
+        let h2 = HeaderRecord {
+            prev_fk: hfk1,
+            version: 1,
+            timestamp: 3,
+            bits: 0x207fffff,
+            nonce: 2,
+            merkle_root: [0x22; 32],
+            hash: hash2,
+        };
+        let mut spend2_txid = [0u8; 32];
+        spend2_txid[0] = 0x22;
+        spend2_txid[31] = 0xce;
+        let ta2 = TxApply {
+            tx: TxRecord {
+                txid: spend2_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: spend1_txid,
+                create_fk: spend1_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(48_0000_0000, vec![0x00])],
+        };
+        q.connect_block(Height(2), &h2, &[ta2]).unwrap();
+        let spend2_fk = q.block_tx_fks(Height(2)).unwrap()[0];
+
+        reset_tx_full_gets();
+        let v = build_tx_json(&q, spend2_fk, Network::Regtest).unwrap();
+        let parent_id = spend1_fk.get().unwrap();
+        assert!(
+            !tx_full_gets().contains(&parent_id),
+            "parent prevout must not zip inwit: {:?}",
+            tx_full_gets()
+        );
+        assert_eq!(v["txid"], block_hash_hex(&spend2_txid));
+        assert_eq!(v["vin"][0]["prevout"]["value"].as_i64(), Some(49_0000_0000));
+        assert_eq!(q.store().txs.body_txid(spend2_fk).unwrap(), spend2_txid);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

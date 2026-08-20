@@ -7,9 +7,24 @@ use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
 use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
 use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+thread_local! {
+    static TX_FULL_GETS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Clear this-thread `get_tx_full` fk log (tests).
+pub fn reset_tx_full_gets() {
+    TX_FULL_GETS.with(|c| c.borrow_mut().clear());
+}
+
+/// Fks that called `get_tx_full` on this thread since the last reset (tests).
+pub fn tx_full_gets() -> Vec<u64> {
+    TX_FULL_GETS.with(|c| c.borrow().clone())
+}
 
 /// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.idx/` live under
 /// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
@@ -476,6 +491,9 @@ impl Store {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+        if let Some(id) = fk.get() {
+            TX_FULL_GETS.with(|c| c.borrow_mut().push(id));
+        }
         self.txs.get_full(fk)
     }
 

@@ -2079,22 +2079,19 @@ impl Query {
             return Err(StoreError::NotFound);
         }
         if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            return self.tx_output_at_fk(fk, tx, vout);
+            return self.tx_output_at_fk(fk, vout);
         }
         Err(StoreError::NotFound)
     }
 
     /// Output at `vout` for a known create fk (packed Class A works without head).
-    pub fn tx_output_at_fk(
-        &self,
-        create_fk: Fk,
-        tx: &TxRecord,
-        vout: u32,
-    ) -> Result<OutputRecord, QueryError> {
-        if vout >= tx.output_count {
+    ///
+    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `inwit`.
+    pub fn tx_output_at_fk(&self, create_fk: Fk, vout: u32) -> Result<OutputRecord, QueryError> {
+        let (meta, outs) = self.store.get_tx_meta_and_outputs(create_fk)?;
+        if vout >= meta.output_count {
             return Err(StoreError::NotFound);
         }
-        let (_, _, outs) = self.store.get_tx_full(create_fk)?;
         outs.get(vout as usize).cloned().ok_or(StoreError::NotFound)
     }
 
@@ -2956,7 +2953,12 @@ mod tests {
         assert!(q.tx_fk_by_txid(&tx.txid).unwrap().is_some());
         let inp = q.tx_input_at_fk(fks[0], &tx, 0).unwrap();
         assert!(inp.is_coinbase());
-        let out = q.tx_output_at_fk(fks[0], &tx, 0).unwrap();
+        rbitcoin_store::reset_tx_full_gets();
+        let out = q.tx_output_at_fk(fks[0], 0).unwrap();
+        assert!(
+            rbitcoin_store::tx_full_gets().is_empty(),
+            "tx_output_at_fk is outs-only (no inwit zip)"
+        );
         assert_eq!(out.value, 50_0000_0000);
         assert!(!q.is_outpoint_spent(&tx.txid, 0).unwrap());
         assert!(!q.is_outpoint_spent_create(fks[0], 0).unwrap());
@@ -3062,7 +3064,7 @@ mod tests {
             }])
             .is_err());
         assert!(q.tx_input_at_fk(fks[0], &tx, 99).is_err());
-        assert!(q.tx_output_at_fk(fks[0], &tx, 99).is_err());
+        assert!(q.tx_output_at_fk(fks[0], 99).is_err());
         assert!(q.merkle_proof(Height(0), &[0xff; 32]).is_err());
         assert!(q.block_tx_fks(Height(50)).is_err());
         assert!(q.block_txids(Height(50)).is_err());

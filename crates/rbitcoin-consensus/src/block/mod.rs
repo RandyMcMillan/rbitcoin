@@ -179,18 +179,16 @@ pub fn validate_block_structure_with_pres(
 
     let has_witness_data = block_has_witness(block);
     let has_commitment = coinbase_has_witness_commitment(block);
-    if has_witness_data || has_commitment {
-        if has_witness_data
-            && ctx.enforce_height_gates
-            && !ctx.params.segwit_active_at(ctx.height.0)
-        {
-            return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
-        }
-        if has_commitment || ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates
-        {
-            let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
-            check_witness_commitment_with_wtxids(block, &non_cb)?;
-        }
+    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
+        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
+    }
+    // Core: BIP141 nonce only after SegWit. Pre-segwit aa21a9ed OP_RETURN is data.
+    // Archive has no reliable height — still check.
+    if (has_witness_data || has_commitment)
+        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
+    {
+        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+        check_witness_commitment_with_wtxids(block, &non_cb)?;
     }
 
     crate::plan_stamp_sub_stats::note_struct_parts(txid_ns, 0, walk_ns);

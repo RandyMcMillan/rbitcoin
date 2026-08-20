@@ -419,6 +419,26 @@ fn s8_mainnet_rejects_witness_before_segwit() {
     );
 }
 
+/// Core `CheckWitnessMalleation` only when SegWit is active. Pre-segwit
+/// `aa21a9ed` OP_RETURN is data (mainnet 434499), not a BIP141 nonce demand.
+#[test]
+fn s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce() {
+    let p = Box::leak(Box::new(ChainParams::mainnet()));
+    let height = 434_499;
+    assert!(!p.segwit_active_at(height));
+    let ctx = ValidationContext::at(p, Height(height), Milestone::NONE);
+    let mut cb = coinbase(height);
+    let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    spk.extend([0u8; 32]);
+    cb.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    });
+    let b = block_with(vec![cb, non_coinbase_spend(10)]);
+    validate_block_structure(&b, &ctx)
+        .expect("pre-segwit dummy commitment OP_RETURN is not bad-witness-nonce-size");
+}
+
 /// Archive prep must accept signet-shaped witness blocks (BIP325).
 /// Regression: GENESIS height + enforce gates rejected signet IBD entirely.
 #[test]

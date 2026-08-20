@@ -9,6 +9,7 @@ use crate::compact::{
 };
 use crate::segmented_head::SegmentedTxHead;
 use rbitcoin_primitives::{Fk, TableKind};
+use std::path::Path;
 
 fn tempfile_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -2247,6 +2248,7 @@ fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
                 true,
             )
             .unwrap();
+            t.flush_head().unwrap();
             assert!(
                 t.head.sealed_segment_count() >= 1,
                 "seal must succeed despite BIP30 duplicate fuse keys"
@@ -2319,6 +2321,7 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
                 .collect();
             t.put_full_batch_indexed(&meta_only_items(&more), true)
                 .unwrap();
+            t.flush_head().unwrap();
             assert!(t.head.sealed_segment_count() >= 1, "must have sealed");
             // Pre-reopen members must resolve through sealed fuse (no FN).
             for i in [1u64, 50, 200, 400] {
@@ -2368,8 +2371,8 @@ fn reopen_rewrites_legacy_v1_sealed_fuse_to_v2() {
                     .collect();
                 t.put_full_batch_indexed(&meta_only_items(&recs), true)
                     .unwrap();
-                assert!(t.head.sealed_segment_count() >= 1);
                 t.flush().unwrap();
+                assert!(t.head.sealed_segment_count() >= 1);
             }
             let fuse_path = dir.join("tx.head").join("000000.fuse8");
             assert!(fuse_path.is_file());
@@ -2436,6 +2439,7 @@ fn soft_span_roll_on_open_segment_not_only_first() {
             for i in 1..=6u64 {
                 t.put_full_batch_indexed(&[mk(i)], true).unwrap();
             }
+            t.flush_head().unwrap();
             let segs_mid = t.head_segment_count();
             let sealed_mid = t.head.sealed_segment_count();
             assert!(
@@ -2445,6 +2449,7 @@ fn soft_span_roll_on_open_segment_not_only_first() {
             for i in 7..=12u64 {
                 t.put_full_batch_indexed(&[mk(i)], true).unwrap();
             }
+            t.flush_head().unwrap();
             let sealed = t.head.sealed_segment_count();
             assert!(
                 sealed > sealed_mid,
@@ -2530,6 +2535,70 @@ fn refuse_legacy_mono_head_on_create() {
     let s = format!("{err}");
     assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for ent in std::fs::read_dir(src).unwrap() {
+        let ent = ent.unwrap();
+        let to = dst.join(ent.file_name());
+        if ent.path().is_dir() {
+            copy_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
+}
+
+/// Kill mid-seal: meta still has an unsealed non-tail OA. Open rebuilds fuse
+/// keys from Class A and seals it before returning.
+#[test]
+fn open_seals_unsealed_nontail_after_copied_roll() {
+    let dir = tempfile_dir("bg-seal-live");
+    let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+    let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+    let n = 205u64;
+    let recs: Vec<TxRecord> = (0..n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }
+        })
+        .collect();
+    t.put_full_batch_indexed(&meta_only_items(&recs), true)
+        .unwrap();
+    assert_eq!(
+        t.head.sealed_segment_count(),
+        0,
+        "roll must leave the seal unpublished"
+    );
+    assert!(
+        t.head.unsealed_ranges().len() >= 2,
+        "tail + sealing OA, unsealed={:?}",
+        t.head.unsealed_ranges()
+    );
+    let copy = tempfile_dir("bg-seal-copy");
+    copy_tree(&dir, &copy);
+    let t2 = TxTable::open(&copy).unwrap();
+    assert!(
+        t2.head.sealed_segment_count() >= 1,
+        "open must rebuild keys and seal leftover nontail"
+    );
+    for i in [1u64, 100, 204, 205] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(t2.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&copy);
 }
 
 fn rec_meta(version: i32, locktime: u32, n_in: u32, n_out: u32) -> TxRecord {

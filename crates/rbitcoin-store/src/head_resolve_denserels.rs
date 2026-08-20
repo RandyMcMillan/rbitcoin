@@ -1,7 +1,7 @@
 //! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
 //! Three probe+identity waves (uring when available):
-//! 1. **Open** — unsealed tail (age 0)
+//! 1. **Open** — every unsealed OA (insert tail + in-flight seal)
 //! 2. **Sealed-hot** — sealed ages 1..=3 (only keys still unfinished)
 //! 3. **Cold** — sealed ages ≥4 (only keys still unfinished)
 //!
@@ -1120,6 +1120,7 @@ mod tests {
             ));
         }
         t.put_full_batch_indexed(&items, true).unwrap();
+        t.flush_head().unwrap();
         assert!(
             t.head.sealed_segment_count() >= 4,
             "need a cold sealed age, segs={} sealed={}",

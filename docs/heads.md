@@ -35,7 +35,7 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no 
 ## Lookup path (txid → create_fk)
 
 1. Live pipeline pin by prev_txid (same Weak as outs).
-2. **Open** wave: unsealed tail (age 0) — probe, two-shot `txid.body`, walk newest-first.
+2. **Open** wave: every unsealed OA (insert tail + in-flight seal), newest-first — probe, two-shot `txid.body`.
 3. Unfinished keys: **sealed-hot** (ages 1..=3), same two-shot + walk.
 4. Still unfinished or **unconnected** after those: **cold** (sealed ages ≥4).
 

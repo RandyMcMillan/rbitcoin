@@ -531,9 +531,8 @@ impl TxTable {
                 t.backfill_head_from(covered.saturating_add(1))?;
                 t.head.flush()?;
             }
-            // Open segment may have creates from a prior process; rebuild fuse
-            // keys from Class A so a later seal never FN pre-restart members.
-            t.rebuild_open_segment_fuse_keys()?;
+            t.rebuild_unsealed_fuse_keys()?;
+            t.head.seal_unsealed_nontail()?;
             // Soft-migrate sealed fuse8 v1 (xorf/bincode) → v2 without wiping head.
             t.rewrite_legacy_sealed_fuses()?;
         }
@@ -592,40 +591,37 @@ impl TxTable {
         Ok(())
     }
 
-    /// Rebuild open-tail fuse keys from Class A body txids (crash/restart safe).
-    fn rebuild_open_segment_fuse_keys(&self) -> Result<(), StoreError> {
-        let Some((first_fk, count)) = self.head.open_tail_range() else {
-            return Ok(());
-        };
-        if count == 0 {
-            return Ok(());
-        }
-        // After Class A count repair, open-tail may still list fks past body/txid
-        // HWM. `replace_open_keys` requires exact open-tail length — skip rebuild
-        // when head led identity (stale fuse keys until next seal path rebuilds).
+    /// Rebuild fuse keys for every unsealed segment from Class A (crash/restart).
+    fn rebuild_unsealed_fuse_keys(&self) -> Result<(), StoreError> {
         let n_body = self.count();
-        let last_fk = first_fk.saturating_add(count).saturating_sub(1);
-        if first_fk == 0 || first_fk > n_body || last_fk > n_body {
-            rbitcoin_log::warn!(
-                "store: skip open-tail fuse rebuild (head first={first_fk} count={count} \
-                 body={n_body}); head may lead truncated Class A"
+        for (file_id, first_fk, count) in self.head.unsealed_ranges() {
+            if count == 0 {
+                continue;
+            }
+            let last_fk = first_fk.saturating_add(count).saturating_sub(1);
+            if first_fk == 0 || first_fk > n_body || last_fk > n_body {
+                rbitcoin_log::warn!(
+                    "store: skip unsealed fuse rebuild file_id={file_id} first={first_fk} \
+                     count={count} body={n_body}; head may lead truncated Class A"
+                );
+                continue;
+            }
+            let txids = self.body_txid_range(first_fk, last_fk)?;
+            if txids.len() as u64 != count {
+                return Err(StoreError::Corrupt(
+                    "tx.head unsealed body range count mismatch",
+                ));
+            }
+            let keys: Vec<u64> = txids
+                .iter()
+                .map(|txid| crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(txid)))
+                .collect();
+            self.head.replace_open_keys_for(file_id, keys)?;
+            rbitcoin_log::info!(
+                "store: tx.head unsealed fuse keys rebuilt file_id={file_id} \
+                 first_fk={first_fk} count={count}"
             );
-            return Ok(());
         }
-        let txids = self.body_txid_range(first_fk, last_fk)?;
-        if txids.len() as u64 != count {
-            return Err(StoreError::Corrupt(
-                "tx.head open-tail body range count mismatch",
-            ));
-        }
-        let keys: Vec<u64> = txids
-            .iter()
-            .map(|txid| crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(txid)))
-            .collect();
-        self.head.replace_open_keys(keys)?;
-        rbitcoin_log::info!(
-            "store: tx.head open-tail fuse keys rebuilt first_fk={first_fk} count={count}"
-        );
         Ok(())
     }
 

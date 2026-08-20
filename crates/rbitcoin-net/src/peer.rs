@@ -850,18 +850,14 @@ fn queue_due_tx_invs(
     // keeps the 30s age gate (`mempool_reorg.py:71`).
     let now = session.clock_now();
     let clock_due = session.take_tx_inv_due(now);
-    let live = mp.list_live();
-    let age_due = live
-        .iter()
-        .any(|(_, _, _, tx)| mp.tx_inv_due(&tx.compute_wtxid()));
-    let unbroadcast_due =
-        !mp.relay_enabled() && live.iter().any(|(txid, _, _, _)| mp.is_unbroadcast(txid));
+    let age_due = mp.any_tx_inv_due();
+    let unbroadcast_due = !mp.relay_enabled() && mp.unbroadcast_count() > 0;
     if !clock_due && !age_due && !unbroadcast_due {
         return;
     }
     let mut n = 0u32;
     let mut max_ann = session.last_inv_sequence();
-    for (txid, _, _, tx) in live {
+    for (txid, w) in mp.list_live_wtxids() {
         if from_this_peer.contains_key(&txid) {
             continue;
         }
@@ -871,7 +867,6 @@ fn queue_due_tx_invs(
         if !mp.relay_enabled() && !mp.is_unbroadcast(&txid) {
             continue;
         }
-        let w = tx.compute_wtxid();
         if session.has_announced_wtx(&w) {
             continue;
         }
@@ -3294,6 +3289,111 @@ mod tests {
                 out_rx.try_recv().is_err(),
                 "relay-on inbound must wait 30s even for unbroadcast"
             );
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// 50ms session tick must not `list_live()` (clone every mempool body).
+    #[test]
+    fn queue_due_tx_invs_idle_tick_does_not_clone_live_bodies() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::Height;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::runtime::Builder;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("inv-tick-noclone");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+                .expect("pad maturity");
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            mp.set_relay_enabled(true);
+            assert!(hub.attach_mempool(mp).is_ok());
+            let cb = hub
+                .query
+                .reconstruct_block_at_height(Height(1))
+                .unwrap()
+                .txdata[0]
+                .compute_txid();
+            let tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: cb, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9999_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let mp = hub.mempool().unwrap();
+            mp.accept_tx(&tx).expect("accept");
+            let _ = mp.sample_reset_perf();
+
+            let peers = crate::peers::PeerHub::new();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            let inbound =
+                peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            queue_due_tx_invs(&hub, inbound.as_ref(), &HashMap::new(), &out_tx);
+            let idle = mp.sample_reset_perf();
+            assert_eq!(
+                idle.list_live, 0,
+                "idle INV tick must not list_live/clone bodies (got {})",
+                idle.list_live
+            );
+            assert!(
+                out_rx.try_recv().is_err(),
+                "idle tick must not INV when nothing is due"
+            );
+
+            let outbound = peers.register(
+                addr,
+                addr,
+                &ver,
+                false,
+                crate::peers::PeerConnType::OutboundFullRelay,
+            );
+            peers.request_all_tx_inv();
+            queue_due_tx_invs(&hub, outbound.as_ref(), &HashMap::new(), &out_tx);
+            let flush = mp.sample_reset_perf();
+            assert_eq!(
+                flush.list_live, 0,
+                "clock_due INV must use wtxid index, not list_live (got {})",
+                flush.list_live
+            );
+            match out_rx.try_recv().expect("clock_due must INV") {
+                NetworkMessage::Inv(v) => {
+                    assert_eq!(v, vec![Inventory::WTx(tx.compute_wtxid())]);
+                }
+                other => panic!("expected WTx inv, got {other:?}"),
+            }
             let _ = std::fs::remove_dir_all(dir);
         });
     }

@@ -20,6 +20,11 @@ before 1.0).
 
 ### Changed
 
+- **Tip-follow INV tick:** `queue_due_tx_invs` no longer `list_live()`
+  (clone every mempool body + `compute_wtxid`) on the 50 ms session
+  poll. Idle ticks return after a cheap due-check; flushes walk stored
+  graph wtxids.
+
 - **`--sptweaks` backfill:** one-core completion machine (`txout`, then
   `inwit`/parents only for P2TR) and batched height-blob + idx writes.
   Mainnet origin→tip on SSD is typically **about 1–2 hours** (was several

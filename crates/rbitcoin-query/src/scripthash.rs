@@ -154,6 +154,57 @@ pub fn apply_history_filter(
     out
 }
 
+fn history_items_from_joined(
+    joined: &[ShJoinedOut],
+    filter: &HistoryFilter,
+) -> Vec<ScriptHashHistoryItem> {
+    let mut by_txid: BTreeMap<[u8; 32], (i64, Fk)> = BTreeMap::new();
+    let to_excl = filter.to_height;
+    for rec in joined {
+        if let Some(to) = to_excl {
+            if i64::from(rec.out.create_height) >= to {
+                continue;
+            }
+        }
+        let ch = i64::from(rec.out.create_height);
+        by_txid
+            .entry(rec.out.txid)
+            .and_modify(|(h, fk)| {
+                if ch < *h {
+                    *h = ch;
+                    *fk = rec.out.create_tx_fk;
+                }
+            })
+            .or_insert((ch, rec.out.create_tx_fk));
+        for sp in &rec.spenders {
+            if let Some(to) = to_excl {
+                if i64::from(sp.height) >= to {
+                    continue;
+                }
+            }
+            let sh = i64::from(sp.height);
+            by_txid
+                .entry(sp.txid)
+                .and_modify(|(h, fk)| {
+                    if sh < *h {
+                        *h = sh;
+                        *fk = sp.fk;
+                    }
+                })
+                .or_insert((sh, sp.fk));
+        }
+    }
+    let items: Vec<ScriptHashHistoryItem> = by_txid
+        .into_iter()
+        .map(|(txid, (height, tx_fk))| ScriptHashHistoryItem {
+            height,
+            txid,
+            tx_fk,
+        })
+        .collect();
+    apply_history_filter(&items, filter)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptHashBalance {
     pub confirmed: i64,
@@ -201,6 +252,16 @@ pub(crate) struct ShJoinedOut {
     pub(crate) spent: bool,
     pub(crate) spender_fks: Vec<Fk>,
     pub(crate) spenders: Vec<ShSpender>,
+}
+
+/// Last scripthash expand+spend join for one Electrum connection.
+///
+/// Holds BALANCE-level outs + spentness. Identity is filled in place on
+/// history / listunspent. Invalid once [`Query::tip_height`] moves.
+pub struct ShJoinSlot {
+    scripthash: [u8; 32],
+    tip_height: u32,
+    joined: Vec<ShJoinedOut>,
 }
 
 /// Which identity sidefiles this SH join must fill.
@@ -384,6 +445,131 @@ impl Query {
         Ok(out)
     }
 
+    fn tip_height_u32(&self) -> u32 {
+        self.tip_height().map(|h| h.0).unwrap_or(0)
+    }
+
+    fn sh_join_slot_hit(slot: &ShJoinSlot, scripthash: &[u8; 32], tip: u32) -> bool {
+        slot.scripthash == *scripthash && slot.tip_height == tip
+    }
+
+    fn ensure_sh_join_slot(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<(), QueryError> {
+        let tip = self.tip_height_u32();
+        if slot
+            .as_ref()
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, tip))
+        {
+            return Ok(());
+        }
+        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)?;
+        *slot = Some(ShJoinSlot {
+            scripthash: *scripthash,
+            tip_height: tip,
+            joined,
+        });
+        Ok(())
+    }
+
+    fn enrich_joined(&self, recs: &mut [ShJoinedOut], need: ShJoinNeed) -> Result<(), QueryError> {
+        if need.create_identity {
+            self.fill_create_txids(recs, false)?;
+        }
+        if need.spender_identity {
+            self.fill_spender_identity(recs)?;
+        }
+        Ok(())
+    }
+
+    fn fill_spender_identity(&self, recs: &mut [ShJoinedOut]) -> Result<(), QueryError> {
+        let mut fks = Vec::new();
+        let mut seen = HashSet::new();
+        for rec in recs.iter() {
+            if rec.spender_fks.is_empty() || !rec.spenders.is_empty() {
+                continue;
+            }
+            for fk in &rec.spender_fks {
+                if seen.insert(*fk) {
+                    fks.push(*fk);
+                }
+            }
+        }
+        if fks.is_empty() {
+            return Ok(());
+        }
+        let txids = self.store.txids_get_many(&fks)?;
+        let heights = self.store.tx_height_get_batch(&fks)?;
+        if txids.len() != fks.len() || heights.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH spender identity/height batch length",
+            ));
+        }
+        let mut id_by_fk = HashMap::new();
+        for (i, fk) in fks.iter().enumerate() {
+            let Some(txid) = txids[i] else {
+                return Err(StoreError::Corrupt(
+                    "invariant: SH spender missing txid.body",
+                ));
+            };
+            id_by_fk.insert(*fk, (txid, heights[i].unwrap_or(0)));
+        }
+        for rec in recs.iter_mut() {
+            if rec.spender_fks.is_empty() || !rec.spenders.is_empty() {
+                continue;
+            }
+            let mut spenders = Vec::with_capacity(rec.spender_fks.len());
+            for fk in &rec.spender_fks {
+                let Some((txid, height)) = id_by_fk.get(fk).copied() else {
+                    return Err(StoreError::Corrupt("invariant: SH spender identity miss"));
+                };
+                spenders.push(ShSpender {
+                    fk: *fk,
+                    txid,
+                    height,
+                });
+            }
+            rec.spenders = spenders;
+        }
+        Ok(())
+    }
+
+    fn balance_from_joined(&self, recs: &[ShJoinedOut]) -> Result<ScriptHashBalance, QueryError> {
+        let mut confirmed = 0i64;
+        for rec in recs {
+            if !self.join_out_spent(rec)? {
+                confirmed = confirmed.saturating_add(rec.out.value);
+            }
+        }
+        Ok(ScriptHashBalance {
+            confirmed,
+            unconfirmed: 0,
+        })
+    }
+
+    fn listunspent_from_joined(
+        &self,
+        recs: &[ShJoinedOut],
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+        let mut out = Vec::new();
+        for rec in recs {
+            if self.join_out_spent(rec)? {
+                continue;
+            }
+            out.push(ScriptHashUtxo {
+                tx_hash: rec.out.txid,
+                tx_pos: rec.out.vout,
+                height: rec.out.create_height,
+                value: rec.out.value,
+                create_tx_fk: rec.out.create_tx_fk,
+            });
+        }
+        out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
+        Ok(out)
+    }
+
     fn join_spends_wave(
         &self,
         creates: &[ScriptHashOutpoint],
@@ -520,51 +706,40 @@ impl Query {
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
         let joined =
             self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY, filter.to_height)?;
-        let mut by_txid: BTreeMap<[u8; 32], (i64, Fk)> = BTreeMap::new();
-        let to_excl = filter.to_height;
-        for rec in joined {
-            if let Some(to) = to_excl {
-                if i64::from(rec.out.create_height) >= to {
-                    continue;
-                }
-            }
-            let ch = i64::from(rec.out.create_height);
-            by_txid
-                .entry(rec.out.txid)
-                .and_modify(|(h, fk)| {
-                    if ch < *h {
-                        *h = ch;
-                        *fk = rec.out.create_tx_fk;
-                    }
-                })
-                .or_insert((ch, rec.out.create_tx_fk));
-            for sp in rec.spenders {
-                if let Some(to) = to_excl {
-                    if i64::from(sp.height) >= to {
-                        continue;
-                    }
-                }
-                let sh = i64::from(sp.height);
-                by_txid
-                    .entry(sp.txid)
-                    .and_modify(|(h, fk)| {
-                        if sh < *h {
-                            *h = sh;
-                            *fk = sp.fk;
-                        }
-                    })
-                    .or_insert((sh, sp.fk));
-            }
+        Ok(history_items_from_joined(&joined, filter))
+    }
+
+    /// Confirmed history using a connection-local join slot when `to_height` is open
+    /// or the slot already holds this scripthash at the current tip.
+    pub fn scripthash_history_slot(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+        self.scripthash_history_filtered_slot(scripthash, &HistoryFilter::open(), slot)
+    }
+
+    /// Slot-aware [`Self::scripthash_history_filtered`].
+    pub fn scripthash_history_filtered_slot(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+        let tip = self.tip_height_u32();
+        let hit = slot
+            .as_ref()
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, tip));
+        if !hit && filter.to_height.is_some() {
+            return self.scripthash_history_filtered(scripthash, filter);
         }
-        let items: Vec<ScriptHashHistoryItem> = by_txid
-            .into_iter()
-            .map(|(txid, (height, tx_fk))| ScriptHashHistoryItem {
-                height,
-                txid,
-                tx_fk,
-            })
-            .collect();
-        Ok(apply_history_filter(&items, filter))
+        self.ensure_sh_join_slot(scripthash, slot)?;
+        let recs = &mut slot
+            .as_mut()
+            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
+            .joined;
+        self.enrich_joined(recs, ShJoinNeed::HISTORY)?;
+        Ok(history_items_from_joined(recs, filter))
     }
 
     /// True when `height` creates or spends a confirmed outpoint for `scripthash`.
@@ -610,16 +785,22 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
-        let mut confirmed = 0i64;
-        for rec in self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)? {
-            if !self.join_out_spent(&rec)? {
-                confirmed = confirmed.saturating_add(rec.out.value);
-            }
-        }
-        Ok(ScriptHashBalance {
-            confirmed,
-            unconfirmed: 0,
-        })
+        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)?;
+        self.balance_from_joined(&joined)
+    }
+
+    /// Slot-aware [`Self::scripthash_balance`].
+    pub fn scripthash_balance_slot(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<ScriptHashBalance, QueryError> {
+        self.ensure_sh_join_slot(scripthash, slot)?;
+        let recs = &slot
+            .as_ref()
+            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
+            .joined;
+        self.balance_from_joined(recs)
     }
 
     fn fill_create_txids(
@@ -680,21 +861,22 @@ impl Query {
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let mut joined = self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None)?;
         self.fill_create_txids(&mut joined, true)?;
-        let mut out = Vec::new();
-        for rec in joined {
-            if self.join_out_spent(&rec)? {
-                continue;
-            }
-            out.push(ScriptHashUtxo {
-                tx_hash: rec.out.txid,
-                tx_pos: rec.out.vout,
-                height: rec.out.create_height,
-                value: rec.out.value,
-                create_tx_fk: rec.out.create_tx_fk,
-            });
-        }
-        out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
-        Ok(out)
+        self.listunspent_from_joined(&joined)
+    }
+
+    /// Slot-aware [`Self::scripthash_listunspent`].
+    pub fn scripthash_listunspent_slot(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+        self.ensure_sh_join_slot(scripthash, slot)?;
+        let recs = &mut slot
+            .as_mut()
+            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
+            .joined;
+        self.fill_create_txids(recs, true)?;
+        self.listunspent_from_joined(recs)
     }
 
     /// Confirmed unspents whose `scriptPubKey` is in `scripts`.

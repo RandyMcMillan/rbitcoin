@@ -161,7 +161,7 @@ pub use recent_creates::{
 };
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
-    ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
+    ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
 };
 pub use stamp::{fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp};
 pub use wave_prevout::ThinInput;
@@ -3042,6 +3042,56 @@ mod tests {
             body_ok_reads(),
             0,
             "spend-in-block probe is prevout create_fk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripthash_join_slot_reuses_class_a_until_tip() {
+        let (dir, q) = temp_query("sh-slot-reuse");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut create_txids = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            create_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let sh = script_hash(&[0x51]);
+        let mut slot = None;
+        reset_body_ok_reads();
+        let bal = q.scripthash_balance_slot(&sh, &mut slot).unwrap();
+        assert_eq!(bal.confirmed, 150_0000_0000);
+        let after_bal = body_ok_reads();
+        assert_eq!(after_bal, 3, "first join expands each create once");
+
+        let hist = q.scripthash_history_slot(&sh, &mut slot).unwrap();
+        assert_eq!(hist.len(), 3);
+        assert_eq!(body_ok_reads(), after_bal, "history must reuse packed outs");
+        let hist_txids: Vec<_> = hist.iter().map(|i| i.txid).collect();
+        for txid in &create_txids {
+            assert!(
+                hist_txids.contains(txid),
+                "history identity from slot enrich"
+            );
+        }
+
+        let utxos = q.scripthash_listunspent_slot(&sh, &mut slot).unwrap();
+        assert_eq!(utxos.len(), 3);
+        assert_eq!(
+            body_ok_reads(),
+            after_bal,
+            "listunspent must reuse packed outs"
+        );
+
+        let (header, ta) = coinbase_block(3, prev, parent_hash);
+        q.connect_block(Height(3), &header, &[ta]).unwrap();
+        q.scripthash_balance_slot(&sh, &mut slot).unwrap();
+        assert!(
+            body_ok_reads() > after_bal,
+            "new tip must invalidate the slot"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

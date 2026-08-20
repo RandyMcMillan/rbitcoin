@@ -19,7 +19,10 @@ before 1.0).
   genesis→tip on a mainnet store (not one 200-block window).
   Stderr progress: 5% steps plus at most one line per 15s, with ETA.
   `--out FILE` writes a per-key CSV (heights, tx/utxo counts, warm
-  latencies per query). `cargo run -p rbitcoin-bench --features cli --release`.
+  latencies per query). `--suite clients` runs N concurrent small-wallet
+  loads on one OS thread (`--clients`, default 8; corpus default
+  `sparrow`; keys over `--max-txs`/`--max-utxos` dropped).
+  `cargo run -p rbitcoin-bench --features cli --release`.
 
 - **CI Windows / Darwin snapshots:** after a green `ci` run on
   `master`/`main` (and on `workflow_dispatch`, and on PRs labeled

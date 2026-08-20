@@ -17,12 +17,14 @@ mod electrum;
 mod esplora;
 mod hex;
 mod jsonrpc;
+mod progress;
 mod stats;
 mod suite;
 mod targets;
 
 use crate::electrum::ElectrumClient;
 use crate::esplora::EsploraClient;
+use crate::progress::Progress;
 use crate::stats::format_report;
 use crate::suite::{electrum_casa, electrum_hot, electrum_sparrow, esplora_casa, CasaOpts, Suite};
 use crate::targets::{load_corpus, load_targets};
@@ -70,7 +72,8 @@ fn usage() -> String {
          Casa: sequential balance/history/utxo; throw away warmup; median of passes.\n\
          Sparrow: subscribe all (load) then get_history all (refresh), batch 50.\n\
          Embedded casa/sparrow keys are spread genesis→tip (not one 200-block window).\n\
-         Compare the same corpus against rbitcoin, Fulcrum, electrs, ElectrumX.",
+         Compare the same corpus against rbitcoin, Fulcrum, electrs, ElectrumX.\n\
+         Progress on stderr (~5% and ≥15s); the p50/p95 table stays on stdout.",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -198,6 +201,17 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     rt.block_on(run_async(cfg, targets))
 }
 
+fn casa_units(n_keys: usize, warmup: u32, passes: u32) -> u64 {
+    let n_pass = warmup.saturating_add(passes.max(1)) as u64;
+    (n_keys as u64).saturating_mul(n_pass)
+}
+
+fn sparrow_units(n_keys: usize, batch: usize) -> u64 {
+    let batch = batch.max(1);
+    let n_batches = n_keys.div_ceil(batch) as u64;
+    n_batches.saturating_mul(2)
+}
+
 async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
     let samples;
     let backend;
@@ -207,6 +221,10 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
             let mut c = ElectrumClient::connect(addr, cfg.timeout).await?;
             samples = match cfg.suite {
                 Suite::Casa => {
+                    let mut progress = Progress::start(
+                        format!("casa {backend}"),
+                        casa_units(targets.len(), cfg.warmup, cfg.passes),
+                    );
                     electrum_casa(
                         &mut c,
                         &targets,
@@ -214,13 +232,21 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
                             warmup: cfg.warmup,
                             passes: cfg.passes,
                         },
+                        &mut progress,
                     )
                     .await?
                 }
                 Suite::Sparrow => {
-                    electrum_sparrow(&mut c, &targets, cfg.batch, cfg.fetch_txs).await?
+                    let mut progress =
+                        Progress::start("sparrow load", sparrow_units(targets.len(), cfg.batch));
+                    electrum_sparrow(&mut c, &targets, cfg.batch, cfg.fetch_txs, &mut progress)
+                        .await?
                 }
-                Suite::Hot => electrum_hot(&mut c, &targets, cfg.timeout).await?,
+                Suite::Hot => {
+                    let mut progress =
+                        Progress::start(format!("hot {backend}"), targets.len() as u64);
+                    electrum_hot(&mut c, &targets, cfg.timeout, &mut progress).await?
+                }
             };
         }
         (None, Some(url)) => {
@@ -231,21 +257,18 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
             let mut c = EsploraClient::connect(url, cfg.timeout).await?;
             samples = match cfg.suite {
                 Suite::Casa | Suite::Hot => {
+                    let (warmup, passes, label) = if cfg.suite == Suite::Hot {
+                        (0, 1, format!("hot {backend}"))
+                    } else {
+                        (cfg.warmup, cfg.passes, format!("casa {backend}"))
+                    };
+                    let mut progress =
+                        Progress::start(label, casa_units(targets.len(), warmup, passes));
                     esplora_casa(
                         &mut c,
                         &targets,
-                        &CasaOpts {
-                            warmup: if cfg.suite == Suite::Hot {
-                                0
-                            } else {
-                                cfg.warmup
-                            },
-                            passes: if cfg.suite == Suite::Hot {
-                                1
-                            } else {
-                                cfg.passes
-                            },
-                        },
+                        &CasaOpts { warmup, passes },
+                        &mut progress,
                     )
                     .await?
                 }
@@ -310,5 +333,12 @@ mod tests {
     fn cli_help_exits_ok() {
         let code = cli_main([OsString::from("rbitcoin-bench"), OsString::from("-h")]);
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn work_units_cover_passes_and_batches() {
+        assert_eq!(casa_units(10, 1, 9), 100);
+        assert_eq!(sparrow_units(100, 50), 4);
+        assert_eq!(sparrow_units(0, 50), 0);
     }
 }

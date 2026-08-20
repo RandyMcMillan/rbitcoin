@@ -580,6 +580,10 @@ the comparison. First pass is usually cache-cold; Casa’s published numbers dro
 that pass. Sequential by default (Casa did not test multi-thread load). TLS is
 the reverse proxy’s job — point the client at plain `127.0.0.1`.
 
+Progress goes to **stderr** (stdout stays the p50/p95 table): about one line
+per 5% plus at most one extra line every 15s, with elapsed and ETA. Sparrow
+relabels load → refresh (→ txs if `--fetch-txs`).
+
 ## Esplora REST
 
 Blockstream-**compatible** **plain HTTP** API for **wallet clients and APIs**

@@ -3,6 +3,7 @@
 use crate::electrum::ElectrumClient;
 use crate::esplora::EsploraClient;
 use crate::jsonrpc;
+use crate::progress::Progress;
 use crate::stats::Sample;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -43,6 +44,7 @@ pub async fn electrum_casa(
     client: &mut ElectrumClient,
     targets: &[String],
     opts: &CasaOpts,
+    progress: &mut Progress,
 ) -> Result<Vec<Sample>, String> {
     let keep = opts.passes.max(1);
     let total = opts.warmup.saturating_add(keep);
@@ -62,29 +64,30 @@ pub async fn electrum_casa(
             let history_n = jsonrpc::history_len(&hist);
             let utxo_n = jsonrpc::utxo_len(&utxo);
             let _ = bal;
-            if pass < opts.warmup {
-                continue;
+            if pass >= opts.warmup {
+                samples.push(Sample {
+                    query: "get_balance",
+                    nanos: bns,
+                    history_n,
+                    utxo_n,
+                });
+                samples.push(Sample {
+                    query: "get_history",
+                    nanos: hns,
+                    history_n,
+                    utxo_n,
+                });
+                samples.push(Sample {
+                    query: "listunspent",
+                    nanos: uns,
+                    history_n,
+                    utxo_n,
+                });
             }
-            samples.push(Sample {
-                query: "get_balance",
-                nanos: bns,
-                history_n,
-                utxo_n,
-            });
-            samples.push(Sample {
-                query: "get_history",
-                nanos: hns,
-                history_n,
-                utxo_n,
-            });
-            samples.push(Sample {
-                query: "listunspent",
-                nanos: uns,
-                history_n,
-                utxo_n,
-            });
+            progress.tick();
         }
     }
+    progress.finish();
     Ok(samples)
 }
 
@@ -92,6 +95,7 @@ pub async fn esplora_casa(
     client: &mut EsploraClient,
     targets: &[String],
     opts: &CasaOpts,
+    progress: &mut Progress,
 ) -> Result<Vec<Sample>, String> {
     let keep = opts.passes.max(1);
     let total = opts.warmup.saturating_add(keep);
@@ -106,29 +110,30 @@ pub async fn esplora_casa(
                 .and_then(|v| v.as_u64())
                 .unwrap_or_else(|| jsonrpc::history_len(&txs));
             let utxo_n = jsonrpc::utxo_len(&utxo);
-            if pass < opts.warmup {
-                continue;
+            if pass >= opts.warmup {
+                samples.push(Sample {
+                    query: "get_balance",
+                    nanos: ins,
+                    history_n,
+                    utxo_n,
+                });
+                samples.push(Sample {
+                    query: "get_history",
+                    nanos: tns,
+                    history_n,
+                    utxo_n,
+                });
+                samples.push(Sample {
+                    query: "listunspent",
+                    nanos: uns,
+                    history_n,
+                    utxo_n,
+                });
             }
-            samples.push(Sample {
-                query: "get_balance",
-                nanos: ins,
-                history_n,
-                utxo_n,
-            });
-            samples.push(Sample {
-                query: "get_history",
-                nanos: tns,
-                history_n,
-                utxo_n,
-            });
-            samples.push(Sample {
-                query: "listunspent",
-                nanos: uns,
-                history_n,
-                utxo_n,
-            });
+            progress.tick();
         }
     }
+    progress.finish();
     Ok(samples)
 }
 
@@ -137,6 +142,7 @@ pub async fn electrum_sparrow(
     targets: &[String],
     batch: usize,
     fetch_txs: bool,
+    progress: &mut Progress,
 ) -> Result<Vec<Sample>, String> {
     let batch = batch.max(1);
     let mut samples = Vec::new();
@@ -155,8 +161,10 @@ pub async fn electrum_sparrow(
             history_n: chunk.len() as u64,
             utxo_n: 0,
         });
+        progress.tick();
         i = end;
     }
+    progress.set_label("sparrow refresh");
     i = 0;
     let mut txids: Vec<String> = Vec::new();
     while i < targets.len() {
@@ -173,6 +181,7 @@ pub async fn electrum_sparrow(
             history_n: chunk.len() as u64,
             utxo_n: 0,
         });
+        progress.tick();
         if fetch_txs {
             for v in &vals {
                 if let Some(arr) = v.as_array() {
@@ -189,6 +198,9 @@ pub async fn electrum_sparrow(
     if fetch_txs {
         txids.sort();
         txids.dedup();
+        let n_tx_batches = txids.len().div_ceil(batch) as u64;
+        progress.add_work(n_tx_batches);
+        progress.set_label("sparrow txs");
         i = 0;
         while i < txids.len() {
             let end = (i + batch).min(txids.len());
@@ -203,9 +215,11 @@ pub async fn electrum_sparrow(
                 history_n: (end - i) as u64,
                 utxo_n: 0,
             });
+            progress.tick();
             i = end;
         }
     }
+    progress.finish();
     Ok(samples)
 }
 
@@ -213,6 +227,7 @@ pub async fn electrum_hot(
     client: &mut ElectrumClient,
     targets: &[String],
     timeout: Duration,
+    progress: &mut Progress,
 ) -> Result<Vec<Sample>, String> {
     let _ = timeout;
     let mut samples = Vec::new();
@@ -237,7 +252,9 @@ pub async fn electrum_hot(
             history_n,
             utxo_n: jsonrpc::utxo_len(&utxo),
         });
+        progress.tick();
     }
+    progress.finish();
     Ok(samples)
 }
 
@@ -289,6 +306,7 @@ mod tests {
             .await
             .unwrap();
         let sh = "ab".repeat(32);
+        let mut progress = Progress::start("casa test", 3);
         let samples = electrum_casa(
             &mut c,
             &[sh],
@@ -296,6 +314,7 @@ mod tests {
                 warmup: 1,
                 passes: 2,
             },
+            &mut progress,
         )
         .await
         .unwrap();
@@ -330,7 +349,10 @@ mod tests {
             .unwrap();
         let a = "ab".repeat(32);
         let b = "cd".repeat(32);
-        let samples = electrum_sparrow(&mut c, &[a, b], 2, false).await.unwrap();
+        let mut progress = Progress::start("sparrow test", 2);
+        let samples = electrum_sparrow(&mut c, &[a, b], 2, false, &mut progress)
+            .await
+            .unwrap();
         assert!(samples.iter().any(|s| s.query == "subscribe_batch"));
         assert!(samples.iter().any(|s| s.query == "get_history_batch"));
     }

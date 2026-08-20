@@ -17,6 +17,7 @@ before 1.0).
   `hot` suite. Embedded `--corpus` lists: `hot` (P2A + public high-tx
   addresses), `casa`/`sparrow` unique scripts sampled from 77 heights
   genesis→tip on a mainnet store (not one 200-block window).
+  Stderr progress: 5% steps plus at most one line per 15s, with ETA.
   `cargo run -p rbitcoin-bench --features cli --release`.
 
 - **CI Windows / Darwin snapshots:** after a green `ci` run on

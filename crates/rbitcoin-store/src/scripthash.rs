@@ -10,6 +10,7 @@ use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
+use crate::io_backend::ReadIoBackend;
 #[cfg(test)]
 use crate::scripthash_head::ShardedScriptHashHead;
 use crate::scripthash_head::{
@@ -546,9 +547,140 @@ fn paged_first_from_last(body: &TableFile, last_page: u64) -> Result<u64, StoreE
     if last_page == 0 {
         return Ok(0);
     }
+    note_sh_page_chain_io();
     let mut page = [0u8; SH_PAGE_SIZE];
     body.read_at(last_page, &mut page)?;
     sh_page_first_off(sh_page_as_array(&page)?)
+}
+
+/// Cap on a contiguous megakey span pread (64 MiB ≈ 16k pages).
+const SH_PAGE_SPAN_MAX: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static SH_PAGE_CHAIN_IOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_sh_page_chain_io() {
+    SH_PAGE_CHAIN_IOS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn note_sh_page_chain_io() {}
+
+#[cfg(test)]
+fn reset_sh_page_chain_ios() {
+    SH_PAGE_CHAIN_IOS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn sh_page_chain_ios() -> u64 {
+    SH_PAGE_CHAIN_IOS.with(|c| c.get())
+}
+
+fn read_sh_page_bytes(body: &TableFile, off: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+    note_sh_page_chain_io();
+    if buf.is_empty() {
+        return Ok(());
+    }
+    match crate::io_backend::read_io_backend() {
+        ReadIoBackend::Pread => body.pread_at(off, buf),
+        ReadIoBackend::Uring => {
+            let end = off.saturating_add(buf.len() as u64);
+            if end > body.logical_len() {
+                return Err(StoreError::Corrupt("pread past logical end"));
+            }
+            use crate::bulk_io::{self, ReadOp};
+            let fd = body.read_fd();
+            let mut ops = [ReadOp {
+                fd,
+                offset: off,
+                buf,
+                result: i32::MIN,
+            }];
+            bulk_io::pread_batch(&mut ops);
+            if ops[0].result < 0 {
+                return Err(StoreError::io(
+                    body.path(),
+                    std::io::Error::from_raw_os_error(-ops[0].result),
+                ));
+            }
+            if ops[0].result as usize != ops[0].buf.len() {
+                return Err(StoreError::Corrupt("scripthash page read short"));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn extend_page_entries(
+    out: &mut Vec<ShEntry>,
+    prev_last: &mut Option<u64>,
+    ents: Vec<ShEntry>,
+) -> Result<(), StoreError> {
+    if let (Some(pl), Some(first)) = (*prev_last, ents.first()) {
+        if first.create_tx_fk.0 <= pl {
+            return Err(StoreError::Corrupt(
+                "invariant: scripthash page chain create_fks not strictly increasing",
+            ));
+        }
+    }
+    if let Some(last) = ents.last() {
+        *prev_last = Some(last.create_tx_fk.0);
+    }
+    out.extend(ents);
+    Ok(())
+}
+
+fn collect_page_chain_span(
+    body: &TableFile,
+    first_page: u64,
+    n_pages: usize,
+) -> Result<Option<Vec<ShEntry>>, StoreError> {
+    let mut buf = vec![0u8; n_pages.saturating_mul(SH_PAGE_SIZE)];
+    read_sh_page_bytes(body, first_page, &mut buf)?;
+    let mut out = Vec::new();
+    let mut prev_last = None;
+    for i in 0..n_pages {
+        let start = i.saturating_mul(SH_PAGE_SIZE);
+        let page = &buf[start..start.saturating_add(SH_PAGE_SIZE)];
+        let (next, ents) = sh_page_decode_slice(page)?;
+        let expect = if i + 1 == n_pages {
+            0
+        } else {
+            first_page.saturating_add(((i + 1) * SH_PAGE_SIZE) as u64)
+        };
+        if next != expect {
+            return Ok(None);
+        }
+        extend_page_entries(&mut out, &mut prev_last, ents)?;
+    }
+    Ok(Some(out))
+}
+
+fn collect_page_chain_linked(
+    body: &TableFile,
+    first_page: u64,
+) -> Result<Vec<ShEntry>, StoreError> {
+    let mut out = Vec::new();
+    let mut prev_last: Option<u64> = None;
+    let mut cur = [0u8; SH_PAGE_SIZE];
+    let mut nxt = [0u8; SH_PAGE_SIZE];
+    if first_page == 0 {
+        return Ok(out);
+    }
+    read_sh_page_bytes(body, first_page, &mut cur)?;
+    loop {
+        let (next, ents) = sh_page_decode_slice(&cur)?;
+        extend_page_entries(&mut out, &mut prev_last, ents)?;
+        if next == 0 {
+            break;
+        }
+        read_sh_page_bytes(body, next, &mut nxt)?;
+        cur = nxt;
+    }
+    Ok(out)
 }
 
 /// Where a scripthash key lives for head upsert routing.
@@ -1203,54 +1335,42 @@ impl ScriptHashTable {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<(Fk, ScriptHashRecord)>, StoreError> {
-        let Some(val) = self.head_value(scripthash)? else {
+        let Some((val, home)) = self.locate_head(scripthash)? else {
             return Ok(Vec::new());
         };
-        let list = self.collect_entries(scripthash, &val)?;
+        let list = self.collect_entries_from(self.body_for(scripthash, home), &val)?;
         Ok(list
             .into_iter()
-            .map(|e| {
-                // Synthetic fk = create_tx_fk for API compat (no body row id).
-                (e.create_tx_fk, ScriptHashRecord::from_entry(*scripthash, e))
-            })
+            .map(|e| (e.create_tx_fk, ScriptHashRecord::from_entry(*scripthash, e)))
             .collect())
-    }
-
-    fn collect_entries(
-        &self,
-        scripthash: &[u8; 32],
-        val: &ShHeadValue,
-    ) -> Result<Vec<ShEntry>, StoreError> {
-        let home = self.key_home(scripthash)?;
-        self.collect_entries_from(self.body_for(scripthash, home), val)
     }
 
     fn collect_page_chain(
         &self,
         body: &TableFile,
         first_page: u64,
+        last_page: u64,
     ) -> Result<Vec<ShEntry>, StoreError> {
-        let mut out = Vec::new();
-        let mut off = first_page;
-        let mut prev_last: Option<u64> = None;
-        while off != 0 {
-            let mut page = [0u8; SH_PAGE_SIZE];
-            body.read_at(off, &mut page)?;
-            let (next, ents) = sh_page_decode_slice(&page)?;
-            if let (Some(pl), Some(first)) = (prev_last, ents.first()) {
-                if first.create_tx_fk.0 <= pl {
-                    return Err(StoreError::Corrupt(
-                        "invariant: scripthash page chain create_fks not strictly increasing",
-                    ));
+        if first_page == 0 {
+            return Ok(Vec::new());
+        }
+        if last_page >= first_page {
+            let span = last_page.saturating_sub(first_page);
+            if span.is_multiple_of(SH_PAGE_SIZE as u64) {
+                let n_pages = (span / SH_PAGE_SIZE as u64).saturating_add(1);
+                let bytes = n_pages.saturating_mul(SH_PAGE_SIZE as u64);
+                if n_pages >= 2
+                    && bytes <= SH_PAGE_SPAN_MAX
+                    && first_page.saturating_add(bytes) <= body.logical_len()
+                {
+                    if let Some(out) = collect_page_chain_span(body, first_page, n_pages as usize)?
+                    {
+                        return Ok(out);
+                    }
                 }
             }
-            if let Some(last) = ents.last() {
-                prev_last = Some(last.create_tx_fk.0);
-            }
-            out.extend(ents);
-            off = next;
         }
-        Ok(out)
+        collect_page_chain_linked(body, first_page)
     }
 
     /// Max durable create_tx_fk for a head value (**last page only** when paged).
@@ -1739,7 +1859,7 @@ impl ScriptHashTable {
                 } else {
                     paged_first_from_last(body, *last_page)?
                 };
-                self.collect_page_chain(body, first)
+                self.collect_page_chain(body, first, *last_page)
             }
         }
     }
@@ -4807,6 +4927,14 @@ mod tests {
         for (i, (_, e)) in got.iter().enumerate() {
             assert_eq!(e.create_tx_fk, Fk(i as u64 + 1));
         }
+        reset_sh_page_chain_ios();
+        let got2 = t.entries(&sh).unwrap();
+        assert_eq!(got2.len(), n);
+        assert!(
+            sh_page_chain_ios() <= 2,
+            "contiguous two-page chain should span-read, ios={}",
+            sh_page_chain_ios()
+        );
         let (first, last) = match t.head_value(&sh).unwrap().unwrap() {
             ShHeadValue::Paged {
                 first_page,

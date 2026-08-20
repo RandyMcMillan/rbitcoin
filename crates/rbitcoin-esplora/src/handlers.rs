@@ -195,19 +195,22 @@ pub async fn block_txid_at(
     State(st): State<AppState>,
     Path((hash_hex, index)): Path<(String, u32)>,
 ) -> Response {
-    let Ok(hash) = parse_hash32(&hash_hex) else {
-        return not_found();
-    };
-    let Some(height) = (match st.query.height_of_hash(&hash) {
-        Ok(h) => h,
-        Err(e) => return store_err(e),
-    }) else {
-        return not_found();
-    };
-    match st.query.block_txid_at(height, index as usize) {
-        Ok(txid) => plain_ok(block_hash_hex(&txid)),
-        Err(e) => store_err(e),
-    }
+    spawn_join(move || {
+        let Ok(hash) = parse_hash32(&hash_hex) else {
+            return not_found();
+        };
+        let Some(height) = (match st.query.height_of_hash(&hash) {
+            Ok(h) => h,
+            Err(e) => return store_err(e),
+        }) else {
+            return not_found();
+        };
+        match st.query.block_txid_at(height, index as usize) {
+            Ok(txid) => plain_ok(block_hash_hex(&txid)),
+            Err(e) => store_err(e),
+        }
+    })
+    .await
 }
 
 /// `GET /blocks` — 10 newest from tip.
@@ -251,19 +254,22 @@ fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
 }
 
 pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
-    let Ok(hash) = parse_hash32(&hash_hex) else {
-        return not_found();
-    };
-    let Some(h) = (match st.query.height_of_hash(&hash) {
-        Ok(h) => h,
-        Err(e) => return store_err(e),
-    }) else {
-        return not_found();
-    };
-    match st.query.block_txids(h) {
-        Ok(ids) => Json(ids.iter().map(block_hash_hex).collect::<Vec<_>>()).into_response(),
-        Err(e) => store_err(e),
-    }
+    spawn_join(move || {
+        let Ok(hash) = parse_hash32(&hash_hex) else {
+            return not_found();
+        };
+        let Some(h) = (match st.query.height_of_hash(&hash) {
+            Ok(h) => h,
+            Err(e) => return store_err(e),
+        }) else {
+            return not_found();
+        };
+        match st.query.block_txids(h) {
+            Ok(ids) => Json(ids.iter().map(block_hash_hex).collect::<Vec<_>>()).into_response(),
+            Err(e) => store_err(e),
+        }
+    })
+    .await
 }
 
 /// Optional start index via path: `/block/:hash/txs` or `/block/:hash/txs/:start`.
@@ -271,11 +277,11 @@ pub async fn block_txs_start(
     State(st): State<AppState>,
     Path((hash_hex, start)): Path<(String, u32)>,
 ) -> Response {
-    block_txs_impl(st, &hash_hex, start)
+    spawn_join(move || block_txs_impl(st, &hash_hex, start)).await
 }
 
 pub async fn block_txs_0(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
-    block_txs_impl(st, &hash_hex, 0)
+    spawn_join(move || block_txs_impl(st, &hash_hex, 0)).await
 }
 
 fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
@@ -312,6 +318,10 @@ fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
 }
 
 pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
+    spawn_join(move || tx_merkle_proof_sync(st, txid_hex)).await
+}
+
+fn tx_merkle_proof_sync(st: AppState, txid_hex: String) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
         return not_found();
     };
@@ -342,22 +352,25 @@ pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<St
 
 /// `GET /tx/:txid/raw` — consensus-encoded transaction bytes.
 pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
-            Ok(raw) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                raw,
-            )
-                .into_response(),
+    spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.get_tx_by_txid(&txid) {
+            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+                Ok(raw) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    raw,
+                )
+                    .into_response(),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 /// `GET /tx/:txid/merkleblock-proof` — BIP37 merkleblock as hex (Blockstream shape).
@@ -365,6 +378,10 @@ pub async fn tx_merkleblock_proof(
     State(st): State<AppState>,
     Path(txid_hex): Path<String>,
 ) -> Response {
+    spawn_join(move || tx_merkleblock_proof_sync(st, txid_hex)).await
+}
+
+fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
         return not_found();
     };
@@ -416,36 +433,42 @@ pub async fn tx_outspend(
     State(st): State<AppState>,
     Path((txid_hex, vout)): Path<(String, u32)>,
 ) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    if st.query.get_tx_by_txid(&txid).ok().flatten().is_none() {
-        return not_found();
-    }
-    match outspend_json(&st.query, &txid, vout) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => store_err(e),
-    }
+    spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        if st.query.get_tx_by_txid(&txid).ok().flatten().is_none() {
+            return not_found();
+        }
+        match outspend_json(&st.query, &txid, vout) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        }
+    })
+    .await
 }
 
 pub async fn tx_outspends(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    let Some((_fk, rec)) = (match st.query.get_tx_by_txid(&txid) {
-        Ok(v) => v,
-        Err(e) => return store_err(e),
-    }) else {
-        return not_found();
-    };
-    let mut arr = Vec::with_capacity(rec.output_count as usize);
-    for vout in 0..rec.output_count {
-        match outspend_json(&st.query, &txid, vout) {
-            Ok(v) => arr.push(v),
+    spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        let Some((_fk, rec)) = (match st.query.get_tx_by_txid(&txid) {
+            Ok(v) => v,
             Err(e) => return store_err(e),
+        }) else {
+            return not_found();
+        };
+        let mut arr = Vec::with_capacity(rec.output_count as usize);
+        for vout in 0..rec.output_count {
+            match outspend_json(&st.query, &txid, vout) {
+                Ok(v) => arr.push(v),
+                Err(e) => return store_err(e),
+            }
         }
-    }
-    Json(arr).into_response()
+        Json(arr).into_response()
+    })
+    .await
 }
 
 fn outspend_json(
@@ -476,7 +499,7 @@ fn outspend_json(
     }))
 }
 
-async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
+pub(crate) async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r,
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -591,7 +614,7 @@ pub async fn scripthash_txs_chain(
     State(st): State<AppState>,
     Path(sh_hex): Path<String>,
 ) -> Response {
-    chain_page(&st, &sh_hex, None)
+    spawn_join(move || chain_page(&st, &sh_hex, None)).await
 }
 
 pub async fn scripthash_txs_chain_cursor(
@@ -601,12 +624,12 @@ pub async fn scripthash_txs_chain_cursor(
     let Ok(after) = parse_hash32(&last) else {
         return not_found();
     };
-    chain_page(&st, &sh_hex, Some(after))
+    spawn_join(move || chain_page(&st, &sh_hex, Some(after))).await
 }
 
 pub async fn address_txs_chain(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => chain_page_sh(&st, &sh, None),
+        Ok(sh) => spawn_join(move || chain_page_sh(&st, &sh, None)).await,
         Err(_) => not_found(),
     }
 }
@@ -619,7 +642,7 @@ pub async fn address_txs_chain_cursor(
         return not_found();
     };
     match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => chain_page_sh(&st, &sh, Some(after)),
+        Ok(sh) => spawn_join(move || chain_page_sh(&st, &sh, Some(after))).await,
         Err(_) => not_found(),
     }
 }
@@ -629,12 +652,12 @@ pub async fn scripthash_txs(State(st): State<AppState>, Path(sh_hex): Path<Strin
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    combined_txs(&st, &sh)
+    spawn_join(move || combined_txs(&st, &sh)).await
 }
 
 pub async fn address_txs(State(st): State<AppState>, Path(addr_s): Path<String>) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => combined_txs(&st, &sh),
+        Ok(sh) => spawn_join(move || combined_txs(&st, &sh)).await,
         Err(_) => not_found(),
     }
 }
@@ -788,7 +811,7 @@ pub async fn scripthash_txs_mempool(
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    mempool_txs_for_sh(&st, &sh)
+    spawn_join(move || mempool_txs_for_sh(&st, &sh)).await
 }
 
 pub async fn address_txs_mempool(
@@ -796,7 +819,7 @@ pub async fn address_txs_mempool(
     Path(addr_s): Path<String>,
 ) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => mempool_txs_for_sh(&st, &sh),
+        Ok(sh) => spawn_join(move || mempool_txs_for_sh(&st, &sh)).await,
         Err(_) => not_found(),
     }
 }

@@ -339,47 +339,56 @@ async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<String>) 
 
 /// `GET /tx/:txid` → full Esplora transaction JSON (incl. asm/type/address).
 async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network) {
-            Ok(v) => Json(v).into_response(),
+    handlers::spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.get_tx_by_txid(&txid) {
+            Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 /// `GET /tx/:txid/hex` → raw consensus-encoded transaction hex.
 async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
-            Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(raw)),
+    handlers::spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.get_tx_by_txid(&txid) {
+            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+                Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(raw)),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 /// `GET /tx/:txid/status` → Esplora confirmation status JSON.
 async fn tx_status(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    let Ok(txid) = parse_hash32(&txid_hex) else {
-        return not_found();
-    };
-    match st.query.get_tx_by_txid(&txid) {
-        Ok(Some((fk, _))) => match tx_status_json(&st.query, fk) {
-            Ok(v) => Json(v).into_response(),
+    handlers::spawn_join(move || {
+        let Ok(txid) = parse_hash32(&txid_hex) else {
+            return not_found();
+        };
+        match st.query.get_tx_by_txid(&txid) {
+            Ok(Some((fk, _))) => match tx_status_json(&st.query, fk) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
+            Ok(None) => not_found(),
             Err(e) => store_err(e),
-        },
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
-    }
+        }
+    })
+    .await
 }
 
 async fn fallback_404() -> Response {
@@ -964,6 +973,44 @@ mod tests {
         let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
         assert_eq!(st, 200, "{body}");
         assert_eq!(body, "[]");
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Packed SH `/txs` runs on `spawn_blocking` so tip height stays on the worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tip_height_overlaps_scripthash_txs_on_one_worker() {
+        use rbitcoin_store::script_hash;
+        use std::time::Instant;
+
+        let (dir, q) = temp_query("spawn-join");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..8u32 {
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+
+        let t0 = Instant::now();
+        let txs_path = format!("/scripthash/{sh_hex}/txs");
+        let h_txs = tokio::spawn(async move { http_get(addr, &txs_path).await });
+        let h_tip = tokio::spawn(async move { http_get(addr, "/blocks/tip/height").await });
+        let (txs, tip) = tokio::join!(h_txs, h_tip);
+        let (st_txs, _) = txs.unwrap();
+        let (st_tip, body_tip) = tip.unwrap();
+        assert_eq!(st_txs, 200);
+        assert_eq!(st_tip, 200, "{body_tip}");
+        assert_eq!(body_tip, "7");
+        assert!(t0.elapsed().as_secs() < 2);
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

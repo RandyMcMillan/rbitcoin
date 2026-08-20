@@ -544,13 +544,20 @@ pub async fn scripthash_utxo(State(st): State<AppState>, Path(sh_hex): Path<Stri
 }
 
 fn utxo_response(st: &AppState, sh: &[u8; 32]) -> Response {
-    match rbitcoin_electrum::scripthash_utxos_with_mempool(&st.query, st.mempool.as_deref(), sh) {
-        Ok(list) => match utxo_list_json(&st.query, &list) {
-            Ok(v) => Json(v).into_response(),
+    st.with_sh_join(|slot| {
+        match rbitcoin_electrum::scripthash_utxos_with_mempool_slot(
+            &st.query,
+            st.mempool.as_deref(),
+            sh,
+            slot,
+        ) {
+            Ok(list) => match utxo_list_json(&st.query, &list) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
             Err(e) => store_err(e),
-        },
-        Err(e) => store_err(e),
-    }
+        }
+    })
 }
 
 pub(crate) fn resolve_address_sh(addr_s: &str, network: Network) -> Result<[u8; 32], ()> {
@@ -565,46 +572,48 @@ fn sh_stats_json(
     address: Option<&str>,
     scripthash_hex: Option<&str>,
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    let chain = st.query.scripthash_chain_stats(sh)?;
-    let chain_stats = json!({
-        "tx_count": chain.tx_count,
-        "funded_txo_count": chain.funded_txo_count,
-        "funded_txo_sum": chain.funded_txo_sum,
-        "spent_txo_count": chain.spent_txo_count,
-        "spent_txo_sum": chain.spent_txo_sum,
-    });
-    let mempool_stats = json!({
-        "tx_count": 0,
-        "funded_txo_count": 0,
-        "funded_txo_sum": 0,
-        "spent_txo_count": 0,
-        "spent_txo_sum": 0,
-    });
-    let mempool_stats = if let Some(mp) = st.mempool.as_ref() {
-        match rbitcoin_electrum::scripthash_mempool_stats(&st.query, mp, sh) {
-            Ok(s) => json!({
-                "tx_count": s.tx_count,
-                "funded_txo_count": s.funded_txo_count,
-                "funded_txo_sum": s.funded_txo_sum,
-                "spent_txo_count": s.spent_txo_count,
-                "spent_txo_sum": s.spent_txo_sum,
-            }),
-            Err(e) => return Err(e),
+    st.with_sh_join(|slot| {
+        let chain = st.query.scripthash_chain_stats_slot(sh, slot)?;
+        let chain_stats = json!({
+            "tx_count": chain.tx_count,
+            "funded_txo_count": chain.funded_txo_count,
+            "funded_txo_sum": chain.funded_txo_sum,
+            "spent_txo_count": chain.spent_txo_count,
+            "spent_txo_sum": chain.spent_txo_sum,
+        });
+        let mempool_stats = json!({
+            "tx_count": 0,
+            "funded_txo_count": 0,
+            "funded_txo_sum": 0,
+            "spent_txo_count": 0,
+            "spent_txo_sum": 0,
+        });
+        let mempool_stats = if let Some(mp) = st.mempool.as_ref() {
+            match rbitcoin_electrum::scripthash_mempool_stats_slot(&st.query, mp, sh, slot) {
+                Ok(s) => json!({
+                    "tx_count": s.tx_count,
+                    "funded_txo_count": s.funded_txo_count,
+                    "funded_txo_sum": s.funded_txo_sum,
+                    "spent_txo_count": s.spent_txo_count,
+                    "spent_txo_sum": s.spent_txo_sum,
+                }),
+                Err(e) => return Err(e),
+            }
+        } else {
+            mempool_stats
+        };
+        let mut obj = json!({
+            "chain_stats": chain_stats,
+            "mempool_stats": mempool_stats,
+        });
+        if let Some(a) = address {
+            obj["address"] = Value::String(a.to_string());
         }
-    } else {
-        mempool_stats
-    };
-    let mut obj = json!({
-        "chain_stats": chain_stats,
-        "mempool_stats": mempool_stats,
-    });
-    if let Some(a) = address {
-        obj["address"] = Value::String(a.to_string());
-    }
-    if let Some(h) = scripthash_hex {
-        obj["scripthash"] = Value::String(h.to_string());
-    }
-    Ok(obj)
+        if let Some(h) = scripthash_hex {
+            obj["scripthash"] = Value::String(h.to_string());
+        }
+        Ok(obj)
+    })
 }
 
 pub async fn scripthash_txs_chain(
@@ -668,13 +677,15 @@ fn chain_page(st: &AppState, sh_hex: &str, after: Option<[u8; 32]>) -> Response 
 
 fn chain_page_sh(st: &AppState, sh: &[u8; 32], after: Option<[u8; 32]>) -> Response {
     let filter = HistoryFilter::esplora_chain_page(after);
-    match st.query.scripthash_history_filtered(sh, &filter) {
-        Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
-            Ok(v) => Json(v).into_response(),
+    st.with_sh_join(
+        |slot| match st.query.scripthash_history_filtered_slot(sh, &filter, slot) {
+            Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
             Err(e) => store_err(e),
         },
-        Err(e) => store_err(e),
-    }
+    )
 }
 
 fn combined_txs(st: &AppState, sh: &[u8; 32]) -> Response {
@@ -697,16 +708,18 @@ fn combined_txs(st: &AppState, sh: &[u8; 32]) -> Response {
         }
     }
     let filter = HistoryFilter::esplora_chain_page(None);
-    match st.query.scripthash_history_filtered(sh, &filter) {
-        Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
-            Ok(chain) => {
-                out.extend(chain);
-                Json(out).into_response()
-            }
+    st.with_sh_join(
+        |slot| match st.query.scripthash_history_filtered_slot(sh, &filter, slot) {
+            Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
+                Ok(chain) => {
+                    out.extend(chain);
+                    Json(out).into_response()
+                }
+                Err(e) => store_err(e),
+            },
             Err(e) => store_err(e),
         },
-        Err(e) => store_err(e),
-    }
+    )
 }
 
 pub async fn mempool_info(State(st): State<AppState>) -> Response {
@@ -1039,6 +1052,97 @@ mod pure_helper_tests {
         );
         assert!(q.reconstruct_archived_block(&hash).unwrap().is_some());
         assert!(q.sample_reset_reconstruct_archived() >= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn casa_sh_routes_reuse_last_join_slot() {
+        use crate::server::AppState;
+        use rbitcoin_query::{body_ok_reads, reset_body_ok_reads};
+        use rbitcoin_store::script_hash;
+        use std::sync::{Arc, Mutex};
+
+        let (dir, q) = temp_query();
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..3u32 {
+            let merkle = {
+                let mut m = [0xab; 32];
+                m[0] = h as u8;
+                m
+            };
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(1, &ph, &merkle, h + 1, 0x207f_ffff, h)
+                }
+            };
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: h + 1,
+                bits: 0x207f_ffff,
+                nonce: h,
+                merkle_root: merkle,
+                hash,
+            };
+            let mut txid = [0xcb; 32];
+            txid[0] = h as u8;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![h as u8],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let st = AppState {
+            query: Arc::new(q),
+            network: Network::Regtest,
+            mempool: None,
+            max_body: 1 << 20,
+            tip_tx: None,
+            ws_sem: None,
+            max_ws_message_bytes: 64 * 1024,
+            max_track_addresses: 64,
+            max_track_txs: 64,
+            sh_join: Arc::new(Mutex::new(None)),
+        };
+        let sh = script_hash(&[0x51]);
+        reset_body_ok_reads();
+        let info = super::sh_stats_json(&st, &sh, None, None).unwrap();
+        assert_eq!(info["chain_stats"]["tx_count"], 3);
+        let after_info = body_ok_reads();
+        assert_eq!(after_info, 3);
+
+        let _ = super::utxo_response(&st, &sh);
+        assert_eq!(
+            body_ok_reads(),
+            after_info,
+            "/utxo must reuse the last SH join"
+        );
+        let _ = super::chain_page_sh(&st, &sh, None);
+        assert_eq!(
+            body_ok_reads(),
+            after_info,
+            "/txs must reuse the last SH join"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

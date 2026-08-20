@@ -15,11 +15,11 @@ use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_net::{MempoolHub, TipEvent};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::Query;
+use rbitcoin_query::{Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
@@ -152,6 +152,22 @@ pub(crate) struct AppState {
     pub(crate) max_ws_message_bytes: usize,
     pub(crate) max_track_addresses: usize,
     pub(crate) max_track_txs: usize,
+    /// Last scripthash join (tip-fenced). HTTP is not session-oriented; one
+    /// slot still covers Casa `/scripthash` → `/txs` → `/utxo` and chain pages.
+    pub(crate) sh_join: Arc<Mutex<Option<ShJoinSlot>>>,
+}
+
+impl AppState {
+    pub(crate) fn with_sh_join<R>(&self, f: impl FnOnce(&mut Option<ShJoinSlot>) -> R) -> R {
+        let mut slot = self
+            .sh_join
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let r = f(&mut slot);
+        *self.sh_join.lock().unwrap_or_else(|p| p.into_inner()) = slot;
+        r
+    }
 }
 
 /// Start Esplora **plain HTTP** (+ wallet WebSocket) on `config.listen`.
@@ -192,6 +208,7 @@ pub async fn run_esplora(
         max_ws_message_bytes: config.max_ws_message_bytes.max(1024),
         max_track_addresses: config.max_track_addresses.max(1),
         max_track_txs: config.max_track_txs.max(1),
+        sh_join: Arc::new(Mutex::new(None)),
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).

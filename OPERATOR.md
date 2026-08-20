@@ -536,7 +536,12 @@ posting list with the new block's tx fks and prevout `create_fk`s; a miss
 does not expand packed `txout`. Full status still runs on a hit. Each Electrum
 TCP connection keeps one last-scripthash join (outs + spentness) until tip
 height changes, so Casa `get_balance` → `get_history` → `listunspent` on the
-same socket pays Class A once. Not a process-global cache.
+same socket pays Class A once. Not a process-global cache. Esplora REST keeps
+one last-scripthash join on the listener (HTTP is not session-oriented) so
+Casa `/scripthash` → `/txs` → `/utxo` and `/txs/chain` pages reuse packed
+outs until tip height changes. Concurrent different keys may replace the
+slot. Esplora WS `block-transactions` uses the same posting-list tip probe
+as Electrum subscribe (miss skips Class A).
 
 Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 --passes 1 --warmup 1`). Do not treat agent-VM times as product numbers.

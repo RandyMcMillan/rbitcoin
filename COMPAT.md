@@ -105,7 +105,7 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | Blocks list | done | `/blocks`, `/blocks/:start_height` (10 summaries, newest-first) |
 | Block | done | `/block/:hash` JSON, `/raw`, `/status`, `/header`, `/txids`, `/txid/:i`, `/txs[/:start]` |
 | Tx | done | `/tx/:txid` full JSON, `/hex`, `/raw`, `/status`, Electrum `/merkle-proof`, BIP37 `/merkleblock-proof`, `/outspend(s)` |
-| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]`; `/utxo` matches Electrum listunspent (mempool funding + drop mempool-spent confirmed); `/txs` from SH join fks; needs SH finalize |
+| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]`; `/utxo` matches Electrum listunspent (mempool funding + drop mempool-spent confirmed); `/txs` from SH join fks; last SH join reused across sequential REST calls until tip height changes; needs SH finalize |
 | Mempool / fees | done | `/mempool`, `/mempool/txids`, `/mempool/recent` (accept-order ring), `/fee-estimates` |
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
@@ -142,7 +142,7 @@ No client API for global `track-mempool*`, `track-rbf`, or `want` stats/charts.
 |-----|------|
 | `{ "block": { "height", "id", "timestamp" } }` | Tip advance after `want: blocks` |
 | `{ "address-transactions": [ … ] }` | Mempool accept touching a tracked script (in/out when resolvable) |
-| `{ "block-transactions": [ … ] }` | Tip height: confirmed history for tracked scripts at that height (SH index) |
+| `{ "block-transactions": [ … ] }` | Tip height: txs in that block that create or spend a tracked script (posting-list probe; no Class A expand on a miss) |
 | `{ "tx": { "txid", "status" } }` | Tracked txid status transition (mempool / confirmed) |
 | `{ "replaced-transactions": [ { "txid", "replaced-by" } ] }` | Full-RBF replace **only if** old or new intersects this connection’s tracks |
 

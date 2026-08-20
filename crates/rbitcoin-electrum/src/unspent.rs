@@ -18,7 +18,7 @@ pub fn scripthash_utxos_with_mempool(
 }
 
 /// [`scripthash_utxos_with_mempool`] using a connection-local join slot.
-pub(crate) fn scripthash_utxos_with_mempool_slot(
+pub fn scripthash_utxos_with_mempool_slot(
     query: &Query,
     mempool: Option<&MempoolHub>,
     sh: &[u8; 32],
@@ -78,12 +78,23 @@ pub fn scripthash_mempool_stats(
     mp: &MempoolHub,
     sh: &[u8; 32],
 ) -> Result<MempoolShStats, QueryError> {
+    let mut slot = None;
+    scripthash_mempool_stats_slot(query, mp, sh, &mut slot)
+}
+
+/// [`scripthash_mempool_stats`] using a join slot (confirmed UTXO walk).
+pub fn scripthash_mempool_stats_slot(
+    query: &Query,
+    mp: &MempoolHub,
+    sh: &[u8; 32],
+    slot: &mut Option<ShJoinSlot>,
+) -> Result<MempoolShStats, QueryError> {
     let items = mp.scripthash_mempool(sh);
     let mut stats = MempoolShStats {
         tx_count: items.len() as u32,
         ..MempoolShStats::default()
     };
-    for u in query.scripthash_listunspent(sh)? {
+    for u in query.scripthash_listunspent_slot(sh, slot)? {
         let op = OutPoint {
             txid: bitcoin::Txid::from_byte_array(u.tx_hash),
             vout: u.tx_pos,

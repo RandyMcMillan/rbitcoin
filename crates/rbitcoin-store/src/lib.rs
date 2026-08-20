@@ -5,6 +5,7 @@
 
 mod address_head;
 mod array_table;
+mod bdz;
 mod binary_fuse8;
 mod block_queue;
 mod bulk_io;
@@ -33,6 +34,7 @@ mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
 mod scripthash_materialize;
+mod scripthash_mphf;
 mod scripthash_overflow;
 mod scripthash_pages;
 mod scripthash_slabs;
@@ -46,6 +48,7 @@ pub mod spend_annotate_uring;
 mod spender_table;
 mod store;
 mod store_secret;
+mod tx_head_mphf;
 mod tx_idx;
 mod tx_table;
 mod txid_body;

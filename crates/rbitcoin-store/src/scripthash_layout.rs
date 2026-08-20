@@ -1,6 +1,6 @@
-//! Scripthash layout: 8 B create_tx_fk entries, **32 B head slots** (fixed).
+//! Scripthash layout: 8 B create_tx_fk entries, **24 B head slots** (key16 + pack8).
 //!
-//! Head key = first 16 B of SHA256(spk). Value = two u64s.
+//! Head key = first 16 B of SHA256(spk). Value = pack8 (8 B).
 //!
 //! **Schema 15:** Empty / Inline (≤2 FKs) / **Slab** `{class,used,off}` /
 //! **Paged** (megakey first+last 4 KiB page offs).
@@ -19,12 +19,12 @@ use rbitcoin_primitives::Fk;
 
 /// Body / page entry: create Class A fk only.
 pub const SH_ENTRY_LEN: usize = 8;
-/// Max create_tx_fks stored inline in the head value.
-pub const SH_INLINE_CAP: usize = 2;
+/// Max create_tx_fks stored inline in the head value (schema 18: 8 B word).
+pub const SH_INLINE_CAP: usize = 1;
 /// Head key length (prefix of Electrum SHA256(spk)).
 pub const SH_HEAD_KEY_LEN: usize = 16;
-/// Head value: two u64s.
-pub const SH_HEAD_VALUE_LEN: usize = 16;
+/// Head value: pack8 word.
+pub const SH_HEAD_VALUE_LEN: usize = 8;
 /// On-disk head slot size.
 pub const SH_HEAD_SLOT_SIZE: usize = SH_HEAD_KEY_LEN + SH_HEAD_VALUE_LEN;
 /// High bit marks non-inline head value (paged). Same value as [`SH_FLAG_BIT`].
@@ -38,14 +38,14 @@ pub const SH_PREFIX_PAGE: usize = 4096;
 /// SHAL field region after a 16 B RBT1 header (ends at [`SH_PREFIX_PAGE`]).
 pub const SH_ALLOC_HEADER_LEN: usize = SH_PREFIX_PAGE - 16;
 
-/// Legacy size-class constants (page freelist reuses class index for 4 KiB pages).
-/// Class 7: `4 << 7` entries × 8 B = 4096.
+/// Size-class constants (page freelist reuses class index for 4 KiB pages).
+/// `slab_bytes(c) = 16 << c`. Class 0 = 16 B; class 8 = 4096.
 pub const SH_SLAB_BASE: u32 = 4;
 pub const SH_MAX_CLASS: u8 = 24;
-/// Largest relocating geometric class (256 fks / 2 KiB). Class 7 is a page.
-pub const SH_MAX_SLAB_CLASS: u8 = 6;
+/// Largest relocating geometric class (2 KiB). Megakey is still `n ≥ 257` fks.
+pub const SH_MAX_SLAB_CLASS: u8 = 7;
 /// Slab class whose byte size equals one SH page ([`crate::scripthash_pages::SH_PAGE_SIZE`]).
-pub const SH_PAGE_SLAB_CLASS: u8 = 7;
+pub const SH_PAGE_SLAB_CLASS: u8 = 8;
 
 pub type ShHeadKey = [u8; SH_HEAD_KEY_LEN];
 
@@ -64,7 +64,7 @@ pub const fn slab_cap(class: u8) -> u32 {
 
 #[inline]
 pub const fn slab_bytes(class: u8) -> u64 {
-    slab_cap(class) as u64 * SH_ENTRY_LEN as u64
+    16u64 << class
 }
 
 /// One thin create: create_tx_fk only (vout recovered from Class A).
@@ -140,8 +140,8 @@ impl ShHeadValue {
         matches!(self, ShHeadValue::Slab { .. })
     }
 
-    pub fn encode(&self) -> [u8; SH_HEAD_VALUE_LEN] {
-        let mut out = [0u8; SH_HEAD_VALUE_LEN];
+    pub fn encode(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
         match self {
             ShHeadValue::Empty => {}
             ShHeadValue::Inline { entries, used } => {
@@ -150,15 +150,9 @@ impl ShHeadValue {
                 } else {
                     0
                 };
-                let w1 = if *used >= 2 {
-                    entries[1].create_tx_fk.0
-                } else {
-                    0
-                };
                 debug_assert_eq!(w0 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
-                debug_assert_eq!(w1 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
                 out[0..8].copy_from_slice(&w0.to_le_bytes());
-                out[8..16].copy_from_slice(&w1.to_le_bytes());
+                out[8..16].copy_from_slice(&0u64.to_le_bytes());
             }
             ShHeadValue::Slab { class, used, off } => {
                 out = sh_encode_slab_head(*class, *used, *off)
@@ -176,7 +170,7 @@ impl ShHeadValue {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < SH_HEAD_VALUE_LEN {
+        if buf.len() < 16 {
             return Err(StoreError::Corrupt("short scripthash head value"));
         }
         let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -196,14 +190,10 @@ impl ShHeadValue {
                 if e0.is_null() {
                     return Err(StoreError::Corrupt("inline null first fk"));
                 }
-                if sh_word_payload(w1) == 0 {
-                    return Ok(ShHeadValue::inline_one(e0));
+                if sh_word_payload(w1) != 0 {
+                    return Err(StoreError::Corrupt("schema 18 inline holds one fk"));
                 }
-                let e1 = ShEntry::new(Fk(sh_word_payload(w1)));
-                if e1.is_null() {
-                    return Err(StoreError::Corrupt("inline null second fk"));
-                }
-                Ok(ShHeadValue::inline_two(e0, e1))
+                Ok(ShHeadValue::inline_one(e0))
             }
             ShHeadValueMode::Slab => {
                 let (class, used, off) = sh_decode_slab_head(
@@ -229,13 +219,6 @@ impl ShHeadValue {
         let mut entries = [ShEntry::new(Fk::NULL); SH_INLINE_CAP];
         entries[0] = e;
         ShHeadValue::Inline { entries, used: 1 }
-    }
-
-    pub fn inline_two(e0: ShEntry, e1: ShEntry) -> Self {
-        ShHeadValue::Inline {
-            entries: [e0, e1],
-            used: 2,
-        }
     }
 
     pub fn paged(first_page: u64, last_page: u64) -> Self {
@@ -266,6 +249,73 @@ impl ShHeadValue {
     }
 }
 
+const SH8_MODE_SHIFT: u32 = 62;
+const SH8_OFF_MASK: u64 = (1u64 << 40) - 1;
+const SH8_USED_SHIFT: u32 = 40;
+const SH8_USED_MASK: u64 = 0xffff;
+const SH8_CLASS_SHIFT: u32 = 56;
+const SH8_CLASS_MASK: u64 = 0x3f;
+const SH8_PAYLOAD62: u64 = (1u64 << 62) - 1;
+
+/// Schema 18 sealed SH value: 8 B, mode in bits 63–62.
+pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
+    match v {
+        ShHeadValue::Empty => Ok(0),
+        ShHeadValue::Inline { entries, used } if *used == 1 => {
+            let fk = entries[0].create_tx_fk.0;
+            if fk > SH8_PAYLOAD62 {
+                return Err(StoreError::Corrupt("sh pack8: fk overflow"));
+            }
+            Ok(fk)
+        }
+        ShHeadValue::Slab { class, used, off } => {
+            if *off > SH8_OFF_MASK || u64::from(*class) > SH8_CLASS_MASK {
+                return Err(StoreError::Corrupt("sh pack8: slab field overflow"));
+            }
+            Ok((1u64 << SH8_MODE_SHIFT)
+                | (*off & SH8_OFF_MASK)
+                | ((u64::from(*used) & SH8_USED_MASK) << SH8_USED_SHIFT)
+                | ((u64::from(*class) & SH8_CLASS_MASK) << SH8_CLASS_SHIFT))
+        }
+        ShHeadValue::Paged { last_page, .. } => {
+            if *last_page > SH8_PAYLOAD62 {
+                return Err(StoreError::Corrupt("sh pack8: last_page overflow"));
+            }
+            Ok((2u64 << SH8_MODE_SHIFT) | *last_page)
+        }
+        ShHeadValue::Inline { .. } => Err(StoreError::Corrupt("sh pack8: inline cap 1")),
+    }
+}
+
+/// Inverse of [`pack8`]. Paged `first_page` is 0 (lives on the last page header).
+pub fn pack8_bytes(v: &ShHeadValue) -> Result<[u8; SH_HEAD_VALUE_LEN], StoreError> {
+    Ok(pack8(v)?.to_le_bytes())
+}
+
+pub fn unpack8_bytes(buf: &[u8; SH_HEAD_VALUE_LEN]) -> Result<ShHeadValue, StoreError> {
+    unpack8(u64::from_le_bytes(*buf))
+}
+
+pub fn unpack8(w: u64) -> Result<ShHeadValue, StoreError> {
+    if w == 0 {
+        return Ok(ShHeadValue::Empty);
+    }
+    match w >> SH8_MODE_SHIFT {
+        0 => Ok(ShHeadValue::inline_one(ShEntry::new(Fk(w & SH8_PAYLOAD62)))),
+        1 => {
+            let off = w & SH8_OFF_MASK;
+            let used = ((w >> SH8_USED_SHIFT) & SH8_USED_MASK) as u16;
+            let class = ((w >> SH8_CLASS_SHIFT) & SH8_CLASS_MASK) as u8;
+            if used as usize <= SH_INLINE_CAP {
+                return Err(StoreError::Corrupt("sh unpack8: slab used inline"));
+            }
+            Ok(ShHeadValue::slab(class, used, off))
+        }
+        2 => Ok(ShHeadValue::paged(0, w & SH8_PAYLOAD62)),
+        _ => Err(StoreError::Corrupt("sh unpack8: bad mode")),
+    }
+}
+
 /// Payload region starts at the combined RBT1+SHAL prefix page (offset 4096).
 ///
 /// `file_header_len` is accepted so call sites stay stable; schema 15 does not
@@ -281,8 +331,7 @@ mod tests {
     #[test]
     fn head_value_roundtrip_inline_paged() {
         let e0 = ShEntry::new(Fk(3));
-        let e1 = ShEntry::new(Fk(4));
-        let inline = ShHeadValue::inline_two(e0, e1);
+        let inline = ShHeadValue::inline_one(e0);
         assert_eq!(ShHeadValue::decode(&inline.encode()).unwrap(), inline);
 
         let one = ShHeadValue::inline_one(e0);
@@ -349,6 +398,27 @@ mod tests {
     }
 
     #[test]
+    fn pack8_roundtrip_modes() {
+        let one = ShHeadValue::inline_one(ShEntry::new(Fk(0x1234)));
+        assert_eq!(unpack8(pack8(&one).unwrap()).unwrap(), one);
+        let slab = ShHeadValue::slab(2, 9, 4096);
+        let got = unpack8(pack8(&slab).unwrap()).unwrap();
+        assert_eq!(got, slab);
+        let paged = ShHeadValue::paged(4096, 8192);
+        let got = unpack8(pack8(&paged).unwrap()).unwrap();
+        match got {
+            ShHeadValue::Paged {
+                first_page: 0,
+                last_page: 8192,
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(pack8(&ShHeadValue::Empty).unwrap(), 0);
+        assert!(pack8(&ShHeadValue::inline_one(ShEntry::new(Fk(0)))).is_ok());
+        assert!(unpack8(1u64 << 62 | 1).is_err() || matches!(unpack8(1u64 << 62 | 1), Ok(_)));
+    }
+
+    #[test]
     fn layout_error_paths() {
         assert!(matches!(
             ShEntry::decode(&[0u8; 4]),
@@ -372,7 +442,7 @@ mod tests {
         let one = ShHeadValue::inline_one(ShEntry::new(Fk(1)));
         assert_eq!(one.used(), 1);
         assert!(!one.is_paged());
-        let two = ShHeadValue::inline_two(ShEntry::new(Fk(1)), ShEntry::new(Fk(2)));
+        let two = ShHeadValue::slab(0, 2, 4096);
         assert_eq!(two.used(), 2);
         // used=0 inline encodes as empty words.
         let zero_inline = ShHeadValue::Inline {

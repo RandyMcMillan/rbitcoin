@@ -236,7 +236,7 @@ pages after annotate does not protect `txout`. See
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
-| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. Legacy mono-head datadirs require reindex |
+| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads. Open segment is 4 B OA; roll opens the next OA immediately and seals the previous (**MPHF + u32 rel + fuse8**) on a sidecar. Legacy mono-head datadirs require reindex |
 | Confirm stages | **lookup · load · scripts · write** | Real queues **loadq=14 · scriptq=4 · writeq=14**. Lookup takes BQ in height order (stops at a hole after `lookup_taken_hi`), dequeues raw, and fills loadq with load-sized batches (8000 inputs / 144 blocks). IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights; hard **min 8000** when more unresolved heights remain. Wave table: [`docs/concurrency.md`](docs/concurrency.md). |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
@@ -275,7 +275,7 @@ megakey pages write as they fill — ≤510 FKs buffered). Schema-16
 `key_len=32` leftover `scripthash.runs` are refused (wipe that dir and
 rematerialize). Class A with creates in the pre-pack 16-byte meta /
 9-byte spent layout is refused (wipe datadir and redo IBD). New keys after seal go
-to one **global ingest OA** (mainnet 2²² slots ≈ 128 MiB). Fan-in reduce is
+to one **global ingest OA** (mainnet 2²⁵ slots × 24 B ≈ 768 MiB). Fan-in reduce is
 **fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
 only at ≥75% of target run size (default target **512 MiB**) and compacts tiny
 catalog runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs
@@ -321,14 +321,14 @@ full-size `scripthash.ovf.head` is removed on open. Existing main keys update
 
 New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
 256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
-heads (`tx.head.meta` + `tx.head.NNNNNN`, **4 B relative** create ids, 128 MiB per
-segment). Probe is **page-local**: high mixed-txid bits select a 1024-slot page,
-double-hash within the page (one 4 KiB IO @ 4 B). Capacity ends at
-**`MIN(body soft span ~16 GiB, 80% of head slots)`**: seal builds **binary fuse8**
-(~9 bits/key) then opens a new segment (no mono-file bits-widen, no shadow
-resize thread). Open segment has **no** filter (always probed); sealed segments
-are fuse-gated newest→oldest. Legacy monolithic `tx.head` / `.new` / `.resize` /
-`.overflow` are **refused** — reindex. Create height is a RAM fence (no
+heads (`tx.head/meta` + open `NNNNNN` OA, sealed `NNNNNN.mphf|.rel|.fuse8`).
+Capacity ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`**: seal
+builds MPHF + dense rel + **binary fuse8**, unlinks OA, then opens a new
+segment. Open segment has **no** filter (always probed); sealed segments are
+fuse-gated then one MPHF+rel pread. Legacy monolithic `tx.head` / `.new` /
+`.resize` / `.overflow` are **refused** — reindex. Schema **18** with populated
+17 `tx.head` or `scripthash*` is refused: wipe `store/tx.head` and
+`store/scripthash*` then restart (Class A kept; indexes rebuild). Create height is a RAM fence (no
 `tx_height` file; schema 16).
 Dense Class A fk + segmented **`txout.idx` / `inwit.idx` / `spent.idx`**.
 Class A is **split** (outs / ins+wit / sole-spender). Spends are schema-v5

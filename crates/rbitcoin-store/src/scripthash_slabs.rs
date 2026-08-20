@@ -14,13 +14,14 @@ use rbitcoin_primitives::Fk;
 /// First fk count that freezes into a megakey page chain (class 6 cap + 1).
 pub const SH_MEGAKEY_MIN_FKS: u32 = 257;
 
-const _: () = assert!(slab_cap(SH_MAX_SLAB_CLASS) == 256);
-const _: () = assert!(SH_MEGAKEY_MIN_FKS == slab_cap(SH_MAX_SLAB_CLASS) + 1);
+const _: () = assert!(slab_bytes(0) == 16);
+const _: () = assert!(slab_bytes(SH_MAX_SLAB_CLASS) == 2048);
+const _: () = assert!(SH_MEGAKEY_MIN_FKS == 257);
 
 /// Smallest relocating class whose **byte** size holds `packed_len`.
 ///
 /// Bulk pack uses this so a tight ULEB stream does not inherit the raw-u64
-/// `n × 8` class. `None` if empty or larger than class 6 (2 KiB).
+/// `n × 8` class. `None` if empty or larger than class 7 (2 KiB).
 pub fn slab_class_for_packed_len(packed_len: usize) -> Option<u8> {
     if packed_len == 0 {
         return None;
@@ -31,9 +32,9 @@ pub fn slab_class_for_packed_len(packed_len: usize) -> Option<u8> {
 /// Smallest class whose slot cap is `≥ n` (`None` if inline or megakey).
 ///
 /// Tip-grow still uses fk-count so a spare slot exists for the next append.
-/// `n ≤ 2` is head-inline (no body). `n ≥ 257` is a page chain.
+/// `n ≤ 1` is head-inline (no body). `n ≥ 257` is a page chain.
 pub fn slab_class_for_n_fks(n: u32) -> Option<u8> {
-    if n as usize <= SH_INLINE_CAP || n > slab_cap(SH_MAX_SLAB_CLASS) {
+    if n as usize <= SH_INLINE_CAP || n >= SH_MEGAKEY_MIN_FKS {
         return None;
     }
     (0..=SH_MAX_SLAB_CLASS).find(|&c| slab_cap(c) >= n)
@@ -200,7 +201,7 @@ mod tests {
     fn slab_class_picks_smallest_fit_and_slack() {
         assert_eq!(slab_class_for_n_fks(0), None);
         assert_eq!(slab_class_for_n_fks(1), None);
-        assert_eq!(slab_class_for_n_fks(2), None);
+        assert_eq!(slab_class_for_n_fks(2), Some(0));
         assert_eq!(slab_class_for_n_fks(3), Some(0));
         assert_eq!(slab_class_for_n_fks(4), Some(0));
         assert_eq!(slab_class_for_n_fks(5), Some(1));
@@ -212,15 +213,25 @@ mod tests {
         assert_eq!(slab_class_for_n_fks_with_slack(256), Some(6));
         assert_eq!(slab_alloc_bytes_for_n_fks(1), 0);
         assert_eq!(page_alloc_bytes_for_n_fks(1), 0);
-        assert_eq!(slab_alloc_bytes_for_n_fks(5), 64);
+        assert_eq!(slab_alloc_bytes_for_n_fks(2), 16);
+        assert_eq!(slab_alloc_bytes_for_n_fks(5), 32);
         assert_eq!(slab_alloc_bytes_for_n_fks(257), 4096);
         let five: Vec<Fk> = (1..=5u64).map(Fk).collect();
         let packed = encode_slab_payload(&five).unwrap();
         assert_eq!(slab_class_for_packed_len(packed.len()), Some(0));
+        let two: Vec<Fk> = vec![Fk(1), Fk(2)];
+        let packed2 = encode_slab_payload(&two).unwrap();
+        assert_eq!(slab_bytes(0), 16);
+        assert_eq!(slab_class_for_packed_len(packed2.len()), Some(0));
+        assert!(
+            packed2.len() as u64 <= slab_bytes(0),
+            "2-fk ULEB must fit class 0 16 B (len={})",
+            packed2.len()
+        );
         let three_hundred: Vec<Fk> = (1..=300u64).map(Fk).collect();
         let packed = encode_slab_payload(&three_hundred).unwrap();
         let class = slab_class_for_packed_len(packed.len()).expect("300 tight deltas fit a slab");
-        assert!(class <= 4, "class={class} packed={}", packed.len());
+        assert!(class <= 5, "class={class} packed={}", packed.len());
         assert_eq!(slab_class_for_packed_len(0), None);
         assert_eq!(slab_class_for_packed_len(2049), None);
         assert_eq!(page_alloc_bytes_for_n_fks(5), 4096);

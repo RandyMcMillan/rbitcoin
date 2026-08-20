@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 17`, durable).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 18`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **17** | **Durable.** SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. Refuse leftover `key_len=32` runs, raw-u64 SH pages, and 16-layout Class A. | **Current** |
+| **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | **Current** |
+| **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Prior |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
 | **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
@@ -30,6 +31,18 @@ Versions below are listed **newest → oldest** after the summary table.
 | **≤3** | Early mmap store; fat heads; mixed prev encoding | Mostly gone |
 
 ---
+
+## v18 (indexes)
+
+Index-only. Sealed SH main is BDZ MPHF + 8 B pack8 (`NN.mphf` / `NN.val`);
+no main fuse8. Membership is mix64(key16) tags after the BDZ `g[]` (pread, not
+RAM). Sealed ovf stays `SHSR`+fuse. `SH_INLINE_CAP = 1`; slab class 0 is 16 B.
+Megakey page header is 8 B (`LAST | index`). Confirm in Direct does not
+enqueue `scripthash.runs` or write the durable head — recollect + pack is tip
+finalize only. A 17 datadir with `tx.head` or `scripthash*` data is refused.
+Sealed `tx.head` is MPHF + `u32` rel + fuse8 (OA unlinked); open segment stays
+4 B OA. Lookup waves unchanged: open OA, sealed fuse then MPHF+rel on the same
+IoCtx SQE path. BIP30 extras live in optional `.mlt`.
 
 ## v17 (durable)
 

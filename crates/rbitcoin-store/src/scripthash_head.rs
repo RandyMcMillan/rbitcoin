@@ -13,13 +13,16 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
+use crate::hashhead::HeadScale;
+#[cfg(test)]
+use crate::hashhead::{initial_slots_for, HeadRole};
 use crate::scripthash_layout::{
-    head_key_from_full, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
-    SH_HEAD_VALUE_LEN,
+    head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
+    SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
 #[cfg(test)]
 use crate::sharded_hashhead::initial_slots_per_shard;
+#[cfg(test)]
 use crate::sharded_hashhead::shard_count_for_role;
 use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
@@ -38,6 +41,7 @@ const SLOTS_PER_CHUNK: u64 = 128;
 const CHUNK_CACHE_MAX: usize = 256;
 
 /// Corrupt message when on-disk SH head shard count ≠ current layout (e.g. 16-way vs 64-way).
+#[cfg(test)]
 pub const SH_HEAD_SHARD_COUNT_MISMATCH: &str =
     "scripthash head shard count mismatch (reindex; expected 64-way mainnet layout)";
 
@@ -184,6 +188,9 @@ fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
 }
 
 impl ScriptHashHead {
+    /// Occupied/slots before ingest seals to L0 (`SHSR`).
+    pub const SH_SEAL_LOAD: f64 = 0.80;
+
     pub fn create_with_slots(path: impl Into<PathBuf>, slots: u64) -> Result<Self, StoreError> {
         let slots = slots.max(2).next_power_of_two();
         let file = TableFile::create(path, TableKind::HashHead)?;
@@ -318,7 +325,7 @@ impl ScriptHashHead {
                 return Ok((None, cache.chunk_loads));
             }
             if k == key {
-                let val = ShHeadValue::decode(&v)?;
+                let val = unpack8_bytes(&v)?;
                 if val.is_empty() {
                     return Ok((None, cache.chunk_loads));
                 }
@@ -370,7 +377,7 @@ impl ScriptHashHead {
                     break;
                 }
                 if k == key {
-                    let val = ShHeadValue::decode(&v)?;
+                    let val = unpack8_bytes(&v)?;
                     if !val.is_empty() {
                         out[i] = Some(val);
                     }
@@ -449,7 +456,7 @@ impl ScriptHashHead {
             let mut need_rehash = false;
             while i < work.len() {
                 let (key, ref val) = work[i];
-                let enc = val.encode();
+                let enc = pack8_bytes(val)?;
                 match cache.try_insert(&key, &enc, true)? {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
@@ -578,7 +585,7 @@ impl ScriptHashHead {
             let mut cache = SlotPageCache::new(self, slots);
             while i < work.len() {
                 let (key, ref val, _) = work[i];
-                let enc = val.encode();
+                let enc = pack8_bytes(val)?;
                 match cache.try_insert(&key, &enc, allow_new)? {
                     InsertResult::Done(was_empty) => {
                         if was_empty {
@@ -625,7 +632,7 @@ impl ScriptHashHead {
         let mut table = vec![0u8; nbytes];
         let mut occupied = 0u64;
         for (key, val) in entries {
-            let enc = val.encode();
+            let enc = pack8_bytes(val)?;
             let mut slot = Self::hash_slot(key, slots);
             let mut placed = false;
             for _ in 0..slots {
@@ -870,7 +877,7 @@ impl ScriptHashHead {
                 if is_empty_slot(&k, &v) {
                     continue;
                 }
-                let val = ShHeadValue::decode(&v)?;
+                let val = unpack8_bytes(&v)?;
                 if !val.is_empty() {
                     let mut full = [0u8; 32];
                     full[0..SH_HEAD_KEY_LEN].copy_from_slice(&k);
@@ -1089,7 +1096,7 @@ impl LiveShardTable {
             self.rehash_double()?;
         }
         let key = head_key_from_full(full);
-        let enc = val.encode();
+        let enc = pack8_bytes(val)?;
         self.place(key, &enc)?;
         self.keys = self.keys.saturating_add(1);
         Ok(())
@@ -1156,10 +1163,12 @@ impl LiveShardTable {
 }
 
 /// Sharded facade (64-way mainnet) over [`ScriptHashHead`].
+#[cfg(test)]
 pub struct ShardedScriptHashHead {
     shards: Vec<ScriptHashHead>,
 }
 
+#[cfg(test)]
 impl ShardedScriptHashHead {
     #[cfg(test)]
     pub fn create_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
@@ -1305,29 +1314,6 @@ impl ShardedScriptHashHead {
         self.shards.iter().all(|s| s.is_known_empty())
     }
 
-    /// Zero head shards `start..` (resume cold materialize from `start`).
-    pub fn reinit_shards_from(&self, start: usize) -> Result<(), StoreError> {
-        for s in self.shards.iter().skip(start) {
-            s.reinit_empty()?;
-        }
-        Ok(())
-    }
-
-    /// Zero one OA shard (dir-variant resume of an unsealed hole).
-    pub fn reinit_shard(&self, shard: usize) -> Result<(), StoreError> {
-        let Some(s) = self.shards.get(shard) else {
-            return Err(StoreError::Corrupt(
-                "scripthash reinit_shard: shard out of range",
-            ));
-        };
-        s.reinit_empty()
-    }
-
-    /// Occupied slot count for one shard (0 if OOB).
-    pub fn shard_occupied(&self, shard: usize) -> u64 {
-        self.shards.get(shard).map(|s| s.occupied()).unwrap_or(0)
-    }
-
     /// Install a finished [`LiveShardTable`] into `shard` (empty cold path).
     #[cfg(test)]
     pub fn install_live_shard(&self, shard: usize, live: LiveShardTable) -> Result<(), StoreError> {
@@ -1342,20 +1328,12 @@ impl ShardedScriptHashHead {
         live.install_into(&self.shards[shard])
     }
 
-    /// Best-effort page-cache release after a cold shard write.
-    pub fn shard_advise_dont_need(&self, shard: usize) {
-        if let Some(s) = self.shards.get(shard) {
-            s.advise_dont_need_all();
-        }
-    }
-
     /// Insert head values, applying **one shard at a time** (sorted within shard).
     ///
     /// When `flush_each_shard` is true (large materialize runs), flush the shard
     /// file after its bucket so the working set does not keep every shard dirty
     /// at once. Small runs skip the per-shard flush and rely on later table flush.
-    /// Max occupied/slots before SH main/overflow should seal (plan: 0.80).
-    pub const SH_SEAL_LOAD: f64 = 0.80;
+    pub const SH_SEAL_LOAD: f64 = ScriptHashHead::SH_SEAL_LOAD;
 
     pub fn flush(&self) -> Result<(), StoreError> {
         for s in &self.shards {
@@ -1613,7 +1591,7 @@ mod tests {
         let mut batch: Vec<(crate::scripthash_layout::ShHeadKey, ShHeadValue)> = Vec::new();
         batch.push((
             head_key_from_full(&existing[0]),
-            ShHeadValue::inline_two(ShEntry::new(Fk(1)), ShEntry::new(Fk(99))),
+            ShHeadValue::slab(0, 2, 4096),
         ));
         for i in 0..6u8 {
             let mut full = [0u8; 32];
@@ -1636,7 +1614,10 @@ mod tests {
         assert_eq!(h.slots(), 8, "no-rehash must not grow");
         // Update applied on the existing key.
         let v = h.get(&existing[0]).unwrap().unwrap();
-        assert_eq!(v.inline_fks(), vec![Fk(1), Fk(99)]);
+        match v {
+            ShHeadValue::Slab { used: 2, .. } => {}
+            other => panic!("expected 2-fk slab update, got {other:?}"),
+        }
         // Remainder keys are not on this head.
         for (hk, _) in &rem {
             let mut full = [0u8; 32];
@@ -1737,7 +1718,7 @@ mod tests {
             let mut key = [0u8; 32];
             key[0..8].copy_from_slice(&i.to_le_bytes());
             let val = if i % 3 == 0 {
-                ShHeadValue::inline_two(ShEntry::new(Fk(i + 1)), ShEntry::new(Fk(i + 100)))
+                ShHeadValue::slab(0, 2, 4096 + i)
             } else if i % 3 == 1 {
                 ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))
             } else {

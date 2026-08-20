@@ -50,7 +50,7 @@ HWM. Roles: [`docs/concurrency.md`](docs/concurrency.md). Heads:
 | Roles | At most **one Class A appender** and **one spend annotator** per process; **N readers** of published ranges always free |
 | Publish | body → idx → count/HWM (Release); then head / `header_txs` as visibility requires |
 | Capacity grow | fallocate/`set_len` only; readers use published HWM |
-| Layout grow (`tx.head`) | **segment roll**: seal open head (fuse8) + create new fixed 25-bit head |
+| Layout grow (`tx.head`) | **segment roll**: open next 25-bit OA; seal previous (MPHF+fuse8) on a sidecar; Open wave probes every unsealed OA |
 | Class C tip | L2 write-behind; `flush_class_c_tip` **before** body-queue dequeue |
 | Not OK | Long-held store locks on IBD/read path, “pause all queries during confirm”, multi appenders |
 

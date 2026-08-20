@@ -7,29 +7,32 @@
 use crate::compact::uleb128_len;
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::HeadRole;
 use crate::hashhead::HeadScale;
+#[cfg(test)]
+use crate::scripthash_head::ShardedScriptHashHead;
 use crate::scripthash_head::{
-    sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead, ShardedScriptHashHead,
+    prefix_shard_of, sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead,
 };
 use crate::scripthash_layout::{
-    head_key_from_full, payload_start, slab_bytes, ShEntry, ShHeadValue, SH_ALLOC_HEADER_LEN,
-    SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS, SH_MAX_SLAB_CLASS,
-    SH_PAGE_SLAB_CLASS,
+    head_key_from_full, pack8_bytes, payload_start, slab_bytes, ShEntry, ShHeadValue,
+    SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_HEAD_VALUE_LEN, SH_INLINE_CAP,
+    SH_MAX_CLASS, SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
+use crate::scripthash_mphf::{self, mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
-    sh_page_init_empty, sh_page_last_fk, sh_page_next, sh_page_pack, sh_page_set_next,
-    sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
+    sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk, sh_page_next,
+    sh_page_pack, sh_page_set_last, sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE,
+    SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload, slab_class_for_n_fks_with_slack,
     slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
 };
-use crate::scripthash_sorted_head::{
-    install_head_part, SortedHead, SortedHeadFilter, SortedHeadWriter,
-};
+use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
 use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{
     list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
@@ -38,6 +41,7 @@ use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 
 /// Durable cold-materialize resume marker (next to `scripthash.head`).
@@ -265,14 +269,17 @@ pub struct ScriptHashTable {
     layout: ShBodyLayout,
     bodies: Vec<TableFile>,
     ovf_body: Option<TableFile>,
-    head: ShardedScriptHashHead,
-    /// Sealed sorted main shards (set when a cold bulk shard is installed).
+    n_shards: usize,
+    /// Sealed MPHF main shards (set when a cold bulk shard is installed).
     /// Per-shard slot so Electrum `get` does not take a process-wide mutex.
-    sorted_main: Box<[RwLock<Option<SortedHead>>]>,
+    sorted_main: Box<[RwLock<Option<MphfHead>>]>,
     /// Global ingest OA for keys first seen after main seal (`scripthash.ovf/ingest`).
     ingest: Mutex<ScriptHashHead>,
-    /// Sealed global ovf (sorted+fuse+idx), newest last.
+    /// L0 sealed global ovf (`SHSR`+fuse), newest last.
     sealed_ovf: Mutex<Vec<SortedHead>>,
+    /// L1 promoted ovf (at most one MPHF+fuse per rematerialize lifetime).
+    ovf_l1: Mutex<Option<OvfL1>>,
+    l1_frozen_warned: AtomicBool,
     /// At least one sealed sorted main shard is installed.
     sorted_main_on: std::sync::atomic::AtomicBool,
     /// One alloc per `bodies` entry (Shared: len 1).
@@ -280,6 +287,14 @@ pub struct ScriptHashTable {
     /// Dir-variant ovf alloc. Shared: `None` (ovf uses `allocs[0]`).
     ovf_alloc: Option<Mutex<AllocState>>,
 }
+
+struct OvfL1 {
+    head: MphfHead,
+    fuse: SealedFuse8,
+}
+
+const SH_L1_FROZEN_WARN: &str =
+    "scripthash ovf L1 MPHF is frozen; wipe store/scripthash* and rematerialize (--shindex)";
 
 /// How `scripthash.body` is oriented on disk (schema 17 variant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,7 +357,7 @@ fn ingest_path(dir: &Path) -> PathBuf {
 fn ingest_oa_slots() -> u64 {
     match HeadScale::from_env() {
         HeadScale::Tiny => 256,
-        HeadScale::Mainnet => 1 << 22,
+        HeadScale::Mainnet => 1 << 25,
     }
 }
 
@@ -371,13 +386,13 @@ fn sorted_main_shard_path(dir: &Path, shard: usize, n_shards: usize) -> PathBuf 
 fn open_sorted_main_shards(
     dir: &Path,
     n_shards: usize,
-) -> Result<Vec<Option<SortedHead>>, StoreError> {
+) -> Result<Vec<Option<MphfHead>>, StoreError> {
     let n = n_shards.max(1);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let p = sorted_main_shard_path(dir, i, n);
-        if file_starts_with_shsr(&p) {
-            out.push(Some(SortedHead::open(&p, SortedHeadFilter::None)?));
+        if MphfHead::exists(&p) {
+            out.push(Some(MphfHead::open(&p)?));
         } else {
             out.push(None);
         }
@@ -385,8 +400,41 @@ fn open_sorted_main_shards(
     Ok(out)
 }
 
-fn wrap_sorted_slots(v: Vec<Option<SortedHead>>) -> Box<[RwLock<Option<SortedHead>>]> {
+fn wrap_sorted_slots(v: Vec<Option<MphfHead>>) -> Box<[RwLock<Option<MphfHead>>]> {
     v.into_iter().map(RwLock::new).collect()
+}
+
+fn open_ovf_l1(dir: &Path) -> Result<Option<OvfL1>, StoreError> {
+    let ovf = dir.join("scripthash.ovf");
+    if !ovf.is_dir() {
+        return Ok(None);
+    }
+    let mut ids: Vec<u32> = std::fs::read_dir(&ovf)
+        .map_err(|e| StoreError::io(&ovf, e))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            name.strip_suffix(".mphf")?
+                .parse::<u32>()
+                .ok()
+                .filter(|_| name.len() == 6 + ".mphf".len())
+        })
+        .collect();
+    ids.sort_unstable();
+    let Some(&id) = ids.last() else {
+        return Ok(None);
+    };
+    let base = sealed_ovf_path(dir, id);
+    if !MphfHead::exists(&base) {
+        return Ok(None);
+    }
+    let head = MphfHead::open(&base)?;
+    let fuse = SealedFuse8::read_from(&{
+        let mut p = base.as_os_str().to_os_string();
+        p.push(".fuse8");
+        PathBuf::from(p)
+    })?;
+    Ok(Some(OvfL1 { head, fuse }))
 }
 
 fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError> {
@@ -433,7 +481,7 @@ fn open_or_create_ingest(dir: &Path) -> Result<ScriptHashHead, StoreError> {
 
 fn sorted_main_present(dir: &Path, n_shards: usize) -> bool {
     let n = n_shards.max(1);
-    (0..n).any(|i| file_starts_with_shsr(&sorted_main_shard_path(dir, i, n)))
+    (0..n).any(|i| MphfHead::exists(&sorted_main_shard_path(dir, i, n)))
 }
 
 fn leftover_oa_wipe_msg() -> String {
@@ -443,15 +491,39 @@ fn leftover_oa_wipe_msg() -> String {
         .into()
 }
 
-/// Live OA at `scripthash.head` (file or shard dir) that is not sealed `SHSR`.
+fn unlink_leftover_oa_stub(dir: &Path) {
+    let stub = dir.join("scripthash.head.oa_stub");
+    if stub.is_dir() {
+        let _ = std::fs::remove_dir_all(&stub);
+    } else if stub.is_file() {
+        let _ = std::fs::remove_file(&stub);
+    }
+}
+
+fn sharded_body_n_shards(dir: &Path) -> Result<usize, StoreError> {
+    let body = sh_body_path(dir);
+    let mut names: Vec<String> = std::fs::read_dir(&body)
+        .map_err(|e| StoreError::io(&body, e))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit()))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(StoreError::Layout(sh_body_layout_wipe_msg()));
+    }
+    for (i, n) in names.iter().enumerate() {
+        if *n != format!("{i:02x}") {
+            return Err(StoreError::Layout(sh_body_layout_wipe_msg()));
+        }
+    }
+    Ok(names.len())
+}
+
+/// Live OA or schema-17 `SHSR` at `scripthash.head` (file or shard dir).
 fn leftover_live_oa_main(head_path: &Path) -> bool {
-    if !head_path.exists() {
-        return false;
-    }
-    if head_path.is_file() {
-        return !file_starts_with_shsr(head_path);
-    }
-    head_path.is_dir()
+    head_path.exists()
 }
 
 /// Non-`SHSR` six-digit files under `scripthash.ovf/` (old OA overflow segs).
@@ -470,15 +542,13 @@ fn leftover_oa_overflow(dir: &Path) -> bool {
     })
 }
 
-fn open_or_create_oa_stub(
-    stub: &Path,
-    n_shards: usize,
-) -> Result<ShardedScriptHashHead, StoreError> {
-    let n = n_shards.max(1);
-    if stub.exists() {
-        return ShardedScriptHashHead::open_for_role(stub, HeadRole::ScriptHash);
+fn paged_first_from_last(body: &TableFile, last_page: u64) -> Result<u64, StoreError> {
+    if last_page == 0 {
+        return Ok(0);
     }
-    ShardedScriptHashHead::create_sharded(stub, n, 64)
+    let mut page = [0u8; SH_PAGE_SIZE];
+    body.read_at(last_page, &mut page)?;
+    sh_page_first_off(sh_page_as_array(&page)?)
 }
 
 /// Where a scripthash key lives for head upsert routing.
@@ -511,16 +581,17 @@ impl ScriptHashTable {
         std::fs::create_dir_all(&ovf_dir).map_err(|e| StoreError::io(&ovf_dir, e))?;
         let ovf = TableFile::create(sh_ovf_body_path(dir), TableKind::ScriptHash)?;
         let ovf_st = init_empty_body(&ovf)?;
-        let head = open_or_create_oa_stub(&dir.join("scripthash.head.oa_stub"), n_shards)?;
         Ok(Self {
             store_dir: dir.to_path_buf(),
             layout: ShBodyLayout::Sharded,
             bodies,
             ovf_body: Some(ovf),
-            head,
+            n_shards,
             sorted_main: wrap_sorted_slots((0..n_shards).map(|_| None).collect()),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(Vec::new()),
+            ovf_l1: Mutex::new(None),
+            l1_frozen_warned: AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(false),
             allocs,
             ovf_alloc: Some(Mutex::new(ovf_st)),
@@ -537,17 +608,20 @@ impl ScriptHashTable {
         if leftover_live_oa_main(&head_path) && !sorted_main_present(dir, expected) {
             return Err(StoreError::Layout(leftover_oa_wipe_msg()));
         }
-        let stub = dir.join("scripthash.head.oa_stub");
-        let head = open_or_create_oa_stub(&stub, expected)?;
-        Self::from_layout_and_head(dir, layout, head)
+        unlink_leftover_oa_stub(dir);
+        let n_shards = match layout {
+            ShBodyLayout::Shared => expected.max(1),
+            ShBodyLayout::Sharded => sharded_body_n_shards(dir)?,
+        };
+        Self::from_layout_and_n_shards(dir, layout, n_shards)
     }
 
-    fn from_layout_and_head(
+    fn from_layout_and_n_shards(
         dir: &Path,
         layout: ShBodyLayout,
-        head: ShardedScriptHashHead,
+        n_shards: usize,
     ) -> Result<Self, StoreError> {
-        let n_shards = head.shard_count().max(1);
+        let n_shards = n_shards.max(1);
         let (bodies, ovf_body, allocs, ovf_alloc, alloc_ver) = match layout {
             ShBodyLayout::Shared => {
                 let f = TableFile::open(sh_body_path(dir), TableKind::ScriptHash)?;
@@ -575,16 +649,19 @@ impl ScriptHashTable {
         wipe_legacy_fullsize_overflow(dir)?;
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
         let sealed_ovf = open_sealed_sorted_ovf(dir)?;
+        let ovf_l1 = open_ovf_l1(dir)?;
         let sorted_on = sorted_main.iter().any(|s| s.is_some());
         let table = Self {
             store_dir: dir.to_path_buf(),
             layout,
             bodies,
             ovf_body,
-            head,
+            n_shards,
             sorted_main: wrap_sorted_slots(sorted_main),
             ingest: Mutex::new(open_or_create_ingest(dir)?),
             sealed_ovf: Mutex::new(sealed_ovf),
+            ovf_l1: Mutex::new(ovf_l1),
+            l1_frozen_warned: AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(sorted_on),
             allocs,
             ovf_alloc,
@@ -610,6 +687,11 @@ impl ScriptHashTable {
         self.ovf_body.as_ref().unwrap_or(&self.bodies[0])
     }
 
+    #[inline]
+    fn shard_index(&self, full: &[u8; 32]) -> usize {
+        prefix_shard_of(full, self.n_shards)
+    }
+
     fn shard_body(&self, si: usize) -> &TableFile {
         match self.layout {
             ShBodyLayout::Shared => &self.bodies[0],
@@ -630,14 +712,14 @@ impl ScriptHashTable {
 
     fn body_for(&self, key: &[u8; 32], home: KeyHome) -> &TableFile {
         match home {
-            KeyHome::Main => self.shard_body(self.head.shard_index(key)),
+            KeyHome::Main => self.shard_body(self.shard_index(key)),
             KeyHome::Ingest | KeyHome::SealedOvf | KeyHome::Absent => self.ovf_file(),
         }
     }
 
     fn alloc_for(&self, key: &[u8; 32], home: KeyHome) -> &Mutex<AllocState> {
         match home {
-            KeyHome::Main => self.shard_alloc(self.head.shard_index(key)),
+            KeyHome::Main => self.shard_alloc(self.shard_index(key)),
             KeyHome::Ingest | KeyHome::SealedOvf | KeyHome::Absent => self.ovf_alloc_mutex(),
         }
     }
@@ -786,6 +868,9 @@ impl ScriptHashTable {
         if !self.sealed_ovf.lock().unwrap().is_empty() {
             return false;
         }
+        if self.ovf_l1.lock().unwrap().is_some() {
+            return false;
+        }
         self.ingest.lock().unwrap().is_known_empty()
     }
 
@@ -800,13 +885,11 @@ impl ScriptHashTable {
     /// the alloc header still says `live_count == 0`.
     pub fn reinit_empty_for_cold_materialize(&self) -> Result<(), StoreError> {
         self.reset_all_bodies()?;
-        self.head.reinit_empty()?;
         for slot in self.sorted_main.iter() {
             *slot.write().unwrap() = None;
         }
         self.sorted_main_on
             .store(false, std::sync::atomic::Ordering::Release);
-        debug_assert!(self.head.is_empty());
         Ok(())
     }
 
@@ -815,7 +898,7 @@ impl ScriptHashTable {
     /// Shared body: prefix HWM (`progress.next_shard..` + `body_bump`).
     /// Sharded bodies: each sealed `scripthash.head/NN` is a commit; holes stay.
     pub fn prepare_cold_resume(&self, progress: &ColdProgress) -> Result<(), StoreError> {
-        let n = self.head.shard_count();
+        let n = self.n_shards;
         let start = progress.next_shard as usize;
         if start > n {
             return Err(StoreError::Corrupt(
@@ -825,7 +908,6 @@ impl ScriptHashTable {
         let payload0 = payload_start(FILE_HEADER_LEN);
         match self.layout {
             ShBodyLayout::Shared => {
-                self.head.reinit_shards_from(start)?;
                 let bump = progress.body_bump.max(payload0);
                 let state = AllocState {
                     live_count: progress.live_count,
@@ -851,12 +933,14 @@ impl ScriptHashTable {
                     if sealed.get(i).copied().unwrap_or(false) {
                         continue;
                     }
-                    self.head.reinit_shard(i)?;
+
                     *self.allocs[i].lock().unwrap() = empty;
                     write_alloc_header(&self.bodies[i], &empty)?;
                     self.bodies[i].set_logical_len(payload0)?;
                     let p = sorted_main_shard_path(&self.store_dir, i, n);
                     let _ = std::fs::remove_file(&p);
+                    let _ = std::fs::remove_file(scripthash_mphf::mphf_path(&p));
+                    let _ = std::fs::remove_file(scripthash_mphf::val_path(&p));
                     let mut idx = p.clone().into_os_string();
                     idx.push(".idx");
                     let _ = std::fs::remove_file(idx);
@@ -887,7 +971,7 @@ impl ScriptHashTable {
         keys_written: u64,
         live_count: u64,
     ) -> Result<(), StoreError> {
-        let n = self.head.shard_count();
+        let n = self.n_shards;
         let next = self
             .sorted_main
             .iter()
@@ -937,6 +1021,9 @@ impl ScriptHashTable {
         if !self.sealed_ovf.lock().unwrap().is_empty() {
             return true;
         }
+        if self.ovf_l1.lock().unwrap().is_some() {
+            return true;
+        }
         false
     }
 
@@ -964,20 +1051,31 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
     ) -> Result<Option<(ShHeadValue, KeyHome)>, StoreError> {
         if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
+            let v = self.fill_paged_first(scripthash, v, KeyHome::Ingest)?;
             return Ok(Some((v, KeyHome::Ingest)));
         }
         let hk = head_key_from_full(scripthash);
         for h in self.sealed_ovf.lock().unwrap().iter().rev() {
             if let Some(v) = h.get(&hk)? {
+                let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
                 return Ok(Some((v, KeyHome::SealedOvf)));
             }
         }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            if l1.fuse.contains(mix_key16(&hk)) {
+                if let Some(v) = l1.head.get(&hk)? {
+                    let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
+                    return Ok(Some((v, KeyHome::SealedOvf)));
+                }
+            }
+        }
         if self.has_sorted_main() {
-            let si = self.head.shard_index(scripthash);
+            let si = self.shard_index(scripthash);
             if let Some(slot) = self.sorted_main.get(si) {
                 let g = slot.read().unwrap();
                 if let Some(h) = g.as_ref() {
                     if let Some(v) = h.get(&hk)? {
+                        let v = self.fill_paged_first(scripthash, v, KeyHome::Main)?;
                         return Ok(Some((v, KeyHome::Main)));
                     }
                 }
@@ -986,12 +1084,30 @@ impl ScriptHashTable {
         Ok(None)
     }
 
+    fn fill_paged_first(
+        &self,
+        key: &[u8; 32],
+        val: ShHeadValue,
+        home: KeyHome,
+    ) -> Result<ShHeadValue, StoreError> {
+        match val {
+            ShHeadValue::Paged {
+                first_page: 0,
+                last_page,
+            } if last_page != 0 => {
+                let first = paged_first_from_last(self.body_for(key, home), last_page)?;
+                Ok(ShHeadValue::paged(first, last_page))
+            }
+            other => Ok(other),
+        }
+    }
+
     fn has_sorted_main(&self) -> bool {
         self.sorted_main_on
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn install_sorted_main(&self, shard: usize, sealed: SortedHead) {
+    fn install_sorted_main(&self, shard: usize, sealed: MphfHead) {
         if let Some(slot) = self.sorted_main.get(shard) {
             *slot.write().unwrap() = Some(sealed);
             self.sorted_main_on
@@ -1385,7 +1501,7 @@ impl ScriptHashTable {
                 }
                 KeyHome::Main => {
                     let hk = head_key_from_full(key);
-                    let si = self.head.shard_index(key);
+                    let si = self.shard_index(key);
                     let updated = if let Some(slot) = self.sorted_main.get(si) {
                         let g = slot.read().unwrap();
                         match g.as_ref() {
@@ -1404,18 +1520,31 @@ impl ScriptHashTable {
         }
 
         if !sealed_ovf_ups.is_empty() {
-            let g = self.sealed_ovf.lock().unwrap();
-            for (key, val) in &sealed_ovf_ups {
-                let hk = head_key_from_full(key);
-                let mut hit = false;
-                for h in g.iter().rev() {
-                    if h.update_value(&hk, val)? {
-                        hit = true;
-                        break;
+            let mut missed: Vec<([u8; 32], ShHeadValue)> = Vec::new();
+            {
+                let g = self.sealed_ovf.lock().unwrap();
+                for (key, val) in &sealed_ovf_ups {
+                    let hk = head_key_from_full(key);
+                    let mut hit = false;
+                    for h in g.iter().rev() {
+                        if h.update_value(&hk, val)? {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if !hit {
+                        missed.push((*key, val.clone()));
                     }
                 }
+            }
+            for (key, val) in missed {
+                let hk = head_key_from_full(&key);
+                let mut hit = false;
+                if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                    hit = l1.head.update_value(&hk, &val)?;
+                }
                 if !hit {
-                    ingest_ups.push((*key, val.clone()));
+                    ingest_ups.push((key, val));
                 }
             }
         }
@@ -1434,7 +1563,7 @@ impl ScriptHashTable {
             let g = self.ingest.lock().unwrap();
             g.load_ratio().unwrap_or(0.0)
         };
-        if load < ShardedScriptHashHead::SH_SEAL_LOAD {
+        if load < ScriptHashHead::SH_SEAL_LOAD {
             return Ok(());
         }
         self.seal_ingest()
@@ -1445,7 +1574,7 @@ impl ScriptHashTable {
             let g = self.ingest.lock().unwrap();
             let mut recs = Vec::new();
             g.for_each_occupied(|full, val| {
-                recs.push((head_key_from_full(&full), val.encode()));
+                recs.push((head_key_from_full(&full), pack8_bytes(&val)?));
                 Ok(())
             })?;
             recs
@@ -1481,6 +1610,13 @@ impl ScriptHashTable {
     const SEALED_OVF_COMPACT_FILES: usize = 8;
 
     fn maybe_compact_sealed_ovf(&self) -> Result<(), StoreError> {
+        if self.ovf_l1.lock().unwrap().is_some() {
+            let n = self.sealed_ovf.lock().unwrap().len();
+            if n >= Self::SEALED_OVF_COMPACT_FILES {
+                self.warn_l1_frozen();
+            }
+            return Ok(());
+        }
         let n = self.sealed_ovf.lock().unwrap().len();
         if n >= Self::SEALED_OVF_COMPACT_FILES {
             self.compact_sealed_ovf()?;
@@ -1488,10 +1624,25 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    fn warn_l1_frozen(&self) {
+        if self
+            .l1_frozen_warned
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            rbitcoin_log::warn!("store: {SH_L1_FROZEN_WARN}");
+        }
+    }
+
     /// K-way merge of sealed global ovf heads. Body offs unchanged. Readers
     /// keep the old `Vec` until this lock is released after rename.
     pub fn compact_sealed_ovf(&self) -> Result<(), StoreError> {
-        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])> = Vec::new();
+        if self.ovf_l1.lock().unwrap().is_some() {
+            self.warn_l1_frozen();
+            return Ok(());
+        }
+        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> =
+            Vec::new();
         let old_paths: Vec<PathBuf> = {
             let g = self.sealed_ovf.lock().unwrap();
             if g.len() < 2 {
@@ -1499,7 +1650,7 @@ impl ScriptHashTable {
             }
             for h in g.iter() {
                 h.for_each_occupied(|k, v| {
-                    recs.push((k, v.encode()));
+                    recs.push((k, pack8_bytes(&v)?));
                     Ok(())
                 })?;
             }
@@ -1527,12 +1678,26 @@ impl ScriptHashTable {
                 .saturating_add(1)
         };
         let path = sealed_ovf_path(&self.store_dir, id);
-        let merged = SortedHead::write(&path, &recs, SortedHeadFilter::Fuse8)?;
+        let packed: Vec<(crate::scripthash_layout::ShHeadKey, u64)> = recs
+            .iter()
+            .map(|(k, raw)| (*k, u64::from_le_bytes(*raw)))
+            .collect();
+        let head = MphfHead::write_pack8(&path, &packed)?;
+        let mut fuse_keys: Vec<u64> = packed.iter().map(|(k, _)| mix_key16(k)).collect();
+        fuse_keys.sort_unstable();
+        fuse_keys.dedup();
+        let fuse = SealedFuse8::build(&fuse_keys)?;
+        {
+            let mut fp = path.as_os_str().to_os_string();
+            fp.push(".fuse8");
+            fuse.write_to(&PathBuf::from(fp))?;
+        }
         let old = {
             let mut g = self.sealed_ovf.lock().unwrap();
-            std::mem::replace(&mut *g, vec![merged])
+            std::mem::take(&mut *g)
         };
         drop(old);
+        *self.ovf_l1.lock().unwrap() = Some(OvfL1 { head, fuse });
         for p in old_paths {
             let _ = std::fs::remove_file(&p);
             let mut idx = p.as_os_str().to_os_string();
@@ -1565,7 +1730,17 @@ impl ScriptHashTable {
                 }
                 Ok(got)
             }
-            ShHeadValue::Paged { first_page, .. } => self.collect_page_chain(body, *first_page),
+            ShHeadValue::Paged {
+                first_page,
+                last_page,
+            } => {
+                let first = if *first_page != 0 {
+                    *first_page
+                } else {
+                    paged_first_from_last(body, *last_page)?
+                };
+                self.collect_page_chain(body, first)
+            }
         }
     }
 
@@ -1689,11 +1864,7 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::Empty);
         }
         if n <= SH_INLINE_CAP as u32 {
-            return Ok(if n == 1 {
-                ShHeadValue::inline_one(live[0])
-            } else {
-                ShHeadValue::inline_two(live[0], live[1])
-            });
+            return Ok(ShHeadValue::inline_one(live[0]));
         }
         if n >= SH_MEGAKEY_MIN_FKS {
             let (first, last) = self.write_new_page_chain(body, alloc, live)?;
@@ -1771,6 +1942,9 @@ impl ScriptHashTable {
             let (start, end) = chunks[pi];
             let next = offs.get(pi + 1).copied().unwrap_or(0);
             sh_page_pack(&mut page, &live[start..end], next)?;
+            if next == 0 {
+                sh_page_set_last(&mut page, offs[0])?;
+            }
             body.write_at(off, &page)?;
         }
         Ok((offs[0], *offs.last().expect("n_pages >= 1")))
@@ -1785,19 +1959,31 @@ impl ScriptHashTable {
         last_page: u64,
         tail: &[ShEntry],
     ) -> Result<u64, StoreError> {
-        let _ = first_page;
         if tail.is_empty() {
             return Ok(last_page);
         }
         let mut last = last_page;
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(last, &mut page)?;
+        let chain_first = {
+            let f = if sh_page_is_last(&page)? {
+                sh_page_first_off(&page)?
+            } else {
+                0
+            };
+            if f == 0 {
+                first_page
+            } else {
+                f
+            }
+        };
         for e in tail {
             if !sh_page_try_append(&mut page, e.create_tx_fk)? {
                 let new_off = self.alloc_page(body, alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 body.write_at(last, &page)?;
                 sh_page_init_empty(&mut page);
+                sh_page_set_last(&mut page, chain_first)?;
                 assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
                 last = new_off;
             }
@@ -1902,7 +2088,7 @@ impl ScriptHashTable {
         match home {
             KeyHome::Main | KeyHome::Absent => {
                 let hk = head_key_from_full(scripthash);
-                let si = self.head.shard_index(scripthash);
+                let si = self.shard_index(scripthash);
                 let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
                     let g = slot.read().unwrap();
                     match g.as_ref() {
@@ -1939,6 +2125,14 @@ impl ScriptHashTable {
                         break;
                     }
                 }
+                drop(g);
+                if !hit {
+                    if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                        if l1.head.update_value(&hk, &new_val)? {
+                            hit = true;
+                        }
+                    }
+                }
                 if !hit {
                     return Err(StoreError::Corrupt(
                         "scripthash: sealed ovf unlink missed home",
@@ -1952,10 +2146,17 @@ impl ScriptHashTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.persist_all_allocs()?;
         self.flush_all_bodies()?;
-        self.head.flush()?;
         self.ingest.lock().unwrap().flush()?;
+        for slot in self.sorted_main.iter() {
+            if let Some(h) = slot.read().unwrap().as_ref() {
+                h.flush()?;
+            }
+        }
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
+        }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            l1.head.flush()?;
         }
         Ok(())
     }
@@ -1963,10 +2164,12 @@ impl ScriptHashTable {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.persist_all_allocs()?;
         self.flush_all_bodies_async()?;
-        self.head.flush_async()?;
         self.ingest.lock().unwrap().flush_async()?;
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
+        }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            l1.head.flush()?;
         }
         Ok(())
     }
@@ -1987,7 +2190,7 @@ impl ScriptHashTable {
                 "scripthash bulk_session requires empty head (reinit first)",
             ));
         }
-        let n_shards = self.head.shard_count().max(1);
+        let n_shards = self.n_shards.max(1);
         let hint = if unique_hint == 0 {
             sh_unique_hint_default()
         } else {
@@ -2013,7 +2216,6 @@ impl ScriptHashTable {
             committed_keys: 0,
             resume_from_shard: 0,
             active_shard: None,
-            head_out: None,
             recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
@@ -2046,7 +2248,7 @@ impl ScriptHashTable {
         if bump > body.logical_len() {
             body.set_logical_len(bump)?;
         }
-        let n_shards = self.head.shard_count().max(1);
+        let n_shards = self.n_shards.max(1);
         let hint = sh_unique_hint_default();
         let key_budget = sh_per_shard_key_budget(hint, n_shards);
         Ok(ScriptHashBulkSession {
@@ -2060,11 +2262,6 @@ impl ScriptHashTable {
             committed_keys: 0,
             resume_from_shard: 0,
             active_shard: Some(shard),
-            head_out: Some(SortedHeadWriter::create(sorted_main_shard_path(
-                self.store_dir(),
-                shard,
-                n_shards,
-            ))?),
             recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
@@ -2091,7 +2288,7 @@ impl ScriptHashTable {
         unique_hint: u64,
         progress: &ColdProgress,
     ) -> Result<ScriptHashBulkSession<'_>, StoreError> {
-        let n_shards = self.head.shard_count().max(1);
+        let n_shards = self.n_shards.max(1);
         let start = progress.next_shard as usize;
         if start >= n_shards {
             return Err(StoreError::Corrupt(
@@ -2099,13 +2296,7 @@ impl ScriptHashTable {
             ));
         }
         // Remaining shards must be empty for live install.
-        for i in start..n_shards {
-            if self.head.shard_occupied(i) != 0 {
-                return Err(StoreError::Corrupt(
-                    "scripthash bulk_session_resume: incomplete shard not empty",
-                ));
-            }
-        }
+
         let hint = if unique_hint == 0 {
             sh_unique_hint_default()
         } else {
@@ -2131,7 +2322,6 @@ impl ScriptHashTable {
             committed_keys: progress.keys_written,
             resume_from_shard: progress.next_shard,
             active_shard: None,
-            head_out: None,
             recs: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
@@ -2151,7 +2341,7 @@ impl ScriptHashTable {
 
     /// Number of SH head shards (1 on Tiny, 64 on mainnet).
     pub fn head_shard_count(&self) -> usize {
-        self.head.shard_count()
+        self.n_shards
     }
 
     /// Current body bump (complete-shard HWM). Shared file: the one bump.
@@ -2164,28 +2354,29 @@ impl ScriptHashTable {
     pub fn publish_sorted_shard(
         &self,
         shard: usize,
-        recs: &[(crate::scripthash_layout::ShHeadKey, [u8; 16])],
+        recs: &[(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])],
         live_count: u64,
         bump: u64,
     ) -> Result<(), StoreError> {
         let mut recs = recs.to_vec();
         recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         recs.dedup_by(|a, b| a.0 == b.0);
-        let n_shards = self.head.shard_count();
+        let n_shards = self.n_shards;
         let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
+        let sealed = MphfHead::write(&path, &recs)?;
         self.install_sorted_main(shard, sealed);
         let body = self.shard_body(shard);
         if bump > body.logical_len() {
             body.set_logical_len(bump)?;
         }
+        let free_head = self.shard_alloc(shard).lock().unwrap().free_head;
         let state = AllocState {
             live_count,
             bump,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
+            free_head,
         };
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
@@ -2199,25 +2390,24 @@ impl ScriptHashTable {
             (a.live_count, a.free_head)
         };
         let bump = pack.bump;
-        if let Some(part) = pack.head_part {
-            let n_shards = self.head.shard_count();
-            let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
-            let sealed = install_head_part(&part, &path)?;
-            self.install_sorted_main(shard, sealed);
-            let body = self.shard_body(shard);
-            if bump > body.logical_len() {
-                body.set_logical_len(bump)?;
-            }
-            let state = AllocState {
-                live_count: live,
-                bump,
-                free_head,
-            };
-            write_alloc_header(body, &state)?;
-            *self.shard_alloc(shard).lock().unwrap() = state;
-        } else {
-            self.publish_sorted_shard(shard, &pack.recs, live, bump)?;
+        let n_shards = self.n_shards;
+        let path = sorted_main_shard_path(&self.store_dir, shard, n_shards);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        let sealed = MphfHead::write(&path, &pack.recs)?;
+        self.install_sorted_main(shard, sealed);
+        let body = self.shard_body(shard);
+        if bump > body.logical_len() {
+            body.set_logical_len(bump)?;
+        }
+        let state = AllocState {
+            live_count: live,
+            bump,
+            free_head,
+        };
+        write_alloc_header(body, &state)?;
+        *self.shard_alloc(shard).lock().unwrap() = state;
         Ok(bump)
     }
 }
@@ -2278,7 +2468,20 @@ pub fn remap_copied_page_chain(
     while off != 0 {
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(off, &mut page)?;
-        let local_next = sh_page_next(sh_page_as_array(&page)?)?;
+        let arr = sh_page_as_array(&page)?;
+        if sh_page_is_last(arr)? {
+            let first = sh_page_first_off(arr)?;
+            let dest_first = if first == 0 {
+                first_dest
+            } else {
+                first.saturating_add(delta)
+            };
+            let arr = sh_page_as_array_mut(&mut page)?;
+            sh_page_set_last(arr, dest_first)?;
+            body.write_at(off, &page)?;
+            break;
+        }
+        let local_next = sh_page_next(arr)?;
         if local_next == 0 {
             break;
         }
@@ -2296,7 +2499,7 @@ pub fn remap_copied_page_chain(
 /// Stream **scripthash-sorted** [`put_chain`] calls. Prefix sharding makes that
 /// order contiguous per head shard: body slabs buffer (~16 MiB); packed
 /// `(key16,value16)` recs accumulate for the active shard and seal to
-/// `SortedHead` on the boundary. Peak head RAM ≈ unique keys in one shard × 32 B.
+/// MPHF+val on the boundary. Peak head RAM ≈ unique keys in one shard × 32 B.
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
     /// Directory for [`ColdProgress`] file.
@@ -2312,10 +2515,8 @@ pub struct ScriptHashBulkSession<'a> {
     /// Skip installing keys for shards `< resume_from_shard` (stream may still deliver them).
     resume_from_shard: u32,
     active_shard: Option<usize>,
-    /// Streaming sealed-main writer for pack-only sessions (`.part` until publish).
-    head_out: Option<SortedHeadWriter>,
     /// Packed recs for [`Self::bulk_session`] (sorted at shard seal; 16 B key order).
-    recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
+    recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
     body_buf: Vec<u8>,
@@ -2339,9 +2540,7 @@ pub struct ScriptHashBulkSession<'a> {
 
 /// One shard packed onto its live body, ready for ordered head publish.
 pub struct ShShardPack {
-    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; 16])>,
-    /// Finished `.part` from [`SortedHeadWriter`] (preferred over `recs`).
-    pub head_part: Option<PathBuf>,
+    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])>,
     pub creates: u64,
     pub max_fk: u64,
     pub keys: u64,
@@ -2438,13 +2637,8 @@ impl<'a> ScriptHashBulkSession<'a> {
             ShBodyLayout::Sharded => self.live_count,
         };
         self.persist_session_alloc(persist_live, self.bump)?;
-        let head_part = match self.head_out.take() {
-            Some(w) => Some(w.finish()?),
-            None => None,
-        };
         let pack = ShShardPack {
-            recs: Vec::new(),
-            head_part,
+            recs: std::mem::take(&mut self.recs),
             creates: self.live_count,
             max_fk: self.max_fk,
             keys: self.keys_written,
@@ -2531,11 +2725,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let val = if open.first_page.is_none() {
             let ents: Vec<ShEntry> = open.buf.iter().map(|&fk| ShEntry::new(Fk(fk))).collect();
             if n <= SH_INLINE_CAP as u32 {
-                if n == 1 {
-                    ShHeadValue::inline_one(ents[0])
-                } else {
-                    ShHeadValue::inline_two(ents[0], ents[1])
-                }
+                ShHeadValue::inline_one(ents[0])
             } else {
                 self.flush_body()?;
                 self.bulk_write_slab(&ents)?
@@ -2546,22 +2736,18 @@ impl<'a> ScriptHashBulkSession<'a> {
                     "scripthash bulk stream: paged key missing last page",
                 ));
             } else {
-                self.write_page(&open.buf, false)?
+                self.write_page(&open.buf, false, open.first_page)?
             };
             let first = open.first_page.unwrap_or(last);
             ShHeadValue::paged(first, last)
         };
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
-        let rec = (head_key_from_full(&open.key), val.encode());
-        if let Some(w) = self.head_out.as_mut() {
-            w.push(rec.0, rec.1)?;
-        } else {
-            self.recs.push(rec);
-            self.peak_table_bytes = self
-                .peak_table_bytes
-                .max(self.recs.len().saturating_mul(32));
-        }
+        let rec = (head_key_from_full(&open.key), pack8_bytes(&val)?);
+        self.recs.push(rec);
+        self.peak_table_bytes = self
+            .peak_table_bytes
+            .max(self.recs.len().saturating_mul(24));
         Ok(())
     }
 
@@ -2589,7 +2775,7 @@ impl<'a> ScriptHashBulkSession<'a> {
 
     /// `Ok(false)` = resume skip (shard already installed).
     fn prepare_stream_key(&mut self, key: [u8; 32]) -> Result<bool, StoreError> {
-        let si = self.table.head.shard_index(&key);
+        let si = self.table.shard_index(&key);
         if (si as u32) < self.resume_from_shard {
             return Ok(false);
         }
@@ -2621,7 +2807,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             .as_mut()
             .map(|o| std::mem::take(&mut o.buf))
             .unwrap_or_default();
-        let off = self.write_page(&buf, true)?;
+        let off = self.write_page(&buf, true, None)?;
         if let Some(open) = self.open_key.as_mut() {
             if open.first_page.is_none() {
                 open.first_page = Some(off);
@@ -2632,7 +2818,12 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     /// Write one page at the aligned bump. `has_next` sets `next` to the following page.
-    fn write_page(&mut self, fks: &[u64], has_next: bool) -> Result<u64, StoreError> {
+    fn write_page(
+        &mut self,
+        fks: &[u64],
+        has_next: bool,
+        chain_first: Option<u64>,
+    ) -> Result<u64, StoreError> {
         self.flush_body()?;
         let base = self.align_bump_for_page()?;
         let next = if has_next {
@@ -2645,6 +2836,9 @@ impl<'a> ScriptHashBulkSession<'a> {
         let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
         sh_page_pack(&mut page, &ents, next)?;
+        if !has_next {
+            sh_page_set_last(&mut page, chain_first.unwrap_or(base))?;
+        }
         self.body().write_at(base, &page)?;
         self.bump = end;
         self.body_write_off = end;
@@ -2680,7 +2874,6 @@ impl<'a> ScriptHashBulkSession<'a> {
 
     fn start_live_shard(&mut self, si: usize) -> Result<(), StoreError> {
         self.recs.clear();
-        self.head_out = None;
         rbitcoin_log::info!(
             "store: scripthash live shard start id={si} key_budget={} (stream recs)",
             self.key_budget
@@ -2773,6 +2966,9 @@ impl<'a> ScriptHashBulkSession<'a> {
                 0
             };
             sh_page_pack(&mut page, &entries[start..end_i], next)?;
+            if next == 0 {
+                sh_page_set_last(&mut page, base)?;
+            }
             self.body().write_at(off, &page)?;
         }
         self.bump = end;
@@ -2823,12 +3019,12 @@ impl<'a> ScriptHashBulkSession<'a> {
             recs.dedup_by(|a, b| a.0 == b.0);
             let keys = recs.len() as u64;
             if !recs.is_empty() {
-                let n_shards = self.table.head.shard_count();
+                let n_shards = self.table.n_shards;
                 let path = sorted_main_shard_path(&self.table.store_dir, si, n_shards);
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let sealed = SortedHead::write(&path, &recs, SortedHeadFilter::None)?;
+                let sealed = MphfHead::write(&path, &recs)?;
                 self.table.install_sorted_main(si, sealed);
             }
             let shard_live = match self.table.layout {
@@ -2853,9 +3049,8 @@ impl<'a> ScriptHashBulkSession<'a> {
             rbitcoin_log::info!(
                 "store: scripthash live shard done id={si} keys={keys} \
                  recs_MiB≈{:.1} write={elapsed:?} next_shard={next}",
-                (keys as f64 * 32.0) / (1024.0 * 1024.0)
+                (keys as f64 * 24.0) / (1024.0 * 1024.0)
             );
-            let _ = self.table.head.shard_advise_dont_need(si);
         }
         self.active_shard = None;
         Ok(())
@@ -2865,7 +3060,6 @@ impl<'a> ScriptHashBulkSession<'a> {
     ///
     /// Call on cooperative cancel so Drop does not install a partial shard.
     pub fn abandon_incomplete(mut self) {
-        self.head_out = None;
         self.recs.clear();
         self.body_buf.clear();
         self.open_key = None;
@@ -2920,7 +3114,6 @@ impl Drop for ScriptHashBulkSession<'_> {
         if self.finished || self.pack_only {
             return;
         }
-        self.head_out = None;
         self.recs.clear();
         self.body_buf.clear();
         self.open_key = None;
@@ -3065,7 +3258,6 @@ mod tests {
         )
         .unwrap();
         drop(ovf);
-        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256).unwrap();
         ScriptHashTable::open(dir).unwrap()
     }
 
@@ -3122,7 +3314,7 @@ mod tests {
             assert_eq!(t.entries(&k_new).unwrap().len(), 8);
 
             let file_dir = tmp();
-            let ft = four_shard_table(&file_dir);
+            let ft = shared_body_table(&file_dir);
             assert_eq!(ft.body_layout(), ShBodyLayout::Shared);
             {
                 let mut s = ft.bulk_session(16).unwrap();
@@ -3527,9 +3719,44 @@ mod tests {
         ));
         t.unlink_create(&sh, Fk(2), 2).unwrap();
         match t.head_value(&sh).unwrap().unwrap() {
-            ShHeadValue::Inline { used, .. } => assert_eq!(used, 2),
-            other => panic!("expected inline demote, got {other:?}"),
+            ShHeadValue::Slab { used, .. } => assert_eq!(used, 2),
+            other => panic!("expected 2-fk slab, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingest_oa_slots_mainnet_is_2_25() {
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(ingest_oa_slots(), 1 << 25);
+            assert_eq!(SH_HEAD_VALUE_LEN, 8);
+            assert_eq!(crate::scripthash_layout::SH_HEAD_SLOT_SIZE, 24);
+        });
+    }
+
+    #[test]
+    fn create_does_not_write_oa_stub() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        assert_eq!(
+            t.head_shard_count(),
+            shard_count_for_role(HeadRole::ScriptHash)
+        );
+        drop(t);
+        assert!(
+            !dir.join("scripthash.head.oa_stub").exists(),
+            "create must not write leftover sharded OA stub"
+        );
+        std::fs::create_dir_all(dir.join("scripthash.head.oa_stub")).unwrap();
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert!(
+            !dir.join("scripthash.head.oa_stub").exists(),
+            "open must unlink leftover oa_stub"
+        );
+        assert_eq!(
+            t.head_shard_count(),
+            shard_count_for_role(HeadRole::ScriptHash)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3778,12 +4005,15 @@ mod tests {
         } else {
             head_p
         };
-        assert!(shard_p.is_file());
+        assert!(
+            MphfHead::exists(&shard_p),
+            "bulk must emit mphf+val for shard 00"
+        );
         let mut idx = shard_p.as_os_str().to_os_string();
         idx.push(".idx");
         let mut fuse = shard_p.as_os_str().to_os_string();
         fuse.push(".fuse8");
-        assert!(PathBuf::from(idx).is_file());
+        assert!(!PathBuf::from(idx).is_file());
         assert!(
             !PathBuf::from(fuse).is_file(),
             "main shards must not write a fuse"
@@ -3803,7 +4033,7 @@ mod tests {
         assert_eq!(t.entries(&sh_new).unwrap().len(), 2);
         assert!(matches!(t.key_home(&sh_new).unwrap(), KeyHome::Ingest));
         assert_eq!(
-            t.sorted_main_pread_count(t.head.shard_index(&sh_new)),
+            t.sorted_main_pread_count(t.shard_index(&sh_new)),
             0,
             "key already on ingest must not pread the main page"
         );
@@ -3890,11 +4120,37 @@ mod tests {
             assert_eq!(t.sealed_ovf.lock().unwrap().len(), 2, "second ingest seal");
 
             t.compact_sealed_ovf().unwrap();
-            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+            assert_eq!(
+                t.sealed_ovf.lock().unwrap().len(),
+                0,
+                "L0 unlinked after promote"
+            );
+            assert!(
+                t.ovf_l1.lock().unwrap().is_some(),
+                "compact promotes L1 MPHF"
+            );
             assert_eq!(t.entries(&first_new).unwrap().len(), 1);
             assert_eq!(t.entries(&second_new).unwrap().len(), 1);
             assert_eq!(t.entries(&sh_main).unwrap().len(), 1);
             assert!(matches!(t.key_home(&sh_main).unwrap(), KeyHome::Main));
+            assert!(matches!(
+                t.key_home(&first_new).unwrap(),
+                KeyHome::SealedOvf
+            ));
+
+            t.compact_sealed_ovf().unwrap();
+            assert!(t.ovf_l1.lock().unwrap().is_some());
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 0);
+            assert_eq!(t.entries(&first_new).unwrap().len(), 1);
+
+            for i in 0..210u32 {
+                let sh = script_hash(&[0xa3, (i & 0xff) as u8, (i >> 8) as u8, 0x03]);
+                t.put_create(&rec(sh, 3000 + u64::from(i), 0)).unwrap();
+            }
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1);
+            t.compact_sealed_ovf().unwrap();
+            assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "L1 frozen: L0 stays");
+            assert_eq!(t.entries(&first_new).unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -3926,18 +4182,18 @@ mod tests {
         ));
         assert!(matches!(
             t.head_value(&sh(0x02)).unwrap().unwrap(),
-            ShHeadValue::Inline { used: 2, .. }
+            ShHeadValue::Slab { used: 2, .. }
         ));
         match t.head_value(&sh(0x06)).unwrap().unwrap() {
             ShHeadValue::Slab { class, used, .. } => {
-                assert_eq!(class, 0, "6 tight deltas fit class 0 (32 B)");
+                assert_eq!(class, 0, "6 tight deltas fit class 0 (16 B)");
                 assert_eq!(used, 6);
             }
             other => panic!("expected class-0 slab, got {other:?}"),
         }
         match t.head_value(&sh(0x14)).unwrap().unwrap() {
             ShHeadValue::Slab { class, used, .. } => {
-                assert_eq!(class, 0, "20 tight deltas fit class 0 (32 B)");
+                assert_eq!(class, 1, "20 tight deltas fit class 1 (32 B)");
                 assert_eq!(used, 20);
             }
             other => panic!("expected class-0 slab, got {other:?}"),
@@ -3946,7 +4202,7 @@ mod tests {
             ShHeadValue::Slab { class, used, .. } => {
                 assert_eq!(used, 600);
                 assert!(
-                    class <= 5,
+                    class <= 6,
                     "600 1-byte deltas stay in a relocating slab, class={class}"
                 );
             }
@@ -4073,8 +4329,8 @@ mod tests {
             remap_copied_page_chain(dst.body(), first_page, delta).unwrap();
         }
         let recs = vec![
-            (head_key_from_full(&slab_key), slab_r.encode()),
-            (head_key_from_full(&mega_key), mega_r.encode()),
+            (head_key_from_full(&slab_key), pack8_bytes(&slab_r).unwrap()),
+            (head_key_from_full(&mega_key), pack8_bytes(&mega_r).unwrap()),
         ];
         dst.publish_sorted_shard(0, &recs, 8 + n_mega as u64, src_hi + delta)
             .unwrap();
@@ -4088,21 +4344,7 @@ mod tests {
     fn pack_one_shard() {
         HeadScale::test_with(HeadScale::Tiny, || {
             let dir = tmp();
-            let body =
-                TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
-            let payload0 = payload_start(FILE_HEADER_LEN);
-            body.ensure_capacity(payload0).unwrap();
-            body.set_logical_len(payload0).unwrap();
-            let state = AllocState {
-                live_count: 0,
-                bump: payload0,
-                free_head: [0; SH_MAX_CLASS as usize + 1],
-            };
-            write_alloc_header(&body, &state).unwrap();
-            drop(body);
-            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256)
-                .unwrap();
-            let t = ScriptHashTable::open(&dir).unwrap();
+            let t = four_shard_dir_table(&dir);
             assert_eq!(t.head_shard_count(), 4);
             let key = |shard: u8, i: u8| {
                 let mut k = [0u8; 32];
@@ -4173,7 +4415,7 @@ mod tests {
                 ShHeadValue::Slab { class, used, .. } => {
                     assert_eq!(used, n as u16);
                     assert!(
-                        class <= 4,
+                        class <= 5,
                         "300 1-byte deltas (~302 B payload) must not jump to pages; class={class}"
                     );
                 }
@@ -4231,18 +4473,24 @@ mod tests {
     }
 
     fn four_shard_table(dir: &std::path::Path) -> ScriptHashTable {
+        four_shard_dir_table(dir)
+    }
+
+    fn shared_body_table(dir: &std::path::Path) -> ScriptHashTable {
         let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
         let payload0 = payload_start(FILE_HEADER_LEN);
         body.ensure_capacity(payload0).unwrap();
         body.set_logical_len(payload0).unwrap();
-        let state = AllocState {
-            live_count: 0,
-            bump: payload0,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
-        };
-        write_alloc_header(&body, &state).unwrap();
+        write_alloc_header(
+            &body,
+            &AllocState {
+                live_count: 0,
+                bump: payload0,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            },
+        )
+        .unwrap();
         drop(body);
-        ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256).unwrap();
         ScriptHashTable::open(dir).unwrap()
     }
 
@@ -4419,8 +4667,8 @@ mod tests {
             assert_eq!(t.entries(&key(0, 0)).unwrap().len(), 1);
             assert_eq!(t.entries(&key(2, 0)).unwrap().len(), 1);
             assert!(
-                dir.join("scripthash.head").join("02").is_file(),
-                "shard 2 head is the durable commit"
+                MphfHead::exists(&dir.join("scripthash.head").join("02")),
+                "shard 2 head is the durable mphf+val commit"
             );
             ColdProgress {
                 next_shard: 1,
@@ -4672,7 +4920,7 @@ mod tests {
         assert_eq!(keys, u64::from(N));
         assert_eq!(t.entry_count(), u64::from(N));
         // Peak is packed recs (32 B/key), not a 2 GiB OA slot table.
-        assert_eq!(peak, (N as usize) * 32);
+        assert_eq!(peak, (N as usize) * 24);
         // Spot-check a few keys survive live install.
         for i in [0u32, 1, 65_535, 70_000, N - 1] {
             let ents = t.entries(&key(i)).unwrap();
@@ -4687,21 +4935,7 @@ mod tests {
         // 4-way head: fill shard 0, abandon, resume from progress, fill rest.
         HeadScale::test_with(HeadScale::Tiny, || {
             let dir = tmp();
-            let body =
-                TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash).unwrap();
-            let payload0 = payload_start(FILE_HEADER_LEN);
-            body.ensure_capacity(payload0).unwrap();
-            body.set_logical_len(payload0).unwrap();
-            let state = AllocState {
-                live_count: 0,
-                bump: payload0,
-                free_head: [0; SH_MAX_CLASS as usize + 1],
-            };
-            write_alloc_header(&body, &state).unwrap();
-            drop(body);
-            ShardedScriptHashHead::create_sharded(dir.join("scripthash.head.oa_stub"), 4, 256)
-                .unwrap();
-            let t = ScriptHashTable::open(&dir).unwrap();
+            let t = four_shard_dir_table(&dir);
             assert_eq!(t.head_shard_count(), 4);
 
             // Keys: shard = full[0] >> 6 for n=4 (top 2 bits).
@@ -4768,7 +5002,7 @@ mod tests {
         session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
         let peak = session.peak_table_bytes;
         let _ = session.finish().unwrap();
-        assert_eq!(peak, 32, "one streamed rec is 32 B, not an OA image");
+        assert_eq!(peak, 24, "one streamed rec is 24 B, not an OA image");
         assert!(
             peak < 16 * 1024 * 1024,
             "peak {peak} looks like create-count sizing"

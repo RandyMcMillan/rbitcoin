@@ -281,6 +281,12 @@ impl Store {
         }
         let inwit_dir = resolve_inwit_dir(&layout)?;
         let txs = TxTable::open_inwit(&path, &inwit_dir)?;
+        if meta_ver == 17 {
+            if schema17_index_data_present(&path) {
+                return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
+            }
+            rewrite_meta_current(&path)?;
+        }
         if layout.is_split() {
             write_inwit_reloc(&path)?;
         }
@@ -1313,6 +1319,58 @@ fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// One-line 17→18 index refuse (`Store::open` + tests).
+const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
+
+fn schema17_index_data_present(dir: &Path) -> bool {
+    crate::segmented_head::SegmentedTxHead::disk_occupied(dir) || scripthash_index_data_present(dir)
+}
+
+fn scripthash_index_data_present(dir: &Path) -> bool {
+    let runs = dir.join("scripthash.runs");
+    if runs.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&runs) {
+            if rd.filter_map(|e| e.ok()).any(|e| e.path().is_file()) {
+                return true;
+            }
+        }
+    }
+    let head = dir.join("scripthash.head");
+    if head.is_file() {
+        return true;
+    }
+    if head.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&head) {
+            if rd.filter_map(|e| e.ok()).any(|e| e.path().is_file()) {
+                return true;
+            }
+        }
+    }
+    let hwm = dir.join("scripthash.include_hwm");
+    if let Ok(buf) = std::fs::read(&hwm) {
+        if buf.len() >= 8 {
+            let n = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+            if n > 0 {
+                return true;
+            }
+        }
+    }
+    let ingest_occ = {
+        let mut p = dir.join("scripthash.ovf").join("ingest").into_os_string();
+        p.push(".occ");
+        PathBuf::from(p)
+    };
+    if let Ok(buf) = std::fs::read(&ingest_occ) {
+        if buf.len() >= 16 && &buf[0..8] == b"SHOCC001" {
+            let n = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+            if n > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Validate store magic + schema. Returns on-disk version when openable.
 fn check_meta(dir: &Path) -> Result<u16, StoreError> {
     let path = dir.join("meta");
@@ -1913,6 +1971,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn open_schema17_empty_indexes_upgrades_meta_to_18() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 17);
+        assert_eq!(read_store_meta_ver(&dir), 17);
+        let s = Store::open(&dir).unwrap();
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema17_with_scripthash_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.scripthash
+                .put_create(&crate::scripthash::ScriptHashRecord::from_fk(
+                    [0xabu8; 32],
+                    Fk(1),
+                ))
+                .unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 17);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema-17 scripthash data"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA18_INDEX_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 17);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema17_with_tx_head_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 17);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema-17 tx.head occupancy"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA18_INDEX_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 17);
+        assert!(dir.join("txout.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Schema-15 16-byte Class A meta with creates cannot open under 17.
     #[test]
     fn open_legacy_class_a_with_creates_refused() {
@@ -2087,7 +2207,6 @@ mod tests {
         write_store_meta_ver(&dir, 16);
         let s = Store::open(&dir).unwrap();
         drop(s);
-        assert_eq!(SCHEMA_VERSION, 17);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2368,6 +2487,33 @@ mod tests {
                 .map(|c| (c.abs_fk, c.body_match))
                 .collect::<Vec<_>>()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Open `tx.head` page is `page_base_for_txid(mix_txid(txid))`, not raw txid.
+    #[test]
+    fn open_head_page_uses_mix_txid_not_raw() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let bits = s.txs.head.bits();
+        let mut txid = [0x11u8; 32];
+        let mut found = false;
+        for i in 0u64..100_000 {
+            txid[24..32].copy_from_slice(&i.to_le_bytes());
+            let mixed = s.txs.secret.mix_txid(&txid);
+            let raw_page = crate::address_head::page_base_for_txid(&txid, bits);
+            let mix_page = crate::address_head::page_base_for_txid(&mixed, bits);
+            if raw_page != mix_page {
+                s.diagnose_leftover_probe(&txid);
+                let diag =
+                    crate::head_resolve_stats::take_leftover_probe_diag().expect("probe dump");
+                assert_eq!(diag.page_base, mix_page);
+                assert_ne!(diag.page_base, raw_page);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "need a txid whose mix moves the open-head page");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

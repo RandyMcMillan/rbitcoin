@@ -12,13 +12,13 @@ header.hash ──► header.head          HashHead (often 1 shard)
                     16 B prefix + 8 B fk; .mlt if multi
 
 txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead
-                    4 B relative create id; fuse8 on seal
+                    open: 4 B rel, page-local mix_txid; seal: MPHF+rel+fuse8
 
-spk hash    ──► scripthash.head/NN   sealed sorted main after tip bulk (`SHSR`)
+spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no fuse)
             ──► scripthash.body/NN     dir-variant main slabs/pages (file variant: scripthash.body)
-            ──► scripthash.ovf/ingest  incremental + post-seal new keys
+            ──► scripthash.ovf/ingest  incremental + post-seal new keys (key16+pack8)
             ──► scripthash.ovf/body    dir-variant ingest + sealed ovf slabs
-            ──► scripthash.ovf/NNNNNN  sealed sorted ovf (ingest rolled)
+            ──► scripthash.ovf/NNNNNN  L0 SHSR pack8; compact once → L1 MPHF+fuse8
 ```
 
 ## When to use which
@@ -26,16 +26,16 @@ spk hash    ──► scripthash.head/NN   sealed sorted main after tip bulk (`S
 | Module | On disk | Key → value | Who reads it |
 |--------|---------|-------------|--------------|
 | `HashHead` + `ShardedHashHead` | `header.head` | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
-| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, `NNNNNN`, `.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`) | Confirm **lookup** stamp after live pin miss |
-| Sealed sorted SH main | `scripthash.head/NN` (`SHSR` + `.idx`) | Electrum **scripthash prefix** → slab/page locators | After tip bulk |
-| Ingest + sealed ovf | `scripthash.ovf/ingest`, `ovf/NNNNNN`, `ovf/body` | Same key for incremental / post-seal new keys | Tip + never-bulk; lookup ingest → ovf → main |
+| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.rel|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`) | Confirm **lookup** stamp after live pin miss |
+| Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators | After tip bulk |
+| Ingest + L0/L1 ovf | `scripthash.ovf/ingest`, L0 `SHSR`, L1 MPHF, `ovf/body` | Same pack8 key for incremental / post-seal new keys | Tip; lookup ingest → L0 → L1 → main |
 
 `tx.head` is **not** a `HashHead`. `HeadRole` is only Header and ScriptHash.
 
 ## Lookup path (txid → create_fk)
 
 1. Live pipeline pin by prev_txid (same Weak as outs).
-2. **Open** wave: unsealed tail (age 0) — probe, two-shot `txid.body`, walk newest-first.
+2. **Open** wave: every unsealed OA (insert tail + in-flight seal), newest-first — probe, two-shot `txid.body`.
 3. Unfinished keys: **sealed-hot** (ages 1..=3), same two-shot + walk.
 4. Still unfinished or **unconnected** after those: **cold** (sealed ages ≥4).
 

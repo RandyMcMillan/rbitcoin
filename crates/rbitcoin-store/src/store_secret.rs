@@ -6,9 +6,11 @@
 //! - **Script XOR:** `xor_key_byte(i) = secret[i % 32] ^ stream_mix(i)` applied to
 //!   on-disk `scriptPubKey`, `scriptSig`, and witness item bytes (Bitcoin Core–style
 //!   at-rest obfuscation of script/witness blobs only — not txids or amounts).
-//! - **TXID mix:** `mix_txid(txid) = SHA256(secret || txid)` used as the open-hash
-//!   probe key for `tx.head` / overflow so an attacker cannot craft similar-prefix
-//!   txids to force pathological probe depth.
+//! - **TXID mix:** `mix_txid(txid) = SHA256(secret || txid)` is the **page-local**
+//!   probe key for the open `tx.head` segment (15-bit page + in-page double hash).
+//!   Without it, anyone can grind ~2¹⁵ SHA256d hashes into one 4 KiB page.
+//!   Sealed MPHF/fuse consume the same mixed u64. Mix is not a file-shard selector
+//!   (segments are by create_fk range; SH shards are scripthash prefix).
 //!
 //! Plaintext reconstruct always de-obfuscates on read. Missing secret on open of a
 //! schema-12+ store is an error (wipe / recreate datadir).

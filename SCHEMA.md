@@ -1,10 +1,10 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 17` (`rbitcoin_primitives`) — **durable**.  
-**Status:** 17 is the frozen on-disk layout. Further durable Class A / B / C
-byte changes are **schema 18** (wipe + IBD, or an inwit-only rewrite).
-This freeze does **not** wipe a 17 datadir again. Stay on 17 until a listed
-18 change lands.
+**Version:** `SCHEMA_VERSION = 18` (`rbitcoin_primitives`).  
+**Status:** 18 changes **indexes only** (`tx.head`, `scripthash*`). Class A / C
+stay 17 bytes. A 17 datadir with populated `tx.head` or `scripthash*` is
+**refused** (wipe those dirs, keep Class A, restart to rebuild). Empty 17
+indexes rewrite `meta` to 18.
 
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
@@ -20,6 +20,9 @@ rematerialize). Sealed SH head/body kept only if pages are already delta
 (`ver=1`). Class A with 16-layout creates is refused the same as 15→17.
 Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
+**17→18 open:** If `tx.head` occupancy or any `scripthash*` data exists:
+`schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
+Empty 17 indexes rewrite `meta` to 18.  
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -38,7 +41,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **file** or **dir** orientation (not a version bump). Slab **class** is the byte allocation (32…2048); `used` is the fk count and may exceed the old geometric `slab_cap(class)` when the ULEB stream fits. Decode `used` fks from the payload. |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
-| Secret | `store.secret` XOR of scripts/witness; keyed `tx.head` mix |
+| Secret | `store.secret` XOR of scripts/witness; `mix_txid` for **open** `tx.head` page-local probes (not shard-by-txid). Sealed MPHF/fuse use the same mixed u64. |
 
 Empty / leftover prior files may be unlinked or `meta` rewritten on open as
 already listed above. A packed `tx.body` with creates, leftover schema-16 SH
@@ -121,7 +124,7 @@ itself changed.
 | Class A body | **Split** `txout` (thin meta + template outs) + `inwit` + `spent` (8 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
 | Class A identity | Dense **`txid.body`** sidefile (32 B header + 32 B/txid by create_fk) | Fixed `fk → offset`; head-resolve multi-cand without Prefix33 body peeks |
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
-| Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; **txid.body** verifies identity |
+| Txid → create | Segmented keyless **`tx.head.*`** (25-bit OA open + MPHF/rel/fuse sealed) | Open page from `mix_txid`; seal-time MPHF + fuse8; **txid.body** verifies identity |
 | Spentness | Annotation on **create output** (+ rare multi-list) | No multi-GiB `point.head` open-hash |
 | Electrum index | Thin **create_tx_fk only** (inline ≤2 / geometric slabs / megakey pages) | Packed to ~run size; expand vouts/value/height at query via Class A + Class C |
 | Best-chain commit | Advance **`confirmed[]` last** | Tip is the commit point; strong/height may lead tip after kill |
@@ -141,7 +144,7 @@ itself changed.
     spent.body / spent.idx/                         # sole-spender 8 B × n_out
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
-    tx.head/                     # meta + NNNNNN + .fuse8 (segmented 25-bit)
+    tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.rel|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
@@ -151,10 +154,11 @@ itself changed.
     scripthash.body                  # 17 file variant: one shared TableFile
     scripthash.body/NN               # 17 dir variant: one TableFile per main shard
     scripthash.ovf/body              # dir variant: ingest + all sealed ovf
-    scripthash.head/NN[.idx]         # Class B sealed sorted main (no fuse)
-    scripthash.ovf/ingest                                # global OA ingest
-    scripthash.ovf/NNNNNN[.fuse8][.idx]                  # sealed global ovf (sorted)
-    scripthash.runs              # SH sorted runs (key_len=40; unique (sh, fk))
+    scripthash.head/NN.mphf + NN.val # Class B sealed MPHF main (8 B pack8; no fuse)
+    scripthash.ovf/ingest                                # global OA ingest (key16+pack8, 2^25)
+    scripthash.ovf/NNNNNN[.fuse8][.idx]                  # L0 SHSR pack8
+    scripthash.ovf/NNNNNN.mphf|.val|.fuse8               # L1 promoted ovf (at most one)
+    scripthash.runs              # recollect spill only (key_len=40); unlinked after seal
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
 
 <datadir-cold>/                  # only when --datadir-cold is set
@@ -423,7 +427,7 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
-| Capacity | Segment ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`** → seal + new open |
+| Capacity | Segment ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`** → open next OA, seal previous on a sidecar |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode (open migrates to v2 from Class A; does **not** wipe head) |
 | Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B); max depth 1024 |
@@ -431,12 +435,15 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 | Lookup | Pin by txid → **hot** (open + ages ≤3) → ID/idx → **cold** (ages ≥4) if needed; fuse-gate sealed; body-verify ([`docs/heads.md`](./docs/heads.md)) |
 | Legacy | Monolithic `tx.head` / `tx.head.new` / `tx.head.resize` / `tx.head.overflow` **refused on open** — reindex |
 
-**Publish order on seal:** write fuse8 file durable → mark segment sealed in
-`tx.head.meta` → open next head for subsequent creates.
+**Publish order on seal:** flush the full OA → open the next head and persist
+`tx.head.meta` (two unsealed) → sidecar writes fuse8 + MPHF/rel → mark the
+previous segment sealed in meta → unlink the OA. Insert does not join the
+sidecar. Lookup Open-wave probes every unsealed OA until publish.
 
 **Probe note:** all candidates for a key share one page (single IO). Keyless
-slots cannot Robin-Hood. Incomplete seal after kill: delete incomplete
-segment/meta and rebuild from Class A, or reindex.
+slots cannot Robin-Hood. Kill mid-seal leaves at most one unsealed non-tail
+OA; open rebuilds its fuse keys from Class A and seals it. Two unsealed
+non-tails is **Corrupt**.
 
 **Capacity @ 0.80 load (25-bit):** ≈ **26.8 M creates/segment**, ~29 MiB fuse8 when sealed (~6.1 B total sealed storage per create including head slots).
 
@@ -482,33 +489,40 @@ wrote them; inserting a later block before an earlier one can leave permanent ho
 Cold bulk: pick the **exact** geometric class from the run-group length (or emit
 pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 
-### Head (schema 15)
+### Head (schema 18)
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
-- Record = **32 B**: key[16] + value[16] (two u64s). **Bit 63** of each value word is a flag; payload in low 63 bits.
-- Main is a **sealed sorted** file per shard (`scripthash.head/NN`) plus `.idx`
-  (16 B key + 8 B off per 128 records / 4 KiB page). **No** main `.fuse8` —
-  misses pay one 4 KiB data pread. Record count is immutable after seal.
-  Existing keys update `value16` in place. New keys are **not** punched into main.
-- Sharded **64-way** on mainnet (prefix of `scripthash[0]`; sorted runs stream
-  one shard band at a time). Cold load writes packed records (no 2 GiB OA image).
+- **Main (sealed):** `scripthash.head/NN.mphf` (BDZ 3-graph, then `n` mix64(key16)
+  tags) + `NN.val` (`n × 8` pack8). MPHF maps into `[0, n)`; a miss fails the
+  tag check (no main `.fuse8`). Record count is immutable after seal. Existing
+  keys pwrite pack8 at `i×8`. New keys are **not** punched into main.
+- pack8 (LE u64): bits 63–62 mode; `00` = 1-fk `create_fk`; `01` = slab
+  `off:u40 \| used:u16 \| class:u6`; `10` = paged `last_page_off` (first page
+  lives in the LAST page header). `SH_INLINE_CAP = 1`.
+- Ingest OA, L0 `SHSR`, L1 ovf MPHF, and main MPHF all store **pack8**.
+- Sharded **64-way** on mainnet (prefix of `scripthash[0]`). Cold load writes
+  packed locators (no OA image). No `scripthash.head.oa_stub`.
 - **Overflow:** one **global** ingest OA (`scripthash.ovf/ingest`, 256 slots tiny /
-  2²² slots mainnet). Load ≥ ~0.80 **seals** ingest to sorted+fuse+idx
-  (`scripthash.ovf/NNNNNN`). ≥8 sealed files **compact** (k-way merge of
-  disjoint records). **Do not fold ovf into main.** Body offs are not copied.
-- Lookup (always): **ingest OA → sealed ovf newest→oldest (fuse skip) →
-  sorted main idx → data** (main only if `SHSR` shards exist). Incremental
-  creates (no bulk yet) live on ingest. A leftover live OA at
-  `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`) is **refused** — wipe
-  `store/scripthash*` and restart with `--shindex` to rematerialize. A key
-  has **exactly one** home.
+  **2²⁵ slots mainnet = 768 MiB** at 24 B). Load ≥ ~0.80 **seals** to L0
+  `SHSR`+fuse (`scripthash.ovf/NNNNNN`, FORMAT_VER=2, rec = key16‖pack8).
+  ≥8 L0 files **compact once** to L1 MPHF+val+fuse8. L1 is **never rewritten**.
+  A later L0 stack of 8 **warns** (`wipe store/scripthash*` + rematerialize).
+  Body offs are not copied. Do not fold ovf locators into `scripthash.body/NN`
+  except via rematerialize.
+- Lookup: **ingest OA → L0 SHSR newest→oldest (fuse) → L1 MPHF (fuse) →
+  main MPHF+val (tags)**. A leftover live OA or schema-17 `SHSR` at
+  `scripthash.head` (or non-`SHSR` six-digit `ovf/NNNNNN`) is **refused**.
+  A key has **exactly one** home.
 
-| Mode | When | Value (`w0`, `w1`) |
-|------|------|---------------------|
-| Empty | no creates | `0`, `0` |
-| Inline | ≤2 create_tx_fks | bit63=0, fk0; bit63=0, fk1 or `0` (fk0 < fk1) |
-| **Slab** | 3–256 fks | both bit63=1; `w0` = body off; `w1` = used:u16 \| class<<16 |
-| **Paged** | ≥257 fks (megakey) | bit63=1, **first** page off; bit63=0, **last** page off |
+At ~2.5×10⁵ new unique scripts/day, first L1 is ~2.3 years after rematerialize
+and the frozen-L1 warning is ~4.7 years. That is not a calendar guarantee.
+
+| Mode | When | pack8 |
+|------|------|-------|
+| Empty | no creates | `0` |
+| Inline | 1 create_tx_fk | mode `00`, fk |
+| **Slab** | 2–256 fks | mode `01`, off/used/class |
+| **Paged** | ≥257 fks (megakey) | mode `10`, last page off |
 
 Schema-13 slab packing (`w0` flagged, `w1` clear) still decodes as paged;
 store open refuses a durable pre-15 SH index (no dual-read of 4 KiB pages as slabs).
@@ -529,18 +543,18 @@ New `Store::create` writes the dir variant. An old 17 binary that
 (not a silent misread). ColdProgress `SHCOLDP1` bytes are unchanged:
 `body_bump` is the shared HWM on the file variant. On the dir variant
 `next_shard` is the **lowest unsealed** main shard (holes after it
-stay); sealed `scripthash.head/NN` is the per-shard commit. Overflow
+stay); sealed `scripthash.head/NN.mphf`+`.val` is the per-shard commit. Overflow
 compact still merges **heads only** — all ovf keys share
 `scripthash.ovf/body`.
 
 - Combined prefix: RBT1 at 0–15, SHAL v3 fields at 16–4095, **payload at 4096**.
   Small slabs pack from bump with **no** 4 KiB align. Megakey pages 4 KiB-align
   that alloc only.
-- Geometric slabs class 0–6 (`32 B`–`2 KiB`; cap `4 << class`). Payload:
+- Geometric slabs class 0–7 (`16 B`–`2 KiB`; `slab_bytes(c) = 16 << c`). Payload:
   `used:u16` + ULEB128 `fk0` + ULEB128 deltas.
-- Megakey **pages** (4 KiB): `next:u64` | `n_fks:u16` | `ver:u8=1` | pad 5 B
-  | ULEB128 `fk0` + ULEB128 gaps. Page is full when the next uleb does not
-  fit (often well above 510 sequential FKs). `ver=0` with `n_fks>0` is a
+- Megakey **pages** (4 KiB): 8 B header `ver:u8 | n_fks:u16 | LAST|page_index u40`
+  then ULEB128 `fk0` + ULEB128 gaps. LAST=1 → index is **first** page; LAST=0 →
+  **next**. Head pack8 paged mode stores **last** page off. `ver=0` with `n_fks>0` is a
   leftover raw-u64 page — rematerialize. Chain first→last; last-page append only.
 - Size-class freelist on SHAL. Grow relocates O(log n) times; megakeys never relocate.
 

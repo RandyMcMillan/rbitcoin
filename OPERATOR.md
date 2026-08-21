@@ -203,18 +203,18 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 | `received getdata for: wtx` | TRACE | One line per peer `MSG_WTX` getdata (Core `p2p_blocksonly` needle; counts are on `tip: perf`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
-Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: perf` instead. Enable `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
+Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` / `ibd: sizes` / `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
 
 ### IBD status lines (every ~5s)
 
 | Line | Level | Use |
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
-| `ibd: perf` | INFO | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread (leftover TipOnly is `stamp=`). **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`lookup_thr keep=`** is live-union splice. **`pin_txid=`** vs leftover `tx.head` |
-| `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
+| `ibd: perf` | DEBUG | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread (leftover TipOnly is `stamp=`). **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`lookup_thr keep=`** is live-union splice. **`pin_txid=`** vs leftover `tx.head` |
+| `ibd: sizes` | DEBUG | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
 | `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit** |
 
-At **info**, progress + perf already expose load/write bottlenecks (schema 16). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
+Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / perf_dbg from the same sample. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
 
 `pin_txid%` is stamp `txid→create_fk` from the published `live_union` chain vs leftover `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 

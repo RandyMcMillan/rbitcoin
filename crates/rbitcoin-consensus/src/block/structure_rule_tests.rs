@@ -98,46 +98,50 @@ fn block_with(txs: Vec<Transaction>) -> Block {
 /// `stamp_sub struct=` split: hash-encode vs extra walks (no algorithm change).
 #[test]
 fn structure_meters_split_txid_wtxid_walk() {
-    let _ = crate::plan_stamp_sub_stats::sample_and_reset();
-    let mut spend = non_coinbase_spend(1);
-    spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
-    let mut b = block_with(vec![coinbase(1), spend]);
-    apply_witness_commitment(&mut b);
-    validate_block_structure_hashed(&b, &ctx_h(1)).expect("witness block structure");
-    let s = crate::plan_stamp_sub_stats::sample_and_reset();
-    assert!(s.struct_txid_ns > 0, "one-pass hash must be metered: {s:?}");
-    assert!(
-        s.struct_walk_ns > 0,
-        "weight/sigops walks must be metered: {s:?}"
-    );
+    crate::plan_stamp_sub_stats::with_exclusive(|| {
+        let _ = crate::plan_stamp_sub_stats::sample_and_reset();
+        let mut spend = non_coinbase_spend(1);
+        spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
+        let mut b = block_with(vec![coinbase(1), spend]);
+        apply_witness_commitment(&mut b);
+        validate_block_structure_hashed(&b, &ctx_h(1)).expect("witness block structure");
+        let s = crate::plan_stamp_sub_stats::sample_and_reset();
+        assert!(s.struct_txid_ns > 0, "one-pass hash must be metered: {s:?}");
+        assert!(
+            s.struct_walk_ns > 0,
+            "weight/sigops walks must be metered: {s:?}"
+        );
+    });
 }
 
 #[test]
 fn structure_with_pres_skips_from_tx() {
     use rbitcoin_query::TxPrecompute;
-    let _ = crate::plan_stamp_sub_stats::sample_and_reset();
-    let mut spend = non_coinbase_spend(1);
-    spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
-    let mut b = block_with(vec![coinbase(1), spend]);
-    apply_witness_commitment(&mut b);
-    let pres: std::sync::Arc<[TxPrecompute]> = b
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
-    let _ = crate::plan_stamp_sub_stats::sample_and_reset();
-    let out = validate_block_structure_with_pres(&b, &ctx_h(1), Some(std::sync::Arc::clone(&pres)))
-        .expect("stashed pres must still enforce merkle");
-    assert_eq!(out.len(), pres.len());
-    assert_eq!(out[0].txid, pres[0].txid);
-    assert!(
-        std::sync::Arc::ptr_eq(&out, &pres),
-        "with_pres must keep the caller Arc"
-    );
-    let s = crate::plan_stamp_sub_stats::sample_and_reset();
-    assert_eq!(s.struct_txid_ns, 0, "with_pres must not from_tx: {s:?}");
-    assert!(s.struct_walk_ns > 0, "merkle/weight still run: {s:?}");
+    crate::plan_stamp_sub_stats::with_exclusive(|| {
+        let mut spend = non_coinbase_spend(1);
+        spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
+        let mut b = block_with(vec![coinbase(1), spend]);
+        apply_witness_commitment(&mut b);
+        let pres: std::sync::Arc<[TxPrecompute]> = b
+            .txdata
+            .iter()
+            .map(TxPrecompute::from_tx)
+            .collect::<Vec<_>>()
+            .into();
+        let _ = crate::plan_stamp_sub_stats::sample_and_reset();
+        let out =
+            validate_block_structure_with_pres(&b, &ctx_h(1), Some(std::sync::Arc::clone(&pres)))
+                .expect("stashed pres must still enforce merkle");
+        assert_eq!(out.len(), pres.len());
+        assert_eq!(out[0].txid, pres[0].txid);
+        assert!(
+            std::sync::Arc::ptr_eq(&out, &pres),
+            "with_pres must keep the caller Arc"
+        );
+        let s = crate::plan_stamp_sub_stats::sample_and_reset();
+        assert_eq!(s.struct_txid_ns, 0, "with_pres must not from_tx: {s:?}");
+        assert!(s.struct_walk_ns > 0, "merkle/weight still run: {s:?}");
+    });
 }
 
 fn assert_bad_block(err: ConsensusError, needle: &str) {

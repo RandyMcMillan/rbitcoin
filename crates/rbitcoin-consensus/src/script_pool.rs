@@ -61,19 +61,40 @@ struct Wave {
 }
 
 impl Wave {
+    fn notify_if_complete(&self) {
+        if !self.is_complete() {
+            return;
+        }
+        *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.done_cv.notify_all();
+        unpark_script_publisher();
+    }
+
     fn claim_chunk(&self) -> Option<Range<usize>> {
         if self.failed.load(Ordering::Relaxed) {
             return None;
         }
-        let i = self.next.fetch_add(STEAL_CHUNK, Ordering::Relaxed);
-        if i >= self.n {
+        // `in_wave` before `next`: a last-chunk claimer is visible to
+        // `is_complete` before `next >= n`, so the publisher cannot free ctx
+        // under a worker about to `apply`.
+        self.in_wave.fetch_add(1, Ordering::AcqRel);
+        if self.failed.load(Ordering::Relaxed) {
+            self.in_wave.fetch_sub(1, Ordering::AcqRel);
+            self.notify_if_complete();
             return None;
         }
+        let i = self.next.fetch_add(STEAL_CHUNK, Ordering::Relaxed);
+        if i >= self.n {
+            self.in_wave.fetch_sub(1, Ordering::AcqRel);
+            self.notify_if_complete();
+            return None;
+        }
+        #[cfg(test)]
+        maybe_delay_claim();
         #[cfg(test)]
         if STEAL_CLAIMS_ON.load(Ordering::Relaxed) {
             STEAL_CLAIMS.fetch_add(1, Ordering::Relaxed);
         }
-        self.in_wave.fetch_add(1, Ordering::AcqRel);
         Some(i..self.n.min(i.saturating_add(STEAL_CHUNK)))
     }
 
@@ -84,8 +105,8 @@ impl Wave {
     }
 
     fn run_chunk(&self, range: Range<usize>) {
-        // SAFETY: `in_wave` was incremented by `claim_chunk`; publisher keeps
-        // `ctx` live until `is_complete` (then `OwnedWave::finish`).
+        // SAFETY: `in_wave` was incremented before `next`; publisher keeps
+        // `ctx` live until `is_complete` (then `OwnedWave` Drop unpublished).
         for i in range {
             if self.failed.load(Ordering::Relaxed) {
                 break;
@@ -101,11 +122,7 @@ impl Wave {
             }
         }
         self.in_wave.fetch_sub(1, Ordering::AcqRel);
-        if self.is_complete() {
-            *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
-            self.done_cv.notify_all();
-            unpark_script_publisher();
-        }
+        self.notify_if_complete();
     }
 
     fn has_unclaimed(&self) -> bool {
@@ -235,7 +252,6 @@ impl<T: Sync> OwnedWave<T> {
 
     pub(crate) fn finish(self) -> Result<(), ConsensusError> {
         self.wave.wait_done();
-        unpublish_fg(&self.wave);
         match self
             .wave
             .first_err
@@ -527,6 +543,29 @@ pub(crate) fn worker_spawn_count() -> usize {
 #[cfg(test)]
 fn idle_waiter_count() -> usize {
     IDLE_WAITERS.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static DELAY_CLAIM: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static DELAY_CLAIM_GO: AtomicBool = AtomicBool::new(true);
+#[cfg(test)]
+static DELAY_CLAIM_ENTERED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DELAY_CLAIM_MU: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static DELAY_CLAIM_CV: Condvar = Condvar::new();
+
+#[cfg(test)]
+fn maybe_delay_claim() {
+    if !DELAY_CLAIM.load(Ordering::SeqCst) {
+        return;
+    }
+    DELAY_CLAIM_ENTERED.fetch_add(1, Ordering::SeqCst);
+    let mut g = DELAY_CLAIM_MU.lock().unwrap_or_else(|p| p.into_inner());
+    while !DELAY_CLAIM_GO.load(Ordering::SeqCst) {
+        g = DELAY_CLAIM_CV.wait(g).unwrap_or_else(|p| p.into_inner());
+    }
 }
 
 #[cfg(test)]
@@ -1065,6 +1104,7 @@ mod tests {
 
     #[test]
     fn second_wave_publishes_when_first_is_claimed() {
+        let _steal = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
         let _occupy = OCCUPY.lock().unwrap_or_else(|p| p.into_inner());
         let hold = HoldJobs::arm();
         let a = start_for_each_owned((0..64u32).collect(), hold_job)
@@ -1082,10 +1122,74 @@ mod tests {
         let b = start_for_each_owned((0..64u32).collect(), hold_job)
             .unwrap()
             .expect("wave b");
-        assert!(b.has_unclaimed() || fg_has_unclaimed() || HOLD_IN.load(Ordering::SeqCst) >= 64);
+        assert!(
+            !a.is_complete(),
+            "first wave still in_wave when second is published"
+        );
+        assert!(b.has_unclaimed() || fg_has_unclaimed() || !a.is_complete());
         drop(hold);
         a.finish().unwrap();
         b.finish().unwrap();
         assert!(!fg_has_unclaimed());
+    }
+
+    fn ok_u32(_: &u32) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    struct DelayClaimArm;
+    impl DelayClaimArm {
+        fn arm() -> Self {
+            DELAY_CLAIM_ENTERED.store(0, Ordering::SeqCst);
+            DELAY_CLAIM_GO.store(false, Ordering::SeqCst);
+            DELAY_CLAIM.store(true, Ordering::SeqCst);
+            Self
+        }
+        fn go(&self) {
+            let _g = DELAY_CLAIM_MU.lock().unwrap_or_else(|p| p.into_inner());
+            DELAY_CLAIM_GO.store(true, Ordering::SeqCst);
+            DELAY_CLAIM_CV.notify_all();
+        }
+    }
+    impl Drop for DelayClaimArm {
+        fn drop(&mut self) {
+            DELAY_CLAIM.store(false, Ordering::SeqCst);
+            let _g = DELAY_CLAIM_MU.lock().unwrap_or_else(|p| p.into_inner());
+            DELAY_CLAIM_GO.store(true, Ordering::SeqCst);
+            DELAY_CLAIM_CV.notify_all();
+        }
+    }
+
+    /// After `in_wave++` and before `next += chunk`, `is_complete` must be
+    /// false (publisher must not free ctx under the claimer).
+    #[test]
+    fn last_claim_holds_in_wave_before_next() {
+        let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let n = worker_spawn_count();
+        let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+        let arm = DelayClaimArm::arm();
+        let wave = thread::spawn(|| {
+            start_for_each_owned((0..2u32).collect(), ok_u32)
+                .unwrap()
+                .expect("wave")
+                .finish()
+        });
+        let start = Instant::now();
+        while DELAY_CLAIM_ENTERED.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "claimer did not enter in_wave delay"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let snap = waves_snap().load();
+        assert!(!snap.is_empty(), "wave not published");
+        assert!(
+            !snap[0].is_complete(),
+            "is_complete during in_wave-before-next window"
+        );
+        arm.go();
+        wave.join().expect("join").expect("wave ok");
+        occupy.release();
     }
 }

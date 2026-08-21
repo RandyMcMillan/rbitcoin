@@ -5,13 +5,15 @@ use crate::block::{verify_one_script_job, ScriptCheckJob};
 use crate::script_pool::{
     fg_has_unclaimed, help_steal, set_script_publisher, start_for_each_owned, OwnedWave,
 };
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
 /// In-flight waves the stage thread will publish while steal is empty.
-const SCRIPT_WAVES_MAX: usize = 8;
+/// Matches `scriptq` cap so load→scripts retain stays bounded.
+const SCRIPT_WAVES_MAX: usize = 4;
 
 fn take_script_jobs(
     prepared: &mut [Prepared],
@@ -22,6 +24,7 @@ fn take_script_jobs(
     for p in prepared {
         if !p.check_scripts {
             p.jobs.clear();
+            p.jobs.shrink_to_fit();
             continue;
         }
         for job in p.jobs.drain(..) {
@@ -31,6 +34,7 @@ fn take_script_jobs(
                 jobs.push(job);
             }
         }
+        p.jobs.shrink_to_fit();
     }
     if n_skip > 0 {
         confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.fetch_add(n_skip, Ordering::Relaxed);
@@ -39,8 +43,7 @@ fn take_script_jobs(
     jobs
 }
 
-fn outcome_from(batch: LoadedBatch, t0: Instant) -> ConfirmScriptOutcome {
-    let work_ns = t0.elapsed().as_nanos() as u64;
+fn outcome_from(batch: LoadedBatch, work_ns: u64) -> ConfirmScriptOutcome {
     confirm_phase_stats::SCRIPT_NS.fetch_add(work_ns, Ordering::Relaxed);
     ConfirmScriptOutcome {
         batch: ScriptOkBatch {
@@ -58,36 +61,57 @@ struct Inflight {
     wave: Option<OwnedWave<ScriptCheckJob>>,
     meta: ScriptsBatchMeta,
     t0: Instant,
+    done_ns: Cell<Option<u64>>,
 }
 
 impl Inflight {
-    fn start(mut batch: LoadedBatch, mat_ns: u64) -> Result<Self, ConsensusError> {
+    fn start(
+        mut batch: LoadedBatch,
+        mat_ns: u64,
+    ) -> Result<Self, (ConsensusError, ScriptsBatchMeta)> {
         let t0 = Instant::now();
         let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
         let jobs = take_script_jobs(&mut batch.prepared, &batch.script_preverified);
-        let wave = start_for_each_owned(jobs, verify_one_script_job)?;
-        Ok(Self {
+        let wave = match start_for_each_owned(jobs, verify_one_script_job) {
+            Ok(w) => w,
+            Err(e) => return Err((e, meta)),
+        };
+        let inf = Self {
             batch,
             wave,
             meta,
             t0,
-        })
+            done_ns: Cell::new(None),
+        };
+        let _ = inf.is_complete();
+        Ok(inf)
     }
 
     fn is_complete(&self) -> bool {
-        self.wave.as_ref().is_none_or(|w| w.is_complete())
+        let done = self.wave.as_ref().is_none_or(|w| w.is_complete());
+        if done && self.done_ns.get().is_none() {
+            self.done_ns.set(Some(self.t0.elapsed().as_nanos() as u64));
+        }
+        done
     }
 
     fn finish(self) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConsensusError> {
+        let work_ns = self
+            .done_ns
+            .get()
+            .unwrap_or_else(|| self.t0.elapsed().as_nanos() as u64);
         if let Some(w) = self.wave {
             w.finish()?;
         }
-        Ok((outcome_from(self.batch, self.t0), self.meta))
+        Ok((outcome_from(self.batch, work_ns), self.meta))
     }
 }
 
 pub fn confirm_scripts_phase(batch: LoadedBatch) -> Result<ConfirmScriptOutcome, ConsensusError> {
-    Inflight::start(batch, 0)?.finish().map(|(o, _)| o)
+    match Inflight::start(batch, 0) {
+        Ok(inf) => inf.finish().map(|(o, _)| o),
+        Err((e, _)) => Err(e),
+    }
 }
 
 /// Handle for a scripts stage started on the caller (no coordinator thread).
@@ -253,7 +277,7 @@ pub fn confirm_scripts_phase_async(batch: LoadedBatch) -> ScriptsPhaseHandle {
     let state = match Inflight::start(batch, 0) {
         Ok(inf) if inf.is_complete() => HandleState::Ready(inf.finish().map(|(o, _)| o)),
         Ok(inf) => HandleState::Live(inf),
-        Err(e) => HandleState::Ready(Err(e)),
+        Err((e, _)) => HandleState::Ready(Err(e)),
     };
     ScriptsPhaseHandle {
         state: std::sync::Mutex::new(state),
@@ -327,7 +351,7 @@ pub fn confirm_scripts_feed_ahead(
 pub fn drive_script_waves(
     mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
     on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
-    on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
+    on_err: impl FnMut(ConsensusError, ScriptsBatchMeta, &[ScriptsBatchMeta]) -> bool,
     should_stop: impl FnMut() -> bool,
 ) {
     drive_script_waves_with(mat_rx, |_, _| {}, on_ok, on_err, should_stop);
@@ -341,7 +365,7 @@ pub fn drive_script_waves_with(
     mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
     mut on_take: impl FnMut(&LoadedBatch, Duration),
     mut on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
-    mut on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
+    mut on_err: impl FnMut(ConsensusError, ScriptsBatchMeta, &[ScriptsBatchMeta]) -> bool,
     mut should_stop: impl FnMut() -> bool,
 ) {
     struct ClearPublisher;
@@ -353,6 +377,14 @@ pub fn drive_script_waves_with(
     set_script_publisher(Some(thread::current()));
     let _clear = ClearPublisher;
     let mut inflight: VecDeque<Inflight> = VecDeque::new();
+    fn drop_tail(inflight: &mut VecDeque<Inflight>) -> Vec<ScriptsBatchMeta> {
+        let mut dropped = Vec::with_capacity(inflight.len());
+        while let Some(rest) = inflight.pop_front() {
+            dropped.push(rest.meta.clone());
+            let _ = rest.finish();
+        }
+        dropped
+    }
     loop {
         if should_stop() {
             break;
@@ -367,7 +399,8 @@ pub fn drive_script_waves_with(
                     }
                 }
                 Err(e) => {
-                    if !on_err(e, meta_err) {
+                    let dropped = drop_tail(&mut inflight);
+                    if !on_err(e, meta_err, &dropped) {
                         return;
                     }
                 }
@@ -380,15 +413,8 @@ pub fn drive_script_waves_with(
                     on_take(&batch, t_recv.elapsed());
                     match Inflight::start(batch, mat_ns) {
                         Ok(f) => inflight.push_back(f),
-                        Err(e) => {
-                            let meta = ScriptsBatchMeta {
-                                n: 0,
-                                first_h: 0,
-                                heights_hashes: Vec::new(),
-                                mat_ns,
-                                t0: Instant::now(),
-                            };
-                            if !on_err(e, meta) {
+                        Err((e, meta)) => {
+                            if !on_err(e, meta, &[]) {
                                 return;
                             }
                         }
@@ -410,15 +436,8 @@ pub fn drive_script_waves_with(
                     on_take(&batch, t_recv.elapsed());
                     match Inflight::start(batch, mat_ns) {
                         Ok(f) => inflight.push_back(f),
-                        Err(e) => {
-                            let meta = ScriptsBatchMeta {
-                                n: 0,
-                                first_h: 0,
-                                heights_hashes: Vec::new(),
-                                mat_ns,
-                                t0: Instant::now(),
-                            };
-                            if !on_err(e, meta) {
+                        Err((e, meta)) => {
+                            if !on_err(e, meta, &[]) {
                                 break;
                             }
                         }
@@ -439,7 +458,7 @@ pub fn drive_script_waves_with(
 pub fn scripts_stage_from_load_channel(
     mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
     on_ok: impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
-    on_err: impl FnMut(ConsensusError, ScriptsBatchMeta) -> bool,
+    on_err: impl FnMut(ConsensusError, ScriptsBatchMeta, &[ScriptsBatchMeta]) -> bool,
     should_stop: impl FnMut() -> bool,
 ) {
     drive_script_waves(mat_rx, on_ok, on_err, should_stop);

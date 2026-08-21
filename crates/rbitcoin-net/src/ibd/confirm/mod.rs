@@ -1275,7 +1275,7 @@ pub(crate) fn spawn_confirm_engine(
                     }
                     !feed_sc.stopped() && !hub_sc.query.confirm_cancelled()
                 },
-                |e, meta| {
+                |e, meta, dropped| {
                     confirm_thr_stats::add_script_work(Duration::ZERO);
                     let msg = e.to_string();
                     if msg.contains("confirm cancelled") || feed_sc.stopped() {
@@ -1288,6 +1288,9 @@ pub(crate) fn spawn_confirm_engine(
                         .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
                         .unwrap_or((meta.first_h, BlockHash::from_byte_array([0u8; 32])));
                     feed_sc.finish(meta.heights_hashes.iter().map(|(h, _)| *h));
+                    for d in dropped {
+                        feed_sc.finish(d.heights_hashes.iter().map(|(h, _)| *h));
+                    }
                     loop_stats_sc
                         .confirm_reject_stops
                         .fetch_add(1, Ordering::Relaxed);
@@ -1298,7 +1301,7 @@ pub(crate) fn spawn_confirm_engine(
                         err: msg,
                         wire: None,
                     });
-                    false
+                    true
                 },
                 || feed_sc.stopped() || hub_sc.query.confirm_cancelled(),
             );

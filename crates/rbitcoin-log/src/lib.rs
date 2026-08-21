@@ -363,7 +363,8 @@ mod tests {
         capture_logs(false);
         init(Level::Info);
         assert!(
-            logs.iter().any(|(l, m)| *l == Level::Info && m.contains("ibd: sizes")),
+            logs.iter()
+                .any(|(l, m)| *l == Level::Info && m.contains("ibd: sizes")),
             "{logs:?}"
         );
         assert!(

@@ -471,8 +471,56 @@ impl Query {
 
         let store = &self.store;
         let sh_run = &self.sh_run;
+        let (spill_tx, spill_rx) =
+            std::sync::mpsc::sync_channel::<RecollectSpillJob>(RECOLLECT_WRITER_QUEUE_CAP);
 
         std::thread::scope(|scope| {
+            let n_spills = &n_spills;
+            let n_creates = &n_creates;
+            let max_fk_seen = &max_fk_seen;
+            let n_txs = &n_txs;
+            let next_chunk = &next_chunk;
+            let first_err = &first_err;
+            let stop = &stop;
+            let done_flags = &done_flags;
+            let seal_prefix = &seal_prefix;
+            scope.spawn({
+                let spill_rx = spill_rx;
+                move || {
+                    while let Ok(mut job) = spill_rx.recv() {
+                        if !job.records.is_empty() {
+                            match sh_run.spill_creates_catalog(&mut job.records) {
+                                Ok((mfk, n)) => {
+                                    n_spills.fetch_add(1, AtomicOrdering::Relaxed);
+                                    n_creates.fetch_add(n, AtomicOrdering::Relaxed);
+                                    max_fk_seen.fetch_max(mfk, AtomicOrdering::Relaxed);
+                                }
+                                Err(e) => {
+                                    *first_err.lock().unwrap() = Some(e);
+                                    stop.store(true, AtomicOrdering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                        for chunk_id in job.pending_chunks {
+                            if let Err(e) = mark_recollect_chunk_done(
+                                chunk_id,
+                                n_chunks,
+                                sealed0,
+                                tip_max,
+                                CHUNK_FKS,
+                                &done_flags,
+                                &seal_prefix,
+                                sh_run,
+                            ) {
+                                *first_err.lock().unwrap() = Some(e);
+                                stop.store(true, AtomicOrdering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
             scope.spawn(|| {
                 let mut last_log = Instant::now();
                 loop {
@@ -511,138 +559,118 @@ impl Query {
             });
 
             for _w in 0..workers {
-                scope.spawn(|| {
-                    // Hold records across many 64k-fk chunks until ~128 MiB.
-                    // Spilling at every chunk end only yields ~5–10 MiB (64k×~2–3 outs).
-                    let mut local: Vec<ScriptHashRecord> =
-                        Vec::with_capacity(thread_spill_recs.min(1 << 22));
-                    let mut pending_done: Vec<usize> = Vec::with_capacity(32);
+                scope.spawn({
+                    let spill_tx = spill_tx.clone();
+                    move || {
+                        let mut local: Vec<rbitcoin_store::ScriptHashRecord> =
+                            Vec::with_capacity(thread_spill_recs.min(1 << 22));
+                        let mut pending_done: Vec<usize> = Vec::with_capacity(32);
 
-                    let flush_pending_done = |pending: &mut Vec<usize>| -> Result<(), StoreError> {
-                        for chunk_id in pending.drain(..) {
-                            mark_recollect_chunk_done(
-                                chunk_id,
-                                n_chunks,
-                                sealed0,
-                                tip_max,
-                                CHUNK_FKS,
-                                &done_flags,
-                                &seal_prefix,
-                                sh_run,
-                            )?;
-                        }
-                        Ok(())
-                    };
+                        let submit = |local: &mut Vec<rbitcoin_store::ScriptHashRecord>,
+                                      pending: &mut Vec<usize>|
+                         -> Result<(), StoreError> {
+                            submit_recollect_spill(&spill_tx, local, pending)
+                        };
 
-                    let spill_and_commit = |local: &mut Vec<ScriptHashRecord>,
-                                            pending: &mut Vec<usize>|
-                     -> Result<(), StoreError> {
-                        if !local.is_empty() {
-                            spill_local(sh_run, local, &n_spills, &n_creates, &max_fk_seen)?;
-                        }
-                        flush_pending_done(pending)
-                    };
+                        loop {
+                            if stop.load(AtomicOrdering::Relaxed)
+                                || cancel
+                                    .map(|c| c.load(AtomicOrdering::Relaxed))
+                                    .unwrap_or(false)
+                            {
+                                stop.store(true, AtomicOrdering::Relaxed);
+                                let _ = submit(&mut local, &mut pending_done);
+                                break;
+                            }
+                            if first_err.lock().unwrap().is_some() {
+                                break;
+                            }
+                            let i = next_chunk.fetch_add(1, AtomicOrdering::Relaxed);
+                            if i >= n_chunks {
+                                if let Err(e) = submit(&mut local, &mut pending_done) {
+                                    *first_err.lock().unwrap() = Some(e);
+                                    stop.store(true, AtomicOrdering::Relaxed);
+                                }
+                                break;
+                            }
+                            let lo = work_lo.saturating_add((i as u64).saturating_mul(CHUNK_FKS));
+                            let hi = lo.saturating_add(CHUNK_FKS).saturating_sub(1).min(tip_max);
+                            if lo > tip_max {
+                                pending_done.push(i);
+                                if local.len() >= thread_spill_recs {
+                                    if let Err(e) = submit(&mut local, &mut pending_done) {
+                                        *first_err.lock().unwrap() = Some(e);
+                                        stop.store(true, AtomicOrdering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
 
-                    loop {
-                        if stop.load(AtomicOrdering::Relaxed)
-                            || cancel
+                            let mut chunk_txs = 0u64;
+                            let mut chunk_max = sealed0;
+                            let mut chunk_ok = true;
+                            if cancel
                                 .map(|c| c.load(AtomicOrdering::Relaxed))
                                 .unwrap_or(false)
-                        {
-                            stop.store(true, AtomicOrdering::Relaxed);
-                            let _ = spill_and_commit(&mut local, &mut pending_done);
-                            break;
-                        }
-                        if first_err.lock().unwrap().is_some() {
-                            break;
-                        }
-                        let i = next_chunk.fetch_add(1, AtomicOrdering::Relaxed);
-                        if i >= n_chunks {
-                            if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
-                                *first_err.lock().unwrap() = Some(e);
+                                || stop.load(AtomicOrdering::Relaxed)
+                            {
                                 stop.store(true, AtomicOrdering::Relaxed);
+                                chunk_ok = false;
+                            } else {
+                                match store.for_each_create_outs_in_fk_span(
+                                    lo,
+                                    hi,
+                                    |fk, outputs| {
+                                        chunk_txs = chunk_txs.saturating_add(1);
+                                        chunk_max = chunk_max.max(fk.0);
+                                        for o in outputs {
+                                            local.push(ScriptHashRecord::from_fk(
+                                                script_hash(&o.script),
+                                                fk,
+                                            ));
+                                        }
+                                        if local.len() >= thread_spill_recs {
+                                            submit(&mut local, &mut pending_done)?;
+                                        }
+                                        Ok(())
+                                    },
+                                ) {
+                                    Ok(()) => {}
+                                    Err(StoreError::Cancelled(_)) => {
+                                        stop.store(true, AtomicOrdering::Relaxed);
+                                        chunk_ok = false;
+                                    }
+                                    Err(e) => {
+                                        *first_err.lock().unwrap() = Some(e);
+                                        stop.store(true, AtomicOrdering::Relaxed);
+                                        chunk_ok = false;
+                                    }
+                                }
                             }
-                            break;
-                        }
-                        let lo = work_lo.saturating_add((i as u64).saturating_mul(CHUNK_FKS));
-                        let hi = lo.saturating_add(CHUNK_FKS).saturating_sub(1).min(tip_max);
-                        if lo > tip_max {
+
+                            if !chunk_ok {
+                                let _ = submit(&mut local, &mut pending_done);
+                                break;
+                            }
+
+                            n_txs.fetch_add(chunk_txs, AtomicOrdering::Relaxed);
+                            max_fk_seen.fetch_max(chunk_max, AtomicOrdering::Relaxed);
+                            // Chunk fully scanned into `local` — commit after next spill
+                            // (or worker exit spill) so SEAL never covers RAM-only data.
                             pending_done.push(i);
                             if local.len() >= thread_spill_recs {
-                                if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
+                                if let Err(e) = submit(&mut local, &mut pending_done) {
                                     *first_err.lock().unwrap() = Some(e);
                                     stop.store(true, AtomicOrdering::Relaxed);
                                     break;
                                 }
                             }
-                            continue;
-                        }
-
-                        let mut chunk_txs = 0u64;
-                        let mut chunk_max = sealed0;
-                        let mut chunk_ok = true;
-                        if cancel
-                            .map(|c| c.load(AtomicOrdering::Relaxed))
-                            .unwrap_or(false)
-                            || stop.load(AtomicOrdering::Relaxed)
-                        {
-                            stop.store(true, AtomicOrdering::Relaxed);
-                            chunk_ok = false;
-                        } else {
-                            match store.for_each_create_outs_in_fk_span(lo, hi, |fk, outputs| {
-                                chunk_txs = chunk_txs.saturating_add(1);
-                                chunk_max = chunk_max.max(fk.0);
-                                for o in outputs {
-                                    local.push(ScriptHashRecord::from_fk(
-                                        script_hash(&o.script),
-                                        fk,
-                                    ));
-                                }
-                                if local.len() >= thread_spill_recs {
-                                    spill_local(
-                                        sh_run,
-                                        &mut local,
-                                        &n_spills,
-                                        &n_creates,
-                                        &max_fk_seen,
-                                    )?;
-                                    flush_pending_done(&mut pending_done)?;
-                                }
-                                Ok(())
-                            }) {
-                                Ok(()) => {}
-                                Err(StoreError::Cancelled(_)) => {
-                                    stop.store(true, AtomicOrdering::Relaxed);
-                                    chunk_ok = false;
-                                }
-                                Err(e) => {
-                                    *first_err.lock().unwrap() = Some(e);
-                                    stop.store(true, AtomicOrdering::Relaxed);
-                                    chunk_ok = false;
-                                }
-                            }
-                        }
-
-                        if !chunk_ok {
-                            let _ = spill_and_commit(&mut local, &mut pending_done);
-                            break;
-                        }
-
-                        n_txs.fetch_add(chunk_txs, AtomicOrdering::Relaxed);
-                        max_fk_seen.fetch_max(chunk_max, AtomicOrdering::Relaxed);
-                        // Chunk fully scanned into `local` — commit after next spill
-                        // (or worker exit spill) so SEAL never covers RAM-only data.
-                        pending_done.push(i);
-                        if local.len() >= thread_spill_recs {
-                            if let Err(e) = spill_and_commit(&mut local, &mut pending_done) {
-                                *first_err.lock().unwrap() = Some(e);
-                                stop.store(true, AtomicOrdering::Relaxed);
-                                break;
-                            }
                         }
                     }
                 });
             }
+            drop(spill_tx);
         });
 
         stop.store(true, AtomicOrdering::Relaxed);
@@ -702,23 +730,36 @@ impl Query {
     }
 }
 
-fn spill_local(
-    sh_run: &crate::sh_builder::ShRunBuilder,
-    local: &mut Vec<rbitcoin_store::ScriptHashRecord>,
-    n_spills: &std::sync::atomic::AtomicU64,
-    n_creates: &std::sync::atomic::AtomicU64,
-    max_fk_seen: &std::sync::atomic::AtomicU64,
-) -> Result<(), StoreError> {
-    use std::sync::atomic::Ordering as AtomicOrdering;
-    if local.is_empty() {
-        return Ok(());
+const RECOLLECT_WRITER_QUEUE_CAP: usize = 2;
+
+struct RecollectSpillJob {
+    records: Vec<rbitcoin_store::ScriptHashRecord>,
+    pending_chunks: Vec<usize>,
+}
+
+fn take_recollect_spill_job(
+    records: &mut Vec<rbitcoin_store::ScriptHashRecord>,
+    pending: &mut Vec<usize>,
+) -> Option<RecollectSpillJob> {
+    if records.is_empty() && pending.is_empty() {
+        return None;
     }
-    let (mfk, n) = sh_run.spill_creates_catalog(local)?;
-    local.clear();
-    n_spills.fetch_add(1, AtomicOrdering::Relaxed);
-    n_creates.fetch_add(n, AtomicOrdering::Relaxed);
-    max_fk_seen.fetch_max(mfk, AtomicOrdering::Relaxed);
-    Ok(())
+    Some(RecollectSpillJob {
+        records: std::mem::take(records),
+        pending_chunks: std::mem::take(pending),
+    })
+}
+
+fn submit_recollect_spill(
+    tx: &std::sync::mpsc::SyncSender<RecollectSpillJob>,
+    records: &mut Vec<rbitcoin_store::ScriptHashRecord>,
+    pending: &mut Vec<usize>,
+) -> Result<(), StoreError> {
+    let Some(job) = take_recollect_spill_job(records, pending) else {
+        return Ok(());
+    };
+    tx.send(job)
+        .map_err(|_| StoreError::Corrupt("invariant: recollect writer gone"))
 }
 
 fn mark_recollect_chunk_done(
@@ -782,6 +823,49 @@ mod tests {
 
     /// Serialize FORCE_REBUILD env mutations (parallel tests share process env).
     static FORCE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn recollect_spill_handoff_scan_continues_before_commit() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RecollectSpillJob>(2);
+        let latch = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let committed = std::sync::Arc::new(AtomicBool::new(false));
+        let scanned_again = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            let latch_w = std::sync::Arc::clone(&latch);
+            let committed_w = std::sync::Arc::clone(&committed);
+            scope.spawn(move || {
+                let job = rx.recv().unwrap();
+                assert_eq!(job.records.len(), 1);
+                assert_eq!(job.pending_chunks, vec![0]);
+                let (lock, cv) = &*latch_w;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                committed_w.store(true, Ordering::Release);
+            });
+            let mut recs = vec![ScriptHashRecord::from_fk([1u8; 32], Fk(1))];
+            let mut pending = vec![0usize];
+            submit_recollect_spill(&tx, &mut recs, &mut pending).unwrap();
+            assert!(recs.is_empty());
+            assert!(
+                pending.is_empty(),
+                "pending_done travels with the job; not marked until the writer commits"
+            );
+            scanned_again.fetch_add(1, Ordering::Relaxed);
+            assert!(
+                !committed.load(Ordering::Acquire),
+                "scan-side continues before the writer latch opens"
+            );
+            {
+                let (lock, cv) = &*latch;
+                *lock.lock().unwrap() = true;
+                cv.notify_one();
+            }
+        });
+        assert!(committed.load(Ordering::Acquire));
+        assert_eq!(scanned_again.load(Ordering::Relaxed), 1);
+    }
 
     fn encode_rec(sh: &[u8; 32], fk: Fk) -> [u8; 40] {
         let mut buf = [0u8; 40];

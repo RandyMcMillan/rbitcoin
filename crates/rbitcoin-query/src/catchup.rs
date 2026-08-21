@@ -411,7 +411,7 @@ impl Query {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(), QueryError> {
         use crate::sh_builder::{recollect_spill_bytes, SH_RUN_REC_LEN};
-        use rbitcoin_store::{script_hash, ScriptHashRecord};
+        use rbitcoin_store::ScriptHashRecord;
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
@@ -618,18 +618,15 @@ impl Query {
                                 stop.store(true, AtomicOrdering::Relaxed);
                                 chunk_ok = false;
                             } else {
-                                match store.for_each_create_outs_in_fk_span(
+                                match store.for_each_create_script_hashes_in_fk_span(
                                     lo,
                                     hi,
-                                    |fk, outputs| {
-                                        chunk_txs = chunk_txs.saturating_add(1);
-                                        chunk_max = chunk_max.max(fk.0);
-                                        for o in outputs {
-                                            local.push(ScriptHashRecord::from_fk(
-                                                script_hash(&o.script),
-                                                fk,
-                                            ));
+                                    |fk, sh| {
+                                        if chunk_max != fk.0 {
+                                            chunk_txs = chunk_txs.saturating_add(1);
+                                            chunk_max = chunk_max.max(fk.0);
                                         }
+                                        local.push(ScriptHashRecord::from_fk(sh, fk));
                                         if local.len() >= thread_spill_recs {
                                             submit(&mut local, &mut pending_done)?;
                                         }

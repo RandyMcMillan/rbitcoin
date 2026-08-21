@@ -1294,12 +1294,12 @@ impl TxTable {
     }
 
     /// Walk create_fks `first..=last` from a coalesced `txout.body` span (one idx
-    /// walk, sequential body pread), not per-fk get.
-    pub fn for_each_outs_in_fk_span(
+    /// walk, sequential body pread), yielding `script_hash` per out.
+    pub fn for_each_script_hashes_in_fk_span(
         &self,
         first: u64,
         last: u64,
-        mut f: impl FnMut(Fk, &[OutputRecord]) -> Result<(), StoreError>,
+        mut f: impl FnMut(Fk, [u8; 32]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         if last < first {
             return Ok(());
@@ -1333,11 +1333,8 @@ impl TxTable {
                     if end > buf.len() {
                         return Err(StoreError::Corrupt("txout span short for fk range"));
                     }
-                    let (_, outs, _) = decode_packed_tx_outs_with_spender_rels_secret(
-                        &buf[rel..end],
-                        Some(&self.secret),
-                    )?;
-                    f(Fk(first.saturating_add(k as u64)), &outs)?;
+                    let fk = Fk(first.saturating_add(k as u64));
+                    visit_packed_script_hashes(&buf[rel..end], Some(&self.secret), |sh| f(fk, sh))?;
                 }
                 Ok(())
             })?;

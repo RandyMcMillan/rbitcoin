@@ -726,6 +726,40 @@ pub fn scan_packed_p2tr_outs(
     Ok(out)
 }
 
+/// SHA256(scriptPubKey) for every packed out. No `OutputRecord` vec.
+pub fn visit_packed_script_hashes(
+    raw: &[u8],
+    secret: Option<&crate::store_secret::StoreSecret>,
+    mut f: impl FnMut([u8; 32]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let mut payload = Vec::new();
+    for _ in 0..meta.output_count {
+        if off >= raw.len() || raw.len() - off < 1 {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        }
+        let flags = raw[off];
+        if flags & 0xf0 != 0 {
+            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
+        }
+        let kind = flags & 0x0f;
+        let mut o = off + 1;
+        let (_v, n) = read_uleb128(&raw[o..])?;
+        o += n;
+        let used = crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
+        payload.clear();
+        payload.extend_from_slice(&raw[o..o + used]);
+        if let Some(sec) = secret {
+            xor_script_kind_v17_payload(kind, &mut payload, sec);
+        }
+        let script = crate::compact::decode_script_kind_v17(kind, &payload)?.0;
+        f(crate::scripthash::script_hash(&script))?;
+        off = o + used;
+    }
+    check_trailing_zero_pad(raw, off)?;
+    Ok(())
+}
+
 /// Sparse pin decode: only materialize `need_vouts` scripts + denserel slots.
 ///
 /// Walks the full packed layout (inputs skipped, non-need outs skipped without

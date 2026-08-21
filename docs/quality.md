@@ -83,14 +83,14 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 44 / 267.** Next claimed-surface leftovers: `mempool_accept` type-check dialect, `mining_basic` `-blockmaxweight`, `rpc_blockchain` prune/muhash keys, `rpc_getblockfrompeer`. Product-never skips stay skip (`no-wallet` 68, `no-prune` 6, `no-zmq`/`no-ipc`, `v1-only` including `p2p_invalid_block`). Unlabeled PRs stay cargo-only; nightly green |
 | 3 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work |
 | 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-21 giants (raw `wc -l`, inline test mods included): `rpc/methods` **5.9k**, `peer` **5.7k**, `scripthash` **5.6k**, `query/lib` **4.2k**, `electrum/server` **3.7k**, `sorted_run` **3.4k**, `chain` **3.3k**, `store` **3.2k**, `ibd/perf_log` **2.7k**. `scripthash.rs` grew with extents / k-way / bulk session — not a split project. No drive-by peels |
+| 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam |
 
 ### Still valid? (this reaudit)
 
 2026-08-21 pass. Tree at #177. Verified: zero in-tree fuzz, inventory
 **44** `run` / **223** `skip` / 267 total, `SCHEMA_VERSION = 19`, findings
-001–021 all fixed, **0** `TODO`/`FIXME`, **3** `#[allow(` (two clippy
-`type_complexity`, one `dead_code` `BodyMissing` event arm), `unsafe`
+001–021 all fixed, **0** `TODO`/`FIXME`, **2** `#[allow(` (clippy
+`type_complexity` in consensus), `unsafe`
 in store IO sessions + `script_pool` + confirm `head_drain`.
 
 | ID | Verdict |
@@ -102,7 +102,7 @@ in store IO sessions + `script_pool` + confirm `head_drain`.
 | **Q-48** | Keep, rank 3. Waits on rust-bitcoin (**RB-007**). |
 | **Q-31** | Keep. Useful for Q-30; not blocking operators. |
 | **Q-34** | **Closed.** `OPERATOR.md` § First hour (regtest); README points at that section. |
-| **R-10** | Keep last. Inline-test peels of `peer` / `methods` / `scripthash` follow in this program. |
+| **R-10** | Keep last. Inline tests left `peer.rs` / `methods.rs` / `scripthash.rs`. Remaining giants are production-sized (`query/lib` **4.2k**). |
 
 Prior-reaudit closures (Q-37, Q-47, Q-49) and Won't-fix calls
 (Q-24/25/32/33/35/38) stand — evidence unchanged. This pass adds
@@ -199,10 +199,10 @@ included; tree at #177):
 |--------|-------|
 | First-party Rust LOC | **~167k** (was ~150k on 2026-08-18; SH extents, confirm pipeline, wallet join, bench crate) |
 | Workspace crates | **14** (`rbitcoin-cli` … `rbitcoin-test` + optional `rbitcoin-bench`; no wallet crate). `rbitcoin-bench` is not default-members and not musl |
-| Largest production files (lines) | `rpc/methods` **5878**, `peer` **5669**, `scripthash` **5566**, `query/lib` **4159**, `electrum/server` **3685**, `sorted_run` **3366**, `chain` **3251**, `store` **3242**, `ibd/perf_log` **2726**, `interpreter` **2628** |
-| Largest test files (lines) | `tx_table/tests` **3209**, `confirm_reject_tests` **2555**, `scenarios` **2267**, `write_idempotent_tests` **2022** |
+| Largest production files (lines) | `query/lib` **4159**, `electrum/server` **3685**, `scripthash` **3446**, `sorted_run` **3366**, `rpc/methods` **3296**, `chain` **3251**, `store` **3242**, `ibd/perf_log` **2743**, `interpreter` **2628**, `peer` **2132** |
+| Largest test files (lines) | `peer_tests` **3521**, `tx_table/tests` **3209**, `methods_tests` **2575**, `confirm_reject_tests` **2555**, `scenarios` **2267**, `scripthash_tests` **2111** |
 | `#[test]` / `#[tokio::test]` | **~1.69k** |
-| `TODO` / `FIXME` / `#[allow(` | **0** / **0** / **3** |
+| `TODO` / `FIXME` / `#[allow(` | **0** / **0** / **2** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
 | Required CI | `fmt`, `deny`, `clippy`, `test`, `multinode`, `coverage` (+ CodeQL) |
 | Extra CI | `musl` / `windows` / `macos` after green master `ci` or PR label `static-binaries`; `core-functional.yml` nightly / labeled PR (not required) |
@@ -226,12 +226,12 @@ included; tree at #177):
 | Architecture clarity | Strong | Roles + HWM + single Class A appender; schema 19 in SCHEMA.md; scripts have no coordinator threads |
 | Dependency hygiene | Strong | No `libbitcoinconsensus`; fuse8/script_pool in-tree; bench crate optional |
 | Operator honesty | Strong | CLI primary; chaininfo disk/progress are real (Q-47); SH materialize keep-runs + last-page cap is pinned; README size matches SCHEMA census |
-| Code modularity | Medium | `rpc/methods` **5.9k**, `peer` **5.7k**, `scripthash` **5.6k**. Residual giants only via **R-10** |
+| Code modularity | Medium | Inline tests peeled from `peer` / `methods` / `scripthash`. Production leftover: `query/lib` **4.2k** (**R-10**) |
 | Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. CI snapshots: musl + CRT-static Windows + system-dylib Darwin |
 | Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
 | Contributor onboarding | Strong | how-we-plan + TDD + inventory; first hour is OPERATOR.md (Q-34) |
 | CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |
-| Dead / stub surface | Strong | Node RPC is a real subset; no dummy chaininfo numbers; `BodyMissing` event arm is the leftover `#[allow(dead_code)]` |
+| Dead / stub surface | Strong | Node RPC is a real subset; no dummy chaininfo numbers |
 | Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
 | Tip-follow mempool APIs | Strong | **R-01–R-04**; persist sidecars exist (Core persist script still skip → Q-41); INV tick no longer clones the mempool |
 | Wallet-client APIs | Strong | Last-slot SH join + serve-lean identity for Electrum/Esplora; Casa/Sparrow times stay host-only (`rbitcoin-bench`) |

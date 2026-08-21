@@ -326,12 +326,6 @@ pub(crate) enum ConfirmEvent {
         /// Rejected tip+1 wire after `take_raw` (BQ row is already gone).
         wire: Option<std::sync::Arc<bitcoin::Block>>,
     },
-    /// Confirm saw tip+1 without durable Class A — clear optimistic `known` and
-    /// drop the feed entry so offer re-probes the store (no permanent blacklist).
-    /// Load no longer constructs this (lookup dequeues BQ); keep the arm for
-    /// the IBD event protocol.
-    #[allow(dead_code)]
-    BodyMissing { hash: BlockHash },
 }
 
 /// Hard cap on consecutive ready heights in one confirm wave.

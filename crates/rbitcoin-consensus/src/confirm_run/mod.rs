@@ -6,8 +6,8 @@
 //!   wire Block → structure → stamp create_fk (Class A planned only)
 //! LOAD STAGE (ibd-confirm-load OS thread):
 //!   pin denserels once → assemble (uses intake wire; **no Class-A wire rebuild**)
-//! SCRIPTS STAGE (ibd-confirm OS thread + script coordinators):
-//!   pure CPU verify — no Query, no disk
+//! SCRIPTS STAGE (`ibd-confirm` OS thread publishes waves; `rbtc-scripts-*` steal):
+//!   pure CPU verify — no Query, no disk. No coordinator threads.
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC.
 //!   `tx.head` write-behind drain runs on process-wide `ibd-confirm-head`
@@ -18,9 +18,9 @@
 //! [`confirm_wire_run`] is the unified entry (tests / tip / IBD).
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is pure
-//! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD uses
-//! [`confirm_scripts_phase_async`] / [`confirm_scripts_feed_ahead`] so the
-//! script coordinators stay fed across batch boundaries (one-batch lookahead).
+//! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD [`drive_script_waves`] publishes
+//! multiple waves from the stage thread when steal is empty, then writes in
+//! height order. Steal workers unpark the publisher when a wave completes.
 
 use crate::block::{
     assemble_block_prevouts, block_has_witness, structural_validate_spends, ScriptCheckJob,
@@ -62,7 +62,7 @@ pub use lookup::{
     PlanStampOutcome,
 };
 use lookup::{create_fks_from_header_ranges, known_create_txid_lookup, stamp_parent_pin_archived};
-use phases::{assemble_run, script_wave};
+use phases::assemble_run;
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
@@ -70,7 +70,8 @@ use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
 pub use scripts::scripts_stage_from_load_channel_with;
 pub use scripts::{
     confirm_scripts_feed_ahead, confirm_scripts_phase, confirm_scripts_phase_async,
-    join_scripts_polling, scripts_stage_from_load_channel, ScriptsBatchMeta, ScriptsPhaseHandle,
+    drive_script_waves, drive_script_waves_with, join_scripts_polling,
+    scripts_stage_from_load_channel, ScriptsBatchMeta, ScriptsPhaseHandle,
 };
 pub use write::confirm_write_phase;
 #[cfg(test)]

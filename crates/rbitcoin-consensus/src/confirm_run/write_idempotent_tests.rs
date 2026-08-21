@@ -214,10 +214,8 @@ fn scripts_feed_ahead_single_batch() {
     assert!(outs[0].batch.is_empty());
 }
 
-/// `confirm_scripts_phase_async` must not occupy a steal worker (`rbtc-scripts-*`).
-///
-/// Thread name is recorded on the handle so a parallel scripts phase
-/// cannot overwrite it.
+/// `confirm_scripts_phase_async` publishes on the caller (no coordinator
+/// thread, no steal worker).
 #[test]
 fn scripts_phase_does_not_run_on_steal_worker() {
     use super::confirm_scripts_phase_async;
@@ -226,13 +224,200 @@ fn scripts_phase_does_not_run_on_steal_worker() {
         .expect("empty phase");
     assert!(ok.batch.is_empty());
     assert!(
-        name.starts_with("rbtc-script-coord-"),
-        "scripts phase must run on a coordinator, got {name:?}"
+        !name.starts_with("rbtc-script-coord-"),
+        "coordinator threads are gone, got {name:?}"
     );
     assert!(
         !name.starts_with("rbtc-scripts-"),
         "scripts phase ran on steal worker {name:?}"
     );
+}
+
+fn linux_thread_comms() -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| {
+        let p = e.ok()?.path().join("comm");
+        std::fs::read_to_string(p).ok()
+    })
+    .map(|s| s.trim().to_string())
+    .collect()
+}
+
+/// IBD `drive_script_waves` writes in input order and never starts
+/// `rbtc-script-coord-*` threads.
+#[test]
+fn drive_script_waves_ordered_without_coordinator_threads() {
+    use super::drive_script_waves;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let (tx, rx) = mpsc::sync_channel(4);
+    let heights = Arc::new(Mutex::new(Vec::new()));
+    let heights_w = Arc::clone(&heights);
+    let stage = thread::Builder::new()
+        .name("ibd-confirm".into())
+        .spawn(move || {
+            drive_script_waves(
+                &rx,
+                |ok, meta| {
+                    heights_w.lock().unwrap().push(meta.first_h);
+                    assert!(ok.batch.is_empty());
+                    true
+                },
+                |_e, _meta, _dropped| false,
+                || false,
+            );
+        })
+        .expect("spawn publisher");
+    for _ in 0..3 {
+        tx.send((empty_loaded_batch(), 0)).expect("send");
+    }
+    drop(tx);
+    crate::unpark_script_publisher();
+    stage.join().expect("publisher");
+    assert_eq!(heights.lock().unwrap().len(), 3);
+    for comm in linux_thread_comms() {
+        assert!(
+            !comm.starts_with("rbtc-script-coord"),
+            "coordinator thread still live: {comm}"
+        );
+    }
+}
+
+fn prepared_at(
+    height: u32,
+    hash: [u8; 32],
+    jobs: Vec<crate::block::ScriptCheckJob>,
+    check_scripts: bool,
+) -> super::Prepared {
+    use bitcoin::CompactTarget;
+    use rbitcoin_primitives::{Fk, Height};
+    super::Prepared {
+        height: Height(height),
+        header_fk: Fk(1),
+        tx_fks: Vec::new(),
+        jobs,
+        spends: Vec::new(),
+        fees: 0,
+        check_scripts,
+        time: 1,
+        bits: CompactTarget::from_consensus(0x207f_ffff),
+        hash,
+        prev_mtp: 0,
+    }
+}
+
+fn loaded_at(
+    height: u32,
+    hash: [u8; 32],
+    jobs: Vec<crate::block::ScriptCheckJob>,
+    check_scripts: bool,
+) -> super::LoadedBatch {
+    super::LoadedBatch {
+        prepared: vec![prepared_at(height, hash, jobs, check_scripts)],
+        wire_blocks: Vec::new(),
+        batch_parents: rbitcoin_query::BatchParents::new(),
+        script_preverified: super::ScriptPreverified::new(),
+        archive_plan: None,
+    }
+}
+
+fn bad_p2pkh_job() -> crate::block::ScriptCheckJob {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let prevouts = vec![TxOut {
+        value: Amount::from_sat(50_0000_0000),
+        script_pubkey: ScriptBuf::from_bytes(vec![
+            0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88,
+            0xac,
+        ]),
+    }];
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([9; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let tid = tx.compute_txid().to_byte_array();
+    crate::block::ScriptCheckJob::with_txid(tid, prevouts, tx, true, true, true, true, true)
+}
+
+/// One-job inline fail keeps the batch height/hash; a later batch still writes.
+#[test]
+fn drive_script_waves_start_fail_keeps_meta_and_continues() {
+    use super::drive_script_waves;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let (tx, rx) = mpsc::sync_channel(4);
+    let oks = Arc::new(Mutex::new(Vec::new()));
+    let errs = Arc::new(Mutex::new(Vec::new()));
+    let oks_w = Arc::clone(&oks);
+    let errs_w = Arc::clone(&errs);
+    let stage = thread::spawn(move || {
+        drive_script_waves(
+            &rx,
+            |ok, meta| {
+                oks_w.lock().unwrap().push(meta.first_h);
+                assert!(ok.batch.prepared.len() == 1);
+                true
+            },
+            |e, meta, dropped| {
+                assert!(dropped.is_empty());
+                errs_w.lock().unwrap().push((
+                    meta.first_h,
+                    meta.heights_hashes.clone(),
+                    format!("{e}"),
+                ));
+                true
+            },
+            || false,
+        );
+    });
+    tx.send((loaded_at(10, [10u8; 32], vec![bad_p2pkh_job()], true), 0))
+        .expect("send bad");
+    tx.send((loaded_at(20, [20u8; 32], Vec::new(), true), 0))
+        .expect("send ok");
+    drop(tx);
+    crate::unpark_script_publisher();
+    stage.join().expect("publisher");
+    let errs = errs.lock().unwrap();
+    assert_eq!(errs.len(), 1, "one reject");
+    assert_eq!(errs[0].0, 10);
+    assert_eq!(errs[0].1, vec![(10, [10u8; 32])]);
+    assert_ne!(errs[0].1[0].1, [0u8; 32]);
+    let oks = oks.lock().unwrap();
+    assert_eq!(&*oks, &[20], "later batch still written");
+}
+
+/// Drained job vecs must drop capacity before write handoff.
+#[test]
+fn script_jobs_shrink_after_take() {
+    use super::confirm_scripts_phase;
+    let mut jobs = Vec::with_capacity(32);
+    jobs.push(bad_p2pkh_job());
+    assert!(jobs.capacity() >= 32);
+    let batch = loaded_at(7, [7u8; 32], jobs, false);
+    let ok = confirm_scripts_phase(batch).expect("skip scripts");
+    assert_eq!(ok.batch.prepared[0].jobs.capacity(), 0);
 }
 
 /// Two ready batches: both verify on the real async path; write order preserved.

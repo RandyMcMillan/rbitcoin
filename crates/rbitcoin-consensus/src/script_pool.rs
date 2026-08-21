@@ -4,9 +4,8 @@
 //! the process-wide `rbtc-scripts-*` workers; (2) [`spawn_detached`] /
 //! [`run_detached_join`] for mempool accept; (3) [`try_for_each_parallel_idle`]
 //! publishes a **background** wave claimed only when no foreground wave and no
-//! detached job are waiting (sptweak CPU). Confirm scripts phases run on
-//! [`spawn_coordinator`], not on steal workers (a worker must not wait on
-//! this pool).
+//! detached job are waiting (sptweak CPU). IBD confirm scripts publish waves
+//! from the stage thread — steal workers must not `wait_done` on this pool.
 //!
 //! Idle steal workers [`thread::park`]. A new wave or detached job bumps an
 //! epoch and [`Thread::unpark`]s every worker (unpark-before-park leaves a
@@ -38,8 +37,8 @@ fn on_steal_worker() -> bool {
     ON_STEAL_WORKER.with(|c| c.get())
 }
 
-/// Type-erased `f(&items[i])`. `ctx` is valid until the publishing
-/// [`try_for_each_parallel`] returns (after [`Wave::wait_done`]).
+/// Type-erased `f(&items[i])`. `ctx` is valid until the publisher drops the
+/// owning [`OwnedWave`] (after [`Wave::is_complete`]).
 struct Apply {
     f: unsafe fn(*const (), usize) -> Result<(), ConsensusError>,
     ctx: *const (),
@@ -62,19 +61,40 @@ struct Wave {
 }
 
 impl Wave {
+    fn notify_if_complete(&self) {
+        if !self.is_complete() {
+            return;
+        }
+        *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.done_cv.notify_all();
+        unpark_script_publisher();
+    }
+
     fn claim_chunk(&self) -> Option<Range<usize>> {
         if self.failed.load(Ordering::Relaxed) {
             return None;
         }
-        let i = self.next.fetch_add(STEAL_CHUNK, Ordering::Relaxed);
-        if i >= self.n {
+        // `in_wave` before `next`: a last-chunk claimer is visible to
+        // `is_complete` before `next >= n`, so the publisher cannot free ctx
+        // under a worker about to `apply`.
+        self.in_wave.fetch_add(1, Ordering::AcqRel);
+        if self.failed.load(Ordering::Relaxed) {
+            self.in_wave.fetch_sub(1, Ordering::AcqRel);
+            self.notify_if_complete();
             return None;
         }
+        let i = self.next.fetch_add(STEAL_CHUNK, Ordering::Relaxed);
+        if i >= self.n {
+            self.in_wave.fetch_sub(1, Ordering::AcqRel);
+            self.notify_if_complete();
+            return None;
+        }
+        #[cfg(test)]
+        maybe_delay_claim();
         #[cfg(test)]
         if STEAL_CLAIMS_ON.load(Ordering::Relaxed) {
             STEAL_CLAIMS.fetch_add(1, Ordering::Relaxed);
         }
-        self.in_wave.fetch_add(1, Ordering::AcqRel);
         Some(i..self.n.min(i.saturating_add(STEAL_CHUNK)))
     }
 
@@ -85,8 +105,8 @@ impl Wave {
     }
 
     fn run_chunk(&self, range: Range<usize>) {
-        // SAFETY: `in_wave` was incremented by `claim_chunk`; publisher does
-        // not return until `wait_done` sees `in_wave == 0`.
+        // SAFETY: `in_wave` was incremented before `next`; publisher keeps
+        // `ctx` live until `is_complete` (then `OwnedWave` Drop unpublished).
         for i in range {
             if self.failed.load(Ordering::Relaxed) {
                 break;
@@ -102,10 +122,11 @@ impl Wave {
             }
         }
         self.in_wave.fetch_sub(1, Ordering::AcqRel);
-        if self.is_complete() {
-            *self.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
-            self.done_cv.notify_all();
-        }
+        self.notify_if_complete();
+    }
+
+    fn has_unclaimed(&self) -> bool {
+        !self.failed.load(Ordering::Relaxed) && self.next.load(Ordering::Relaxed) < self.n
     }
 
     fn wait_done(&self) {
@@ -113,6 +134,20 @@ impl Wave {
         while !self.is_complete() {
             g = self.done_cv.wait(g).unwrap_or_else(|p| p.into_inner());
         }
+    }
+}
+
+static PUBLISHER: Mutex<Option<thread::Thread>> = Mutex::new(None);
+
+pub(crate) fn set_script_publisher(t: Option<thread::Thread>) {
+    *PUBLISHER.lock().unwrap_or_else(|p| p.into_inner()) = t;
+}
+
+/// Wake the scripts stage thread (wave complete, `scriptq` send, or shutdown).
+pub fn unpark_script_publisher() {
+    let t = PUBLISHER.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    if let Some(t) = t {
+        t.unpark();
     }
 }
 
@@ -166,6 +201,134 @@ fn steal_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
 
 fn steal_bg_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
     steal_from(&waves_bg_snap().load())
+}
+
+/// True when steal workers can still claim a foreground job.
+pub(crate) fn fg_has_unclaimed() -> bool {
+    waves_snap().load().iter().any(|w| w.has_unclaimed())
+}
+
+/// Run one steal chunk on the caller (not a steal worker). Used by the
+/// scripts stage thread to finish a wave tail instead of parking.
+pub(crate) fn help_steal() -> bool {
+    if on_steal_worker() {
+        return false;
+    }
+    let Some((w, range)) = steal_chunk() else {
+        return false;
+    };
+    w.run_chunk(range);
+    true
+}
+
+struct ApplyCtx<T> {
+    items: *const T,
+    f: fn(&T) -> Result<(), ConsensusError>,
+}
+
+unsafe impl<T: Sync> Send for ApplyCtx<T> {}
+unsafe impl<T: Sync> Sync for ApplyCtx<T> {}
+
+/// Publisher-owned job list + live wave. Safe to move; heap allocation is stable.
+pub(crate) struct OwnedWave<T: Sync> {
+    _items: Box<[T]>,
+    _ctx: Box<ApplyCtx<T>>,
+    wave: Arc<Wave>,
+}
+
+impl<T: Sync> OwnedWave<T> {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.wave.is_complete()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_unclaimed(&self) -> bool {
+        self.wave.has_unclaimed()
+    }
+
+    pub(crate) fn wait_complete(&self) {
+        self.wave.wait_done();
+    }
+
+    pub(crate) fn finish(self) -> Result<(), ConsensusError> {
+        self.wave.wait_done();
+        match self
+            .wave
+            .first_err
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T: Sync> Drop for OwnedWave<T> {
+    fn drop(&mut self) {
+        self.wave.wait_done();
+        unpublish_fg(&self.wave);
+    }
+}
+
+fn unpublish_fg(wave: &Arc<Wave>) {
+    let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+    g.retain(|w| !Arc::ptr_eq(w, wave));
+    publish_waves(&g);
+}
+
+/// Publish `items` for steal workers without waiting. `None` = already done
+/// (empty or single-item ran inline).
+pub(crate) fn start_for_each_owned<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    if on_steal_worker() {
+        return Err(ConsensusError::BadBlock(
+            "try_for_each from a script worker",
+        ));
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    if items.len() == 1 {
+        f(&items[0])?;
+        return Ok(None);
+    }
+    let items = items.into_boxed_slice();
+    let ctx = Box::new(ApplyCtx {
+        items: items.as_ptr(),
+        f,
+    });
+    unsafe fn apply<T>(ptr: *const (), i: usize) -> Result<(), ConsensusError> {
+        let ctx = unsafe { &*(ptr as *const ApplyCtx<T>) };
+        (ctx.f)(unsafe { &*ctx.items.add(i) })
+    }
+    let wave = Arc::new(Wave {
+        n: items.len(),
+        next: AtomicUsize::new(0),
+        in_wave: AtomicUsize::new(0),
+        failed: AtomicBool::new(false),
+        first_err: Mutex::new(None),
+        apply: Apply {
+            f: apply::<T>,
+            ctx: (&*ctx as *const ApplyCtx<T>).cast(),
+        },
+        done: Mutex::new(false),
+        done_cv: Condvar::new(),
+    });
+    {
+        let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+        g.push(Arc::clone(&wave));
+        publish_waves(&g);
+    }
+    wake_steal_workers();
+    Ok(Some(OwnedWave {
+        _items: items,
+        _ctx: ctx,
+        wave,
+    }))
 }
 
 /// Parallel map over `items` until the first error (or all succeed).
@@ -281,25 +444,6 @@ static WORKER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static IDLE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
-fn recv_job(jobs: &Mutex<VecDeque<Job>>, cv: &Condvar, count_idle: bool) -> Job {
-    let _ = count_idle;
-    let mut g = jobs.lock().unwrap_or_else(|p| p.into_inner());
-    loop {
-        if let Some(job) = g.pop_front() {
-            return job;
-        }
-        #[cfg(test)]
-        if count_idle {
-            IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
-        }
-        g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
-        #[cfg(test)]
-        if count_idle {
-            IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
 fn take_detached_job(pool: &ScriptWorkers) -> Option<Job> {
     pool.jobs
         .lock()
@@ -402,6 +546,29 @@ fn idle_waiter_count() -> usize {
 }
 
 #[cfg(test)]
+static DELAY_CLAIM: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static DELAY_CLAIM_GO: AtomicBool = AtomicBool::new(true);
+#[cfg(test)]
+static DELAY_CLAIM_ENTERED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DELAY_CLAIM_MU: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static DELAY_CLAIM_CV: Condvar = Condvar::new();
+
+#[cfg(test)]
+fn maybe_delay_claim() {
+    if !DELAY_CLAIM.load(Ordering::SeqCst) {
+        return;
+    }
+    DELAY_CLAIM_ENTERED.fetch_add(1, Ordering::SeqCst);
+    let mut g = DELAY_CLAIM_MU.lock().unwrap_or_else(|p| p.into_inner());
+    while !DELAY_CLAIM_GO.load(Ordering::SeqCst) {
+        g = DELAY_CLAIM_CV.wait(g).unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+#[cfg(test)]
 static DELAY_PARK: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static DELAY_PARK_GO: AtomicBool = AtomicBool::new(true);
@@ -435,48 +602,6 @@ where
         q.push_back(Box::new(work));
     }
     wake_steal_workers();
-}
-
-/// Two coordinators for IBD feed-ahead phases. Must not share the steal
-/// worker set: a phase that waits on `try_for_each_parallel` would deadlock
-/// if it occupied an `rbtc-scripts-*` thread.
-struct CoordWorkers {
-    jobs: Mutex<VecDeque<Job>>,
-    cv: Condvar,
-}
-
-static COORD: OnceLock<CoordWorkers> = OnceLock::new();
-
-fn coord_workers() -> &'static CoordWorkers {
-    static SPAWN: OnceLock<()> = OnceLock::new();
-    let pool = COORD.get_or_init(|| CoordWorkers {
-        jobs: Mutex::new(VecDeque::new()),
-        cv: Condvar::new(),
-    });
-    SPAWN.get_or_init(|| {
-        for i in 0..2 {
-            let _ = thread::Builder::new()
-                .name(format!("rbtc-script-coord-{i}"))
-                .spawn(move || loop {
-                    let f = recv_job(&pool.jobs, &pool.cv, false);
-                    f();
-                });
-        }
-    });
-    pool
-}
-
-/// Submit `work` on a scripts-phase coordinator (not a steal worker).
-pub(crate) fn spawn_coordinator<F>(work: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    let pool = coord_workers();
-    {
-        let mut q = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
-        q.push_back(Box::new(work));
-    }
-    pool.cv.notify_one();
 }
 
 /// Run `work` on the shared `rbtc-scripts` pool and join the result.
@@ -949,5 +1074,122 @@ mod tests {
         std::panic::set_hook(prev);
         assert!(panicked.is_err());
         try_for_each_parallel(&[1u32, 2, 3, 4], |_| Ok(())).unwrap();
+    }
+
+    static HOLD_JOBS: AtomicBool = AtomicBool::new(false);
+    static HOLD_IN: AtomicUsize = AtomicUsize::new(0);
+
+    fn hold_job(_: &u32) -> Result<(), ConsensusError> {
+        HOLD_IN.fetch_add(1, Ordering::SeqCst);
+        let t0 = Instant::now();
+        while HOLD_JOBS.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(3) {
+            thread::park_timeout(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    struct HoldJobs;
+    impl HoldJobs {
+        fn arm() -> Self {
+            HOLD_IN.store(0, Ordering::SeqCst);
+            HOLD_JOBS.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+    impl Drop for HoldJobs {
+        fn drop(&mut self) {
+            HOLD_JOBS.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn second_wave_publishes_when_first_is_claimed() {
+        let _steal = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let _occupy = OCCUPY.lock().unwrap_or_else(|p| p.into_inner());
+        let hold = HoldJobs::arm();
+        let a = start_for_each_owned((0..64u32).collect(), hold_job)
+            .unwrap()
+            .expect("wave a");
+        let start = Instant::now();
+        while a.has_unclaimed() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "first wave not fully claimed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!fg_has_unclaimed());
+        let b = start_for_each_owned((0..64u32).collect(), hold_job)
+            .unwrap()
+            .expect("wave b");
+        assert!(
+            !a.is_complete(),
+            "first wave still in_wave when second is published"
+        );
+        assert!(b.has_unclaimed() || fg_has_unclaimed() || !a.is_complete());
+        drop(hold);
+        a.finish().unwrap();
+        b.finish().unwrap();
+        assert!(!fg_has_unclaimed());
+    }
+
+    fn ok_u32(_: &u32) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    struct DelayClaimArm;
+    impl DelayClaimArm {
+        fn arm() -> Self {
+            DELAY_CLAIM_ENTERED.store(0, Ordering::SeqCst);
+            DELAY_CLAIM_GO.store(false, Ordering::SeqCst);
+            DELAY_CLAIM.store(true, Ordering::SeqCst);
+            Self
+        }
+        fn go(&self) {
+            let _g = DELAY_CLAIM_MU.lock().unwrap_or_else(|p| p.into_inner());
+            DELAY_CLAIM_GO.store(true, Ordering::SeqCst);
+            DELAY_CLAIM_CV.notify_all();
+        }
+    }
+    impl Drop for DelayClaimArm {
+        fn drop(&mut self) {
+            DELAY_CLAIM.store(false, Ordering::SeqCst);
+            let _g = DELAY_CLAIM_MU.lock().unwrap_or_else(|p| p.into_inner());
+            DELAY_CLAIM_GO.store(true, Ordering::SeqCst);
+            DELAY_CLAIM_CV.notify_all();
+        }
+    }
+
+    /// After `in_wave++` and before `next += chunk`, `is_complete` must be
+    /// false (publisher must not free ctx under the claimer).
+    #[test]
+    fn last_claim_holds_in_wave_before_next() {
+        let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let n = worker_spawn_count();
+        let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+        let arm = DelayClaimArm::arm();
+        let wave = thread::spawn(|| {
+            start_for_each_owned((0..2u32).collect(), ok_u32)
+                .unwrap()
+                .expect("wave")
+                .finish()
+        });
+        let start = Instant::now();
+        while DELAY_CLAIM_ENTERED.load(Ordering::SeqCst) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "claimer did not enter in_wave delay"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let snap = waves_snap().load();
+        assert!(!snap.is_empty(), "wave not published");
+        assert!(
+            !snap[0].is_complete(),
+            "is_complete during in_wave-before-next window"
+        );
+        arm.go();
+        wave.join().expect("join").expect("wave ok");
+        occupy.release();
     }
 }

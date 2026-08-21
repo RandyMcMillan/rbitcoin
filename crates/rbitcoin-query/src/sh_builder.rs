@@ -1136,6 +1136,9 @@ impl ShRunBuilder {
         let t_finish = Instant::now();
         let n_total = mat.creates;
         let n_keys = mat.keys;
+        let merge_ns = mat.merge_ns;
+        let pack_ns = mat.pack_ns;
+        let mphf_ns = mat.mphf_ns;
         let body_flush_ns = mat.body_flush_ns;
         let head_fill_ns = mat.head_fill_ns;
         store.scripthash.flush()?;
@@ -1180,12 +1183,16 @@ impl ShRunBuilder {
         info!(
             "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} \
              deferred≈{n_deferred} shards={n_shards} elapsed={:?} \
-             stages: claim={:?} reduce={:?} reinit={:?} stream={:?} body_flush={:?} head_fill={:?} finish_flush={:?}",
+             stages: claim={:?} reduce={:?} reinit={:?} stream={:?} merge={:?} pack={:?} \
+             mphf={:?} body_flush={:?} head_fill={:?} finish_flush={:?}",
             t0.elapsed(),
             Duration::from_nanos(claim_ns),
             Duration::from_nanos(reduce_ns),
             Duration::from_nanos(reinit_ns),
             Duration::from_nanos(stream_ns),
+            Duration::from_nanos(merge_ns),
+            Duration::from_nanos(pack_ns),
+            Duration::from_nanos(mphf_ns),
             Duration::from_nanos(body_flush_ns),
             Duration::from_nanos(head_fill_ns),
             Duration::from_nanos(finish_ns),

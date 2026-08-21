@@ -2767,6 +2767,7 @@ pub struct ShShardPack {
     pub max_fk: u64,
     pub keys: u64,
     pub bump: u64,
+    pub body_flush_ns: u64,
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
@@ -2865,6 +2866,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             max_fk: self.max_fk,
             keys: self.keys_written,
             bump: self.bump,
+            body_flush_ns: self.body_flush_ns,
         };
         self.finished = true;
         Ok(pack)

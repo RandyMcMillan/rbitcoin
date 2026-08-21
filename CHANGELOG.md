@@ -67,6 +67,13 @@ before 1.0).
   adds headerless SH interiors, script coordinators, flattening uring
   machines, process pin FIFO, and `rbitcoin-bench` in required CI.
 
+- **Quality cheap wins:** confirm queue owner docs match **14/4/14**.
+  **Q-34** first hour is [`OPERATOR.md`](OPERATOR.md) (regtest mine →
+  Electrum → Esplora). **Q-36** default INFO is `ibd: progress`;
+  `ibd: perf` / `ibd: sizes` are DEBUG. **Q-50** closed (named `other=`
+  residual). Inline tests moved out of `peer.rs` / `methods.rs` /
+  `scripthash.rs`. Dead `ConfirmEvent::BodyMissing` removed.
+
 - **tx.head drain thread:** confirm write-behind insert runs on a process-wide
   `ibd-confirm-head` OS thread overlapping structural + Class C, instead of a
   per-batch `thread::scope` spawn.

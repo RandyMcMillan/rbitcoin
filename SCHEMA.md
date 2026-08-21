@@ -568,7 +568,8 @@ compact still merges **heads only** — all ovf keys share
 - Megakey **pages** (4 KiB): `ver=1` header is 8 B `ver:u8 | n_fks:u16 | LAST|page_index u40`
   then ULEB128 `fk0` + ULEB128 gaps. LAST=1 → index is **first** page; LAST=0 →
   **next**. `ver=2` last-in-extent / chain-last adds 16 B: `extent_base:u64` +
-  `extent_n:u32` + reserved (stream starts at 24). Mode 11 pack8 stores **last**
+  `extent_n:u32` + reserved (stream starts at 24, max 4072 B). Last-page chunks
+  use that cap; `ver=1` intermediates still fill 4088 B. Mode 11 pack8 stores **last**
   page off; that page holds `(extent_base, extent_n)`. Query span-reads `extent_n`
   pages then linked-walks a 4 KiB tail. Mode 10 / `ver=1` is a linked walk only.
   `ver=0` with `n_fks>0` is a leftover raw-u64 page — rematerialize. Last-page

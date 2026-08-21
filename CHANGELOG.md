@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **SH materialize last page:** megakey chunking sizes the last extent page
+  for the `ver=2` 24 B header (4072 B stream), not the `ver=1` 4088 B cap.
+  A key whose delta stream sat in 4073..=4088 B overflowed
+  `scripthash page pack: entries exceed page capacity` and aborted bulk
+  materialize.
+
 - **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
   `unpark` permit (wave publish / detached job). A worker that misses steal
   and parks after the wake still runs the work. Jobs mutex stays the

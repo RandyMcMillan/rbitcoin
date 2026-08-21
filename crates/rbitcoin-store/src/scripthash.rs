@@ -2958,7 +2958,19 @@ impl<'a> ScriptHashBulkSession<'a> {
                     "scripthash bulk stream: paged key missing last page",
                 ));
             } else {
-                self.write_page(&open.buf, false, open.first_page)?
+                let fks: Vec<Fk> = open.buf.iter().copied().map(Fk).collect();
+                let chunks = sh_page_chunk_ranges(&fks)?;
+                let mut last = 0u64;
+                for (i, &(start, end)) in chunks.iter().enumerate() {
+                    let part: Vec<u64> = fks[start..end].iter().map(|fk| fk.0).collect();
+                    let is_last = i + 1 == chunks.len();
+                    last = self.write_page(
+                        &part,
+                        !is_last,
+                        if is_last { open.first_page } else { None },
+                    )?;
+                }
+                last
             };
             ShHeadValue::extent(last)
         };
@@ -5053,6 +5065,69 @@ mod tests {
             other => panic!("expected slab, got {other:?}"),
         }
         assert_eq!(t.entries(&sh).unwrap().len(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Delta stream in 4073..=4088 B fits `ver=1` but not `ver=2` last-page header.
+    #[test]
+    fn bulk_session_extent_last_page_splits_when_ver2_header_eats_stream() {
+        use crate::scripthash_pages::SH_PAGE_EXTENT_STREAM_MAX;
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let n = SH_PAGE_EXTENT_STREAM_MAX + 8;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x11;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut session = t.bulk_session(1).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        let (creates, keys, _, _) = session.finish().unwrap();
+        assert_eq!(keys, 1);
+        assert_eq!(creates, n as u64);
+        assert_eq!(t.entries(&sh).unwrap().len(), n);
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Extent { last_page } => {
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                let (base, n_ext) = sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .expect("ver=2 last page");
+                assert!(
+                    n_ext >= 2,
+                    "must not pack 4080-byte stream as one ver=2 page"
+                );
+                assert_ne!(base, last_page);
+            }
+            other => panic!("expected extent, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streamed megakey: last remainder can sit in 4073..=4088 B after `ver=1` flushes.
+    #[test]
+    fn bulk_session_streamed_last_remainder_fits_ver2() {
+        use crate::scripthash_pages::{SH_PAGE_EXTENT_STREAM_MAX, SH_PAGE_STREAM_MAX};
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX + 8;
+        let mut sh = [0u8; 32];
+        sh[0] = 0x12;
+        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut session = t.bulk_session(1).unwrap();
+        session.put_chain(sh, &ents).unwrap();
+        let (creates, keys, _, _) = session.finish().unwrap();
+        assert_eq!(keys, 1);
+        assert_eq!(creates, n as u64);
+        assert_eq!(t.entries(&sh).unwrap().len(), n);
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Extent { last_page } => {
+                let mut page = [0u8; SH_PAGE_SIZE];
+                t.body().read_at(last_page, &mut page).unwrap();
+                assert!(sh_page_extent(sh_page_as_array(&page).unwrap())
+                    .unwrap()
+                    .is_some());
+            }
+            other => panic!("expected extent, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

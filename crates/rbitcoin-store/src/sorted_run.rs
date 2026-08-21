@@ -400,6 +400,18 @@ pub fn write_sorted_run(
     Ok(run)
 }
 
+/// Insert an already-written `{seq:06}.run` into the parent [`MANIFEST`].
+///
+/// Pair with [`write_sorted_run_file_with_policy`] so the body write can run
+/// without holding the catalog mutex. Callers serialize this against other
+/// MANIFEST writers.
+pub fn commit_run_to_catalog(run: &SortedRunPath) -> Result<(), StoreError> {
+    let Some(dir) = run.path.parent() else {
+        return Ok(());
+    };
+    manifest_insert(dir, run)
+}
+
 /// Write run file only (no MANIFEST) with an explicit policy.
 ///
 /// L0 spills use [`RunWritePolicy::L0`]; catalog merge internals use
@@ -3326,6 +3338,22 @@ mod tests {
         assert!(RunWritePolicy::IBD_BACKGROUND.pace);
         assert!(RunWritePolicy::CATALOG.durable);
         assert!(RunWritePolicy::IBD_BACKGROUND.durable);
+    }
+
+    #[test]
+    fn commit_run_to_catalog_inserts_file_only_write() {
+        let d = tmp_dir();
+        let path = next_run_path(&d, 1);
+        let mut rec = [0u8; 40];
+        rec[0] = 1;
+        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let run = write_sorted_run_file_with_policy(&path, 40, 40, &rec, RunWritePolicy::CATALOG)
+            .unwrap();
+        commit_run_to_catalog(&run).unwrap();
+        let listed = list_runs(&d).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].seq(), Some(1));
+        assert_eq!(listed[0].count, 1);
     }
 
     /// L0 spills must be readable without fsync; max create_fk tracked during merge

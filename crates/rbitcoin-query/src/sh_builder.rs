@@ -26,12 +26,12 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
-    list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    materialize_sh_shards, merge_runs_with_policy, next_run_path, reduce_runs_to_fanin_cancellable,
-    set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
-    RunWritePolicy, ScriptHashRecord, SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS,
-    SH_RUN_SORT_KEY_LEN,
+    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, commit_run_to_catalog,
+    for_each_merged_rec_opts, list_fanin_reduce_outputs, list_materialize_claims, list_runs,
+    load_fanin_checkpoint, materialize_sh_shards, merge_runs_with_policy, next_run_path,
+    reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority, write_sorted_run,
+    write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashRecord,
+    SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -717,25 +717,40 @@ impl ShRunBuilder {
             let g = self.inner.lock().unwrap();
             g.ctrl.next_seq
         };
-        let run = {
+        let path = {
+            let mut g = self.inner.lock().unwrap();
             let _io = runs_io.lock().unwrap();
-            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
+            next_seq = next_seq
+                .max(g.ctrl.next_seq)
+                .max(next_seq_ceiling(&runs_dir));
             let path = next_run_path(&runs_dir, next_seq);
             next_seq = next_seq.saturating_add(1);
-            let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body)?;
-            debug!(
-                "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
-                run.count,
-                run_body_bytes(&run) as f64 / (1024.0 * 1024.0),
-                run.path.display()
-            );
-            run
-        };
-        {
-            let mut g = self.inner.lock().unwrap();
             g.ctrl.next_seq = next_seq.max(g.ctrl.next_seq);
+            path
+        };
+        let part = path.with_extension("run.part");
+        let run = write_sorted_run_file_with_policy(
+            &part,
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+            RunWritePolicy::CATALOG,
+        )?;
+        debug!(
+            "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
+            run.count,
+            run_body_bytes(&run) as f64 / (1024.0 * 1024.0),
+            path.display()
+        );
+        {
+            let _io = runs_io.lock().unwrap();
+            std::fs::rename(&part, &path).map_err(|e| StoreError::io(&path, e))?;
+            let run = SortedRunPath {
+                path: path.clone(),
+                ..run
+            };
+            commit_run_to_catalog(&run)?;
         }
-        let _ = run;
         Ok((max_fk, n))
     }
 
@@ -1855,6 +1870,36 @@ mod tests {
         assert_eq!((_s0, f0), (sh_a, Fk(1)));
         assert_eq!((_s1, f1), (sh_a, Fk(3)));
         assert_eq!((_s2, f2), (sh_b, Fk(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_creates_catalog_concurrent_unique_seqs() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-spill-conc-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        std::thread::scope(|scope| {
+            for i in 0..4u8 {
+                let b = &b;
+                scope.spawn(move || {
+                    let mut sh = [0u8; 32];
+                    sh[0] = i.saturating_add(1);
+                    let mut creates = vec![ScriptHashRecord::from_fk(sh, Fk(u64::from(i) + 1))];
+                    b.spill_creates_catalog(&mut creates).unwrap();
+                });
+            }
+        });
+        let runs = list_runs(&dir.join("scripthash.runs")).unwrap();
+        assert_eq!(runs.len(), 4, "each worker must land a catalog run");
+        let mut seqs: Vec<u64> = runs.iter().filter_map(|r| r.seq()).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 4, "seqs must be unique: {seqs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

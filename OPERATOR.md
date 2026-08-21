@@ -59,6 +59,47 @@ create/open/grow use positional `ReadFile`/`WriteFile` +
 Default `--datadir` is cwd-relative `datadir` via `Path::new(".").join("datadir")`
 (`./datadir` on Unix, `.\datadir` on Windows).
 
+## First hour (regtest)
+
+One loop: mine a block, one Electrum RPC, one Esplora GET. This is **regtest**,
+not validated mainnet (default mainnet `--milestone` skips historical scripts).
+Signet/mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+
+Electrum and Esplora **require `--shindex`**. JSON-RPC is only there so
+`rbitcoin-cli` can mine.
+
+```bash
+./target/release/rbitcoin-node \
+  --datadir /tmp/rb-hour \
+  --network regtest \
+  --no-seeds \
+  --shindex \
+  --rpc-listen 127.0.0.1:18443 \
+  --electrum-listen 127.0.0.1:50001 \
+  --esplora-listen 127.0.0.1:3000
+```
+
+In another terminal (cookie at `/tmp/rb-hour/.cookie`):
+
+```bash
+./target/release/rbitcoin-cli --datadir /tmp/rb-hour --rpcport 18443 \
+  generatetodescriptor 1 'raw(51)'
+
+python3 - <<'PY'
+import json, socket
+s = socket.create_connection(("127.0.0.1", 50001))
+req = json.dumps({"id": 1, "method": "server.version", "params": ["rbitcoin-hour", "1.4"]}) + "\n"
+s.sendall(req.encode())
+print(s.recv(4096).decode())
+PY
+
+curl -s http://127.0.0.1:3000/blocks/tip/height
+```
+
+Expect: a generated block hash list, an Electrum `server.version` result, and
+`1` from Esplora (tip height after the generate). More Electrum/Esplora surface:
+sections below and [`COMPAT.md`](./COMPAT.md).
+
 ## CLI (operator-first)
 
 Routine knobs are **CLI / conf**, not required env vars. Clean smoke:

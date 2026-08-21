@@ -85,8 +85,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 4 | **Q-36** | Perf log diet | ops | Default INFO short enough to ship a node without a pager. DEBUG / `tip: perf` keep meters. Closed noise: getheaders storm (#43), SH megakey 10 s heartbeat, per-query `api:`/`sh_join`/tweaks (#166), per-item getdata wtx (#163). Remaining: `ibd: perf` / `tip: perf` lines still ~2.5 KB at INFO. Q-50 adds meters on DEBUG/`tip: perf`, never more INFO |
 | 5 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work |
 | 6 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 7 | **Q-34** | First-hour tutorial | docs | Regtest mine → Electrum query → one Esplora GET. One page; no second map |
-| 8 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-21 giants (raw `wc -l`, inline test mods included): `rpc/methods` **5.9k**, `peer` **5.7k**, `scripthash` **5.6k**, `query/lib` **4.2k**, `electrum/server` **3.7k**, `sorted_run` **3.4k**, `chain` **3.3k**, `store` **3.2k**, `ibd/perf_log` **2.7k**. `scripthash.rs` grew with extents / k-way / bulk session — not a split project. No drive-by peels |
+| 7 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. 2026-08-21 giants (raw `wc -l`, inline test mods included): `rpc/methods` **5.9k**, `peer` **5.7k**, `scripthash` **5.6k**, `query/lib` **4.2k**, `electrum/server` **3.7k**, `sorted_run` **3.4k**, `chain` **3.3k**, `store` **3.2k**, `ibd/perf_log` **2.7k**. `scripthash.rs` grew with extents / k-way / bulk session — not a split project. No drive-by peels |
 
 ### Still valid? (this reaudit)
 
@@ -104,7 +103,7 @@ in store IO sessions + `script_pool` + confirm `head_drain`.
 | **Q-36** | Keep. TRACE moved per-query API and per-item getdata; INFO `ibd: perf` is still a firehose. |
 | **Q-48** | Keep, rank 5. Waits on rust-bitcoin (**RB-007**). |
 | **Q-31** | Keep. Useful for Q-30; not blocking operators. |
-| **Q-34** | Keep. Onboarding still medium; no first-hour page. |
+| **Q-34** | **Closed.** `OPERATOR.md` § First hour (regtest); README points at that section. |
 | **R-10** | Keep last, list refreshed. `peer` **5.7k** and `scripthash` **5.6k** passed `query/lib`. Peel only when Q-50/Q-41 need a seam. |
 
 Prior-reaudit closures (Q-37, Q-47, Q-49) and Won't-fix calls
@@ -124,7 +123,7 @@ id is in **bold**. Do not start **R-11+** — new work is the next unused
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 8 |
+| R-10 | **R-10** | Open rank 7 |
 
 New work after this reaudit starts at **Q-51**.
 
@@ -164,6 +163,7 @@ findings 001–021, CI split, map-free README, …) live in
 | **—** | Schema 18/19 indexes | Sealed MPHF `g` is FdOnly (#161). SH extent pack8 mode 11; last-page stream **4072 B** for the `ver=2` header (#177). Class A / C stay 17 bytes. 17 populated `tx.head`/`scripthash*` still refused |
 | **—** | Confirm scripts + write-behind | Park/unpark steal (#173). `ibd-confirm` publishes waves (no coordinators, #174). Process-wide `ibd-confirm-head` drain (#176). BIP141 nonce skipped pre-SegWit (#175) |
 | **—** | Wallet-client SH join | Serve-lean `txid.body` identity (#168). Last-slot Electrum/Esplora join + tip probe (#170/#171). Optional `rbitcoin-bench` (#164–#172; not default-members) |
+| **Q-34** | First-hour tutorial | [`OPERATOR.md`](../OPERATOR.md) § First hour (regtest): mine → Electrum `server.version` → Esplora tip height. README points there. No second docs map |
 | **Q-49** | v2-only peer discovery | `x809.<seed>` first, then unfiltered; `addr`/`addrv2` requires `P2P_V2`; dial skips `INCOMPATIBLE` while any better addr remains. Owner: [`OPERATOR.md`](../OPERATOR.md) § P2P + `seeds.rs` |
 | **Q-47** | Honest `getblockchaininfo` disk / progress | Store file walk + `blocks/headers` (not dummy 0 / 0.5) |
 | **Q-37** | Warm default suite ≤3 min | Required CI `test` **~85 s** (2026-08-17, ubuntu-24.04). Stretch &lt;2 min met on CI-class. Recorded in TESTING.md |
@@ -229,7 +229,7 @@ included; tree at #177):
 | Code modularity | Medium | `rpc/methods` **5.9k**, `peer` **5.7k**, `scripthash` **5.6k**. Residual giants only via **R-10** |
 | Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. CI snapshots: musl + CRT-static Windows + system-dylib Darwin |
 | Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
-| Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
+| Contributor onboarding | Strong | how-we-plan + TDD + inventory; first hour is OPERATOR.md (Q-34) |
 | CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |
 | Dead / stub surface | Strong | Node RPC is a real subset; no dummy chaininfo numbers; `BodyMissing` event arm is the leftover `#[allow(dead_code)]` |
 | Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
@@ -268,7 +268,7 @@ included; tree at #177):
 | Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active programs: **Q-41** (Core functional `run` set), confirm perf (**Q-50** meters first) |
 | Release engineering | **Q-20**, **Q-21**, **Q-23** (completed) |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** |
-| Docs / README | Map is done; then **Q-34** |
+| Docs / README | Map is done; first hour is OPERATOR.md (**Q-34** closed) |
 | “Are we leading yet?” | North star + grade board |
 
 ---

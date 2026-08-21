@@ -66,9 +66,10 @@ Product surface: [`COMPAT.md`](./COMPAT.md).
 Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash,
 Electrum, Esplora REST, libre mempool) for the **server-side / wallet-client
 backend** role. **0.x mainnet** is early production: run **signet first**, then
-mainnet with monitoring ([`OPERATOR.md`](./OPERATOR.md)). Finishing any one
-operator’s first full mainnet sync is **not** a gate for using or packaging
-this tree.
+mainnet with monitoring ([`OPERATOR.md`](./OPERATOR.md)). First hour on
+regtest (mine → Electrum → Esplora): [`OPERATOR.md`](./OPERATOR.md#first-hour-regtest).
+Finishing any one operator’s first full mainnet sync is **not** a gate for
+using or packaging this tree.
 
 **Non-goal:** powering a **graphical block explorer** (search boxes,
 address-prefix autocomplete, explorer-only catalogue APIs). Product surface:

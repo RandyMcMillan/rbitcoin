@@ -410,7 +410,7 @@ impl Query {
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(), QueryError> {
-        use crate::sh_builder::{RECOLLECT_THREAD_SPILL_BYTES, SH_RUN_REC_LEN};
+        use crate::sh_builder::{recollect_spill_bytes, SH_RUN_REC_LEN};
         use rbitcoin_store::{script_hash, ScriptHashRecord};
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Mutex;
@@ -444,8 +444,8 @@ impl Query {
         const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
         let workers = recollect_workers();
-        let thread_spill_recs =
-            (RECOLLECT_THREAD_SPILL_BYTES / u64::from(SH_RUN_REC_LEN)).max(1) as usize;
+        let spill_bytes = recollect_spill_bytes();
+        let thread_spill_recs = (spill_bytes / u64::from(SH_RUN_REC_LEN)).max(1) as usize;
         let work_lo = sealed0.saturating_add(1);
         let work_span = tip_max.saturating_sub(sealed0);
         let n_chunks = work_span.div_ceil(CHUNK_FKS).max(1) as usize;
@@ -455,7 +455,7 @@ impl Query {
              tip_max_create_fk={tip_max} chunks={n_chunks} chunk_fks={CHUNK_FKS} \
              workers={workers} thread_spill_MiB≈{:.0}",
             tip.0,
-            RECOLLECT_THREAD_SPILL_BYTES as f64 / (1024.0 * 1024.0)
+            spill_bytes as f64 / (1024.0 * 1024.0)
         );
 
         let t0 = Instant::now();

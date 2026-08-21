@@ -1449,9 +1449,34 @@ pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Floor for catalog compact: do **not** merge intentional recollect spills.
 ///
-/// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so ~128 MiB spills are never
-/// candidates. Tip direct k-way can open thousands of FDs without rewriting them.
+/// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so default ~128 MiB spills
+/// are never candidates. Live compact uses [`catalog_compact_floor_bytes`] of
+/// the resolved spill size.
 pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4;
+
+const RECOLLECT_SPILL_BYTES_MIN: u64 = 16 * 1024 * 1024;
+const RECOLLECT_SPILL_BYTES_MAX: u64 = 512 * 1024 * 1024;
+
+/// Parse `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` (16 MiB–512 MiB, default 128 MiB).
+pub fn parse_recollect_spill_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .map(|n| n.clamp(RECOLLECT_SPILL_BYTES_MIN, RECOLLECT_SPILL_BYTES_MAX))
+        .unwrap_or(RECOLLECT_THREAD_SPILL_BYTES)
+}
+
+/// Resolved recollect spill size (`RBITCOIN_SH_RECOLLECT_SPILL_BYTES` or default).
+pub fn recollect_spill_bytes() -> u64 {
+    parse_recollect_spill_bytes(
+        std::env::var("RBITCOIN_SH_RECOLLECT_SPILL_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Compact floor: 3/4 of the effective recollect spill so intentional spills stay.
+pub fn catalog_compact_floor_bytes(spill_bytes: u64) -> u64 {
+    spill_bytes.saturating_mul(3) / 4
+}
 
 /// True if a catalog run body should be eligible for undersized compact.
 ///
@@ -1461,7 +1486,7 @@ pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) 
         return false;
     }
     let half = target_run_bytes / 2;
-    let small_max = half.min(CATALOG_COMPACT_FLOOR_BYTES);
+    let small_max = half.min(catalog_compact_floor_bytes(recollect_spill_bytes()));
     body_bytes < small_max
 }
 
@@ -2201,6 +2226,40 @@ mod tests {
             50 * 1024 * 1024,
             64 * 1024 * 1024
         ));
+    }
+
+    #[test]
+    fn recollect_spill_bytes_parse_clamps() {
+        assert_eq!(
+            parse_recollect_spill_bytes(None),
+            RECOLLECT_THREAD_SPILL_BYTES
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("not-a-number")),
+            RECOLLECT_THREAD_SPILL_BYTES
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("1")),
+            16 * 1024 * 1024,
+            "below 16MiB clamps up"
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("999999999999")),
+            512 * 1024 * 1024,
+            "above 512MiB clamps down"
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("268435456")),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            catalog_compact_floor_bytes(RECOLLECT_THREAD_SPILL_BYTES),
+            CATALOG_COMPACT_FLOOR_BYTES
+        );
+        assert_eq!(
+            catalog_compact_floor_bytes(256 * 1024 * 1024),
+            192 * 1024 * 1024
+        );
     }
 
     #[test]

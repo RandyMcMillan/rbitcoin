@@ -97,7 +97,7 @@ pub use scripthash_head::{
 };
 pub use scripthash_layout::ShHeadValue;
 pub use scripthash_layout::SH_MAX_SLAB_CLASS;
-pub use scripthash_materialize::{materialize_sh_shards, ShShardMaterialize};
+pub use scripthash_materialize::{materialize_sh_shards, MaterializeStageNs, ShShardMaterialize};
 pub use scripthash_slabs::{
     decode_fk_delta_stream, decode_slab_payload, encode_fk_delta_stream, encode_slab_payload,
     page_alloc_bytes_for_n_fks, slab_alloc_bytes_for_n_fks, slab_class_for_n_fks,
@@ -114,16 +114,16 @@ pub use sharded_hashhead::{
     SHARD_COUNT_TX_SH,
 };
 pub use sorted_run::{
-    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, crc32, detach_run,
-    dynamic_merge_fanin, dynamic_merge_fanin_for, fanin_passes_total, for_each_merged_rec,
-    for_each_merged_rec_opts, for_each_merged_rec_shard, list_fanin_reduce_outputs,
-    list_materialize_claims, list_runs, load_fanin_checkpoint, lookup_key, merge_runs,
-    merge_runs_to_file, merge_runs_to_file_with_policy, merge_runs_with_policy, next_run_path,
-    open_run, read_run_body, reduce_runs_to_fanin, reduce_runs_to_fanin_cancellable, remove_run,
-    set_thread_idle_io_priority, sh_merge_workers, shard_record_starts, verify_run_body,
-    write_fanin_checkpoint, write_sorted_run, write_sorted_run_file_with_policy, MergeToFileResult,
-    RunWritePolicy, SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME,
-    FANIN_TARGET_STREAM_RUNS,
+    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, commit_run_to_catalog, crc32,
+    detach_run, dynamic_merge_fanin, dynamic_merge_fanin_for, fanin_passes_total,
+    for_each_merged_rec, for_each_merged_rec_opts, for_each_merged_rec_shard,
+    list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
+    lookup_key, merge_runs, merge_runs_to_file, merge_runs_to_file_with_policy,
+    merge_runs_with_policy, next_run_path, open_run, read_run_body, reduce_runs_to_fanin,
+    reduce_runs_to_fanin_cancellable, remove_run, set_thread_idle_io_priority, sh_merge_workers,
+    shard_record_starts, shard_record_starts_many, verify_run_body, write_fanin_checkpoint,
+    write_sorted_run, write_sorted_run_file_with_policy, MergeToFileResult, RunWritePolicy,
+    SortedRunPath, FANIN_CHECKPOINT_NAME, FANIN_READY_NAME, FANIN_TARGET_STREAM_RUNS,
 };
 pub use sp_tweaks::{SpTweaksTable, TWEAK_LEN};
 pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx, TweakWave};

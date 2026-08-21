@@ -2445,6 +2445,7 @@ impl ScriptHashTable {
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
+            fk_scratch: Vec::with_capacity(512),
             pack_only: false,
             max_fk: 0,
             free_head,
@@ -2491,6 +2492,7 @@ impl ScriptHashTable {
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
+            fk_scratch: Vec::with_capacity(512),
             pack_only: true,
             max_fk: 0,
             free_head,
@@ -2551,6 +2553,7 @@ impl ScriptHashTable {
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
+            fk_scratch: Vec::with_capacity(512),
             pack_only: false,
             max_fk: 0,
             free_head: [0; SH_MAX_CLASS as usize + 1],
@@ -2754,6 +2757,8 @@ pub struct ScriptHashBulkSession<'a> {
     pub peak_table_bytes: usize,
     /// In-flight key: at most one page of FKs (streaming megakey).
     open_key: Option<BulkOpenKey>,
+    /// Reused FK page buffer (one alloc per session, not per key).
+    fk_scratch: Vec<u64>,
     /// When true, head is streamed to `.part` and installed at `publish_packed_shard`.
     pack_only: bool,
     max_fk: u64,
@@ -2767,6 +2772,7 @@ pub struct ShShardPack {
     pub max_fk: u64,
     pub keys: u64,
     pub bump: u64,
+    pub body_flush_ns: u64,
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
@@ -2800,6 +2806,29 @@ impl<'a> ScriptHashBulkSession<'a> {
     /// Unique keys packed so far.
     pub fn keys_written(&self) -> u64 {
         self.keys_written
+    }
+
+    fn take_fk_scratch(&mut self) -> Vec<u64> {
+        let mut buf = std::mem::take(&mut self.fk_scratch);
+        if buf.capacity() < 512 {
+            buf.reserve(512);
+        }
+        buf
+    }
+
+    fn return_fk_scratch(&mut self, mut buf: Vec<u64>) {
+        buf.clear();
+        self.fk_scratch = buf;
+    }
+
+    #[cfg(test)]
+    fn fk_scratch_capacity(&self) -> usize {
+        self.fk_scratch.capacity().max(
+            self.open_key
+                .as_ref()
+                .map(|o| o.buf.capacity())
+                .unwrap_or(0),
+        )
     }
 
     /// Head shards fully installed so far.
@@ -2865,6 +2894,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             max_fk: self.max_fk,
             keys: self.keys_written,
             bump: self.bump,
+            body_flush_ns: self.body_flush_ns,
         };
         self.finished = true;
         Ok(pack)
@@ -2886,9 +2916,10 @@ impl<'a> ScriptHashBulkSession<'a> {
             if !self.prepare_stream_key(key)? {
                 return Ok(());
             }
+            let buf = self.take_fk_scratch();
             self.open_key = Some(BulkOpenKey {
                 key,
-                buf: Vec::with_capacity(512),
+                buf,
                 stream_used: 0,
                 n_total: 0,
                 first_page: None,
@@ -2941,6 +2972,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             return Ok(());
         };
         if open.n_total == 0 {
+            self.return_fk_scratch(open.buf);
             return Ok(());
         }
         let n = open.n_total;
@@ -2981,6 +3013,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.peak_table_bytes = self
             .peak_table_bytes
             .max(self.recs.len().saturating_mul(24));
+        self.return_fk_scratch(open.buf);
         Ok(())
     }
 
@@ -3035,17 +3068,21 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn write_open_full_page_with_next(&mut self) -> Result<(), StoreError> {
-        let buf = self
+        let mut buf = self
             .open_key
             .as_mut()
             .map(|o| std::mem::take(&mut o.buf))
             .unwrap_or_default();
         let off = self.write_page(&buf, true, None)?;
+        buf.clear();
         if let Some(open) = self.open_key.as_mut() {
             if open.first_page.is_none() {
                 open.first_page = Some(off);
             }
             open.stream_used = 0;
+            open.buf = buf;
+        } else {
+            self.return_fk_scratch(buf);
         }
         Ok(())
     }
@@ -4653,6 +4690,27 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = i & 0x3f;
         k
+    }
+
+    #[test]
+    fn bulk_session_reuses_fk_scratch_across_keys() {
+        HeadScale::test_with(HeadScale::Tiny, || {
+            let dir = tmp();
+            let t = four_shard_table(&dir);
+            let mut session = t.pack_shard_session(0).unwrap();
+            for i in 0..32u8 {
+                session
+                    .push_sorted_fk(shard0_key(i), Fk(u64::from(i) + 1))
+                    .unwrap();
+            }
+            session.finish_key().unwrap();
+            assert!(
+                session.fk_scratch_capacity() >= 512,
+                "session must keep the first FK vec: cap={}",
+                session.fk_scratch_capacity()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

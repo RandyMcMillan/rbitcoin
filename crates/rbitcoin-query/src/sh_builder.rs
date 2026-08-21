@@ -16,7 +16,7 @@
 //!
 //! # Write amp
 //!
-//! Catalog compact only rewrites **crumbs** under [`CATALOG_COMPACT_FLOOR_BYTES`].
+//! Catalog compact only rewrites **crumbs** under [`catalog_compact_floor_bytes`].
 //! Intentional ~128 MiB recollect spills go straight to tip direct k-way.
 
 use super::run_builder_core::{
@@ -26,12 +26,12 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
-    list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-    materialize_sh_shards, merge_runs_with_policy, next_run_path, reduce_runs_to_fanin_cancellable,
-    set_thread_idle_io_priority, write_sorted_run, write_sorted_run_file_with_policy, ColdProgress,
-    RunWritePolicy, ScriptHashRecord, SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS,
-    SH_RUN_SORT_KEY_LEN,
+    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, commit_run_to_catalog,
+    for_each_merged_rec_opts, list_fanin_reduce_outputs, list_materialize_claims, list_runs,
+    load_fanin_checkpoint, materialize_sh_shards, merge_runs_with_policy, next_run_path,
+    reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority,
+    write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashRecord,
+    SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
 };
 
 /// How tip finalize applies remaining SH runs (pure decision; no I/O).
@@ -717,25 +717,40 @@ impl ShRunBuilder {
             let g = self.inner.lock().unwrap();
             g.ctrl.next_seq
         };
-        let run = {
+        let path = {
+            let mut g = self.inner.lock().unwrap();
             let _io = runs_io.lock().unwrap();
-            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
+            next_seq = next_seq
+                .max(g.ctrl.next_seq)
+                .max(next_seq_ceiling(&runs_dir));
             let path = next_run_path(&runs_dir, next_seq);
             next_seq = next_seq.saturating_add(1);
-            let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body)?;
-            debug!(
-                "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
-                run.count,
-                run_body_bytes(&run) as f64 / (1024.0 * 1024.0),
-                run.path.display()
-            );
-            run
-        };
-        {
-            let mut g = self.inner.lock().unwrap();
             g.ctrl.next_seq = next_seq.max(g.ctrl.next_seq);
+            path
+        };
+        let part = path.with_extension("run.part");
+        let run = write_sorted_run_file_with_policy(
+            &part,
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+            RunWritePolicy::CATALOG,
+        )?;
+        debug!(
+            "ibd: SH recollect spill records≈{} body≈{:.1}MiB max_fk={max_fk} path={}",
+            run.count,
+            run_body_bytes(&run) as f64 / (1024.0 * 1024.0),
+            path.display()
+        );
+        {
+            let _io = runs_io.lock().unwrap();
+            std::fs::rename(&part, &path).map_err(|e| StoreError::io(&path, e))?;
+            let run = SortedRunPath {
+                path: path.clone(),
+                ..run
+            };
+            commit_run_to_catalog(&run)?;
         }
-        let _ = run;
         Ok((max_fk, n))
     }
 
@@ -1136,6 +1151,9 @@ impl ShRunBuilder {
         let t_finish = Instant::now();
         let n_total = mat.creates;
         let n_keys = mat.keys;
+        let merge_ns = mat.merge_ns;
+        let pack_ns = mat.pack_ns;
+        let mphf_ns = mat.mphf_ns;
         let body_flush_ns = mat.body_flush_ns;
         let head_fill_ns = mat.head_fill_ns;
         store.scripthash.flush()?;
@@ -1180,12 +1198,16 @@ impl ShRunBuilder {
         info!(
             "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} \
              deferred≈{n_deferred} shards={n_shards} elapsed={:?} \
-             stages: claim={:?} reduce={:?} reinit={:?} stream={:?} body_flush={:?} head_fill={:?} finish_flush={:?}",
+             stages: claim={:?} reduce={:?} reinit={:?} stream={:?} merge={:?} pack={:?} \
+             mphf={:?} body_flush={:?} head_fill={:?} finish_flush={:?}",
             t0.elapsed(),
             Duration::from_nanos(claim_ns),
             Duration::from_nanos(reduce_ns),
             Duration::from_nanos(reinit_ns),
             Duration::from_nanos(stream_ns),
+            Duration::from_nanos(merge_ns),
+            Duration::from_nanos(pack_ns),
+            Duration::from_nanos(mphf_ns),
             Duration::from_nanos(body_flush_ns),
             Duration::from_nanos(head_fill_ns),
             Duration::from_nanos(finish_ns),
@@ -1427,9 +1449,35 @@ pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Floor for catalog compact: do **not** merge intentional recollect spills.
 ///
-/// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so ~128 MiB spills are never
-/// candidates. Tip direct k-way can open thousands of FDs without rewriting them.
-pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4;
+/// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so default ~128 MiB spills
+/// are never candidates. Live compact uses [`catalog_compact_floor_bytes`] of
+/// the resolved spill size.
+#[cfg(test)]
+const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4;
+
+const RECOLLECT_SPILL_BYTES_MIN: u64 = 16 * 1024 * 1024;
+const RECOLLECT_SPILL_BYTES_MAX: u64 = 512 * 1024 * 1024;
+
+/// Parse `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` (16 MiB–512 MiB, default 128 MiB).
+pub fn parse_recollect_spill_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .map(|n| n.clamp(RECOLLECT_SPILL_BYTES_MIN, RECOLLECT_SPILL_BYTES_MAX))
+        .unwrap_or(RECOLLECT_THREAD_SPILL_BYTES)
+}
+
+/// Resolved recollect spill size (`RBITCOIN_SH_RECOLLECT_SPILL_BYTES` or default).
+pub fn recollect_spill_bytes() -> u64 {
+    parse_recollect_spill_bytes(
+        std::env::var("RBITCOIN_SH_RECOLLECT_SPILL_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Compact floor: 3/4 of the effective recollect spill so intentional spills stay.
+pub fn catalog_compact_floor_bytes(spill_bytes: u64) -> u64 {
+    spill_bytes.saturating_mul(3) / 4
+}
 
 /// True if a catalog run body should be eligible for undersized compact.
 ///
@@ -1439,7 +1487,7 @@ pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) 
         return false;
     }
     let half = target_run_bytes / 2;
-    let small_max = half.min(CATALOG_COMPACT_FLOOR_BYTES);
+    let small_max = half.min(catalog_compact_floor_bytes(recollect_spill_bytes()));
     body_bytes < small_max
 }
 
@@ -1449,8 +1497,8 @@ pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) 
 /// (`!force_all`). Never tip `drain_spills` or parallel recollect (multi-thread
 /// writers would race IBD and reintroduce write amp).
 ///
-/// Runs ≥ [`CATALOG_COMPACT_FLOOR_BYTES`] are left alone so recollect's ~128 MiB
-/// spills stream straight into tip k-way merge.
+/// Runs ≥ [`catalog_compact_floor_bytes`] of the resolved spill are left
+/// alone so recollect spills stream straight into tip k-way merge.
 fn compact_catalog_undersized(
     runs_dir: &Path,
     next_seq: &mut u64,
@@ -1600,7 +1648,7 @@ fn sh_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbitcoin_store::{read_run_body, Store};
+    use rbitcoin_store::{read_run_body, write_sorted_run, Store};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1848,6 +1896,36 @@ mod tests {
         assert_eq!((_s0, f0), (sh_a, Fk(1)));
         assert_eq!((_s1, f1), (sh_a, Fk(3)));
         assert_eq!((_s2, f2), (sh_b, Fk(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_creates_catalog_concurrent_unique_seqs() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-spill-conc-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        std::thread::scope(|scope| {
+            for i in 0..4u8 {
+                let b = &b;
+                scope.spawn(move || {
+                    let mut sh = [0u8; 32];
+                    sh[0] = i.saturating_add(1);
+                    let mut creates = vec![ScriptHashRecord::from_fk(sh, Fk(u64::from(i) + 1))];
+                    b.spill_creates_catalog(&mut creates).unwrap();
+                });
+            }
+        });
+        let runs = list_runs(&dir.join("scripthash.runs")).unwrap();
+        assert_eq!(runs.len(), 4, "each worker must land a catalog run");
+        let mut seqs: Vec<u64> = runs.iter().filter_map(|r| r.seq()).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 4, "seqs must be unique: {seqs:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2149,6 +2227,40 @@ mod tests {
             50 * 1024 * 1024,
             64 * 1024 * 1024
         ));
+    }
+
+    #[test]
+    fn recollect_spill_bytes_parse_clamps() {
+        assert_eq!(
+            parse_recollect_spill_bytes(None),
+            RECOLLECT_THREAD_SPILL_BYTES
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("not-a-number")),
+            RECOLLECT_THREAD_SPILL_BYTES
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("1")),
+            16 * 1024 * 1024,
+            "below 16MiB clamps up"
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("999999999999")),
+            512 * 1024 * 1024,
+            "above 512MiB clamps down"
+        );
+        assert_eq!(
+            parse_recollect_spill_bytes(Some("268435456")),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            catalog_compact_floor_bytes(RECOLLECT_THREAD_SPILL_BYTES),
+            CATALOG_COMPACT_FLOOR_BYTES
+        );
+        assert_eq!(
+            catalog_compact_floor_bytes(256 * 1024 * 1024),
+            192 * 1024 * 1024
+        );
     }
 
     #[test]

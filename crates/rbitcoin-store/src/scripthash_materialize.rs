@@ -6,7 +6,7 @@
 use crate::error::StoreError;
 use crate::file::ensure_nofile_budget_at_least;
 use crate::scripthash::{ColdProgress, ScriptHashTable, ShBodyLayout, ShShardPack};
-use crate::sorted_run::{for_each_merged_rec_shard, shard_record_starts, SortedRunPath};
+use crate::sorted_run::{for_each_merged_rec_shard, SortedRunPath};
 use rbitcoin_primitives::Fk;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -28,6 +28,10 @@ struct MaterializeProgress {
     keys_packed: AtomicU64,
     shards_published: AtomicU32,
     creates_published: AtomicU64,
+    merge_ns: AtomicU64,
+    pack_ns: AtomicU64,
+    mphf_ns: AtomicU64,
+    body_flush_ns: AtomicU64,
     stop: AtomicBool,
     complete: AtomicBool,
     wake: Condvar,
@@ -49,6 +53,10 @@ impl MaterializeProgress {
             keys_packed: AtomicU64::new(0),
             shards_published: AtomicU32::new(0),
             creates_published: AtomicU64::new(0),
+            merge_ns: AtomicU64::new(0),
+            pack_ns: AtomicU64::new(0),
+            mphf_ns: AtomicU64::new(0),
+            body_flush_ns: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             complete: AtomicBool::new(false),
             wake: Condvar::new(),
@@ -72,6 +80,15 @@ impl MaterializeProgress {
             pending: creates.saturating_sub(published),
             shards: self.shards_published.load(Ordering::Relaxed),
             pct,
+        }
+    }
+
+    fn stages(&self) -> MaterializeStageNs {
+        MaterializeStageNs {
+            merge_ns: self.merge_ns.load(Ordering::Relaxed),
+            pack_ns: self.pack_ns.load(Ordering::Relaxed),
+            mphf_ns: self.mphf_ns.load(Ordering::Relaxed),
+            body_flush_ns: self.body_flush_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -108,14 +125,37 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// CPU-summed stage times for [`materialize_sh_shards`] (parallel workers add).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MaterializeStageNs {
+    pub merge_ns: u64,
+    pub pack_ns: u64,
+    pub mphf_ns: u64,
+    pub body_flush_ns: u64,
+}
+
 /// Result of [`materialize_sh_shards`].
 #[derive(Debug, Clone, Copy)]
 pub struct ShShardMaterialize {
     pub creates: u64,
     pub keys: u64,
     pub max_fk: u64,
+    pub merge_ns: u64,
+    pub pack_ns: u64,
+    pub mphf_ns: u64,
     pub body_flush_ns: u64,
     pub head_fill_ns: u64,
+}
+
+impl ShShardMaterialize {
+    fn with_stages(mut self, stages: MaterializeStageNs) -> Self {
+        self.merge_ns = stages.merge_ns;
+        self.pack_ns = stages.pack_ns;
+        self.mphf_ns = stages.mphf_ns;
+        self.body_flush_ns = stages.body_flush_ns;
+        self.head_fill_ns = stages.mphf_ns;
+        self
+    }
 }
 
 fn decode_sh_run_rec(rec: &[u8]) -> Result<([u8; 32], Fk), StoreError> {
@@ -165,6 +205,8 @@ fn pack_shard(
     progress: &MaterializeProgress,
 ) -> Result<ShShardPack, StoreError> {
     let mut session = table.pack_shard_session(shard)?;
+    let mut pack_ns = 0u64;
+    let t_merge = Instant::now();
     for_each_merged_rec_shard(inputs, cuts, shard, false, |rec| {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
             return Err(StoreError::Cancelled("scripthash shard pack"));
@@ -173,11 +215,21 @@ fn pack_shard(
         if fk.is_null() {
             return Ok(());
         }
+        let t_pack = Instant::now();
         session.push_sorted_fk(sh, fk)?;
+        pack_ns = pack_ns.saturating_add(t_pack.elapsed().as_nanos() as u64);
         progress.recs_packed.fetch_add(1, Ordering::Relaxed);
         Ok(())
     })?;
+    let merge_wall = t_merge.elapsed().as_nanos() as u64;
+    progress
+        .merge_ns
+        .fetch_add(merge_wall.saturating_sub(pack_ns), Ordering::Relaxed);
+    progress.pack_ns.fetch_add(pack_ns, Ordering::Relaxed);
     let pack = session.finish_pack()?;
+    progress
+        .body_flush_ns
+        .fetch_add(pack.body_flush_ns, Ordering::Relaxed);
     progress.keys_packed.fetch_add(pack.keys, Ordering::Relaxed);
     Ok(pack)
 }
@@ -191,7 +243,11 @@ fn seal_shard(
 ) -> Result<(), StoreError> {
     max_fk.fetch_max(pack.max_fk, Ordering::Relaxed);
     let creates = pack.creates;
+    let t_mphf = Instant::now();
     let bump = table.publish_packed_shard(shard, pack)?;
+    progress
+        .mphf_ns
+        .fetch_add(t_mphf.elapsed().as_nanos() as u64, Ordering::Relaxed);
     progress
         .creates_published
         .fetch_add(creates, Ordering::Relaxed);
@@ -236,14 +292,14 @@ pub fn materialize_sh_shards(
             creates: table.entry_count(),
             keys: 0,
             max_fk: 0,
+            merge_ns: 0,
+            pack_ns: 0,
+            mphf_ns: 0,
             body_flush_ns: 0,
             head_fill_ns: 0,
         });
     }
-    let cuts: Vec<Vec<u64>> = inputs
-        .iter()
-        .map(|r| shard_record_starts(r, n_shards))
-        .collect::<Result<Vec<_>, _>>()?;
+    let cuts = crate::sorted_run::shard_record_starts_many(inputs, n_shards)?;
     let workers = resolve_workers(workers, jobs.len(), inputs.len(), table.body_layout());
     rbitcoin_log::info!(
         "store: scripthash shard-kway start resume_from={resume_from} n_shards={n_shards} \
@@ -362,9 +418,13 @@ pub fn materialize_sh_shards(
             creates: progress.creates_published.load(Ordering::Relaxed),
             keys: progress.keys_packed.load(Ordering::Relaxed),
             max_fk: max_fk.load(Ordering::Relaxed),
+            merge_ns: 0,
+            pack_ns: 0,
+            mphf_ns: 0,
             body_flush_ns: 0,
-            head_fill_ns: t0.elapsed().as_nanos() as u64,
-        })
+            head_fill_ns: 0,
+        }
+        .with_stages(progress.stages()))
     })?;
     Ok(out)
 }
@@ -418,5 +478,61 @@ mod tests {
         let mut last = None;
         log_materialize_status(&mut last, &s, 64, Instant::now());
         assert!(last.is_some());
+    }
+
+    #[test]
+    fn materialize_stage_ns_are_populated() {
+        crate::hashhead::HeadScale::test_with(crate::hashhead::HeadScale::Tiny, || {
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-sh-stage-ns-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let runs_dir = dir.join("runs");
+            std::fs::create_dir_all(&runs_dir).unwrap();
+            let rec = |sh0: u8, fk: u64| {
+                let mut r = [0u8; 40];
+                r[0] = sh0;
+                r[32..40].copy_from_slice(&fk.to_le_bytes());
+                r
+            };
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for i in 0..8u64 {
+                let body = rec((i as u8) * 16, i + 1);
+                if i % 2 == 0 {
+                    a.extend_from_slice(&body);
+                } else {
+                    b.extend_from_slice(&body);
+                }
+            }
+            crate::sorted_run::write_sorted_run(&runs_dir.join("000001.run"), 40, 40, &a).unwrap();
+            crate::sorted_run::write_sorted_run(&runs_dir.join("000002.run"), 40, 40, &b).unwrap();
+            let inputs = [
+                crate::sorted_run::open_run(&runs_dir.join("000001.run")).unwrap(),
+                crate::sorted_run::open_run(&runs_dir.join("000002.run")).unwrap(),
+            ];
+            let table = crate::scripthash::ScriptHashTable::create(&dir).unwrap();
+            let mat = materialize_sh_shards(&table, &inputs, 0, 1, None).unwrap();
+            assert!(mat.creates >= 8);
+            assert!(
+                mat.merge_ns
+                    .saturating_add(mat.pack_ns)
+                    .saturating_add(mat.mphf_ns)
+                    .saturating_add(mat.body_flush_ns)
+                    > 0,
+                "stage ns must be real merge={} pack={} mphf={} body={}",
+                mat.merge_ns,
+                mat.pack_ns,
+                mat.mphf_ns,
+                mat.body_flush_ns
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

@@ -1623,6 +1623,52 @@ fn inwit_and_txout_secret_xor_roundtrip() {
 }
 
 #[test]
+fn visit_packed_script_hashes_matches_full_decode() {
+    let secret = crate::store_secret::StoreSecret::from_bytes([0x3cu8; 32]);
+    let tx = TxRecord {
+        txid: [9u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 3,
+    };
+    let inputs = vec![InputRecord {
+        prev_txid: [0u8; 32],
+        create_fk: Fk::NULL,
+        prev_index: u32::MAX,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let outputs = vec![
+        OutputRecord::unspent(50, vec![0x51]),
+        OutputRecord::unspent(25, vec![0x00, 0x14, 0xaa]),
+        OutputRecord::unspent(1, {
+            let mut s = vec![0x51, 0x20];
+            s.extend_from_slice(&[0xbb; 32]);
+            s
+        }),
+    ];
+    let mut raw = Vec::new();
+    encode_packed_tx_with_secret(&tx, &inputs, &outputs, &mut raw, Some(&secret));
+    let (_, decoded, _) =
+        decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(&secret)).unwrap();
+    let expect: Vec<[u8; 32]> = decoded
+        .iter()
+        .map(|o| crate::scripthash::script_hash(&o.script))
+        .collect();
+    let mut got = Vec::new();
+    visit_packed_script_hashes(&raw, Some(&secret), |h| {
+        got.push(h);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(got, expect);
+}
+
+#[test]
 fn short_or_truncated_packed_body_rejected() {
     assert!(!is_packed_tx_payload(&[]));
     assert!(!is_packed_tx_payload(&[0u8; 15]));

@@ -33,6 +33,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
 | `RBITCOIN_SH_RECOLLECT_WORKERS` | default | SH recollect parallelism |
+| `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` | 128 MiB | Recollect per-worker spill (clamp 16–512 MiB); compact floor is 3/4 of this |
 | `RBITCOIN_SH_MAX_DIRECT_MERGE` | default | SH direct-merge cap |
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | default | SH run target size |
 | `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |

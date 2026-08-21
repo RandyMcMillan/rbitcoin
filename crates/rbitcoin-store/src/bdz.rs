@@ -446,15 +446,27 @@ fn stream_g_pages(
 }
 
 fn try_peel(keys: &[u64], seed: u64, m: u32, n: u32) -> Option<Vec<u32>> {
+    let m_us = m as usize;
     let mut edges = vec![[0u32; 3]; keys.len()];
-    let mut deg = vec![0u32; m as usize];
-    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); m as usize];
+    let mut deg = vec![0u32; m_us];
     for (i, &k) in keys.iter().enumerate() {
         let h = hash3(k, seed, m);
         edges[i] = h;
         for v in h {
             deg[v as usize] = deg[v as usize].saturating_add(1);
-            adj[v as usize].push(i as u32);
+        }
+    }
+    let mut off = vec![0u32; m_us + 1];
+    for i in 0..m_us {
+        off[i + 1] = off[i].saturating_add(deg[i]);
+    }
+    let mut adj = vec![0u32; off[m_us] as usize];
+    let mut wr = off[..m_us].to_vec();
+    for (i, h) in edges.iter().enumerate() {
+        for &v in h {
+            let slot = wr[v as usize] as usize;
+            adj[slot] = i as u32;
+            wr[v as usize] = wr[v as usize].saturating_add(1);
         }
     }
     let mut live = vec![true; keys.len()];
@@ -472,7 +484,9 @@ fn try_peel(keys: &[u64], seed: u64, m: u32, n: u32) -> Option<Vec<u32>> {
         if deg[v as usize] != 1 {
             continue;
         }
-        let Some(&ei) = adj[v as usize].iter().find(|&&e| live[e as usize]) else {
+        let lo = off[v as usize] as usize;
+        let hi = off[v as usize + 1] as usize;
+        let Some(&ei) = adj[lo..hi].iter().find(|&&e| live[e as usize]) else {
             continue;
         };
         live[ei as usize] = false;
@@ -524,6 +538,22 @@ mod tests {
         assert!(seen.iter().all(|&b| b));
         let miss = f.index(0xDEAD_BEEF_u64).unwrap();
         assert!(miss < keys.len() as u32);
+    }
+
+    #[test]
+    fn bdz_injective_2k() {
+        let keys: Vec<u64> = (0..2_000u64)
+            .map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11))
+            .collect();
+        let f = BdzMphf::build(&keys).unwrap();
+        let mut seen = vec![false; keys.len()];
+        for &k in &keys {
+            let i = f.index(k).unwrap() as usize;
+            assert!(i < keys.len());
+            assert!(!seen[i], "collision at {i}");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|&b| b));
     }
 
     #[test]

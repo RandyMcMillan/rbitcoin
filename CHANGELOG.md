@@ -9,6 +9,16 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **SH recollect / tip materialize:** catalog spill writes outside `runs_io`,
+  a bounded writer queue overlaps Class A scan with catalog fsync, pack
+  reuses one FK scratch, and BDZ peel uses CSR adjacency (same `BdzMphf::build`
+  for SH and `tx.head`). Stage timers (`merge`/`pack`/`mphf`/`body_flush`)
+  are real. Catalog and SH head bytes are unchanged.
+  `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` overrides the 128 MiB default
+  (16–512 MiB).
+
 ### Fixed
 
 - **SH materialize last page:** megakey chunking sizes the last extent page

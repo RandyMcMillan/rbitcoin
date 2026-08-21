@@ -400,6 +400,18 @@ pub fn write_sorted_run(
     Ok(run)
 }
 
+/// Insert an already-written `{seq:06}.run` into the parent [`MANIFEST`].
+///
+/// Pair with [`write_sorted_run_file_with_policy`] so the body write can run
+/// without holding the catalog mutex. Callers serialize this against other
+/// MANIFEST writers.
+pub fn commit_run_to_catalog(run: &SortedRunPath) -> Result<(), StoreError> {
+    let Some(dir) = run.path.parent() else {
+        return Ok(());
+    };
+    manifest_insert(dir, run)
+}
+
 /// Write run file only (no MANIFEST) with an explicit policy.
 ///
 /// L0 spills use [`RunWritePolicy::L0`]; catalog merge internals use
@@ -1258,6 +1270,35 @@ pub fn shard_record_starts(run: &SortedRunPath, n_shards: usize) -> Result<Vec<u
         starts[s] = lo;
     }
     Ok(starts)
+}
+
+/// [`shard_record_starts`] for each run, in input order (parallel over runs).
+pub fn shard_record_starts_many(
+    runs: &[SortedRunPath],
+    n_shards: usize,
+) -> Result<Vec<Vec<u64>>, StoreError> {
+    if runs.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(runs.len());
+        for run in runs {
+            joins.push(scope.spawn(move || shard_record_starts(run, n_shards)));
+        }
+        let mut out = Vec::with_capacity(joins.len());
+        for j in joins {
+            match j.join() {
+                Ok(Ok(starts)) => out.push(starts),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(StoreError::Corrupt(
+                        "scripthash shard_record_starts worker panicked",
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// Stream k-way merge of sorted runs, invoking `on_rec` for each record in key order.
@@ -3041,6 +3082,29 @@ mod tests {
     }
 
     #[test]
+    fn shard_record_starts_many_matches_serial() {
+        let d = tmp_dir();
+        let mut runs = Vec::new();
+        for seq in 1..=4u64 {
+            let mut body = Vec::new();
+            for i in 0..8u8 {
+                let sh0 = i.wrapping_mul(32).saturating_add(seq as u8);
+                body.extend_from_slice(&sh_rec(sh0, seq * 10 + u64::from(i)));
+            }
+            runs.push(write_sorted_run(&next_run_path(&d, seq), 40, 40, &body).unwrap());
+        }
+        let serial: Vec<Vec<u64>> = runs
+            .iter()
+            .map(|r| super::shard_record_starts(r, 4).unwrap())
+            .collect();
+        let parallel = super::shard_record_starts_many(&runs, 4).unwrap();
+        assert_eq!(parallel, serial);
+        let one = super::shard_record_starts_many(&runs[..1], 4).unwrap();
+        assert_eq!(one, serial[..1]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn run_cursor_range() {
         let d = tmp_dir();
         let mut body = Vec::new();
@@ -3326,6 +3390,22 @@ mod tests {
         assert!(RunWritePolicy::IBD_BACKGROUND.pace);
         assert!(RunWritePolicy::CATALOG.durable);
         assert!(RunWritePolicy::IBD_BACKGROUND.durable);
+    }
+
+    #[test]
+    fn commit_run_to_catalog_inserts_file_only_write() {
+        let d = tmp_dir();
+        let path = next_run_path(&d, 1);
+        let mut rec = [0u8; 40];
+        rec[0] = 1;
+        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let run = write_sorted_run_file_with_policy(&path, 40, 40, &rec, RunWritePolicy::CATALOG)
+            .unwrap();
+        commit_run_to_catalog(&run).unwrap();
+        let listed = list_runs(&d).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].seq(), Some(1));
+        assert_eq!(listed[0].count, 1);
     }
 
     /// L0 spills must be readable without fsync; max create_fk tracked during merge

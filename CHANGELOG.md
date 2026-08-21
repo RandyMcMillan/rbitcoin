@@ -60,6 +60,20 @@ before 1.0).
 
 ### Changed
 
+- **Quality reaudit (2026-08-21).** [`docs/quality.md`](docs/quality.md)
+  refreshed against #177: schema **19**, Core functional **44/267**,
+  confirm no-coord / park / head-drain and SH last-page extent called
+  Completed. Open ranking unchanged (Q-30 fuzz still rank 1). Won't-fix
+  adds headerless SH interiors, script coordinators, flattening uring
+  machines, process pin FIFO, and `rbitcoin-bench` in required CI.
+
+- **Quality cheap wins:** confirm queue owner docs match **14/4/14**.
+  **Q-34** first hour is [`OPERATOR.md`](OPERATOR.md) (regtest mine →
+  Electrum → Esplora). **Q-36** default INFO is `ibd: progress`;
+  `ibd: perf` / `ibd: sizes` are DEBUG. **Q-50** closed (named `other=`
+  residual). Inline tests moved out of `peer.rs` / `methods.rs` /
+  `scripthash.rs`. Dead `ConfirmEvent::BodyMissing` removed.
+
 - **tx.head drain thread:** confirm write-behind insert runs on a process-wide
   `ibd-confirm-head` OS thread overlapping structural + Class C, instead of a
   per-batch `thread::scope` spawn.

@@ -429,10 +429,6 @@ pub async fn ibd_cancellable(
                     st.max_ready_height = st.max_ready_height.max(tip);
                     max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                 }
-                ConfirmEvent::BodyMissing { hash } => {
-                    st.body.demote_known(hash);
-                    st.body.mark_missing(hash);
-                }
                 ConfirmEvent::Reject {
                     height,
                     hash,
@@ -528,10 +524,6 @@ pub async fn ibd_cancellable(
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                     st.max_ready_height = st.max_ready_height.max(tip);
                     max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
-                }
-                ConfirmEvent::BodyMissing { hash } => {
-                    st.body.demote_known(hash);
-                    st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject {
                     height,
@@ -1046,10 +1038,6 @@ pub async fn ibd_cancellable(
                             archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                             st.max_ready_height = st.max_ready_height.max(tip);
                             max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
-                        }
-                        ConfirmEvent::BodyMissing { hash } => {
-                            st.body.demote_known(hash);
-                            st.body.mark_missing(hash);
                         }
                         ConfirmEvent::Reject {
                             height,

@@ -67,6 +67,25 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    static CAPTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CAPTURED: std::cell::RefCell<Vec<(Level, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record [`log_at`] lines on this thread until [`take_logs`]. Off in production.
+pub fn capture_logs(on: bool) {
+    CAPTURE.with(|c| c.set(on));
+    if !on {
+        let _ = take_logs();
+    }
+}
+
+/// Drain lines recorded after [`capture_logs`]`(true)`.
+pub fn take_logs() -> Vec<(Level, String)> {
+    CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 #[cfg(test)]
 fn take_last_log_record(level: Level, args: fmt::Arguments<'_>) {
     LAST_LOG.with(|c| *c.borrow_mut() = Some((level, args.to_string())));
@@ -197,6 +216,9 @@ pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
 pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     #[cfg(test)]
     take_last_log_record(level, args);
+    if CAPTURE.with(|c| c.get()) {
+        CAPTURED.with(|c| c.borrow_mut().push((level, args.to_string())));
+    }
     if !enabled(level) {
         return;
     }
@@ -329,6 +351,27 @@ mod tests {
         log_at(Level::Error, format_args!("shown {}", 1));
         log_at_style(Level::Error, Style::Bold, format_args!("bold shown"));
         init(Level::Info);
+    }
+
+    #[test]
+    fn capture_logs_records_level_even_when_disabled() {
+        capture_logs(true);
+        init_off();
+        info!("ibd: sizes hidden-at-off");
+        debug!("ibd: perf meters");
+        let logs = take_logs();
+        capture_logs(false);
+        init(Level::Info);
+        assert!(
+            logs.iter()
+                .any(|(l, m)| *l == Level::Info && m.contains("ibd: sizes")),
+            "{logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|(l, m)| *l == Level::Debug && m.contains("ibd: perf")),
+            "{logs:?}"
+        );
     }
 
     #[test]

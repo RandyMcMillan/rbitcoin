@@ -45,7 +45,7 @@ for signet/mainnet sync. **Not** CLI.
 
 | Former env | Production default |
 |------------|--------------------|
-| Confirm `scriptq` / `writeq` | 4 / 20 (`ready=` is not a cap) |
+| Confirm `loadq` / `scriptq` / `writeq` | 14 / 4 / 14 (`ready=` is not a cap) |
 | `RBITCOIN_CONFIRM_BATCH_INPUTS` | 8000 soft inputs/pack |
 | Per-path IO (`PIN_IO`, `HEAD_RESOLVE_IO`, `SPEND_META`, `SPEND_ANN`, `CLASS_C_IO`) | Follow **`RBITCOIN_IO` only** (strings deleted) |
 | `RBITCOIN_FD_APPEND` | Never read (deleted) |

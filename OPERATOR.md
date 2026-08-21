@@ -59,6 +59,47 @@ create/open/grow use positional `ReadFile`/`WriteFile` +
 Default `--datadir` is cwd-relative `datadir` via `Path::new(".").join("datadir")`
 (`./datadir` on Unix, `.\datadir` on Windows).
 
+## First hour (regtest)
+
+One loop: mine a block, one Electrum RPC, one Esplora GET. This is **regtest**,
+not validated mainnet (default mainnet `--milestone` skips historical scripts).
+Signet/mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+
+Electrum and Esplora **require `--shindex`**. JSON-RPC is only there so
+`rbitcoin-cli` can mine.
+
+```bash
+./target/release/rbitcoin-node \
+  --datadir /tmp/rb-hour \
+  --network regtest \
+  --no-seeds \
+  --shindex \
+  --rpc-listen 127.0.0.1:18443 \
+  --electrum-listen 127.0.0.1:50001 \
+  --esplora-listen 127.0.0.1:3000
+```
+
+In another terminal (cookie at `/tmp/rb-hour/.cookie`):
+
+```bash
+./target/release/rbitcoin-cli --datadir /tmp/rb-hour --rpcport 18443 \
+  generatetodescriptor 1 'raw(51)'
+
+python3 - <<'PY'
+import json, socket
+s = socket.create_connection(("127.0.0.1", 50001))
+req = json.dumps({"id": 1, "method": "server.version", "params": ["rbitcoin-hour", "1.4"]}) + "\n"
+s.sendall(req.encode())
+print(s.recv(4096).decode())
+PY
+
+curl -s http://127.0.0.1:3000/blocks/tip/height
+```
+
+Expect: a generated block hash list, an Electrum `server.version` result, and
+`1` from Esplora (tip height after the generate). More Electrum/Esplora surface:
+sections below and [`COMPAT.md`](./COMPAT.md).
+
 ## CLI (operator-first)
 
 Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
@@ -162,18 +203,18 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 | `received getdata for: wtx` | TRACE | One line per peer `MSG_WTX` getdata (Core `p2p_blocksonly` needle; counts are on `tip: perf`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
-Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: perf` instead. Enable `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
+Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` / `ibd: sizes` / `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
 
 ### IBD status lines (every ~5s)
 
 | Line | Level | Use |
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window at tip rate) |
-| `ibd: perf` | INFO | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread (leftover TipOnly is `stamp=`). **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`lookup_thr keep=`** is live-union splice. **`pin_txid=`** vs leftover `tx.head` |
-| `ibd: sizes` | INFO | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
+| `ibd: perf` | DEBUG | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread (leftover TipOnly is `stamp=`). **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`lookup_thr keep=`** is live-union splice. **`pin_txid=`** vs leftover `tx.head` |
+| `ibd: sizes` | DEBUG | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
 | `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit** |
 
-At **info**, progress + perf already expose load/write bottlenecks (schema 16). Enable **debug** for plan-batch / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
+Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / perf_dbg from the same sample. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
 
 `pin_txid%` is stamp `txid→create_fk` from the published `live_union` chain vs leftover `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 

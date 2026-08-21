@@ -89,7 +89,7 @@ known retain structures:
 | `work` / `body` | IBD maps + body-presence sets |
 | `bq soft=n/win RAM=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB (**raw only**) |
 | `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
-| `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap 8) + pipeline-wide `parents=` + feed ready/inflight |
+| `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap **14**) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
 | `heap … iflight= pstore= recent= union= h2h= fence= sh_mt= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB`; one published Arc + overlay + fifo) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |

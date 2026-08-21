@@ -507,6 +507,38 @@ pub(super) fn create_fks_from_header_ranges(
 pub mod plan_stamp_sub_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(test)]
+    mod exclusive {
+        use std::cell::Cell;
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        thread_local! {
+            static HELD: Cell<bool> = const { Cell::new(false) };
+        }
+        pub fn with<R>(f: impl FnOnce() -> R) -> R {
+            if HELD.with(Cell::get) {
+                return f();
+            }
+            let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            HELD.with(|h| h.set(true));
+            let r = f();
+            HELD.with(|h| h.set(false));
+            r
+        }
+    }
+    #[cfg(not(test))]
+    mod exclusive {
+        #[inline]
+        pub fn with<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_exclusive<R>(f: impl FnOnce() -> R) -> R {
+        exclusive::with(f)
+    }
+
     static STRUCT_NS: AtomicU64 = AtomicU64::new(0);
     static STRUCT_TXID_NS: AtomicU64 = AtomicU64::new(0);
     static STRUCT_WTXID_NS: AtomicU64 = AtomicU64::new(0);
@@ -517,30 +549,34 @@ pub mod plan_stamp_sub_stats {
 
     /// Split of [`validate_block_structure_hashed`]: txid encode, wtxid encode, other walks.
     pub fn note_struct_parts(txid_ns: u64, wtxid_ns: u64, walk_ns: u64) {
-        if txid_ns > 0 {
-            STRUCT_TXID_NS.fetch_add(txid_ns, Ordering::Relaxed);
-        }
-        if wtxid_ns > 0 {
-            STRUCT_WTXID_NS.fetch_add(wtxid_ns, Ordering::Relaxed);
-        }
-        if walk_ns > 0 {
-            STRUCT_WALK_NS.fetch_add(walk_ns, Ordering::Relaxed);
-        }
+        exclusive::with(|| {
+            if txid_ns > 0 {
+                STRUCT_TXID_NS.fetch_add(txid_ns, Ordering::Relaxed);
+            }
+            if wtxid_ns > 0 {
+                STRUCT_WTXID_NS.fetch_add(wtxid_ns, Ordering::Relaxed);
+            }
+            if walk_ns > 0 {
+                STRUCT_WALK_NS.fetch_add(walk_ns, Ordering::Relaxed);
+            }
+        });
     }
 
     pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, batch_ns: u64) {
-        if struct_ns > 0 {
-            STRUCT_NS.fetch_add(struct_ns, Ordering::Relaxed);
-        }
-        if prepare_ns > 0 {
-            PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
-        }
-        if filter_ns > 0 {
-            FILTER_NS.fetch_add(filter_ns, Ordering::Relaxed);
-        }
-        if batch_ns > 0 {
-            BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
-        }
+        exclusive::with(|| {
+            if struct_ns > 0 {
+                STRUCT_NS.fetch_add(struct_ns, Ordering::Relaxed);
+            }
+            if prepare_ns > 0 {
+                PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
+            }
+            if filter_ns > 0 {
+                FILTER_NS.fetch_add(filter_ns, Ordering::Relaxed);
+            }
+            if batch_ns > 0 {
+                BATCH_NS.fetch_add(batch_ns, Ordering::Relaxed);
+            }
+        });
     }
 
     #[derive(Debug, Default, Clone, Copy)]
@@ -555,7 +591,7 @@ pub mod plan_stamp_sub_stats {
     }
 
     pub fn sample_and_reset() -> Sample {
-        Sample {
+        exclusive::with(|| Sample {
             struct_ns: STRUCT_NS.swap(0, Ordering::Relaxed),
             struct_txid_ns: STRUCT_TXID_NS.swap(0, Ordering::Relaxed),
             struct_wtxid_ns: STRUCT_WTXID_NS.swap(0, Ordering::Relaxed),
@@ -563,7 +599,7 @@ pub mod plan_stamp_sub_stats {
             prepare_ns: PREPARE_NS.swap(0, Ordering::Relaxed),
             filter_ns: FILTER_NS.swap(0, Ordering::Relaxed),
             batch_ns: BATCH_NS.swap(0, Ordering::Relaxed),
-        }
+        })
     }
 }
 

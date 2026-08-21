@@ -6,14 +6,15 @@
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, loadq=/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
-//! | INFO  | `ibd: perf …` | Download + in-RAM body-queue soft depth; **load_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
-//! | INFO  | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
+//! | DEBUG | `ibd: perf …` | Download + in-RAM body-queue soft depth; **load_budget** + pin cold_range/idx us/new + assemble us/in path splits; queues |
+//! | DEBUG | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_batch head resolve; class_a commit |
 //!
 //! **Pins:** pipeline-local (plan batch_pin / BatchParents).
 //!
-//! Sample **once** per tick and reset all atomics, then format INFO always and
-//! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
+//! Sample **once** per tick and reset all atomics, then format `ibd: progress`
+//! at INFO and meters (`perf` / `sizes` / `perf_dbg`) at DEBUG from the same
+//! sample.
 //!
 //! Unified path: peer → **body queue** → confirm **lookup** (stamp) → **load**
 //! (pin+assemble) → **scripts** → **write** (sole Class A append + Class C / spends / tip).
@@ -45,7 +46,7 @@
 use super::confirm::ConfirmPipelineSizes;
 use super::state::WorkStructureSizes;
 use super::status::LoopStats;
-use rbitcoin_log::{debug, enabled, info, Level};
+use rbitcoin_log::{debug, enabled, Level};
 use rbitcoin_query::ProcessOwnedSizes;
 
 /// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
@@ -1192,7 +1193,7 @@ fn write_stage_ms(s: &IbdPerfSample) -> u64 {
     s.write.stage_ms()
 }
 
-/// Stable INFO line for production grepping (unified load→scripts→write).
+/// Stable DEBUG meter line (unified load→scripts→write).
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let write_ms = write_stage_ms(s);
@@ -1939,10 +1940,10 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     )
 }
 
-/// Emit consolidated INFO (+ DEBUG if enabled). Single stderr flush at end.
+/// Emit meters at DEBUG (`ibd: progress` is a separate INFO tick).
 pub(crate) fn log_sample(s: &IbdPerfSample) {
-    info!("{}", format_info(s));
-    info!("{}", format_sizes(s));
+    debug!("{}", format_info(s));
+    debug!("{}", format_sizes(s));
     if enabled(Level::Debug) {
         debug!("{}", format_debug(s));
     }
@@ -2023,6 +2024,22 @@ mod tests {
         s.write.cache_tip_ms = 5;
         // 15+2+50+40+100+25+80+5 = 317
         assert_eq!(write_stage_ms(&s), 317);
+    }
+
+    #[test]
+    fn log_sample_perf_and_sizes_are_debug() {
+        rbitcoin_log::capture_logs(true);
+        log_sample(&IbdPerfSample::default());
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let meters: Vec<_> = logs
+            .iter()
+            .filter(|(_, m)| m.starts_with("ibd: perf ") || m.starts_with("ibd: sizes "))
+            .collect();
+        assert_eq!(meters.len(), 2, "{logs:?}");
+        for (level, msg) in &meters {
+            assert_eq!(*level, Level::Debug, "{level:?} {msg}");
+        }
     }
 
     #[test]

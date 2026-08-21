@@ -510,6 +510,10 @@ pub fn sh_page_count_for_entries(n: usize) -> usize {
 }
 
 /// Split strictly increasing FKs into page-sized delta-stream chunks.
+///
+/// Intermediate pages use [`SH_PAGE_STREAM_MAX`] (`ver=1`). The last chunk is
+/// sized for [`SH_PAGE_EXTENT_STREAM_MAX`] so `ver=2` extent packing cannot
+/// overflow the 16 B extra header.
 pub fn sh_page_chunk_ranges(fks: &[Fk]) -> Result<Vec<(usize, usize)>, StoreError> {
     if fks.is_empty() {
         return Ok(Vec::new());
@@ -533,7 +537,39 @@ pub fn sh_page_chunk_ranges(fks: &[Fk]) -> Result<Vec<(usize, usize)>, StoreErro
         }
     }
     out.push((start, fks.len()));
+    split_last_chunk_for_extent(fks, &mut out);
     Ok(out)
+}
+
+fn split_last_chunk_for_extent(fks: &[Fk], chunks: &mut Vec<(usize, usize)>) {
+    loop {
+        let Some(&(start, end)) = chunks.last() else {
+            return;
+        };
+        if start >= end {
+            return;
+        }
+        let mut used = 0usize;
+        let mut split = end;
+        for i in start..end {
+            let add = if i == start {
+                uleb128_len(fks[i].0)
+            } else {
+                uleb128_len(fks[i].0.saturating_sub(fks[i - 1].0))
+            };
+            if i > start && used + add > SH_PAGE_EXTENT_STREAM_MAX {
+                split = i;
+                break;
+            }
+            used += add;
+        }
+        if split == end {
+            return;
+        }
+        chunks.pop();
+        chunks.push((start, split));
+        chunks.push((split, end));
+    }
 }
 
 /// Pack up to [`SH_PAGE_FK_CAP`] **strictly increasing** entries into a fresh page
@@ -799,6 +835,38 @@ mod tests {
         assert_eq!(sh_page_next(&tailed).unwrap(), 12288);
         assert_eq!(sh_page_extent(&tailed).unwrap(), Some((4096, 2)));
         assert!(!sh_page_is_last(&tailed).unwrap());
+    }
+
+    /// Sequential 1-byte deltas of length `STREAM_MAX` fit `ver=1` but not `ver=2`
+    /// (16 B extra extent header). Chunking must leave the last page ≤ extent cap
+    /// so cold materialize `pack_extent_last` cannot overflow.
+    #[test]
+    fn chunk_ranges_last_page_fits_extent_header() {
+        let n = SH_PAGE_EXTENT_STREAM_MAX + 8;
+        assert!(n <= SH_PAGE_STREAM_MAX);
+        let fks: Vec<Fk> = (1..=n as u64).map(Fk).collect();
+        assert!(n > SH_PAGE_EXTENT_STREAM_MAX);
+        let chunks = sh_page_chunk_ranges(&fks).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "last page must split so ver=2 header fits, got {chunks:?}"
+        );
+        let ents: Vec<_> = fks.iter().map(|&fk| ShEntry::new(fk)).collect();
+        let n_pages = chunks.len() as u32;
+        let mut got = Vec::new();
+        for (pi, &(start, end)) in chunks.iter().enumerate() {
+            let mut page = [0u8; SH_PAGE_SIZE];
+            if pi + 1 == chunks.len() {
+                sh_page_pack_extent_last(&mut page, &ents[start..end], 4096, n_pages, 0)
+                    .expect("last chunk must pack as ver=2");
+                assert_eq!(sh_page_extent(&page).unwrap(), Some((4096, n_pages)));
+            } else {
+                let next = 4096 + ((pi as u64) + 1) * (SH_PAGE_SIZE as u64);
+                sh_page_pack(&mut page, &ents[start..end], next).unwrap();
+            }
+            got.extend(sh_page_entries(&page).unwrap());
+        }
+        assert_eq!(got, ents);
     }
 
     #[test]

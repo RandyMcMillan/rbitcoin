@@ -6,7 +6,7 @@
 use crate::error::StoreError;
 use crate::file::ensure_nofile_budget_at_least;
 use crate::scripthash::{ColdProgress, ScriptHashTable, ShBodyLayout, ShShardPack};
-use crate::sorted_run::{for_each_merged_rec_shard, shard_record_starts, SortedRunPath};
+use crate::sorted_run::{for_each_merged_rec_shard, SortedRunPath};
 use rbitcoin_primitives::Fk;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -299,10 +299,7 @@ pub fn materialize_sh_shards(
             head_fill_ns: 0,
         });
     }
-    let cuts: Vec<Vec<u64>> = inputs
-        .iter()
-        .map(|r| shard_record_starts(r, n_shards))
-        .collect::<Result<Vec<_>, _>>()?;
+    let cuts = crate::sorted_run::shard_record_starts_many(inputs, n_shards)?;
     let workers = resolve_workers(workers, jobs.len(), inputs.len(), table.body_layout());
     rbitcoin_log::info!(
         "store: scripthash shard-kway start resume_from={resume_from} n_shards={n_shards} \

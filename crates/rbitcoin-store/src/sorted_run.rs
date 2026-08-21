@@ -1272,6 +1272,35 @@ pub fn shard_record_starts(run: &SortedRunPath, n_shards: usize) -> Result<Vec<u
     Ok(starts)
 }
 
+/// [`shard_record_starts`] for each run, in input order (parallel over runs).
+pub fn shard_record_starts_many(
+    runs: &[SortedRunPath],
+    n_shards: usize,
+) -> Result<Vec<Vec<u64>>, StoreError> {
+    if runs.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(runs.len());
+        for run in runs {
+            joins.push(scope.spawn(move || shard_record_starts(run, n_shards)));
+        }
+        let mut out = Vec::with_capacity(joins.len());
+        for j in joins {
+            match j.join() {
+                Ok(Ok(starts)) => out.push(starts),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(StoreError::Corrupt(
+                        "scripthash shard_record_starts worker panicked",
+                    ))
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
 /// Stream k-way merge of sorted runs, invoking `on_rec` for each record in key order.
 ///
 /// Does **not** buffer the full merge body (unlike [`merge_runs`]). Used by SH
@@ -3049,6 +3078,29 @@ mod tests {
                 starts
             );
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn shard_record_starts_many_matches_serial() {
+        let d = tmp_dir();
+        let mut runs = Vec::new();
+        for seq in 1..=4u64 {
+            let mut body = Vec::new();
+            for i in 0..8u8 {
+                let sh0 = i.wrapping_mul(32).saturating_add(seq as u8);
+                body.extend_from_slice(&sh_rec(sh0, seq * 10 + u64::from(i)));
+            }
+            runs.push(write_sorted_run(&next_run_path(&d, seq), 40, 40, &body).unwrap());
+        }
+        let serial: Vec<Vec<u64>> = runs
+            .iter()
+            .map(|r| super::shard_record_starts(r, 4).unwrap())
+            .collect();
+        let parallel = super::shard_record_starts_many(&runs, 4).unwrap();
+        assert_eq!(parallel, serial);
+        let one = super::shard_record_starts_many(&runs[..1], 4).unwrap();
+        assert_eq!(one, serial[..1]);
         let _ = fs::remove_dir_all(&d);
     }
 

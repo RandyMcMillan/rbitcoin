@@ -215,7 +215,7 @@ included; tree at #177):
 | Core functional | **44** unmodified v31.1 scripts `run`; 223 skip (68 `no-wallet`, 46 `rpc-missing`, 31 `core-log`, …) |
 | Residual `RBITCOIN_*` in crates | Honored set listed in `env-knobs.md` (**Q-16** closed) |
 | On-disk | **Schema 19** (Class A/C still 17 bytes; 18 = MPHF indexes; 19 = SH extent last page). Populated 17 `tx.head`/`scripthash*` refused |
-| Confirm queues | **loadq=14 · scriptq=4 · writeq=14** (hardcoded; `env-knobs.md` “Hardcoded” row still says writeq=20 in one place — owner-doc drift, not a Q-id) |
+| Confirm queues | **loadq=14 · scriptq=4 · writeq=14** (hardcoded) |
 | IBD confirm rate | Last instrumented fat-era number **6.4 blk/s** at #126 (2026-08-18). Not re-baselined after loadq/stamp/no-coord/head-drain. **Q-50** owns residual meters, not a new rate claim |
 | Fuzz | **None** |
 
@@ -228,7 +228,7 @@ included; tree at #177):
 | Operator honesty | Strong | CLI primary; chaininfo disk/progress are real (Q-47); SH materialize keep-runs + last-page cap is pinned; README size matches SCHEMA census |
 | Code modularity | Medium | `rpc/methods` **5.9k**, `peer` **5.7k**, `scripthash` **5.6k**. Residual giants only via **R-10** |
 | Cross-platform | Medium (honest) | Completion session ports Darwin/Windows store IO. CI snapshots: musl + CRT-static Windows + system-dylib Darwin |
-| Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests. Minor hardcoded-queue drift in `env-knobs.md` |
+| Docs consistency | Strong | One map (`docs/README.md`); AGENTS slim; comments-as-smell + no repo-text tests |
 | Contributor onboarding | Medium | how-we-plan + TDD + inventory; tutorial still **Q-34** |
 | CI fidelity | Strong | Split gates; `test` ~85 s; Core functional nightly extra |
 | Dead / stub surface | Strong | Node RPC is a real subset; no dummy chaininfo numbers; `BodyMissing` event arm is the leftover `#[allow(dead_code)]` |

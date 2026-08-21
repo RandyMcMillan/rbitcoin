@@ -509,8 +509,8 @@ impl Query {
                                 sealed0,
                                 tip_max,
                                 CHUNK_FKS,
-                                &done_flags,
-                                &seal_prefix,
+                                done_flags,
+                                seal_prefix,
                                 sh_run,
                             ) {
                                 *first_err.lock().unwrap() = Some(e);

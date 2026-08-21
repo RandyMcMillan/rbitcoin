@@ -16,7 +16,7 @@
 //!
 //! # Write amp
 //!
-//! Catalog compact only rewrites **crumbs** under [`CATALOG_COMPACT_FLOOR_BYTES`].
+//! Catalog compact only rewrites **crumbs** under [`catalog_compact_floor_bytes`].
 //! Intentional ~128 MiB recollect spills go straight to tip direct k-way.
 
 use super::run_builder_core::{
@@ -29,7 +29,7 @@ use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, commit_run_to_catalog,
     for_each_merged_rec_opts, list_fanin_reduce_outputs, list_materialize_claims, list_runs,
     load_fanin_checkpoint, materialize_sh_shards, merge_runs_with_policy, next_run_path,
-    reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority, write_sorted_run,
+    reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority,
     write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashRecord,
     SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
 };
@@ -1452,7 +1452,8 @@ pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 /// Slightly below [`RECOLLECT_THREAD_SPILL_BYTES`] so default ~128 MiB spills
 /// are never candidates. Live compact uses [`catalog_compact_floor_bytes`] of
 /// the resolved spill size.
-pub const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4;
+#[cfg(test)]
+const CATALOG_COMPACT_FLOOR_BYTES: u64 = RECOLLECT_THREAD_SPILL_BYTES.saturating_mul(3) / 4;
 
 const RECOLLECT_SPILL_BYTES_MIN: u64 = 16 * 1024 * 1024;
 const RECOLLECT_SPILL_BYTES_MAX: u64 = 512 * 1024 * 1024;
@@ -1496,8 +1497,8 @@ pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) 
 /// (`!force_all`). Never tip `drain_spills` or parallel recollect (multi-thread
 /// writers would race IBD and reintroduce write amp).
 ///
-/// Runs ≥ [`CATALOG_COMPACT_FLOOR_BYTES`] are left alone so recollect's ~128 MiB
-/// spills stream straight into tip k-way merge.
+/// Runs ≥ [`catalog_compact_floor_bytes`] of the resolved spill are left
+/// alone so recollect spills stream straight into tip k-way merge.
 fn compact_catalog_undersized(
     runs_dir: &Path,
     next_seq: &mut u64,
@@ -1647,7 +1648,7 @@ fn sh_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbitcoin_store::{read_run_body, Store};
+    use rbitcoin_store::{read_run_body, write_sorted_run, Store};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

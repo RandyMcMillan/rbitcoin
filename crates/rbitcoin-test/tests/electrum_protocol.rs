@@ -141,25 +141,6 @@ async fn electrum_server_version_history_balance() {
     );
 
     drop(reader);
-    handle.shutdown().await;
-}
-
-/// Broad method coverage: ping/features/headers/listunspent/tx APIs + error paths.
-#[tokio::test]
-async fn electrum_more_methods_and_errors() {
-    let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create(dir.path().join("store")).unwrap();
-    let params = ChainParams::regtest();
-    let chain = build_mature_regtest_with_spend(&q, &params);
-    let _ = chain;
-    let _ = Milestone::NONE;
-
-    let q = Arc::new(q);
-    let (tip_tx, _) = broadcast::channel(4);
-    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(cfg, q.clone(), params.clone(), tip_tx, None)
-        .await
-        .expect("electrum listen");
 
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
 

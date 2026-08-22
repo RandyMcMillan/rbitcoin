@@ -1700,7 +1700,7 @@ mod tests {
             genesis.block_hash(),
             genesis.header.time,
             1,
-            256,
+            80,
             0,
         );
         let q = Arc::new(q);

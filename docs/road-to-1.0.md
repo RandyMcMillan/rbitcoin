@@ -16,19 +16,15 @@ Core clone, not a soak badge, not a desktop wallet.
 
 | You should get | 1.0 |
 |----------------|-----|
-| **Datadir** | 1.0.x opens a 1.0.0 store. Format changes after that are a new major (or an explicit migrate). No silent wipe. |
-| **Chain** | Invalid blocks stay invalid. Core JSON corpora still have no allowlist; past findings stay fixed. |
+| **Datadir** | Every **1.x.x** opens a **1.0.0** store. No silent wipe. |
+| **Chain** | No known consensus divergences from Core. |
 | **Wallets** | Electrum / Esplora work for the clients we claim, on a node that finished IBD + SH index. |
 | **Index time** | `--shindex` after IBD is a known, resume-safe wait — not an unbounded hour-loss. Faster than 0.5 is the point. |
-| **RAM** | IBD, SH build, and tip-follow have **explained** process RSS (heap, not “the disk is in page cache”). No surprise multi-GiB leaks. |
-| **Fees** | The 10-minute inclusion estimate is checked against **whether txs actually get in**, not against Core’s historical estimator. |
-| **P2P** | A single network neighborhood should not own your tip; junk peers / compact-block spam should not knock the node over. DoS = Core is **not** the bar; “won’t fold to the obvious attacks” is. |
+| **RAM** | **2 GiB** process RSS is enough for IBD, SH build, and tip-follow (knobs may trade wall time, e.g. serial SH build). Heap, not “the disk is in page cache.” |
+| **Fees** | The 10-minute inclusion estimate is aimed at txs that actually get in, not Core’s historical estimator. |
+| **P2P** | A single network neighborhood should not own your tip; junk peers / compact-block spam should not knock the node over. Peer diversity aims at **Core asmap utility** (not necessarily the same implementation). |
 | **Support** | [`SECURITY.md`](../SECURITY.md) names **1.0.x** with a real window. |
 | **Install** | Still the musl GitHub Release. Useful **libraries** may also be on crates.io. |
-
-`--shindex` defaults **on** only if index build is fast and RAM-sane enough
-that Electrum-from-a-fresh-node is the normal path. Otherwise it stays
-opt-in; wallets still require it.
 
 0.6 / 0.7 can ship any of this without freezing the store.
 
@@ -80,30 +76,33 @@ Store, P2P, RPC, Electrum server, the node — stay in this repo. Revisit
 
 Operators feel **wall-clock after IBD** (`--shindex`) and **RSS** while
 syncing, while building the index, and at tip with wallets connected.
-Measure on a real SSD; keep resume (don’t throw away sealed shards). Do
-not “fix” RSS by deleting the body queue or pretending kernel page cache
-is a leak ([`ibd-memory.md`](./ibd-memory.md)).
+Target **2 GiB** process RSS in all three phases; knobs may slow the
+machine to hit it (serial SH build instead of all-core pack, smaller
+ingest, and so on). Measure on a real SSD; keep resume. Page cache is
+not a leak ([`ibd-memory.md`](./ibd-memory.md)).
 
 ### Harder to eclipse or DoS
 
 Today: 125 inbound, rate windows, compact-block score, v2-only discovery.
-Missing vs a careful Core operator: addr diversity / netgroups, something
-like **anchors** so a restart doesn’t redraw the whole peer graph from
-DNS, inbound eviction that isn’t “newest wins.” Tor/asmap can wait.
+1.0 should match **Core asmap utility** (a diverse outbound set so one
+netgroup cannot own the tip) even if the mechanism is not Core’s asmap
+file. Also: something like **anchors** so a restart doesn’t redraw the
+whole peer graph from DNS, inbound eviction that isn’t “newest wins.”
+Tor can wait.
 
 Electrum/Esplora connection caps stay always-on.
 
 ### Fee estimates that match inclusion
 
 Product is **“in about 10 minutes under this mempool”**
-([`mempool-fee-estimation.md`](./mempool-fee-estimation.md)). 1.0 needs a
-harness: recorded pool + blocks → estimate vs what actually confirmed
-(signet / frozen pack). Cold start and fee spikes should have stated
-error bars. No need to mimic Core’s multi-horizon API.
+([`mempool-fee-estimation.md`](./mempool-fee-estimation.md)). We cannot
+prove that in general. 1.0 runs the node long enough to **record
+inclusion success rate** against a stated target (and how it behaves
+cold / after a fee spike). No need to mimic Core’s multi-horizon API.
 
 ### Freeze the store last
 
-When the rest is true, tag 1.0 so **1.0.x does not wipe 1.0.0 datadirs**.
+When the rest is true, tag 1.0 so **every 1.x.x opens a 1.0.0 store**.
 Older-than-1.0 or corrupt files can still refuse with a one-line message.
 
 ---
@@ -111,6 +110,5 @@ Older-than-1.0 or corrupt files can still refuse with a one-line message.
 ## After 1.0 (unless it falls out earlier)
 
 - BIP331 package relay, if rust-bitcoin still has no types (**Q-48**)
-- Default `--shindex` on, if index build is not there yet
-- Tor / asmap
+- Tor
 - Publishing the store as a crate

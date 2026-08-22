@@ -4,7 +4,7 @@ This project plans and executes work as a sequence of **small vertical slices**,
 each sized for one **Red → Green → Refactor** cycle (see [AGENTS.md](../AGENTS.md)
 TDD section). Plans have **more steps** than a typical “phase 1 / phase 2”
 design doc; each step should leave the tree greener and the suite a little
-stronger. Long-range 1.0 gates (not slice size): [`road-to-1.0.md`](./road-to-1.0.md).
+stronger.
 
 Influences: Extreme Programming (stories, planning game, small releases,
 TDD, continuous refactoring), INVEST stories, vertical slicing, YAGNI / simple

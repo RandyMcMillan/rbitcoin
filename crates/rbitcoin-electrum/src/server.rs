@@ -649,8 +649,9 @@ where
         write_line(writer, &crate::tweaks::done_notify()).await?;
         return Ok(());
     };
-    // Remaining heights: budgeted multi-height thin load (one Class A idx→body
-    // wave per batch) then per-height Cake notifies. Hole / unindexed → single-height path.
+    // Remaining heights: pre-taproot empty waves (no store), else budgeted
+    // thin load (one txout span per batch) then Cake notifies. Hole → one height.
+    // `server.ping` must not drop the in-flight wave.
     let mut next = req.start.saturating_add(1);
     let limits = crate::tweaks::subscribe_range_limits();
     while next <= last {
@@ -663,72 +664,65 @@ where
             let start_h = batch_start;
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let thin = crate::tweaks::load_thin_batch(&q, start_h, last_h, lim)?;
-                    if thin.is_empty() {
-                        return Ok::<Vec<String>, String>(vec![crate::tweaks::height_notify_json(
-                            &q, &c, start_h,
-                        )?]);
-                    }
-                    Ok(thin
-                        .into_iter()
-                        .map(|(h, rows)| crate::tweaks::thin_height_notify_json(h, &rows))
-                        .collect())
+                    crate::tweaks::remaining_notify_lines(&q, &c, start_h, last_h, lim)
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
             }
         };
-        let batch = tokio::select! {
-            biased;
-            line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
-                match line {
-                    Ok(Ok(Some(l))) => {
-                        if !l.trim().is_empty() {
-                            if let Ok(req) = serde_json::from_str::<Value>(&l) {
-                                let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
-                                if req.get("method").and_then(|m| m.as_str()) == Some("server.ping")
-                                {
-                                    write_line(
-                                        writer,
-                                        &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
-                                    )
-                                    .await?;
+        tokio::pin!(batch_fut);
+        let batch = loop {
+            tokio::select! {
+                biased;
+                line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
+                    match line {
+                        Ok(Ok(Some(l))) => {
+                            if !l.trim().is_empty() {
+                                if let Ok(req) = serde_json::from_str::<Value>(&l) {
+                                    let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
+                                    if req.get("method").and_then(|m| m.as_str()) == Some("server.ping")
+                                    {
+                                        write_line(
+                                            writer,
+                                            &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                    Ok(Ok(None)) => return Ok(()),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "idle timeout",
-                        ));
+                        Ok(Ok(None)) => return Ok(()),
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "idle timeout",
+                            ));
+                        }
                     }
                 }
-            }
-            map = batch_fut => {
-                match map {
-                    Ok(v) => v,
-                    Err(e) => {
-                        rbitcoin_log::api_call(
-                            "electrum",
-                            &peer.to_string(),
-                            "blockchain.tweaks.subscribe",
-                            &format!("[{batch_start},batch]"),
-                            0,
-                            Some(&e),
-                        );
-                        break;
-                    }
+                map = &mut batch_fut => {
+                    break map;
                 }
             }
         };
+        let batch = match batch {
+            Ok(v) => v,
+            Err(e) => {
+                rbitcoin_log::api_call(
+                    "electrum",
+                    &peer.to_string(),
+                    "blockchain.tweaks.subscribe",
+                    &format!("[{batch_start},batch]"),
+                    0,
+                    Some(&e),
+                );
+                break;
+            }
+        };
         let n = batch.len() as u32;
-        for line in &batch {
-            write_raw_line(writer, line).await?;
-        }
+        write_raw_lines(writer, &batch).await?;
         next = batch_start.saturating_add(n.max(1));
     }
     write_line(writer, &crate::tweaks::done_notify()).await?;
@@ -752,6 +746,27 @@ async fn write_raw_line<W: AsyncWrite + Unpin>(
 ) -> Result<(), std::io::Error> {
     writer.write_all(msg.as_bytes()).await?;
     writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn write_raw_lines<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    lines: &[String],
+) -> Result<(), std::io::Error> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut n = 0usize;
+    for l in lines {
+        n = n.saturating_add(l.len()).saturating_add(1);
+    }
+    let mut buf = Vec::with_capacity(n);
+    for l in lines {
+        buf.extend_from_slice(l.as_bytes());
+        buf.push(b'\n');
+    }
+    writer.write_all(&buf).await?;
     writer.flush().await?;
     Ok(())
 }

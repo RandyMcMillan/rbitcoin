@@ -75,7 +75,7 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 | Method | Status | Notes |
 |--------|--------|-------|
 | server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below |
-| blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; outs from `txout`). Isolate may still hardcode `electrs.cakewallet.com` |
+| blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; one `txout` span per wave). Pre-taproot: empty maps in ≤1024-height writes. Isolate may still hardcode `electrs.cakewallet.com` |
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full**; `listunspent` loads `txid.body` only for unspent creates; one TCP connection reuses the last SH outs+spent join until tip height changes |
 | scripthash.get_mempool / subscribe | done | Status on mempool announce **and** on confirming tip when that block creates or spends the hash (posting-list probe; no Class A expand on a miss) |

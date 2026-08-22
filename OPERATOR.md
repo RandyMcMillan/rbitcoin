@@ -596,7 +596,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
-| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sptweaks` index: multi-height load (default ≤128 heights / ≤8192 eligible txs per wave) then per-height Cake notifies; Class A join is one `idx_body_pipeline` wave per batch (uring when enabled). Without index / hole: naive per height (Class A + parent outs). JSON-RPC result is the **first** height (`getTweaks` probe `[0,1,false]` → `{"0": {}}`). Further heights are notifications, then `{"message":"done"}`. `count` is honored through tip. `server.version[0]` contains `electrs`. On 9p-class IO expect slower than local disk. |
+| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sptweaks` index: multi-height load (default ≤128 heights / ≤8192 eligible txs per wave) then per-height Cake notifies, **one TCP flush per wave**. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `inwit` stays out). Pre-taproot heights are empty maps in waves of ≤1024 (no store). Without index / hole: naive per height (Class A + parent outs). JSON-RPC result is the **first** height (`getTweaks` probe `[0,1,false]` → `{"0": {}}`). Further heights are notifications, then `{"message":"done"}`. `count` is honored through tip. `server.version[0]` contains `electrs`. On 9p-class IO expect slower than local disk. |
 
 ### API request log
 

@@ -1,7 +1,7 @@
 //! Thin BIP-352 tweak index: Query join of `sp_tweaks.*` + Class A.
 
 use super::*;
-use rbitcoin_store::{IdxBodyJob, IdxBodyMode, SpTweaksTable};
+use rbitcoin_store::SpTweaksTable;
 
 /// Eligible tx after thin-index join (P2TR outs only).
 #[derive(Clone, Debug)]
@@ -166,9 +166,10 @@ impl Query {
     /// index hole, or [`ThinTweakRangeLimits`].
     ///
     /// Empty `Ok(vec![])` means the first height is not indexed (caller falls
-    /// back per-height). One Class A [`IdxBodyMode::Full`] wave for all eligible
-    /// fks (existing pipeline / uring). `sp_tweaks` mutex is not held during
-    /// Class A IO.
+    /// back per-height). Eligible Class A join is **one sequential `txout`
+    /// span** from first..=last eligible fk in the wave (ineligible txout in
+    /// the hole is included; `inwit` is not). `sp_tweaks` mutex is not held
+    /// during Class A IO.
     pub fn load_thin_tweaks_range(
         &self,
         start: Height,
@@ -242,33 +243,52 @@ impl Query {
 
         if !elig_fks.is_empty() {
             let txids = self.store.txs.txid_sidefile().get_many(&elig_fks)?;
-            let mut jobs: Vec<IdxBodyJob> = elig_fks
-                .iter()
-                .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
-                .collect();
-            self.store.idx_body_pipeline(&mut jobs, IdxBodyMode::Full)?;
-            let mut body_bytes = 0u64;
-            for (i, job) in jobs.iter().enumerate() {
-                if !job.ok {
-                    return Err(StoreError::Corrupt(
-                        "invariant: thin tweak eligible body missing",
-                    ));
-                }
-                body_bytes = body_bytes.saturating_add(job.body.len() as u64);
-                let Some(txid) = txids.get(i).copied().flatten() else {
-                    return Err(StoreError::Corrupt(
-                        "invariant: thin tweak eligible txid missing",
-                    ));
+            let ranges = self.store.tx_body_range_batch(&elig_fks)?;
+            let mut span_off = u64::MAX;
+            let mut span_end = 0u64;
+            for r in &ranges {
+                let Some((off, len)) = *r else {
+                    return Err(
+                        StoreError::Corrupt("invariant: thin tweak eligible body missing").into(),
+                    );
                 };
-                let (pi, ei) = tag[i];
-                let p2tr = self.store.txs.packed_p2tr_from_raw(&job.body)?;
-                out_rows[pi].push(ThinTweakRow {
-                    txid,
-                    tweak: plans[pi].elig[ei].1,
-                    p2tr,
-                });
+                if len == 0 {
+                    return Err(
+                        StoreError::Corrupt("invariant: thin tweak eligible body missing").into(),
+                    );
+                }
+                span_off = span_off.min(off);
+                span_end = span_end.max(off.saturating_add(len));
             }
-            self.note_thin_tweak_body_bytes(body_bytes);
+            if span_off >= span_end {
+                return Err(
+                    StoreError::Corrupt("invariant: thin tweak eligible body missing").into(),
+                );
+            }
+            let span_len = span_end - span_off;
+            self.store.txs.with_body_span(span_off, span_len, |raw| {
+                for (i, r) in ranges.iter().enumerate() {
+                    let (off, len) = r.unwrap();
+                    let rel = (off - span_off) as usize;
+                    let sl = raw.get(rel..rel.saturating_add(len as usize)).ok_or(
+                        StoreError::Corrupt("invariant: thin tweak eligible body missing"),
+                    )?;
+                    let Some(txid) = txids.get(i).copied().flatten() else {
+                        return Err(StoreError::Corrupt(
+                            "invariant: thin tweak eligible txid missing",
+                        ));
+                    };
+                    let (pi, ei) = tag[i];
+                    let p2tr = self.store.txs.packed_p2tr_from_raw(sl)?;
+                    out_rows[pi].push(ThinTweakRow {
+                        txid,
+                        tweak: plans[pi].elig[ei].1,
+                        p2tr,
+                    });
+                }
+                Ok(())
+            })?;
+            self.note_thin_tweak_body_bytes(span_len);
         }
 
         Ok(plans
@@ -387,8 +407,7 @@ mod tests {
         (p2wpkh, p2tr, ser.to_vec())
     }
 
-    /// Fat ineligible packed row between two eligible txs must not be pulled
-    /// into the thin-serve body read (span would include it).
+    /// Fat **inwit** between eligible txs must stay out of the `txout` span.
     #[test]
     fn load_thin_skips_fat_ineligible_between_eligible() {
         let (dir, q) = tmp_q();
@@ -526,6 +545,134 @@ mod tests {
             read < fat.1,
             "read {read} must be smaller than the skipped fat row {}",
             fat.1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cake `output_pubkeys` come from `txout` only. One sequential span from
+    /// first..=last eligible in the wave (ineligible txout in the hole is
+    /// included; fat **inwit** stays out).
+    #[test]
+    fn load_thin_span_reads_ineligible_txout_between_eligible() {
+        let (dir, q) = tmp_q();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let (p2wpkh, p2tr, ser) = p2wpkh_p2tr();
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let h0 = header(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: genesis_txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 3,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![
+                        OutputRecord::unspent(20_0000_0000, p2wpkh.clone()),
+                        OutputRecord::unspent(20_0000_0000, p2wpkh.clone()),
+                        OutputRecord::unspent(10_0000_0000, vec![0x51]),
+                    ],
+                }],
+            )
+            .unwrap();
+        q.put_sp_tweaks_block(Height(0), fk0, &[None]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let mut tid_a = [0u8; 32];
+        tid_a[0] = 0xaa;
+        let mut tid_mid = [0u8; 32];
+        tid_mid[0] = 0xfe;
+        let mut tid_b = [0u8; 32];
+        tid_b[0] = 0xbb;
+        let fat_script = vec![0x51; 4096];
+        let spend =
+            |prev: u32, txid: [u8; 32], outs: Vec<OutputRecord>, wit: Vec<Vec<u8>>| TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 2,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: outs.len() as u32,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: genesis_txid,
+                    create_fk,
+                    prev_index: prev,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: wit,
+                }],
+                outputs: outs,
+            };
+        let h1 = header(1, fk0, Some(h0.hash));
+        let header_fk = q
+            .connect_block(
+                Height(1),
+                &h1,
+                &[
+                    spend(
+                        0,
+                        tid_a,
+                        vec![OutputRecord::unspent(19_0000_0000, p2tr.clone())],
+                        vec![vec![0u8; 64], ser.clone()],
+                    ),
+                    spend(
+                        2,
+                        tid_mid,
+                        vec![OutputRecord::unspent(9_0000_0000, fat_script)],
+                        vec![vec![0u8; 64]],
+                    ),
+                    spend(
+                        1,
+                        tid_b,
+                        vec![OutputRecord::unspent(19_0000_0000, p2tr)],
+                        vec![vec![0u8; 64], ser],
+                    ),
+                ],
+            )
+            .unwrap();
+        let mut tw_a = [0x02; 33];
+        tw_a[0] = 0x02;
+        let mut tw_b = [0x03; 33];
+        tw_b[0] = 0x03;
+        q.put_sp_tweaks_block(Height(1), header_fk, &[Some(tw_a), None, Some(tw_b)])
+            .unwrap();
+
+        let fks = q.block_tx_fks(Height(1)).unwrap();
+        let mid_txout = q.store().txs.body_range(fks[1]).unwrap();
+        assert!(
+            mid_txout.1 >= 4096,
+            "ineligible txout too small to observe span: {}",
+            mid_txout.1
+        );
+        let elig_txout = q
+            .store()
+            .txs
+            .body_range(fks[0])
+            .unwrap()
+            .1
+            .saturating_add(q.store().txs.body_range(fks[2]).unwrap().1);
+
+        let _ = q.sample_reset_thin_tweak_body_bytes();
+        let rows = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].txid, tid_a);
+        assert_eq!(rows[1].txid, tid_b);
+        let read = q.sample_reset_thin_tweak_body_bytes();
+        assert!(
+            read >= mid_txout.1,
+            "thin serve must read the txout span covering the ineligible hole \
+             (read={read} mid_txout={} elig_txout={elig_txout})",
+            mid_txout.1
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

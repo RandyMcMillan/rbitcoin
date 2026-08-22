@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **SH decode-into + drop ShEntry:** page/slab decode appends into a caller
+  `Vec<Fk>`. Collect, tip pack, and `put_chain` work on `Fk`. Query history
+  uses `create_fks`. `ShEntry` / `ScriptHashEntry` are gone. On-disk pack8 /
+  slab / page bytes are unchanged.
+
 - **SH pack write-behind:** sequential slabs append to a 16 MiB session
   `body_buf` (one `pwrite` per flush; HWM persist at shard seal). Slab and
   page encode write into a caller buffer; 1-FK keys stay head-only with no

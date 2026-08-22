@@ -651,7 +651,7 @@ fn collect_page_chain_span(
     for i in 0..n_pages {
         let start = i.saturating_mul(SH_PAGE_SIZE);
         let page = &buf[start..start.saturating_add(SH_PAGE_SIZE)];
-        let (next, ents) = sh_page_decode_slice(page)?;
+        let (next, fks) = sh_page_decode_slice(page)?;
         if i + 1 == n_pages {
             last_next = next;
         } else {
@@ -660,6 +660,7 @@ fn collect_page_chain_span(
                 return Ok(None);
             }
         }
+        let ents: Vec<ShEntry> = fks.into_iter().map(ShEntry::new).collect();
         extend_page_entries(&mut out, &mut prev_last, ents)?;
     }
     Ok(Some((out, last_next)))
@@ -678,7 +679,8 @@ fn collect_page_chain_linked(
     }
     read_sh_page_bytes(body, first_page, &mut cur)?;
     loop {
-        let (next, ents) = sh_page_decode_slice(&cur)?;
+        let (next, fks) = sh_page_decode_slice(&cur)?;
+        let ents: Vec<ShEntry> = fks.into_iter().map(ShEntry::new).collect();
         extend_page_entries(&mut out, &mut prev_last, ents)?;
         if next == 0 {
             break;
@@ -721,7 +723,8 @@ fn collect_extent_then_tail(body: &TableFile, last_page: u64) -> Result<Vec<ShEn
     let mut nxt = [0u8; SH_PAGE_SIZE];
     read_sh_page_bytes(body, tail_off, &mut cur)?;
     loop {
-        let (next, ents) = sh_page_decode_slice(&cur)?;
+        let (next, fks) = sh_page_decode_slice(&cur)?;
+        let ents: Vec<ShEntry> = fks.into_iter().map(ShEntry::new).collect();
         extend_page_entries(&mut out, &mut prev_last, ents)?;
         if next == 0 {
             break;

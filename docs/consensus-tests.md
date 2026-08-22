@@ -10,9 +10,12 @@ Every consensus rule **we implement** (not delegated wholesale to rust-bitcoin) 
 nix-shell
 cargo test -p rbitcoin-consensus --lib
 cargo test -p rbitcoin-test --test consensus_rules
-# Core JSON corpora (script_tests / tx_valid / tx_invalid):
+# Core JSON corpora (script_tests / tx_valid / tx_invalid / sighash / BIP341):
 cargo test -p rbitcoin-consensus --lib core_script_tests_all_rows -- --nocapture
 cargo test -p rbitcoin-consensus --lib core_tx_ -- --nocapture
+cargo test -p rbitcoin-consensus --lib core_sighash -- --nocapture
+cargo test -p rbitcoin-consensus --lib core_bip341 -- --nocapture
+cargo test -p rbitcoin-consensus --lib block_866342 -- --nocapture
 # broader integration still covers connect success paths:
 cargo test -p rbitcoin-test --test scenarios consensus_
 ```
@@ -31,6 +34,7 @@ refreshing; do not check copies into `tests/fixtures/`.
 | `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
 | `sighash.json` | same | `script::core_sighash::core_sighash_all_rows` | every data row digest matches Core |
 | `bip341_wallet_vectors.json` | same | `script::core_bip341::core_bip341_wallet_vectors_all_rows` | key-path fully-signed + per-input spends accept; unknown-leaf script-path accepts |
+| mainnet 866342 + prevouts | `tests/fixtures/block_866342/` (Floresta zstd) | `block::block_866342::block_866342_structure_and_scripts` | structure at height + every non-coinbase `verify_job_all_inputs` |
 
 ### How the harness works
 
@@ -103,6 +107,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
 | C18 | Core `sighash.json` | 32-byte digest via `SighashCache::legacy_signature_hash` | `script::core_sighash::core_sighash_all_rows` |
 | C19 | Core `bip341_wallet_vectors.json` | `verify_job_all_inputs` accept (taproot+witness) | `script::core_bip341::core_bip341_wallet_vectors_all_rows` |
+| C20 | Mainnet 866342 + Floresta prevouts | structure + scripts; overweight 4_000_001 WU rejects | `block::block_866342::*` |
 | C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
 
 ## Adding a new rule

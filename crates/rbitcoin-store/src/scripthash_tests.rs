@@ -1288,6 +1288,55 @@ fn pack_shard_session_slab_flush_times_body_and_roundtrips() {
 }
 
 #[test]
+fn create_fks_matches_entries() {
+    HeadScale::test_with(HeadScale::Tiny, || {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let one = script_hash(&[0x01]);
+        t.put_create(&rec(one, 7, 0)).unwrap();
+        assert_eq!(
+            t.create_fks(&one).unwrap(),
+            t.entries(&one)
+                .unwrap()
+                .into_iter()
+                .map(|(fk, _)| fk)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(t.create_fks(&one).unwrap(), vec![Fk(7)]);
+
+        let two = script_hash(&[0x02]);
+        t.put_create(&rec(two, 1, 0)).unwrap();
+        t.put_create(&rec(two, 2, 0)).unwrap();
+        assert_eq!(t.create_fks(&two).unwrap(), vec![Fk(1), Fk(2)]);
+        assert_eq!(
+            t.create_fks(&two).unwrap(),
+            t.entries(&two)
+                .unwrap()
+                .into_iter()
+                .map(|(fk, _)| fk)
+                .collect::<Vec<_>>()
+        );
+
+        let mega = script_hash(&[0x03]);
+        let recs: Vec<_> = (1..=600u64).map(|i| rec(mega, i, 0)).collect();
+        t.put_create_batch(&recs).unwrap();
+        let fks = t.create_fks(&mega).unwrap();
+        assert_eq!(fks.len(), 600);
+        assert_eq!(fks.first().copied(), Some(Fk(1)));
+        assert_eq!(fks.last().copied(), Some(Fk(600)));
+        assert_eq!(
+            fks,
+            t.entries(&mega)
+                .unwrap()
+                .into_iter()
+                .map(|(fk, _)| fk)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
 fn bulk_dense_five_fks_use_class0_slab() {
     HeadScale::test_with(HeadScale::Tiny, || {
         let dir = tmp();

@@ -726,9 +726,8 @@ pub fn sh_page_decode_slice_into(buf: &[u8], out: &mut Vec<Fk>) -> Result<u64, S
 
 /// Decode page fields from an arbitrary slice (rejects len ≠ 4096).
 pub fn sh_page_decode_slice(buf: &[u8]) -> Result<(u64, Vec<Fk>), StoreError> {
-    let mut out = Vec::new();
-    let next = sh_page_decode_slice_into(buf, &mut out)?;
-    Ok((next, out))
+    let page = sh_page_as_array(buf)?;
+    Ok((sh_page_next(page)?, sh_page_entries(page)?))
 }
 
 #[cfg(test)]

@@ -92,7 +92,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 
 2026-08-21 pass. Tree at #177. Verified: zero in-tree fuzz, inventory
 **44** `run` / **223** `skip` / 267 total, `SCHEMA_VERSION = 19`, findings
-001–021 all fixed, **0** `TODO`/`FIXME`, **2** `#[allow(` (clippy
+001–022 all fixed, **0** `TODO`/`FIXME`, **2** `#[allow(` (clippy
 `type_complexity` in consensus), `unsafe`
 in store IO sessions + `script_pool` + confirm `head_drain`.
 
@@ -156,7 +156,7 @@ Retired on purpose. Not a backlog. Not a failure.
 ## Completed
 
 **One short list** of the latest quality program. Older closures (Q-01–Q-14,
-findings 001–021, CI split, map-free README, …) live in
+findings 001–022, CI split, map-free README, …) live in
 [`CHANGELOG.md`](../CHANGELOG.md). Do not reopen without new evidence.
 
 | ID | Item | Resolution |
@@ -214,7 +214,7 @@ included; tree at #177):
 | Host cargo silos | `target/dev` (test) / `target/cov` (coverage) |
 | Release | `nix build .#rbitcoin-musl` → static install |
 | Core corpora | **No allowlist** |
-| Findings 001–021 | All **fixed** (no new numbered reports since 021) |
+| Findings 001–022 | All **fixed** |
 | Core functional | **44** unmodified v31.1 scripts `run`; 223 skip (68 `no-wallet`, 46 `rpc-missing`, 31 `core-log`, …) |
 | Residual `RBITCOIN_*` in crates | Honored set listed in `env-knobs.md` (**Q-16** closed) |
 | On-disk | **Schema 19** (Class A/C still 17 bytes; 18 = MPHF indexes; 19 = SH extent last page). Populated 17 `tx.head`/`scripthash*` refused |
@@ -238,7 +238,7 @@ included; tree at #177):
 | Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
 | Tip-follow mempool APIs | Strong | **R-01–R-04**; persist sidecars exist (Core persist script still skip → Q-41); INV tick no longer clones the mempool |
 | Wallet-client APIs | Strong | Last-slot SH join + serve-lean identity for Electrum/Esplora; Casa/Sparrow times stay host-only (`rbitcoin-bench`) |
-| Adversarial / findings | Medium–Strong | **001–021** closed; **no fuzz** (**Q-30**); Core functional is the active surface program (**Q-41**) |
+| Adversarial / findings | Medium–Strong | **001–022** closed; **no fuzz** (**Q-30**); Core functional is the active surface program (**Q-41**) |
 | Perf observability | Strong | Named residuals (`other=` / `drain_join=`) (**Q-50**). Default INFO is `ibd: progress` (**Q-36**) |
 
 ---

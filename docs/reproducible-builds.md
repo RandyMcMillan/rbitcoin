@@ -95,8 +95,15 @@ with the musl package. Windows IoRing is not supported.
 
 ### GitHub Release (`v*.*.*` tags)
 
+Merge the version-bump PR into `master` locally, then:
+
+```bash
+./scripts/release.sh           # checks, tag vX.Y.Z, push master + tag
+./scripts/release.sh --dry-run
+```
+
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds the
-same three snapshots on a version tag and attaches them to a GitHub Release:
+same three snapshots on that tag and attaches them to a GitHub Release:
 
 | File | Notes |
 |------|--------|

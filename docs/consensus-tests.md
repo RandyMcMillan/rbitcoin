@@ -98,6 +98,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C1–C14 | (see prior matrix) | … | structure / locktime / script unit tests |
 | C15 | Core `tx_valid` / `tx_invalid` | accept / reject | `script::core_tx_vectors::*` (row-level, not parse-only) |
 | C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
+| C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
 
 ## Adding a new rule
 

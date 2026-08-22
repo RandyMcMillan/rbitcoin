@@ -31,12 +31,20 @@ builds stay on `nix develop` / `cargo test`; release is always musl static.
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 **GitHub Release** (`v*.*.*` tags) is the operator snapshot: Linux musl +
-Windows CRT-static PE + Darwin aarch64 zip. Retry from Actions → **release**
-→ Run workflow (artifacts only, no tag). PR `ci` **windows** / **macos**
-jobs smoke store create/open + `--smoke`; they do not upload binaries.
-Local Linux `target/release/` install is still `nix build .#rbitcoin-musl`
-on a clean master tree. Windows IoRing is not supported. Darwin/Windows
-are not Nix packages — see [`docs/reproducible-builds.md`](docs/reproducible-builds.md).
+Windows CRT-static PE + Darwin aarch64 zip. Merge the version-bump PR into
+`master` locally (merge commit), then:
+
+```bash
+./scripts/release.sh          # checks, tag vX.Y.Z, push master + tag
+# ./scripts/release.sh --dry-run
+```
+
+Retry from Actions → **release** → Run workflow (artifacts only, no tag).
+PR `ci` **windows** / **macos** jobs smoke store create/open + `--smoke`;
+they do not upload binaries. Local Linux `target/release/` install is still
+`nix build .#rbitcoin-musl` on a clean master tree. Windows IoRing is not
+supported. Darwin/Windows are not Nix packages — see
+[`docs/reproducible-builds.md`](docs/reproducible-builds.md).
 
 **Darwin Gatekeeper:** the zip is ad-hoc signed (`codesign -s -`), not
 notarized. If Finder or a browser sets quarantine and the binary is killed

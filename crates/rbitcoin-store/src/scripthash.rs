@@ -2725,9 +2725,11 @@ pub fn remap_copied_page_chain(
 /// Live-OA bulk writer for cold SH materialize.
 ///
 /// Stream **scripthash-sorted** [`put_chain`] calls. Prefix sharding makes that
-/// order contiguous per head shard: body slabs buffer (~16 MiB); packed
-/// `(key16,value16)` recs accumulate for the active shard and seal to
-/// MPHF+val on the boundary. Peak head RAM ≈ unique keys in one shard × 32 B.
+/// order contiguous per head shard. Sequential slabs land in a 16 MiB
+/// `body_buf` and reach disk in one `write_at` per flush; alloc HWM persist
+/// is at shard seal. Packed `(key16, pack8)` recs accumulate for the active
+/// shard and seal to MPHF+val on the boundary. Peak head RAM ≈ unique keys
+/// in one shard × 32 B.
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
     /// Directory for [`ColdProgress`] file.
@@ -2747,6 +2749,8 @@ pub struct ScriptHashBulkSession<'a> {
     recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
+    /// Sequential slab bytes; flushed at [`BULK_BODY_FLUSH`] or before a
+    /// direct `write_at` (freelist reuse, page, gap carve).
     body_buf: Vec<u8>,
     body_write_off: u64,
     finished: bool,
@@ -3310,6 +3314,8 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.body().write_at(off, bytes)
     }
 
+    /// One `write_at` of pending slab bytes; advances `body_write_off`.
+    /// Alloc HWM persist stays at shard seal.
     fn flush_body(&mut self) -> Result<(), StoreError> {
         if self.body_buf.is_empty() {
             return Ok(());

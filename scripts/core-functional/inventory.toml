@@ -410,7 +410,7 @@ reason = "no-zmq"
 [[test]]
 name = "mempool_accept.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "official: after permitbaremultisig + incrementalrelayfee, testmempoolaccept(rawtxs='ff00baar') is -32602 'rawtxs array required' not -3 'JSON value of type string is not of expected type array' (mempool_accept.py:98); Core type-check / reject-reason zoo later"
 
 [[test]]
@@ -476,7 +476,7 @@ analog = "follow-up: accept_package"
 [[test]]
 name = "mempool_persist.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "core_analogs::analog_mempool_persist_reopen"
 
 [[test]]
@@ -516,7 +516,7 @@ analog = "follow-up: reorg package"
 [[test]]
 name = "mining_basic.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "official: test_block_max_weight getrawmempool() is 1 not 0 (mining_basic.py:296); submitheader/sigops/blockmintxfee shipped; -blockmaxweight/-blockreservedweight/prune not this wave"
 
 [[test]]
@@ -837,7 +837,7 @@ reason = "core-net-policy"
 [[test]]
 name = "rpc_blockchain.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "official: getblockchaininfo missing 'time' (rpc_blockchain.py:157); time+mediantime now shipped; prune keys / muhash / getchaintxstats still later"
 
 [[test]]
@@ -868,7 +868,7 @@ analog = "none"
 [[test]]
 name = "rpc_estimatefee.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "follow-up: estimatesmartfee exists; Core multi-horizon text"
 
 [[test]]
@@ -908,19 +908,19 @@ reason = "no-wallet"
 [[test]]
 name = "rpc_gettxspendingprevout.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "gettxspendingprevout shipped; Core field/error zoo"
 
 [[test]]
 name = "rpc_help.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "follow-up: Core help categories / converthelp"
 
 [[test]]
 name = "rpc_invalid_address_message.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "follow-up: validateaddress error text"
 
 [[test]]
@@ -952,7 +952,7 @@ analog = "follow-up: orphan RPCs"
 [[test]]
 name = "rpc_packages.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "follow-up: submitpackage"
 
 [[test]]
@@ -967,7 +967,7 @@ reason = "no-wallet"
 [[test]]
 name = "rpc_rawtransaction.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "official: without -txindex getrawtransaction still serves (Class A always indexes); type-check -3 shipped"
 
 [[test]]
@@ -1019,7 +1019,7 @@ reason = "core-log"
 [[test]]
 name = "rpc_validateaddress.py"
 status = "skip"
-reason = "rpc-missing"
+reason = "rpc-dialect"
 analog = "follow-up: validateaddress exists; Core error-text"
 
 [[test]]

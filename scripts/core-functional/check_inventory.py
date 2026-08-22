@@ -33,6 +33,7 @@ VALID_REASONS = frozenset(
         "core-net-policy",
         "policy-libre",
         "rpc-missing",
+        "rpc-dialect",
         "core-cpp-unit",
         "prev-release",
         "harness",
@@ -95,7 +96,13 @@ def check(inventory_path: Path, disk_names: list[str]) -> list[str]:
                 errors.append(f"illegal reason: unknown ({name})")
             elif reason not in VALID_REASONS:
                 errors.append(f"illegal reason: {reason} ({name})")
-            elif reason in ("no-prune", "core-internal", "no-utxo-set", "rpc-missing"):
+            elif reason in (
+                "no-prune",
+                "core-internal",
+                "no-utxo-set",
+                "rpc-missing",
+                "rpc-dialect",
+            ):
                 analog = row.get("analog")
                 if not analog or not str(analog).strip():
                     errors.append(f"missing analog: {name}")

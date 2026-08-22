@@ -23,6 +23,10 @@ before 1.0).
 
 ### Changed
 
+- **Core functional inventory:** skip reason `rpc-dialect` for COMPAT-done
+  methods whose unmodified script still fails on type-check / field zoo.
+  `rpc-missing` is only “method not implemented.” Analog required.
+
 - **Schema upgrade one-pager:** [`OPERATOR.md`](OPERATOR.md#schema-upgrade)
   copy-paste for 17 populated `tx.head` / `scripthash*` (wipe those dirs, keep
   Class A), 18→19 `meta` rewrite, and kill-9 → crash-recovery. Byte layout

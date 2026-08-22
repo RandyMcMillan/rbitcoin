@@ -11,6 +11,10 @@ before 1.0).
 
 ### Changed
 
+- **Core functional inventory:** skip reason `rpc-dialect` for COMPAT-done
+  methods whose unmodified script still fails on type-check / field zoo.
+  `rpc-missing` is only “method not implemented.” Analog required.
+
 - **SH decode-into + drop ShEntry:** page/slab decode appends into a caller
   `Vec<Fk>`. Collect, tip pack, and `put_chain` work on `Fk`. Query history
   uses `create_fks`. `ShEntry` / `ScriptHashEntry` are gone. On-disk pack8 /

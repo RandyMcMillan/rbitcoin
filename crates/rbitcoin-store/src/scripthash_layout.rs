@@ -67,41 +67,12 @@ pub const fn slab_bytes(class: u8) -> u64 {
     16u64 << class
 }
 
-/// One thin create: create_tx_fk only (vout recovered from Class A).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ShEntry {
-    pub create_tx_fk: Fk,
-}
-
-impl ShEntry {
-    pub fn new(create_tx_fk: Fk) -> Self {
-        Self { create_tx_fk }
-    }
-
-    pub fn encode(self) -> [u8; SH_ENTRY_LEN] {
-        self.create_tx_fk.0.to_le_bytes()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < SH_ENTRY_LEN {
-            return Err(StoreError::Corrupt("short scripthash entry"));
-        }
-        Ok(Self {
-            create_tx_fk: Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-        })
-    }
-
-    pub fn is_null(self) -> bool {
-        self.create_tx_fk.is_null()
-    }
-}
-
 /// Durable head value for one scripthash key (16 B on disk).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShHeadValue {
     Empty,
     Inline {
-        entries: [ShEntry; SH_INLINE_CAP],
+        entries: [Fk; SH_INLINE_CAP],
         used: u8,
     },
     /// Geometric slab: `used` fks at `off`, size class `class` (0–6).
@@ -149,11 +120,7 @@ impl ShHeadValue {
         match self {
             ShHeadValue::Empty => {}
             ShHeadValue::Inline { entries, used } => {
-                let w0 = if *used >= 1 {
-                    entries[0].create_tx_fk.0
-                } else {
-                    0
-                };
+                let w0 = if *used >= 1 { entries[0].0 } else { 0 };
                 debug_assert_eq!(w0 & SH_SLAB_MARKER, 0, "fk must not set flag bit");
                 out[0..8].copy_from_slice(&w0.to_le_bytes());
                 out[8..16].copy_from_slice(&0u64.to_le_bytes());
@@ -194,7 +161,7 @@ impl ShHeadValue {
         match sh_head_value_mode(w0, w1)? {
             ShHeadValueMode::Empty => Ok(ShHeadValue::Empty),
             ShHeadValueMode::Inline => {
-                let e0 = ShEntry::new(Fk(sh_word_payload(w0)));
+                let e0 = Fk(sh_word_payload(w0));
                 if e0.is_null() {
                     return Err(StoreError::Corrupt("inline null first fk"));
                 }
@@ -223,9 +190,9 @@ impl ShHeadValue {
         }
     }
 
-    pub fn inline_one(e: ShEntry) -> Self {
-        let mut entries = [ShEntry::new(Fk::NULL); SH_INLINE_CAP];
-        entries[0] = e;
+    pub fn inline_one(fk: Fk) -> Self {
+        let mut entries = [Fk::NULL; SH_INLINE_CAP];
+        entries[0] = fk;
         ShHeadValue::Inline { entries, used: 1 }
     }
 
@@ -244,8 +211,8 @@ impl ShHeadValue {
         ShHeadValue::Slab { class, used, off }
     }
 
-    /// Collect live entries from an inline value (oldest→newest).
-    pub fn inline_entries(&self) -> &[ShEntry] {
+    /// Collect live create fks from an inline value (oldest→newest).
+    pub fn inline_entries(&self) -> &[Fk] {
         match self {
             ShHeadValue::Inline { entries, used } => &entries[..*used as usize],
             _ => &[],
@@ -254,10 +221,7 @@ impl ShHeadValue {
 
     /// All create_tx_fks in this value (inline only; paged needs body read).
     pub fn inline_fks(&self) -> Vec<Fk> {
-        self.inline_entries()
-            .iter()
-            .map(|e| e.create_tx_fk)
-            .collect()
+        self.inline_entries().to_vec()
     }
 }
 
@@ -274,7 +238,7 @@ pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
     match v {
         ShHeadValue::Empty => Ok(0),
         ShHeadValue::Inline { entries, used } if *used == 1 => {
-            let fk = entries[0].create_tx_fk.0;
+            let fk = entries[0].0;
             if fk > SH8_PAYLOAD62 {
                 return Err(StoreError::Corrupt("sh pack8: fk overflow"));
             }
@@ -319,7 +283,7 @@ pub fn unpack8(w: u64) -> Result<ShHeadValue, StoreError> {
         return Ok(ShHeadValue::Empty);
     }
     match w >> SH8_MODE_SHIFT {
-        0 => Ok(ShHeadValue::inline_one(ShEntry::new(Fk(w & SH8_PAYLOAD62)))),
+        0 => Ok(ShHeadValue::inline_one(Fk(w & SH8_PAYLOAD62))),
         1 => {
             let off = w & SH8_OFF_MASK;
             let used = ((w >> SH8_USED_SHIFT) & SH8_USED_MASK) as u16;
@@ -361,7 +325,7 @@ mod tests {
 
     #[test]
     fn head_value_roundtrip_inline_paged() {
-        let e0 = ShEntry::new(Fk(3));
+        let e0 = Fk(3);
         let inline = ShHeadValue::inline_one(e0);
         assert_eq!(ShHeadValue::decode(&inline.encode()).unwrap(), inline);
 
@@ -410,9 +374,12 @@ mod tests {
     }
 
     #[test]
-    fn entry_roundtrip() {
-        let e = ShEntry::new(Fk(0xdead_beef));
-        assert_eq!(ShEntry::decode(&e.encode()).unwrap(), e);
+    fn inline_one_fk_pack8_roundtrip() {
+        let one = ShHeadValue::inline_one(Fk(0xdead_beef));
+        assert_eq!(unpack8(pack8(&one).unwrap()).unwrap(), one);
+        assert_eq!(pack8(&one).unwrap(), 0xdead_beef);
+        let packed = pack8_bytes(&one).unwrap();
+        assert_eq!(unpack8_bytes(&packed).unwrap(), one);
     }
 
     #[test]
@@ -430,7 +397,7 @@ mod tests {
 
     #[test]
     fn pack8_roundtrip_modes() {
-        let one = ShHeadValue::inline_one(ShEntry::new(Fk(0x1234)));
+        let one = ShHeadValue::inline_one(Fk(0x1234));
         assert_eq!(unpack8(pack8(&one).unwrap()).unwrap(), one);
         let slab = ShHeadValue::slab(2, 9, 4096);
         let got = unpack8(pack8(&slab).unwrap()).unwrap();
@@ -445,7 +412,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(pack8(&ShHeadValue::Empty).unwrap(), 0);
-        assert!(pack8(&ShHeadValue::inline_one(ShEntry::new(Fk(0)))).is_ok());
+        assert!(pack8(&ShHeadValue::inline_one(Fk(0))).is_ok());
         assert!(unpack8(1u64 << 62 | 1).is_err() || matches!(unpack8(1u64 << 62 | 1), Ok(_)));
     }
 
@@ -471,16 +438,12 @@ mod tests {
 
     #[test]
     fn layout_error_paths() {
-        assert!(matches!(
-            ShEntry::decode(&[0u8; 4]),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(ShEntry::new(Fk::NULL).is_null());
+        assert!(Fk::NULL.is_null());
         assert!(matches!(
             ShHeadValue::decode(&[0u8; 8]),
             Err(StoreError::Corrupt(_))
         ));
-        let one = ShHeadValue::inline_one(ShEntry::new(Fk(9)));
+        let one = ShHeadValue::inline_one(Fk(9));
         assert_eq!(one.inline_fks(), vec![Fk(9)]);
         assert!(ShHeadValue::Empty.inline_entries().is_empty());
         assert_eq!(payload_start(16), 16 + SH_ALLOC_HEADER_LEN as u64);
@@ -490,14 +453,14 @@ mod tests {
     fn head_value_used_and_paged_flags() {
         assert_eq!(ShHeadValue::Empty.used(), 0);
         assert!(!ShHeadValue::Empty.is_paged());
-        let one = ShHeadValue::inline_one(ShEntry::new(Fk(1)));
+        let one = ShHeadValue::inline_one(Fk(1));
         assert_eq!(one.used(), 1);
         assert!(!one.is_paged());
         let two = ShHeadValue::slab(0, 2, 4096);
         assert_eq!(two.used(), 2);
         // used=0 inline encodes as empty words.
         let zero_inline = ShHeadValue::Inline {
-            entries: [ShEntry::new(Fk::NULL); SH_INLINE_CAP],
+            entries: [Fk::NULL; SH_INLINE_CAP],
             used: 0,
         };
         assert_eq!(

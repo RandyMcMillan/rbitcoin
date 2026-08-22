@@ -1353,7 +1353,6 @@ impl ShardedScriptHashHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripthash_layout::ShEntry;
     use rbitcoin_primitives::Fk;
 
     #[test]
@@ -1396,7 +1395,7 @@ mod tests {
         let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
         let mut key = [0u8; 32];
         key[0] = 7;
-        let val = ShHeadValue::inline_one(ShEntry::new(Fk(42)));
+        let val = ShHeadValue::inline_one(Fk(42));
         h.insert(&key, &val).unwrap();
         assert_eq!(h.get(&key).unwrap().unwrap(), val);
         assert!(h.clear_key(&key).unwrap());
@@ -1428,11 +1427,8 @@ mod tests {
             let mut k = [0u8; 32];
             k[0..4].copy_from_slice(&i.to_le_bytes());
             k[4] = 0x5a;
-            h.insert(
-                &k,
-                &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
-            )
-            .unwrap();
+            h.insert(&k, &ShHeadValue::inline_one(Fk(u64::from(i) + 1)))
+                .unwrap();
             keys.push(k);
         }
         // Mix in missing keys.
@@ -1478,11 +1474,8 @@ mod tests {
             let mut k = [0u8; 32];
             k[0..4].copy_from_slice(&i.to_le_bytes());
             k[8] = (i % 251) as u8;
-            h.insert(
-                &k,
-                &ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
-            )
-            .unwrap();
+            h.insert(&k, &ShHeadValue::inline_one(Fk(u64::from(i) + 1)))
+                .unwrap();
             keys.push(k);
         }
 
@@ -1530,8 +1523,7 @@ mod tests {
         assert!(h.is_known_empty());
         let mut key = [0u8; 32];
         key[0] = 0xab;
-        h.insert(&key, &ShHeadValue::inline_one(ShEntry::new(Fk(1))))
-            .unwrap();
+        h.insert(&key, &ShHeadValue::inline_one(Fk(1))).unwrap();
         assert_eq!(h.occupied(), 1);
         drop(h);
         // Drop sidecar only — reopen must not scan body and must not claim empty.
@@ -1580,7 +1572,7 @@ mod tests {
             full[1] = 0x11;
             seed.push((
                 head_key_from_full(&full),
-                ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
+                ShHeadValue::inline_one(Fk(u64::from(i) + 1)),
             ));
             existing.push(full);
         }
@@ -1599,7 +1591,7 @@ mod tests {
             full[1] = 0x22;
             batch.push((
                 head_key_from_full(&full),
-                ShHeadValue::inline_one(ShEntry::new(Fk(100 + u64::from(i)))),
+                ShHeadValue::inline_one(Fk(100 + u64::from(i))),
             ));
         }
         let rem = h.insert_many_no_rehash(&batch, true).unwrap();
@@ -1635,10 +1627,7 @@ mod tests {
         let mut brand = [0u8; 32];
         brand[0] = 0xfe;
         brand[1] = 0x99;
-        let only_new = vec![(
-            head_key_from_full(&brand),
-            ShHeadValue::inline_one(ShEntry::new(Fk(555))),
-        )];
+        let only_new = vec![(head_key_from_full(&brand), ShHeadValue::inline_one(Fk(555)))];
         let rem2 = h.insert_many_no_rehash(&only_new, false).unwrap();
         assert_eq!(rem2.len(), 1, "update-only must remainder all new keys");
         assert!(h.get(&brand).unwrap().is_none());
@@ -1665,8 +1654,7 @@ mod tests {
         h.reserve_additional(200).unwrap(); // cold grow empty
         let mut k = [0u8; 32];
         k[0] = 9;
-        h.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(1))))
-            .unwrap();
+        h.insert(&k, &ShHeadValue::inline_one(Fk(1))).unwrap();
         h.reserve_additional(50).unwrap(); // rehash when occupied
         let _ = std::fs::remove_file(&path);
 
@@ -1684,8 +1672,7 @@ mod tests {
         let mut live = LiveShardTable::with_key_budget(8);
         let mut k0 = [0u8; 32];
         k0[0] = 0x00;
-        live.insert(&k0, &ShHeadValue::inline_one(ShEntry::new(Fk(3))))
-            .unwrap();
+        live.insert(&k0, &ShHeadValue::inline_one(Fk(3))).unwrap();
         sh.install_live_shard(0, live).unwrap();
         assert!(!sh.is_empty());
         assert!(matches!(
@@ -1720,7 +1707,7 @@ mod tests {
             let val = if i % 3 == 0 {
                 ShHeadValue::slab(0, 2, 4096 + i)
             } else if i % 3 == 1 {
-                ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))
+                ShHeadValue::inline_one(Fk(i + 1))
             } else {
                 ShHeadValue::paged(4112 + i * 4096, 4112 + i * 4096)
             };
@@ -1732,7 +1719,7 @@ mod tests {
         for i in 40u64..80 {
             let mut key = [0u8; 32];
             key[0..8].copy_from_slice(&i.to_le_bytes());
-            more.push((key, ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))));
+            more.push((key, ShHeadValue::inline_one(Fk(i + 1))));
         }
         h.insert_many(&more).unwrap();
         let mut seen = 0u64;
@@ -1786,8 +1773,7 @@ mod tests {
         assert_eq!(h1.shard_count(), 1);
         let mut k = [0u8; 32];
         k[0] = 0xab;
-        h1.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(9))))
-            .unwrap();
+        h1.insert(&k, &ShHeadValue::inline_one(Fk(9))).unwrap();
         assert!(h1.get(&k).unwrap().is_some());
         h1.clear_key(&k).unwrap();
         h1.reinit_empty().unwrap();
@@ -1803,11 +1789,8 @@ mod tests {
         for i in 0u8..16 {
             let mut key = [0u8; 32];
             key[0] = i.wrapping_mul(0x40); // spread high bits
-            h.insert(
-                &key,
-                &ShHeadValue::inline_one(ShEntry::new(Fk(i as u64 + 1))),
-            )
-            .unwrap();
+            h.insert(&key, &ShHeadValue::inline_one(Fk(i as u64 + 1)))
+                .unwrap();
             assert_eq!(h.shard_index(&key), prefix_shard_of(&key, 4));
         }
         h.flush().unwrap();

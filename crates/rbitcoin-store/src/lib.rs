@@ -87,9 +87,8 @@ pub use point_table::PointRecord;
 pub use scripthash::{
     copy_sh_body_range, detect_sh_body_layout, has_sh_run_rebuild_source, load_include_hwm,
     remap_copied_page_chain, remap_sh_head_value, script_hash, sh_run_catalog_key_len_ok,
-    store_include_hwm, ColdProgress, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord,
-    ScriptHashTable, ShBodyLayout, ShShardPack, COLD_PROGRESS_NAME, INCLUDE_HWM_NAME,
-    SH_RUN_SORT_KEY_LEN,
+    store_include_hwm, ColdProgress, ScriptHashBulkSession, ScriptHashRecord, ScriptHashTable,
+    ShBodyLayout, ShShardPack, COLD_PROGRESS_NAME, INCLUDE_HWM_NAME, SH_RUN_SORT_KEY_LEN,
 };
 pub use scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_slots_for_keys, sh_unique_hint_default,
@@ -99,10 +98,11 @@ pub use scripthash_layout::ShHeadValue;
 pub use scripthash_layout::SH_MAX_SLAB_CLASS;
 pub use scripthash_materialize::{materialize_sh_shards, MaterializeStageNs, ShShardMaterialize};
 pub use scripthash_slabs::{
-    decode_fk_delta_stream, decode_slab_payload, encode_fk_delta_stream,
-    encode_fk_delta_stream_into, encode_slab_payload, encode_slab_payload_into,
-    page_alloc_bytes_for_n_fks, slab_alloc_bytes_for_n_fks, slab_class_for_n_fks,
-    slab_class_for_n_fks_with_slack, slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
+    decode_fk_delta_stream, decode_fk_delta_stream_into, decode_slab_payload,
+    decode_slab_payload_into, encode_fk_delta_stream, encode_fk_delta_stream_into,
+    encode_slab_payload, encode_slab_payload_into, page_alloc_bytes_for_n_fks,
+    slab_alloc_bytes_for_n_fks, slab_class_for_n_fks, slab_class_for_n_fks_with_slack,
+    slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
 };
 pub use scripthash_sorted_head::{SortedHead, SortedHeadFilter, SH_SORTED_RECS_PER_PAGE};
 pub use segmented_head::{

@@ -106,7 +106,7 @@ fn sh_bodies_are_split() {
         assert_eq!(t.body_layout(), ShBodyLayout::Sharded);
         let k0 = sh_prefix_key(0, 0);
         let k2 = sh_prefix_key(2, 0);
-        let ents: Vec<ShEntry> = (1..=8).map(|i| ShEntry::new(Fk(i))).collect();
+        let ents: Vec<Fk> = (1..=8).map(|i| Fk(i)).collect();
         {
             let mut s = t.bulk_session(16).unwrap();
             s.put_chain(k0, &ents).unwrap();
@@ -244,9 +244,9 @@ fn put_unique(t: &ScriptHashTable, tag: u8, n: u32) {
 
 #[test]
 fn script_hash_record_helpers_and_table_flush_open() {
-    let e = ShEntry::new(Fk(9));
-    let r = ScriptHashRecord::from_entry([1u8; 32], e);
-    assert_eq!(r.entry(), e);
+    let e = Fk(9);
+    let r = ScriptHashRecord::from_fk([1u8; 32], e);
+    assert_eq!(r.create_tx_fk, e);
     assert!(!r.is_tombstone());
     let tomb = ScriptHashRecord::from_fk([2u8; 32], Fk::NULL);
     assert!(tomb.is_tombstone());
@@ -813,9 +813,7 @@ fn cold_install_sorted_main_and_global_ingest() {
     let sh_main = script_hash(&[0x10]);
     let sh_new = script_hash(&[0x99]);
     let mut session = t.bulk_session(16).unwrap();
-    session
-        .put_chain(sh_main, &[ShEntry::new(Fk(1)), ShEntry::new(Fk(2))])
-        .unwrap();
+    session.put_chain(sh_main, &[Fk(1), Fk(2)]).unwrap();
     session.finish().unwrap();
     assert!(
         t.has_sorted_main(),
@@ -876,7 +874,7 @@ fn reopen_after_ingest_seal_and_unlink_homes() {
         let t = ScriptHashTable::create(&dir).unwrap();
         let sh_main = script_hash(&[0x10]);
         let mut session = t.bulk_session(8).unwrap();
-        session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
+        session.put_chain(sh_main, &[Fk(1)]).unwrap();
         session.finish().unwrap();
 
         let mut first_new = [0u8; 32];
@@ -919,7 +917,7 @@ fn compact_merges_two_sealed_global_ovf_files() {
         let t = ScriptHashTable::create(&dir).unwrap();
         let sh_main = script_hash(&[0x10]);
         let mut session = t.bulk_session(8).unwrap();
-        session.put_chain(sh_main, &[ShEntry::new(Fk(1))]).unwrap();
+        session.put_chain(sh_main, &[Fk(1)]).unwrap();
         session.finish().unwrap();
 
         let mut first_new = [0u8; 32];
@@ -986,7 +984,7 @@ fn bulk_session_packs_exact_class_from_count() {
     for &(tag, n) in cases {
         let mut sh = [0u8; 32];
         sh[0] = tag;
-        let ents: Vec<_> = (1..=u64::from(n)).map(|i| ShEntry::new(Fk(i))).collect();
+        let ents: Vec<_> = (1..=u64::from(n)).map(|i| Fk(i)).collect();
         session.put_chain(sh, &ents).unwrap();
     }
     let (creates, keys, _, _) = session.finish().unwrap();
@@ -1054,7 +1052,7 @@ fn bulk_session_put_chain_roundtrip() {
         sh[1] = 0xab;
         let n = if i % 5 == 0 { 8 } else { 1 + (i % 2) };
         let ents: Vec<_> = (0..n)
-            .map(|j| ShEntry::new(Fk(u64::from(i) * 100 + u64::from(j) + 1)))
+            .map(|j| Fk(u64::from(i) * 100 + u64::from(j) + 1))
             .collect();
         session.put_chain(sh, &ents).unwrap();
     }
@@ -1283,6 +1281,55 @@ fn pack_shard_session_slab_flush_times_body_and_roundtrips() {
             assert_eq!(ents[0].0, Fk(base));
             assert_eq!(ents[1].0, Fk(base + 1));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn create_fks_matches_entries() {
+    HeadScale::test_with(HeadScale::Tiny, || {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let one = script_hash(&[0x01]);
+        t.put_create(&rec(one, 7, 0)).unwrap();
+        assert_eq!(
+            t.create_fks(&one).unwrap(),
+            t.entries(&one)
+                .unwrap()
+                .into_iter()
+                .map(|(fk, _)| fk)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(t.create_fks(&one).unwrap(), vec![Fk(7)]);
+
+        let two = script_hash(&[0x02]);
+        t.put_create(&rec(two, 1, 0)).unwrap();
+        t.put_create(&rec(two, 2, 0)).unwrap();
+        assert_eq!(t.create_fks(&two).unwrap(), vec![Fk(1), Fk(2)]);
+        assert_eq!(
+            t.create_fks(&two).unwrap(),
+            t.entries(&two)
+                .unwrap()
+                .into_iter()
+                .map(|(fk, _)| fk)
+                .collect::<Vec<_>>()
+        );
+
+        let mega = script_hash(&[0x03]);
+        let recs: Vec<_> = (1..=600u64).map(|i| rec(mega, i, 0)).collect();
+        t.put_create_batch(&recs).unwrap();
+        let fks = t.create_fks(&mega).unwrap();
+        assert_eq!(fks.len(), 600);
+        assert_eq!(fks.first().copied(), Some(Fk(1)));
+        assert_eq!(fks.last().copied(), Some(Fk(600)));
+        assert_eq!(
+            fks,
+            t.entries(&mega)
+                .unwrap()
+                .into_iter()
+                .map(|(fk, _)| fk)
+                .collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -1707,7 +1754,7 @@ fn bulk_session_extent_last_page_splits_when_ver2_header_eats_stream() {
     let n = SH_PAGE_EXTENT_STREAM_MAX + 8;
     let mut sh = [0u8; 32];
     sh[0] = 0x11;
-    let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+    let ents: Vec<_> = (1..=n as u64).map(|i| Fk(i)).collect();
     let mut session = t.bulk_session(1).unwrap();
     session.put_chain(sh, &ents).unwrap();
     let (creates, keys, _, _) = session.finish().unwrap();
@@ -1741,7 +1788,7 @@ fn bulk_session_streamed_last_remainder_fits_ver2() {
     let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX + 8;
     let mut sh = [0u8; 32];
     sh[0] = 0x12;
-    let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+    let ents: Vec<_> = (1..=n as u64).map(|i| Fk(i)).collect();
     let mut session = t.bulk_session(1).unwrap();
     session.put_chain(sh, &ents).unwrap();
     let (creates, keys, _, _) = session.finish().unwrap();
@@ -1773,11 +1820,11 @@ fn bulk_session_megakey_page_chain_contiguous_once() {
     let mut sh = [0u8; 32];
     sh[0] = 0x10;
     sh[1] = 0xee;
-    let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+    let ents: Vec<_> = (1..=n as u64).map(|i| Fk(i)).collect();
     let mut sh_next = [0u8; 32];
     sh_next[0] = 0x10;
     sh_next[1] = 0xef;
-    let next_ents = vec![ShEntry::new(Fk(1)), ShEntry::new(Fk(2))];
+    let next_ents = vec![Fk(1), Fk(2)];
     let mut session = t.bulk_session(2).unwrap();
     session.put_chain(sh, &ents).unwrap();
     session.put_chain(sh_next, &next_ents).unwrap();
@@ -1869,15 +1916,13 @@ fn extent_append_links_tail_when_bump_moved() {
     let mut sh = [0u8; 32];
     sh[0] = 0x21;
     sh[1] = 0xaa;
-    let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+    let ents: Vec<_> = (1..=n as u64).map(|i| Fk(i)).collect();
     let mut sh_gap = [0u8; 32];
     sh_gap[0] = 0x21;
     sh_gap[1] = 0xab;
     let mut session = t.bulk_session(2).unwrap();
     session.put_chain(sh, &ents).unwrap();
-    session
-        .put_chain(sh_gap, &[ShEntry::new(Fk(1)), ShEntry::new(Fk(2))])
-        .unwrap();
+    session.put_chain(sh_gap, &[Fk(1), Fk(2)]).unwrap();
     let _ = session.finish().unwrap();
     let (base, last0, n0) = extent_meta(&t, &sh);
     assert_eq!(n0, 2);
@@ -1917,7 +1962,7 @@ fn extent_append_glued_bumps_extent_n() {
     let n = SH_PAGE_STREAM_MAX + SH_PAGE_EXTENT_STREAM_MAX - 1;
     let mut sh = [0u8; 32];
     sh[0] = 0x22;
-    let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
+    let ents: Vec<_> = (1..=n as u64).map(|i| Fk(i)).collect();
     let mut session = t.bulk_session(1).unwrap();
     session.put_chain(sh, &ents).unwrap();
     let _ = session.finish().unwrap();
@@ -1967,7 +2012,7 @@ fn reinit_clears_head_when_live_count_already_zero() {
     let mut sh = [0u8; 32];
     sh[0] = 0x7e;
     let mut session = t.bulk_session(1).unwrap();
-    session.put_chain(sh, &[ShEntry::new(Fk(42))]).unwrap();
+    session.put_chain(sh, &[Fk(42)]).unwrap();
     let _ = session.finish().unwrap();
     assert!(!t.head_is_empty());
     t.test_zero_live_count_keep_head().unwrap();
@@ -1979,7 +2024,7 @@ fn reinit_clears_head_when_live_count_already_zero() {
     assert!(t.head_is_empty());
     assert_eq!(t.entry_count(), 0);
     let mut session = t.bulk_session(2).unwrap();
-    session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
+    session.put_chain(sh, &[Fk(1)]).unwrap();
     let (n, _, _, _) = session.finish().unwrap();
     assert_eq!(n, 1);
     assert_eq!(t.entries(&sh).unwrap()[0].1.create_tx_fk, Fk(1));
@@ -2003,9 +2048,7 @@ fn bulk_session_flushes_head_on_prefix_shard_boundary() {
     assert!(t.head_value(&key(0)).unwrap().is_none());
     for i in 0..N {
         let sh = key(i);
-        session
-            .put_chain(sh, &[ShEntry::new(Fk(u64::from(i) + 1))])
-            .unwrap();
+        session.put_chain(sh, &[Fk(u64::from(i) + 1)]).unwrap();
         // Active shard not yet installed: this key is only in the live image.
         if i == 70_000 {
             assert!(
@@ -2047,13 +2090,11 @@ fn cold_progress_and_resume_skips_complete_shards() {
         let mut session = t.bulk_session(64).unwrap();
         for i in 0..8u8 {
             session
-                .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
+                .put_chain(key(0, i), &[Fk(u64::from(i) + 1)])
                 .unwrap();
         }
         // Cross into shard 1 so shard 0 is installed + checkpointed.
-        session
-            .put_chain(key(1, 0), &[ShEntry::new(Fk(100))])
-            .unwrap();
+        session.put_chain(key(1, 0), &[Fk(100)]).unwrap();
         assert!(ColdProgress::load(&dir).unwrap().is_some());
         let p = ColdProgress::load(&dir).unwrap().unwrap();
         assert_eq!(p.next_shard, 1);
@@ -2066,16 +2107,13 @@ fn cold_progress_and_resume_skips_complete_shards() {
         // Re-deliver shard 0 keys (must be ignored).
         for i in 0..8u8 {
             session
-                .put_chain(key(0, i), &[ShEntry::new(Fk(u64::from(i) + 1))])
+                .put_chain(key(0, i), &[Fk(u64::from(i) + 1)])
                 .unwrap();
         }
         for shard in 1u8..4 {
             for i in 0..4u8 {
                 session
-                    .put_chain(
-                        key(shard, i),
-                        &[ShEntry::new(Fk(u64::from(shard) * 100 + u64::from(i)))],
-                    )
+                    .put_chain(key(shard, i), &[Fk(u64::from(shard) * 100 + u64::from(i))])
                     .unwrap();
             }
         }
@@ -2099,7 +2137,7 @@ fn live_session_does_not_size_from_create_count() {
     let mut session = t.bulk_session(1_000).unwrap();
     let mut sh = [0u8; 32];
     sh[0] = 1;
-    session.put_chain(sh, &[ShEntry::new(Fk(1))]).unwrap();
+    session.put_chain(sh, &[Fk(1)]).unwrap();
     let peak = session.peak_table_bytes;
     let _ = session.finish().unwrap();
     assert_eq!(peak, 24, "one streamed rec is 24 B, not an OA image");

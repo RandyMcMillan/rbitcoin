@@ -390,12 +390,12 @@ impl Query {
         to_height: Option<i64>,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         let t_pages = std::time::Instant::now();
-        let entries = self.store.scripthash.entries(scripthash)?;
+        let entries = self.store.scripthash.create_fks(scripthash)?;
         let pages_us = t_pages.elapsed().as_micros();
         let mut fks = Vec::new();
-        for (_fk, thin) in entries {
-            if self.store.is_confirmed_strong(thin.create_tx_fk)? {
-                fks.push(thin.create_tx_fk);
+        for fk in entries {
+            if self.store.is_confirmed_strong(fk)? {
+                fks.push(fk);
             }
         }
         if let Some(to) = to_height {
@@ -781,14 +781,11 @@ impl Query {
         scripthash: &[u8; 32],
         height: Height,
     ) -> Result<Vec<Fk>, QueryError> {
-        let entries = self.store.scripthash.entries(scripthash)?;
+        let entries = self.store.scripthash.create_fks(scripthash)?;
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let mut posting: Vec<u64> = entries
-            .iter()
-            .filter_map(|(_, r)| r.create_tx_fk.get())
-            .collect();
+        let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
         posting.sort_unstable();
         posting.dedup();
         let block_fks = self.block_tx_fks(height)?;

@@ -259,7 +259,7 @@ fn pwrite_file(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripthash_layout::{pack8, ShEntry};
+    use crate::scripthash_layout::pack8;
     use rbitcoin_primitives::Fk;
 
     fn tmp() -> PathBuf {
@@ -286,8 +286,8 @@ mod tests {
     fn sh_mphf_two_keys_get_and_miss() {
         let dir = tmp();
         let base = dir.join("00");
-        let a = ShHeadValue::inline_one(ShEntry::new(Fk(11)));
-        let b = ShHeadValue::inline_one(ShEntry::new(Fk(22)));
+        let a = ShHeadValue::inline_one(Fk(11));
+        let b = ShHeadValue::inline_one(Fk(22));
         let recs = [(key(1), pack8(&a).unwrap()), (key(2), pack8(&b).unwrap())];
         let h = MphfHead::write_pack8(&base, &recs).unwrap();
         assert_eq!(h.get(&key(1)).unwrap().unwrap(), a);
@@ -308,7 +308,7 @@ mod tests {
     fn sh_mphf_update_inline_to_slab() {
         let dir = tmp();
         let base = dir.join("00");
-        let one = ShHeadValue::inline_one(ShEntry::new(Fk(3)));
+        let one = ShHeadValue::inline_one(Fk(3));
         let h = MphfHead::write_pack8(&base, &[(key(4), pack8(&one).unwrap())]).unwrap();
         let slab = ShHeadValue::slab(0, 2, 4096);
         assert!(h.update_value(&key(4), &slab).unwrap());

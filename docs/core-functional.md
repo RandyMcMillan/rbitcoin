@@ -178,9 +178,9 @@ Named scenarios in `crates/rbitcoin-test/tests/core_analogs.rs`:
 
 | Core skip | Analog |
 |-----------|--------|
-| `feature_assumevalid.py` | `analog_milestone_skip_below_check_above` |
+| `feature_assumevalid.py` | `analog_milestone_and_mempool_persist` (skip-below / check-above + missing prevout under high milestone) |
 | `feature_reindex*.py` | `analog_reconstruct_after_lost_head` |
-| `mempool_persist.py` | `analog_mempool_persist_reopen` |
+| `mempool_persist.py` | `analog_milestone_and_mempool_persist` (same pad) |
 
 `rpc-missing` also requires `analog` (a follow-up row or `none`).
 

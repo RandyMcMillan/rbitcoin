@@ -34,7 +34,7 @@ refreshing; do not check copies into `tests/fixtures/`.
 | `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
 | `sighash.json` | same | `script::core_sighash::core_sighash_all_rows` | every data row digest matches Core |
 | `bip341_wallet_vectors.json` | same | `script::core_bip341::core_bip341_wallet_vectors_all_rows` | key-path fully-signed + per-input spends accept; unknown-leaf script-path accepts |
-| mainnet 866342 + prevouts | `tests/fixtures/block_866342/` (Floresta zstd) | `block::block_866342::block_866342_structure_and_scripts` | structure at height + every non-coinbase `verify_job_all_inputs` |
+| mainnet 866342 + prevouts | `tests/fixtures/block_866342/` (Floresta zstd) | `block::block_866342::block_866342_structure_scripts_and_overweight` | structure at height + every non-coinbase `verify_job_all_inputs`; extra-NOP clone is 4_000_001 WU |
 
 ### How the harness works
 

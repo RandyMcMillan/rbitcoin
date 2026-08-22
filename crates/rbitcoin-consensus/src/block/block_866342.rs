@@ -115,8 +115,7 @@ fn patch_witness_commitment(block: &mut Block) {
     block.header.merkle_root = block.compute_merkle_root().expect("merkle");
 }
 
-fn oversized_866342() -> Block {
-    let mut block = load_block();
+fn oversized_866342(mut block: Block) -> Block {
     let extra = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -140,7 +139,7 @@ fn oversized_866342() -> Block {
 }
 
 #[test]
-fn block_866342_structure_and_scripts() {
+fn block_866342_structure_scripts_and_overweight() {
     let t0 = Instant::now();
     let block = load_block();
     assert_eq!(
@@ -161,6 +160,7 @@ fn block_866342_structure_and_scripts() {
     );
 
     let n_tx = block.txdata.len();
+    let fat = oversized_866342(block.clone());
     let arc = Arc::new(block);
     let mut stxos = prevouts.into_iter();
     for i in 1..n_tx {
@@ -189,21 +189,17 @@ fn block_866342_structure_and_scripts() {
         });
     }
     assert!(stxos.next().is_none(), "leftover spent_utxos");
-    eprintln!(
-        "block_866342 structure+scripts wall={:.3}s txs={}",
-        t0.elapsed().as_secs_f64(),
-        n_tx
-    );
-}
 
-#[test]
-fn block_866342_overweight_rejects() {
-    let block = oversized_866342();
-    assert_eq!(block.weight().to_wu(), OVERWEIGHT_WU);
-    let ctx = ctx();
-    let err = validate_block_structure_hashed(&block, &ctx).expect_err("overweight");
+    assert_eq!(fat.weight().to_wu(), OVERWEIGHT_WU);
+    let err = validate_block_structure_hashed(&fat, &ctx).expect_err("overweight");
     match err {
         ConsensusError::BadBlock(s) => assert!(s.contains("weight"), "got {s}"),
         other => panic!("expected weight BadBlock, got {other}"),
     }
+
+    eprintln!(
+        "block_866342 structure+scripts+overweight wall={:.3}s txs={}",
+        t0.elapsed().as_secs_f64(),
+        n_tx
+    );
 }

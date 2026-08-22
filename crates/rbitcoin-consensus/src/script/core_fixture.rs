@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 const HINT: &str = "run ./scripts/core-functional/init-submodule.sh (sparse v31.1 pin)";
 
@@ -116,15 +116,30 @@ fn stage_dir() -> PathBuf {
 
 /// Replace `dest` with a hard link to `src`, or a copy if link is not allowed.
 fn install(src: &Path, dest: &Path) {
-    if dest.exists() {
-        let _ = fs::remove_file(dest);
+    static STAGE: Mutex<()> = Mutex::new(());
+    let _g = STAGE.lock().unwrap();
+    if dest.is_file() {
+        return;
     }
     if fs::hard_link(src, dest).is_ok() {
         return;
     }
-    let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
+    let tmp = dest.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     fs::copy(src, &tmp).unwrap_or_else(|e| panic!("copy {src:?} -> {tmp:?}: {e}"));
-    fs::rename(&tmp, dest).unwrap_or_else(|e| panic!("rename {tmp:?} -> {dest:?}: {e}"));
+    match fs::rename(&tmp, dest) {
+        Ok(()) => {}
+        Err(_) if dest.is_file() => {
+            let _ = fs::remove_file(&tmp);
+        }
+        Err(e) => panic!("rename {tmp:?} -> {dest:?}: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +173,16 @@ mod tests {
             head.trim_start().starts_with('['),
             "expected JSON array at {p:?}"
         );
+    }
+
+    #[test]
+    fn concurrent_stage_same_json_does_not_lose_tmp() {
+        let a = std::thread::spawn(|| stage_core_json("bip341_wallet_vectors.json"));
+        let b = std::thread::spawn(|| stage_core_json("bip341_wallet_vectors.json"));
+        let pa = a.join().expect("a");
+        let pb = b.join().expect("b");
+        assert_eq!(pa, pb);
+        assert!(pa.is_file());
     }
 
     #[test]

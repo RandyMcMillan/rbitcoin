@@ -1636,6 +1636,23 @@ mod tests {
         std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}"))
     }
 
+    fn spend_true(cb: Txid, fee: u64, spk: ScriptBuf) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - fee),
+                script_pubkey: spk,
+            }],
+        }
+    }
+
     #[test]
     fn sh_index_insert_overwrite_and_remove_miss() {
         let mut idx = MempoolShIndex::new();
@@ -1650,55 +1667,212 @@ mod tests {
         assert!(idx.txs_for(&[3u8; 32]).next().is_none());
     }
 
+    /// One 8-coinbase pad covers reorg-reaccept, unbroadcast persist, SH reopen,
+    /// live accept/fee/package, unknown-SH delta, and accept-stage meters.
     #[test]
-    fn reorg_reaccept_marks_wtxid_servable() {
-        use bitcoin::absolute::LockTime;
-        use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    fn hub_live_journey() {
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
         use rbitcoin_primitives::Height;
+        use rbitcoin_store::script_hash;
 
         if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
             std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
         }
         let store_dir = tmp();
-        let mp_dir = tmp();
         let q = Query::open_or_create(&store_dir).unwrap();
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        const N_CB: u32 = 8;
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
             &q,
             &params,
             genesis.block_hash(),
             genesis.header.time,
             1,
-            102,
-            2,
+            100 + N_CB,
+            N_CB,
         );
-        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
-        hub.set_relay_enabled(true);
-        let tx = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: coinbase_txids[0],
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_9999_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        assert!(!hub.is_reorg_servable(&tx.compute_wtxid()));
-        assert_eq!(hub.reorg_reaccept(std::slice::from_ref(&tx)), 1);
-        assert!(hub.is_reorg_servable(&tx.compute_wtxid()));
-        let _ = std::fs::remove_dir_all(&mp_dir);
+        let q = Arc::new(q);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let sh = script_hash(spk.as_bytes());
+
+        {
+            let mp = tmp();
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            let tx = spend_true(cbs[0], 1_000, spk.clone());
+            assert!(!hub.is_reorg_servable(&tx.compute_wtxid()));
+            assert_eq!(hub.reorg_reaccept(std::slice::from_ref(&tx)), 1);
+            assert!(hub.is_reorg_servable(&tx.compute_wtxid()));
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            let mp = tmp();
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            let tx = spend_true(cbs[1], 1_000, spk.clone());
+            hub.accept_tx(&tx).expect("accept");
+            hub.note_unbroadcast(tx.compute_txid());
+            assert_eq!(hub.unbroadcast_count(), 1);
+            hub.flush().expect("shutdown flush");
+            drop(hub);
+            let hub2 = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub2.set_relay_enabled(true);
+            assert_eq!(hub2.unbroadcast_count(), 1);
+            let mut rx = hub2.subscribe_announces();
+            hub2.rebroadcast_unbroadcast();
+            let got = rx.try_recv().expect("mockscheduler rebroadcast");
+            assert_eq!(got.txid, tx.compute_txid());
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            let mp = tmp();
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            let mut rx = hub.subscribe_announces();
+            let parent = spend_true(cbs[2], 1_000, spk.clone());
+            hub.accept_tx(&parent).expect("accept");
+            let ann = rx.try_recv().expect("announce");
+            assert!(ann.scripthashes.contains(&sh));
+            let child = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_9998_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            hub.accept_tx(&child).expect("child");
+            assert!(hub.scripthash_mempool(&sh).len() >= 2);
+            hub.flush().unwrap();
+            drop(hub);
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            assert!(hub.scripthash_mempool(&sh).len() >= 2);
+            assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
+            assert!(!hub.scripthash_mempool(&sh).is_empty());
+            assert!(hub.remove_for_block(&[child.compute_txid()]) >= 1);
+            assert!(hub.scripthash_mempool(&sh).is_empty());
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            let mp = tmp();
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            let mut ann_rx = hub.subscribe_announces();
+            let provider = QueryUtxoProvider { query: q.as_ref() };
+            let op0 = OutPoint {
+                txid: cbs[3],
+                vout: 0,
+            };
+            assert!(provider.get_txout(&op0).is_some());
+            let parent = spend_true(cbs[3], 1_000, spk.clone());
+            let pr = hub.accept_tx(&parent).expect("accept parent");
+            assert_eq!(pr.txid, parent.compute_txid());
+            assert!(matches!(ann_rx.try_recv(), Ok(_)));
+            let recent = hub.recent_accepts();
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].txid, parent.compute_txid());
+            assert_eq!(recent[0].fee_sat, 1_000);
+            let child = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - 2_000),
+                    script_pubkey: spk.clone(),
+                }],
+            };
+            let second = spend_true(cbs[4], 5_000, ScriptBuf::from_bytes(vec![0x52]));
+            hub.accept_tx(&child).expect("child");
+            let pkg = hub.accept_package(&[second]).expect("package");
+            assert_eq!(pkg.len(), 1);
+            assert_eq!(hub.live_count(), 3);
+            assert!(hub.contains(&parent.compute_txid()));
+            let wtxid = parent.compute_wtxid();
+            assert!(hub.contains_wtxid(&wtxid));
+            assert!(hub.get_tx_by_wtxid(&wtxid).is_some());
+            assert!(!hub.fee_histogram().is_empty());
+            let e1 = hub.estimate_fee_btc_per_kb(1);
+            let e5 = hub.estimate_fee_btc_per_kb(5);
+            let e20 = hub.estimate_fee_btc_per_kb(20);
+            assert!(e1 >= 0.0 && e5 >= 0.0 && e20 >= 0.0);
+            let spent = hub.spent_outpoints();
+            assert!(spent.contains(&op0));
+            let rows = hub.scripthash_mempool(&sh);
+            assert!(rows.len() >= 2);
+            assert!(rows.iter().any(|r| r.height == -1));
+            let delta = hub.scripthash_unconfirmed_delta(&sh);
+            assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
+            assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
+            assert!(hub.list_live().len() < 3);
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            let mp = tmp();
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            let _ = hub.sample_reset_perf();
+            let mut fee_sum = 0i64;
+            for (i, cbtxid) in cbs[5..8].iter().enumerate() {
+                let fee = 1_000u64 + i as u64;
+                fee_sum += fee as i64;
+                hub.accept_tx(&spend_true(*cbtxid, fee, spk.clone()))
+                    .expect("accept spend");
+            }
+            let n = 3u64;
+            let s = hub.sample_reset_perf();
+            assert_eq!(s.accepts, n);
+            assert!(s.accept_us > 0);
+            assert!(s.accept_lock_us > 0);
+            assert!(s.accept_utxo_us > 0);
+            assert!(s.accept_script_us > 0);
+            assert!(s.accept_durable_us > 0);
+            assert!(
+                s.accept_lock_us >= s.accept_durable_us,
+                "lock_us={} durable_us={}",
+                s.accept_lock_us,
+                s.accept_durable_us
+            );
+            assert!(
+                s.accept_us >= s.accept_script_us,
+                "wall={} script={}",
+                s.accept_us,
+                s.accept_script_us
+            );
+            let z = hub.sample_reset_perf();
+            assert_eq!(z.accepts, 0);
+            let unused = script_hash(&[0x00]);
+            let _ = hub.sample_reset_perf();
+            assert_eq!(hub.scripthash_unconfirmed_delta(&unused), 0);
+            let s = hub.sample_reset_perf();
+            assert_eq!(s.delta_prevouts, 0);
+            assert_eq!(hub.scripthash_unconfirmed_delta(&sh), -fee_sum);
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
@@ -1733,161 +1907,6 @@ mod tests {
                 "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
             )
         );
-    }
-
-    #[test]
-    fn unbroadcast_persists_and_mockscheduler_rebroadcasts() {
-        use bitcoin::absolute::LockTime;
-        use bitcoin::transaction::Version as TxVersion;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-        let store_dir = tmp();
-        let mp_dir = tmp();
-        let q = Query::open_or_create(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            2,
-        );
-        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
-        hub.set_relay_enabled(true);
-        let tx = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: coinbase_txids[0],
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_9999_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        hub.accept_tx(&tx).expect("accept");
-        hub.note_unbroadcast(tx.compute_txid());
-        assert_eq!(hub.unbroadcast_count(), 1);
-        hub.flush().expect("shutdown flush");
-        drop(hub);
-
-        let q2 = Query::open_or_create(&store_dir).unwrap();
-        let hub2 = MempoolHub::open(&mp_dir, Arc::new(q2)).unwrap();
-        hub2.set_relay_enabled(true);
-        assert_eq!(
-            hub2.unbroadcast_count(),
-            1,
-            "unbroadcast set must reload from sidecar"
-        );
-        let mut rx = hub2.subscribe_announces();
-        hub2.rebroadcast_unbroadcast();
-        let got = rx.try_recv().expect("mockscheduler rebroadcast");
-        assert_eq!(got.txid, tx.compute_txid());
-        let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    /// Accept → persist → reopen rebuilds the scripthash index; remove unindexes.
-    #[test]
-    fn sh_index_reopen_and_remove_unindexes() {
-        use bitcoin::transaction::Version as TxVersion;
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-        use rbitcoin_store::script_hash;
-
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-        let store_dir = tmp();
-        let mp_dir = tmp();
-        let q = Query::open_or_create(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            103,
-            1,
-        );
-        let q = Arc::new(q);
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
-        hub.set_relay_enabled(true);
-        let mut rx = hub.subscribe_announces();
-        let spk = ScriptBuf::from_bytes(vec![0x51]);
-        let sh = script_hash(spk.as_bytes());
-        let parent = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: coinbase_txids[0],
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_9999_0000),
-                script_pubkey: spk,
-            }],
-        };
-        hub.accept_tx(&parent).expect("accept");
-        let ann = rx.try_recv().expect("announce");
-        assert!(ann.scripthashes.contains(&sh), "announce lists output sh");
-        // Child spends mempool parent — indexes input SH via graph.creator.
-        let child = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_9998_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        hub.accept_tx(&child).expect("child");
-        assert!(hub.scripthash_mempool(&sh).len() >= 2);
-        hub.flush().unwrap();
-        drop(hub);
-
-        // Reopen: reindex_live_scripthashes must restore the mapping.
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
-        hub.set_relay_enabled(true);
-        assert!(hub.scripthash_mempool(&sh).len() >= 2);
-        assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
-        // Child remains indexed until removed.
-        assert!(!hub.scripthash_mempool(&sh).is_empty());
-        assert!(hub.remove_for_block(&[child.compute_txid()]) >= 1);
-        assert!(hub.scripthash_mempool(&sh).is_empty());
-        let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]
@@ -1999,316 +2018,6 @@ mod tests {
         // Empty store: still can accept nothing without parents — just open hub.
         let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
         assert!(hub.recent_accepts().is_empty());
-        let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    /// Accept live spends of confirmed OP_TRUE coinbases via QueryUtxoProvider —
-    /// covers fee histogram, estimate percentiles, scripthash mempool/delta,
-    /// wtxid lookup, package announce, and spent outpoints.
-    #[test]
-    fn hub_live_accept_fee_scripthash_and_package() {
-        use bitcoin::transaction::Version as TxVersion;
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-        use rbitcoin_store::script_hash;
-
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-        let store_dir = tmp();
-        let mp_dir = tmp();
-        let q = Query::open_or_create(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        // Early coinbases + maturity pad (shared helper).
-        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            103,
-            3,
-        );
-
-        let q_arc = Arc::new(q);
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q_arc)).unwrap();
-        hub.set_relay_enabled(true);
-        let mut ann_rx = hub.subscribe_announces();
-
-        // QueryUtxoProvider hit on confirmed coinbase.
-        let provider = QueryUtxoProvider {
-            query: q_arc.as_ref(),
-        };
-        let op0 = OutPoint {
-            txid: coinbase_txids[0],
-            vout: 0,
-        };
-        assert!(provider.get_txout(&op0).is_some());
-
-        let spk = ScriptBuf::from_bytes(vec![0x51]);
-        let sh = script_hash(spk.as_bytes());
-
-        // Parent spend → fee 1000.
-        let parent = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: op0,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000 - 1_000),
-                script_pubkey: spk.clone(),
-            }],
-        };
-        let pr = hub.accept_tx(&parent).expect("accept parent");
-        assert_eq!(pr.txid, parent.compute_txid());
-        assert!(matches!(ann_rx.try_recv(), Ok(_)));
-        let recent = hub.recent_accepts();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(recent[0].txid, parent.compute_txid());
-        assert_eq!(recent[0].fee_sat, 1_000);
-
-        // Child of mempool parent (height=-1 scripthash path) + second chain spend.
-        let child = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000 - 2_000),
-                script_pubkey: spk.clone(),
-            }],
-        };
-        let second = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: coinbase_txids[1],
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000 - 5_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x52]), // different spk
-            }],
-        };
-        // Package: child then second is not topo for child; accept child alone then package second.
-        hub.accept_tx(&child).expect("child");
-        let pkg = hub.accept_package(&[second.clone()]).expect("package");
-        assert_eq!(pkg.len(), 1);
-
-        assert_eq!(hub.live_count(), 3);
-        assert!(hub.contains(&parent.compute_txid()));
-        assert!(hub.get_tx(&parent.compute_txid()).is_some());
-        let wtxid = parent.compute_wtxid();
-        assert!(hub.contains_wtxid(&wtxid));
-        assert!(hub.get_tx_by_wtxid(&wtxid).is_some());
-
-        // Fee surfaces with live graph.
-        assert!(!hub.fee_histogram().is_empty());
-        let e1 = hub.estimate_fee_btc_per_kb(1); // 90th
-        let e5 = hub.estimate_fee_btc_per_kb(5); // 50th
-        let e20 = hub.estimate_fee_btc_per_kb(20); // 20th
-        assert!(e1 >= 0.0 && e5 >= 0.0 && e20 >= 0.0);
-
-        let spent = hub.spent_outpoints();
-        assert!(spent.contains(&op0));
-        assert!(spent.contains(&OutPoint {
-            txid: parent.compute_txid(),
-            vout: 0
-        }));
-
-        // Scripthash: parent/child touch OP_TRUE; second does not.
-        let rows = hub.scripthash_mempool(&sh);
-        assert!(rows.len() >= 2);
-        assert!(rows.iter().any(|r| r.height == -1)); // child of mempool parent
-        let delta = hub.scripthash_unconfirmed_delta(&sh);
-        // Parent spent chain coinbase; child spent parent (mempool) and holds OP_TRUE.
-        // Second spends another OP_TRUE coinbase to a different script.
-        // unconfirmed = +(50e8-2000) - 50e8 - 50e8
-        assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
-
-        // Remove confirmed + reorg reaccept empty already covered; remove live.
-        assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
-        assert!(hub.list_live().len() < 3);
-
-        let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    /// Electrum get_balance must not store-resolve every mempool chain input for
-    /// a scripthash the mempool index does not mention (Cake empty-key path).
-    #[test]
-    fn unconfirmed_delta_unknown_sh_does_not_resolve_chain_prevouts() {
-        use bitcoin::transaction::Version as TxVersion;
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-        use rbitcoin_store::script_hash;
-
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-        let store_dir = tmp();
-        let mp_dir = tmp();
-        let q = Query::open_or_create(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        const N_SPENDS: u32 = 4;
-        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            100 + N_SPENDS,
-            N_SPENDS,
-        );
-        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
-        hub.set_relay_enabled(true);
-        let spk = ScriptBuf::from_bytes(vec![0x51]);
-        let mut fee_sum = 0i64;
-        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
-            let fee = 1_000u64 + i as u64;
-            fee_sum += fee as i64;
-            let tx = Transaction {
-                version: TxVersion::TWO,
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: *cbtxid,
-                        vout: 0,
-                    },
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    witness: Witness::new(),
-                }],
-                output: vec![TxOut {
-                    value: Amount::from_sat(50_0000_0000 - fee),
-                    script_pubkey: spk.clone(),
-                }],
-            };
-            hub.accept_tx(&tx).expect("accept spend");
-        }
-        let _ = hub.sample_reset_perf();
-        let unused = script_hash(&[0x00]);
-        assert_eq!(hub.scripthash_unconfirmed_delta(&unused), 0);
-        let s = hub.sample_reset_perf();
-        assert_eq!(
-            s.delta_prevouts, 0,
-            "unknown scripthash must not resolve mempool chain prevouts (got {})",
-            s.delta_prevouts
-        );
-        let sh = script_hash(spk.as_bytes());
-        assert_eq!(hub.scripthash_unconfirmed_delta(&sh), -fee_sum);
-        let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    /// C0: stage meters accumulate on accept; sample-and-reset clears them.
-    ///
-    /// Also acts as the **baseline microbench harness** for later staged-accept
-    /// work (lock ≈ wall while scripts/durable still run under the hub mutex).
-    #[test]
-    fn accept_stage_meters_and_baseline_harness() {
-        use bitcoin::transaction::Version as TxVersion;
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-        let store_dir = tmp();
-        let mp_dir = tmp();
-        let q = Query::open_or_create(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        const N_SPENDS: u32 = 4;
-        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            100 + N_SPENDS,
-            N_SPENDS,
-        );
-
-        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
-        hub.set_relay_enabled(true);
-        let _ = hub.sample_reset_perf(); // clear open noise
-
-        let spk = ScriptBuf::from_bytes(vec![0x51]);
-        for (i, cbtxid) in coinbase_txids.iter().enumerate() {
-            let fee = 1_000u64 + i as u64;
-            let tx = Transaction {
-                version: TxVersion::TWO,
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: *cbtxid,
-                        vout: 0,
-                    },
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    witness: Witness::new(),
-                }],
-                output: vec![TxOut {
-                    value: Amount::from_sat(50_0000_0000 - fee),
-                    script_pubkey: spk.clone(),
-                }],
-            };
-            hub.accept_tx(&tx).expect("accept harness spend");
-        }
-
-        let s = hub.sample_reset_perf();
-        assert_eq!(s.accepts, N_SPENDS as u64);
-        assert!(s.accept_us > 0, "wall meter");
-        assert!(s.accept_lock_us > 0, "lock meter");
-        assert!(s.accept_utxo_us > 0, "utxo stage (chain coin resolve)");
-        assert!(s.accept_script_us > 0, "script stage");
-        assert!(s.accept_durable_us > 0, "durable stage");
-        // C1: script runs outside the exclusive lock (detached rbtc-scripts).
-        // Lock still covers prepare + durable commit; durable stays under lock.
-        assert!(
-            s.accept_lock_us >= s.accept_durable_us,
-            "lock_us={} durable_us={}",
-            s.accept_lock_us,
-            s.accept_durable_us
-        );
-        // Structural: script time is metered and wall includes it.
-        assert!(
-            s.accept_us >= s.accept_script_us,
-            "wall={} script={}",
-            s.accept_us,
-            s.accept_script_us
-        );
-        // Sample-and-reset clears.
-        let z = hub.sample_reset_perf();
-        assert_eq!(z.accepts, 0);
-        assert_eq!(z.accept_script_us, 0);
-        assert_eq!(z.accept_lock_us, 0);
-
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

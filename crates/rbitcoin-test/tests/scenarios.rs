@@ -6,10 +6,7 @@
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, BlockHash};
 use rbitcoin_cli::cli_main as cli_cli_main;
-use rbitcoin_consensus::{
-    accept_and_connect_block, validate_block_connect, validate_block_structure, ChainParams,
-    ConsensusError, Milestone, ValidationContext,
-};
+use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
 use rbitcoin_net::outbound_for_ibd;
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
@@ -1402,98 +1399,6 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     let again = q.ensure_header(&tip_rec).unwrap();
     assert_eq!(again, tip_fk);
 }
-
-#[test]
-fn consensus_reject_bad_structure_and_milestone() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let params = ChainParams::regtest();
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-
-    let mut block = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
-    block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
-    let ctx = ValidationContext::at(&params, Height(1), Milestone::NONE);
-    assert!(matches!(
-        validate_block_structure(&block, &ctx),
-        Err(ConsensusError::BadBlock(_))
-    ));
-
-    let block2 = mine_regtest_block(
-        BlockHash::from_byte_array([0x22; 32]),
-        genesis.header.time + 2,
-        1,
-        vec![],
-    );
-    assert!(accept_and_connect_block(&q, &params, Height(1), &block2, Milestone::NONE).is_err());
-
-    // Milestone: skip scripts only — prevouts still run; coinbase chain is fine.
-    let td2 = TestDatadir::new().unwrap();
-    let q2 = Query::open_or_create(td2.store_path()).unwrap();
-    let ms = Milestone { height: 100 };
-    assert!(ms.skips_scripts_at(1));
-    assert!(ms.skips_scripts_at(1));
-    accept_and_connect_block(&q2, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
-    accept_and_connect_block(&q2, &params, Height(1), &b1, ms).unwrap();
-    assert_eq!(q2.tip_height(), Some(Height(1)));
-
-    // Under a high milestone, a block that spends a missing prevout must still fail
-    // (connect is not fully skipped — only scripts).
-    let td3 = TestDatadir::new().unwrap();
-    let q3 = Query::open_or_create(td3.store_path()).unwrap();
-    let ms_hi = Milestone { height: 1_000_000 };
-    accept_and_connect_block(&q3, &params, Height::GENESIS, &genesis, ms_hi).unwrap();
-    // Child of genesis but with an extra invalid non-coinbase input path: mine a
-    // normal block then mutate... easier: accept only genesis, then try connect
-    // with wrong prev link is header failure. Use validate_block_connect on a
-    // synthetic spend of unknown outpoint after a valid height-1 coinbase-only
-    // block would need a second tx — mine empty block then skip.
-    //
-    // Spend an outpoint that never existed: build via mine with empty spends and
-    // reject a manually broken second block that points at a fake prevout by
-    // going through validate_block_connect.
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-    let b_ok = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
-    accept_and_connect_block(&q3, &params, Height(1), &b_ok, ms_hi).unwrap();
-    // Fabricate a height-2 block spending a nonexistent outpoint.
-    let coinbase = &b_ok.txdata[0];
-    let _ = coinbase;
-    let mut bad = mine_regtest_block(b_ok.block_hash(), b_ok.header.time + 1, 2, vec![]);
-    // Append a phantom spend of a random outpoint.
-    let phantom = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0xcd; 32]),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::new(),
-        }],
-    };
-    bad.txdata.push(phantom);
-    bad.header.merkle_root = bad.compute_merkle_root().unwrap();
-    let ctx = ValidationContext::at(&params, Height(2), ms_hi);
-    let err = validate_block_connect(&q3, &bad, &ctx, None).expect_err("prevout must fail");
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("prev")
-            || msg.contains("not found")
-            || msg.contains("missing")
-            || msg.contains("input")
-            || msg.contains("spend"),
-        "expected prevout failure under milestone, got: {err}"
-    );
-}
-
-// ─── 3-stage confirm + parent pin surface ───────────────────────────────────
 
 /// Split load → scripts → write (IBD pipeline stages) on a spend run.
 /// Also exercises parent pin stats + tip advance, and load ready timeout/cancel.

@@ -2714,6 +2714,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn chain_view_sh_join_slot_miss_on_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-sh-slot");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        let genesis_txid = t0.tx.txid;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+
+        let (h1, mut t1) = coinbase_block(1, prev_fk, Some(hash0));
+        t1.tx.txid[5] = 0xaa;
+        let txid_a = t1.tx.txid;
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let view_a = q.pin_chain_view().unwrap().unwrap();
+
+        let sh = script_hash(&[0x51]);
+        let mut slot = None;
+        let hist_a = q.scripthash_history_slot(&sh, &mut slot).unwrap();
+        let ids_a: Vec<_> = hist_a.iter().map(|i| i.txid).collect();
+        assert!(ids_a.contains(&txid_a), "height-1 A must be in history");
+        assert!(ids_a.contains(&genesis_txid));
+
+        let live = q.scripthash_history_in(&sh, &view_a).unwrap();
+        assert!(live.iter().any(|i| i.txid == txid_a));
+        let genesis_view = ChainView {
+            height: Height(0),
+            hash: hash0,
+            header_fk: prev_fk,
+        };
+        let only_g = q.scripthash_history_in(&sh, &genesis_view).unwrap();
+        let g_ids: Vec<_> = only_g.iter().map(|i| i.txid).collect();
+        assert!(g_ids.contains(&genesis_txid));
+        assert!(
+            !g_ids.contains(&txid_a),
+            "history under a height-0 pin must omit the height-1 create"
+        );
+
+        q.disconnect_tip().unwrap();
+        let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+        h1b.nonce = h1.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        let mut t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+        t1b.tx.txid[5] = 0xbb;
+        let txid_b = t1b.tx.txid;
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+        assert_ne!(txid_a, txid_b);
+        assert_eq!(q.tip_height(), Some(Height(1)));
+
+        let hist_b = q.scripthash_history_slot(&sh, &mut slot).unwrap();
+        let ids_b: Vec<_> = hist_b.iter().map(|i| i.txid).collect();
+        assert!(
+            ids_b.contains(&txid_b),
+            "same-height replace must miss the slot and emit B, got {ids_b:?}"
+        );
+        assert!(
+            !ids_b.contains(&txid_a),
+            "stale slot would still show A after same-height replace: {ids_b:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Finish-path stamp-only notes must not wipe leftover_n for the fail pack.
     #[test]
     fn leftover_last_plan_batch_survives_stamp_only_note() {
@@ -2929,8 +2997,9 @@ mod tests {
         assert_eq!(utxos[0].tx_pos, 1);
         assert_eq!(utxos[0].value, 20_0000_0000);
 
+        let view = q.pin_chain_view().unwrap().unwrap();
         let list_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None, &view)
             .unwrap();
         assert!(
             list_join.iter().any(|r| r.spent && r.spenders.is_empty()),
@@ -2938,7 +3007,7 @@ mod tests {
         );
         assert!(list_join.iter().any(|r| !r.spent));
         let hist_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY, None)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY, None, &view)
             .unwrap();
         assert!(
             hist_join.iter().any(|r| r.spent && !r.spenders.is_empty()),
@@ -2958,7 +3027,7 @@ mod tests {
         assert_eq!(stats.spent_txo_sum, 10_0000_0000);
         assert_eq!(body_ok_reads(), 1);
         let stats_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS, None)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS, None, &view)
             .unwrap();
         assert!(
             stats_join.iter().all(|r| r.spenders.is_empty()),

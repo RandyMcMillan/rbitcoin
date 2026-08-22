@@ -257,10 +257,11 @@ pub(crate) struct ShJoinedOut {
 /// Last scripthash expand+spend join for one Electrum connection.
 ///
 /// Holds BALANCE-level outs + spentness. Identity is filled in place on
-/// history / listunspent. Invalid once [`Query::tip_height`] moves.
+/// history / listunspent. Invalid once the published tip **hash** moves
+/// (including a same-height replace).
 pub struct ShJoinSlot {
     scripthash: [u8; 32],
-    tip_height: u32,
+    tip_hash: [u8; 32],
     joined: Vec<ShJoinedOut>,
 }
 
@@ -379,22 +380,28 @@ impl Query {
         }
     }
 
+    fn confirmed_strong_in(&self, fk: Fk, view: &ChainView) -> Result<bool, QueryError> {
+        self.store.is_confirmed_strong_at(fk, Some(view.height.0))
+    }
+
     /// Confirmed-strong create outpoints plus confirmed spenders (create_fk join).
     ///
     /// When `to_height` is set, creates with Class C height `>= to_height` are not
-    /// expanded (their spends cannot fall in the window).
+    /// expanded (their spends cannot fall in the window). Visibility is
+    /// [`Store::is_confirmed_strong_at`] against `view.height`.
     pub(crate) fn join_creates_and_spends(
         &self,
         scripthash: &[u8; 32],
         need: ShJoinNeed,
         to_height: Option<i64>,
+        view: &ChainView,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.create_fks(scripthash)?;
         let pages_us = t_pages.elapsed().as_micros();
         let mut fks = Vec::new();
         for fk in entries {
-            if self.store.is_confirmed_strong(fk)? {
+            if self.confirmed_strong_in(fk, view)? {
                 fks.push(fk);
             }
         }
@@ -425,7 +432,7 @@ impl Query {
             let creates = self.expand_create_fks_wave(scripthash, wave, need)?;
             class_a_us = class_a_us.saturating_add(t_a.elapsed().as_micros());
             let t_s = std::time::Instant::now();
-            out.extend(self.join_spends_wave(&creates, need)?);
+            out.extend(self.join_spends_wave(&creates, need, view)?);
             spends_us = spends_us.saturating_add(t_s.elapsed().as_micros());
         }
         let total_us = pages_us
@@ -445,12 +452,8 @@ impl Query {
         Ok(out)
     }
 
-    fn tip_height_u32(&self) -> u32 {
-        self.tip_height().map(|h| h.0).unwrap_or(0)
-    }
-
-    fn sh_join_slot_hit(slot: &ShJoinSlot, scripthash: &[u8; 32], tip: u32) -> bool {
-        slot.scripthash == *scripthash && slot.tip_height == tip
+    fn sh_join_slot_hit(slot: &ShJoinSlot, scripthash: &[u8; 32], view: &ChainView) -> bool {
+        slot.scripthash == *scripthash && slot.tip_hash == view.hash
     }
 
     fn ensure_sh_join_slot(
@@ -458,17 +461,29 @@ impl Query {
         scripthash: &[u8; 32],
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<(), QueryError> {
-        let tip = self.tip_height_u32();
+        let Some(view) = self.pin_chain_view()? else {
+            *slot = None;
+            return Ok(());
+        };
+        self.ensure_sh_join_slot_in(scripthash, slot, &view)
+    }
+
+    fn ensure_sh_join_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<(), QueryError> {
         if slot
             .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, tip))
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view))
         {
             return Ok(());
         }
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)?;
+        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None, view)?;
         *slot = Some(ShJoinSlot {
             scripthash: *scripthash,
-            tip_height: tip,
+            tip_hash: view.hash,
             joined,
         });
         Ok(())
@@ -604,6 +619,7 @@ impl Query {
         &self,
         creates: &[ScriptHashOutpoint],
         need: ShJoinNeed,
+        view: &ChainView,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
         if creates.is_empty() {
             return Ok(Vec::new());
@@ -658,12 +674,12 @@ impl Query {
             }
             if flags & output_flags::MULTI_SPENDER != 0 {
                 for fk in self.store.spenders_create(c.create_tx_fk, c.vout)? {
-                    if self.store.is_confirmed_strong(fk)? {
+                    if self.confirmed_strong_in(fk, view)? {
                         per_out[i].push(fk);
                         spender_fks.push(fk);
                     }
                 }
-            } else if self.store.is_confirmed_strong(field)? {
+            } else if self.confirmed_strong_in(field, view)? {
                 per_out[i].push(field);
                 spender_fks.push(field);
             }
@@ -722,20 +738,41 @@ impl Query {
         self.scripthash_history_filtered(scripthash, &HistoryFilter::open())
     }
 
+    /// Confirmed history for `scripthash` as of `view` (open filter).
+    pub fn scripthash_history_in(
+        &self,
+        scripthash: &[u8; 32],
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+        self.scripthash_history_filtered_in(scripthash, &HistoryFilter::open(), view)
+    }
+
     /// Confirmed history for a scripthash, filtered by height window / limit / cursor.
     ///
     /// Assembles the full confirmed history (creates + confirmed spenders), then
     /// applies [`apply_history_filter`]. When `filter.to_height` is set, create
     /// outpoints with `create_height >= to_height` are skipped during expand
     /// (spends of those creates are also ≥ create height, so they cannot fall
-    /// inside the window).
+    /// inside the window). Pins the live tip.
     pub fn scripthash_history_filtered(
         &self,
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+        let Some(view) = self.pin_chain_view()? else {
+            return Ok(Vec::new());
+        };
+        self.scripthash_history_filtered_in(scripthash, filter, &view)
+    }
+
+    pub fn scripthash_history_filtered_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
         let joined =
-            self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY, filter.to_height)?;
+            self.join_creates_and_spends(scripthash, ShJoinNeed::HISTORY, filter.to_height, view)?;
         Ok(history_items_from_joined(&joined, filter))
     }
 
@@ -756,14 +793,17 @@ impl Query {
         filter: &HistoryFilter,
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let tip = self.tip_height_u32();
+        let Some(view) = self.pin_chain_view()? else {
+            *slot = None;
+            return Ok(Vec::new());
+        };
         let hit = slot
             .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, tip));
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, &view));
         if !hit && filter.to_height.is_some() {
-            return self.scripthash_history_filtered(scripthash, filter);
+            return self.scripthash_history_filtered_in(scripthash, filter, &view);
         }
-        self.ensure_sh_join_slot(scripthash, slot)?;
+        self.ensure_sh_join_slot_in(scripthash, slot, &view)?;
         let recs = &mut slot
             .as_mut()
             .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
@@ -831,7 +871,13 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None)?;
+        let Some(view) = self.pin_chain_view()? else {
+            return Ok(ScriptHashBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+            });
+        };
+        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::BALANCE, None, &view)?;
         self.balance_from_joined(&joined)
     }
 
@@ -842,11 +888,13 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<ScriptHashBalance, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
-        let recs = &slot
-            .as_ref()
-            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
-            .joined;
-        self.balance_from_joined(recs)
+        let Some(recs) = slot.as_ref() else {
+            return Ok(ScriptHashBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+            });
+        };
+        self.balance_from_joined(&recs.joined)
     }
 
     fn fill_create_txids(
@@ -905,7 +953,11 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
-        let mut joined = self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None)?;
+        let Some(view) = self.pin_chain_view()? else {
+            return Ok(Vec::new());
+        };
+        let mut joined =
+            self.join_creates_and_spends(scripthash, ShJoinNeed::LISTUNSPENT, None, &view)?;
         self.fill_create_txids(&mut joined, true)?;
         self.listunspent_from_joined(&joined)
     }
@@ -917,12 +969,11 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
-        let recs = &mut slot
-            .as_mut()
-            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
-            .joined;
-        self.fill_create_txids(recs, true)?;
-        self.listunspent_from_joined(recs)
+        let Some(recs) = slot.as_mut() else {
+            return Ok(Vec::new());
+        };
+        self.fill_create_txids(&mut recs.joined, true)?;
+        self.listunspent_from_joined(&recs.joined)
     }
 
     /// Confirmed unspents whose `scriptPubKey` is in `scripts`.
@@ -1004,7 +1055,17 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
-        let joined = self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS, None)?;
+        let Some(view) = self.pin_chain_view()? else {
+            return Ok(ScriptHashChainStats {
+                tx_count: 0,
+                funded_txo_count: 0,
+                funded_txo_sum: 0,
+                spent_txo_count: 0,
+                spent_txo_sum: 0,
+            });
+        };
+        let joined =
+            self.join_creates_and_spends(scripthash, ShJoinNeed::CHAIN_STATS, None, &view)?;
         self.chain_stats_from_joined(&joined)
     }
 
@@ -1015,11 +1076,16 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<ScriptHashChainStats, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
-        let recs = &slot
-            .as_ref()
-            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
-            .joined;
-        self.chain_stats_from_joined(recs)
+        let Some(recs) = slot.as_ref() else {
+            return Ok(ScriptHashChainStats {
+                tx_count: 0,
+                funded_txo_count: 0,
+                funded_txo_sum: 0,
+                spent_txo_count: 0,
+                spent_txo_sum: 0,
+            });
+        };
+        self.chain_stats_from_joined(&recs.joined)
     }
 }
 

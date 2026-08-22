@@ -81,6 +81,52 @@ pub fn subscribe_range_limits() -> ThinTweakRangeLimits {
     ThinTweakRangeLimits::default()
 }
 
+/// Pre-taproot empty Cake notifies per write (no store). Mainnet genesis→origin
+/// is ~700k heights; one flush per height is the 10/s-class path.
+pub const EMPTY_WAVE_HEIGHTS: u32 = 1024;
+
+/// Inclusive last height of a pre-taproot empty wave, if `start` is below
+/// taproot. `None` when taproot is already active at `start` (incl. regtest).
+pub fn pre_taproot_wave_last(start: u32, last: u32, taproot_h: u32) -> Option<u32> {
+    if start >= taproot_h {
+        return None;
+    }
+    let cap = start.saturating_add(EMPTY_WAVE_HEIGHTS.saturating_sub(1));
+    Some(last.min(taproot_h.saturating_sub(1)).min(cap))
+}
+
+/// One subscribe wave of Cake notify lines starting at `start`.
+///
+/// Pre-taproot: empty height maps, no Class A. Indexed: thin batch. Hole:
+/// one naive/thin height.
+pub fn remaining_notify_lines(
+    query: &Query,
+    chain: &ChainParams,
+    start: u32,
+    last: u32,
+    limits: ThinTweakRangeLimits,
+) -> Result<Vec<String>, String> {
+    if start > last {
+        return Ok(Vec::new());
+    }
+    if let Some(end) = pre_taproot_wave_last(start, last, chain.taproot_height()) {
+        let n = end.saturating_sub(start).saturating_add(1) as usize;
+        let mut out = Vec::with_capacity(n);
+        for h in start..=end {
+            out.push(thin_height_notify_json(h, &[]));
+        }
+        return Ok(out);
+    }
+    let thin = load_thin_batch(query, start, last, limits)?;
+    if thin.is_empty() {
+        return Ok(vec![height_notify_json(query, chain, start)?]);
+    }
+    Ok(thin
+        .into_iter()
+        .map(|(h, rows)| thin_height_notify_json(h, &rows))
+        .collect())
+}
+
 /// Load a budgeted contiguous thin-index batch starting at `start`.
 ///
 /// Empty → first height not indexed (caller uses per-height naive/thin).
@@ -308,6 +354,90 @@ mod tests {
         assert_eq!(last_height(10, 1, Some(100)), Some(10));
         assert_eq!(last_height(50, 1, Some(10)), None);
         assert_eq!(last_height(0, 1, None), None);
+    }
+
+    #[test]
+    fn pre_taproot_wave_covers_1024_then_stops_at_activation() {
+        assert_eq!(pre_taproot_wave_last(0, 10, 709_632), Some(10));
+        assert_eq!(pre_taproot_wave_last(0, 2_000, 709_632), Some(1023));
+        assert_eq!(
+            pre_taproot_wave_last(709_000, 800_000, 709_632),
+            Some(709_631)
+        );
+        assert_eq!(pre_taproot_wave_last(709_632, 800_000, 709_632), None);
+        assert_eq!(pre_taproot_wave_last(0, 100, 0), None);
+    }
+
+    #[test]
+    fn remaining_lines_pre_taproot_are_one_empty_wave() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::{Query, TxApply};
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-electrum-empty-wave-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        q.set_sptweaks_enabled(true, Height(10_000)).unwrap();
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..8u32 {
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            merkle[5] = 0xec;
+            let hash = match parent_hash {
+                None => merkle,
+                Some(ph) => {
+                    rbitcoin_store::block_header_hash(1, &ph, &merkle, h + 1, 0x207fffff, h)
+                }
+            };
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: h + 1,
+                bits: 0x207fffff,
+                nonce: h,
+                merkle_root: merkle,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![h as u8], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            parent_hash = Some(hash);
+        }
+        let chain = ChainParams::mainnet();
+        let lines = remaining_notify_lines(&q, &chain, 1, 7, subscribe_range_limits()).unwrap();
+        assert_eq!(lines.len(), 7);
+        for (i, line) in lines.iter().enumerate() {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let h = (i + 1).to_string();
+            assert_eq!(v["method"], "blockchain.tweaks.subscribe");
+            assert!(v["params"][0][&h].as_object().unwrap().is_empty(), "{v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

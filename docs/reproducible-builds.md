@@ -96,6 +96,22 @@ Same cadence as musl: green `master` `ci`, `workflow_dispatch`, or PR
 label **`static-binaries`**. Staging: `scripts/stage-native-artifacts.sh`.
 Not byte-identical with the musl package. Windows IoRing is not supported.
 
+### GitHub Release (`v*.*.*` tags)
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) builds the
+same three snapshots on a version tag and attaches them to a GitHub Release:
+
+| File | Notes |
+|------|--------|
+| `rbitcoin-node-x86_64-linux` / `rbitcoin-cli-x86_64-linux` | Static musl; **operator** binary |
+| `SHA256SUMS.linux-musl` + `rbitcoin.cdx.json` | Checksums + CycloneDX from `scripts/sbom.sh` |
+| `rbitcoin-*-x86_64-windows.exe` + `SHA256SUMS.windows` | CRT-static PE |
+| `rbitcoin-*-aarch64-darwin` + `SHA256SUMS.darwin` | Ad-hoc codesign; not notarized |
+
+`workflow_dispatch` on that workflow builds artifacts only (no Release).
+Creating or changing `.github/workflows/release.yml` may need an operator
+push (GitHub App tokens often cannot write workflow files).
+
 **Byte-identity gate** (`./scripts/repro-check.sh`) still forces two clean
 `--rebuild`s — use it for release verification, not every commit.
 

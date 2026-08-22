@@ -1227,6 +1227,32 @@ fn bulk_session_reuses_fk_scratch_across_keys() {
 }
 
 #[test]
+fn pack_shard_session_inline_one_fk_does_not_grow_body() {
+    HeadScale::test_with(HeadScale::Tiny, || {
+        let dir = tmp();
+        let t = four_shard_table(&dir);
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        let mut session = t.pack_shard_session(0).unwrap();
+        session.push_sorted_fk(shard0_key(1), Fk(7)).unwrap();
+        let pack = session.finish_pack().unwrap();
+        assert_eq!(pack.keys, 1);
+        assert_eq!(pack.creates, 1);
+        assert_eq!(
+            pack.bump, payload0,
+            "1-FK inline must not allocate body: bump={} payload0={}",
+            pack.bump, payload0
+        );
+        t.publish_packed_shard(0, pack).unwrap();
+        assert!(matches!(
+            t.head_value(&shard0_key(1)).unwrap().unwrap(),
+            ShHeadValue::Inline { used: 1, .. }
+        ));
+        assert_eq!(t.entries(&shard0_key(1)).unwrap()[0].0, Fk(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
 fn pack_shard_session_slab_flush_times_body_and_roundtrips() {
     HeadScale::test_with(HeadScale::Tiny, || {
         let dir = tmp();

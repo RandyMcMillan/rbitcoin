@@ -30,7 +30,7 @@ use crate::scripthash_pages::{
     sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
-    decode_slab_payload, encode_slab_payload, slab_class_for_n_fks_with_slack,
+    decode_slab_payload, encode_slab_payload_into, slab_class_for_n_fks_with_slack,
     slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
 };
 use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
@@ -2050,9 +2050,13 @@ impl ScriptHashTable {
             let last = self.write_new_page_chain(body, alloc, live)?;
             return Ok(ShHeadValue::extent(last));
         }
-        let fks: Vec<Fk> = live.iter().map(|e| e.create_tx_fk).collect();
-        let payload = encode_slab_payload(&fks)?;
-        let class = match Self::slab_class_fitting(n, payload.len(), slack) {
+        let mut raw = [0u64; SH_MEGAKEY_MIN_FKS as usize - 1];
+        for (i, e) in live.iter().enumerate() {
+            raw[i] = e.create_tx_fk.0;
+        }
+        let mut payload = [0u8; 2048];
+        let packed_len = encode_slab_payload_into(&mut payload, &raw[..n as usize])?;
+        let class = match Self::slab_class_fitting(n, packed_len, slack) {
             Some(c) => c,
             None => {
                 let last = self.write_new_page_chain(body, alloc, live)?;
@@ -2060,7 +2064,7 @@ impl ScriptHashTable {
             }
         };
         let cap = slab_bytes(class) as usize;
-        if payload.len() > cap {
+        if packed_len > cap {
             return Err(StoreError::Corrupt(
                 "invariant: scripthash slab payload exceeds class bytes",
             ));
@@ -2074,9 +2078,9 @@ impl ScriptHashTable {
         } else {
             self.alloc_slab(body, alloc, class)?
         };
-        let mut buf = vec![0u8; cap];
-        buf[..payload.len()].copy_from_slice(&payload);
-        body.write_at(off, &buf)?;
+        let mut buf = [0u8; 2048];
+        buf[..packed_len].copy_from_slice(&payload[..packed_len]);
+        body.write_at(off, &buf[..cap])?;
         Ok(ShHeadValue::slab(class, n as u16, off))
     }
 
@@ -2926,36 +2930,39 @@ impl<'a> ScriptHashBulkSession<'a> {
                 last_fk: None,
             });
         }
-        if let Some(open) = self.open_key.as_ref() {
-            if !open.buf.is_empty() {
-                let prev = open.last_fk.expect("open page has last_fk");
-                if fk.0 > prev
-                    && open.stream_used.saturating_add(uleb128_len(fk.0 - prev))
-                        > SH_PAGE_STREAM_MAX
-                {
-                    self.write_open_full_page_with_next()?;
+        let add = {
+            let open = self
+                .open_key
+                .as_ref()
+                .expect("open_key after prepare_stream_key");
+            if let Some(prev) = open.last_fk {
+                if fk.0 == prev {
+                    return Ok(());
                 }
+                if fk.0 < prev {
+                    return Err(StoreError::Corrupt(
+                        "scripthash bulk stream: create_fk not strictly increasing",
+                    ));
+                }
+                if open.buf.is_empty() {
+                    uleb128_len(fk.0)
+                } else {
+                    let add = uleb128_len(fk.0 - prev);
+                    if open.stream_used.saturating_add(add) > SH_PAGE_STREAM_MAX {
+                        self.write_open_full_page_with_next()?;
+                        uleb128_len(fk.0)
+                    } else {
+                        add
+                    }
+                }
+            } else {
+                uleb128_len(fk.0)
             }
-        }
+        };
         let open = self
             .open_key
             .as_mut()
             .expect("open_key after prepare_stream_key");
-        if let Some(prev) = open.last_fk {
-            if fk.0 == prev {
-                return Ok(());
-            }
-            if fk.0 < prev {
-                return Err(StoreError::Corrupt(
-                    "scripthash bulk stream: create_fk not strictly increasing",
-                ));
-            }
-        }
-        let add = if open.buf.is_empty() {
-            uleb128_len(fk.0)
-        } else {
-            uleb128_len(fk.0 - open.last_fk.unwrap())
-        };
         open.stream_used = open.stream_used.saturating_add(add);
         open.buf.push(fk.0);
         open.last_fk = Some(fk.0);
@@ -2977,11 +2984,10 @@ impl<'a> ScriptHashBulkSession<'a> {
         }
         let n = open.n_total;
         let val = if open.first_page.is_none() {
-            let ents: Vec<ShEntry> = open.buf.iter().map(|&fk| ShEntry::new(Fk(fk))).collect();
             if n <= SH_INLINE_CAP as u32 {
-                ShHeadValue::inline_one(ents[0])
+                ShHeadValue::inline_one(ShEntry::new(Fk(open.buf[0])))
             } else {
-                self.bulk_write_slab(&ents)?
+                self.bulk_write_slab(&open.buf)?
             }
         } else {
             let last = if open.buf.is_empty() {
@@ -3205,19 +3211,30 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     /// Write one exact-class slab (byte-fit ULEB payload). Pages if stream > class 6.
-    fn bulk_write_slab(&mut self, entries: &[ShEntry]) -> Result<ShHeadValue, StoreError> {
-        let n = entries.len() as u32;
-        let fks: Vec<Fk> = entries.iter().map(|e| e.create_tx_fk).collect();
-        let payload = encode_slab_payload(&fks)?;
-        let Some(class) = slab_class_for_packed_len(payload.len()) else {
-            let last = self.bulk_write_page_chain(entries)?;
+    fn bulk_write_slab(&mut self, fks: &[u64]) -> Result<ShHeadValue, StoreError> {
+        let n = fks.len() as u32;
+        let mut payload = [0u8; 2048];
+        let packed_len = match encode_slab_payload_into(&mut payload, fks) {
+            Ok(len) => len,
+            Err(StoreError::Corrupt(msg))
+                if msg == "uleb128 dest short" || msg == "scripthash slab dest short" =>
+            {
+                let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
+                let last = self.bulk_write_page_chain(&ents)?;
+                return Ok(ShHeadValue::extent(last));
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(class) = slab_class_for_packed_len(packed_len) else {
+            let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
+            let last = self.bulk_write_page_chain(&ents)?;
             return Ok(ShHeadValue::extent(last));
         };
         let off = self.alloc_reloc_class(class)?;
         let need = slab_bytes(class) as usize;
-        let mut buf = vec![0u8; need];
-        buf[..payload.len()].copy_from_slice(&payload);
-        self.write_body_bytes(off, &buf)?;
+        let mut buf = [0u8; 2048];
+        buf[..packed_len].copy_from_slice(&payload[..packed_len]);
+        self.write_body_bytes(off, &buf[..need])?;
         Ok(ShHeadValue::slab(class, n as u16, off))
     }
 

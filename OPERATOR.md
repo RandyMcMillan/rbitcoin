@@ -464,6 +464,25 @@ Order-of-magnitude costs (mainnet-class SSD; not a warranty):
 
 Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` ≠ `sh_tip_ready`).
 
+### Abort / resume (tip materialize)
+
+Keep **`store/scripthash.runs`**. SIGINT / SIGTERM mid-cold keeps every
+**sealed** `scripthash.head/NN` (`scripthash.cold_progress`); restart with the
+same `--datadir --shindex` packs **unsealed** shards only (holes stay). Do not
+delete runs to “start over” unless you intend a full Class A recollect.
+
+| Stop | What restart does |
+|------|-------------------|
+| SIGTERM / SIGINT mid materialize | Resume. Lowest unsealed shard is `next_shard`. Catalog runs stay. |
+| Kill-9 mid pack | Same idea; unfinished shard work is redone. Open follows [`docs/crash-recovery.md`](docs/crash-recovery.md) (scripthash Direct). |
+| Empty SH head + usable catalog | FullCold from runs. |
+| Durable SH head + leftover runs | **Warm-only.** Do not wipe. |
+| Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--shindex`. |
+
+Electrum waits until SH is tip-ready. Do **not** `rm -rf store/` for an SH
+abort. Force-rebuild sticky env (`RBITCOIN_SH_FORCE_REBUILD`) must never redo
+multi-hour Class A work casually — [`docs/env-knobs.md`](docs/env-knobs.md).
+
 ## Silent payment tweaks (`--sptweaks`)
 
 Optional **thin** BIP-352 index for Cake-compatible `blockchain.tweaks.subscribe`.

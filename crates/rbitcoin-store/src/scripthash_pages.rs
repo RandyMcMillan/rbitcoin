@@ -435,7 +435,13 @@ pub fn sh_page_pack_extent_last(
     extent_n: u32,
     next_off: u64,
 ) -> Result<(), StoreError> {
-    sh_page_pack_extent_last_fks(page, &sh_page_fks_from_entries(entries), extent_base, extent_n, next_off)
+    sh_page_pack_extent_last_fks(
+        page,
+        &sh_page_fks_from_entries(entries),
+        extent_base,
+        extent_n,
+        next_off,
+    )
 }
 
 /// Pack a last-in-extent page from raw create fks.
@@ -721,8 +727,9 @@ mod tests {
     fn sh_page_pack_matches_encoded_stream() {
         let fks: Vec<u64> = (1..=80).collect();
         let ents: Vec<_> = fks.iter().copied().map(|i| ShEntry::new(Fk(i))).collect();
-        let stream = encode_fk_delta_stream(&ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>())
-            .unwrap();
+        let stream =
+            encode_fk_delta_stream(&ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>())
+                .unwrap();
         let mut page = [0u8; SH_PAGE_SIZE];
         sh_page_pack(&mut page, &ents, 8192).unwrap();
         assert_eq!(sh_page_n_fks(&page).unwrap() as usize, fks.len());
@@ -769,7 +776,10 @@ mod tests {
         sh_page_pack(&mut page, &one, 0).unwrap();
         assert_eq!(
             sh_page_last_fk(&page).unwrap(),
-            sh_page_entries(&page).unwrap().last().map(|e| e.create_tx_fk)
+            sh_page_entries(&page)
+                .unwrap()
+                .last()
+                .map(|e| e.create_tx_fk)
         );
 
         let ents: Vec<_> = (1u64..=600).map(|i| ShEntry::new(Fk(i))).collect();
@@ -777,7 +787,10 @@ mod tests {
         sh_page_pack(&mut big, &ents, 0).unwrap();
         assert_eq!(
             sh_page_last_fk(&big).unwrap(),
-            sh_page_entries(&big).unwrap().last().map(|e| e.create_tx_fk)
+            sh_page_entries(&big)
+                .unwrap()
+                .last()
+                .map(|e| e.create_tx_fk)
         );
         assert_eq!(sh_page_last_fk(&big).unwrap(), Some(Fk(600)));
     }

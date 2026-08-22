@@ -28,8 +28,7 @@ use crate::scripthash_pages::{
     sh_page_extent, sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk,
     sh_page_next, sh_page_pack, sh_page_pack_extent_last, sh_page_pack_extent_last_fks,
     sh_page_pack_fks, sh_page_set_extent, sh_page_set_last, sh_page_set_next, sh_page_try_append,
-    SH_PAGE_SIZE,
-    SH_PAGE_STREAM_MAX,
+    SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload_into, slab_class_for_n_fks_with_slack,
@@ -2443,6 +2442,7 @@ impl ScriptHashTable {
             keys_written: 0,
             shards_flushed: 0,
             body_flush_ns: 0,
+            pack_ns: 0,
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
@@ -2490,6 +2490,7 @@ impl ScriptHashTable {
             keys_written: 0,
             shards_flushed: 0,
             body_flush_ns: 0,
+            pack_ns: 0,
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
@@ -2551,6 +2552,7 @@ impl ScriptHashTable {
             keys_written: progress.keys_written,
             shards_flushed: progress.next_shard,
             body_flush_ns: 0,
+            pack_ns: 0,
             head_fill_ns: 0,
             peak_table_bytes: 0,
             open_key: None,
@@ -2752,6 +2754,8 @@ pub struct ScriptHashBulkSession<'a> {
     shards_flushed: u32,
     /// Wall time spent in body `write_at` flushes.
     pub body_flush_ns: u64,
+    /// Wall time spent in [`Self::finish_key`] (one sample per unique key).
+    pub pack_ns: u64,
     /// Wall time spent installing head shards (write of live image).
     pub head_fill_ns: u64,
     /// Peak packed-rec buffer (bytes) — test/bench meter.
@@ -2774,6 +2778,7 @@ pub struct ShShardPack {
     pub keys: u64,
     pub bump: u64,
     pub body_flush_ns: u64,
+    pub pack_ns: u64,
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
@@ -2896,6 +2901,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             keys: self.keys_written,
             bump: self.bump,
             body_flush_ns: self.body_flush_ns,
+            pack_ns: self.pack_ns,
         };
         self.finished = true;
         Ok(pack)
@@ -2972,6 +2978,21 @@ impl<'a> ScriptHashBulkSession<'a> {
 
     /// Seal the open key (inline / slab / last page).
     pub fn finish_key(&mut self) -> Result<(), StoreError> {
+        if self.open_key.is_none() {
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        let flush_before = self.body_flush_ns;
+        let r = self.finish_open_key();
+        let elapsed = t0.elapsed().as_nanos() as u64;
+        let flush_delta = self.body_flush_ns.saturating_sub(flush_before);
+        self.pack_ns = self
+            .pack_ns
+            .saturating_add(elapsed.saturating_sub(flush_delta));
+        r
+    }
+
+    fn finish_open_key(&mut self) -> Result<(), StoreError> {
         let Some(open) = self.open_key.take() else {
             return Ok(());
         };
@@ -3273,7 +3294,10 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn write_body_bytes(&mut self, off: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        let sequential = off == self.body_write_off.saturating_add(self.body_buf.len() as u64);
+        let sequential = off
+            == self
+                .body_write_off
+                .saturating_add(self.body_buf.len() as u64);
         if sequential {
             self.body_buf.extend_from_slice(bytes);
             if self.body_buf.len() >= BULK_BODY_FLUSH {

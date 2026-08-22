@@ -99,10 +99,10 @@ pub use scripthash_layout::ShHeadValue;
 pub use scripthash_layout::SH_MAX_SLAB_CLASS;
 pub use scripthash_materialize::{materialize_sh_shards, MaterializeStageNs, ShShardMaterialize};
 pub use scripthash_slabs::{
-    decode_fk_delta_stream, decode_slab_payload, encode_fk_delta_stream, encode_fk_delta_stream_into,
-    encode_slab_payload, encode_slab_payload_into, page_alloc_bytes_for_n_fks,
-    slab_alloc_bytes_for_n_fks, slab_class_for_n_fks, slab_class_for_n_fks_with_slack,
-    slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
+    decode_fk_delta_stream, decode_slab_payload, encode_fk_delta_stream,
+    encode_fk_delta_stream_into, encode_slab_payload, encode_slab_payload_into,
+    page_alloc_bytes_for_n_fks, slab_alloc_bytes_for_n_fks, slab_class_for_n_fks,
+    slab_class_for_n_fks_with_slack, slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
 };
 pub use scripthash_sorted_head::{SortedHead, SortedHeadFilter, SH_SORTED_RECS_PER_PAGE};
 pub use segmented_head::{

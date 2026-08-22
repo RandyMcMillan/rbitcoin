@@ -153,7 +153,7 @@ impl ShShardMaterialize {
         self.pack_ns = stages.pack_ns;
         self.mphf_ns = stages.mphf_ns;
         self.body_flush_ns = stages.body_flush_ns;
-        self.head_fill_ns = stages.mphf_ns;
+        self.head_fill_ns = 0;
         self
     }
 }
@@ -205,8 +205,7 @@ fn pack_shard(
     progress: &MaterializeProgress,
 ) -> Result<ShShardPack, StoreError> {
     let mut session = table.pack_shard_session(shard)?;
-    let mut pack_ns = 0u64;
-    let t_merge = Instant::now();
+    let t_loop = Instant::now();
     for_each_merged_rec_shard(inputs, cuts, shard, false, |rec| {
         if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
             return Err(StoreError::Cancelled("scripthash shard pack"));
@@ -215,18 +214,18 @@ fn pack_shard(
         if fk.is_null() {
             return Ok(());
         }
-        let t_pack = Instant::now();
         session.push_sorted_fk(sh, fk)?;
-        pack_ns = pack_ns.saturating_add(t_pack.elapsed().as_nanos() as u64);
         progress.recs_packed.fetch_add(1, Ordering::Relaxed);
         Ok(())
     })?;
-    let merge_wall = t_merge.elapsed().as_nanos() as u64;
-    progress
-        .merge_ns
-        .fetch_add(merge_wall.saturating_sub(pack_ns), Ordering::Relaxed);
-    progress.pack_ns.fetch_add(pack_ns, Ordering::Relaxed);
+    let loop_wall = t_loop.elapsed().as_nanos() as u64;
+    let pack_during_loop = session.pack_ns;
+    progress.merge_ns.fetch_add(
+        loop_wall.saturating_sub(pack_during_loop),
+        Ordering::Relaxed,
+    );
     let pack = session.finish_pack()?;
+    progress.pack_ns.fetch_add(pack.pack_ns, Ordering::Relaxed);
     progress
         .body_flush_ns
         .fetch_add(pack.body_flush_ns, Ordering::Relaxed);
@@ -504,11 +503,15 @@ mod tests {
             let mut a = Vec::new();
             let mut b = Vec::new();
             for i in 0..8u64 {
-                let body = rec((i as u8) * 16, i + 1);
+                let sh0 = (i as u8) * 16;
+                let body1 = rec(sh0, i * 10 + 1);
+                let body2 = rec(sh0, i * 10 + 2);
                 if i % 2 == 0 {
-                    a.extend_from_slice(&body);
+                    a.extend_from_slice(&body1);
+                    a.extend_from_slice(&body2);
                 } else {
-                    b.extend_from_slice(&body);
+                    b.extend_from_slice(&body1);
+                    b.extend_from_slice(&body2);
                 }
             }
             crate::sorted_run::write_sorted_run(&runs_dir.join("000001.run"), 40, 40, &a).unwrap();
@@ -519,18 +522,18 @@ mod tests {
             ];
             let table = crate::scripthash::ScriptHashTable::create(&dir).unwrap();
             let mat = materialize_sh_shards(&table, &inputs, 0, 1, None).unwrap();
-            assert!(mat.creates >= 8);
+            assert!(mat.creates >= 16);
             assert!(
-                mat.merge_ns
-                    .saturating_add(mat.pack_ns)
-                    .saturating_add(mat.mphf_ns)
-                    .saturating_add(mat.body_flush_ns)
-                    > 0,
+                mat.pack_ns > 0 && mat.body_flush_ns > 0 && mat.mphf_ns > 0,
                 "stage ns must be real merge={} pack={} mphf={} body={}",
                 mat.merge_ns,
                 mat.pack_ns,
                 mat.mphf_ns,
                 mat.body_flush_ns
+            );
+            assert_eq!(
+                mat.head_fill_ns, 0,
+                "pack-only materialize must not alias head_fill to mphf"
             );
             let _ = std::fs::remove_dir_all(&dir);
         });

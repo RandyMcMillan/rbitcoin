@@ -7,9 +7,7 @@ use crate::bdz::BdzMphf;
 use crate::error::StoreError;
 use crate::fuse8_filter::fuse_key_from_mixed;
 use crate::io_handle::IoHandle;
-use crate::scripthash_layout::{
-    pack8, unpack8, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
-};
+use crate::scripthash_layout::{pack8, unpack8, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;

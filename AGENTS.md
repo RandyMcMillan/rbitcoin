@@ -160,11 +160,11 @@ Actions is the workspace/coverage/clippy gate.
 
 ### Push, PR, poll CI
 
-Required jobs: **`fmt`**, **`deny`**, **`clippy`**, **`test`**, **`multinode`**,
-**`coverage`**. `musl.yml` / `windows.yml` / `macos.yml` are **not** required.
-Label **`core-functional`** when the PR touches the Core functional harness.
-Label **`static-binaries`** to build musl / Windows / Darwin operator
-snapshots on that PR (same jobs as green `master` `ci`).
+Required jobs: **`fmt`**, **`deny`**, **`clippy`**, **`test`**, **`windows`**,
+**`macos`**, **`multinode`**, **`coverage`**. `windows` / `macos` are native
+store + `--smoke` (not operator zips). Operator binaries are GitHub Releases
+(`release.yml`). Label **`core-functional`** when the PR touches the Core
+functional harness.
 
 `origin` fetch/pull is HTTPS; `pushurl` is SSH (operator). This VM has **no**
 GitHub App SSH key. The App token from `~/.config/rbitcoin-grok/gh-login.sh`

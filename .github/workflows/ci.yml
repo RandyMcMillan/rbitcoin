@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -18,7 +21,9 @@ env:
 # every GitHub Actions “stable” bump. Bump intentionally with the toolchain.
 #
 # Jobs are split so each gate is its own required check on the PR/push UI:
-#   fmt + deny + clippy + test in parallel; coverage waits for fmt/clippy/test.
+#   fmt + deny + clippy + test + windows + macos in parallel;
+#   coverage / multinode wait for fmt/clippy/test.
+# Operator binaries are GitHub Releases (release.yml), not this workflow.
 jobs:
   deny:
     runs-on: ubuntu-latest
@@ -80,8 +85,55 @@ jobs:
         run: ./scripts/stage-native-artifacts.test.sh
       - name: fuzz-run self-test
         run: ./scripts/fuzz-run.test.sh
+      - name: os-smoke self-test
+        run: ./scripts/ci-os-smoke.test.sh
       - name: cargo test
         run: cargo test --workspace
+
+  # Windows IOCP store + --smoke. Required. Not a CRT-static snapshot.
+  windows:
+    name: windows
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TARGET_DIR: target/dev
+      RBITCOIN_HEAD_SCALE: tiny
+      RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-windows
+          workspaces: ". -> target/dev"
+      - name: store + node smoke
+        run: ./scripts/ci-os-smoke.sh
+
+  # Darwin pool IO + --smoke. Required. Not a notarized / operator zip.
+  macos:
+    name: macos
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/dev
+      RBITCOIN_HEAD_SCALE: tiny
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-macos
+          workspaces: ". -> target/dev"
+      - name: store + node smoke
+        run: ./scripts/ci-os-smoke.sh
 
   # Multi-node IBD tier A (same cadence as coverage — every push/PR after gates).
   # Budget: ~2 min wall for 8-block + 10-block cold reconstruct paths.

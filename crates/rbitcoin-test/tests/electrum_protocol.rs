@@ -126,6 +126,7 @@ async fn electrum_server_version_history_balance() {
         .send(rbitcoin_electrum::TipNotify {
             height: tip_h + 1,
             header_hex: tip_hex.clone(),
+            reorg_from_height: None,
         })
         .expect("tip push");
     // Notification has no id — wait for one line.

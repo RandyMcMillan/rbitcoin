@@ -182,6 +182,9 @@ impl ElectrumHandle {
 pub struct TipNotify {
     pub height: u32,
     pub header_hex: String,
+    /// Set when this tip replaced a previous prefix (reorg / same-height).
+    /// Subscribe restatuses every watched scripthash, not only the new block.
+    pub reorg_from_height: Option<u32>,
 }
 
 /// Start Electrum **plain TCP** listener.
@@ -370,20 +373,24 @@ where
                             let mp = mempool.clone();
                             let subs: Vec<[u8; 32]> = sh_subs.iter().copied().collect();
                             let height = t.height;
+                            let restatus_all = t.reorg_from_height.is_some();
                             let notes = tokio::task::spawn_blocking(move || {
                                 let mut out = Vec::new();
                                 for sh in subs {
-                                    let hit = q
-                                        .scripthash_touched_at_height(&sh, Height(height))
-                                        .ok()
-                                        .unwrap_or(false);
+                                    let hit = restatus_all
+                                        || q
+                                            .scripthash_touched_at_height(&sh, Height(height))
+                                            .ok()
+                                            .unwrap_or(false);
                                     if !hit {
                                         continue;
                                     }
                                     let status = if let Some(mp) = &mp {
                                         scripthash_status_full(&q, mp, &sh).ok()
                                     } else {
-                                        q.scripthash_history(&sh).ok().map(|h| scripthash_status(&h))
+                                        q.scripthash_history(&sh).ok().map(|h| {
+                                            scripthash_status(Some(&q), &h)
+                                        })
                                     };
                                     if let Some(status) = status {
                                         out.push((sh, status));
@@ -1017,7 +1024,7 @@ fn dispatch_with_join(
                 let hist = query
                     .scripthash_history_slot(&sh, sh_join)
                     .map_err(|e| e.to_string())?;
-                scripthash_status(&hist)
+                scripthash_status(Some(query), &hist)
             };
             Ok(json!(status))
         }
@@ -1266,14 +1273,26 @@ fn hash_hex_rev(h: &[u8; 32]) -> String {
     rbitcoin_primitives::hex_encode(r)
 }
 
-fn scripthash_status(hist: &[rbitcoin_query::ScriptHashHistoryItem]) -> String {
+fn scripthash_status(
+    query: Option<&Query>,
+    hist: &[rbitcoin_query::ScriptHashHistoryItem],
+) -> String {
     if hist.is_empty() {
         return String::new();
     }
     use bitcoin::hashes::{sha256, Hash as _};
     let mut s = String::new();
     for i in hist {
-        s.push_str(&format!("{}:{}:", txid_hex(&i.txid), i.height));
+        if i.height > 0 {
+            let bh = query
+                .and_then(|q| q.header_at_height(Height(i.height as u32)).ok())
+                .flatten()
+                .map(|(_, rec)| hash_hex_rev(&rec.hash))
+                .unwrap_or_default();
+            s.push_str(&format!("{}:{}:{}:", txid_hex(&i.txid), i.height, bh));
+        } else {
+            s.push_str(&format!("{}:{}:", txid_hex(&i.txid), i.height));
+        }
     }
     let hash = sha256::Hash::hash(s.as_bytes());
     rbitcoin_primitives::hex_encode(hash.to_byte_array())
@@ -1301,7 +1320,7 @@ fn scripthash_status_full_slot(
         });
     }
     hist.sort_by_key(|i| i.height);
-    Ok(scripthash_status(&hist))
+    Ok(scripthash_status(Some(query), &hist))
 }
 
 /// Helper to compute electrum scripthash hex (reversed) from script bytes.
@@ -1384,13 +1403,16 @@ mod tests {
             .unwrap_err()
             .contains("to_height"));
 
-        let empty_status = scripthash_status(&[]);
+        let empty_status = scripthash_status(None, &[]);
         assert!(empty_status.is_empty());
-        let status = scripthash_status(&[rbitcoin_query::ScriptHashHistoryItem {
-            height: 1,
-            txid: [1u8; 32],
-            tx_fk: Fk::NULL,
-        }]);
+        let status = scripthash_status(
+            None,
+            &[rbitcoin_query::ScriptHashHistoryItem {
+                height: 1,
+                txid: [1u8; 32],
+                tx_fk: Fk::NULL,
+            }],
+        );
         assert_eq!(status.len(), 64);
 
         use bitcoin::hashes::Hash;
@@ -2569,7 +2591,7 @@ mod tests {
         };
         let full_hist = q.scripthash_history(&sh_bytes).unwrap();
         assert_eq!(full_hist.len(), 4);
-        assert_eq!(scripthash_status(&full_hist), status_s);
+        assert_eq!(scripthash_status(Some(&q), &full_hist), status_s);
 
         let _ = prev;
         let _ = std::fs::remove_dir_all(&dir);
@@ -2645,6 +2667,7 @@ mod tests {
             .send(TipNotify {
                 height: 1,
                 header_hex: "aa".repeat(80),
+                reorg_from_height: None,
             })
             .unwrap();
         resp.clear();
@@ -2769,6 +2792,7 @@ mod tests {
             .send(TipNotify {
                 height: 1,
                 header_hex: "aa".repeat(80),
+                reorg_from_height: None,
             })
             .unwrap();
         resp.clear();
@@ -2893,6 +2917,7 @@ mod tests {
             .send(TipNotify {
                 height: 1,
                 header_hex: "aa".repeat(80),
+                reorg_from_height: None,
             })
             .unwrap();
         resp.clear();
@@ -2902,6 +2927,246 @@ mod tests {
         )
         .await;
         assert!(extra.is_err(), "untouched tip must not restatus: {resp:?}");
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_status_includes_blockhash() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let merkle = [0xab; 32];
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash: merkle,
+        };
+        let mut txid = [0xcb; 32];
+        txid[31] = 0;
+        let t0 = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        q.connect_block(Height(0), &h0, &[t0.clone()]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let mut h1 = h0.clone();
+        h1.prev_fk = prev_fk;
+        h1.timestamp = 2;
+        h1.nonce = 1;
+        h1.hash = rbitcoin_store::block_header_hash(
+            h1.version,
+            &merkle,
+            &h1.merkle_root,
+            h1.timestamp,
+            h1.bits,
+            h1.nonce,
+        );
+        let mut t1 = t0;
+        t1.tx.txid[5] = 0xaa;
+        q.connect_block(Height(1), &h1, &[t1.clone()]).unwrap();
+        let sh = script_hash(&[0x51]);
+        let hist_a = q.scripthash_history(&sh).unwrap();
+        let status_a = scripthash_status(Some(&q), &hist_a);
+        let legacy = {
+            use bitcoin::hashes::{sha256, Hash as _};
+            let mut s = String::new();
+            for i in &hist_a {
+                s.push_str(&format!("{}:{}:", txid_hex(&i.txid), i.height));
+            }
+            rbitcoin_primitives::hex_encode(sha256::Hash::hash(s.as_bytes()).to_byte_array())
+        };
+        assert_ne!(
+            status_a, legacy,
+            "status preimage must include confirming block hash"
+        );
+
+        q.disconnect_tip().unwrap();
+        let mut h1b = h1.clone();
+        h1b.nonce = 9;
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &merkle,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        q.connect_block(Height(1), &h1b, &[t1]).unwrap();
+        let hist_b = q.scripthash_history(&sh).unwrap();
+        let status_b = scripthash_status(Some(&q), &hist_b);
+        assert_eq!(
+            hist_a
+                .iter()
+                .map(|i| (i.txid, i.height))
+                .collect::<Vec<_>>(),
+            hist_b
+                .iter()
+                .map(|i| (i.txid, i.height))
+                .collect::<Vec<_>>(),
+            "same txs at the same heights"
+        );
+        assert_ne!(
+            status_a, status_b,
+            "same-height replace must change status via blockhash"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chain_view_reorg_notifies_dropped_scripthash() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let mut hash = [0u8; 32];
+        hash[0] = 0x42;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let hfk0 = q.connect_block(Height(0), &header, &[ta]).unwrap();
+        let sh = electrum_scripthash_hex(&[0x51]);
+
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(2);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, std::sync::Arc::clone(&q), params, tip_tx.clone(), None)
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let mut line = serde_json::to_string(&json!({
+            "jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[sh]
+        }))
+        .unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut resp = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let first: Value = serde_json::from_str(&resp).unwrap();
+        let status0 = first["result"].as_str().unwrap().to_string();
+        assert!(!status0.is_empty());
+        let _ = hfk0;
+
+        q.disconnect_tip().unwrap();
+        let mut hash_b = [0u8; 32];
+        hash_b[0] = 0x43;
+        let header_b = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: hash_b,
+            hash: hash_b,
+        };
+        let mut txid_b = [0u8; 32];
+        txid_b[0] = 0x99;
+        txid_b[31] = 0xcd;
+        let ta_b = TxApply {
+            tx: TxRecord {
+                txid: txid_b,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![1],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x00])],
+        };
+        q.connect_block(Height(0), &header_b, &[ta_b]).unwrap();
+        tip_tx
+            .send(TipNotify {
+                height: 0,
+                header_hex: "aa".repeat(80),
+                reorg_from_height: Some(0),
+            })
+            .unwrap();
+        resp.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("reorg must restatus even when the new block misses the scripthash")
+        .unwrap();
+        let push: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            push["method"].as_str(),
+            Some("blockchain.scripthash.subscribe")
+        );
+        assert_ne!(
+            push["params"][1].as_str().unwrap_or("missing"),
+            status0,
+            "dropped history must change status"
+        );
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

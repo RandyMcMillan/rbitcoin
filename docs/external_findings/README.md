@@ -26,6 +26,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [019](./019-bip30-not-enforced.md) | critical | BIP30 not enforced | fixed | cluster 015/017 + BIP34-gated batch |
 | [020](./020-pending-child-after-reorg.md) | high | Pending child not connected after reorg | fixed | `drain_connects_pending_child_of_new_tip_after_reorg` |
 | [021](./021-regtest-activation-heights.md) | low | Regtest BIP65/66 heights stale | fixed | `params::tests::for_network_and_helpers` |
+| [022](./022-stack-altstack-share-max-size.md) | high | `MAX_STACK_SIZE` ignored altstack on PushBytes / TUCK | fixed | `stack_and_altstack_share_max_size_on_pushdata` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

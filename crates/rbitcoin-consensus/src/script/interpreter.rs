@@ -350,16 +350,16 @@ pub(crate) fn eval_script_sig_pushes(
     for ins in script.instructions() {
         match ins.map_err(|_| ConsensusError::Script("scriptSig parse".into()))? {
             Instruction::PushBytes(b) => {
-                push(stack, b.as_bytes().to_vec())?;
+                push(stack, 0, b.as_bytes().to_vec())?;
             }
             Instruction::Op(op) => {
                 let n = op.to_u8();
                 if n == 0x00 {
-                    push(stack, vec![])?;
+                    push(stack, 0, vec![])?;
                 } else if n == 0x4f {
-                    push(stack, vec![0x81])?;
+                    push(stack, 0, vec![0x81])?;
                 } else if (0x51..=0x60).contains(&n) {
-                    push(stack, vec![n - 0x50])?;
+                    push(stack, 0, vec![n - 0x50])?;
                 } else {
                     return Err(ConsensusError::Script("scriptSig non-push".into()));
                 }
@@ -421,7 +421,7 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("MINIMALDATA".into()));
                         }
                     }
-                    push(stack, data.to_vec())?;
+                    push(stack, altstack.len(), data.to_vec())?;
                 }
             }
             Instruction::Op(op) => {
@@ -500,9 +500,9 @@ pub(crate) fn eval_script(
 
                 let rm = ctx.minimal_data;
                 match code {
-                    0x00 => push(stack, vec![])?,
-                    0x4f => push(stack, vec![0x81])?,
-                    n if (0x51..=0x60).contains(&n) => push(stack, vec![n - 0x50])?,
+                    0x00 => push(stack, altstack.len(), vec![])?,
+                    0x4f => push(stack, altstack.len(), vec![0x81])?,
+                    n if (0x51..=0x60).contains(&n) => push(stack, altstack.len(), vec![n - 0x50])?,
 
                     0x50 => {
                         return Err(ConsensusError::Script("OP_RESERVED".into()));
@@ -530,7 +530,7 @@ pub(crate) fn eval_script(
                         let v = altstack
                             .pop()
                             .ok_or_else(|| ConsensusError::Script("altstack empty".into()))?;
-                        push(stack, v)?;
+                        push(stack, altstack.len(), v)?;
                     }
                     0x6d => {
                         pop(stack)?;
@@ -540,24 +540,24 @@ pub(crate) fn eval_script(
                         require_n(stack, 2)?;
                         let a = stack[stack.len() - 2].clone();
                         let b = stack[stack.len() - 1].clone();
-                        push(stack, a)?;
-                        push(stack, b)?;
+                        push(stack, altstack.len(), a)?;
+                        push(stack, altstack.len(), b)?;
                     }
                     0x6f => {
                         require_n(stack, 3)?;
                         let a = stack[stack.len() - 3].clone();
                         let b = stack[stack.len() - 2].clone();
                         let c = stack[stack.len() - 1].clone();
-                        push(stack, a)?;
-                        push(stack, b)?;
-                        push(stack, c)?;
+                        push(stack, altstack.len(), a)?;
+                        push(stack, altstack.len(), b)?;
+                        push(stack, altstack.len(), c)?;
                     }
                     0x70 => {
                         require_n(stack, 4)?;
                         let a = stack[stack.len() - 4].clone();
                         let b = stack[stack.len() - 3].clone();
-                        push(stack, a)?;
-                        push(stack, b)?;
+                        push(stack, altstack.len(), a)?;
+                        push(stack, altstack.len(), b)?;
                     }
                     0x71 => {
                         require_n(stack, 6)?;
@@ -580,12 +580,12 @@ pub(crate) fn eval_script(
                         require_n(stack, 1)?;
                         if cast_to_bool(stack.last().unwrap()) {
                             let v = stack.last().unwrap().clone();
-                            push(stack, v)?;
+                            push(stack, altstack.len(), v)?;
                         }
                     }
                     0x74 => {
                         let d = stack.len() as i64;
-                        push(stack, scriptnum_encode(d))?;
+                        push(stack, altstack.len(), scriptnum_encode(d))?;
                     }
                     0x75 => {
                         pop(stack)?;
@@ -593,18 +593,18 @@ pub(crate) fn eval_script(
                     0x76 => {
                         require_n(stack, 1)?;
                         let v = stack.last().unwrap().clone();
-                        push(stack, v)?;
+                        push(stack, altstack.len(), v)?;
                     }
                     0x77 => {
                         require_n(stack, 2)?;
                         let top = pop(stack)?;
                         pop(stack)?;
-                        push(stack, top)?;
+                        push(stack, altstack.len(), top)?;
                     }
                     0x78 => {
                         require_n(stack, 2)?;
                         let v = stack[stack.len() - 2].clone();
-                        push(stack, v)?;
+                        push(stack, altstack.len(), v)?;
                     }
                     0x79 => {
                         let n = scriptnum_decode(&pop(stack)?, rm)?;
@@ -612,7 +612,7 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("OP_PICK".into()));
                         }
                         let v = stack[stack.len() - 1 - n as usize].clone();
-                        push(stack, v)?;
+                        push(stack, altstack.len(), v)?;
                     }
                     0x7a => {
                         let n = scriptnum_decode(&pop(stack)?, rm)?;
@@ -621,7 +621,7 @@ pub(crate) fn eval_script(
                         }
                         let idx = stack.len() - 1 - n as usize;
                         let v = stack.remove(idx);
-                        push(stack, v)?;
+                        push(stack, altstack.len(), v)?;
                     }
                     0x7b => {
                         require_n(stack, 3)?;
@@ -638,14 +638,14 @@ pub(crate) fn eval_script(
                         require_n(stack, 2)?;
                         let v = stack[stack.len() - 1].clone();
                         stack.insert(stack.len() - 2, v);
-                        if stack.len() > MAX_STACK_SIZE {
+                        if stack.len() + altstack.len() > MAX_STACK_SIZE {
                             return Err(ConsensusError::Script("stack size".into()));
                         }
                     }
                     0x82 => {
                         require_n(stack, 1)?;
                         let sz = stack.last().unwrap().len() as i64;
-                        push(stack, scriptnum_encode(sz))?;
+                        push(stack, altstack.len(), scriptnum_encode(sz))?;
                     }
                     0x89 | 0x8a => {
                         return Err(ConsensusError::Script("OP_RESERVED".into()));
@@ -653,7 +653,7 @@ pub(crate) fn eval_script(
                     0x87 => {
                         let a = pop(stack)?;
                         let b = pop(stack)?;
-                        push(stack, bool_encode(a == b))?;
+                        push(stack, altstack.len(), bool_encode(a == b))?;
                     }
                     0x88 => {
                         let a = pop(stack)?;
@@ -664,41 +664,41 @@ pub(crate) fn eval_script(
                     }
                     0x8b => {
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, scriptnum_encode(v.saturating_add(1)))?;
+                        push(stack, altstack.len(), scriptnum_encode(v.saturating_add(1)))?;
                     }
                     0x8c => {
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, scriptnum_encode(v.saturating_sub(1)))?;
+                        push(stack, altstack.len(), scriptnum_encode(v.saturating_sub(1)))?;
                     }
                     0x8f => {
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, scriptnum_encode(-v))?;
+                        push(stack, altstack.len(), scriptnum_encode(-v))?;
                     }
                     0x90 => {
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, scriptnum_encode(v.abs()))?;
+                        push(stack, altstack.len(), scriptnum_encode(v.abs()))?;
                     }
                     0x91 => {
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, bool_encode(v == 0))?;
+                        push(stack, altstack.len(), bool_encode(v == 0))?;
                     }
                     0x92 => {
                         let v = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, bool_encode(v != 0))?;
+                        push(stack, altstack.len(), bool_encode(v != 0))?;
                     }
-                    0x93 => bin_arith(stack, rm, |a, b| a + b)?,
-                    0x94 => bin_arith(stack, rm, |a, b| a - b)?,
+                    0x93 => bin_arith(stack, altstack.len(), rm, |a, b| a + b)?,
+                    0x94 => bin_arith(stack, altstack.len(), rm, |a, b| a - b)?,
                     0x9a => {
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, bool_encode(a != 0 && b != 0))?;
+                        push(stack, altstack.len(), bool_encode(a != 0 && b != 0))?;
                     }
                     0x9b => {
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, bool_encode(a != 0 || b != 0))?;
+                        push(stack, altstack.len(), bool_encode(a != 0 || b != 0))?;
                     }
-                    0x9c => bin_cmp(stack, rm, |a, b| a == b)?,
+                    0x9c => bin_cmp(stack, altstack.len(), rm, |a, b| a == b)?,
                     0x9d => {
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
@@ -706,49 +706,57 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("OP_NUMEQUALVERIFY".into()));
                         }
                     }
-                    0x9e => bin_cmp(stack, rm, |a, b| a != b)?,
-                    0x9f => bin_cmp(stack, rm, |a, b| a < b)?,
-                    0xa0 => bin_cmp(stack, rm, |a, b| a > b)?,
-                    0xa1 => bin_cmp(stack, rm, |a, b| a <= b)?,
-                    0xa2 => bin_cmp(stack, rm, |a, b| a >= b)?,
+                    0x9e => bin_cmp(stack, altstack.len(), rm, |a, b| a != b)?,
+                    0x9f => bin_cmp(stack, altstack.len(), rm, |a, b| a < b)?,
+                    0xa0 => bin_cmp(stack, altstack.len(), rm, |a, b| a > b)?,
+                    0xa1 => bin_cmp(stack, altstack.len(), rm, |a, b| a <= b)?,
+                    0xa2 => bin_cmp(stack, altstack.len(), rm, |a, b| a >= b)?,
                     0xa3 => {
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, scriptnum_encode(a.min(b)))?;
+                        push(stack, altstack.len(), scriptnum_encode(a.min(b)))?;
                     }
                     0xa4 => {
                         let b = scriptnum_decode(&pop(stack)?, rm)?;
                         let a = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, scriptnum_encode(a.max(b)))?;
+                        push(stack, altstack.len(), scriptnum_encode(a.max(b)))?;
                     }
                     0xa5 => {
                         let max = scriptnum_decode(&pop(stack)?, rm)?;
                         let min = scriptnum_decode(&pop(stack)?, rm)?;
                         let x = scriptnum_decode(&pop(stack)?, rm)?;
-                        push(stack, bool_encode(x >= min && x < max))?;
+                        push(stack, altstack.len(), bool_encode(x >= min && x < max))?;
                     }
                     0xa6 => {
                         let v = pop(stack)?;
                         use bitcoin::hashes::ripemd160;
-                        push(stack, ripemd160::Hash::hash(&v).to_byte_array().to_vec())?;
+                        push(
+                            stack,
+                            altstack.len(),
+                            ripemd160::Hash::hash(&v).to_byte_array().to_vec(),
+                        )?;
                     }
                     0xa7 => {
                         // OP_SHA1 is consensus-enabled (was stubbed → would fail post-milestone).
                         let v = pop(stack)?;
-                        push(stack, crypto::sha1(&v).to_vec())?;
+                        push(stack, altstack.len(), crypto::sha1(&v).to_vec())?;
                     }
                     0xa8 => {
                         let v = pop(stack)?;
-                        push(stack, crypto::sha256(&v).to_vec())?;
+                        push(stack, altstack.len(), crypto::sha256(&v).to_vec())?;
                     }
                     0xa9 => {
                         let v = pop(stack)?;
-                        push(stack, crypto::hash160(&v).to_vec())?;
+                        push(stack, altstack.len(), crypto::hash160(&v).to_vec())?;
                     }
                     0xaa => {
                         let v = pop(stack)?;
                         use bitcoin::hashes::sha256d;
-                        push(stack, sha256d::Hash::hash(&v).to_byte_array().to_vec())?;
+                        push(
+                            stack,
+                            altstack.len(),
+                            sha256d::Hash::hash(&v).to_byte_array().to_vec(),
+                        )?;
                     }
                     0xab => {
                         // Tapscript: instruction index. Base/v0: scriptCode after this opcode.
@@ -759,13 +767,13 @@ pub(crate) fn eval_script(
                         ctx.codeseparator_script_off
                             .set(Some(byte_index.saturating_add(1)));
                     }
-                    0xac => op_checksig(stack, ctx, false)?,
-                    0xad => op_checksig(stack, ctx, true)?,
+                    0xac => op_checksig(stack, altstack.len(), ctx, false)?,
+                    0xad => op_checksig(stack, altstack.len(), ctx, true)?,
                     0xba => {
                         if ctx.sig_version != SigVersion::TapScript {
                             return Err(ConsensusError::Script("unknown opcode 0xba".into()));
                         }
-                        op_checksigadd(stack, ctx)?;
+                        op_checksigadd(stack, altstack.len(), ctx)?;
                     }
                     0xae => {
                         // BIP342: CHECKMULTISIG disabled in tapscript (hard fail).
@@ -774,7 +782,7 @@ pub(crate) fn eval_script(
                                 "CHECKMULTISIG disabled in tapscript".into(),
                             ));
                         }
-                        op_checkmultisig(stack, ctx, false, &mut op_count)?;
+                        op_checkmultisig(stack, altstack.len(), ctx, false, &mut op_count)?;
                     }
                     0xaf => {
                         if ctx.sig_version == SigVersion::TapScript {
@@ -782,7 +790,7 @@ pub(crate) fn eval_script(
                                 "CHECKMULTISIGVERIFY disabled in tapscript".into(),
                             ));
                         }
-                        op_checkmultisig(stack, ctx, true, &mut op_count)?;
+                        op_checkmultisig(stack, altstack.len(), ctx, true, &mut op_count)?;
                     }
                     0xb1 => {
                         // BIP65: pre-activation is NOP.
@@ -878,13 +886,14 @@ fn sequence_csv_ok(seq: Sequence, csv: u32) -> bool {
 
 fn op_checksig(
     stack: &mut Vec<Vec<u8>>,
+    alt_len: usize,
     ctx: &EvalContext<'_>,
     verify: bool,
 ) -> Result<(), ConsensusError> {
     let pubkey = pop(stack)?;
     let sig = pop(stack)?;
     if ctx.sig_version == SigVersion::TapScript {
-        return op_checksig_tapscript(stack, &sig, &pubkey, ctx, verify);
+        return op_checksig_tapscript(stack, alt_len, &sig, &pubkey, ctx, verify);
     }
     let ok = checksig_legacy(&sig, &pubkey, ctx, None)?;
     if verify {
@@ -892,13 +901,17 @@ fn op_checksig(
             return Err(ConsensusError::Script("CHECKSIGVERIFY".into()));
         }
     } else {
-        push(stack, bool_encode(ok))?;
+        push(stack, alt_len, bool_encode(ok))?;
     }
     Ok(())
 }
 
 /// BIP342 OP_CHECKSIGADD: stack is `… sig n pubkey` → `… n` or `… n+1`.
-fn op_checksigadd(stack: &mut Vec<Vec<u8>>, ctx: &EvalContext<'_>) -> Result<(), ConsensusError> {
+fn op_checksigadd(
+    stack: &mut Vec<Vec<u8>>,
+    alt_len: usize,
+    ctx: &EvalContext<'_>,
+) -> Result<(), ConsensusError> {
     require_n(stack, 3)?;
     let pubkey = pop(stack)?;
     let n_raw = pop(stack)?;
@@ -906,10 +919,10 @@ fn op_checksigadd(stack: &mut Vec<Vec<u8>>, ctx: &EvalContext<'_>) -> Result<(),
     let n = scriptnum_decode(&n_raw, ctx.minimal_data)?;
     match tapscript_sig_result(&sig, &pubkey, ctx)? {
         TapSigResult::EmptySig => {
-            push(stack, scriptnum_encode(n))?;
+            push(stack, alt_len, scriptnum_encode(n))?;
         }
         TapSigResult::Valid => {
-            push(stack, scriptnum_encode(n.saturating_add(1)))?;
+            push(stack, alt_len, scriptnum_encode(n.saturating_add(1)))?;
         }
     }
     Ok(())
@@ -925,6 +938,7 @@ enum TapSigResult {
 
 fn op_checksig_tapscript(
     stack: &mut Vec<Vec<u8>>,
+    alt_len: usize,
     sig: &[u8],
     pubkey: &[u8],
     ctx: &EvalContext<'_>,
@@ -936,11 +950,11 @@ fn op_checksig_tapscript(
                 return Err(ConsensusError::Script("CHECKSIGVERIFY empty".into()));
             }
             // BIP342: push empty vector (not 0x00 byte).
-            push(stack, vec![])?;
+            push(stack, alt_len, vec![])?;
         }
         TapSigResult::Valid => {
             if !verify {
-                push(stack, vec![0x01])?;
+                push(stack, alt_len, vec![0x01])?;
             }
         }
     }
@@ -974,6 +988,7 @@ fn tapscript_sig_result(
 
 fn op_checkmultisig(
     stack: &mut Vec<Vec<u8>>,
+    alt_len: usize,
     ctx: &EvalContext<'_>,
     verify: bool,
     op_count: &mut usize,
@@ -1054,7 +1069,7 @@ fn op_checkmultisig(
             return Err(ConsensusError::Script("CHECKMULTISIGVERIFY".into()));
         }
     } else {
-        push(stack, bool_encode(f_success))?;
+        push(stack, alt_len, bool_encode(f_success))?;
     }
     Ok(())
 }
@@ -1381,8 +1396,8 @@ fn sighash_for_script(
     }
 }
 
-fn push(stack: &mut Vec<Vec<u8>>, v: Vec<u8>) -> Result<(), ConsensusError> {
-    if stack.len() + 1 > MAX_STACK_SIZE {
+fn push(stack: &mut Vec<Vec<u8>>, alt_len: usize, v: Vec<u8>) -> Result<(), ConsensusError> {
+    if stack.len().saturating_add(alt_len).saturating_add(1) > MAX_STACK_SIZE {
         return Err(ConsensusError::Script("stack size".into()));
     }
     stack.push(v);
@@ -1523,22 +1538,24 @@ fn scriptnum_is_minimal(vch: &[u8]) -> bool {
 
 fn bin_arith(
     stack: &mut Vec<Vec<u8>>,
+    alt_len: usize,
     require_minimal: bool,
     f: impl Fn(i64, i64) -> i64,
 ) -> Result<(), ConsensusError> {
     let b = scriptnum_decode(&pop(stack)?, require_minimal)?;
     let a = scriptnum_decode(&pop(stack)?, require_minimal)?;
-    push(stack, scriptnum_encode(f(a, b)))
+    push(stack, alt_len, scriptnum_encode(f(a, b)))
 }
 
 fn bin_cmp(
     stack: &mut Vec<Vec<u8>>,
+    alt_len: usize,
     require_minimal: bool,
     f: impl Fn(i64, i64) -> bool,
 ) -> Result<(), ConsensusError> {
     let b = scriptnum_decode(&pop(stack)?, require_minimal)?;
     let a = scriptnum_decode(&pop(stack)?, require_minimal)?;
-    push(stack, bool_encode(f(a, b)))
+    push(stack, alt_len, bool_encode(f(a, b)))
 }
 
 #[cfg(test)]
@@ -2298,6 +2315,26 @@ mod success_and_disabled_tests {
             format!("{err}").contains("stack") || format!("{err}").contains("size"),
             "got {err}"
         );
+    }
+
+    /// Core: main stack + altstack share MAX_STACK_SIZE. Direct PushBytes used
+    /// to skip the opcode-end combined check (`push()` only counted the main
+    /// stack). 201 TOALTSTACK (op budget) + 799 OP_1 + one PushBytes = 1001.
+    #[test]
+    fn stack_and_altstack_share_max_size_on_pushdata() {
+        let mut script = Vec::new();
+        for _ in 0..201 {
+            script.push(0x51); // OP_1 (not an op-count opcode)
+        }
+        for _ in 0..201 {
+            script.push(0x6b); // OP_TOALTSTACK
+        }
+        for _ in 0..799 {
+            script.push(0x51);
+        }
+        script.extend_from_slice(&[0x01, 0x01]); // PushBytes, not OP_1
+        let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
+        assert!(format!("{err}").contains("stack size"), "got {err}");
     }
 
     #[test]

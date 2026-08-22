@@ -40,5 +40,5 @@ rust-bitcoin helper,” put it **here**; when the engine still disagrees with Co
 ## Related
 
 - Core corpus policy (no allowlist): [`consensus-tests.md`](./consensus-tests.md)
-- External differential findings (fixed **001–021**): [`external_findings/`](./external_findings/)
+- External differential findings (fixed **001–022**): [`external_findings/`](./external_findings/)
 - Architecture script split: [`architecture.md`](./architecture.md)

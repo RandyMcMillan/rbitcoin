@@ -29,6 +29,7 @@ refreshing; do not check copies into `tests/fixtures/`.
 | `script_tests.json` | `third_party/bitcoin/src/test/data/` (staged to `$CARGO_TARGET_DIR/core-data/`) | `script::core_vectors::core_script_tests_all_rows` | **every** data row; `fail == 0` (no allowlist) |
 | `tx_valid.json` | same | `script::core_tx_vectors::core_tx_valid_all_rows` | every data row accept |
 | `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
+| `sighash.json` | same | `script::core_sighash::core_sighash_all_rows` | every data row digest matches Core |
 
 ### How the harness works
 
@@ -43,8 +44,9 @@ refreshing; do not check copies into `tests/fixtures/`.
 - Soft majority pass rates are **not** success criteria.
 - There is **no** row skip inventory. A mismatch fails the test; fix the engine or
   the fixture interpretation before commit.
-- **Status:** all three Core JSON corpora green on the shipped path
-  (`script_tests` 1222/1222 on Core v31.1, `tx_valid` 121/121, `tx_invalid` 93/93).
+- **Status:** Core JSON corpora green on the shipped path
+  (`script_tests` 1222/1222 on Core v31.1, `tx_valid` 121/121, `tx_invalid` 93/93,
+  `sighash` 500/500).
 
 ### rust-bitcoin vs Core fixtures
 
@@ -98,6 +100,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C1–C14 | (see prior matrix) | … | structure / locktime / script unit tests |
 | C15 | Core `tx_valid` / `tx_invalid` | accept / reject at listed flags; valid still accepts with extra implemented flags off (FillFlags-implied bits skipped); invalid still rejects with extra **restriction** flags on (not P2SH/WITNESS/TAPROOT class changes) | `script::core_tx_vectors::*` |
 | C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
+| C18 | Core `sighash.json` | 32-byte digest via `SighashCache::legacy_signature_hash` | `script::core_sighash::core_sighash_all_rows` |
 | C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
 
 ## Adding a new rule

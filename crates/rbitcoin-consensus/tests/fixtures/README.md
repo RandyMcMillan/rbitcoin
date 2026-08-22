@@ -27,5 +27,6 @@ add a rust unit instead.
 | `script_tests.json` | `cargo test -p rbitcoin-consensus --lib core_script_tests_all_rows -- --nocapture` |
 | `tx_valid.json` | `cargo test -p rbitcoin-consensus --lib core_tx_valid_all_rows -- --nocapture` (flag subsets: `core_tx_valid_flag_subsets`) |
 | `tx_invalid.json` | `cargo test -p rbitcoin-consensus --lib core_tx_invalid_all_rows -- --nocapture` (restriction supersets: `core_tx_invalid_flag_supersets`) |
+| `sighash.json` | `cargo test -p rbitcoin-consensus --lib core_sighash_all_rows -- --nocapture` |
 
-Success requires **fail == 0** after an explicit allowlist (see `docs/consensus-tests.md`). Soft majority pass rates are not used.
+Success requires **fail == 0** with no allowlist (see `docs/consensus-tests.md`). Soft majority pass rates are not used.

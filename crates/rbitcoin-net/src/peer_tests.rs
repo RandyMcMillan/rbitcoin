@@ -3599,3 +3599,110 @@ fn bloom_disabled_messages_request_disconnect() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `p2p_invalid_locator.py`: getheaders/getblocks with locator > MAX_LOCATOR_SZ disconnect.
+#[test]
+fn oversize_locator_request_disconnect() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message::RawNetworkMessage;
+    use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage};
+    use bitcoin::Network;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            checksum,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let (dir, q) = tmp_store("locator-oversize");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let mut pending_headers = HashMap::new();
+    let mut pending_blocks = HashMap::new();
+    let mut pending_cmpct = HashMap::new();
+    let mut from_peer = HashMap::new();
+    let mut requested = HashSet::new();
+    let mut wants_headers = false;
+    let mut wtxid = false;
+    let mut send_cmpct = false;
+    let mut cmpct_ver = 2u32;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let stop = BlockHash::from_byte_array([0u8; 32]);
+    let oversize: Vec<BlockHash> = (0..=MAX_LOCATOR_SZ)
+        .map(|i| BlockHash::from_byte_array([i as u8; 32]))
+        .collect();
+    assert_eq!(oversize.len(), MAX_LOCATOR_SZ + 1);
+    let within: Vec<BlockHash> = oversize[..MAX_LOCATOR_SZ].to_vec();
+
+    for msg in [
+        NetworkMessage::GetHeaders(GetHeadersMessage::new(oversize.clone(), stop)),
+        NetworkMessage::GetBlocks(GetBlocksMessage::new(oversize.clone(), stop)),
+    ] {
+        let mut ban = 0u32;
+        rt.block_on(async {
+            handle_peer_frame(
+                frame_for(msg),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        assert!(
+            ban >= BAN_SCORE_THRESHOLD,
+            "oversize locator must punish-disconnect (ban={ban})"
+        );
+    }
+
+    // Exactly MAX_LOCATOR_SZ stays connected (ban untouched).
+    let mut ban = 0u32;
+    rt.block_on(async {
+        handle_peer_frame(
+            frame_for(NetworkMessage::GetHeaders(GetHeadersMessage::new(
+                within, stop,
+            ))),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            None,
+        )
+        .await
+        .unwrap();
+    });
+    assert_eq!(ban, 0, "max-sized locator must not disconnect");
+
+    let _ = std::fs::remove_dir_all(dir);
+}

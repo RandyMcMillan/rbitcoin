@@ -5,7 +5,7 @@
 //! the fk stream is shared by slab payloads and megakey pages
 //! ([`encode_fk_delta_stream`]).
 
-use crate::compact::{read_uleb128, uleb128_len, write_uleb128};
+use crate::compact::{read_uleb128, write_uleb128_into};
 use crate::error::StoreError;
 use crate::scripthash_layout::{slab_bytes, slab_cap, SH_INLINE_CAP, SH_MAX_SLAB_CLASS};
 use crate::scripthash_pages::{sh_page_count_for_entries, SH_FLAG_BIT, SH_PAGE_SIZE};
@@ -74,31 +74,40 @@ pub fn slab_alloc_bytes_for_n_fks(n: u32) -> u64 {
 ///
 /// Does not prefix `used` — slabs write `u16` first; pages keep `n_fks` in the
 /// page header. Empty input → empty stream.
-pub fn encode_fk_delta_stream(fks: &[Fk]) -> Result<Vec<u8>, StoreError> {
+pub fn encode_fk_delta_stream_into(out: &mut [u8], fks: &[u64]) -> Result<usize, StoreError> {
     if fks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
-    if fks[0].is_null() {
+    if fks[0] == 0 {
         return Err(StoreError::Corrupt("scripthash fk stream null first fk"));
     }
-    if fks[0].0 & SH_FLAG_BIT != 0 {
+    if fks[0] & SH_FLAG_BIT != 0 {
         return Err(StoreError::Corrupt("scripthash fk stream flag bit set"));
     }
     for w in fks.windows(2) {
-        if w[1].0 <= w[0].0 {
+        if w[1] <= w[0] {
             return Err(StoreError::Corrupt(
                 "invariant: scripthash fk stream not strictly increasing",
             ));
         }
-        if w[1].0 & SH_FLAG_BIT != 0 {
+        if w[1] & SH_FLAG_BIT != 0 {
             return Err(StoreError::Corrupt("scripthash fk stream flag bit set"));
         }
     }
-    let mut out = Vec::with_capacity(uleb128_len(fks[0].0) + fks.len());
-    write_uleb128(&mut out, fks[0].0);
+    let mut n = write_uleb128_into(out, fks[0])?;
     for w in fks.windows(2) {
-        write_uleb128(&mut out, w[1].0 - w[0].0);
+        n += write_uleb128_into(out.get_mut(n..).unwrap_or(&mut []), w[1] - w[0])?;
     }
+    Ok(n)
+}
+
+/// Encode strictly increasing create fks as ULEB128 `fk0` + ULEB128 deltas.
+pub fn encode_fk_delta_stream(fks: &[Fk]) -> Result<Vec<u8>, StoreError> {
+    let mut raw = Vec::with_capacity(fks.len());
+    raw.extend(fks.iter().map(|fk| fk.0));
+    let mut out = vec![0u8; raw.len().saturating_mul(10)];
+    let n = encode_fk_delta_stream_into(&mut out, &raw)?;
+    out.truncate(n);
     Ok(out)
 }
 
@@ -140,15 +149,26 @@ pub fn decode_fk_delta_stream(buf: &[u8], n: usize) -> Result<Vec<Fk>, StoreErro
     Ok(out)
 }
 
-/// Slab payload: `used:u16` LE + [`encode_fk_delta_stream`].
-pub fn encode_slab_payload(fks: &[Fk]) -> Result<Vec<u8>, StoreError> {
+/// Slab payload: `used:u16` LE + [`encode_fk_delta_stream_into`].
+pub fn encode_slab_payload_into(out: &mut [u8], fks: &[u64]) -> Result<usize, StoreError> {
     if fks.len() > u16::MAX as usize {
         return Err(StoreError::Corrupt("scripthash slab used overflow"));
     }
-    let stream = encode_fk_delta_stream(fks)?;
-    let mut out = Vec::with_capacity(2 + stream.len());
-    out.extend_from_slice(&(fks.len() as u16).to_le_bytes());
-    out.extend_from_slice(&stream);
+    if out.len() < 2 {
+        return Err(StoreError::Corrupt("scripthash slab dest short"));
+    }
+    let n = encode_fk_delta_stream_into(&mut out[2..], fks)?;
+    out[..2].copy_from_slice(&(fks.len() as u16).to_le_bytes());
+    Ok(2 + n)
+}
+
+/// Slab payload: `used:u16` LE + [`encode_fk_delta_stream`].
+pub fn encode_slab_payload(fks: &[Fk]) -> Result<Vec<u8>, StoreError> {
+    let mut raw = Vec::with_capacity(fks.len());
+    raw.extend(fks.iter().map(|fk| fk.0));
+    let mut out = vec![0u8; 2 + raw.len().saturating_mul(10)];
+    let n = encode_slab_payload_into(&mut out, &raw)?;
+    out.truncate(n);
     Ok(out)
 }
 
@@ -260,6 +280,13 @@ mod tests {
             let slab = encode_slab_payload(&fks).unwrap();
             assert_eq!(decode_slab_payload(&slab).unwrap(), fks);
             assert_eq!(slab.len(), 2 + stream.len());
+            let raw: Vec<u64> = raw.to_vec();
+            let mut stream_into = vec![0u8; raw.len().saturating_mul(10).max(1)];
+            let sn = encode_fk_delta_stream_into(&mut stream_into, &raw).unwrap();
+            assert_eq!(&stream_into[..sn], stream.as_slice());
+            let mut slab_into = vec![0u8; 2 + raw.len().saturating_mul(10).max(1)];
+            let pn = encode_slab_payload_into(&mut slab_into, &raw).unwrap();
+            assert_eq!(&slab_into[..pn], slab.as_slice());
         }
         assert!(encode_fk_delta_stream(&[Fk(5), Fk(5)]).is_err());
         assert!(encode_fk_delta_stream(&[Fk(0)]).is_err());

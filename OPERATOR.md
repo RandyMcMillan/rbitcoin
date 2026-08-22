@@ -367,9 +367,8 @@ Capacity ends at **80% of head slots** (~26.8 M creates at 25-bit): seal
 builds MPHF + dense rel + **binary fuse8**, unlinks OA, then opens a new
 segment. Idx 16 GiB soft-span does not cut `tx.head`. Open segment has **no** filter (always probed); sealed segments are
 fuse-gated then one MPHF+rel pread. Legacy monolithic `tx.head` / `.new` /
-`.resize` / `.overflow` are **refused** — reindex. Schema **18** with populated
-17 `tx.head` or `scripthash*` is refused: wipe `store/tx.head` and
-`store/scripthash*` then restart (Class A kept; indexes rebuild). Create height is a RAM fence (no
+`.resize` / `.overflow` are **refused** — reindex. Schema 17 populated indexes
+versus this binary: [Schema upgrade](#schema-upgrade). Create height is a RAM fence (no
 `tx_height` file; schema 16).
 Dense Class A fk + segmented **`txout.idx` / `inwit.idx` / `spent.idx`**.
 Class A is **split** (outs / ins+wit / sole-spender). Spends are schema-v5
@@ -384,6 +383,47 @@ bulk-load at tip as sorted files (ingest OA is the only large SH heap). Densify
 is gated by body-queue soft depth — do not raise that depth without watching
 RSS vs page cache. Working-set sizes:
 [`SCHEMA.md`](./SCHEMA.md) (mainnet census) and [`docs/ibd-memory.md`](docs/ibd-memory.md).
+
+## Schema upgrade
+
+Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 19`). This section is
+the operator copy-paste only — do not treat it as a second layout map.
+
+Open **never silently wipes** a populated store. An older `store/meta` either
+rewrites `meta` (payload-only) or **refuses** with a one-line message that
+names the dirs. Corrupt files are **not** repaired in-process.
+
+| Incoming `meta` | What this binary does |
+|-----------------|------------------------|
+| **19** | Open. |
+| **18** (empty or occupied) | Rewrite `meta` to 19. No wipe. Mode 10 SH pages stay readable; new megakeys write mode 11. |
+| **17**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 19, then open. |
+| **17**, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
+| Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
+
+An **18 binary** refuses 19 `meta` (do not downgrade in place).
+
+When the 17-index refuse fires, the log line is:
+
+```text
+schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)
+```
+
+Copy-paste (node stopped with SIGTERM):
+
+```bash
+DATADIR=/path/to/datadir
+rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
+```
+
+Keep Class A (`txout` / `inwit` / `spent` + idx, `txid.body`, headers) and
+Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
+`--shindex`, SH rematerializes from runs / Class A. Do **not** `rm -rf store/`.
+
+**Kill-9 / crash is not a schema upgrade.** Open follows
+[`docs/crash-recovery.md`](docs/crash-recovery.md) (tip-as-commit, Class C
+repair above tip). Prefer SIGTERM ([Resume / clean stop](#resume--clean-stop)).
+A corrupt file still means wipe/reindex — not an in-process repair.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 

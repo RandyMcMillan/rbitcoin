@@ -18,6 +18,11 @@ before 1.0).
 
 ### Changed
 
+- **Schema upgrade one-pager:** [`OPERATOR.md`](OPERATOR.md#schema-upgrade)
+  copy-paste for 17 populated `tx.head` / `scripthash*` (wipe those dirs, keep
+  Class A), 18→19 `meta` rewrite, and kill-9 → crash-recovery. Byte layout
+  stays [`SCHEMA.md`](SCHEMA.md).
+
 - **RPC docs:** permanent gaps no longer call GBT a non-goal. Template RPC is
   the cluster-chunk selector (no stratum / testdummy); `generate*` stays
   regtest harness. Matches [`COMPAT.md`](COMPAT.md).

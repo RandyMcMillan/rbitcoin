@@ -1227,6 +1227,40 @@ fn bulk_session_reuses_fk_scratch_across_keys() {
 }
 
 #[test]
+fn pack_shard_session_slab_flush_times_body_and_roundtrips() {
+    HeadScale::test_with(HeadScale::Tiny, || {
+        let dir = tmp();
+        let t = four_shard_table(&dir);
+        let mut session = t.pack_shard_session(0).unwrap();
+        const N: u8 = 32;
+        for i in 0..N {
+            let k = shard0_key(i);
+            let base = u64::from(i) * 10 + 1;
+            session.push_sorted_fk(k, Fk(base)).unwrap();
+            session.push_sorted_fk(k, Fk(base + 1)).unwrap();
+        }
+        let pack = session.finish_pack().unwrap();
+        assert!(
+            pack.body_flush_ns > 0,
+            "slab writes must flush through body_buf: body_flush_ns={}",
+            pack.body_flush_ns
+        );
+        assert_eq!(pack.keys, u64::from(N));
+        assert_eq!(pack.creates, u64::from(N) * 2);
+        t.publish_packed_shard(0, pack).unwrap();
+        for i in 0..N {
+            let k = shard0_key(i);
+            let ents = t.entries(&k).unwrap();
+            assert_eq!(ents.len(), 2, "key {i}");
+            let base = u64::from(i) * 10 + 1;
+            assert_eq!(ents[0].0, Fk(base));
+            assert_eq!(ents[1].0, Fk(base + 1));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
 fn bulk_dense_five_fks_use_class0_slab() {
     HeadScale::test_with(HeadScale::Tiny, || {
         let dir = tmp();

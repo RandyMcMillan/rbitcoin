@@ -2436,7 +2436,7 @@ impl ScriptHashTable {
             active_shard: None,
             recs: Vec::new(),
             key_budget,
-            body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
+            body_buf: Vec::with_capacity(BULK_BODY_FLUSH),
             body_write_off: bump,
             finished: false,
             keys_written: 0,
@@ -2483,7 +2483,7 @@ impl ScriptHashTable {
             active_shard: Some(shard),
             recs: Vec::new(),
             key_budget,
-            body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
+            body_buf: Vec::with_capacity(BULK_BODY_FLUSH),
             body_write_off: bump,
             finished: false,
             keys_written: 0,
@@ -2544,7 +2544,7 @@ impl ScriptHashTable {
             active_shard: None,
             recs: Vec::new(),
             key_budget,
-            body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
+            body_buf: Vec::with_capacity(BULK_BODY_FLUSH),
             body_write_off: bump,
             finished: false,
             keys_written: progress.keys_written,
@@ -2981,7 +2981,6 @@ impl<'a> ScriptHashBulkSession<'a> {
             if n <= SH_INLINE_CAP as u32 {
                 ShHeadValue::inline_one(ents[0])
             } else {
-                self.flush_body()?;
                 self.bulk_write_slab(&ents)?
             }
         } else {
@@ -3095,6 +3094,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         chain_first: Option<u64>,
     ) -> Result<u64, StoreError> {
         self.flush_body()?;
+        debug_assert!(self.body_buf.is_empty());
         let base = self.align_bump_for_page()?;
         let next = if has_next {
             base.saturating_add(SH_PAGE_SIZE as u64)
@@ -3112,6 +3112,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             let n = ((base.saturating_sub(first) / SH_PAGE_SIZE as u64).saturating_add(1)) as u32;
             sh_page_pack_extent_last(&mut page, &ents, first, n, 0)?;
         }
+        debug_assert!(self.body_buf.is_empty());
         self.body().write_at(base, &page)?;
         self.bump = end;
         self.body_write_off = end;
@@ -3119,6 +3120,8 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn align_bump_for_page(&mut self) -> Result<u64, StoreError> {
+        self.flush_body()?;
+        debug_assert!(self.body_buf.is_empty());
         let aligned = (self.bump + 4095) & !4095;
         if aligned != self.bump {
             let bump = self.bump;
@@ -3140,7 +3143,6 @@ impl<'a> ScriptHashBulkSession<'a> {
         let need = slab_bytes(class);
         let off = self.bump;
         self.bump = self.bump.saturating_add(need);
-        self.body_write_off = self.bump;
         self.ensure_body_capacity(self.bump)?;
         Ok(off)
     }
@@ -3215,7 +3217,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let need = slab_bytes(class) as usize;
         let mut buf = vec![0u8; need];
         buf[..payload.len()].copy_from_slice(&payload);
-        self.body().write_at(off, &buf)?;
+        self.write_body_bytes(off, &buf)?;
         Ok(ShHeadValue::slab(class, n as u16, off))
     }
 
@@ -3224,6 +3226,8 @@ impl<'a> ScriptHashBulkSession<'a> {
         if entries.is_empty() {
             return Err(StoreError::Corrupt("scripthash bulk page chain empty"));
         }
+        self.flush_body()?;
+        debug_assert!(self.body_buf.is_empty());
         let base = self.align_bump_for_page()?;
         let fks: Vec<Fk> = entries.iter().map(|e| e.create_tx_fk).collect();
         let chunks = sh_page_chunk_ranges(&fks)?;
@@ -3245,6 +3249,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                     0,
                 )?;
             }
+            debug_assert!(self.body_buf.is_empty());
             self.body().write_at(off, &page)?;
         }
         self.bump = end;
@@ -3253,12 +3258,21 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn ensure_body_capacity(&self, need: u64) -> Result<(), StoreError> {
-        let body = self.body();
-        body.ensure_capacity(need)?;
-        if need > body.logical_len() {
-            body.set_logical_len(need)?;
+        self.body().ensure_capacity(need)
+    }
+
+    fn write_body_bytes(&mut self, off: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let sequential = off == self.body_write_off.saturating_add(self.body_buf.len() as u64);
+        if sequential {
+            self.body_buf.extend_from_slice(bytes);
+            if self.body_buf.len() >= BULK_BODY_FLUSH {
+                self.flush_body()?;
+            }
+            return Ok(());
         }
-        Ok(())
+        self.flush_body()?;
+        debug_assert!(self.body_buf.is_empty());
+        self.body().write_at(off, bytes)
     }
 
     fn flush_body(&mut self) -> Result<(), StoreError> {

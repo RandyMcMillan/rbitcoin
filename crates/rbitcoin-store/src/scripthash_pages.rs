@@ -41,9 +41,9 @@
 use crate::compact::{read_uleb128, uleb128_len, write_uleb128_into};
 use crate::error::StoreError;
 use crate::scripthash_layout::{ShEntry, SH_ENTRY_LEN};
-use crate::scripthash_slabs::{
-    decode_fk_delta_stream, encode_fk_delta_stream, encode_fk_delta_stream_into,
-};
+#[cfg(test)]
+use crate::scripthash_slabs::encode_fk_delta_stream;
+use crate::scripthash_slabs::{decode_fk_delta_stream, encode_fk_delta_stream_into};
 use rbitcoin_primitives::Fk;
 
 /// Disk page size for SH FK chains (aligned allocations).
@@ -683,26 +683,23 @@ pub fn sh_page_try_append_entry(
     }
     let (used, last) = sh_page_stream_tail(page)?;
     let n = sh_page_n_fks(page)? as usize;
-    let add = match last {
-        None => uleb128_len(entry.create_tx_fk.0),
+    let delta = match last {
+        None => entry.create_tx_fk.0,
         Some(prev) => {
             if entry.create_tx_fk.0 <= prev.0 {
                 return Err(StoreError::Corrupt(
                     "invariant: scripthash page append create_fk not strictly increasing",
                 ));
             }
-            uleb128_len(entry.create_tx_fk.0 - prev.0)
+            entry.create_tx_fk.0 - prev.0
         }
     };
+    let add = uleb128_len(delta);
     if used + add > sh_page_stream_cap(page) {
         return Ok(false);
     }
     let mut tmp = [0u8; 10];
-    let wrote = if last.is_none() {
-        write_uleb128_into(&mut tmp, entry.create_tx_fk.0)?
-    } else {
-        write_uleb128_into(&mut tmp, entry.create_tx_fk.0 - last.unwrap().0)?
-    };
+    let wrote = write_uleb128_into(&mut tmp, delta)?;
     debug_assert_eq!(wrote, add);
     let off = sh_page_stream_off(page) + used;
     page[off..off + wrote].copy_from_slice(&tmp[..wrote]);

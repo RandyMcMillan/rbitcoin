@@ -18,8 +18,8 @@ use crate::scripthash_head::{
 };
 use crate::scripthash_layout::{
     head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShEntry, ShHeadValue,
-    SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_HEAD_VALUE_LEN, SH_INLINE_CAP,
-    SH_MAX_CLASS, SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
+    SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
+    SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
 use crate::scripthash_mphf::{self, mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;

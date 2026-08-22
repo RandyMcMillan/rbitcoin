@@ -111,12 +111,16 @@ pub fn encode_fk_delta_stream(fks: &[Fk]) -> Result<Vec<u8>, StoreError> {
     Ok(out)
 }
 
-/// Decode `n` strictly increasing fks from a delta stream (stops after `n`).
-pub fn decode_fk_delta_stream(buf: &[u8], n: usize) -> Result<Vec<Fk>, StoreError> {
+/// Decode `n` strictly increasing fks from a delta stream into `out` (stops after `n`).
+pub fn decode_fk_delta_stream_into(
+    buf: &[u8],
+    n: usize,
+    out: &mut Vec<Fk>,
+) -> Result<(), StoreError> {
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let mut out = Vec::with_capacity(n);
+    out.reserve(n);
     let mut off = 0usize;
     let (first, used) = read_uleb128(buf.get(off..).unwrap_or(&[]))?;
     if first == 0 {
@@ -146,6 +150,13 @@ pub fn decode_fk_delta_stream(buf: &[u8], n: usize) -> Result<Vec<Fk>, StoreErro
         }
         out.push(Fk(next));
     }
+    Ok(())
+}
+
+/// Decode `n` strictly increasing fks from a delta stream (stops after `n`).
+pub fn decode_fk_delta_stream(buf: &[u8], n: usize) -> Result<Vec<Fk>, StoreError> {
+    let mut out = Vec::with_capacity(n);
+    decode_fk_delta_stream_into(buf, n, &mut out)?;
     Ok(out)
 }
 
@@ -172,13 +183,20 @@ pub fn encode_slab_payload(fks: &[Fk]) -> Result<Vec<u8>, StoreError> {
     Ok(out)
 }
 
-/// Decode a slab payload (`used` + stream). Extra padding after the stream is ignored.
-pub fn decode_slab_payload(buf: &[u8]) -> Result<Vec<Fk>, StoreError> {
+/// Decode a slab payload (`used` + stream) into `out`. Extra padding after the stream is ignored.
+pub fn decode_slab_payload_into(buf: &[u8], out: &mut Vec<Fk>) -> Result<(), StoreError> {
     if buf.len() < 2 {
         return Err(StoreError::Corrupt("scripthash slab payload short"));
     }
     let used = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    decode_fk_delta_stream(&buf[2..], used)
+    decode_fk_delta_stream_into(&buf[2..], used, out)
+}
+
+/// Decode a slab payload (`used` + stream). Extra padding after the stream is ignored.
+pub fn decode_slab_payload(buf: &[u8]) -> Result<Vec<Fk>, StoreError> {
+    let mut out = Vec::new();
+    decode_slab_payload_into(buf, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -277,8 +295,14 @@ mod tests {
             );
             let got = decode_fk_delta_stream(&stream, fks.len()).unwrap();
             assert_eq!(got, fks);
+            let mut into = Vec::new();
+            decode_fk_delta_stream_into(&stream, fks.len(), &mut into).unwrap();
+            assert_eq!(into, got);
             let slab = encode_slab_payload(&fks).unwrap();
             assert_eq!(decode_slab_payload(&slab).unwrap(), fks);
+            let mut slab_got = Vec::new();
+            decode_slab_payload_into(&slab, &mut slab_got).unwrap();
+            assert_eq!(slab_got, fks);
             assert_eq!(slab.len(), 2 + stream.len());
             let raw: Vec<u64> = raw.to_vec();
             let mut stream_into = vec![0u8; raw.len().saturating_mul(10).max(1)];
@@ -299,5 +323,20 @@ mod tests {
         assert!(decode_fk_delta_stream(&[0x01, 0x00], 2).is_err());
         assert!(decode_slab_payload(&[0]).is_err());
         assert!(decode_fk_delta_stream(&[], 0).unwrap().is_empty());
+        let mut keep = vec![Fk(99)];
+        decode_fk_delta_stream_into(&[], 0, &mut keep).unwrap();
+        assert_eq!(keep, vec![Fk(99)]);
+        for (buf, n) in [
+            (&[0x00][..], 1usize),
+            (&flagged[..], 1),
+            (&[0x01, 0x00][..], 2),
+        ] {
+            let vec_err = decode_fk_delta_stream(buf, n).unwrap_err();
+            let into_err = decode_fk_delta_stream_into(buf, n, &mut Vec::new()).unwrap_err();
+            assert_eq!(format!("{into_err}"), format!("{vec_err}"));
+        }
+        let slab_err = decode_slab_payload(&[0]).unwrap_err();
+        let slab_into_err = decode_slab_payload_into(&[0], &mut Vec::new()).unwrap_err();
+        assert_eq!(format!("{slab_into_err}"), format!("{slab_err}"));
     }
 }

@@ -23,6 +23,10 @@ before 1.0).
 
 ### Changed
 
+- **`getnetworkinfo.version`:** pin `rpc_client_version("0.5.0") == 500`
+  (`major*10000+minor*100+patch`, same as `0.1.0` → `100`). Workspace
+  version stays 0.1.0 until the tag PR.
+
 - **Core functional inventory:** skip reason `rpc-dialect` for COMPAT-done
   methods whose unmodified script still fails on type-check / field zoo.
   `rpc-missing` is only “method not implemented.” Analog required.

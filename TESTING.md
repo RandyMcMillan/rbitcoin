@@ -88,7 +88,7 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 | Package / binary (warm, order-of-magnitude) | Budget | Notes |
 |---------------------------------------------|-------:|-------|
 | `rbitcoin-store --lib` | **&lt;45 s** | Fan-in reduce tests must use a **tiny** stream target, not production 4096 |
-| `rbitcoin-consensus --lib` | **&lt;30 s** | Prefer pure unit over full-store loops when the branch allows |
+| `rbitcoin-consensus --lib` | **&lt;30 s** | Prefer pure unit over full-store loops. Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
 | `rbitcoin-query --lib` | **&lt;20 s** | |
 | `rbitcoin-test --test scenarios` | **&lt;15 s** | Prefer `pad_empty_from` / shared mature helpers |
 | **Full** `cargo test --workspace` | **≤3 min** warm | Stretch **&lt;2 min**; ignore-tier IBD stays out |
@@ -101,12 +101,12 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 |--------------|--------|
 | `n = FANIN_TARGET_STREAM_RUNS + ε` (~4k run files) | Pass a tiny `target_stream_runs` into reduce; keep 4096 geometry in pure math tests only |
 | Multi‑GiB / mainnet head scale under `cargo test` | `RBITCOIN_HEAD_SCALE=tiny` / `cfg(test)` default; force mainnet only for explicit scale tests |
-| Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` once per store |
+| Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
 **Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` also `--skip`s those names plus `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
 
-**Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
+**Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
 ## Coverage
 
@@ -207,8 +207,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md) |
 | `core_analogs::analog_milestone_and_mempool_persist` | Consensus | Milestone skip-below/check-above, missing prevout under high milestone, mempool persist (one pad) |
 | `scripthash_index_history_balance_and_reorg` | Query | Electrum index + reorg spend clear |
-| `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
-| `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |
+| `electrum_server_version_history_balance` | Electrum | One mature pad: version/history/balance/headers **and** ping/features/tx/errors |
 | `two_node_header_and_block_sync` | P2P (**default + multinode CI**) | Seeder → peer 8-block IBD. **Not** re-run under `coverage.sh`. |
 | `serve_after_restart_via_reconstruct` | P2P (**multinode job only**) | Cold serve via reconstruct |
 | `ibd_skips_dead_peer` | P2P (**multinode job only**) | Live seeder + `127.0.0.1:1` |

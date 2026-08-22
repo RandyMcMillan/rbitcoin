@@ -77,9 +77,14 @@ Store, P2P, RPC, Electrum server, the node — stay in this repo. Revisit
 Operators feel **wall-clock after IBD** (`--shindex`) and **RSS** while
 syncing, while building the index, and at tip with wallets connected.
 Target **2 GiB** process RSS in all three phases; knobs may slow the
-machine to hit it (serial SH build instead of all-core pack, smaller
-ingest, and so on). Measure on a real SSD; keep resume. Page cache is
+machine to hit it. Measure on a real SSD; keep resume. Page cache is
 not a leak ([`ibd-memory.md`](./ibd-memory.md)).
+
+| Done | Step |
+|:----:|------|
+| [x] | Auto-tune SH recollect / materialize workers: at most **one per 1.5 GiB** host `MemAvailable` (env still overrides) |
+| [ ] | 2 GiB RSS in IBD, SH build, and tip-follow |
+| [ ] | SH wall-clock after IBD (resume-safe) |
 
 ### Harder to eclipse or DoS
 

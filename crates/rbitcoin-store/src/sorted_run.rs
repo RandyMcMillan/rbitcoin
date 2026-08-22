@@ -1824,19 +1824,64 @@ fn cancel_requested(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
         .unwrap_or(false)
 }
 
+/// Host RAM budget per SH recollect / k-way worker (`MemAvailable`).
+pub const SH_WORKER_FREE_RAM_BYTES: u64 = 3 << 29;
+
+/// Cap SH workers at 1 per [`SH_WORKER_FREE_RAM_BYTES`] of free RAM (floor 1).
+pub fn sh_workers_for_free_ram(cpus: usize, free_bytes: u64) -> usize {
+    let cpus = cpus.clamp(1, 256);
+    let ram_cap = (free_bytes / SH_WORKER_FREE_RAM_BYTES).max(1) as usize;
+    cpus.min(ram_cap.clamp(1, 256))
+}
+
+/// `MemAvailable` from `/proc/meminfo` text (kB → bytes).
+fn mem_available_from_meminfo(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemAvailable:") else {
+            continue;
+        };
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(kb.saturating_mul(1024));
+    }
+    None
+}
+
+/// Host memory available for new allocations. Linux: `MemAvailable`. Else `None`.
+pub fn host_mem_available_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        return mem_available_from_meminfo(&text);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn sh_logical_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 256)
+}
+
+/// CPUs capped by 1.5 GiB host `MemAvailable` per worker. Unknown free → 1.
+pub fn sh_workers_capped_by_free_ram() -> usize {
+    sh_workers_for_free_ram(sh_logical_cpus(), host_mem_available_bytes().unwrap_or(0))
+}
+
 /// How many parallel chunk merges within the single fan-in pass.
 ///
-/// Default: all logical CPUs. Override `RBITCOIN_SH_MERGE_WORKERS` (`1` = serial).
+/// Default: [`sh_workers_capped_by_free_ram`]. Override `RBITCOIN_SH_MERGE_WORKERS`
+/// (`1` = serial).
 pub fn sh_merge_workers() -> usize {
     if let Ok(s) = std::env::var("RBITCOIN_SH_MERGE_WORKERS") {
         if let Ok(n) = s.parse::<usize>() {
             return n.clamp(1, 256);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 256)
+    sh_workers_capped_by_free_ram()
 }
 
 /// Choose chunk width so **one** pass yields ≤ `target_stream` outputs.
@@ -2467,6 +2512,34 @@ mod tests {
                 None => std::env::remove_var("RBITCOIN_SH_MERGE_WORKERS"),
             }
         }
+    }
+
+    #[test]
+    fn sh_workers_cap_one_per_1_5_gib_free() {
+        const G: u64 = 1 << 30;
+        let one_half = 3 * G / 2;
+        assert_eq!(sh_workers_for_free_ram(8, 0), 1);
+        assert_eq!(sh_workers_for_free_ram(8, G), 1);
+        assert_eq!(sh_workers_for_free_ram(8, one_half), 1);
+        assert_eq!(sh_workers_for_free_ram(8, one_half.saturating_sub(1)), 1);
+        assert_eq!(sh_workers_for_free_ram(8, 3 * G), 2);
+        assert_eq!(sh_workers_for_free_ram(8, 9 * G / 2), 3);
+        assert_eq!(sh_workers_for_free_ram(4, 15 * G), 4);
+        assert_eq!(sh_workers_for_free_ram(16, 15 * G), 10);
+        assert_eq!(sh_workers_for_free_ram(0, 15 * G), 1);
+    }
+
+    #[test]
+    fn mem_available_parses_proc_meminfo() {
+        let text = "MemTotal:       16384000 kB\nMemFree:         1000000 kB\nMemAvailable:    3145728 kB\nBuffers:          200000 kB\n";
+        assert_eq!(mem_available_from_meminfo(text), Some(3145728 * 1024));
+        assert_eq!(mem_available_from_meminfo("MemTotal: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn sh_merge_workers_env_overrides_ram_cap() {
+        let _g = MergeWorkersGuard::set("7");
+        assert_eq!(sh_merge_workers(), 7);
     }
 
     #[test]

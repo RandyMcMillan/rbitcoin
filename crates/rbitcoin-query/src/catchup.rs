@@ -450,11 +450,16 @@ impl Query {
         let work_span = tip_max.saturating_sub(sealed0);
         let n_chunks = work_span.div_ceil(CHUNK_FKS).max(1) as usize;
 
+        let free_gib =
+            rbitcoin_store::host_mem_available_bytes().map(|b| b as f64 / (1u64 << 30) as f64);
         rbitcoin_log::info!(
             "node: scripthash Class A recollect start seal={sealed0} tip_height={} \
              tip_max_create_fk={tip_max} chunks={n_chunks} chunk_fks={CHUNK_FKS} \
-             workers={workers} thread_spill_MiB≈{:.0}",
+             workers={workers} free_GiB={} thread_spill_MiB≈{:.0}",
             tip.0,
+            free_gib
+                .map(|g| format!("{g:.1}"))
+                .unwrap_or_else(|| "?".into()),
             spill_bytes as f64 / (1024.0 * 1024.0)
         );
 
@@ -789,17 +794,14 @@ fn mark_recollect_chunk_done(
     sh_run.publish_seal_watermark(new_seal)
 }
 
-/// Parallel recollect worker count (`RBITCOIN_SH_RECOLLECT_WORKERS`, else CPUs).
+/// Parallel recollect worker count (`RBITCOIN_SH_RECOLLECT_WORKERS`, else RAM-capped CPUs).
 fn recollect_workers() -> usize {
     if let Ok(s) = std::env::var("RBITCOIN_SH_RECOLLECT_WORKERS") {
         if let Ok(n) = s.parse::<usize>() {
             return n.clamp(1, 256);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 256)
+    rbitcoin_store::sh_workers_capped_by_free_ram()
 }
 
 #[cfg(test)]

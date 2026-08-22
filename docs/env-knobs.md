@@ -32,13 +32,13 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_HEAD_SLOTS_SCRIPTHASH` | scale default | SH hash-head initial slots |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
-| `RBITCOIN_SH_RECOLLECT_WORKERS` | default | SH recollect parallelism |
+| `RBITCOIN_SH_RECOLLECT_WORKERS` | min(n-cpu, MemAvailable/1.5 GiB) | SH recollect parallelism (`1` = serial). Unset = auto |
 | `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` | 128 MiB | Recollect per-worker spill (clamp 16–512 MiB); compact floor is 3/4 of this |
 | `RBITCOIN_SH_MAX_DIRECT_MERGE` | default | SH direct-merge cap |
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | default | SH run target size |
 | `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |
 | `RBITCOIN_SH_MEMTABLE_CAP` | default | SH memtable cap |
-| `RBITCOIN_SH_MERGE_WORKERS` | n-cpu | Fan-in reduce + shard-kway materialize (`1` = serial) |
+| `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, MemAvailable/1.5 GiB) | Fan-in reduce + shard-kway (`1` = serial). Unset = auto |
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--maxinbound` / conf omitted |
 
 ## Hardcoded (no env)

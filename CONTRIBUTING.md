@@ -82,15 +82,11 @@ nix build .#rbitcoin-musl
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
-Green **push** CI on `master`/`main` also runs
-[`.github/workflows/musl.yml`](./.github/workflows/musl.yml),
-[`.github/workflows/windows.yml`](./.github/workflows/windows.yml), and
-[`.github/workflows/macos.yml`](./.github/workflows/macos.yml) and uploads
-90-day snapshots (Linux musl static, Windows CRT-static, Darwin
-system-dylib). That is not the byte-identity gate (`repro-check.sh`).
-Download from those workflow checks on the commit, not from the `ci` run.
-Label a PR **`static-binaries`** to run the same three builds on the PR
-head. Unlabeled PRs keep the cargo gates only.
+Required `ci.yml` **`windows`** / **`macos`** jobs smoke native store IO
+and `rbitcoin-node --smoke`. They do **not** package operator binaries.
+Linux musl / Windows CRT-static / Darwin zips are GitHub Releases
+([`.github/workflows/release.yml`](./.github/workflows/release.yml)).
+That is not the byte-identity gate (`repro-check.sh`).
 
 ## Commits
 

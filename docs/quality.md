@@ -172,8 +172,8 @@ findings 001–021, CI split, map-free README, …) live in
 | **—** | Core functional `run` set | **44** unmodified v31.1 scripts (was 38 at last reaudit, 9 at first green). Remaining growth is **Q-41** |
 | **Q-15 / Q-42–Q-46** | CLI, inbound config, RPC honesty, Libre-only, IO aliases | 2026-08-16 cruft program |
 | **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | 2026-08-12. Wall leftover was **Q-37** (now closed) |
-| **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; `musl.yml` after green master `ci` |
-| **—** | Darwin / Windows operator snapshots | `windows.yml` / `macos.yml` after green master `ci` or PR label `static-binaries`. Native store smoke + Darwin ad-hoc codesign |
+| **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; musl zip is GitHub Release only |
+| **—** | Darwin / Windows operator snapshots | GitHub Release (`release.yml`). PR `ci` `windows` / `macos` smoke store IO + `--smoke` |
 
 ---
 
@@ -204,8 +204,8 @@ included; tree at #177):
 | `#[test]` / `#[tokio::test]` | **~1.69k** |
 | `TODO` / `FIXME` / `#[allow(` | **0** / **0** / **2** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
-| Required CI | `fmt`, `deny`, `clippy`, `test`, `multinode`, `coverage` (+ CodeQL) |
-| Extra CI | `musl` / `windows` / `macos` after green master `ci` or PR label `static-binaries`; `core-functional.yml` nightly / labeled PR (not required) |
+| Required CI | `fmt`, `deny`, `clippy`, `test`, `windows`, `macos`, `multinode`, `coverage` (+ CodeQL) |
+| Extra CI | `release.yml` on `v*.*.*` / dispatch; `fuzz.yml` nightly; `core-functional.yml` nightly / labeled PR (not required) |
 | rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.23.x** |
 | Host cargo silos | `target/dev` (test) / `target/cov` (coverage) |

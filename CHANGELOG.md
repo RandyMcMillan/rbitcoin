@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **PR CI OS smoke:** `ci.yml` `windows` / `macos` jobs run store create/open
+  + `--smoke` on every PR and master push. Operator binaries are GitHub
+  Releases only (`release.yml`). Snapshot workflows `musl.yml` /
+  `windows.yml` / `macos.yml` and the `static-binaries` label are gone.
+
 ## [0.5.0] — 2026-08-22
 
 First **named published** 0.x line. **Not 1.0.** Schema 19 is still bumpable

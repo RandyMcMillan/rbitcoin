@@ -1,9 +1,9 @@
 # GitHub Release for annotated tags `v*.*.*` (0.5+).
 #
-# Not a required PR check. Builds the same three operator snapshots as
-# musl.yml / windows.yml / macos.yml, then attaches them to the tag.
-# Linux musl is the operator binary. Darwin is ad-hoc signed (not notarized).
-# Windows is CRT-static PE (no IoRing).
+# Not a required PR check. Builds the three operator snapshots and
+# attaches them to the tag. Linux musl is the operator binary. Darwin is
+# ad-hoc signed (not notarized). Windows is CRT-static PE (no IoRing).
+# PR CI smokes Windows/Darwin store IO in ci.yml; it does not package.
 #
 # Triggers:
 #   - push of tag v*.*.* (publishes the Release)

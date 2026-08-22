@@ -30,18 +30,10 @@ that produces a Nix-glibc dynamic link that fails outside the store. Dev/test
 builds stay on `nix develop` / `cargo test`; release is always musl static.
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
-**CI snapshots:** every green `master` (or `main`) `ci` run starts
-`musl`, `windows`, and `macos`, which upload 90-day artifacts:
-
-| Workflow | Artifact |
-|----------|----------|
-| **musl** | `rbitcoin-musl-x86_64-linux-<12-hex>` — fully static |
-| **windows** | `rbitcoin-x86_64-windows-<12-hex>` — MSVC CRT-static `.exe` |
-| **macos** | `rbitcoin-aarch64-darwin-<12-hex>` — system-dylib only, ad-hoc signed (not notarized). **aarch64 only** |
-
-Open the commit → Checks → workflow → Artifacts. None of these are
-required PR checks. Retry from Actions → workflow → Run workflow.
-Label a PR **`static-binaries`** to build the same three on that head.
+**GitHub Release** (`v*.*.*` tags) is the operator snapshot: Linux musl +
+Windows CRT-static PE + Darwin aarch64 zip. Retry from Actions → **release**
+→ Run workflow (artifacts only, no tag). PR `ci` **windows** / **macos**
+jobs smoke store create/open + `--smoke`; they do not upload binaries.
 Local Linux `target/release/` install is still `nix build .#rbitcoin-musl`
 on a clean master tree. Windows IoRing is not supported. Darwin/Windows
 are not Nix packages — see [`docs/reproducible-builds.md`](docs/reproducible-builds.md).

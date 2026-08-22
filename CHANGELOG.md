@@ -11,6 +11,11 @@ before 1.0).
 
 ### Added
 
+- **Fuzz (Q-30 min):** isolated `fuzz/` workspace, `block_wire` target on
+  `check_block_wire` (consensus-encoded block → archive structure). Nightly
+  `.github/workflows/fuzz.yml` (not a required PR check). Operator may need
+  to push the workflow file.
+
 - **Tag GitHub Release:** `.github/workflows/release.yml` on `v*.*.*` builds
   musl + Windows + Darwin snapshots and attaches them (Linux SBOM included).
   `workflow_dispatch` builds artifacts only. Operator may need to push the

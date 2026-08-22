@@ -1,0 +1,53 @@
+# Nightly libFuzzer for consensus block wire (Q-30 minimum).
+# Not a required PR check. Product rustc stays 1.95; this job uses nightly
+# only to drive cargo-fuzz.
+#
+# Operator may need to push this workflow file (GitHub App often cannot).
+
+name: fuzz
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  block_wire:
+    name: block_wire
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
+        with:
+          toolchain: nightly
+
+      - name: clang (libFuzzer)
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Seed corpus from in-tree signet fixture
+        run: |
+          set -euo pipefail
+          mkdir -p fuzz/corpus/block_wire
+          cp crates/rbitcoin-consensus/tests/fixtures/signet_block_1.bin \
+            fuzz/corpus/block_wire/signet_block_1.bin
+
+      - name: cargo fuzz run block_wire
+        run: |
+          set -euo pipefail
+          cargo fuzz run block_wire -- \
+            -max_total_time=120 -timeout=10 -max_len=1048576

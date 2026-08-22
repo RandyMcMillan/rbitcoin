@@ -62,6 +62,17 @@ pub fn validate_block_structure(
     validate_block_structure_hashed(block, ctx).map(|_| ())
 }
 
+/// Decode consensus-encoded block bytes and run archive-structure checks.
+///
+/// Junk / truncated wire returns `Err`. Must not panic — fuzz entry.
+pub fn check_block_wire(data: &[u8]) -> Result<(), ConsensusError> {
+    use bitcoin::consensus::encode::deserialize;
+    let block: Block =
+        deserialize(data).map_err(|_| ConsensusError::BadBlock("block wire decode"))?;
+    let params = ChainParams::regtest();
+    validate_block_structure(&block, &ValidationContext::archive_structure(&params))
+}
+
 /// Like [`validate_block_structure`], but returns **once-computed** txids for reuse
 /// (merkle / dup / archive encode) so callers do not re-hash every tx.
 pub fn validate_block_structure_hashed(

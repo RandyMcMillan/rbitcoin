@@ -30,6 +30,16 @@ fn ctx_h(height: u32) -> ValidationContext<'static> {
     ValidationContext::at(p, Height(height), Milestone::NONE)
 }
 
+#[test]
+fn check_block_wire_junk_does_not_panic() {
+    for data in [b"".as_slice(), &[0u8; 1], &[0xff; 80], b"not-a-block"] {
+        let _ = super::check_block_wire(data);
+    }
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let raw = bitcoin::consensus::encode::serialize(&genesis);
+    let _ = super::check_block_wire(&raw);
+}
+
 fn coinbase(height: u32) -> Transaction {
     // Consensus requires coinbase scriptSig length in 2..=100.
     let mut ss = if height == 0 {

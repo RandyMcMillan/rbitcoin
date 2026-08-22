@@ -1835,6 +1835,7 @@ pub fn sh_workers_for_free_ram(cpus: usize, free_bytes: u64) -> usize {
 }
 
 /// `MemAvailable` from `/proc/meminfo` text (kB → bytes).
+#[cfg(any(test, target_os = "linux"))]
 fn mem_available_from_meminfo(text: &str) -> Option<u64> {
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("MemAvailable:") else {

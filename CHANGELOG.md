@@ -25,12 +25,33 @@ before 1.0).
   `RBITCOIN_SH_MERGE_WORKERS` still override (`1` = serial). Start logs
   include `free_GiB=`.
 
+## [0.5.1] — 2026-08-22
+
+Workspace version **0.5.1**. Consensus + Electrum serve fixes on the 0.5 line.
+
+### Fixed
+
+- **Script stack size vs altstack ([022](docs/external_findings/022-stack-altstack-share-max-size.md)):**
+  `push()` and `OP_TUCK` counted only the main stack against `MAX_STACK_SIZE`.
+  Core shares 1000 across **stack + altstack** on every push (including
+  `PushBytes`). Combined overflow now rejects (`stack size`). Regression:
+  `stack_and_altstack_share_max_size_on_pushdata`.
+
+- **Electrum silent-payment tweak serve:** indexed join is one sequential
+  `txout` span per wave (not one body pread per eligible tx). Pre-taproot
+  empty Cake maps flush in ≤1024-height waves. `server.ping` does not drop
+  an in-flight wave.
+
+### Changed
+
 - **PR CI OS smoke:** `ci.yml` `windows` / `macos` jobs run native store
   platform tests (TableFile, SH free-RAM probe, pool/IOCP session, default
   `RBITCOIN_IO` kind) + `--smoke` on every PR and master push. Operator
   binaries are GitHub Releases only (`release.yml`). Snapshot workflows
   `musl.yml` / `windows.yml` / `macos.yml` and the `static-binaries` label
   are gone.
+
+- **`getnetworkinfo.version`:** `rpc_client_version("0.5.1") == 501`.
 
 ## [0.5.0] — 2026-08-22
 

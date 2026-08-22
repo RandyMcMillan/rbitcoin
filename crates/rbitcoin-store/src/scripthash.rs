@@ -26,8 +26,10 @@ use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
     sh_page_extent, sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk,
-    sh_page_next, sh_page_pack, sh_page_pack_extent_last, sh_page_set_extent, sh_page_set_last,
-    sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
+    sh_page_next, sh_page_pack, sh_page_pack_extent_last, sh_page_pack_extent_last_fks,
+    sh_page_pack_fks, sh_page_set_extent, sh_page_set_last, sh_page_set_next, sh_page_try_append,
+    SH_PAGE_SIZE,
+    SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload, encode_slab_payload_into, slab_class_for_n_fks_with_slack,
@@ -3109,14 +3111,13 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         let end = base.saturating_add(SH_PAGE_SIZE as u64);
         self.ensure_body_capacity(end)?;
-        let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
         if has_next {
-            sh_page_pack(&mut page, &ents, next)?;
+            sh_page_pack_fks(&mut page, fks, next)?;
         } else {
             let first = chain_first.unwrap_or(base);
             let n = ((base.saturating_sub(first) / SH_PAGE_SIZE as u64).saturating_add(1)) as u32;
-            sh_page_pack_extent_last(&mut page, &ents, first, n, 0)?;
+            sh_page_pack_extent_last_fks(&mut page, fks, first, n, 0)?;
         }
         debug_assert!(self.body_buf.is_empty());
         self.body().write_at(base, &page)?;
@@ -3219,15 +3220,13 @@ impl<'a> ScriptHashBulkSession<'a> {
             Err(StoreError::Corrupt(msg))
                 if msg == "uleb128 dest short" || msg == "scripthash slab dest short" =>
             {
-                let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
-                let last = self.bulk_write_page_chain(&ents)?;
+                let last = self.bulk_write_page_chain(fks)?;
                 return Ok(ShHeadValue::extent(last));
             }
             Err(e) => return Err(e),
         };
         let Some(class) = slab_class_for_packed_len(packed_len) else {
-            let ents: Vec<ShEntry> = fks.iter().copied().map(|fk| ShEntry::new(Fk(fk))).collect();
-            let last = self.bulk_write_page_chain(&ents)?;
+            let last = self.bulk_write_page_chain(fks)?;
             return Ok(ShHeadValue::extent(last));
         };
         let off = self.alloc_reloc_class(class)?;
@@ -3239,15 +3238,15 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     /// Write a full page chain at the aligned bump. Returns (first, last).
-    fn bulk_write_page_chain(&mut self, entries: &[ShEntry]) -> Result<u64, StoreError> {
-        if entries.is_empty() {
+    fn bulk_write_page_chain(&mut self, fks: &[u64]) -> Result<u64, StoreError> {
+        if fks.is_empty() {
             return Err(StoreError::Corrupt("scripthash bulk page chain empty"));
         }
         self.flush_body()?;
         debug_assert!(self.body_buf.is_empty());
         let base = self.align_bump_for_page()?;
-        let fks: Vec<Fk> = entries.iter().map(|e| e.create_tx_fk).collect();
-        let chunks = sh_page_chunk_ranges(&fks)?;
+        let wrapped: Vec<Fk> = fks.iter().copied().map(Fk).collect();
+        let chunks = sh_page_chunk_ranges(&wrapped)?;
         let n_pages = chunks.len();
         let end = base.saturating_add((n_pages as u64).saturating_mul(SH_PAGE_SIZE as u64));
         self.ensure_body_capacity(end)?;
@@ -3256,11 +3255,11 @@ impl<'a> ScriptHashBulkSession<'a> {
             let off = base + (pi as u64) * (SH_PAGE_SIZE as u64);
             if pi + 1 < n_pages {
                 let next = off + SH_PAGE_SIZE as u64;
-                sh_page_pack(&mut page, &entries[start..end_i], next)?;
+                sh_page_pack_fks(&mut page, &fks[start..end_i], next)?;
             } else {
-                sh_page_pack_extent_last(
+                sh_page_pack_extent_last_fks(
                     &mut page,
-                    &entries[start..end_i],
+                    &fks[start..end_i],
                     base,
                     n_pages as u32,
                     0,

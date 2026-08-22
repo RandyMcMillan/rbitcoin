@@ -41,7 +41,9 @@
 use crate::compact::{read_uleb128, uleb128_len, write_uleb128};
 use crate::error::StoreError;
 use crate::scripthash_layout::{ShEntry, SH_ENTRY_LEN};
-use crate::scripthash_slabs::{decode_fk_delta_stream, encode_fk_delta_stream};
+use crate::scripthash_slabs::{
+    decode_fk_delta_stream, encode_fk_delta_stream, encode_fk_delta_stream_into,
+};
 use rbitcoin_primitives::Fk;
 
 /// Disk page size for SH FK chains (aligned allocations).
@@ -402,10 +404,44 @@ pub fn sh_page_set_extent(
     Ok(())
 }
 
+fn sh_page_write_stream(page: &mut [u8; SH_PAGE_SIZE], fks: &[u64]) -> Result<(), StoreError> {
+    if fks.len() > u16::MAX as usize {
+        return Err(StoreError::Corrupt(
+            "scripthash page pack: entries exceed page capacity",
+        ));
+    }
+    let off = sh_page_stream_off(page);
+    match encode_fk_delta_stream_into(&mut page[off..], fks) {
+        Ok(_) => {
+            sh_page_set_n_fks(page, fks.len() as u16);
+            Ok(())
+        }
+        Err(StoreError::Corrupt("uleb128 dest short")) => Err(StoreError::Corrupt(
+            "scripthash page pack: entries exceed page capacity",
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+fn sh_page_fks_from_entries(entries: &[ShEntry]) -> Vec<u64> {
+    entries.iter().map(|e| e.create_tx_fk.0).collect()
+}
+
 /// Pack a last-in-extent (or chain-last) `ver=2` page.
 pub fn sh_page_pack_extent_last(
     page: &mut [u8; SH_PAGE_SIZE],
     entries: &[ShEntry],
+    extent_base: u64,
+    extent_n: u32,
+    next_off: u64,
+) -> Result<(), StoreError> {
+    sh_page_pack_extent_last_fks(page, &sh_page_fks_from_entries(entries), extent_base, extent_n, next_off)
+}
+
+/// Pack a last-in-extent page from raw create fks.
+pub fn sh_page_pack_extent_last_fks(
+    page: &mut [u8; SH_PAGE_SIZE],
+    fks: &[u64],
     extent_base: u64,
     extent_n: u32,
     next_off: u64,
@@ -417,14 +453,7 @@ pub fn sh_page_pack_extent_last(
         sh_page_set_next(page, next_off)?;
     }
     sh_page_set_extent(page, extent_base, extent_n)?;
-    for e in entries {
-        if !sh_page_try_append_entry(page, *e)? {
-            return Err(StoreError::Corrupt(
-                "scripthash page pack: entries exceed page capacity",
-            ));
-        }
-    }
-    Ok(())
+    sh_page_write_stream(page, fks)
 }
 
 /// Number of FKs stored in this page.
@@ -582,35 +611,22 @@ pub fn sh_page_pack(
     entries: &[ShEntry],
     next_off: u64,
 ) -> Result<(), StoreError> {
-    let stream =
-        encode_fk_delta_stream(&entries.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>())?;
-    if stream.len() > SH_PAGE_STREAM_MAX {
-        return Err(StoreError::Corrupt(
-            "scripthash page pack: entries exceed page capacity",
-        ));
-    }
-    // Pre-check strictly increasing so pack fails cleanly (not mid-page).
-    for w in entries.windows(2) {
-        if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
-            return Err(StoreError::Corrupt(
-                "invariant: scripthash page pack create_fks not strictly increasing",
-            ));
-        }
-    }
+    sh_page_pack_fks(page, &sh_page_fks_from_entries(entries), next_off)
+}
+
+/// Pack a `ver=1` page from raw create fks.
+pub fn sh_page_pack_fks(
+    page: &mut [u8; SH_PAGE_SIZE],
+    fks: &[u64],
+    next_off: u64,
+) -> Result<(), StoreError> {
     sh_page_init_empty(page);
     if next_off == 0 {
         sh_page_set_last(page, 0)?;
     } else {
         sh_page_set_next(page, next_off)?;
     }
-    for e in entries {
-        if !sh_page_try_append_entry(page, *e)? {
-            return Err(StoreError::Corrupt(
-                "scripthash page pack: page full unexpectedly",
-            ));
-        }
-    }
-    Ok(())
+    sh_page_write_stream(page, fks)
 }
 
 /// Append one create FK to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
@@ -678,6 +694,35 @@ pub fn sh_page_decode_slice(buf: &[u8]) -> Result<(u64, Vec<ShEntry>), StoreErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sh_page_pack_matches_encoded_stream() {
+        let fks: Vec<u64> = (1..=80).collect();
+        let ents: Vec<_> = fks.iter().copied().map(|i| ShEntry::new(Fk(i))).collect();
+        let stream = encode_fk_delta_stream(&ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>())
+            .unwrap();
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_pack(&mut page, &ents, 8192).unwrap();
+        assert_eq!(sh_page_n_fks(&page).unwrap() as usize, fks.len());
+        assert_eq!(sh_page_next(&page).unwrap(), 8192);
+        assert_eq!(
+            &page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + stream.len()],
+            stream.as_slice()
+        );
+        let mut over = [0u8; SH_PAGE_SIZE];
+        let too_many: Vec<_> = (1..=SH_PAGE_STREAM_MAX as u64 + 2)
+            .map(|i| ShEntry::new(Fk(i)))
+            .collect();
+        match sh_page_pack(&mut over, &too_many, 0) {
+            Err(StoreError::Corrupt(m)) => {
+                assert!(
+                    m.contains("entries exceed page capacity"),
+                    "capacity error must stay the same string: {m}"
+                );
+            }
+            other => panic!("expected capacity Corrupt, got {other:?}"),
+        }
+    }
 
     #[test]
     fn sh_page_delta_packs_600_sequential_in_one_page() {

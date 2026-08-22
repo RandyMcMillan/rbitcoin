@@ -30,6 +30,7 @@ refreshing; do not check copies into `tests/fixtures/`.
 | `tx_valid.json` | same | `script::core_tx_vectors::core_tx_valid_all_rows` | every data row accept |
 | `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject |
 | `sighash.json` | same | `script::core_sighash::core_sighash_all_rows` | every data row digest matches Core |
+| `bip341_wallet_vectors.json` | same | `script::core_bip341::core_bip341_wallet_vectors_all_rows` | key-path fully-signed + per-input spends accept; unknown-leaf script-path accepts |
 
 ### How the harness works
 
@@ -46,7 +47,7 @@ refreshing; do not check copies into `tests/fixtures/`.
   the fixture interpretation before commit.
 - **Status:** Core JSON corpora green on the shipped path
   (`script_tests` 1222/1222 on Core v31.1, `tx_valid` 121/121, `tx_invalid` 93/93,
-  `sighash` 500/500).
+  `sighash` 500/500, `bip341_wallet_vectors` 9/9).
 
 ### rust-bitcoin vs Core fixtures
 
@@ -101,6 +102,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C15 | Core `tx_valid` / `tx_invalid` | accept / reject at listed flags; valid still accepts with extra implemented flags off (FillFlags-implied bits skipped); invalid still rejects with extra **restriction** flags on (not P2SH/WITNESS/TAPROOT class changes) | `script::core_tx_vectors::*` |
 | C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
 | C18 | Core `sighash.json` | 32-byte digest via `SighashCache::legacy_signature_hash` | `script::core_sighash::core_sighash_all_rows` |
+| C19 | Core `bip341_wallet_vectors.json` | `verify_job_all_inputs` accept (taproot+witness) | `script::core_bip341::core_bip341_wallet_vectors_all_rows` |
 | C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
 
 ## Adding a new rule

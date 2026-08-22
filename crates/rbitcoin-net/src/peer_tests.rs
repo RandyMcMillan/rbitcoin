@@ -1863,7 +1863,8 @@ fn handle_peer_frame_control_and_inv_paths() {
         let mut from_peer = HashMap::new();
         let mut ban = 0u32;
 
-        // SendHeaders / SendCmpct / WtxidRelay / SendAddrV2 / Pong / MemPool / GetAddr / Ping
+        // SendHeaders / SendCmpct / WtxidRelay / SendAddrV2 / Pong / GetAddr / Ping
+        // (MemPool disconnects — covered by bloom_disabled_messages_request_disconnect.)
         for msg in [
             NetworkMessage::SendHeaders,
             NetworkMessage::SendCmpct(SendCmpct {
@@ -1873,7 +1874,6 @@ fn handle_peer_frame_control_and_inv_paths() {
             NetworkMessage::WtxidRelay,
             NetworkMessage::SendAddrV2,
             NetworkMessage::Pong(7),
-            NetworkMessage::MemPool,
             NetworkMessage::GetAddr,
             NetworkMessage::Ping(42),
         ] {

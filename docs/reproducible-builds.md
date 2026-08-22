@@ -95,8 +95,15 @@ with the musl package. Windows IoRing is not supported.
 
 ### GitHub Release (`v*.*.*` tags)
 
+Operator path after the version bump is on `master`:
+
+```bash
+./scripts/release.sh           # Cargo/nix/CHANGELOG checks, tag vX.Y.Z, push
+./scripts/release.sh --dry-run
+```
+
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds the
-same three snapshots on a version tag and attaches them to a GitHub Release:
+same three snapshots on that tag and attaches them to a GitHub Release:
 
 | File | Notes |
 |------|--------|

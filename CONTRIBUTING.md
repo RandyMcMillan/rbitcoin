@@ -81,6 +81,8 @@ nix build .#rbitcoin-musl
 ```
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
+Tag a published line with [`scripts/release.sh`](./scripts/release.sh)
+(clean `master`, matching Cargo/nix/CHANGELOG, annotated `vX.Y.Z`).
 
 Required `ci.yml` **`windows`** / **`macos`** jobs smoke native store
 platform tests (TableFile, SH free-RAM probe, pool/IOCP session) and

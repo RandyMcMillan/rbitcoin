@@ -23,9 +23,13 @@ before 1.0).
 
 ### Changed
 
+- **0.5 operator voice:** README / SECURITY / experimental-mainnet treat
+  **0.5.x** as the named published 0.x line (not 1.0, not a soak badge).
+  Default milestone skip, `--shindex` off, and schema refuse/wipe stay
+  unmissable.
+
 - **`getnetworkinfo.version`:** pin `rpc_client_version("0.5.0") == 500`
-  (`major*10000+minor*100+patch`, same as `0.1.0` → `100`). Workspace
-  version stays 0.1.0 until the tag PR.
+  (`major*10000+minor*100+patch`, same as `0.1.0` → `100`).
 
 - **Core functional inventory:** skip reason `rpc-dialect` for COMPAT-done
   methods whose unmodified script still fails on type-check / field zoo.

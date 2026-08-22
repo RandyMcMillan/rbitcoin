@@ -83,7 +83,7 @@ not a leak ([`ibd-memory.md`](./ibd-memory.md)).
 
 | Done | Step |
 |:----:|------|
-| [x] | Auto-tune SH recollect / materialize workers: at most **one per 1.5 GiB** host `MemAvailable` (env still overrides) |
+| [x] | Auto-tune SH recollect / materialize workers: at most **one per 1.5 GiB** host free RAM (Linux / Darwin / Windows; env still overrides) |
 | [ ] | 2 GiB RSS in IBD, SH build, and tip-follow |
 | [ ] | SH wall-clock after IBD (resume-safe) |
 

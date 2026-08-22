@@ -35,7 +35,7 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
-| **SH recollect / k-way workers** | min(CPUs, `MemAvailable` / 1.5 GiB); floor 1. Env `RBITCOIN_SH_RECOLLECT_WORKERS` / `RBITCOIN_SH_MERGE_WORKERS` override | Start of recollect / tip materialize. Logs `workers=` `free_GiB=` |
+| **SH recollect / k-way workers** | min(CPUs, host free RAM / 1.5 GiB); floor 1. Linux `/proc/meminfo` `MemAvailable`; Darwin `host_statistics64` free+inactive pages; Windows `GlobalMemoryStatusEx` `ullAvailPhys`. Unknown OS → 1 worker. Env `RBITCOIN_SH_RECOLLECT_WORKERS` / `RBITCOIN_SH_MERGE_WORKERS` override | Start of recollect / tip materialize. Logs `workers=` `free_GiB=` |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
 
 Tests that need a clean process must call these **same** entry points (or drop the

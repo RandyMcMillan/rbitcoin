@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **Road to 1.0:** [`docs/road-to-1.0.md`](docs/road-to-1.0.md) owns 1.0
+  product gates (claimed Core functional, Core-parity fuzz, selected
+  crates.io libraries, SH/RSS, eclipse/DoS, fee validation, schema freeze).
+  [`docs/quality.md`](docs/quality.md) stays the living Open backlog.
+
 ### Changed
 
 - **PR CI OS smoke:** `ci.yml` `windows` / `macos` jobs run store create/open

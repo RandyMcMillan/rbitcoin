@@ -21,6 +21,9 @@ Update a row when work lands. Prefer that over a new dated audit PDF.
 
 This is not a security audit. Numbers are order-of-magnitude.
 
+**1.0 product gates** (what an operator can count on) live in
+[`road-to-1.0.md`](./road-to-1.0.md). Do not copy that list here.
+
 ---
 
 ## North star: industry-leading full node in Rust

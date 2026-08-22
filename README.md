@@ -74,7 +74,8 @@ Core or Fulcrum replacement, not a soak badge. Run **signet first**, then
 mainnet with monitoring ([`OPERATOR.md`](./OPERATOR.md)). First hour on
 regtest (mine → Electrum → Esplora): [`OPERATOR.md`](./OPERATOR.md#first-hour-regtest).
 Finishing any one operator’s first full mainnet sync is **not** a gate for
-using or packaging this tree.
+using or packaging this tree. 1.0 gates:
+[`docs/road-to-1.0.md`](./docs/road-to-1.0.md).
 
 **Non-goal:** powering a **graphical block explorer** (search boxes,
 address-prefix autocomplete, explorer-only catalogue APIs). Product surface:

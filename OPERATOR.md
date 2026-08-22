@@ -297,8 +297,8 @@ backfill them. Scripthash is **not** progressively materialized into heads:
 confirm only enqueues sorted runs (background flush + merge). At tip the node
 **merges remaining runs and cold bulk-loads** durable SH tables before Electrum
 (the only deferred index work). Tip SH materialize **slices the catalog
-k-way by prefix shard** (one worker per CPU core, 256 KiB pages; no
-extra 64-file rewrite). Workers write `scripthash.body/NN` and seal `scripthash.head/NN`
+k-way by prefix shard** (workers = min(CPUs, host free RAM / 1.5 GiB),
+256 KiB pages; no extra 64-file rewrite). Workers write `scripthash.body/NN` and seal `scripthash.head/NN`
 themselves (no publisher, no wait on a slow megakey shard). SIGINT
 keeps every sealed head; resume packs only unsealed shards (holes
 stay). Legacy shared `scripthash.body` stays one writer with prefix

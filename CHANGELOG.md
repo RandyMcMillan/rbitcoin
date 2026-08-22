@@ -18,10 +18,19 @@ before 1.0).
 
 ### Changed
 
-- **PR CI OS smoke:** `ci.yml` `windows` / `macos` jobs run store create/open
-  + `--smoke` on every PR and master push. Operator binaries are GitHub
-  Releases only (`release.yml`). Snapshot workflows `musl.yml` /
-  `windows.yml` / `macos.yml` and the `static-binaries` label are gone.
+- **SH workers follow free RAM:** recollect and k-way materialize default to
+  at most **one worker per 1.5 GiB** host free RAM (Linux `MemAvailable`,
+  Darwin free+inactive pages, Windows `AvailPhys`; unknown OS → 1 worker).
+  Unset env is auto; `RBITCOIN_SH_RECOLLECT_WORKERS` /
+  `RBITCOIN_SH_MERGE_WORKERS` still override (`1` = serial). Start logs
+  include `free_GiB=`.
+
+- **PR CI OS smoke:** `ci.yml` `windows` / `macos` jobs run native store
+  platform tests (TableFile, SH free-RAM probe, pool/IOCP session, default
+  `RBITCOIN_IO` kind) + `--smoke` on every PR and master push. Operator
+  binaries are GitHub Releases only (`release.yml`). Snapshot workflows
+  `musl.yml` / `windows.yml` / `macos.yml` and the `static-binaries` label
+  are gone.
 
 ## [0.5.0] — 2026-08-22
 

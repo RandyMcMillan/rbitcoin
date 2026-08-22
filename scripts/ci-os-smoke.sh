@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Native OS smoke for ci.yml windows / macos (and local). Store TableFile
-# create/open plus rbitcoin-node --smoke. Not a packaged snapshot.
+# Native OS smoke for ci.yml windows / macos (and local). Store tests that
+# hit OS-specific IO / RAM probes, plus rbitcoin-node --smoke. Not a
+# packaged snapshot.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -8,14 +9,42 @@ cd "$ROOT"
 
 export RBITCOIN_HEAD_SCALE="${RBITCOIN_HEAD_SCALE:-tiny}"
 
+# Substring filters (one cargo test each — libtest ANDs extra args).
+# Keep this list the platform-diff surface, not the whole store suite.
+STORE_PLATFORM_FILTERS=(
+  file::advise_tests
+  sorted_run::tests::sh_workers
+  sorted_run::tests::sh_merge_workers_env
+  sorted_run::tests::mem_available
+  sorted_run::tests::host_mem
+  sorted_run::tests::darwin_vm
+  io_backend::tests
+  uring_session::tests::default_kind_follows_os
+  uring_session::tests::pool_
+  io_session_iocp
+)
+# Windows OVERLAPPED + concurrent grow can `pread short` and abort the
+# process (STATUS_STACK_BUFFER_OVERRUN). Still runs on Linux workspace.
+STORE_PLATFORM_SKIPS=(
+  concurrent_readers_during_append_and_grow
+)
+
 if [[ "${CI_OS_SMOKE_DRY_RUN:-}" == "1" ]]; then
-  echo "smoke=store-roundtrip+node-smoke"
+  echo "smoke=store-platform+node-smoke"
   echo "RBITCOIN_HEAD_SCALE=$RBITCOIN_HEAD_SCALE"
+  echo "filters=${STORE_PLATFORM_FILTERS[*]}"
+  echo "skip=${STORE_PLATFORM_SKIPS[*]}"
   exit 0
 fi
 
-cargo test -p rbitcoin-store --lib -- \
-  file::advise_tests::scripthash_body_create_open_roundtrip
+skip_args=()
+for s in "${STORE_PLATFORM_SKIPS[@]}"; do
+  skip_args+=(--skip "$s")
+done
+
+for f in "${STORE_PLATFORM_FILTERS[@]}"; do
+  cargo test -p rbitcoin-store --lib -- "$f" "${skip_args[@]}"
+done
 
 cargo build -p rbitcoin-node -p rbitcoin-cli
 

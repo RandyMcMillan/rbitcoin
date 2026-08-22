@@ -82,8 +82,9 @@ nix build .#rbitcoin-musl
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
-Required `ci.yml` **`windows`** / **`macos`** jobs smoke native store IO
-and `rbitcoin-node --smoke`. They do **not** package operator binaries.
+Required `ci.yml` **`windows`** / **`macos`** jobs smoke native store
+platform tests (TableFile, SH free-RAM probe, pool/IOCP session) and
+`rbitcoin-node --smoke`. They do **not** package operator binaries.
 Linux musl / Windows CRT-static / Darwin zips are GitHub Releases
 ([`.github/workflows/release.yml`](./.github/workflows/release.yml)).
 That is not the byte-identity gate (`repro-check.sh`).

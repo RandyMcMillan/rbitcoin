@@ -951,6 +951,10 @@ impl ShRunBuilder {
         }
 
         let workers = rbitcoin_store::sh_merge_workers();
+        let free_gib = rbitcoin_store::host_mem_available_bytes()
+            .map(|b| b as f64 / (1u64 << 30) as f64)
+            .map(|g| format!("{g:.1}"))
+            .unwrap_or_else(|| "?".into());
         let t_reduce = Instant::now();
         let max_direct = max_direct_merge();
         let mut direct_kway = false;
@@ -964,7 +968,7 @@ impl ShRunBuilder {
                 direct_kway = true;
                 info!(
                     "node: scripthash tip direct k-way claimed={} workers={workers} \
-                     records≈{claimed_recs} body≈{:.1}MiB max_direct={max_direct}",
+                     free_GiB={free_gib} records≈{claimed_recs} body≈{:.1}MiB max_direct={max_direct}",
                     claimed.len(),
                     claimed_body as f64 / (1024.0 * 1024.0),
                 );
@@ -1123,7 +1127,7 @@ impl ShRunBuilder {
         info!(
             "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true \
              direct_kway={direct_kway} n_shards={n_shards} resume_from_shard={resume_from} \
-             workers={workers}",
+             workers={workers} free_GiB={free_gib}",
             stream_inputs.len()
         );
         let t0 = Instant::now();

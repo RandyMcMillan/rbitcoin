@@ -20,6 +20,7 @@ Core clone, not a soak badge, not a desktop wallet.
 | **Chain** | No known consensus divergences from Core. |
 | **Wallets** | Electrum / Esplora work for the clients we claim, on a node that finished IBD + SH index. |
 | **Index time** | `--shindex` after IBD is a known, resume-safe wait — not an unbounded hour-loss. Faster than 0.5 is the point. |
+| **IBD** | Typical block connect about **1 s** on a laptop-class SSD (today often 2–10 s). |
 | **RAM** | **2 GiB** process RSS is enough for IBD, SH build, and tip-follow (knobs may trade wall time, e.g. serial SH build). Heap, not “the disk is in page cache.” |
 | **Fees** | The 10-minute inclusion estimate is aimed at txs that actually get in, not Core’s historical estimator. |
 | **P2P** | A single network neighborhood should not own your tip; junk peers / compact-block spam should not knock the node over. Peer diversity aims at **Core asmap utility** (not necessarily the same implementation). |
@@ -77,9 +78,23 @@ Store, P2P, RPC, Electrum server, the node — stay in this repo. Revisit
 Operators feel **wall-clock after IBD** (`--shindex`) and **RSS** while
 syncing, while building the index, and at tip with wallets connected.
 Target **2 GiB** process RSS in all three phases; knobs may slow the
-machine to hit it (serial SH build instead of all-core pack, smaller
-ingest, and so on). Measure on a real SSD; keep resume. Page cache is
+machine to hit it. Measure on a real SSD; keep resume. Page cache is
 not a leak ([`ibd-memory.md`](./ibd-memory.md)).
+
+| Done | Step |
+|:----:|------|
+| [x] | Auto-tune SH recollect / materialize workers: at most **one per 1.5 GiB** host free RAM (Linux / Darwin / Windows; env still overrides) |
+| [ ] | 2 GiB RSS in IBD, SH build, and tip-follow |
+| [ ] | SH wall-clock after IBD (resume-safe) |
+
+### Faster IBD
+
+Connecting a typical mainnet block during catch-up should be about **1
+second** on a laptop-class SSD, not the 2–10 s we often see now.
+
+| Done | Step |
+|:----:|------|
+| [ ] | Typical IBD block connect ~1 s |
 
 ### Harder to eclipse or DoS
 

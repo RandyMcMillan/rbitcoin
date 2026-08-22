@@ -7,6 +7,9 @@ to 19. An 18 binary refuses 19 `meta`. A 17 datadir with populated `tx.head`
 or `scripthash*` is **refused** (wipe those dirs, keep Class A, restart to
 rebuild). Empty 17 indexes rewrite `meta` to 19.
 
+Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
+[`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
+
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is

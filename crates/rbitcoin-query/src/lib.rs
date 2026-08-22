@@ -150,6 +150,7 @@ pub use batch_parents::{
     SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
+pub use chain_view::ChainView;
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
@@ -2647,6 +2648,69 @@ mod tests {
 
         q.disconnect_tip().unwrap();
         assert!(q.tip_height().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_pin_none_on_empty_store() {
+        let (dir, q) = temp_query("chain-view-empty");
+        assert!(q.pin_chain_view().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_pin_live_across_extension_dead_after_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-pin");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+
+        let genesis = q.pin_chain_view().unwrap().expect("genesis tip");
+        assert_eq!(genesis.height, Height(0));
+        assert_eq!(genesis.hash, hash0);
+        assert!(genesis.still_live(&q).unwrap());
+
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        assert!(
+            genesis.still_live(&q).unwrap(),
+            "prefix pin stays live across tip extension"
+        );
+
+        let tip1 = q.pin_chain_view().unwrap().expect("height 1");
+        assert_eq!(tip1.height, Height(1));
+        assert_eq!(tip1.hash, h1.hash);
+        assert!(tip1.still_live(&q).unwrap());
+
+        q.disconnect_tip().unwrap();
+        assert!(
+            !tip1.still_live(&q).unwrap(),
+            "disconnect of pinned height kills the view"
+        );
+        assert!(genesis.still_live(&q).unwrap());
+
+        let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+        h1b.nonce = h1.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+        assert_ne!(h1b.hash, tip1.hash);
+        assert!(
+            !tip1.still_live(&q).unwrap(),
+            "same-height replace must not keep the old pin live"
+        );
+        let tip1b = q.pin_chain_view().unwrap().expect("replacement tip");
+        assert_eq!(tip1b.height, Height(1));
+        assert_eq!(tip1b.hash, h1b.hash);
+        assert!(tip1b.still_live(&q).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

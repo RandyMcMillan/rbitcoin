@@ -11,6 +11,10 @@ before 1.0).
 
 ### Changed
 
+- **`getnetworkinfo.version`:** pin `rpc_client_version("0.5.0") == 500`
+  (`major*10000+minor*100+patch`, same as `0.1.0` → `100`). Workspace
+  version stays 0.1.0 until the tag PR.
+
 - **SH decode-into + drop ShEntry:** page/slab decode appends into a caller
   `Vec<Fk>`. Collect, tip pack, and `put_chain` work on `Fk`. Query history
   uses `create_fks`. `ShEntry` / `ScriptHashEntry` are gone. On-disk pack8 /

@@ -2558,6 +2558,11 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
         100,
         "0.1.0 is major*10000+minor*100+patch (not 10000, which is 1.0.0)"
     );
+    assert_eq!(
+        rpc_client_version("0.5.0"),
+        500,
+        "0.5.0 is the same mapping (not Core 27.0 / 270000)"
+    );
     let flags = rbitcoin_net::local_service_flags();
     let bits = flags.to_u64();
     let hex = format!("{bits:016x}");

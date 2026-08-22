@@ -95,10 +95,10 @@ with the musl package. Windows IoRing is not supported.
 
 ### GitHub Release (`v*.*.*` tags)
 
-Operator path after the version bump is on `master`:
+Merge the version-bump PR into `master` locally, then:
 
 ```bash
-./scripts/release.sh           # Cargo/nix/CHANGELOG checks, tag vX.Y.Z, push
+./scripts/release.sh           # checks, tag vX.Y.Z, push master + tag
 ./scripts/release.sh --dry-run
 ```
 

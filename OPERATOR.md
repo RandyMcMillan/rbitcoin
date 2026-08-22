@@ -31,14 +31,12 @@ builds stay on `nix develop` / `cargo test`; release is always musl static.
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 **GitHub Release** (`v*.*.*` tags) is the operator snapshot: Linux musl +
-Windows CRT-static PE + Darwin aarch64 zip. After the version bump is on
-`master` (CHANGELOG `## [X.Y.Z]`, `Cargo.toml` / `nix/rbitcoin.nix` match):
+Windows CRT-static PE + Darwin aarch64 zip. Merge the version-bump PR into
+`master` locally (merge commit), then:
 
 ```bash
-git checkout master && git pull
-./scripts/release.sh          # checks, annotated tag vX.Y.Z, push
+./scripts/release.sh          # checks, tag vX.Y.Z, push master + tag
 # ./scripts/release.sh --dry-run
-# ./scripts/release.sh --watch   # wait for release.yml
 ```
 
 Retry from Actions → **release** → Run workflow (artifacts only, no tag).

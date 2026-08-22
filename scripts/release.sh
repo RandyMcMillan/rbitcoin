@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 # Tag and push vX.Y.Z so GitHub Actions release.yml builds operator snapshots.
 #
-# Usage (clean master after the version bump is merged):
-#   ./scripts/release.sh              # check, annotated tag, push
+# Typical: merge the version-bump PR into master locally, then:
+#   ./scripts/release.sh              # check, annotated tag, push master + tag
 #   ./scripts/release.sh --dry-run    # checks only
 #   ./scripts/release.sh --no-push    # tag locally, do not push
-#   ./scripts/release.sh --watch      # after push, wait for release.yml
 #
 # Version is workspace.package.version (Cargo.toml). Files that must match:
 # Cargo.toml, nix/rbitcoin.nix, CHANGELOG.md ## [X.Y.Z]. Tag is vX.Y.Z.
-# Does not merge PRs, force-push, or rewrite remotes.
+# Pushes the current branch (master) and the tag. Does not force-push or
+# rewrite remotes.
 set -euo pipefail
 
 ROOT=""
 DRY=0
 PUSH=1
-WATCH=0
 ALLOW_BRANCH=""
 REMOTE="origin"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--no-push] [--watch] [--allow-branch NAME] [--remote NAME] [--root DIR]" >&2
+  echo "usage: $0 [--dry-run] [--no-push] [--allow-branch NAME] [--remote NAME] [--root DIR]" >&2
   exit 2
 }
 
@@ -28,7 +27,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --no-push) PUSH=0 ;;
-    --watch) WATCH=1 ;;
     --allow-branch)
       [[ $# -ge 2 ]] || usage
       ALLOW_BRANCH="$2"
@@ -145,31 +143,11 @@ echo "release: created annotated $tag at $(git rev-parse --short HEAD)"
 
 if [[ "$PUSH" -eq 0 ]]; then
   echo "release: not pushed (--no-push). Push with:"
-  echo "  git push ${REMOTE} refs/tags/${tag}"
+  echo "  git push ${REMOTE} refs/heads/${branch} refs/tags/${tag}"
   exit 0
 fi
 
-git push "$REMOTE" "refs/tags/${tag}"
-echo "release: pushed $tag → $REMOTE"
+git push "$REMOTE" "refs/heads/${branch}" "refs/tags/${tag}"
+echo "release: pushed ${branch} + ${tag} → $REMOTE"
 echo "release: GitHub Actions .github/workflows/release.yml builds musl/Windows/Darwin"
 echo "release: https://github.com/reardencode/rbitcoin/releases/tag/${tag}"
-
-if [[ "$WATCH" -eq 1 ]]; then
-  command -v gh >/dev/null 2>&1 || die "gh is required for --watch"
-  echo "release: waiting for workflow run…"
-  # Tag push SHA is this commit; newest release.yml run for this SHA.
-  run_id=""
-  sha="$(git rev-parse HEAD)"
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    run_id="$(
-      gh run list --workflow release.yml --limit 10 --json databaseId,headSha \
-        --jq "[.[] | select(.headSha == \"${sha}\")][0].databaseId // empty"
-    )"
-    if [[ -n "$run_id" ]]; then
-      break
-    fi
-    sleep 5
-  done
-  [[ -n "$run_id" ]] || die "no release.yml run for ${sha} yet; check Actions"
-  gh run watch "$run_id" --exit-status
-fi

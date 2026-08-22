@@ -54,9 +54,9 @@ Workspace version **0.5.1**. Consensus + Electrum serve fixes on the 0.5 line.
 - **`getnetworkinfo.version`:** `rpc_client_version("0.5.1") == 501`.
 
 - **Release script:** `./scripts/release.sh` on clean `master` checks
-  Cargo/nix/CHANGELOG, creates annotated `vX.Y.Z`, and pushes the tag
-  (`release.yml` builds the snapshots). `--dry-run` / `--no-push` /
-  `--watch`.
+  Cargo/nix/CHANGELOG, creates annotated `vX.Y.Z`, and pushes **master
+  + the tag** (`release.yml` builds the snapshots). `--dry-run` /
+  `--no-push`.
 
 ## [0.5.0] — 2026-08-22
 

@@ -27,6 +27,8 @@ assert_ok "dry-run default HEAD_SCALE is tiny" \
   grep -qx "RBITCOIN_HEAD_SCALE=tiny" <<<"$out"
 assert_ok "dry-run lists TableFile advise tests" \
   grep -q "file::advise_tests" <<<"$out"
+assert_ok "dry-run skips Windows concurrent grow/read abort" \
+  grep -q "skip=concurrent_readers_during_append_and_grow" <<<"$out"
 assert_ok "dry-run lists SH RAM / host_mem probes" \
   grep -q "sorted_run::tests::host_mem" <<<"$out"
 assert_ok "dry-run lists Darwin vm page math" \

@@ -23,16 +23,27 @@ STORE_PLATFORM_FILTERS=(
   uring_session::tests::pool_
   io_session_iocp
 )
+# Windows OVERLAPPED + concurrent grow can `pread short` and abort the
+# process (STATUS_STACK_BUFFER_OVERRUN). Still runs on Linux workspace.
+STORE_PLATFORM_SKIPS=(
+  concurrent_readers_during_append_and_grow
+)
 
 if [[ "${CI_OS_SMOKE_DRY_RUN:-}" == "1" ]]; then
   echo "smoke=store-platform+node-smoke"
   echo "RBITCOIN_HEAD_SCALE=$RBITCOIN_HEAD_SCALE"
   echo "filters=${STORE_PLATFORM_FILTERS[*]}"
+  echo "skip=${STORE_PLATFORM_SKIPS[*]}"
   exit 0
 fi
 
+skip_args=()
+for s in "${STORE_PLATFORM_SKIPS[@]}"; do
+  skip_args+=(--skip "$s")
+done
+
 for f in "${STORE_PLATFORM_FILTERS[@]}"; do
-  cargo test -p rbitcoin-store --lib -- "$f"
+  cargo test -p rbitcoin-store --lib -- "$f" "${skip_args[@]}"
 done
 
 cargo build -p rbitcoin-node -p rbitcoin-cli

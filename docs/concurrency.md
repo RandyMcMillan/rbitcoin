@@ -79,6 +79,31 @@ spend annotations.
 There is **no** global “pause queries during confirm write.” Tip-as-commit +
 `is_confirmed_strong` define query visibility ([`crash-recovery.md`](./crash-recovery.md)).
 
+### Confirmed-tx readers: pin + retry (not a lock)
+
+Wallet APIs (Electrum / Esplora) must not mix two chain prefixes in one
+response, and they must tell the client **which tip hash** the body belongs
+to. Yuval brought the A-B-A hole to our attention (same height, different
+block, silent status). The shape we ship follows
+[mempool/mempool#6584](https://github.com/mempool/mempool/issues/6584)
+(HTTP tip-hash header on every response) and the Electrum 1.7
+`chaintip` discussion in
+[spesmilo/electrum-protocol#2](https://github.com/spesmilo/electrum-protocol/pull/2)
+(added, then reverted in
+[#17](https://github.com/spesmilo/electrum-protocol/pull/17) because ElectrumX
+cannot pin bitcoind RPC — we can).
+
+| Rule | Detail |
+|------|--------|
+| Pin | `Query::pin_chain_view` captures `{height, hash, header_fk}` of published tip |
+| Filter | SH join uses `is_confirmed_strong_at(fk, view.height)`; slot keys on **hash** |
+| Live-check | `ChainView::still_live` ⇔ `confirmed[height] == header_fk` |
+| Extension | Prefix pin stays live; creates above the pin are filtered |
+| Disconnect / same-height replace | Pin dies; `run_at_chain_view` retries (bound 8) then `StoreError::Stale` |
+| Not OK | Pause queries during write, MVCC Class C, serving a disconnected hash |
+
+API tokens: [`COMPAT.md`](../COMPAT.md) (Esplora headers, Electrum JSON-RPC extra members, status preimage).
+
 ## Practical rules
 
 1. Do **not** spawn a second Class A writer while IBD confirm write is running.

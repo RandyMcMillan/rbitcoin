@@ -11,6 +11,15 @@ before 1.0).
 
 ### Added
 
+- **Confirmed-tx chain view:** Electrum/Esplora responses for confirmed
+  txs are built at one published tip and stamp that tip for the client
+  (`X-Bitcoin-Chain-Tip` on Esplora; JSON-RPC `chain_tip` on Electrum).
+  Same-height reorgs invalidate the SH join cache and change Electrum
+  status (block hash in the preimage). Yuval raised the A-B-A hole;
+  shape from [mempool#6584](https://github.com/mempool/mempool/issues/6584)
+  and [electrum-protocol#2](https://github.com/spesmilo/electrum-protocol/pull/2).
+  [`COMPAT.md`](COMPAT.md), [`docs/concurrency.md`](docs/concurrency.md).
+
 - **Road to 1.0:** [`docs/road-to-1.0.md`](docs/road-to-1.0.md) owns 1.0
   product gates (claimed Core functional, Core-parity fuzz, selected
   crates.io libraries, SH/RSS, eclipse/DoS, fee validation, schema freeze).

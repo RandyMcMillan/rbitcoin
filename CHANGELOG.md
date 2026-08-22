@@ -67,6 +67,10 @@ before 1.0).
 
 ### Fixed
 
+- **Fuzz CI nightly:** `scripts/fuzz-run.sh` / `fuzz.yml` set
+  `RUSTUP_TOOLCHAIN=nightly` so `rust-toolchain.toml` 1.95 cannot feed
+  cargo-fuzz (`-Zsanitizer` is nightly-only).
+
 - **SH materialize last page:** megakey chunking sizes the last extent page
   for the `ver=2` 24 B header (4072 B stream), not the `ver=1` 4088 B cap.
   A key whose delta stream sat in 4073..=4088 B overflowed

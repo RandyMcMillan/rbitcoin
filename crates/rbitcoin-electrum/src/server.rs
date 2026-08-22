@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{HistoryFilter, Query, ShJoinSlot};
+use rbitcoin_query::{ChainView, HistoryFilter, Query, ShJoinSlot};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -488,6 +488,7 @@ where
                     continue;
                 }
                 let t0 = Instant::now();
+                let mut stamped: Option<ChainView> = None;
                 let result = if method_stays_on_worker(method) {
                     dispatch_with_join(
                         method,
@@ -510,26 +511,47 @@ where
                     let mut hs = header_sub;
                     let mut shs = sh_subs.clone();
                     let mut slot = sh_join.take();
+                    let stamp = method_stamps_chain_tip(&method_owned);
                     match tokio::task::spawn_blocking(move || {
-                        let r = dispatch_with_join(
-                            &method_owned,
-                            &params_owned,
-                            &q,
-                            &cfg,
-                            &p,
-                            mp.as_deref(),
-                            &mut hs,
-                            &mut shs,
-                            &mut slot,
-                        );
-                        (r, hs, shs, slot)
+                        let (r, view) = if stamp {
+                            electrum_at_chain_view(&q, |q| {
+                                dispatch_with_join(
+                                    &method_owned,
+                                    &params_owned,
+                                    q,
+                                    &cfg,
+                                    &p,
+                                    mp.as_deref(),
+                                    &mut hs,
+                                    &mut shs,
+                                    &mut slot,
+                                )
+                            })
+                        } else {
+                            (
+                                dispatch_with_join(
+                                    &method_owned,
+                                    &params_owned,
+                                    &q,
+                                    &cfg,
+                                    &p,
+                                    mp.as_deref(),
+                                    &mut hs,
+                                    &mut shs,
+                                    &mut slot,
+                                ),
+                                None,
+                            )
+                        };
+                        (r, hs, shs, slot, view)
                     })
                     .await
                     {
-                        Ok((r, hs, shs, slot)) => {
+                        Ok((r, hs, shs, slot, view)) => {
                             header_sub = hs;
                             sh_subs = shs;
                             sh_join = slot;
+                            stamped = view;
                             r
                         }
                         Err(e) => {
@@ -552,7 +574,7 @@ where
                             wall_ms,
                             None,
                         );
-                        json!({"jsonrpc":"2.0","id": id, "result": v})
+                        rpc_result(&id, &v, stamped.as_ref())
                     }
                     Err(e) => {
                         rbitcoin_log::api_call(
@@ -800,6 +822,52 @@ fn method_stays_on_worker(method: &str) -> bool {
     )
 }
 
+fn method_stamps_chain_tip(method: &str) -> bool {
+    matches!(
+        method,
+        "blockchain.scripthash.get_history"
+            | "blockchain.scripthash.get_balance"
+            | "blockchain.scripthash.listunspent"
+            | "blockchain.transaction.get"
+            | "blockchain.transaction.get_merkle"
+    )
+}
+
+fn rpc_result(id: &Value, result: &Value, view: Option<&ChainView>) -> Value {
+    let mut obj = json!({"jsonrpc":"2.0","id": id, "result": result});
+    if let Some(v) = view {
+        obj["chain_tip"] = json!(hash_hex_rev(&v.hash));
+        obj["chain_tip_height"] = json!(v.height.0);
+    }
+    obj
+}
+
+fn electrum_at_chain_view<F>(query: &Query, mut f: F) -> (Result<Value, String>, Option<ChainView>)
+where
+    F: FnMut(&Query) -> Result<Value, String>,
+{
+    const BOUND: u32 = 8;
+    for _ in 0..BOUND {
+        let view = match query.pin_chain_view() {
+            Ok(v) => v,
+            Err(e) => return (Err(e.to_string()), None),
+        };
+        let Some(view) = view else {
+            return (f(query), None);
+        };
+        let out = f(query);
+        if out.is_err() {
+            return (out, None);
+        }
+        match view.still_live(query) {
+            Ok(true) => return (out, Some(view)),
+            Ok(false) => continue,
+            Err(e) => return (Err(e.to_string()), None),
+        }
+    }
+    (Err("chain view moved".into()), None)
+}
+
 #[cfg(test)]
 fn dispatch(
     method: &str,
@@ -847,6 +915,7 @@ fn dispatch_with_join(
             // implement server.features.
             "silent_payments": [0],
             "tweaks": true,
+            "chain_tip": true,
         })),
         "blockchain.headers.subscribe" => {
             *header_sub = true;
@@ -1418,6 +1487,7 @@ mod tests {
         assert_eq!(features["server_version"], v[0]);
         assert_eq!(features["silent_payments"], json!([0]));
         assert_eq!(features["tweaks"], json!(true));
+        assert_eq!(features["chain_tip"], json!(true));
 
         let probe = dispatch(
             "blockchain.tweaks.subscribe",
@@ -1651,6 +1721,10 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 1);
         assert!(v.get("result").is_some());
+        assert!(
+            v.get("chain_tip").is_none(),
+            "ping must not grow chain_tip: {v}"
+        );
 
         // Empty line ignored; malformed JSON ignored; then version.
         let stream = reader.into_inner();
@@ -1673,6 +1747,184 @@ mod tests {
         .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], 2);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chain_view_get_history_stamps_tip_and_changes_on_replace() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let (h0, t0) = {
+            let merkle = [0xab; 32];
+            let header = HeaderRecord {
+                prev_fk: Fk::NULL,
+                version: 1,
+                timestamp: 1,
+                bits: 0x207fffff,
+                nonce: 0,
+                merkle_root: merkle,
+                hash: merkle,
+            };
+            let mut txid = [0xcb; 32];
+            txid[31] = 0;
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![0],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            (header, ta)
+        };
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let mut h1 = h0.clone();
+        h1.prev_fk = prev_fk;
+        h1.timestamp = 2;
+        h1.nonce = 1;
+        h1.hash = rbitcoin_store::block_header_hash(
+            h1.version,
+            &hash0,
+            &h1.merkle_root,
+            h1.timestamp,
+            h1.bits,
+            h1.nonce,
+        );
+        let mut t1 = {
+            let mut txid = [0xcb; 32];
+            txid[5] = 0xaa;
+            TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![1],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            }
+        };
+        t1.tx.txid[0] = 1;
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let tip_a = hash_hex_rev(&h1.hash);
+
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx, None)
+            .await
+            .expect("listen");
+        let sh = electrum_scripthash_hex(&[0x51]);
+
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let req = json!({
+            "jsonrpc":"2.0","id":1,
+            "method":"blockchain.scripthash.get_history","params":[sh]
+        });
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut resp = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], 1, "{v}");
+        assert!(v["result"].as_array().is_some(), "{v}");
+        assert_eq!(v["chain_tip"], tip_a, "{v}");
+        assert_eq!(v["chain_tip_height"], 1, "{v}");
+
+        q.disconnect_tip().unwrap();
+        let mut h1b = h1.clone();
+        h1b.nonce = 9;
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        let mut t1b = {
+            let mut txid = [0xcb; 32];
+            txid[5] = 0xbb;
+            TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![2],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            }
+        };
+        t1b.tx.txid[0] = 2;
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+        let tip_b = hash_hex_rev(&h1b.hash);
+        assert_ne!(tip_a, tip_b);
+
+        let stream = reader.into_inner();
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        resp.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut resp),
+        )
+        .await
+        .expect("timeout")
+        .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["chain_tip"], tip_b, "{v}");
+        assert_eq!(v["chain_tip_height"], 1, "{v}");
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

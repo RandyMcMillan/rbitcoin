@@ -38,7 +38,7 @@
 //! Chain is **singly linked** first → … → last. Head stores first+last for O(1)
 //! walk start and O(1) append target.
 
-use crate::compact::{read_uleb128, uleb128_len, write_uleb128};
+use crate::compact::{read_uleb128, uleb128_len, write_uleb128_into};
 use crate::error::StoreError;
 use crate::scripthash_layout::{ShEntry, SH_ENTRY_LEN};
 use crate::scripthash_slabs::{
@@ -488,21 +488,46 @@ fn sh_page_stream(page: &[u8; SH_PAGE_SIZE]) -> &[u8] {
     &page[sh_page_stream_off(page)..]
 }
 
-fn sh_page_stream_used(page: &[u8; SH_PAGE_SIZE]) -> Result<usize, StoreError> {
+fn sh_page_stream_tail(page: &[u8; SH_PAGE_SIZE]) -> Result<(usize, Option<Fk>), StoreError> {
+    sh_page_require_delta(page)?;
     let n = sh_page_n_fks(page)? as usize;
     if n == 0 {
-        return Ok(0);
+        return Ok((0, None));
     }
-    let mut off = 0usize;
     let buf = sh_page_stream(page);
-    for _ in 0..n {
-        let (_, used) = read_uleb128(buf.get(off..).unwrap_or(&[]))?;
+    let cap = sh_page_stream_cap(page);
+    let mut off = 0usize;
+    let (first, used) = read_uleb128(buf.get(off..).unwrap_or(&[]))?;
+    if first == 0 {
+        return Err(StoreError::Corrupt("scripthash fk stream null first fk"));
+    }
+    if first & SH_FLAG_BIT != 0 {
+        return Err(StoreError::Corrupt("scripthash fk stream flag bit set"));
+    }
+    off += used;
+    if off > cap {
+        return Err(StoreError::Corrupt("scripthash page stream overrun"));
+    }
+    let mut last = first;
+    for _ in 1..n {
+        let (d, used) = read_uleb128(buf.get(off..).unwrap_or(&[]))?;
         off += used;
-        if off > sh_page_stream_cap(page) {
+        if off > cap {
             return Err(StoreError::Corrupt("scripthash page stream overrun"));
         }
+        if d == 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: scripthash fk stream zero delta",
+            ));
+        }
+        last = last
+            .checked_add(d)
+            .ok_or(StoreError::Corrupt("scripthash fk stream delta overflow"))?;
+        if last & SH_FLAG_BIT != 0 {
+            return Err(StoreError::Corrupt("scripthash fk stream flag bit set"));
+        }
     }
-    Ok(off)
+    Ok((off, Some(Fk(last))))
 }
 
 #[inline]
@@ -524,8 +549,7 @@ pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<ShEntry>, StoreE
 /// Last create_tx_fk on this page (`None` if empty).
 #[inline]
 pub fn sh_page_last_fk(page: &[u8; SH_PAGE_SIZE]) -> Result<Option<Fk>, StoreError> {
-    let ents = sh_page_entries(page)?;
-    Ok(ents.last().map(|e| e.create_tx_fk))
+    Ok(sh_page_stream_tail(page)?.1)
 }
 
 /// Number of 4 KiB pages needed for `n` create entries (`0` → `0`).
@@ -651,33 +675,31 @@ pub fn sh_page_try_append_entry(
             "scripthash: create_fk must have bit63 clear",
         ));
     }
-    sh_page_require_delta(page)?;
+    let (used, last) = sh_page_stream_tail(page)?;
     let n = sh_page_n_fks(page)? as usize;
-    let used = sh_page_stream_used(page)?;
-    let add = if n == 0 {
-        uleb128_len(entry.create_tx_fk.0)
-    } else {
-        let last = sh_page_last_fk(page)?.expect("n>0 has last fk");
-        if entry.create_tx_fk.0 <= last.0 {
-            return Err(StoreError::Corrupt(
-                "invariant: scripthash page append create_fk not strictly increasing",
-            ));
+    let add = match last {
+        None => uleb128_len(entry.create_tx_fk.0),
+        Some(prev) => {
+            if entry.create_tx_fk.0 <= prev.0 {
+                return Err(StoreError::Corrupt(
+                    "invariant: scripthash page append create_fk not strictly increasing",
+                ));
+            }
+            uleb128_len(entry.create_tx_fk.0 - prev.0)
         }
-        uleb128_len(entry.create_tx_fk.0 - last.0)
     };
     if used + add > sh_page_stream_cap(page) {
         return Ok(false);
     }
-    let mut tmp = Vec::with_capacity(add);
-    if n == 0 {
-        write_uleb128(&mut tmp, entry.create_tx_fk.0);
+    let mut tmp = [0u8; 10];
+    let wrote = if last.is_none() {
+        write_uleb128_into(&mut tmp, entry.create_tx_fk.0)?
     } else {
-        let last = sh_page_last_fk(page)?.expect("n>0 has last fk");
-        write_uleb128(&mut tmp, entry.create_tx_fk.0 - last.0);
-    }
-    debug_assert_eq!(tmp.len(), add);
+        write_uleb128_into(&mut tmp, entry.create_tx_fk.0 - last.unwrap().0)?
+    };
+    debug_assert_eq!(wrote, add);
     let off = sh_page_stream_off(page) + used;
-    page[off..off + tmp.len()].copy_from_slice(&tmp);
+    page[off..off + wrote].copy_from_slice(&tmp[..wrote]);
     if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
         page[SH_PAGE_OFF_VER] = SH_PAGE_DELTA_VER;
     }
@@ -733,6 +755,31 @@ mod tests {
         assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(600)));
         assert_eq!(sh_page_entries(&page).unwrap(), ents);
         assert_eq!(page[SH_PAGE_OFF_VER], SH_PAGE_DELTA_VER);
+    }
+
+    #[test]
+    fn sh_page_last_fk_matches_entries_last() {
+        let mut empty = [0u8; SH_PAGE_SIZE];
+        sh_page_init_empty(&mut empty);
+        assert_eq!(sh_page_last_fk(&empty).unwrap(), None);
+        assert!(sh_page_entries(&empty).unwrap().is_empty());
+
+        let one = [ShEntry::new(Fk(9))];
+        let mut page = [0u8; SH_PAGE_SIZE];
+        sh_page_pack(&mut page, &one, 0).unwrap();
+        assert_eq!(
+            sh_page_last_fk(&page).unwrap(),
+            sh_page_entries(&page).unwrap().last().map(|e| e.create_tx_fk)
+        );
+
+        let ents: Vec<_> = (1u64..=600).map(|i| ShEntry::new(Fk(i))).collect();
+        let mut big = [0u8; SH_PAGE_SIZE];
+        sh_page_pack(&mut big, &ents, 0).unwrap();
+        assert_eq!(
+            sh_page_last_fk(&big).unwrap(),
+            sh_page_entries(&big).unwrap().last().map(|e| e.create_tx_fk)
+        );
+        assert_eq!(sh_page_last_fk(&big).unwrap(), Some(Fk(600)));
     }
 
     #[test]

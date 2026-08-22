@@ -15,11 +15,10 @@ and [`OPERATOR.md`](./OPERATOR.md).
 
 | Version | Support |
 |---------|---------|
-| **0.5.x** | Supported **published** line. Security-relevant fixes land here until **0.6** or **1.0**. No LTS. |
-| **0.x** (this tree, untagged) | Active development. Same policy as 0.5.x until the tag; report against a git commit. |
+| **0.5.x** | Supported **published** line. Security-relevant fixes land here until **0.6** or **1.0**. No LTS. Report against the tag (and binary digest if you built musl static). |
 | **1.0+** (future) | Will define a clearer support window once the on-disk schema and public surface stabilize. |
 
-Report against a **git commit** (and binary digest if you built musl static).
+Untagged trees: report against a **git commit** (and binary digest if you built musl static).
 
 ## Reporting a vulnerability
 

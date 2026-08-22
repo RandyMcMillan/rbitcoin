@@ -21,6 +21,10 @@ Update a row when work lands. Prefer that over a new dated audit PDF.
 
 This is not a security audit. Numbers are order-of-magnitude.
 
+**1.0 product gates** (schema freeze, claimed-surface functional, Core-parity
+fuzz, libraries, SH/RSS, eclipse/DoS, fee validation) live in
+[`road-to-1.0.md`](./road-to-1.0.md). Do not copy that table here.
+
 ---
 
 ## North star: industry-leading full node in Rust

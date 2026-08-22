@@ -212,7 +212,8 @@ analog = "follow-up: IBD tip-age / maxtipage"
 [[test]]
 name = "feature_maxuploadtarget.py"
 status = "skip"
-reason = "core-log"
+reason = "core-net-policy"
+analog = "no BIP37 bloom; script restarts with -peerbloomfilters (upload-target later)"
 
 [[test]]
 name = "feature_minchainwork.py"
@@ -617,7 +618,8 @@ analog = "follow-up: feefilter"
 [[test]]
 name = "p2p_filter.py"
 status = "skip"
-reason = "core-log"
+reason = "core-net-policy"
+analog = "no BIP37 bloom (filter*/mempool disconnect only; Core -peerbloomfilters=1 not offered)"
 
 [[test]]
 name = "p2p_fingerprint.py"
@@ -784,7 +786,8 @@ status = "run"
 [[test]]
 name = "p2p_sendtxrcncl.py"
 status = "skip"
-reason = "core-log"
+reason = "core-net-policy"
+analog = "no BIP37 bloom; script uses -peerbloomfilters with txreconciliation"
 
 [[test]]
 name = "p2p_timeouts.py"

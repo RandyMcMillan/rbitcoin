@@ -5,9 +5,10 @@
 | `*.bin` / `*.hex` / `*.txt` | Captured mainnet/signet blocks for regression | project |
 | `bip352_send_and_receive_test_vectors.json` | BIP-352 official send/receive vectors | BSD-2-Clause (BIP) |
 
-Core JSON corpora (`script_tests.json`, `tx_valid.json`, `tx_invalid.json`)
-are **not** checked in here. Each `cargo test` run hard-links or copies them
-from Bitcoin Core **v31.1**
+Core JSON under `src/test/data/` (`script_tests.json`, `tx_valid.json`,
+`tx_invalid.json`, `sighash.json`, `bip341_wallet_vectors.json`, …) is
+**not** checked in here. Each `cargo test` run hard-links or copies named
+files from Bitcoin Core **v31.1**
 (`9be056a8a72b624dae9623b2f7bded92c2a21c91`) at
 `third_party/bitcoin/src/test/data/` into `$CARGO_TARGET_DIR/core-data/`.
 

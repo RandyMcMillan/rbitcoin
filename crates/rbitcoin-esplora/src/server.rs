@@ -4,7 +4,7 @@ use crate::handlers;
 use crate::tx_json::{build_tx_json, tx_status_json};
 use crate::ws;
 use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,7 +15,7 @@ use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_net::{MempoolHub, TipEvent};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{Query, ShJoinSlot};
+use rbitcoin_query::{ChainView, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -79,6 +79,43 @@ async fn meter_rest(req: Request, next: Next) -> Response {
         err.as_deref(),
     );
     resp
+}
+
+pub(crate) const HDR_CHAIN_TIP: &str = "x-bitcoin-chain-tip";
+pub(crate) const HDR_CHAIN_TIP_HEIGHT: &str = "x-bitcoin-chain-tip-height";
+
+fn stamp_chain_view_headers(resp: &mut Response, view: &ChainView) {
+    let hash = block_hash_hex(&view.hash);
+    let height = view.height.0.to_string();
+    if let Ok(v) = HeaderValue::from_str(&hash) {
+        resp.headers_mut().insert(HDR_CHAIN_TIP, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&height) {
+        resp.headers_mut().insert(HDR_CHAIN_TIP_HEIGHT, v);
+    }
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("X-Bitcoin-Chain-Tip, X-Bitcoin-Chain-Tip-Height"),
+    );
+}
+
+async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let view = match st.query.pin_chain_view() {
+        Ok(v) => v,
+        Err(e) => return store_err(e),
+    };
+    let mut resp = next.run(req).await;
+    let Some(view) = view else {
+        return resp;
+    };
+    match view.still_live(&st.query) {
+        Ok(true) => {
+            stamp_chain_view_headers(&mut resp, &view);
+            resp
+        }
+        Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, "chain view moved").into_response(),
+        Err(e) => store_err(e),
+    }
 }
 
 /// Default concurrent upgraded WebSocket sockets (separate from REST concurrency).
@@ -274,7 +311,11 @@ pub async fn run_esplora(
         .route("/mempool/recent", get(handlers::mempool_recent))
         .route("/fee-estimates", get(handlers::fee_estimates))
         .fallback(fallback_404)
-        // Outer → inner: concurrency → body → timeout → meter (around handler).
+        // Outer → inner: concurrency → body → timeout → meter → chain-view stamp.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            stamp_chain_view_mw,
+        ))
         .layer(middleware::from_fn(meter_rest))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -428,6 +469,7 @@ pub(crate) fn not_found() -> Response {
 pub(crate) fn store_err(e: rbitcoin_query::QueryError) -> Response {
     match e {
         StoreError::NotFound => not_found(),
+        StoreError::Stale(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),
     }
 }
@@ -529,13 +571,30 @@ mod tests {
         (header, ta)
     }
 
+    fn header_value(text: &str, name: &str) -> Option<String> {
+        let want = name.to_ascii_lowercase();
+        text.split("\r\n\r\n")
+            .next()
+            .unwrap_or("")
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(&want))
+            .map(|(_, v)| v.trim().to_string())
+    }
+
     async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+        let (status, _hdrs, body) = http_get_raw(addr, path).await;
+        (status, body)
+    }
+
+    async fn http_get_raw(addr: SocketAddr, path: &str) -> (u16, String, String) {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
-        let text = String::from_utf8_lossy(&buf);
+        let text = String::from_utf8_lossy(&buf).into_owned();
         let status = text
             .lines()
             .next()
@@ -548,7 +607,7 @@ mod tests {
             .unwrap_or("")
             .trim()
             .to_string();
-        (status, body)
+        (status, text, body)
     }
 
     #[tokio::test]
@@ -588,13 +647,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chain_view_tip_header_matches_hash_body() {
+        let (dir, q) = temp_query("chain-view-hdr");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let addr = handle.local_addr;
+
+        let (st, raw, body) = http_get_raw(addr, "/blocks/tip/hash").await;
+        assert_eq!(st, 200, "hash body={body}");
+        let tip = header_value(&raw, HDR_CHAIN_TIP).expect("X-Bitcoin-Chain-Tip");
+        let height = header_value(&raw, HDR_CHAIN_TIP_HEIGHT).expect("height");
+        assert_eq!(tip, body);
+        assert_eq!(height, "0");
+        let expose = header_value(&raw, "access-control-expose-headers").unwrap_or_default();
+        assert!(
+            expose.to_ascii_lowercase().contains("x-bitcoin-chain-tip"),
+            "CORS must expose the tip header: {expose}"
+        );
+
+        let (st, raw, _) = http_get_raw(addr, "/blocks/tip/height").await;
+        assert_eq!(st, 200);
+        assert_eq!(
+            header_value(&raw, HDR_CHAIN_TIP).as_deref(),
+            Some(tip.as_str())
+        );
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chain_view_header_changes_after_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-reorg-hdr");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let sh = rbitcoin_store::script_hash(&[0x51]);
+        let sh_hex = block_hash_hex(&sh);
+
+        let (st, raw_a, _) = http_get_raw(addr, &format!("/scripthash/{sh_hex}/utxo")).await;
+        assert_eq!(st, 200, "utxo A");
+        let tip_a = header_value(&raw_a, HDR_CHAIN_TIP).expect("tip A");
+        assert_eq!(tip_a, block_hash_hex(&h1.hash));
+
+        q.disconnect_tip().unwrap();
+        let mut h1b = coinbase(1, prev_fk, Some(hash0)).0;
+        h1b.nonce = h1.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        let t1b = coinbase(1, prev_fk, Some(hash0)).1;
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+
+        let (st, raw_b, _) = http_get_raw(addr, &format!("/scripthash/{sh_hex}/utxo")).await;
+        assert_eq!(st, 200, "utxo B");
+        let tip_b = header_value(&raw_b, HDR_CHAIN_TIP).expect("tip B");
+        assert_eq!(tip_b, block_hash_hex(&h1b.hash));
+        assert_ne!(tip_a, tip_b);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn empty_chain_tip_is_unavailable() {
         let (dir, q) = temp_query("empty");
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
         let handle = run_esplora(cfg, q, None, None).await.expect("listen");
-        let (st, _) = http_get(handle.local_addr, "/blocks/tip/height").await;
+        let (st, raw, _) = http_get_raw(handle.local_addr, "/blocks/tip/height").await;
         assert_eq!(st, 503);
+        assert!(
+            header_value(&raw, HDR_CHAIN_TIP).is_none(),
+            "empty chain must omit the tip header"
+        );
         let (st, _) = http_get(handle.local_addr, "/blocks/tip/hash").await;
         assert_eq!(st, 503);
         handle.shutdown().await;

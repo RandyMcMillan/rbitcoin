@@ -106,7 +106,8 @@ still wait for durable SH when shindex is on.
 | Method / area | Why |
 |---------------|-----|
 | Wallet RPC | No keystore |
-| Mining / GBT | Non-goal. Regtest `generate*` is harness-only. `submitblock` is the same receive path as P2P. |
+| Stratum / pool / BIP9 testdummy | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` are a cluster-chunk **selector** ([`COMPAT.md`](../COMPAT.md)). No stratum, no testdummy, no wallet keys |
+| Core `generate*` as a mining product | **Regtest harness only.** `submitblock` is the same receive path as P2P |
 | `combinerawtransaction` | Not implemented |
 | Full `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate. `raw()` Class A walk is the MiniWallet subset only. |
 | Address history via Core method names | Use Electrum/Esplora with `--shindex` |

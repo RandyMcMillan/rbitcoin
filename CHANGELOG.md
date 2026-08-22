@@ -18,6 +18,10 @@ before 1.0).
 
 ### Changed
 
+- **RPC docs:** permanent gaps no longer call GBT a non-goal. Template RPC is
+  the cluster-chunk selector (no stratum / testdummy); `generate*` stays
+  regtest harness. Matches [`COMPAT.md`](COMPAT.md).
+
 - **SH materialize resume:** [`OPERATOR.md`](OPERATOR.md) `--shindex` section
   documents abort/resume: keep `scripthash.runs`, sealed shards stay, restart
   packs unsealed shards only. Not a schema bump.

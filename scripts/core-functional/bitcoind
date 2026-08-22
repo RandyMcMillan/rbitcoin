@@ -77,6 +77,9 @@ IGNORE_FLAGS = frozenset(
         "print-cmd",
         "acceptnonstdtxn",
         "peerblockfilters",
+        # No BIP37 bloom product; node always disconnects on filter*/mempool.
+        # Ignore so Core tests may still pass -peerbloomfilters[=0|1] on argv.
+        "peerbloomfilters",
         # Core v31.1: ancestor/descendant limits are deprecated no-ops
         # (cluster limits replaced them). Match that — do not invent a second
         # mempool graph policy.

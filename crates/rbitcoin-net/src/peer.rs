@@ -1643,7 +1643,15 @@ async fn handle_peer_frame(
                 }
             }
         }
-        NetworkMessage::MemPool => {}
+        // No BIP37 bloom product (Core v31 default `-peerbloomfilters=0`).
+        // Disconnect peers that send mempool/filter* (`p2p_nobloomfilter_messages.py`).
+        NetworkMessage::MemPool
+        | NetworkMessage::FilterLoad(_)
+        | NetworkMessage::FilterAdd(_)
+        | NetworkMessage::FilterClear => {
+            punish_disconnect(ban_score, session);
+            return Ok(());
+        }
         NetworkMessage::GetAddr => {
             queue_out(out_tx, NetworkMessage::Addr(vec![]))?;
         }

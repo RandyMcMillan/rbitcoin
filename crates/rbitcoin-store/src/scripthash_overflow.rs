@@ -475,7 +475,7 @@ pub fn wipe_legacy_fullsize_overflow(store_dir: &Path) -> Result<(), StoreError>
 mod tests {
     use super::*;
     use crate::hashhead::HeadRole;
-    use crate::scripthash_layout::{ShEntry, ShHeadValue};
+    use crate::scripthash_layout::ShHeadValue;
     use rbitcoin_primitives::Fk;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -573,12 +573,10 @@ mod tests {
 
             let mut k1 = [0u8; 32];
             k1[0] = 0x71;
-            let v1 = ShHeadValue::inline_one(ShEntry::new(Fk(7)));
+            let v1 = ShHeadValue::inline_one(Fk(7));
             stack.insert(&k1, &v1).unwrap();
             assert!(stack.get(&k1).unwrap().is_some());
-            stack
-                .insert(&k1, &ShHeadValue::inline_one(ShEntry::new(Fk(8))))
-                .unwrap();
+            stack.insert(&k1, &ShHeadValue::inline_one(Fk(8))).unwrap();
             assert_eq!(stack.get(&k1).unwrap().unwrap().inline_fks(), vec![Fk(8)]);
             stack.insert_on_segment(0, &[]).unwrap();
             match stack.insert_on_segment(99, &[(k1, v1.clone())]) {
@@ -596,10 +594,7 @@ mod tests {
                 key[1] = i as u8;
                 stack
                     .insert_new_with_roll(
-                        &[(
-                            key,
-                            ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
-                        )],
+                        &[(key, ShHeadValue::inline_one(Fk(u64::from(i) + 1)))],
                         ShardedScriptHashHead::SH_SEAL_LOAD,
                     )
                     .unwrap();
@@ -651,7 +646,7 @@ mod tests {
             let mut key = [0u8; 32];
             key[0] = 0xab;
             stack
-                .insert_new_with_roll(&[(key, ShHeadValue::inline_one(ShEntry::new(Fk(1))))], 0.99)
+                .insert_new_with_roll(&[(key, ShHeadValue::inline_one(Fk(1)))], 0.99)
                 .unwrap();
             let fuse = ovf_fuse_path(&dir, 0);
             let mut raw = Vec::from(*b"BF8R");
@@ -678,7 +673,7 @@ mod tests {
             let mut key = [0u8; 32];
             key[0] = 0xcd;
             stack
-                .insert_new_with_roll(&[(key, ShHeadValue::inline_one(ShEntry::new(Fk(2))))], 0.99)
+                .insert_new_with_roll(&[(key, ShHeadValue::inline_one(Fk(2)))], 0.99)
                 .unwrap();
             std::fs::write(ovf_fuse_path(&dir, 0), b"XXXX garbage").unwrap();
         }
@@ -717,10 +712,7 @@ mod tests {
                     let mut key = [0u8; 32];
                     key[0] = 0x55;
                     key[1] = i as u8;
-                    (
-                        key,
-                        ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
-                    )
+                    (key, ShHeadValue::inline_one(Fk(u64::from(i) + 1)))
                 })
                 .collect();
             stack
@@ -750,10 +742,7 @@ mod tests {
                 key[1] = i as u8;
                 stack
                     .insert_new_with_roll(
-                        &[(
-                            key,
-                            ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1))),
-                        )],
+                        &[(key, ShHeadValue::inline_one(Fk(u64::from(i) + 1)))],
                         ShardedScriptHashHead::SH_SEAL_LOAD,
                     )
                     .unwrap();

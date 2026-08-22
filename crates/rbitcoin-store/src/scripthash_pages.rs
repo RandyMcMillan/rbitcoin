@@ -40,7 +40,7 @@
 
 use crate::compact::{read_uleb128, uleb128_len, write_uleb128_into};
 use crate::error::StoreError;
-use crate::scripthash_layout::{ShEntry, SH_ENTRY_LEN};
+use crate::scripthash_layout::SH_ENTRY_LEN;
 #[cfg(test)]
 use crate::scripthash_slabs::encode_fk_delta_stream;
 use crate::scripthash_slabs::{decode_fk_delta_stream_into, encode_fk_delta_stream_into};
@@ -423,27 +423,6 @@ fn sh_page_write_stream(page: &mut [u8; SH_PAGE_SIZE], fks: &[u64]) -> Result<()
     }
 }
 
-fn sh_page_fks_from_entries(entries: &[ShEntry]) -> Vec<u64> {
-    entries.iter().map(|e| e.create_tx_fk.0).collect()
-}
-
-/// Pack a last-in-extent (or chain-last) `ver=2` page.
-pub fn sh_page_pack_extent_last(
-    page: &mut [u8; SH_PAGE_SIZE],
-    entries: &[ShEntry],
-    extent_base: u64,
-    extent_n: u32,
-    next_off: u64,
-) -> Result<(), StoreError> {
-    sh_page_pack_extent_last_fks(
-        page,
-        &sh_page_fks_from_entries(entries),
-        extent_base,
-        extent_n,
-        next_off,
-    )
-}
-
 /// Pack a last-in-extent page from raw create fks.
 pub fn sh_page_pack_extent_last_fks(
     page: &mut [u8; SH_PAGE_SIZE],
@@ -552,6 +531,7 @@ pub fn sh_page_entries_into(
 }
 
 /// Entries currently stored in the page (**strictly increasing** create_tx_fk).
+#[cfg(test)]
 pub fn sh_page_entries(page: &[u8; SH_PAGE_SIZE]) -> Result<Vec<Fk>, StoreError> {
     let mut out = Vec::new();
     sh_page_entries_into(page, &mut out)?;
@@ -637,19 +617,6 @@ fn split_last_chunk_for_extent(fks: &[Fk], chunks: &mut Vec<(usize, usize)>) {
     }
 }
 
-/// Pack up to [`SH_PAGE_FK_CAP`] **strictly increasing** entries into a fresh page
-/// with `next_page_off` already set.
-///
-/// Cold bulk and new-chain writers use this so each page is written **once** with its
-/// next link known up front — no read-modify-write of the previous page.
-pub fn sh_page_pack(
-    page: &mut [u8; SH_PAGE_SIZE],
-    entries: &[ShEntry],
-    next_off: u64,
-) -> Result<(), StoreError> {
-    sh_page_pack_fks(page, &sh_page_fks_from_entries(entries), next_off)
-}
-
 /// Pack a `ver=1` page from raw create fks.
 pub fn sh_page_pack_fks(
     page: &mut [u8; SH_PAGE_SIZE],
@@ -666,23 +633,15 @@ pub fn sh_page_pack_fks(
 }
 
 /// Append one create FK to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
-pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool, StoreError> {
-    sh_page_try_append_entry(page, ShEntry::new(fk))
-}
-
-/// Append one [`ShEntry`] to the page. Returns `Ok(true)` if appended, `Ok(false)` if full.
 ///
-/// Requires `entry.create_tx_fk` **strictly greater** than the page's last FK when
-/// non-empty (sorted page chain invariant). Equal/lower is a pack/encode bug —
-/// durable re-queue of lower FKs is filtered **before** append by table writers.
-pub fn sh_page_try_append_entry(
-    page: &mut [u8; SH_PAGE_SIZE],
-    entry: ShEntry,
-) -> Result<bool, StoreError> {
-    if entry.is_null() {
+/// Requires `fk` **strictly greater** than the page's last FK when non-empty
+/// (sorted page chain invariant). Equal/lower is a pack/encode bug — durable
+/// re-queue of lower FKs is filtered **before** append by table writers.
+pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool, StoreError> {
+    if fk.is_null() {
         return Err(StoreError::InvalidFk);
     }
-    if entry.create_tx_fk.0 & SH_FLAG_BIT != 0 {
+    if fk.0 & SH_FLAG_BIT != 0 {
         return Err(StoreError::Corrupt(
             "scripthash: create_fk must have bit63 clear",
         ));
@@ -690,14 +649,14 @@ pub fn sh_page_try_append_entry(
     let (used, last) = sh_page_stream_tail(page)?;
     let n = sh_page_n_fks(page)? as usize;
     let delta = match last {
-        None => entry.create_tx_fk.0,
+        None => fk.0,
         Some(prev) => {
-            if entry.create_tx_fk.0 <= prev.0 {
+            if fk.0 <= prev.0 {
                 return Err(StoreError::Corrupt(
                     "invariant: scripthash page append create_fk not strictly increasing",
                 ));
             }
-            entry.create_tx_fk.0 - prev.0
+            fk.0 - prev.0
         }
     };
     let add = uleb128_len(delta);
@@ -725,6 +684,7 @@ pub fn sh_page_decode_slice_into(buf: &[u8], out: &mut Vec<Fk>) -> Result<u64, S
 }
 
 /// Decode page fields from an arbitrary slice (rejects len ≠ 4096).
+#[cfg(test)]
 pub fn sh_page_decode_slice(buf: &[u8]) -> Result<(u64, Vec<Fk>), StoreError> {
     let page = sh_page_as_array(buf)?;
     Ok((sh_page_next(page)?, sh_page_entries(page)?))
@@ -734,15 +694,17 @@ pub fn sh_page_decode_slice(buf: &[u8]) -> Result<(u64, Vec<Fk>), StoreError> {
 mod tests {
     use super::*;
 
+    fn raw(fks: &[Fk]) -> Vec<u64> {
+        fks.iter().map(|fk| fk.0).collect()
+    }
+
     #[test]
     fn sh_page_pack_matches_encoded_stream() {
         let fks: Vec<u64> = (1..=80).collect();
-        let ents: Vec<_> = fks.iter().copied().map(|i| ShEntry::new(Fk(i))).collect();
-        let stream =
-            encode_fk_delta_stream(&ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>())
-                .unwrap();
+        let ents: Vec<_> = fks.iter().copied().map(Fk).collect();
+        let stream = encode_fk_delta_stream(&ents).unwrap();
         let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_pack(&mut page, &ents, 8192).unwrap();
+        sh_page_pack_fks(&mut page, &fks, 8192).unwrap();
         assert_eq!(sh_page_n_fks(&page).unwrap() as usize, fks.len());
         assert_eq!(sh_page_next(&page).unwrap(), 8192);
         assert_eq!(
@@ -761,10 +723,8 @@ mod tests {
         assert_eq!(slice_into, slice_ents);
         assert_eq!(slice_ents, wrapped);
         let mut over = [0u8; SH_PAGE_SIZE];
-        let too_many: Vec<_> = (1..=SH_PAGE_STREAM_MAX as u64 + 2)
-            .map(|i| ShEntry::new(Fk(i)))
-            .collect();
-        match sh_page_pack(&mut over, &too_many, 0) {
+        let too_many: Vec<u64> = (1..=SH_PAGE_STREAM_MAX as u64 + 2).collect();
+        match sh_page_pack_fks(&mut over, &too_many, 0) {
             Err(StoreError::Corrupt(m)) => {
                 assert!(
                     m.contains("entries exceed page capacity"),
@@ -777,15 +737,12 @@ mod tests {
 
     #[test]
     fn sh_page_delta_packs_600_sequential_in_one_page() {
-        let ents: Vec<_> = (1u64..=600).map(|i| ShEntry::new(Fk(i))).collect();
+        let ents: Vec<_> = (1u64..=600).map(Fk).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_pack(&mut page, &ents, 0).unwrap();
+        sh_page_pack_fks(&mut page, &raw(&ents), 0).unwrap();
         assert_eq!(sh_page_n_fks(&page).unwrap(), 600);
         assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(600)));
-        assert_eq!(
-            sh_page_entries(&page).unwrap(),
-            ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>()
-        );
+        assert_eq!(sh_page_entries(&page).unwrap(), ents);
         assert_eq!(page[SH_PAGE_OFF_VER], SH_PAGE_DELTA_VER);
     }
 
@@ -796,17 +753,17 @@ mod tests {
         assert_eq!(sh_page_last_fk(&empty).unwrap(), None);
         assert!(sh_page_entries(&empty).unwrap().is_empty());
 
-        let one = [ShEntry::new(Fk(9))];
+        let one = [Fk(9)];
         let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_pack(&mut page, &one, 0).unwrap();
+        sh_page_pack_fks(&mut page, &raw(&one), 0).unwrap();
         assert_eq!(
             sh_page_last_fk(&page).unwrap(),
             sh_page_entries(&page).unwrap().last().copied()
         );
 
-        let ents: Vec<_> = (1u64..=600).map(|i| ShEntry::new(Fk(i))).collect();
+        let ents: Vec<_> = (1u64..=600).map(Fk).collect();
         let mut big = [0u8; SH_PAGE_SIZE];
-        sh_page_pack(&mut big, &ents, 0).unwrap();
+        sh_page_pack_fks(&mut big, &raw(&ents), 0).unwrap();
         assert_eq!(
             sh_page_last_fk(&big).unwrap(),
             sh_page_entries(&big).unwrap().last().copied()
@@ -946,19 +903,16 @@ mod tests {
 
     #[test]
     fn sh_page_ver2_extent_roundtrip() {
-        let ents: Vec<_> = (1u64..=3).map(|i| ShEntry::new(Fk(i))).collect();
+        let ents: Vec<_> = (1u64..=3).map(Fk).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
-        sh_page_pack_extent_last(&mut page, &ents, 4096, 2, 0).unwrap();
+        sh_page_pack_extent_last_fks(&mut page, &raw(&ents), 4096, 2, 0).unwrap();
         assert_eq!(page[SH_PAGE_OFF_VER], SH_PAGE_EXTENT_VER);
         assert_eq!(sh_page_extent(&page).unwrap(), Some((4096, 2)));
         assert_eq!(sh_page_next(&page).unwrap(), 0);
         assert_eq!(sh_page_first_off(&page).unwrap(), 4096);
-        assert_eq!(
-            sh_page_entries(&page).unwrap(),
-            ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>()
-        );
+        assert_eq!(sh_page_entries(&page).unwrap(), ents);
         let mut tailed = [0u8; SH_PAGE_SIZE];
-        sh_page_pack_extent_last(&mut tailed, &ents, 4096, 2, 12288).unwrap();
+        sh_page_pack_extent_last_fks(&mut tailed, &raw(&ents), 4096, 2, 12288).unwrap();
         assert_eq!(sh_page_next(&tailed).unwrap(), 12288);
         assert_eq!(sh_page_extent(&tailed).unwrap(), Some((4096, 2)));
         assert!(!sh_page_is_last(&tailed).unwrap());
@@ -978,22 +932,21 @@ mod tests {
             chunks.len() >= 2,
             "last page must split so ver=2 header fits, got {chunks:?}"
         );
-        let ents: Vec<_> = fks.iter().map(|&fk| ShEntry::new(fk)).collect();
         let n_pages = chunks.len() as u32;
         let mut got = Vec::new();
         for (pi, &(start, end)) in chunks.iter().enumerate() {
             let mut page = [0u8; SH_PAGE_SIZE];
             if pi + 1 == chunks.len() {
-                sh_page_pack_extent_last(&mut page, &ents[start..end], 4096, n_pages, 0)
+                sh_page_pack_extent_last_fks(&mut page, &raw(&fks[start..end]), 4096, n_pages, 0)
                     .expect("last chunk must pack as ver=2");
                 assert_eq!(sh_page_extent(&page).unwrap(), Some((4096, n_pages)));
             } else {
                 let next = 4096 + ((pi as u64) + 1) * (SH_PAGE_SIZE as u64);
-                sh_page_pack(&mut page, &ents[start..end], next).unwrap();
+                sh_page_pack_fks(&mut page, &raw(&fks[start..end]), next).unwrap();
             }
             got.extend(sh_page_entries(&page).unwrap());
         }
-        assert_eq!(got, ents.iter().map(|e| e.create_tx_fk).collect::<Vec<_>>());
+        assert_eq!(got, fks);
     }
 
     #[test]
@@ -1022,7 +975,7 @@ mod tests {
         assert_eq!(sh_page_n_fks(&page).unwrap(), 0);
         assert_eq!(sh_page_next(&page).unwrap(), 0);
         assert!(sh_page_try_append(&mut page, Fk(1)).unwrap());
-        assert!(sh_page_try_append_entry(&mut page, ShEntry::new(Fk(2))).unwrap());
+        assert!(sh_page_try_append(&mut page, Fk(2)).unwrap());
         assert_eq!(sh_page_entries(&page).unwrap(), vec![Fk(1), Fk(2)]);
         sh_page_set_next(&mut page, 8192).unwrap();
         assert_eq!(sh_page_next(&page).unwrap(), 8192);
@@ -1037,9 +990,6 @@ mod tests {
         assert!(i > SH_PAGE_FK_CAP as u64);
         assert!(!sh_page_try_append(&mut full, Fk(i)).unwrap());
         assert_eq!(sh_page_entries(&full).unwrap().len() as u64, i - 1);
-        // ShEntry bytes match layout encode.
-        let e = ShEntry::new(Fk(0xabc));
-        assert_eq!(e.encode(), e.create_tx_fk.0.to_le_bytes());
     }
 
     #[test]
@@ -1055,8 +1005,7 @@ mod tests {
         assert_eq!(sh_page_count_for_entries(0), 0);
         assert_eq!(sh_page_count_for_entries(1), 1);
         let n = SH_PAGE_STREAM_MAX + 200;
-        let ents: Vec<_> = (1..=n as u64).map(|i| ShEntry::new(Fk(i))).collect();
-        let fks: Vec<Fk> = ents.iter().map(|e| e.create_tx_fk).collect();
+        let fks: Vec<Fk> = (1..=n as u64).map(Fk).collect();
         let chunks = sh_page_chunk_ranges(&fks).unwrap();
         assert!(chunks.len() >= 2, "stream overflow must split pages");
         let base = 4096u64;
@@ -1069,7 +1018,7 @@ mod tests {
                 0
             };
             let mut page = [0u8; SH_PAGE_SIZE];
-            sh_page_pack(&mut page, &ents[start..end], next).unwrap();
+            sh_page_pack_fks(&mut page, &raw(&fks[start..end]), next).unwrap();
             assert_eq!(sh_page_next(&page).unwrap(), next);
             assert_eq!(sh_page_n_fks(&page).unwrap() as usize, end - start);
             pages.push(page);
@@ -1082,11 +1031,9 @@ mod tests {
         }
         assert_eq!(got, fks);
         // One page cannot hold STREAM_MAX+1 one-byte deltas (first fk + N gaps).
-        let too_many: Vec<_> = (1..=SH_PAGE_STREAM_MAX as u64 + 2)
-            .map(|i| ShEntry::new(Fk(i)))
-            .collect();
+        let too_many: Vec<u64> = (1..=SH_PAGE_STREAM_MAX as u64 + 2).collect();
         let mut page = [0u8; SH_PAGE_SIZE];
-        assert!(sh_page_pack(&mut page, &too_many, 0).is_err());
+        assert!(sh_page_pack_fks(&mut page, &too_many, 0).is_err());
     }
 
     #[test]
@@ -1101,12 +1048,8 @@ mod tests {
         assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(20)));
 
         // Pack rejects unsorted input.
-        let unsorted = vec![
-            ShEntry::new(Fk(3)),
-            ShEntry::new(Fk(1)),
-            ShEntry::new(Fk(2)),
-        ];
-        assert!(sh_page_pack(&mut page, &unsorted, 0).is_err());
+        let unsorted = [3u64, 1, 2];
+        assert!(sh_page_pack_fks(&mut page, &unsorted, 0).is_err());
 
         // Decode refuses durable unsorted bytes (plant equal consecutive).
         sh_page_init_empty(&mut page);

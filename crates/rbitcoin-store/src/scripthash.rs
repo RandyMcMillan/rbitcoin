@@ -17,18 +17,17 @@ use crate::scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead,
 };
 use crate::scripthash_layout::{
-    head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShEntry, ShHeadValue,
+    head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShHeadValue,
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
     SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
 use crate::scripthash_mphf::{self, mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
 use crate::scripthash_pages::{
-    sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice,
-    sh_page_decode_slice_into, sh_page_extent, sh_page_first_off, sh_page_init_empty,
-    sh_page_is_last, sh_page_last_fk, sh_page_next, sh_page_pack, sh_page_pack_extent_last,
-    sh_page_pack_extent_last_fks, sh_page_pack_fks, sh_page_set_extent, sh_page_set_last,
-    sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
+    sh_page_as_array, sh_page_as_array_mut, sh_page_chunk_ranges, sh_page_decode_slice_into,
+    sh_page_extent, sh_page_first_off, sh_page_init_empty, sh_page_is_last, sh_page_last_fk,
+    sh_page_next, sh_page_pack_extent_last_fks, sh_page_pack_fks, sh_page_set_extent,
+    sh_page_set_last, sh_page_set_next, sh_page_try_append, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
 };
 use crate::scripthash_slabs::{
     decode_slab_payload_into, encode_slab_payload_into, slab_class_for_n_fks_with_slack,
@@ -158,8 +157,6 @@ pub fn script_hash(script: &[u8]) -> [u8; 32] {
     sha256::Hash::hash(script).to_byte_array()
 }
 
-pub use crate::scripthash_layout::ShEntry as ScriptHashEntry;
-
 /// Store / index create pointer for a scripthash.
 ///
 /// On-disk SH tables store **only** `create_tx_fk` per key (schema v6). Electrum
@@ -172,19 +169,11 @@ pub struct ScriptHashRecord {
 }
 
 impl ScriptHashRecord {
-    pub fn entry(&self) -> ShEntry {
-        ShEntry::new(self.create_tx_fk)
-    }
-
-    pub fn from_entry(scripthash: [u8; 32], e: ShEntry) -> Self {
+    pub fn from_fk(scripthash: [u8; 32], create_tx_fk: Fk) -> Self {
         Self {
             scripthash,
-            create_tx_fk: e.create_tx_fk,
+            create_tx_fk,
         }
-    }
-
-    pub fn from_fk(scripthash: [u8; 32], create_tx_fk: Fk) -> Self {
-        Self::from_entry(scripthash, ShEntry::new(create_tx_fk))
     }
 
     pub fn is_tombstone(&self) -> bool {
@@ -1450,7 +1439,7 @@ impl ScriptHashTable {
             ShHeadValue::Empty => Ok(None),
             ShHeadValue::Inline { .. } => {
                 let ents = val.inline_entries();
-                Ok(ents.iter().map(|e| e.create_tx_fk).max_by_key(|f| f.0))
+                Ok(ents.iter().copied().max_by_key(|f| f.0))
             }
             ShHeadValue::Slab { class, off, .. } => {
                 let ents = self.read_slab(body, *class, *off)?;
@@ -1611,10 +1600,10 @@ impl ScriptHashTable {
             let kh_early = home.get(&key).copied().unwrap_or(KeyHome::Absent);
             let max = self.last_create_fk_on(self.body_for(&key, kh_early), &cur)?;
             let max_u = max.map(|f| f.0).unwrap_or(0);
-            let add: Vec<ShEntry> = fk_vals
+            let add: Vec<Fk> = fk_vals
                 .into_iter()
                 .filter(|&fk| max.is_none() || fk > max_u)
-                .map(|fk| ShEntry::new(Fk(fk)))
+                .map(Fk)
                 .collect();
             if add.is_empty() {
                 continue;
@@ -1913,7 +1902,7 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         old: &ShHeadValue,
-        live: &[ShEntry],
+        live: &[Fk],
     ) -> Result<ShHeadValue, StoreError> {
         let n = live.len() as u32;
         let old_list = self.collect_entries_from(body, old)?;
@@ -1929,7 +1918,7 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::Empty);
         }
         for w in live.windows(2) {
-            if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
+            if w[1].0 <= w[0].0 {
                 return Err(StoreError::Corrupt(
                     "invariant: scripthash rewrite create_fks not strictly increasing",
                 ));
@@ -1946,14 +1935,13 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         old: &ShHeadValue,
-        new_ents: &[ShEntry],
+        new_ents: &[Fk],
     ) -> Result<ShHeadValue, StoreError> {
         if new_ents.is_empty() {
             return Ok(old.clone());
         }
-        // Defensive: batch must be strictly increasing.
         for w in new_ents.windows(2) {
-            if w[1].create_tx_fk.0 <= w[0].create_tx_fk.0 {
+            if w[1].0 <= w[0].0 {
                 return Err(StoreError::Corrupt(
                     "invariant: scripthash append batch create_fks not strictly increasing",
                 ));
@@ -1969,13 +1957,9 @@ impl ScriptHashTable {
                 self.pack_entries(body, alloc, &live, true)
             }
             ShHeadValue::Slab { class, off, .. } => {
-                let mut live = self
-                    .read_slab(body, *class, *off)?
-                    .into_iter()
-                    .map(ShEntry::new)
-                    .collect::<Vec<_>>();
+                let mut live = self.read_slab(body, *class, *off)?;
                 if let (Some(last), Some(first_new)) = (live.last(), new_ents.first()) {
-                    if first_new.create_tx_fk.0 <= last.create_tx_fk.0 {
+                    if first_new.0 <= last.0 {
                         return Err(StoreError::Corrupt(
                             "invariant: scripthash slab append create_fk not strictly increasing",
                         ));
@@ -2018,7 +2002,7 @@ impl ScriptHashTable {
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
-        live: &[ShEntry],
+        live: &[Fk],
         slack: bool,
     ) -> Result<ShHeadValue, StoreError> {
         self.pack_entries_reuse(body, alloc, live, slack, None)
@@ -2028,7 +2012,7 @@ impl ScriptHashTable {
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
-        live: &[ShEntry],
+        live: &[Fk],
         slack: bool,
         reuse: Option<(u8, u64)>,
     ) -> Result<ShHeadValue, StoreError> {
@@ -2044,8 +2028,8 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::extent(last));
         }
         let mut raw = [0u64; SH_MEGAKEY_MIN_FKS as usize - 1];
-        for (i, e) in live.iter().enumerate() {
-            raw[i] = e.create_tx_fk.0;
+        for (i, fk) in live.iter().enumerate() {
+            raw[i] = fk.0;
         }
         let mut payload = [0u8; 2048];
         let packed_len = encode_slab_payload_into(&mut payload, &raw[..n as usize])?;
@@ -2105,23 +2089,23 @@ impl ScriptHashTable {
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
-        live: &[ShEntry],
+        live: &[Fk],
     ) -> Result<u64, StoreError> {
         if live.is_empty() {
             return Err(StoreError::Corrupt("scripthash empty page chain"));
         }
-        let fks: Vec<Fk> = live.iter().map(|e| e.create_tx_fk).collect();
-        let chunks = sh_page_chunk_ranges(&fks)?;
+        let chunks = sh_page_chunk_ranges(live)?;
         let n_pages = chunks.len();
         let base = self.alloc_extent(body, alloc, n_pages)?;
         let mut page = [0u8; SH_PAGE_SIZE];
         for (pi, &(start, end)) in chunks.iter().enumerate() {
             let off = base.saturating_add((pi as u64).saturating_mul(SH_PAGE_SIZE as u64));
+            let raw: Vec<u64> = live[start..end].iter().map(|fk| fk.0).collect();
             if pi + 1 == n_pages {
-                sh_page_pack_extent_last(&mut page, &live[start..end], base, n_pages as u32, 0)?;
+                sh_page_pack_extent_last_fks(&mut page, &raw, base, n_pages as u32, 0)?;
             } else {
                 let next = off.saturating_add(SH_PAGE_SIZE as u64);
-                sh_page_pack(&mut page, &live[start..end], next)?;
+                sh_page_pack_fks(&mut page, &raw, next)?;
             }
             body.write_at(off, &page)?;
         }
@@ -2135,7 +2119,7 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         first_page: u64,
         last_page: u64,
-        tail: &[ShEntry],
+        tail: &[Fk],
     ) -> Result<u64, StoreError> {
         if tail.is_empty() {
             return Ok(last_page);
@@ -2156,20 +2140,20 @@ impl ScriptHashTable {
                 f
             }
         };
-        for e in tail {
-            if !sh_page_try_append(&mut page, e.create_tx_fk)? {
+        for fk in tail {
+            if !sh_page_try_append(&mut page, *fk)? {
                 let new_off = self.alloc_page(body, alloc)?;
                 sh_page_set_next(&mut page, new_off)?;
                 body.write_at(last, &page)?;
                 if let Some((base, n)) = extent {
                     let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
                     let new_n = if glued { n.saturating_add(1) } else { n };
-                    sh_page_pack_extent_last(&mut page, &[*e], base, new_n, 0)?;
+                    sh_page_pack_extent_last_fks(&mut page, &[fk.0], base, new_n, 0)?;
                     extent = Some((base, new_n));
                 } else {
                     sh_page_init_empty(&mut page);
                     sh_page_set_last(&mut page, chain_first)?;
-                    assert!(sh_page_try_append(&mut page, e.create_tx_fk)?);
+                    assert!(sh_page_try_append(&mut page, *fk)?);
                 }
                 last = new_off;
             }
@@ -2249,7 +2233,7 @@ impl ScriptHashTable {
                 while off != 0 {
                     let mut page = [0u8; SH_PAGE_SIZE];
                     body.read_at(off, &mut page)?;
-                    let (next, _) = sh_page_decode_slice(&page)?;
+                    let next = sh_page_next(&page)?;
                     self.free_slab(body, alloc, SH_PAGE_SLAB_CLASS, off)?;
                     off = next;
                 }
@@ -2259,7 +2243,7 @@ impl ScriptHashTable {
                 while off != 0 {
                     let mut page = [0u8; SH_PAGE_SIZE];
                     body.read_at(off, &mut page)?;
-                    let (next, _) = sh_page_decode_slice(&page)?;
+                    let next = sh_page_next(&page)?;
                     self.free_slab(body, alloc, SH_PAGE_SLAB_CLASS, off)?;
                     off = next;
                 }
@@ -2301,7 +2285,6 @@ impl ScriptHashTable {
         };
         live.remove(pos);
         live.sort_by_key(|fk| fk.0);
-        let live: Vec<ShEntry> = live.into_iter().map(ShEntry::new).collect();
         let alloc_mu = self.alloc_for(scripthash, home);
         let mut alloc = alloc_mu.lock().unwrap();
         let new_val = self.rewrite_entries_for_key(body, &mut alloc, &val, &live)?;
@@ -3011,7 +2994,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let n = open.n_total;
         let val = if open.first_page.is_none() {
             if n <= SH_INLINE_CAP as u32 {
-                ShHeadValue::inline_one(ShEntry::new(Fk(open.buf[0])))
+                ShHeadValue::inline_one(Fk(open.buf[0]))
             } else {
                 self.bulk_write_slab(&open.buf)?
             }
@@ -3053,14 +3036,14 @@ impl<'a> ScriptHashBulkSession<'a> {
     /// Keys must be presented in **non-decreasing scripthash order** (sorted-run
     /// merge). Crossing a prefix-shard boundary installs the previous live image.
     /// FKs are sorted+deduped here so merge-stream order glitches never break pages.
-    pub fn put_chain(&mut self, key: [u8; 32], entries: &[ShEntry]) -> Result<(), StoreError> {
+    pub fn put_chain(&mut self, key: [u8; 32], entries: &[Fk]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
         let mut fks: Vec<u64> = entries
             .iter()
-            .filter(|e| !e.create_tx_fk.is_null())
-            .map(|e| e.create_tx_fk.0)
+            .filter(|fk| !fk.is_null())
+            .map(|fk| fk.0)
             .collect();
         fks.sort_unstable();
         fks.dedup();
@@ -3213,7 +3196,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 continue;
             }
             let key = recs[i].scripthash;
-            let mut live: Vec<ShEntry> = Vec::new();
+            let mut live: Vec<Fk> = Vec::new();
             let mut seen: Vec<Fk> = Vec::new();
             while i < recs.len() {
                 let r = &recs[i];
@@ -3222,7 +3205,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 }
                 if !r.create_tx_fk.is_null() && !seen.contains(&r.create_tx_fk) {
                     seen.push(r.create_tx_fk);
-                    live.push(ShEntry::new(r.create_tx_fk));
+                    live.push(r.create_tx_fk);
                 }
                 i += 1;
             }

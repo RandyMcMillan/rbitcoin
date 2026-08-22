@@ -486,7 +486,6 @@ fn read_idx(path: &Path) -> Result<Vec<(ShHeadKey, u64)>, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripthash_layout::ShEntry;
     use rbitcoin_primitives::Fk;
 
     fn tmp() -> PathBuf {
@@ -511,7 +510,7 @@ mod tests {
     fn recs(n: u32) -> Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> {
         (0..n)
             .map(|i| {
-                let v = ShHeadValue::inline_one(ShEntry::new(Fk(u64::from(i) + 1)));
+                let v = ShHeadValue::inline_one(Fk(u64::from(i) + 1));
                 (key_of(i), pack8_bytes(&v).unwrap())
             })
             .collect()

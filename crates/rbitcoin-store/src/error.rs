@@ -25,6 +25,8 @@ pub enum StoreError {
     Cancelled(&'static str),
     /// Operator layout / open-option error (not on-disk corruption).
     Layout(String),
+    /// Published chain prefix moved (reorg) during a confirmed-tx read. Retry.
+    Stale(&'static str),
 }
 
 impl StoreError {
@@ -56,6 +58,7 @@ impl fmt::Display for StoreError {
             StoreError::BudgetFull(m) => write!(f, "budget full: {m}"),
             StoreError::Cancelled(m) => write!(f, "cancelled: {m}"),
             StoreError::Layout(m) => write!(f, "{m}"),
+            StoreError::Stale(m) => write!(f, "{m}"),
         }
     }
 }
@@ -96,6 +99,7 @@ mod tests {
             StoreError::BudgetFull("block_queue"),
             StoreError::Cancelled("stop"),
             StoreError::Layout("inwit is on a cold datadir".into()),
+            StoreError::Stale("chain view moved"),
         ];
         let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
         assert_eq!(texts[0], "invalid store magic");
@@ -109,6 +113,7 @@ mod tests {
         assert!(texts[7].contains("budget full: block_queue"));
         assert!(texts[8].contains("cancelled: stop"));
         assert_eq!(texts[9], "inwit is on a cold datadir");
+        assert_eq!(texts[10], "chain view moved");
         for e in &arms {
             assert!(e.source().is_none());
         }

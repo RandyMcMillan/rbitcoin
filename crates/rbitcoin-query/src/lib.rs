@@ -2782,6 +2782,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn chain_view_run_retries_after_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-retry");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+
+        let mut calls = 0u32;
+        let (view, n) = q
+            .run_at_chain_view(|view| {
+                calls += 1;
+                if calls == 1 {
+                    q.disconnect_tip().unwrap();
+                    let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+                    h1b.nonce = h1.nonce.wrapping_add(7);
+                    h1b.hash = rbitcoin_store::block_header_hash(
+                        h1b.version,
+                        &hash0,
+                        &h1b.merkle_root,
+                        h1b.timestamp,
+                        h1b.bits,
+                        h1b.nonce,
+                    );
+                    let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+                    q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+                    assert!(!view.still_live(&q).unwrap());
+                }
+                Ok(calls)
+            })
+            .unwrap();
+        assert!(calls >= 2, "must retry after the pin died, calls={calls}");
+        assert_eq!(n, calls);
+        assert!(view.still_live(&q).unwrap());
+        assert_eq!(view.hash, q.pin_chain_view().unwrap().unwrap().hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_run_errors_when_always_stale() {
+        let (dir, q) = temp_query("chain-view-stale");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let mut nonce = h1.nonce;
+        let err = q
+            .run_at_chain_view(|_view| {
+                q.disconnect_tip().unwrap();
+                nonce = nonce.wrapping_add(1);
+                let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+                h1b.nonce = nonce;
+                h1b.hash = rbitcoin_store::block_header_hash(
+                    h1b.version,
+                    &hash0,
+                    &h1b.merkle_root,
+                    h1b.timestamp,
+                    h1b.bits,
+                    h1b.nonce,
+                );
+                let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+                q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("chain view moved"),
+            "stale bound must name the move, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("corrupt"),
+            "a moved view is not corruption: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_run_not_found_on_empty() {
+        let (dir, q) = temp_query("chain-view-retry-empty");
+        let err = q.run_at_chain_view(|_v| Ok(())).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Finish-path stamp-only notes must not wipe leftover_n for the fail pack.
     #[test]
     fn leftover_last_plan_batch_survives_stamp_only_note() {

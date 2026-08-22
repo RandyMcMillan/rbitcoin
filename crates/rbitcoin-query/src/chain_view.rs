@@ -40,6 +40,27 @@ impl Query {
         }))
     }
 
+    /// Pin, run `f`, return the body if that pin is still published; else retry.
+    ///
+    /// Bound is 8. Empty chain is [`StoreError::NotFound`]. A pin that never
+    /// stays live is [`StoreError::Stale`], not corruption.
+    pub fn run_at_chain_view<T, F>(&self, mut f: F) -> Result<(ChainView, T), QueryError>
+    where
+        F: FnMut(&ChainView) -> Result<T, QueryError>,
+    {
+        const BOUND: u32 = 8;
+        for _ in 0..BOUND {
+            let Some(view) = self.pin_chain_view()? else {
+                return Err(StoreError::NotFound);
+            };
+            let out = f(&view)?;
+            if view.still_live(self)? {
+                return Ok((view, out));
+            }
+        }
+        Err(StoreError::Stale("chain view moved"))
+    }
+
     pub fn header_at_height(
         &self,
         height: Height,

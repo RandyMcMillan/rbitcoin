@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **Tag GitHub Release:** `.github/workflows/release.yml` on `v*.*.*` builds
+  musl + Windows + Darwin snapshots and attaches them (Linux SBOM included).
+  `workflow_dispatch` builds artifacts only. Operator may need to push the
+  workflow file.
+
 ### Changed
 
 - **SH materialize resume:** [`OPERATOR.md`](OPERATOR.md) `--shindex` section

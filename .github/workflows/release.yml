@@ -1,0 +1,274 @@
+# GitHub Release for annotated tags `v*.*.*` (0.5+).
+#
+# Not a required PR check. Builds the same three operator snapshots as
+# musl.yml / windows.yml / macos.yml, then attaches them to the tag.
+# Linux musl is the operator binary. Darwin is ad-hoc signed (not notarized).
+# Windows is CRT-static PE (no IoRing).
+#
+# Triggers:
+#   - push of tag v*.*.* (publishes the Release)
+#   - workflow_dispatch (build artifacts only; no tag → no Release)
+#
+# Operator push of this workflow file may be required (GitHub App cannot
+# always create `.github/workflows/*`).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref or SHA to build (empty = this branch tip)
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  BUILD_REF: ${{ inputs.ref || github.sha }}
+
+jobs:
+  musl:
+    name: musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      short: ${{ steps.meta.outputs.short }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_REF }}
+          persist-credentials: false
+
+      - name: Record built SHA
+        id: meta
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            max-jobs = auto
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: musl-${{ runner.os }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: musl-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: musl-${{ runner.os }}-
+          purge-last-accessed: P7D
+          purge-primary-key: never
+
+      - name: Build musl (flake)
+        run: ./scripts/repro-build.sh musl ./result
+
+      - name: Stage artifacts
+        run: ./scripts/stage-musl-artifacts.sh ./result ./dist
+
+      - name: SBOM
+        run: ./scripts/sbom.sh ./dist/rbitcoin.cdx.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rbitcoin-musl-x86_64-linux-${{ steps.meta.outputs.short }}
+          path: |
+            dist/rbitcoin-node
+            dist/rbitcoin-cli
+            dist/SHA256SUMS
+            dist/rbitcoin.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
+  windows:
+    name: windows
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      short: ${{ steps.meta.outputs.short }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/release-win
+      RUSTFLAGS: "-C target-feature=+crt-static -C debuginfo=0 -C strip=symbols"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_REF }}
+          persist-credentials: false
+
+      - name: Record built SHA
+        id: meta
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows-crt-static
+          workspaces: ". -> target/release-win"
+
+      - name: Build CRT-static node + cli
+        run: cargo build --release --target x86_64-pc-windows-msvc -p rbitcoin-node -p rbitcoin-cli
+
+      - name: Stage artifacts
+        run: ./scripts/stage-native-artifacts.sh windows target/release-win/x86_64-pc-windows-msvc/release ./dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rbitcoin-x86_64-windows-${{ steps.meta.outputs.short }}
+          path: |
+            dist/rbitcoin-node.exe
+            dist/rbitcoin-cli.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
+
+  macos:
+    name: macos
+    runs-on: macos-14
+    timeout-minutes: 120
+    outputs:
+      short: ${{ steps.meta.outputs.short }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target/release-darwin
+      RUSTFLAGS: "-C debuginfo=0 -C strip=symbols"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_REF }}
+          persist-credentials: false
+
+      - name: Record built SHA
+        id: meta
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos-aarch64
+          workspaces: ". -> target/release-darwin"
+
+      - name: Build node + cli
+        run: cargo build --release -p rbitcoin-node -p rbitcoin-cli
+
+      - name: Stage artifacts
+        run: ./scripts/stage-native-artifacts.sh darwin target/release-darwin/release ./dist
+
+      - name: Verify ad-hoc codesign
+        run: |
+          set -euo pipefail
+          codesign -v dist/rbitcoin-node
+          codesign -v dist/rbitcoin-cli
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rbitcoin-aarch64-darwin-${{ steps.meta.outputs.short }}
+          path: |
+            dist/rbitcoin-node
+            dist/rbitcoin-cli
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: github-release
+    needs: [musl, windows, macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short='${{ needs.musl.outputs.short }}'
+          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" \
+            -n "rbitcoin-musl-x86_64-linux-${short}" -D musl
+          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" \
+            -n "rbitcoin-x86_64-windows-${short}" -D windows
+          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" \
+            -n "rbitcoin-aarch64-darwin-${short}" -D darwin
+          mkdir -p dist
+          cp musl/rbitcoin-node musl/rbitcoin-cli musl/SHA256SUMS musl/rbitcoin.cdx.json dist/
+          mv dist/SHA256SUMS dist/SHA256SUMS.linux-musl
+          mv dist/rbitcoin-node dist/rbitcoin-node-x86_64-linux
+          mv dist/rbitcoin-cli dist/rbitcoin-cli-x86_64-linux
+          cp windows/rbitcoin-node.exe windows/rbitcoin-cli.exe windows/SHA256SUMS dist/
+          mv dist/SHA256SUMS dist/SHA256SUMS.windows
+          mv dist/rbitcoin-node.exe dist/rbitcoin-node-x86_64-windows.exe
+          mv dist/rbitcoin-cli.exe dist/rbitcoin-cli-x86_64-windows.exe
+          cp darwin/rbitcoin-node darwin/rbitcoin-cli darwin/SHA256SUMS dist/
+          mv dist/SHA256SUMS dist/SHA256SUMS.darwin
+          mv dist/rbitcoin-node dist/rbitcoin-node-aarch64-darwin
+          mv dist/rbitcoin-cli dist/rbitcoin-cli-aarch64-darwin
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes="rbitcoin ${tag}
+
+          Linux **musl x86_64** is the operator binary (statically linked).
+          Windows is CRT-static PE (no IoRing). Darwin aarch64 is ad-hoc
+          codesigned, **not notarized** (\`xattr -d com.apple.quarantine\`).
+
+          Schema is still 0.x (refuse/wipe on incompatible open). Default
+          mainnet \`--milestone 840000\` skips historical scripts.
+          "
+          gh release create "$tag" \
+            --repo "${{ github.repository }}" \
+            --title "rbitcoin ${tag}" \
+            --notes "$notes" \
+            dist/rbitcoin-node-x86_64-linux \
+            dist/rbitcoin-cli-x86_64-linux \
+            dist/SHA256SUMS.linux-musl \
+            dist/rbitcoin.cdx.json \
+            dist/rbitcoin-node-x86_64-windows.exe \
+            dist/rbitcoin-cli-x86_64-windows.exe \
+            dist/SHA256SUMS.windows \
+            dist/rbitcoin-node-aarch64-darwin \
+            dist/rbitcoin-cli-aarch64-darwin \
+            dist/SHA256SUMS.darwin

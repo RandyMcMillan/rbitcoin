@@ -11,6 +11,14 @@ before 1.0).
 
 ### Changed
 
+- **SH pack write-behind:** sequential slabs append to a 16 MiB session
+  `body_buf` (one `pwrite` per flush; HWM persist at shard seal). Slab and
+  page encode write into a caller buffer; 1-FK keys stay head-only with no
+  heap collect; megakey pages encode the delta stream once. `recs` hold
+  `u64` pack8 through `MphfHead::write_pack8`. Stage timers
+  (`merge`/`pack`/`mphf`/`body_flush`) are disjoint; pack-only
+  `head_fill_ns` is 0. On-disk pack8 / slab / page bytes are unchanged.
+
 - **SH recollect / tip materialize:** catalog spill writes outside `runs_io`,
   a bounded writer queue overlaps Class A scan with catalog fsync, pack
   reuses one FK scratch, and BDZ peel uses CSR adjacency (same `BdzMphf::build`

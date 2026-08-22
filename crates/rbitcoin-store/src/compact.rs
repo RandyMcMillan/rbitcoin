@@ -78,19 +78,31 @@ pub fn uleb128_len(mut n: u64) -> usize {
     len
 }
 
-/// Unsigned LEB128 (7-bit groups, MSB continuation).
-pub fn write_uleb128(out: &mut Vec<u8>, mut n: u64) {
+/// Unsigned LEB128 into `dst`. Returns bytes written.
+pub fn write_uleb128_into(dst: &mut [u8], mut n: u64) -> Result<usize, StoreError> {
+    let mut i = 0usize;
     loop {
+        if i >= dst.len() {
+            return Err(StoreError::Corrupt("uleb128 dest short"));
+        }
         let mut b = (n & 0x7f) as u8;
         n >>= 7;
         if n != 0 {
             b |= 0x80;
         }
-        out.push(b);
+        dst[i] = b;
+        i += 1;
         if n == 0 {
-            break;
+            return Ok(i);
         }
     }
+}
+
+/// Unsigned LEB128 (7-bit groups, MSB continuation).
+pub fn write_uleb128(out: &mut Vec<u8>, n: u64) {
+    let mut tmp = [0u8; 10];
+    let used = write_uleb128_into(&mut tmp, n).expect("10-byte stack holds any u64 uleb128");
+    out.extend_from_slice(&tmp[..used]);
 }
 
 pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
@@ -409,6 +421,23 @@ mod tests {
             assert_eq!(v, n);
             assert_eq!(used, buf.len());
         }
+    }
+
+    #[test]
+    fn write_uleb128_into_matches_vec() {
+        for n in [0u64, 127, 128, 255, 300, u32::MAX as u64, u64::MAX] {
+            let mut vec = Vec::new();
+            write_uleb128(&mut vec, n);
+            let mut dst = [0u8; 16];
+            let used = write_uleb128_into(&mut dst, n).unwrap();
+            assert_eq!(used, vec.len());
+            assert_eq!(used, uleb128_len(n));
+            assert_eq!(&dst[..used], vec.as_slice());
+        }
+        assert!(matches!(
+            write_uleb128_into(&mut [0u8; 1], 128),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]

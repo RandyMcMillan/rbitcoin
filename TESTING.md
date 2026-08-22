@@ -204,8 +204,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `consensus_mature_chain_spend_and_reconstruct` | Consensus+query | **One** mature mine: spend, local prev_fk, double-spend, reopen reconstruct |
 | `ibd_parallel_archive_idempotent_confirm_without_tx_head` | Query+consensus | Out-of-order archive, re-archive idempotent, head-off prevout+maturity |
 | `resume_head_off_warms_cache_for_external_prev` | Query+consensus | Resume head-off: warm Class A cache fixes external-prev missing prevout |
-| `consensus_reject_bad_structure_and_milestone` | Consensus | Bad merkle/prev + milestone skip |
 | `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md) |
+| `core_analogs::analog_milestone_and_mempool_persist` | Consensus | Milestone skip-below/check-above, missing prevout under high milestone, mempool persist (one pad) |
 | `scripthash_index_history_balance_and_reorg` | Query | Electrum index + reorg spend clear |
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
 | `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |

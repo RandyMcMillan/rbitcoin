@@ -1160,8 +1160,8 @@ fn remap_sh_body() {
         remap_copied_page_chain(dst.body(), base.saturating_add(delta), delta).unwrap();
     }
     let recs = vec![
-        (head_key_from_full(&slab_key), pack8_bytes(&slab_r).unwrap()),
-        (head_key_from_full(&mega_key), pack8_bytes(&mega_r).unwrap()),
+        (head_key_from_full(&slab_key), pack8(&slab_r).unwrap()),
+        (head_key_from_full(&mega_key), pack8(&mega_r).unwrap()),
     ];
     dst.publish_sorted_shard(0, &recs, 8 + n_mega as u64, src_hi + delta)
         .unwrap();

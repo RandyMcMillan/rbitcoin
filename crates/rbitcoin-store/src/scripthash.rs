@@ -17,7 +17,7 @@ use crate::scripthash_head::{
     prefix_shard_of, sh_per_shard_key_budget, sh_unique_hint_default, ScriptHashHead,
 };
 use crate::scripthash_layout::{
-    head_key_from_full, pack8_bytes, payload_start, slab_bytes, ShEntry, ShHeadValue,
+    head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShEntry, ShHeadValue,
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_HEAD_VALUE_LEN, SH_INLINE_CAP,
     SH_MAX_CLASS, SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
 };
@@ -1817,8 +1817,7 @@ impl ScriptHashTable {
             self.warn_l1_frozen();
             return Ok(());
         }
-        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> =
-            Vec::new();
+        let mut recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)> = Vec::new();
         let old_paths: Vec<PathBuf> = {
             let g = self.sealed_ovf.lock().unwrap();
             if g.len() < 2 {
@@ -1826,7 +1825,7 @@ impl ScriptHashTable {
             }
             for h in g.iter() {
                 h.for_each_occupied(|k, v| {
-                    recs.push((k, pack8_bytes(&v)?));
+                    recs.push((k, pack8(&v)?));
                     Ok(())
                 })?;
             }
@@ -1854,12 +1853,8 @@ impl ScriptHashTable {
                 .saturating_add(1)
         };
         let path = sealed_ovf_path(&self.store_dir, id);
-        let packed: Vec<(crate::scripthash_layout::ShHeadKey, u64)> = recs
-            .iter()
-            .map(|(k, raw)| (*k, u64::from_le_bytes(*raw)))
-            .collect();
-        let head = MphfHead::write_pack8(&path, &packed)?;
-        let mut fuse_keys: Vec<u64> = packed.iter().map(|(k, _)| mix_key16(k)).collect();
+        let head = MphfHead::write_pack8(&path, &recs)?;
+        let mut fuse_keys: Vec<u64> = recs.iter().map(|(k, _)| mix_key16(k)).collect();
         fuse_keys.sort_unstable();
         fuse_keys.dedup();
         let fuse = SealedFuse8::build(&fuse_keys)?;
@@ -2581,7 +2576,7 @@ impl ScriptHashTable {
     pub fn publish_sorted_shard(
         &self,
         shard: usize,
-        recs: &[(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])],
+        recs: &[(crate::scripthash_layout::ShHeadKey, u64)],
         live_count: u64,
         bump: u64,
     ) -> Result<(), StoreError> {
@@ -2593,7 +2588,7 @@ impl ScriptHashTable {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let sealed = MphfHead::write(&path, &recs)?;
+        let sealed = MphfHead::write_pack8(&path, &recs)?;
         self.install_sorted_main(shard, sealed);
         let body = self.shard_body(shard);
         if bump > body.logical_len() {
@@ -2622,7 +2617,7 @@ impl ScriptHashTable {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let sealed = MphfHead::write(&path, &pack.recs)?;
+        let sealed = MphfHead::write_pack8(&path, &pack.recs)?;
         self.install_sorted_main(shard, sealed);
         let body = self.shard_body(shard);
         if bump > body.logical_len() {
@@ -2747,7 +2742,7 @@ pub struct ScriptHashBulkSession<'a> {
     resume_from_shard: u32,
     active_shard: Option<usize>,
     /// Packed recs for [`Self::bulk_session`] (sorted at shard seal; 16 B key order).
-    recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])>,
+    recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
     body_buf: Vec<u8>,
@@ -2773,7 +2768,7 @@ pub struct ScriptHashBulkSession<'a> {
 
 /// One shard packed onto its live body, ready for ordered head publish.
 pub struct ShShardPack {
-    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, [u8; SH_HEAD_VALUE_LEN])>,
+    pub recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)>,
     pub creates: u64,
     pub max_fk: u64,
     pub keys: u64,
@@ -3015,7 +3010,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
-        let rec = (head_key_from_full(&open.key), pack8_bytes(&val)?);
+        let rec = (head_key_from_full(&open.key), pack8(&val)?);
         self.recs.push(rec);
         self.peak_table_bytes = self
             .peak_table_bytes
@@ -3329,7 +3324,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let sealed = MphfHead::write(&path, &recs)?;
+                let sealed = MphfHead::write_pack8(&path, &recs)?;
                 self.table.install_sorted_main(si, sealed);
             }
             let shard_live = match self.table.layout {

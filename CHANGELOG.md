@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **Fuzz (Q-30 min):** isolated `fuzz/` workspace, `block_wire` target on
+  `check_block_wire` (consensus-encoded block → archive structure). Nightly
+  `.github/workflows/fuzz.yml` (not a required PR check). Operator may need
+  to push the workflow file.
+
 ### Changed
 
 - **SH decode-into + drop ShEntry:** page/slab decode appends into a caller

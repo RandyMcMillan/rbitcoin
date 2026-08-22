@@ -1,4 +1,9 @@
 /target/
+# cargo-fuzz (isolated workspace under fuzz/)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
 **/*.rs.bk
 .coverage/
 coverage/

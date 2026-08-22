@@ -609,7 +609,7 @@ fn read_sh_page_bytes(body: &TableFile, off: u64, buf: &mut [u8]) -> Result<(), 
 }
 
 fn extend_page_entries(
-    out: &mut Vec<Fk>,
+    out: &[Fk],
     prev_last: &mut Option<u64>,
     start: usize,
 ) -> Result<(), StoreError> {
@@ -649,7 +649,7 @@ fn collect_page_chain_span(
                 return Ok(None);
             }
         }
-        extend_page_entries(&mut out, &mut prev_last, at)?;
+        extend_page_entries(&out, &mut prev_last, at)?;
     }
     Ok(Some((out, last_next)))
 }
@@ -666,7 +666,7 @@ fn collect_page_chain_linked(body: &TableFile, first_page: u64) -> Result<Vec<Fk
     loop {
         let at = out.len();
         let next = sh_page_decode_slice_into(&cur, &mut out)?;
-        extend_page_entries(&mut out, &mut prev_last, at)?;
+        extend_page_entries(&out, &mut prev_last, at)?;
         if next == 0 {
             break;
         }
@@ -710,7 +710,7 @@ fn collect_extent_then_tail(body: &TableFile, last_page: u64) -> Result<Vec<Fk>,
     loop {
         let at = out.len();
         let next = sh_page_decode_slice_into(&cur, &mut out)?;
-        extend_page_entries(&mut out, &mut prev_last, at)?;
+        extend_page_entries(&out, &mut prev_last, at)?;
         if next == 0 {
             break;
         }

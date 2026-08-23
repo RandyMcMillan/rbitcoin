@@ -37,8 +37,11 @@ jobs:
       - name: clang (libFuzzer)
         run: sudo apt-get update && sudo apt-get install -y clang
 
-      - name: cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+      # Prebuilt cargo-fuzz — do not cargo install (compiles from crates.io
+      # inside the 20-min job timeout). Pin Action commit (CodeQL).
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-fuzz@0.13.2
 
       # rust-toolchain.toml is 1.95; cargo-fuzz needs nightly -Zsanitizer.
       - name: cargo fuzz run block_wire

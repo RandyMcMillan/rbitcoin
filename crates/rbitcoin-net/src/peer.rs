@@ -937,6 +937,13 @@ async fn handle_peer_frame(
                 rbitcoin_log::info!("redundant version message from peer");
             }
         }
+        NetworkMessage::Verack => {
+            if let Some(s) = session {
+                rbitcoin_log::info!("ignoring redundant verack message from peer={}", s.id);
+            } else {
+                rbitcoin_log::info!("ignoring redundant verack message");
+            }
+        }
         NetworkMessage::Ping(n) => {
             if let Some(s) = session {
                 queue_due_tx_invs(hub, s, from_this_peer, out_tx);

@@ -881,8 +881,6 @@ pub mod class_c_phase_stats {
     pub static SCRIPTHASH_NS: AtomicU64 = AtomicU64::new(0);
     pub static TIP_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// SH: filter which wave txs need create rows.
-    pub static SH_FILTER_NS: AtomicU64 = AtomicU64::new(0);
     /// SH: load creates from Class A for new txs (Direct runs enqueue).
     pub static SH_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     /// SH: sort creates by scripthash (tip append path).
@@ -919,10 +917,9 @@ pub mod class_c_phase_stats {
         )
     }
 
-    /// `(filter, collect, sort, seed, body, head)` nanoseconds.
-    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+    /// `(collect, sort, seed, body, head)` nanoseconds.
+    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64) {
         (
-            SH_FILTER_NS.swap(0, Ordering::Relaxed),
             SH_COLLECT_NS.swap(0, Ordering::Relaxed),
             SH_SORT_NS.swap(0, Ordering::Relaxed),
             SH_SEED_NS.swap(0, Ordering::Relaxed),
@@ -961,7 +958,6 @@ pub mod class_c_phase_stats {
     /// Snapshot for tip-follow accept logs (does **not** reset). Prefer sample_* after.
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct TipShSnap {
-        pub filter_ns: u64,
         pub collect_ns: u64,
         pub sort_ns: u64,
         pub seed_ns: u64,
@@ -975,7 +971,7 @@ pub mod class_c_phase_stats {
     }
 
     impl TipShSnap {
-        /// Sum of durable-append substeps (sort+seed+body+head); filter+collect separate.
+        /// Sum of durable-append substeps (sort+seed+body+head); collect separate.
         pub fn append_ns(&self) -> u64 {
             self.sort_ns
                 .saturating_add(self.seed_ns)
@@ -984,22 +980,19 @@ pub mod class_c_phase_stats {
         }
 
         pub fn total_sh_ns(&self) -> u64 {
-            self.filter_ns
-                .saturating_add(self.collect_ns)
-                .saturating_add(self.append_ns())
+            self.collect_ns.saturating_add(self.append_ns())
         }
     }
 
     /// Sample SH subtimers + counts in one call (resets all SH_* for this module).
     pub fn sample_tip_sh_and_reset() -> TipShSnap {
-        let (filter_ns, collect_ns, sort_ns, seed_ns, body_ns, head_ns) = sample_sh_sub_and_reset();
+        let (collect_ns, sort_ns, seed_ns, body_ns, head_ns) = sample_sh_sub_and_reset();
         let (pin, cold) = sample_sh_collect_src_and_reset();
         let (creates, unique, written) = sample_sh_counts_and_reset();
         // Also clear aggregate SCRIPTHASH_NS / STRONG / TIP if caller only wants SH —
         // tip logger samples strong/tip separately. Leave STRONG/TIP alone here.
         let _ = SCRIPTHASH_NS.swap(0, Ordering::Relaxed);
         TipShSnap {
-            filter_ns,
             collect_ns,
             sort_ns,
             seed_ns,
@@ -2710,7 +2703,7 @@ mod tests {
         // class_c counters are process-global; exercise the APIs without exact
         // equality (parallel tests may sample/reset between).
         class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
-        class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);
+        class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_COLLECT_NS, 5);
         class_c_phase_stats::TIP_NS.store(3, AtomicOrdering::Relaxed);
         let _ = class_c_phase_stats::sample_and_reset();
         let _ = class_c_phase_stats::sample_sh_sub_and_reset();
@@ -3281,18 +3274,62 @@ mod tests {
     }
 
     #[test]
-    fn recover_sh_writebehind_fails_open_on_missing_header_txs() {
+    fn recover_sh_writebehind_fails_open_on_interior_missing_header_txs() {
         let (dir, q) = temp_query("sh-wb-recover-corrupt");
         let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
         q.connect_block(Height(0), &h0, &[t0]).unwrap();
-        q.store().confirmed.set(Height(1), Fk(999_999)).unwrap();
-        let err = q.recover_sh_writebehind().expect_err("missing header_txs");
+        let prev0 = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
+        let hash1 = h1.hash;
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        let hfk1 = q.confirm_block(Height(1), &hash1).unwrap();
+        let (h2, t2) = coinbase_block(2, hfk1, Some(hash1));
+        q.commit_class_a_only(&h2, &[t2]).unwrap();
+        q.confirm_block(Height(2), &h2.hash).unwrap();
+        assert!(q.store().header_txs.clear_body(hfk1).unwrap());
+        let err = q.recover_sh_writebehind().expect_err("interior hole");
         let msg = format!("{err}");
         assert!(
             msg.contains("invariant:") || msg.contains("missing"),
             "expected invariant/missing body, got {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_sh_writebehind_skips_bodyless_structural_tip() {
+        let (dir, q) = temp_query("sh-wb-recover-tip-nobody");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev0 = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        let hfk1 = q.confirm_block(Height(1), &h1.hash).unwrap();
+        let _stolen = q.take_sh_job_for_apply().expect("height-1 job");
+        q.finish_sh_job(Height(1));
+        assert_eq!(q.tip_height(), Some(Height(1)));
+        assert!(q.store().header_txs.clear_body(hfk1).unwrap());
+        q.recover_sh_writebehind()
+            .expect("body-less structural tip must not fail open");
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        assert!(
+            q.sh_pending_max_height().is_none() || q.sh_pending_max_height().unwrap() < 1,
+            "body-less tip must not be re-queued"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_sh_writebehind_halt_sets_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        crate::connect::request_sh_writebehind_halt(&stop, 7, &"apply failed");
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "apply error must request process stop so the node exits"
+        );
     }
 
     /// Pending write-behind records join at live tip so a confirmed spend is

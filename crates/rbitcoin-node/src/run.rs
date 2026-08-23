@@ -327,6 +327,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         Some(spawn_sh_writebehind(
             Arc::clone(&node.hub.query),
             Arc::clone(&shutdown.flag),
+            {
+                let sd = Arc::clone(&shutdown);
+                move || sd.request()
+            },
         ))
     } else {
         None

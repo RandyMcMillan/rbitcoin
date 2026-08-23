@@ -108,6 +108,26 @@ out="$(bash "$REL" --root "$SYNC" --dry-run --allow-branch master --allow-diverg
 assert_ok "allow-diverged skips origin/master gate" \
   grep -q "dry-run ok" <<<"$out"
 
+MAIN="$WORKDIR/main"
+mkdir -p "$MAIN"
+seed_tree "$MAIN"
+git_c -C "$MAIN" branch -m main
+git_c clone -q --bare "$MAIN" "$WORKDIR/origin-main.git"
+git_c -C "$MAIN" remote add origin "$WORKDIR/origin-main.git"
+out="$(bash "$REL" --root "$MAIN" --dry-run --allow-branch main)"
+assert_ok "dry-run ok when HEAD matches origin/main" \
+  grep -q "dry-run ok" <<<"$out"
+
+TOPIC="$WORKDIR/topic"
+mkdir -p "$TOPIC"
+seed_tree "$TOPIC"
+git_c -C "$TOPIC" checkout -q -b release-topic
+git_c clone -q --bare "$TOPIC" "$WORKDIR/origin-topic.git"
+git_c -C "$TOPIC" remote add origin "$WORKDIR/origin-topic.git"
+out="$(bash "$REL" --root "$TOPIC" --dry-run --allow-branch release-topic)"
+assert_ok "dry-run ok when HEAD matches origin/release-topic" \
+  grep -q "dry-run ok" <<<"$out"
+
 if [[ "$FAIL" -ne 0 ]]; then
   echo "release.test.sh: $PASS passed, $FAIL failed"
   exit 1

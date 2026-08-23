@@ -132,12 +132,12 @@ elif [[ "$DRY" -eq 0 && "$PUSH" -eq 1 ]]; then
 fi
 
 if [[ "$PUSH" -eq 1 ]]; then
-  git fetch "$REMOTE" "+refs/heads/master:refs/remotes/${REMOTE}/master" \
-    || die "git fetch $REMOTE master failed"
-  remote_master="$(git rev-parse "refs/remotes/${REMOTE}/master")"
+  git fetch "$REMOTE" "+refs/heads/${branch}:refs/remotes/${REMOTE}/${branch}" \
+    || die "git fetch $REMOTE $branch failed"
+  remote_head="$(git rev-parse "refs/remotes/${REMOTE}/${branch}")"
   head="$(git rev-parse HEAD)"
-  if [[ "$head" != "$remote_master" && "$ALLOW_DIVERGED" -ne 1 ]]; then
-    die "HEAD is not ${REMOTE}/master ($head vs $remote_master); pass --allow-diverged"
+  if [[ "$head" != "$remote_head" && "$ALLOW_DIVERGED" -ne 1 ]]; then
+    die "HEAD is not ${REMOTE}/${branch} ($head vs $remote_head); pass --allow-diverged"
   fi
 fi
 

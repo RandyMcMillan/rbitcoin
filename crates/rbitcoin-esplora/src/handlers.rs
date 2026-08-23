@@ -16,8 +16,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network};
 use rbitcoin_primitives::{median_time_past_times, Fk, Height};
-use rbitcoin_query::{ChainViewKind, HistoryFilter, Query};
-use rbitcoin_store::script_hash;
+use rbitcoin_query::{ChainViewKind, HistoryFilter, Query, ScriptHashChainStats};
+use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::str::FromStr;
 
@@ -603,20 +603,32 @@ fn utxo_response(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Respon
             Err(e) => store_err(e),
         }
     } else {
-        st.with_sh_join(|slot| {
-            match rbitcoin_electrum::scripthash_utxos_with_mempool_slot(
-                &st.query,
-                st.mempool.as_deref(),
-                sh,
-                slot,
-            ) {
-                Ok(list) => match utxo_list_json(&st.query, &list) {
-                    Ok(v) => Json(v).into_response(),
-                    Err(e) => store_err(e),
-                },
-                Err(e) => store_err(e),
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |view| {
+            st.with_sh_join(|slot| {
+                rbitcoin_electrum::scripthash_utxos_with_mempool_slot_in(
+                    &st.query,
+                    st.mempool.as_deref(),
+                    sh,
+                    slot,
+                    view,
+                )
+            })
+        }) {
+            Ok((view, list)) => {
+                return maybe_attach_view(
+                    match utxo_list_json(&st.query, &list) {
+                        Ok(v) => Json(v).into_response(),
+                        Err(e) => store_err(e),
+                    },
+                    Some(view),
+                );
             }
-        })
+            Err(StoreError::NotFound) => match utxo_list_json(&st.query, &[]) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
+            Err(e) => store_err(e),
+        }
     };
     maybe_attach_view(resp, view)
 }
@@ -634,16 +646,23 @@ fn sh_stats_json(
     scripthash_hex: Option<&str>,
     asof: Option<[u8; 32]>,
 ) -> Result<(Value, Option<rbitcoin_query::ChainView>), rbitcoin_query::QueryError> {
-    let view = st
-        .query
-        .pin_view(ChainViewKind::ScriptHash, asof.as_ref())?;
-    if asof.is_some() && view.is_none() {
-        return Err(rbitcoin_store::StoreError::NotFound);
-    }
-    let chain = if let Some(v) = view.as_ref().filter(|_| asof.is_some()) {
-        st.query.scripthash_chain_stats_in(sh, v)?
+    let (chain, view) = if asof.is_some() {
+        let view = st
+            .query
+            .pin_view(ChainViewKind::ScriptHash, asof.as_ref())?;
+        if view.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        let v = view.as_ref().unwrap();
+        (st.query.scripthash_chain_stats_in(sh, v)?, view)
     } else {
-        st.with_sh_join(|slot| st.query.scripthash_chain_stats_slot(sh, slot))?
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |v| {
+            st.query.scripthash_chain_stats_in(sh, v)
+        }) {
+            Ok((view, chain)) => (chain, Some(view)),
+            Err(StoreError::NotFound) => (ScriptHashChainStats::default(), None),
+            Err(e) => return Err(e),
+        }
     };
     let chain_stats = json!({
         "tx_count": chain.tx_count,
@@ -791,15 +810,24 @@ fn chain_page_sh(
             Err(e) => store_err(e),
         }
     } else {
-        st.with_sh_join(
-            |slot| match st.query.scripthash_history_filtered_slot(sh, &filter, slot) {
-                Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
-                    Ok(v) => Json(v).into_response(),
-                    Err(e) => store_err(e),
-                },
-                Err(e) => store_err(e),
-            },
-        )
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |view| {
+            st.with_sh_join(|slot| {
+                st.query
+                    .scripthash_history_filtered_slot_in(sh, &filter, slot, view)
+            })
+        }) {
+            Ok((view, items)) => {
+                return maybe_attach_view(
+                    match history_items_to_tx_json(&st.query, &items, st.network) {
+                        Ok(v) => Json(v).into_response(),
+                        Err(e) => store_err(e),
+                    },
+                    Some(view),
+                );
+            }
+            Err(StoreError::NotFound) => Json(Vec::<Value>::new()).into_response(),
+            Err(e) => store_err(e),
+        }
     };
     maybe_attach_view(resp, view)
 }
@@ -843,18 +871,27 @@ fn combined_txs(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Respons
             Err(e) => store_err(e),
         }
     } else {
-        st.with_sh_join(
-            |slot| match st.query.scripthash_history_filtered_slot(sh, &filter, slot) {
-                Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
-                    Ok(chain) => {
-                        out.extend(chain);
-                        Json(out).into_response()
-                    }
-                    Err(e) => store_err(e),
-                },
-                Err(e) => store_err(e),
-            },
-        )
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |view| {
+            st.with_sh_join(|slot| {
+                st.query
+                    .scripthash_history_filtered_slot_in(sh, &filter, slot, view)
+            })
+        }) {
+            Ok((view, items)) => {
+                return maybe_attach_view(
+                    match history_items_to_tx_json(&st.query, &items, st.network) {
+                        Ok(chain) => {
+                            out.extend(chain);
+                            Json(out).into_response()
+                        }
+                        Err(e) => store_err(e),
+                    },
+                    Some(view),
+                );
+            }
+            Err(StoreError::NotFound) => Json(out).into_response(),
+            Err(e) => store_err(e),
+        }
     };
     maybe_attach_view(resp, view)
 }

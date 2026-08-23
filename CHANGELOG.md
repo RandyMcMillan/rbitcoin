@@ -135,6 +135,160 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   `SHA256SUMS` (90 days). Not required checks. `musl` uses the same
   label. Linux musl stays Nix; Darwin/Windows are native runners.
 
+- **`generateblock submit=false`:** mine one block without connecting it
+  and return `{hash,hex}` for `submitheader`. `output` accepts `raw()`
+  descriptors.
+
+- **`getblockstats`:** reconstruct the block and return Core fee / UTXO /
+  weight fields (`hash_or_height`, `stats`). Genesis is excluded from
+  actual UTXO counts; `OP_RETURN` is unspendable. Even `medianfee` is the
+  integer mean of the two middle scores (Core `CalculateTruncatedMedian`).
+
+- **`docs/errata.md`:** RAM leftover maps are one fk per txid. Pre-BIP30
+  clobber is correct enough; post-BIP30 a disconnected sibling in those
+  maps is an unlikely visibility hole, not the n−1 leftover miss.
+
+- **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
+  (modified fees) from the live graph.
+- **Test RPC proxy** (Core functional suite only): utility RPCs
+  (`createrawtransaction`, `signrawtransactionwithkey`, `createmultisig`,
+  `combinerawtransaction`, decode helpers) and an Esplora-backed wallet
+  façade (`createwallet`, `importdescriptors`, `send`, `listunspent`, …)
+  live in the bitcoind shim, not on `rbitcoin-node`.
+- **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
+  `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
+  `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
+  and into min-relay admission (free tx + delta can enter).
+
+- **Core `-testactivationheight` overlay:** `name@height` (regtest) is parsed
+  on `rbitcoin-node` and applied in `ChainParams` (`csv` / `segwit` / `bip34`
+  / `dersig` / `cltv`). Script flags still follow the getters in a later
+  confirm step. Shim forwards consensus/mempool/peer flags
+  (`whitelist`, `blocksonly`, `minrelaytxfee`, `permitbaremultisig`,
+  `limitcluster*`, `peertimeout`, `maxconnections`, `persistmempool`,
+  `minimumchainwork`) instead of dropping them. `-minimumchainwork` keeps
+  the node in IBD (no relay) until tip work meets the hex floor. There is
+  no `-txindex` flag: Class A always looks up by txid. Core v31.1
+  ancestor/descendant limit flags stay ignored (they are no-ops there).
+
+- **Core functional coverage:** analog scenarios for `--milestone` skip-below /
+  check-above, reconstruct after lost RAM head, and durable mempool reopen
+  (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
+  required on `rpc-missing` as well as prune / LevelDB / UTXO-set skips.
+
+- **MiniWallet + receive-block path:** `generatetodescriptor` (`raw(HEX)`),
+  `scantxoutset` over Class A, `gettxout`, `getindexinfo` (Class A tx
+  lookup), `getchaintips` (active tip), `waitforblock*`. Generate includes
+  mempool txs then `remove_for_block`. `sendrawtransaction` maps accept
+  rejects to Core `-26` strings. `submitblock` and P2P `block` share
+  `ChainHub::accept_received_block` (hold never-confirmed side bodies,
+  `accept_branch` on more work). Once-confirmed losers stay in Class A.
+  Not a coins-DB / GBT product.
+
+- **Core functional `run` set:** 14 unmodified scripts (first-green nine plus
+  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`,
+  `feature_csv_activation.py`, `feature_bip68_sequence.py`).
+  `feature_nulldummy.py` is run (stateless raw-tx + ignored `-addresstype`).
+
+- **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
+  mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.
+
+- **rbitcoin 199-block cache:** `create_cache.py` mines 199 via `generate`
+  into `scripts/core-functional/cache/store`. `run.sh` preseeds empty Core
+  `blocks/`+`chainstate/` and `--keepcache`; the shim copies our store into
+  cache-shaped dests only.
+
+- **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
+  via `ChainHub`; reconsider reconstructs from Class A; precious prefers
+  an equal-work sibling (held or archive).
+
+- **Debug.log mapper:** `scripts/core-functional/debuglog_map.toml` plus
+  shim line pump. First extra Core script: `rpc_uptime.py` (setmocktime
+  range + uptime ignores mock).
+
+- **Regtest `setmocktime`:** `NodeClock` (AtomicI64; `0` = wall). Generate
+  timestamps and future-header checks honor the mock. Not a process
+  `time()` hook (log stamps stay wall).
+
+- **Live `getpeerinfo` / `addnode` / `disconnectnode` / `addconnection`:**
+  sessions register after BIP324 handshake. `addnode onetry` dials via the
+  same outbound path as tip-follow. `subver` is the peer's version UA
+  (our `-uacomment` is advertised on our `version`). `bytesrecv_per_msg.pong`
+  is counted so Core `connect_nodes` can wait for handshake.
+
+- **`syncwithvalidationinterfacequeue`:** no-op `null`. Core’s framework
+  calls it from `sync_mempools`; we have no wallet/index callback queue.
+
+- **First unmodified Core functional scripts:** inventory marks
+  `feature_help.py` and `feature_uacomment.py` `run`.
+  `scripts/core-functional/run.sh` invokes those two via Core’s
+  `test_runner.py` (still never from default `cargo test`).
+
+- **Regtest generate / submitblock (harness only):** `generatetoaddress`,
+  `generateblock`, `generate`, and `submitblock` mine or accept through
+  `ChainHub::accept_block` (same confirm path as P2P). Refused on mainnet /
+  signet / testnet. Not a mining product (no GBT).
+
+- **Core v31.1 submodule is the JSON source:** `third_party/bitcoin` is a
+  shallow gitlink at `9be056a`. `cargo test` hard-links or copies
+  `script_tests.json` / `tx_valid.json` / `tx_invalid.json` from
+  `src/test/data` into `$CARGO_TARGET_DIR/core-data` every run (no in-tree
+  copies). Missing pin: the fixture helper and `scripts/coverage.sh` run
+  `./scripts/core-functional/init-submodule.sh` (sparse ~16 MiB).
+  `sync-core-fixtures.sh --check` requires the three files in the submodule
+  and none under `tests/fixtures/`.
+
+- **Local extras after the v31.1 pin:** rust units for CHECKSIGVERIFY /
+  CHECKMULTISIGVERIFY then `OP_1` (VERIFY must abort), empty-stack CLTV,
+  and CLTV/CSV `0x80` (scriptnum −0) not taking the negative branch.
+
+- **Core functional nightly job:** `.github/workflows/core-functional.yml`
+  runs `scripts/core-functional/nightly.sh` on cron, `workflow_dispatch`,
+  and PRs labeled `core-functional`. Unlabeled PRs keep cargo gates only.
+  The job warns — does not fail — when a newer final Bitcoin Core release
+  exists than `inventory.toml` `pin` (semver of published finals, not
+  GitHub `/releases/latest`). Bump the submodule, fixtures, and inventory
+  when it fires.
+
+- **Core functional bitcoind shim:** `scripts/core-functional/bitcoind`
+  starts `rbitcoin-node` from TestNode argv (`-datadir` → `DIR/regtest`
+  so the cookie is `{datadir}/regtest/.cookie`). Clean chain:
+  `getblockcount` is 0; RPC `stop` shuts down. Not the operator CLI.
+
+- **Core functional runner:** `scripts/core-functional/run.sh` invokes Core
+  `test_runner.py` only for inventory `run` names (`--v2transport`,
+  `--exclude` every skip). A skip name fails `not in run set`. `--list` /
+  `--dry-run` need no node. Default `cargo test` does not call it.
+
+- **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
+  classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +
+  reason; `analog` required for prune / LevelDB / UTXO-set skips).
+  `python3 scripts/core-functional/check_inventory.py` fails on an unknown
+  or incomplete row. See [`docs/core-functional.md`](docs/core-functional.md).
+  No Core scripts run in default `cargo test` yet.
+
+- **`--datadir-cold PATH`:** Class A `inwit.body` / `inwit.idx/` (cold; ~486 GiB
+  on mainnet) live under `{PATH}/store` when set. `--datadir` still holds every
+  other file (`txout`, `spent`, heads, mempool, peers, cookie). Omit the flag
+  and both hot and cold files stay in `--datadir`. Conf: `datadir-cold=`.
+  Existing split: move `inwit.body` + `inwit.idx/` yourself; the hot store
+  records `inwit.reloc` so a later open without the flag refuses.
+
+- **CI musl artifacts:** after a green `ci` run on `master`/`main`, workflow
+  `musl` builds `nix build .#rbitcoin-musl` and uploads
+  `rbitcoin-node` / `rbitcoin-cli` + `SHA256SUMS` (90 days). Not a required
+  PR check. Manual retry: Actions → musl → Run workflow.
+
+- **IBD write meters:** `tweaks=` on `ibd: perf` / `perf_dbg` and `confirm write slow`
+  (BIP-352 index wall after spend annotate). Makes the `--sptweaks` write-thread
+  cost visible in the fat-era IBD hole.
+
+- **`--sptweaks`:** optional thin BIP-352 index (`sp_tweaks.idx` / `.body`).
+  Persist is `len:tweak` only (0 or 33-byte compressed `A_tweak`). Cake outs
+  join `txout`. Confirm appends; reorg truncates; background backfill.
+  Electrum still serves naive when the flag is off or a height is a hole.
+
+
 ### Changed
 
 - **0.5 operator voice:** README / SECURITY / experimental-mainnet treat
@@ -312,93 +466,6 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
 
 - **Confirm queue caps:** `loadq=14` · `scriptq=4` · `writeq=14`
   (was loadq=8 · writeq=20).
-
-### Fixed
-
-- **Fuzz CI nightly:** `scripts/fuzz-run.sh` / `fuzz.yml` set
-  `RUSTUP_TOOLCHAIN=nightly` so `rust-toolchain.toml` 1.95 cannot feed
-  cargo-fuzz (`-Zsanitizer` is nightly-only).
-
-- **SH materialize last page:** megakey chunking sizes the last extent page
-  for the `ver=2` 24 B header (4072 B stream), not the `ver=1` 4088 B cap.
-  A key whose delta stream sat in 4073..=4088 B overflowed
-  `scripthash page pack: entries exceed page capacity` and aborted bulk
-  materialize.
-
-- **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
-  `unpark` permit (wave publish / detached job). A worker that misses steal
-  and parks after the wake still runs the work. Jobs mutex stays the
-  detached-job queue only.
-
-- **Script steal last-chunk:** `in_wave` increments before `next.fetch_add`,
-  so `is_complete` cannot free wave ctx under a claimer about to `apply`.
-  A lost claim decrements `in_wave` and re-checks completion.
-
-- **Darwin / Windows smoke:** schema 17 dir-variant SH body is
-  `scripthash.body/NN` + `scripthash.ovf/body`. Snapshot jobs now accept
-  that layout (legacy file body still ok). Default `--datadir` is
-  `Path::new(".").join("datadir")` so Windows does not mix `./datadir\store`.
-
-- **Lookup wave at-least-unless-tip:** the 8000-input floor still
-  holds a thin *far* layer while more BQ heights can join, but a
-  single block at store tip+1 emits so load can take it.
-
-- **IBD most-work rewind:** a heavier header branch (resume sibling
-  fork, competing tip+1, or BadPrev) disconnects to the LCA and the
-  normal confirm pipeline extends the winner. Gather-then-`accept_branch`
-  could not converge: awaiting was overwritten, `HELD_CAP=32` evicted
-  mids, and lookup stamped disconnected BQ heights (`…f972` @ 961635
-  while tip stayed on the loser).
-
-- **IBD BadPrev / fork child at tip+1:** work-path slots are first-wins
-  and prev-anchored. After `take_raw`, Reject carries the wire so
-  CompetingPath still classifies; `lookup_taken_hi` rewinds to tip;
-  the losing slot identity is evicted (not `mark_missing` / re-get
-  the same hash). Reorg apply clears the path suffix.
-
-- **Tip-hole / densify / receive share one in-hand rule:** confirmed,
-  matching BQ hash, or `H ≤ lookup_taken_hi`. Taken loadq heights are
-  not fetch holes and do not re-getdata or `mark_pending`.
-
-- **Lookup walk after loadq take:** `block_queue_unresolved_heights`
-  starts after `lookup_taken_hi`. Taken BQ rows are not a fetch hole,
-  so lookup can fill loadq ahead of tip. A missing height *above*
-  that high-water still stops the walk.
-
-- **Windows / Darwin store smoke `--release` compile:** `take_raw_clone_n`
-  and the raw-clone meter are `cfg(any(test, debug_assertions))`. Native
-  `cargo test --release -p rbitcoin-store --lib` (windows.yml / macos.yml)
-  compiles the whole test crate; the meter stays off in production
-  `--release` node builds.
-
-- **Windows store create (os error 87):** table files open
-  `FILE_FLAG_OVERLAPPED` for IOCP. `TableFile::create` / `open` / trailing
-  header used std `Write`/`Read`/`Seek`, which call `WriteFile`/`ReadFile`
-  with a NULL `OVERLAPPED` and fail with `ERROR_INVALID_PARAMETER` on the
-  first file (`scripthash.body`). Header IO is positional `IoHandle`
-  pread/pwrite; grow uses `SetFileInformationByHandle`. IOCP associate no
-  longer treats every 87 as success (tracked same-port rebind only).
-  `windows.yml` / `macos.yml` smoke `TableFile` create/open and
-  `--smoke` until `store/scripthash.body` exists. Darwin zips are ad-hoc
-  `codesign -s -` (not notarized).
-
-### Removed
-
-- **Host forensics and cargo benches:** `examples/diag_*`, `dump_wit`,
-  all `[[bench]]`, `rbitcoin-store-bench`, `freeze_benches`,
-  `reader_contention`, `diag_tip961461`, and ignored page-group / SH-head
-  wall microbenches. Default graph is product + suite
-  (`scripts/check_default_targets.test.sh`). Host A/B is musl + `ibd: perf`.
-
-- **Unused spend-annotate wrappers:** `Store::put_spend_batch_by_create` and
-  `_ranged`. Confirm write is abs-meta only
-  (`put_spend_batch_by_abs_meta_known`). `put_spend` / `put_spend_batch`
-  (txid) stay for `connect_block` / archive commit.
-
-- **`script_bench` facade:** detached script verify and fixture tests use
-  `ScriptCheckJob` + `verify_scripts_pool` / `verify_job_all_inputs`.
-
-### Changed
 
 - **Core functional Wave E / thin leftovers.** Official unmodified
   `p2p_getdata.py` is `run` (37→**38**). Invalid GETDATA inv type 0
@@ -595,40 +662,6 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   `ensure_external_parent_denserels_from_plan` are gone. IBD pin is
   `pin_for_wire_batch` (in-flight / same-batch / pstore adopt / cold
   range). Plan keeps ranges+txids until `freeze_after_pin`.
-
-### Added
-
-- **`generateblock submit=false`:** mine one block without connecting it
-  and return `{hash,hex}` for `submitheader`. `output` accepts `raw()`
-  descriptors.
-
-- **`getblockstats`:** reconstruct the block and return Core fee / UTXO /
-  weight fields (`hash_or_height`, `stats`). Genesis is excluded from
-  actual UTXO counts; `OP_RETURN` is unspendable. Even `medianfee` is the
-  integer mean of the two middle scores (Core `CalculateTruncatedMedian`).
-
-- **`docs/errata.md`:** RAM leftover maps are one fk per txid. Pre-BIP30
-  clobber is correct enough; post-BIP30 a disconnected sibling in those
-  maps is an unlikely visibility hole, not the n−1 leftover miss.
-
-- **`getmempoolcluster`:** cluster weight, tx count, and mining chunks
-  (modified fees) from the live graph.
-- **Test RPC proxy** (Core functional suite only): utility RPCs
-  (`createrawtransaction`, `signrawtransactionwithkey`, `createmultisig`,
-  `combinerawtransaction`, decode helpers) and an Esplora-backed wallet
-  façade (`createwallet`, `importdescriptors`, `send`, `listunspent`, …)
-  live in the bitcoind shim, not on `rbitcoin-node`.
-- **Mempool verbose fees:** `getrawmempool` / `getmempoolentry` emit
-  `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight`.
-  `prioritisetransaction` deltas flow into modified/ancestor/descendant/chunk
-  and into min-relay admission (free tx + delta can enter).
-
-### Removed
-
-- **`rbtpkg` P2P command.** Homegrown len-prefixed package inject is gone.
-  Packages stay on RPC `submitpackage` and Esplora `POST /txs/package`.
-
-### Changed
 
 - **One SH durable dialect.** Incremental creates go to ingest OA (then
   sealed `SHSR` ovf). Live OA main / `ShOverflowStack` writes are gone.
@@ -924,140 +957,6 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   `100`); `localservices` match advertised flags; `maxmempool` is the hub
   weight budget.
 
-### Removed
-
-- **`RWF_DONTCACHE`:** first-party flag, capability probe, and
-  `dontcache_policy`. `spent.body` is its own file; evicting those pages
-  does not protect `txout`. Uring machines stay.
-- Unused Core-style `check_tx_standard` (admit is Libre only).
-- Path-named IO backend aliases and always-true `class_a_append_uses_pwrite`.
-- `crate_name()` / `smoke_crate_names` coverage theater.
-
-### Fixed
-
-- **Core functional proxy ports:** Esplora binds `rpcport+20000`, not
-  `node_rpc+1`. Consecutive Core `-rpcport` values made the next node's
-  internal RPC land on the previous node's Esplora (`HTTP 404` on
-  `getblockcount` in multi-node tests).
-
-### Added
-
-- **Core `-testactivationheight` overlay:** `name@height` (regtest) is parsed
-  on `rbitcoin-node` and applied in `ChainParams` (`csv` / `segwit` / `bip34`
-  / `dersig` / `cltv`). Script flags still follow the getters in a later
-  confirm step. Shim forwards consensus/mempool/peer flags
-  (`whitelist`, `blocksonly`, `minrelaytxfee`, `permitbaremultisig`,
-  `limitcluster*`, `peertimeout`, `maxconnections`, `persistmempool`,
-  `minimumchainwork`) instead of dropping them. `-minimumchainwork` keeps
-  the node in IBD (no relay) until tip work meets the hex floor. There is
-  no `-txindex` flag: Class A always looks up by txid. Core v31.1
-  ancestor/descendant limit flags stay ignored (they are no-ops there).
-
-- **Core functional coverage:** analog scenarios for `--milestone` skip-below /
-  check-above, reconstruct after lost RAM head, and durable mempool reopen
-  (`crates/rbitcoin-test/tests/core_analogs.rs`). Inventory `analog=` is
-  required on `rpc-missing` as well as prune / LevelDB / UTXO-set skips.
-
-- **MiniWallet + receive-block path:** `generatetodescriptor` (`raw(HEX)`),
-  `scantxoutset` over Class A, `gettxout`, `getindexinfo` (Class A tx
-  lookup), `getchaintips` (active tip), `waitforblock*`. Generate includes
-  mempool txs then `remove_for_block`. `sendrawtransaction` maps accept
-  rejects to Core `-26` strings. `submitblock` and P2P `block` share
-  `ChainHub::accept_received_block` (hold never-confirmed side bodies,
-  `accept_branch` on more work). Once-confirmed losers stay in Class A.
-  Not a coins-DB / GBT product.
-
-- **Core functional `run` set:** 14 unmodified scripts (first-green nine plus
-  `rpc_getchaintips.py`, `rpc_invalidateblock.py`, `rpc_preciousblock.py`,
-  `feature_csv_activation.py`, `feature_bip68_sequence.py`).
-  `feature_nulldummy.py` is run (stateless raw-tx + ignored `-addresstype`).
-
-- **`echo` + mixed `{args, argN}`:** Core testing RPC and AuthServiceProxy
-  mixed named+positional. Inventory marks `rpc_named_arguments.py` `run`.
-
-- **rbitcoin 199-block cache:** `create_cache.py` mines 199 via `generate`
-  into `scripts/core-functional/cache/store`. `run.sh` preseeds empty Core
-  `blocks/`+`chainstate/` and `--keepcache`; the shim copies our store into
-  cache-shaped dests only.
-
-- **`invalidateblock` / `reconsiderblock` / `preciousblock`:** disconnect
-  via `ChainHub`; reconsider reconstructs from Class A; precious prefers
-  an equal-work sibling (held or archive).
-
-- **Debug.log mapper:** `scripts/core-functional/debuglog_map.toml` plus
-  shim line pump. First extra Core script: `rpc_uptime.py` (setmocktime
-  range + uptime ignores mock).
-
-- **Regtest `setmocktime`:** `NodeClock` (AtomicI64; `0` = wall). Generate
-  timestamps and future-header checks honor the mock. Not a process
-  `time()` hook (log stamps stay wall).
-
-- **Live `getpeerinfo` / `addnode` / `disconnectnode` / `addconnection`:**
-  sessions register after BIP324 handshake. `addnode onetry` dials via the
-  same outbound path as tip-follow. `subver` is the peer's version UA
-  (our `-uacomment` is advertised on our `version`). `bytesrecv_per_msg.pong`
-  is counted so Core `connect_nodes` can wait for handshake.
-
-- **`syncwithvalidationinterfacequeue`:** no-op `null`. Core’s framework
-  calls it from `sync_mempools`; we have no wallet/index callback queue.
-
-- **First unmodified Core functional scripts:** inventory marks
-  `feature_help.py` and `feature_uacomment.py` `run`.
-  `scripts/core-functional/run.sh` invokes those two via Core’s
-  `test_runner.py` (still never from default `cargo test`).
-
-- **Regtest generate / submitblock (harness only):** `generatetoaddress`,
-  `generateblock`, `generate`, and `submitblock` mine or accept through
-  `ChainHub::accept_block` (same confirm path as P2P). Refused on mainnet /
-  signet / testnet. Not a mining product (no GBT).
-
-- **Core v31.1 submodule is the JSON source:** `third_party/bitcoin` is a
-  shallow gitlink at `9be056a`. `cargo test` hard-links or copies
-  `script_tests.json` / `tx_valid.json` / `tx_invalid.json` from
-  `src/test/data` into `$CARGO_TARGET_DIR/core-data` every run (no in-tree
-  copies). Missing pin: the fixture helper and `scripts/coverage.sh` run
-  `./scripts/core-functional/init-submodule.sh` (sparse ~16 MiB).
-  `sync-core-fixtures.sh --check` requires the three files in the submodule
-  and none under `tests/fixtures/`.
-
-- **Local extras after the v31.1 pin:** rust units for CHECKSIGVERIFY /
-  CHECKMULTISIGVERIFY then `OP_1` (VERIFY must abort), empty-stack CLTV,
-  and CLTV/CSV `0x80` (scriptnum −0) not taking the negative branch.
-
-- **Core functional nightly job:** `.github/workflows/core-functional.yml`
-  runs `scripts/core-functional/nightly.sh` on cron, `workflow_dispatch`,
-  and PRs labeled `core-functional`. Unlabeled PRs keep cargo gates only.
-  The job warns — does not fail — when a newer final Bitcoin Core release
-  exists than `inventory.toml` `pin` (semver of published finals, not
-  GitHub `/releases/latest`). Bump the submodule, fixtures, and inventory
-  when it fires.
-
-- **Core functional bitcoind shim:** `scripts/core-functional/bitcoind`
-  starts `rbitcoin-node` from TestNode argv (`-datadir` → `DIR/regtest`
-  so the cookie is `{datadir}/regtest/.cookie`). Clean chain:
-  `getblockcount` is 0; RPC `stop` shuts down. Not the operator CLI.
-
-- **Core functional runner:** `scripts/core-functional/run.sh` invokes Core
-  `test_runner.py` only for inventory `run` names (`--v2transport`,
-  `--exclude` every skip). A skip name fails `not in run set`. `--list` /
-  `--dry-run` need no node. Default `cargo test` does not call it.
-
-- **Core functional inventory (v31.1):** `scripts/core-functional/inventory.toml`
-  classifies every Bitcoin Core `test/functional/*.py` (`run` / `skip` +
-  reason; `analog` required for prune / LevelDB / UTXO-set skips).
-  `python3 scripts/core-functional/check_inventory.py` fails on an unknown
-  or incomplete row. See [`docs/core-functional.md`](docs/core-functional.md).
-  No Core scripts run in default `cargo test` yet.
-
-- **`--datadir-cold PATH`:** Class A `inwit.body` / `inwit.idx/` (cold; ~486 GiB
-  on mainnet) live under `{PATH}/store` when set. `--datadir` still holds every
-  other file (`txout`, `spent`, heads, mempool, peers, cookie). Omit the flag
-  and both hot and cold files stay in `--datadir`. Conf: `datadir-cold=`.
-  Existing split: move `inwit.body` + `inwit.idx/` yourself; the hot store
-  records `inwit.reloc` so a later open without the flag refuses.
-
-### Changed
-
 - **Schema 17 (durable) — wipe the datadir and redo IBD.** Opening a
   store that already has Class A creates (schema 15/16 16-byte meta /
   9-byte spent) or leftover `key_len=32` SH runs is refused. Empty
@@ -1086,7 +985,150 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   a fake `loadq=n/8`. Load leftover head is `leftover_n/hit/ms/pend/cdf`;
   lookup wave wall is `lookup_thr wave=`.
 
+- **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty
+  suffix — now pinned. Class A `txout`/`inwit`/`spent` bodies submit as one
+  `pwrite_batch` wave. `tx.head` insert is write-behind (page-grouped drain
+  overlaps structural/Class C); resolve hits a pending txid→fk map until drain.
+  Crash-open backfills a lagging head from Class A.
+- **`ibd: sizes` residual:** `fuse8=` / `open_keys=` / `class_c_l2=` enter
+  accounted. Sealed fuse fingerprints (~9 bits/create) were the ~1.6 GiB gap
+  at 1.42 B creates — see [`docs/ibd-memory.md`](docs/ibd-memory.md).
+- **Agent delivery:** plans land on a worktree topic branch as many small
+  commits and **one PR**. Full workspace test/coverage is GitHub Actions, not
+  a local plan-end ritual; poll the PR to green. Musl install stays
+  post-merge on `master`. Leave `origin` on SSH (operator auth); the App
+  fetch/push uses an explicit HTTPS URL. See `AGENTS.md` and
+  `docs/how-we-plan.md`.
+
+- **Docs honesty:** root `/api.jsonl` is gitignored. SCHEMA `archive_epoch.wire_depth`
+  is an unread leftover field (no tip wire ring). `page_rmw_pipelined` is
+  documented as test-only. io-modality no longer describes a map hatch;
+  OPERATOR densify is body-queue soft depth (no archive-queue cap).
+- **Table flush:** `TableFile::flush` always `sync_data` after a dirty persist.
+
+- **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
+  Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
+  link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).
+
+- **Lookup stamp:** consult live `PipelineParentStore` by prev_txid before
+  `tx.head` (`pin_txid=` / `pin_txid%` / `pin_txid_ms` / `head_n` /
+  `us/pin_txid` on `ibd: perf`). Remaining head `txout.idx` fills are
+  page-grouped on the held resolve session. `pin_hit%` is adopt/plan
+  reuse only (this-window range-fills stay `pin_new`).
+
+- **Schema 16:** drop `tx_height.body` (~5 GiB). Create height is a resident
+  fence from `confirmed[]` + `header_txs_*` (O(blocks), RAM bsearch). Reorg
+  holes return unconnected. Schema 15 stores soft-open (unlink leftover file).
+  Old binaries refuse 16 (they still write `tx_height`).
+
+- **Script pool:** `try_for_each_parallel` steals on process-wide
+  `rbtc-scripts-*` workers (no per-batch `thread::scope`). Confirm phases run
+  on two `rbtc-script-coord-*` threads so a steal worker is not blocked inside
+  the phase. Pool wait uses a condvar deque (not `recv` under mutex).
+
+- **`--sptweaks` during IBD:** Direct confirm no longer write-throughs the
+  thin BIP-352 index (it was 50–80% of fat-era write). After tip, SH
+  materialize (if `--shindex`) then a sequential backfill to live tip;
+  Tip write-through only when `height == next_height`. Restart resumes
+  from `next_height`.
+
+- **Schema 15 Class A split:** `txout.body` (outs) + `inwit.body` (ins+witness)
+  + `spent.body` (9 B×n_out). Packed `tx.body` with creates is refused. Pin/SH
+  read outs only; annotate RMW is `spent_off+9×vout`. Working-set census in
+  [`SCHEMA.md`](./SCHEMA.md).
+- **Schema 15 Class B SH:** geometric slabs + megakey pages; sealed
+  sorted+idx main (**no** main fuse); global ingest OA; sealed ovf keeps
+  fuse8. Tip lookup is overflow (ingest + ovf fuse) then main. Open
+  rematerialized SHSR shards via an OA stub; sealed ovf files are not
+  opened as OA. Unlink writes the home `locate_head` found. Cold bulk
+  streams packed recs (no per-shard OA image). Page-era durable SH is
+  refused. The OA global `scripthash.head.fuse8` builder is gone.
+- **Electrum / RPC:** skip O(mempool) API walks; overlap Electrum dispatch;
+  thin `--sptweaks` serve is idx→body uring, not a packed span.
+- **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so
+  Cake Wallet’s `getNodeIsElectrs()` will probe `blockchain.tweaks.subscribe`.
+- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--conf`,
+  Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
+- **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`.
+- **Fee snapshot / mempool APIs:** published fee table and mining chunks so
+  Electrum/Esplora estimates do not block accepts (R-01–R-04).
+- **Quality gates:** `cargo deny` on PR (Q-20); coverage uses prebuilt
+  `cargo-llvm-cov` (Q-22); `scripts/sbom.sh` emits CycloneDX from Cargo.lock.
+
+
 ### Fixed
+
+- **Fuzz CI nightly:** `scripts/fuzz-run.sh` / `fuzz.yml` set
+  `RUSTUP_TOOLCHAIN=nightly` so `rust-toolchain.toml` 1.95 cannot feed
+  cargo-fuzz (`-Zsanitizer` is nightly-only).
+
+- **SH materialize last page:** megakey chunking sizes the last extent page
+  for the `ver=2` 24 B header (4072 B stream), not the `ver=1` 4088 B cap.
+  A key whose delta stream sat in 4073..=4088 B overflowed
+  `scripthash page pack: entries exceed page capacity` and aborted bulk
+  materialize.
+
+- **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
+  `unpark` permit (wave publish / detached job). A worker that misses steal
+  and parks after the wake still runs the work. Jobs mutex stays the
+  detached-job queue only.
+
+- **Script steal last-chunk:** `in_wave` increments before `next.fetch_add`,
+  so `is_complete` cannot free wave ctx under a claimer about to `apply`.
+  A lost claim decrements `in_wave` and re-checks completion.
+
+- **Darwin / Windows smoke:** schema 17 dir-variant SH body is
+  `scripthash.body/NN` + `scripthash.ovf/body`. Snapshot jobs now accept
+  that layout (legacy file body still ok). Default `--datadir` is
+  `Path::new(".").join("datadir")` so Windows does not mix `./datadir\store`.
+
+- **Lookup wave at-least-unless-tip:** the 8000-input floor still
+  holds a thin *far* layer while more BQ heights can join, but a
+  single block at store tip+1 emits so load can take it.
+
+- **IBD most-work rewind:** a heavier header branch (resume sibling
+  fork, competing tip+1, or BadPrev) disconnects to the LCA and the
+  normal confirm pipeline extends the winner. Gather-then-`accept_branch`
+  could not converge: awaiting was overwritten, `HELD_CAP=32` evicted
+  mids, and lookup stamped disconnected BQ heights (`…f972` @ 961635
+  while tip stayed on the loser).
+
+- **IBD BadPrev / fork child at tip+1:** work-path slots are first-wins
+  and prev-anchored. After `take_raw`, Reject carries the wire so
+  CompetingPath still classifies; `lookup_taken_hi` rewinds to tip;
+  the losing slot identity is evicted (not `mark_missing` / re-get
+  the same hash). Reorg apply clears the path suffix.
+
+- **Tip-hole / densify / receive share one in-hand rule:** confirmed,
+  matching BQ hash, or `H ≤ lookup_taken_hi`. Taken loadq heights are
+  not fetch holes and do not re-getdata or `mark_pending`.
+
+- **Lookup walk after loadq take:** `block_queue_unresolved_heights`
+  starts after `lookup_taken_hi`. Taken BQ rows are not a fetch hole,
+  so lookup can fill loadq ahead of tip. A missing height *above*
+  that high-water still stops the walk.
+
+- **Windows / Darwin store smoke `--release` compile:** `take_raw_clone_n`
+  and the raw-clone meter are `cfg(any(test, debug_assertions))`. Native
+  `cargo test --release -p rbitcoin-store --lib` (windows.yml / macos.yml)
+  compiles the whole test crate; the meter stays off in production
+  `--release` node builds.
+
+- **Windows store create (os error 87):** table files open
+  `FILE_FLAG_OVERLAPPED` for IOCP. `TableFile::create` / `open` / trailing
+  header used std `Write`/`Read`/`Seek`, which call `WriteFile`/`ReadFile`
+  with a NULL `OVERLAPPED` and fail with `ERROR_INVALID_PARAMETER` on the
+  first file (`scripthash.body`). Header IO is positional `IoHandle`
+  pread/pwrite; grow uses `SetFileInformationByHandle`. IOCP associate no
+  longer treats every 87 as success (tracked same-port rebind only).
+  `windows.yml` / `macos.yml` smoke `TableFile` create/open and
+  `--smoke` until `store/scripthash.body` exists. Darwin zips are ad-hoc
+  `codesign -s -` (not notarized).
+
+- **Core functional proxy ports:** Esplora binds `rpcport+20000`, not
+  `node_rpc+1`. Consecutive Core `-rpcport` values made the next node's
+  internal RPC land on the previous node's Esplora (`HTTP 404` on
+  `getblockcount` in multi-node tests).
 
 - **`sp_tweaks` rolls a new 4 GiB body instead of dying at `u32` off:**
   mainnet backfill hit `store: corrupt record: sp_tweaks body exceeds u32
@@ -1164,7 +1206,60 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   **seals** a full segment. Pending hits now run **before** the plan
   `with_thread_local` (same serial `record_range` as before).
 
+- **Tests:** head and `tx.idx` share one thread-local soft-span override.
+  `HeadScale::test_with` pins tiny/mainnet without process-global `set_var`.
+
+- **Head resolve 2-wave:** wave 1 is open + sealed ages ≤3 again. The spend-only
+  DONTCACHE change had made `head_or_idx_segment_index` always false, so hot
+  probed every segment and cold was empty. Unconnected hot hits still run
+  wave 2 so `TipThenAny` / `TipOnly` can take a connected sibling in age ≥4.
+
+- **Tests:** scripts-phase steal-worker pin records the coordinator thread on
+  the handle (not a process-global name). Archive plan/commit wall stats sample
+  under an exclusive lock so parallel `sample_and_reset` cannot steal the
+  window. Head soft-span override is thread-local so a sibling
+  `test_set_soft_span_bytes(0)` cannot reset another test's 48-byte roll
+  window (`tip_then_any_connected_in_cold_beats_unconnected_hot`).
+
+- **Findings 012–021** (fuzzamoto differential): identity/BIP30 cluster,
+  tapleaf, compact-block, reorg drain — all closed with named regressions.
+- **Mainnet BIP30:** skip the two Core `IsBIP30Repeat` overwrites (91842 /
+  91880 hashes). Those coinbases were overwritten while still unspent, not
+  fully spent. IBD `bad-txns-BIP30` at logged `@91859` was the first height
+  of a write batch that contained 91880.
+- **Electrum tweaks subscribe:** stream remaining heights as notifications
+  and finish with Cake’s `{"message":"done"}`. A one-shot 8-height result left
+  the scan isolate idle after `[restore, remaining, false]`.
+- **Electrum `get_balance`:** unconfirmed delta uses the mempool scripthash
+  index instead of store-resolving every live chain input. Empty Cake keys were
+  ~1.5 s each on a mainnet mempool.
+
+
 ### Removed
+
+- **Host forensics and cargo benches:** `examples/diag_*`, `dump_wit`,
+  all `[[bench]]`, `rbitcoin-store-bench`, `freeze_benches`,
+  `reader_contention`, `diag_tip961461`, and ignored page-group / SH-head
+  wall microbenches. Default graph is product + suite
+  (`scripts/check_default_targets.test.sh`). Host A/B is musl + `ibd: perf`.
+
+- **Unused spend-annotate wrappers:** `Store::put_spend_batch_by_create` and
+  `_ranged`. Confirm write is abs-meta only
+  (`put_spend_batch_by_abs_meta_known`). `put_spend` / `put_spend_batch`
+  (txid) stay for `connect_block` / archive commit.
+
+- **`script_bench` facade:** detached script verify and fixture tests use
+  `ScriptCheckJob` + `verify_scripts_pool` / `verify_job_all_inputs`.
+
+- **`rbtpkg` P2P command.** Homegrown len-prefixed package inject is gone.
+  Packages stay on RPC `submitpackage` and Esplora `POST /txs/package`.
+
+- **`RWF_DONTCACHE`:** first-party flag, capability probe, and
+  `dontcache_policy`. `spent.body` is its own file; evicting those pages
+  does not protect `txout`. Uring machines stay.
+- Unused Core-style `check_tx_standard` (admit is Libre only).
+- Path-named IO backend aliases and always-true `class_a_append_uses_pwrite`.
+- `crate_name()` / `smoke_crate_names` coverage theater.
 
 - **Dead store APIs / duplicate benches:** refuse-only `TxTable::put` /
   `Store::put_tx` / `Query::put_tx`, `body_txid_at`, and
@@ -1219,139 +1314,11 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   tests use `commit_class_a_only`. `Query::connect_block` stays as the cheap
   store fixture. Plan stamp is TipOnly; store `TipThenAny` remains for RPC.
 
-### Changed
-
-- **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty
-  suffix — now pinned. Class A `txout`/`inwit`/`spent` bodies submit as one
-  `pwrite_batch` wave. `tx.head` insert is write-behind (page-grouped drain
-  overlaps structural/Class C); resolve hits a pending txid→fk map until drain.
-  Crash-open backfills a lagging head from Class A.
-- **`ibd: sizes` residual:** `fuse8=` / `open_keys=` / `class_c_l2=` enter
-  accounted. Sealed fuse fingerprints (~9 bits/create) were the ~1.6 GiB gap
-  at 1.42 B creates — see [`docs/ibd-memory.md`](docs/ibd-memory.md).
-- **Agent delivery:** plans land on a worktree topic branch as many small
-  commits and **one PR**. Full workspace test/coverage is GitHub Actions, not
-  a local plan-end ritual; poll the PR to green. Musl install stays
-  post-merge on `master`. Leave `origin` on SSH (operator auth); the App
-  fetch/push uses an explicit HTTPS URL. See `AGENTS.md` and
-  `docs/how-we-plan.md`.
-
-- **Docs honesty:** root `/api.jsonl` is gitignored. SCHEMA `archive_epoch.wire_depth`
-  is an unread leftover field (no tip wire ring). `page_rmw_pipelined` is
-  documented as test-only. io-modality no longer describes a map hatch;
-  OPERATOR densify is body-queue soft depth (no archive-queue cap).
-- **Table flush:** `TableFile::flush` always `sync_data` after a dirty persist.
-
-- **Docs Q-14:** [`docs/heads.md`](docs/heads.md) is the head-module glossary.
-  Pipeline details stay in `concurrency.md`; architecture / OPERATOR / AGENTS
-  link instead of restating. SCHEMA tree uses `tx.head/` (not flat names).
-
-### Fixed
-
-- **Tests:** head and `tx.idx` share one thread-local soft-span override.
-  `HeadScale::test_with` pins tiny/mainnet without process-global `set_var`.
-
-### Removed
-
 - **Dead DONTCACHE / IO aliases:** head/idx probe no longer threads an always-false
   DONTCACHE flag. `sealed_age_from_index` lives with winner-age stats.
   Dropped `get_outs_denserels_by_range_batch`, `spend_meta_backend_next`,
   `load_needs_resize`, `HeadRole::Tx` / `RBITCOIN_HEAD_SLOTS_TX`, and
   `RBITCOIN_IO_URING` (`RBITCOIN_IO=pread` is the only pread hatch).
-
-### Added
-
-- **CI musl artifacts:** after a green `ci` run on `master`/`main`, workflow
-  `musl` builds `nix build .#rbitcoin-musl` and uploads
-  `rbitcoin-node` / `rbitcoin-cli` + `SHA256SUMS` (90 days). Not a required
-  PR check. Manual retry: Actions → musl → Run workflow.
-
-### Fixed
-
-- **Head resolve 2-wave:** wave 1 is open + sealed ages ≤3 again. The spend-only
-  DONTCACHE change had made `head_or_idx_segment_index` always false, so hot
-  probed every segment and cold was empty. Unconnected hot hits still run
-  wave 2 so `TipThenAny` / `TipOnly` can take a connected sibling in age ≥4.
-
-- **Tests:** scripts-phase steal-worker pin records the coordinator thread on
-  the handle (not a process-global name). Archive plan/commit wall stats sample
-  under an exclusive lock so parallel `sample_and_reset` cannot steal the
-  window. Head soft-span override is thread-local so a sibling
-  `test_set_soft_span_bytes(0)` cannot reset another test's 48-byte roll
-  window (`tip_then_any_connected_in_cold_beats_unconnected_hot`).
-
-### Changed
-
-- **Lookup stamp:** consult live `PipelineParentStore` by prev_txid before
-  `tx.head` (`pin_txid=` / `pin_txid%` / `pin_txid_ms` / `head_n` /
-  `us/pin_txid` on `ibd: perf`). Remaining head `txout.idx` fills are
-  page-grouped on the held resolve session. `pin_hit%` is adopt/plan
-  reuse only (this-window range-fills stay `pin_new`).
-
-- **Schema 16:** drop `tx_height.body` (~5 GiB). Create height is a resident
-  fence from `confirmed[]` + `header_txs_*` (O(blocks), RAM bsearch). Reorg
-  holes return unconnected. Schema 15 stores soft-open (unlink leftover file).
-  Old binaries refuse 16 (they still write `tx_height`).
-
-- **Script pool:** `try_for_each_parallel` steals on process-wide
-  `rbtc-scripts-*` workers (no per-batch `thread::scope`). Confirm phases run
-  on two `rbtc-script-coord-*` threads so a steal worker is not blocked inside
-  the phase. Pool wait uses a condvar deque (not `recv` under mutex).
-
-- **`--sptweaks` during IBD:** Direct confirm no longer write-throughs the
-  thin BIP-352 index (it was 50–80% of fat-era write). After tip, SH
-  materialize (if `--shindex`) then a sequential backfill to live tip;
-  Tip write-through only when `height == next_height`. Restart resumes
-  from `next_height`.
-
-- **Schema 15 Class A split:** `txout.body` (outs) + `inwit.body` (ins+witness)
-  + `spent.body` (9 B×n_out). Packed `tx.body` with creates is refused. Pin/SH
-  read outs only; annotate RMW is `spent_off+9×vout`. Working-set census in
-  [`SCHEMA.md`](./SCHEMA.md).
-- **Schema 15 Class B SH:** geometric slabs + megakey pages; sealed
-  sorted+idx main (**no** main fuse); global ingest OA; sealed ovf keeps
-  fuse8. Tip lookup is overflow (ingest + ovf fuse) then main. Open
-  rematerialized SHSR shards via an OA stub; sealed ovf files are not
-  opened as OA. Unlink writes the home `locate_head` found. Cold bulk
-  streams packed recs (no per-shard OA image). Page-era durable SH is
-  refused. The OA global `scripthash.head.fuse8` builder is gone.
-- **Electrum / RPC:** skip O(mempool) API walks; overlap Electrum dispatch;
-  thin `--sptweaks` serve is idx→body uring, not a packed span.
-- **Electrum `server.version`:** first element is `rbitcoin-electrs <ver>` so
-  Cake Wallet’s `getNodeIsElectrs()` will probe `blockchain.tweaks.subscribe`.
-- **CLI-first config:** `--maxinbound`/`--maxconnections`, `--conf`,
-  Core-like aliases (`--assumevalid-height`, `--maxmempool`, `--chain`).
-- **Tip-follow logging:** every accepted tip block logs Core-like `UpdateTip: …`.
-- **Fee snapshot / mempool APIs:** published fee table and mining chunks so
-  Electrum/Esplora estimates do not block accepts (R-01–R-04).
-- **Quality gates:** `cargo deny` on PR (Q-20); coverage uses prebuilt
-  `cargo-llvm-cov` (Q-22); `scripts/sbom.sh` emits CycloneDX from Cargo.lock.
-
-### Fixed
-
-- **Findings 012–021** (fuzzamoto differential): identity/BIP30 cluster,
-  tapleaf, compact-block, reorg drain — all closed with named regressions.
-- **Mainnet BIP30:** skip the two Core `IsBIP30Repeat` overwrites (91842 /
-  91880 hashes). Those coinbases were overwritten while still unspent, not
-  fully spent. IBD `bad-txns-BIP30` at logged `@91859` was the first height
-  of a write batch that contained 91880.
-- **Electrum tweaks subscribe:** stream remaining heights as notifications
-  and finish with Cake’s `{"message":"done"}`. A one-shot 8-height result left
-  the scan isolate idle after `[restore, remaining, false]`.
-- **Electrum `get_balance`:** unconfirmed delta uses the mempool scripthash
-  index instead of store-resolving every live chain input. Empty Cake keys were
-  ~1.5 s each on a mainnet mempool.
-
-### Added
-
-- **IBD write meters:** `tweaks=` on `ibd: perf` / `perf_dbg` and `confirm write slow`
-  (BIP-352 index wall after spend annotate). Makes the `--sptweaks` write-thread
-  cost visible in the fat-era IBD hole.
-
-- **`--sptweaks`:** optional thin BIP-352 index (`sp_tweaks.idx` / `.body`).
-  Persist is `len:tweak` only (0 or 33-byte compressed `A_tweak`). Cake outs
-  join `txout`. Confirm appends; reorg truncates; background backfill.
-  Electrum still serves naive when the flag is off or a height is a hole.
 
 ## [0.1.0] — 2026-07-26
 

@@ -387,7 +387,6 @@ where
                                 mempool.clone(),
                                 &sh_subs,
                                 &mut last_sent_status,
-                                config.max_scripthash_subs,
                                 heights,
                             )
                             .await?;
@@ -401,7 +400,6 @@ where
                                 mempool.clone(),
                                 &sh_subs,
                                 &mut last_sent_status,
-                                config.max_scripthash_subs,
                                 None,
                             )
                             .await?;
@@ -432,7 +430,6 @@ where
                     mempool.clone(),
                     &sh_subs,
                     &mut last_sent_status,
-                    config.max_scripthash_subs,
                     scan,
                 )
                 .await?;
@@ -460,7 +457,6 @@ where
                                 let Some(status) = take_new_status(
                                     &mut last_sent_status,
                                     &sh_subs,
-                                    config.max_scripthash_subs,
                                     *sh,
                                     status,
                                 ) else {
@@ -857,12 +853,21 @@ fn restatus_notes(
     out
 }
 
+const TICK_SCAN_MAX_GAP: u32 = 32;
+
 fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>> {
     if seen == now {
         return None;
     }
     match (seen, now) {
-        (Some(a), Some(b)) if b > a => Some(Some((a.saturating_add(1)..=b).collect())),
+        (Some(a), Some(b)) if b > a => {
+            let gap = b.saturating_sub(a);
+            if gap > TICK_SCAN_MAX_GAP {
+                Some(None)
+            } else {
+                Some(Some((a.saturating_add(1)..=b).collect()))
+            }
+        }
         _ => Some(None),
     }
 }
@@ -870,15 +875,11 @@ fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>> {
 fn take_new_status(
     last_sent: &mut HashMap<[u8; 32], String>,
     sh_subs: &HashSet<[u8; 32]>,
-    cap: usize,
     sh: [u8; 32],
     status: String,
 ) -> Option<String> {
     last_sent.retain(|k, _| sh_subs.contains(k));
     if last_sent.get(&sh) == Some(&status) {
-        return None;
-    }
-    if last_sent.len() >= cap && !last_sent.contains_key(&sh) {
         return None;
     }
     last_sent.insert(sh, status.clone());
@@ -891,7 +892,6 @@ async fn emit_sh_notes<W: AsyncWrite + Unpin>(
     mempool: Option<Arc<MempoolHub>>,
     sh_subs: &HashSet<[u8; 32]>,
     last_sent: &mut HashMap<[u8; 32], String>,
-    cap: usize,
     heights: Option<Vec<u32>>,
 ) -> Result<(), std::io::Error> {
     let q = Arc::clone(query);
@@ -902,7 +902,7 @@ async fn emit_sh_notes<W: AsyncWrite + Unpin>(
     .await
     .unwrap_or_default();
     for (sh, status) in notes {
-        let Some(status) = take_new_status(last_sent, sh_subs, cap, sh, status) else {
+        let Some(status) = take_new_status(last_sent, sh_subs, sh, status) else {
             continue;
         };
         let msg = json!({
@@ -1936,17 +1936,23 @@ mod tests {
 
         assert_eq!(tick_scan(Some(1), Some(1)), None);
         assert_eq!(tick_scan(Some(0), Some(2)), Some(Some(vec![1, 2])));
+        assert_eq!(tick_scan(Some(0), Some(32)), Some(Some((1..=32).collect())));
+        assert_eq!(
+            tick_scan(Some(0), Some(33)),
+            Some(None),
+            "gap above TICK_SCAN_MAX_GAP restatuses all"
+        );
         assert_eq!(tick_scan(Some(2), Some(1)), Some(None));
         assert_eq!(tick_scan(None, Some(0)), Some(None));
         let mut last = HashMap::new();
         let mut subs = HashSet::new();
         let sh = [9u8; 32];
         subs.insert(sh);
-        let first = take_new_status(&mut last, &subs, 8, sh, "aa".into()).unwrap();
+        let first = take_new_status(&mut last, &subs, sh, "aa".into()).unwrap();
         assert_eq!(first, "aa");
-        assert!(take_new_status(&mut last, &subs, 8, sh, "aa".into()).is_none());
+        assert!(take_new_status(&mut last, &subs, sh, "aa".into()).is_none());
         assert_eq!(
-            take_new_status(&mut last, &subs, 8, sh, "bb".into()).unwrap(),
+            take_new_status(&mut last, &subs, sh, "bb".into()).unwrap(),
             "bb"
         );
     }

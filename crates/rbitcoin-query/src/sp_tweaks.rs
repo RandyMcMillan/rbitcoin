@@ -385,15 +385,6 @@ mod tests {
         assert!(m.contains("body missing"), "{m}");
         assert!(e.contains("body empty"), "{e}");
         assert_ne!(m, e);
-        let trunc = StoreError::Corrupt("invariant: thin tweak eligible body span truncated");
-        let txid = StoreError::Corrupt("invariant: thin tweak eligible txid missing");
-        let t = format!("{trunc}");
-        let x = format!("{txid}");
-        assert!(t.contains("span truncated"), "{t}");
-        assert!(x.contains("txid missing"), "{x}");
-        let all = [m, e, t, x];
-        let n = all.iter().collect::<std::collections::HashSet<_>>().len();
-        assert_eq!(n, 4, "each thin-tweak failure mode must name itself");
     }
 
     #[test]

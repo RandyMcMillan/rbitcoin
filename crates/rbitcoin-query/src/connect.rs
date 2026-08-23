@@ -187,13 +187,7 @@ impl Query {
         let through = self.sh_indexed_through_height();
         let mut jobs = Vec::new();
         for item in items {
-            let t_filter = std::time::Instant::now();
-            let skip = through.map(|t| item.height.0 <= t).unwrap_or(false);
-            add_sh_part(
-                &sh_stats::SH_FILTER_NS,
-                t_filter.elapsed().as_nanos() as u64,
-            );
-            if skip {
+            if through.map(|t| item.height.0 <= t).unwrap_or(false) {
                 continue;
             }
             let t_collect = std::time::Instant::now();
@@ -411,13 +405,15 @@ impl Query {
                 .ok_or(StoreError::Corrupt(
                     "invariant: confirmed height missing header",
                 ))?;
-            let tx_fks = self
-                .store
-                .header_txs
-                .get_list(header_fk)?
-                .ok_or(StoreError::Corrupt(
-                    "invariant: confirmed height missing header_txs",
-                ))?;
+            let tx_fks = match self.store.header_txs.get_list(header_fk)? {
+                Some(tx_fks) => tx_fks,
+                None if h == tip.0 => break,
+                None => {
+                    return Err(StoreError::Corrupt(
+                        "invariant: confirmed height missing header_txs",
+                    ));
+                }
+            };
             items.push(ConfirmPrepared {
                 height: Height(h),
                 header_fk,
@@ -443,7 +439,28 @@ impl Query {
         }
         let mut h = tip.0;
         loop {
-            let fks = self.block_tx_fks(Height(h))?;
+            let header_fk = self
+                .store
+                .confirmed
+                .get(Height(h))?
+                .ok_or(StoreError::Corrupt(
+                    "invariant: confirmed height missing header",
+                ))?;
+            let fks = match self.store.header_txs.get_list(header_fk)? {
+                Some(fks) => fks,
+                None if h == tip.0 => {
+                    if h == 0 {
+                        return Ok(None);
+                    }
+                    h -= 1;
+                    continue;
+                }
+                None => {
+                    return Err(StoreError::Corrupt(
+                        "invariant: confirmed height missing header_txs",
+                    ));
+                }
+            };
             let max_fk = fks.iter().map(|f| f.0).max().unwrap_or(0);
             if max_fk <= hwm {
                 return Ok(Some(h));
@@ -687,48 +704,67 @@ fn log_disconnect_tip(height: u32, hash: &[u8; 32], n_tx: usize) {
     rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, n_tx));
 }
 
+pub(crate) fn request_sh_writebehind_halt(
+    stop: &std::sync::atomic::AtomicBool,
+    h: u32,
+    e: &impl std::fmt::Display,
+) {
+    rbitcoin_log::error!("scripthash write-behind h={h}: {e}");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// One Class B appender for SH write-behind. Tests drain via [`Query::apply_sh_pending`].
+///
+/// Apply errors request `stop` and `on_fatal` so the process exits instead of
+/// leaving a dead worker with a growing pending queue.
 pub fn spawn_sh_writebehind(
     query: std::sync::Arc<Query>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_fatal: impl FnOnce() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("rbtc-sh-wb".into())
-        .spawn(move || loop {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            let job = loop {
+        .spawn(move || {
+            let mut on_fatal = Some(on_fatal);
+            loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let job = loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(job) = query.take_sh_job_for_apply() {
+                        break job;
+                    }
+                    let g = query.sh_pending.lock().unwrap();
+                    let (g2, wait) = query
+                        .sh_pending_cv
+                        .wait_timeout(g, std::time::Duration::from_millis(200))
+                        .unwrap();
+                    drop(g2);
+                    if wait.timed_out() {
+                        continue;
+                    }
+                };
+                let t0 = std::time::Instant::now();
+                let h = job.height.0;
+                let height = job.height;
+                let apply_err = query.apply_sh_job(job.clone()).err();
+                if let Some(e) = apply_err {
+                    query.requeue_sh_job_front(job);
+                    query.finish_sh_job(height);
+                    request_sh_writebehind_halt(&stop, h, &e);
+                    if let Some(f) = on_fatal.take() {
+                        f();
+                    }
                     return;
                 }
-                if let Some(job) = query.take_sh_job_for_apply() {
-                    break job;
-                }
-                let g = query.sh_pending.lock().unwrap();
-                let (g2, wait) = query
-                    .sh_pending_cv
-                    .wait_timeout(g, std::time::Duration::from_millis(200))
-                    .unwrap();
-                drop(g2);
-                if wait.timed_out() {
-                    continue;
-                }
-            };
-            let t0 = std::time::Instant::now();
-            let h = job.height.0;
-            let height = job.height;
-            let apply_err = query.apply_sh_job(job.clone()).err();
-            if let Some(e) = apply_err {
-                query.requeue_sh_job_front(job);
                 query.finish_sh_job(height);
-                rbitcoin_log::error!("scripthash write-behind h={h}: {e}");
-                return;
+                let wall_ms = t0.elapsed().as_millis();
+                let lag = query.sh_lag_heights();
+                rbitcoin_log::info!("sh: apply h={h} wall={wall_ms}ms lag={lag}");
             }
-            query.finish_sh_job(height);
-            let wall_ms = t0.elapsed().as_millis();
-            let lag = query.sh_lag_heights();
-            rbitcoin_log::info!("sh: apply h={h} wall={wall_ms}ms lag={lag}");
         })
         .expect("spawn sh write-behind")
 }

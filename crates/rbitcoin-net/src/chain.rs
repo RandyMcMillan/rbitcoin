@@ -1942,7 +1942,6 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     let tip_ms = i.tip_ns / 1_000_000;
     let sh = &i.sh;
     let sh_ms = sh.total_sh_ns() / 1_000_000;
-    let filt_ms = sh.filter_ns / 1_000_000;
     let coll_ms = sh.collect_ns / 1_000_000;
     let sort_ms = sh.sort_ns / 1_000_000;
     let seed_ms = sh.seed_ns / 1_000_000;
@@ -1958,7 +1957,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
         "tip: accept h={h} tx={n_tx} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
          class_a={class_a_ms}ms class_c={class_c_ms}ms (strong={strong_ms} tip_set={tip_ms}) \
          sh={sh_ms}ms sh_lag={sh_lag} \
-         (filter={filt_ms} collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
+         (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
          spend={spend_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
@@ -2348,7 +2347,6 @@ mod tests {
             tip_ns: 2_000_000,
             sh_lag: 2,
             sh: rbitcoin_query::class_c_phase_stats::TipShSnap {
-                filter_ns: 1_000_000,
                 collect_ns: 20_000_000,
                 sort_ns: 5_000_000,
                 seed_ns: 800_000_000,
@@ -2365,7 +2363,7 @@ mod tests {
         assert!(line.contains("wall=2500ms"), "{line}");
         assert!(line.contains("class_c=7ms"), "{line}");
         assert!(line.contains("(strong=5 tip_set=2)"), "{line}");
-        assert!(line.contains("sh=1726ms"), "{line}"); // 1+20+5+800+600+300
+        assert!(line.contains("sh=1725ms"), "{line}"); // 20+5+800+600+300
         assert!(line.contains("sh_lag=2"), "{line}");
         // Substep ms are unitless inside the paren (outer fields carry `ms`).
         assert!(line.contains("seed=800"), "{line}");

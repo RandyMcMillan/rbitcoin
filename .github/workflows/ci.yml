@@ -85,6 +85,8 @@ jobs:
         run: ./scripts/stage-native-artifacts.test.sh
       - name: fuzz-run self-test
         run: ./scripts/fuzz-run.test.sh
+      - name: release self-test
+        run: ./scripts/release.test.sh
       - name: os-smoke self-test
         run: ./scripts/ci-os-smoke.test.sh
       - name: cargo test

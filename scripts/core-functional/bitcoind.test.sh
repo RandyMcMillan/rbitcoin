@@ -261,6 +261,54 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# feature_port.py: -listen is a Core boolean (ignored; we always listen).
+OUT_LISTEN="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=18555 2>/dev/null)" || OUT_LISTEN=""
+if printf '%s' "$OUT_LISTEN" | grep -q -- "--listen 127.0.0.1:18555"; then
+  echo "ok - -listen accepted with -port"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -listen accepted with -port (got: $OUT_LISTEN)"
+  FAIL=$((FAIL + 1))
+fi
+
+assert_fail_msg "port 65536 invalid" "Error: Invalid port specified in -port: '65536'" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=65536
+assert_fail_msg "port 0 invalid" "Error: Invalid port specified in -port: '0'" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=0
+
+# feature_port.py: Core-shaped Bound to lines in debug.log for -listen/-port.
+PORT_DD="$WORKDIR/port-bound"
+mkdir -p "$PORT_DD"
+# FAKE exits immediately; Bound to is written before Popen.
+if RBITCOIN_NODE="$FAKE" "$SHIM" -datadir="$PORT_DD" -regtest -listen -port=18666 >/dev/null 2>&1 \
+  || true; then
+  :
+fi
+LOG_BOUND="$PORT_DD/regtest/debug.log"
+if [[ -f "$LOG_BOUND" ]] \
+  && grep -q 'Bound to 0.0.0.0:18666' "$LOG_BOUND" \
+  && grep -q 'Bound to 127.0.0.1:18667' "$LOG_BOUND"; then
+  echo "ok - -listen -port emits Core Bound to dual-bind lines"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -listen -port Bound to dual-bind (log: $([[ -f $LOG_BOUND ]] && cat "$LOG_BOUND" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+
+PORT_DD2="$WORKDIR/port-bind"
+mkdir -p "$PORT_DD2"
+RBITCOIN_NODE="$FAKE" "$SHIM" -datadir="$PORT_DD2" -regtest -listen -port=18666 -bind=0.0.0.0:18777 >/dev/null 2>&1 || true
+LOG_BOUND2="$PORT_DD2/regtest/debug.log"
+if [[ -f "$LOG_BOUND2" ]] \
+  && grep -q 'Bound to 0.0.0.0:18777' "$LOG_BOUND2" \
+  && ! grep -q 'Bound to 0.0.0.0:18666' "$LOG_BOUND2"; then
+  echo "ok - -bind port wins Bound to over -port"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -bind port wins Bound to (log: $([[ -f $LOG_BOUND2 ]] && cat "$LOG_BOUND2" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+
 # Live smoke when a real node binary is on disk (optional in this script).
 REAL=""
 if [[ -n "${RBITCOIN_NODE_REAL:-}" && -x "${RBITCOIN_NODE_REAL}" ]]; then

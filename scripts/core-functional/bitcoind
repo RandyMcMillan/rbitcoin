@@ -109,6 +109,8 @@ IGNORE_FLAGS = frozenset(
         "maxuploadtarget",
         "rest",
         "discover",
+        # Core boolean; we always --listen on 127.0.0.1 (feature_port.py).
+        "listen",
         "listenonion",
         "dnsseed",
         "forcednsseed",
@@ -217,10 +219,23 @@ def _more_verbose_log_level(cur: str | None, new: str) -> str | None:
     return cur
 
 
+def _parse_bind(val: str) -> tuple[str, int | None, bool]:
+    """Parse Core -bind=HOST[:PORT][=onion] → (host, port_or_None, is_onion)."""
+    onion = val.endswith("=onion") or "=onion" in val
+    hostport = val.split("=", 1)[0]
+    if ":" in hostport:
+        host, port_s = hostport.rsplit(":", 1)
+        try:
+            return host, int(port_s), onion
+        except ValueError:
+            return hostport, None, onion
+    return hostport, None, onion
+
+
 def translate(
     argv: list[str],
-) -> tuple[list[str], Path, int, Path | None, Path | None, str | None]:
-    """Return (node argv, datadir, rpcport, blocksdir, walletdir, wallet)."""
+) -> tuple[list[str], Path, int, Path | None, Path | None, str | None, list[str]]:
+    """Return (node argv, datadir, rpcport, blocksdir, walletdir, wallet, bound_lines)."""
     datadir: Path | None = None
     rpcport: str | None = None
     p2pport: str | None = None
@@ -234,6 +249,8 @@ def translate(
     blocksdir_arg: Path | None = None
     walletdir_arg: Path | None = None
     wallet_name: str | None = None
+    # Core-shaped bind announcements for debug.log (feature_port.py).
+    binds: list[tuple[str, int | None, bool]] = []
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -296,15 +313,24 @@ def translate(
         elif key == "rpcport":
             rpcport = val
         elif key == "port":
-            p2pport = val
+            raw = val if val is not None else ""
+            try:
+                n = int(raw)
+            except ValueError:
+                n = -1
+            if n < 1 or n > 65535:
+                print(
+                    f"Error: Invalid port specified in -port: '{raw}'",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            p2pport = str(n)
         elif key == "bind" and val:
-            # Skip Core's extra onion bind (127.0.0.1:P=onion).
-            if val.endswith("=onion") or "=onion" in val:
-                pass
-            else:
-                hostport = val.split("=", 1)[0]
-                if ":" in hostport:
-                    p2pport = hostport.rsplit(":", 1)[1]
+            host, bport, onion = _parse_bind(val)
+            binds.append((host, bport, onion))
+            # Non-onion bind with an explicit port supplies the P2P listen port.
+            if not onion and bport is not None:
+                p2pport = str(bport)
         elif key == "regtest":
             network = "regtest"
         elif key == "uacomment":
@@ -418,7 +444,40 @@ def translate(
     for c in uacomments:
         cmd += [f"--uacomment={c}"]
     cmd += extra_node_args
-    return cmd, node_dir, int(rpcport), blocksdir_arg, walletdir_arg, wallet_name
+
+    # Core debug.log "Bound to …" announcements (feature_port.py).
+    port_n = int(p2pport)
+    bound_lines: list[str] = []
+    non_onion = [(h, p, o) for (h, p, o) in binds if not o]
+    onion_binds = [(h, p, o) for (h, p, o) in binds if o]
+    if non_onion:
+        for host, bport, _ in non_onion:
+            bound_lines.append(f"Bound to {host}:{bport if bport is not None else port_n}")
+        for host, bport, _ in onion_binds:
+            bound_lines.append(
+                f"Bound to {host}:{bport if bport is not None else port_n + 1}"
+            )
+    else:
+        bound_lines.append(f"Bound to 0.0.0.0:{port_n}")
+        if onion_binds:
+            for host, bport, _ in onion_binds:
+                bound_lines.append(
+                    f"Bound to {host}:{bport if bport is not None else port_n + 1}"
+                )
+        else:
+            bound_lines.append(f"Bound to 127.0.0.1:{port_n + 1}")
+    # Actual node listen (map_debuglog / prior harness expectation).
+    bound_lines.append(f"Bound to 127.0.0.1:{port_n}")
+
+    return (
+        cmd,
+        node_dir,
+        int(rpcport),
+        blocksdir_arg,
+        walletdir_arg,
+        wallet_name,
+        bound_lines,
+    )
 
 
 def _try_dir_lock(path: Path, label: Path) -> object | None:
@@ -444,9 +503,15 @@ def _try_dir_lock(path: Path, label: Path) -> object | None:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     print_cmd = "--print-cmd" in argv
-    cmd, node_dir, public_rpc, blocksdir_arg, walletdir_arg, wallet_name = translate(
-        argv
-    )
+    (
+        cmd,
+        node_dir,
+        public_rpc,
+        blocksdir_arg,
+        walletdir_arg,
+        wallet_name,
+        bound_lines,
+    ) = translate(argv)
     pid_path = node_dir / "bitcoind.pid"
     if print_cmd:
         print(" ".join(cmd))
@@ -494,10 +559,8 @@ def main(argv: list[str] | None = None) -> int:
     log_path = node_dir / "debug.log"
     prior = log_path.stat().st_size if log_path.is_file() else 0
     log_f = open(log_path, "ab", buffering=0)
-    for i, a in enumerate(cmd):
-        if a == "--listen" and i + 1 < len(cmd):
-            log_f.write(f"Bound to {cmd[i + 1]}\n".encode())
-            break
+    for line in bound_lines:
+        log_f.write(f"{line}\n".encode())
     map_path = HERE / "debuglog_map.toml"
     rules = load_rules(map_path) if map_path.is_file() else []
     try:

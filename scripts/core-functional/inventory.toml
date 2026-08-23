@@ -231,8 +231,7 @@ status = "run"
 
 [[test]]
 name = "feature_port.py"
-status = "skip"
-reason = "core-log"
+status = "run"
 
 [[test]]
 name = "feature_posix_fs_permissions.py"
@@ -680,9 +679,7 @@ analog = "official: --v1transport add_p2p_connection magic-bytes mismatch (p2p_i
 
 [[test]]
 name = "p2p_invalid_locator.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: locator bounds"
+status = "run"
 
 [[test]]
 name = "p2p_invalid_messages.py"
@@ -916,9 +913,7 @@ analog = "follow-up: Core help categories / converthelp"
 
 [[test]]
 name = "rpc_invalid_address_message.py"
-status = "skip"
-reason = "rpc-dialect"
-analog = "follow-up: validateaddress error text"
+status = "run"
 
 [[test]]
 name = "rpc_invalidateblock.py"

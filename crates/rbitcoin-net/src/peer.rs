@@ -979,6 +979,10 @@ async fn handle_peer_frame(
             // connected on a well-formed (including empty-list) message.
         }
         NetworkMessage::GetHeaders(gh) => {
+            if gh.locator_hashes.len() > MAX_LOCATOR_SZ {
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
             let headers = headers_reply_for_getheaders(hub, gh)?;
             if let Some(s) = session {
                 if let Some(last) = headers.last() {
@@ -990,6 +994,10 @@ async fn handle_peer_frame(
             queue_out(out_tx, NetworkMessage::Headers(headers))?;
         }
         NetworkMessage::GetBlocks(gb) => {
+            if gb.locator_hashes.len() > MAX_LOCATOR_SZ {
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
             let headers = headers_for_peer(
                 hub.cache.as_ref(),
                 hub.query.as_ref(),

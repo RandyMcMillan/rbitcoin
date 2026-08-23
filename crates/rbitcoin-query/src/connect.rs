@@ -313,10 +313,16 @@ impl Query {
         }
     }
 
-    /// Durable watermark plus pending jobs (RAM records already collected).
+    /// Durable watermark plus pending jobs (RAM records already collected),
+    /// never above the live tip (reorg may leave pending jobs until mempool reaccept).
     pub(crate) fn sh_visible_through_height(&self) -> Option<u32> {
-        self.sh_indexed_through_height()
-            .max(self.sh_pending_max_height())
+        let vis = self
+            .sh_indexed_through_height()
+            .max(self.sh_pending_max_height())?;
+        match self.tip_height() {
+            Some(tip) => Some(vis.min(tip.0)),
+            None => None,
+        }
     }
 
     /// Apply queued SH write-behind jobs in height order (one Class B appender).
@@ -379,28 +385,28 @@ impl Query {
     }
 
     pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
-        let result = self.apply_sh_job_inner(&job);
-        if result.is_ok() {
+        let applied = self.apply_sh_job_inner(&job)?;
+        if applied {
             unindex_sh_ram_head(&mut self.sh_ram_head.lock().unwrap(), &job);
         }
-        result
+        Ok(())
     }
 
-    fn apply_sh_job_inner(&self, job: &ShPendingJob) -> Result<(), QueryError> {
+    fn apply_sh_job_inner(&self, job: &ShPendingJob) -> Result<bool, QueryError> {
         use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
         let _appender = self.sh_appender.lock().unwrap();
         if !self.sh_index_enabled() || self.index_mode().is_direct() {
-            return Ok(());
+            return Ok(false);
         }
         if self
             .sh_indexed_through_height()
             .is_some_and(|t| job.height.0 <= t)
         {
-            return Ok(());
+            return Ok(false);
         }
         if self.store.confirmed.get(job.height)? != Some(job.header_fk) {
-            return Ok(());
+            return Ok(false);
         }
 
         let sh_creates = &job.records;
@@ -436,10 +442,10 @@ impl Query {
             let _ = self.store.scripthash.note_include_hwm(tip_sh_max_fk);
             let _ = self.sh_run.publish_seal_watermark(tip_sh_max_fk);
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn drop_sh_pending_from(&self, height: Height) {
+    pub fn drop_sh_pending_from(&self, height: Height) {
         let mut pending = self.sh_pending.lock().unwrap();
         let dropped: Vec<ShPendingJob> = pending
             .iter()
@@ -719,11 +725,24 @@ impl Query {
     ///
     /// Every successful tip shrink logs [`format_disconnect_tip_line`] at **warn**.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
+        self.disconnect_tip_with(true)
+    }
+
+    /// Class C disconnect without dropping RAM SH pending (reorg reaccept first).
+    pub fn disconnect_tip_keep_pending(&self) -> Result<(), QueryError> {
+        self.disconnect_tip_with(false)
+    }
+
+    fn disconnect_tip_with(&self, drop_pending: bool) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let _appender = self.sh_appender.lock().unwrap();
-        self.drop_sh_pending_from(height);
+        if drop_pending {
+            self.drop_sh_pending_from(height);
+        } else {
+            self.clamp_sh_released_before(height);
+        }
         let hash = self
             .header_at_height(height)?
             .map(|(_, rec)| rec.hash)

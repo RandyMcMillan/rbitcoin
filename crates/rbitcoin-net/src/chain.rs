@@ -1788,7 +1788,7 @@ impl ChainHub {
                 self.confirmed.write().unwrap().remove(&th);
             }
             self.query
-                .disconnect_tip()
+                .disconnect_tip_keep_pending()
                 .map_err(|e| NetError::Consensus(e.to_string()))?;
         }
         self.cache.truncate_to_height(keep_height);
@@ -1806,6 +1806,8 @@ impl ChainHub {
             // spend now-immature coinbases must leave (`mempool_reorg`).
             mp.evict_after_reorg();
         }
+        self.query
+            .drop_sh_pending_from(Height(keep_height.saturating_add(1)));
         Ok(())
     }
 
@@ -2900,6 +2902,8 @@ mod tests {
         assert!(in_mp(&mp), "pre-connect: tx must be in mempool overlay");
         assert!(!in_hist(), "pre-connect: tx must not be confirmed history");
 
+        let cold0 = rbitcoin_query::class_c_phase_stats::SH_COLLECT_COLD
+            .load(std::sync::atomic::Ordering::Relaxed);
         let block = hub
             .assemble_block_to_script(spk, vec![spend])
             .expect("assemble");
@@ -2907,6 +2911,12 @@ mod tests {
             AcceptOutcome::Accepted { height } => assert_eq!(height, 101),
             other => panic!("expected Accepted, got {other:?}"),
         }
+        let cold1 = rbitcoin_query::class_c_phase_stats::SH_COLLECT_COLD
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            cold1, cold0,
+            "mempool-origin creates must collect from pins, not cold Class A"
+        );
         assert_eq!(
             hub.query.sh_indexed_through_height(),
             through,
@@ -2936,6 +2946,18 @@ mod tests {
             hist_hits + mp_hits,
             1,
             "tx must not vanish or duplicate across overlay and history"
+        );
+
+        let h101 = hub.tip_hash().expect("spend block");
+        hub.invalidate_block(h101).expect("reorg spend block");
+        assert_eq!(hub.tip_height(), Some(100));
+        assert!(
+            in_mp(&mp),
+            "reorg must restore mempool overlay before dropping RAM SH head"
+        );
+        assert!(
+            !in_hist(),
+            "disconnected spend must not remain confirmed history"
         );
 
         let _ = std::fs::remove_dir_all(dir);

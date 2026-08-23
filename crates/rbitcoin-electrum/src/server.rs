@@ -551,7 +551,7 @@ where
                     let mut hs = header_sub;
                     let mut shs = sh_subs.clone();
                     let mut slot = sh_join.take();
-                    let mut proto = protocol.clone();
+                    let proto = protocol.clone();
                     let stamp = method_stamps_chain_tip(&method_owned);
                     match tokio::task::spawn_blocking(move || {
                         let (r, view) = if stamp {
@@ -571,7 +571,7 @@ where
                                         &mut hs,
                                         &mut shs,
                                         &mut slot,
-                                        &mut proto,
+                                        &proto,
                                         view,
                                         is_asof,
                                     )
@@ -579,7 +579,7 @@ where
                             )
                         } else {
                             (
-                                dispatch_with_join(
+                                dispatch_pinned(
                                     &method_owned,
                                     &params_owned,
                                     &q,
@@ -589,7 +589,9 @@ where
                                     &mut hs,
                                     &mut shs,
                                     &mut slot,
-                                    &mut proto,
+                                    &proto,
+                                    None,
+                                    false,
                                 ),
                                 None,
                             )
@@ -846,7 +848,7 @@ fn restatus_notes(
             query
                 .scripthash_history(sh)
                 .ok()
-                .map(|h| scripthash_status(Some(query), &h))
+                .and_then(|h| scripthash_status(Some(query), &h).ok())
         };
         if let Some(status) = status {
             out.push((*sh, status));
@@ -1076,6 +1078,12 @@ fn dispatch_with_join(
     sh_join: &mut Option<ShJoinSlot>,
     protocol: &mut String,
 ) -> Result<Value, String> {
+    if method == "server.version" {
+        if protocol.is_empty() {
+            *protocol = negotiate_protocol(params)?;
+        }
+        return Ok(json!([SERVER_VERSION, protocol.as_str()]));
+    }
     dispatch_pinned(
         method, params, query, config, chain, mempool, header_sub, sh_subs, sh_join, protocol,
         None, false,
@@ -1092,17 +1100,12 @@ fn dispatch_pinned(
     header_sub: &mut bool,
     sh_subs: &mut HashSet<[u8; 32]>,
     sh_join: &mut Option<ShJoinSlot>,
-    protocol: &mut String,
+    protocol: &str,
     pinned: Option<&ChainView>,
     is_asof: bool,
 ) -> Result<Value, String> {
     match method {
-        "server.version" => {
-            if protocol.is_empty() {
-                *protocol = negotiate_protocol(params)?;
-            }
-            Ok(json!([SERVER_VERSION, protocol.as_str()]))
-        }
+        "server.version" => Ok(json!([SERVER_VERSION, protocol])),
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!(config.banner)),
         "server.donation_address" => Ok(json!(config.donation_address)),
@@ -1155,7 +1158,7 @@ fn dispatch_pinned(
             let (params, asof) = if pinned.is_some() {
                 (params.clone(), None)
             } else {
-                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?
+                take_trailing_asof(method, params, protocol == PROTOCOL_ASOF)?
             };
             let sh = param_scripthash(&params, 0)?;
             let (filter, mut include_mempool) = parse_get_history_window(&params)?;
@@ -1213,7 +1216,7 @@ fn dispatch_pinned(
             let (params, asof) = if pinned.is_some() {
                 (params.clone(), None)
             } else {
-                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?
+                take_trailing_asof(method, params, protocol == PROTOCOL_ASOF)?
             };
             let sh = param_scripthash(&params, 0)?;
             let mut b = if let Some(view) = pinned {
@@ -1250,7 +1253,7 @@ fn dispatch_pinned(
             let (params, asof) = if pinned.is_some() {
                 (params.clone(), None)
             } else {
-                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?
+                take_trailing_asof(method, params, protocol == PROTOCOL_ASOF)?
             };
             let sh = param_scripthash(&params, 0)?;
             let u = if let Some(view) = pinned {
@@ -1304,7 +1307,7 @@ fn dispatch_pinned(
                 let hist = query
                     .scripthash_history_slot(&sh, sh_join)
                     .map_err(|e| e.to_string())?;
-                scripthash_status(Some(query), &hist)
+                scripthash_status(Some(query), &hist)?
             };
             Ok(json!(status))
         }
@@ -1686,26 +1689,31 @@ fn hash_hex_rev(h: &[u8; 32]) -> String {
 fn scripthash_status(
     query: Option<&Query>,
     hist: &[rbitcoin_query::ScriptHashHistoryItem],
-) -> String {
+) -> Result<String, String> {
     if hist.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
     use bitcoin::hashes::{sha256, Hash as _};
     let mut s = String::new();
     for i in hist {
         if i.height > 0 {
-            let bh = query
-                .and_then(|q| q.header_at_height(Height(i.height as u32)).ok())
-                .flatten()
-                .map(|(_, rec)| hash_hex_rev(&rec.hash))
-                .unwrap_or_default();
-            s.push_str(&format!("{}:{}:{}:", txid_hex(&i.txid), i.height, bh));
+            let q = query.ok_or_else(|| "status preimage needs a chain query".to_string())?;
+            let (_, rec) = q
+                .header_at_height(Height(i.height as u32))
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "header missing for confirmed history row".to_string())?;
+            s.push_str(&format!(
+                "{}:{}:{}:",
+                txid_hex(&i.txid),
+                i.height,
+                hash_hex_rev(&rec.hash)
+            ));
         } else {
             s.push_str(&format!("{}:{}:", txid_hex(&i.txid), i.height));
         }
     }
     let hash = sha256::Hash::hash(s.as_bytes());
-    rbitcoin_primitives::hex_encode(hash.to_byte_array())
+    Ok(rbitcoin_primitives::hex_encode(hash.to_byte_array()))
 }
 
 fn scripthash_status_full(query: &Query, mp: &MempoolHub, sh: &[u8; 32]) -> Result<String, String> {
@@ -1730,7 +1738,7 @@ fn scripthash_status_full_slot(
         });
     }
     hist.sort_by_key(|i| i.height);
-    Ok(scripthash_status(Some(query), &hist))
+    Ok(scripthash_status(Some(query), &hist)?)
 }
 
 /// Helper to compute electrum scripthash hex (reversed) from script bytes.
@@ -1883,17 +1891,36 @@ mod tests {
             .unwrap_err()
             .contains("to_height"));
 
-        let empty_status = scripthash_status(None, &[]);
+        let empty_status = scripthash_status(None, &[]).unwrap();
         assert!(empty_status.is_empty());
-        let status = scripthash_status(
+        let missing = scripthash_status(
             None,
             &[rbitcoin_query::ScriptHashHistoryItem {
                 height: 1,
                 txid: [1u8; 32],
                 tx_fk: Fk::NULL,
             }],
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("query"),
+            "confirmed preimage without query: {missing}"
         );
-        assert_eq!(status.len(), 64);
+        let (dir, q) = tmp_store();
+        let missing_hdr = scripthash_status(
+            Some(&q),
+            &[rbitcoin_query::ScriptHashHistoryItem {
+                height: 1,
+                txid: [1u8; 32],
+                tx_fk: Fk::NULL,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            missing_hdr.contains("header missing"),
+            "confirmed row without header: {missing_hdr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
 
         use bitcoin::hashes::Hash;
         let hdr = bitcoin::block::Header {
@@ -3188,7 +3215,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = PROTOCOL_ASOF.to_string();
+                let proto = PROTOCOL_ASOF.to_string();
                 dispatch_pinned(
                     "blockchain.transaction.get",
                     rpc_params,
@@ -3199,7 +3226,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3218,7 +3245,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = PROTOCOL_ASOF.to_string();
+                let proto = PROTOCOL_ASOF.to_string();
                 dispatch_pinned(
                     "blockchain.transaction.get",
                     rpc_params,
@@ -3229,7 +3256,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3249,7 +3276,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = PROTOCOL_ASOF.to_string();
+                let proto = PROTOCOL_ASOF.to_string();
                 dispatch_pinned(
                     "blockchain.transaction.get_merkle",
                     rpc_params,
@@ -3260,7 +3287,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3279,7 +3306,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = PROTOCOL_ASOF.to_string();
+                let proto = PROTOCOL_ASOF.to_string();
                 dispatch_pinned(
                     "blockchain.transaction.get_merkle",
                     rpc_params,
@@ -3290,7 +3317,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3328,7 +3355,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = PROTOCOL_ASOF.to_string();
+                let proto = PROTOCOL_ASOF.to_string();
                 dispatch_pinned(
                     "blockchain.scripthash.get_balance",
                     rpc_params,
@@ -3339,7 +3366,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3443,7 +3470,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = String::new();
+                let proto = String::new();
                 dispatch_pinned(
                     "blockchain.scripthash.get_balance",
                     rpc_params,
@@ -3454,7 +3481,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3475,7 +3502,7 @@ mod tests {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
-                let mut proto = String::new();
+                let proto = String::new();
                 dispatch_pinned(
                     "blockchain.scripthash.get_balance",
                     rpc_params,
@@ -3486,7 +3513,7 @@ mod tests {
                     &mut hs,
                     &mut subs,
                     &mut slot,
-                    &mut proto,
+                    &proto,
                     view,
                     is_asof,
                 )
@@ -3762,7 +3789,7 @@ mod tests {
         };
         let full_hist = q.scripthash_history(&sh_bytes).unwrap();
         assert_eq!(full_hist.len(), 4);
-        assert_eq!(scripthash_status(Some(&q), &full_hist), status_s);
+        assert_eq!(scripthash_status(Some(&q), &full_hist).unwrap(), status_s);
 
         let _ = prev;
         let _ = std::fs::remove_dir_all(&dir);
@@ -4161,7 +4188,7 @@ mod tests {
         q.connect_block(Height(1), &h1, &[t1.clone()]).unwrap();
         let sh = script_hash(&[0x51]);
         let hist_a = q.scripthash_history(&sh).unwrap();
-        let status_a = scripthash_status(Some(&q), &hist_a);
+        let status_a = scripthash_status(Some(&q), &hist_a).unwrap();
         let legacy = {
             use bitcoin::hashes::{sha256, Hash as _};
             let mut s = String::new();
@@ -4188,7 +4215,7 @@ mod tests {
         );
         q.connect_block(Height(1), &h1b, &[t1]).unwrap();
         let hist_b = q.scripthash_history(&sh).unwrap();
-        let status_b = scripthash_status(Some(&q), &hist_b);
+        let status_b = scripthash_status(Some(&q), &hist_b).unwrap();
         assert_eq!(
             hist_a
                 .iter()

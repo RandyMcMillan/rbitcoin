@@ -1,7 +1,7 @@
 //! Esplora HTTP listener (axum + tower limits) and wallet WebSocket live path.
 
 use crate::handlers;
-use crate::tx_json::{build_tx_json, tx_status_json, tx_status_json_in};
+use crate::tx_json::{build_tx_json, tx_status_json_in};
 use crate::ws;
 use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
 use axum::http::request::Parts;
@@ -638,6 +638,7 @@ fn encode_header_hex(hdr: &bitcoin::block::Header) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_json::tx_status_json;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::{Query, TxApply};
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};

@@ -322,10 +322,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
-    // Tweaks are not write-through in Direct. Once so both sites do not launch two walkers.
-    if config.shindex {
-        spawn_sh_writebehind(Arc::clone(&node.hub.query), Arc::clone(&shutdown.flag));
-    }
+    // One Class B appender thread. Join it at shutdown so apply does not race flush.
+    let sh_writebehind = if config.shindex {
+        Some(spawn_sh_writebehind(
+            Arc::clone(&node.hub.query),
+            Arc::clone(&shutdown.flag),
+        ))
+    } else {
+        None
+    };
     if config.sptweaks && node.hub.query.index_mode().is_tip() {
         spawn_sptweaks_backfill(
             Arc::clone(&node.hub.query),
@@ -978,6 +983,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             info!("rpc: stop requested via JSON-RPC");
         }
         h.shutdown().await;
+    }
+    shutdown.request();
+    if let Some(h) = sh_writebehind {
+        let _ = h.join();
     }
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.

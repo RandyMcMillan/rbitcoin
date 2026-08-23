@@ -3,7 +3,8 @@
 use crate::handlers;
 use crate::tx_json::{build_tx_json, tx_status_json, tx_status_json_in};
 use crate::ws;
-use axum::extract::{Path, Query as AxumQuery, Request, State};
+use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -15,9 +16,10 @@ use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_net::{MempoolHub, TipEvent};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{ChainView, Query, ShJoinSlot};
+use rbitcoin_query::{ChainView, ChainViewKind, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
 use serde::Deserialize;
+use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -105,10 +107,52 @@ pub(crate) struct AsOfQuery {
     pub asof: Option<String>,
 }
 
+/// Parsed `?asof=` (None if omitted). Invalid hex is 404.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AsOf(pub Option<[u8; 32]>);
+
+impl FromRequestParts<AppState> for AsOf {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let AxumQuery(q) = AxumQuery::<AsOfQuery>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| not_found())?;
+        parse_asof_param(&q).map(AsOf).map_err(|_| not_found())
+    }
+}
+
 pub(crate) fn parse_asof_param(q: &AsOfQuery) -> Result<Option<[u8; 32]>, ()> {
     match q.asof.as_deref() {
         None => Ok(None),
         Some(s) => parse_hash32(s).map(Some),
+    }
+}
+
+pub(crate) fn attach_chain_view(mut resp: Response, view: ChainView) -> Response {
+    resp.extensions_mut().insert(view);
+    resp
+}
+
+pub(crate) fn maybe_attach_view(resp: Response, view: Option<ChainView>) -> Response {
+    match view {
+        Some(v) => attach_chain_view(resp, v),
+        None => resp,
+    }
+}
+
+pub(crate) fn pin_or_reject(
+    query: &Query,
+    kind: ChainViewKind,
+    asof: Option<[u8; 32]>,
+) -> Result<Option<ChainView>, Response> {
+    match query.pin_view(kind, asof.as_ref()) {
+        Ok(None) if asof.is_some() => Err(not_found()),
+        Ok(v) => Ok(v),
+        Err(e) => Err(store_err(e)),
     }
 }
 
@@ -131,24 +175,44 @@ fn path_uses_sh_view(path: &str) -> bool {
     path.starts_with("/address/") || path.starts_with("/scripthash/")
 }
 
+/// COMPAT.md: `?asof=` only on tx status/outspend(s) and address/scripthash
+/// `/`, `/utxo`, `/txs`, `/txs/chain` (not `/txs/mempool`).
+fn path_accepts_asof(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["tx", _, "status"] | ["tx", _, "outspends"] | ["tx", _, "outspend", _] => true,
+        ["address", _] | ["scripthash", _] => true,
+        ["address", _, "utxo"] | ["scripthash", _, "utxo"] => true,
+        ["address", _, "txs"] | ["scripthash", _, "txs"] => true,
+        ["address", _, "txs", "chain"] | ["scripthash", _, "txs", "chain"] => true,
+        ["address", _, "txs", "chain", _] | ["scripthash", _, "txs", "chain", _] => true,
+        _ => false,
+    }
+}
+
+fn path_never_pins(path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.as_slice() {
+        ["mempool"] | ["mempool", _] => true,
+        ["fee-estimates"] => true,
+        ["tx"] | ["txs", "package"] => true,
+        ["address", _, "txs", "mempool"] | ["scripthash", _, "txs", "mempool"] => true,
+        _ => false,
+    }
+}
+
 async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let asof = match asof_hash_from_uri(req.uri()) {
         Ok(v) => v,
         Err(()) => return not_found(),
     };
-    let sh_view = path_uses_sh_view(req.uri().path());
-    let view = if let Some(hash) = asof {
-        let pin = if sh_view {
-            st.query.pin_sh_chain_view_at(&hash)
-        } else {
-            st.query.pin_chain_view_at(&hash)
-        };
-        match pin {
-            Ok(Some(v)) => Some(v),
-            Ok(None) => return not_found(),
-            Err(e) => return store_err(e),
-        }
-    } else if sh_view {
+    let path = req.uri().path().to_string();
+    if asof.is_some() && !path_accepts_asof(&path) {
+        return not_found();
+    }
+    let pre_view = if path_never_pins(&path) || asof.is_some() {
+        None
+    } else if path_uses_sh_view(&path) {
         match st.query.pin_sh_chain_view() {
             Ok(v) => v,
             Err(e) => return store_err(e),
@@ -160,6 +224,7 @@ async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Nex
         }
     };
     let mut resp = next.run(req).await;
+    let view = resp.extensions().get::<ChainView>().copied().or(pre_view);
     let Some(view) = view else {
         return resp;
     };
@@ -491,29 +556,24 @@ async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Res
 async fn tx_status(
     State(st): State<AppState>,
     Path(txid_hex): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     handlers::spawn_join(move || {
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
         match st.query.tx_fk_by_txid(&txid) {
             Ok(Some(fk)) => {
-                let status = if let Some(hash) = asof {
-                    match st.query.pin_chain_view_at(&hash) {
-                        Ok(Some(view)) => tx_status_json_in(&st.query, fk, &view),
-                        Ok(None) => return not_found(),
-                        Err(e) => return store_err(e),
-                    }
-                } else {
-                    tx_status_json(&st.query, fk)
+                let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
+                    Ok(v) => v,
+                    Err(r) => return r,
+                };
+                let status = match &view {
+                    Some(v) => tx_status_json_in(&st.query, fk, v),
+                    None => Ok(json!({ "confirmed": false })),
                 };
                 match status {
-                    Ok(v) => Json(v).into_response(),
+                    Ok(v) => maybe_attach_view(Json(v).into_response(), view),
                     Err(e) => store_err(e),
                 }
             }
@@ -901,6 +961,38 @@ mod tests {
         .await;
         assert_eq!(st, 404);
 
+        let (st, raw, _) = http_get_raw(addr, &format!("/tx/{create_hex}?asof={asof0}")).await;
+        assert_eq!(st, 404, "asof is not documented on GET /tx/:txid");
+        assert!(
+            header_value(&raw, HDR_CHAIN_TIP).is_none(),
+            "rejected asof must not stamp a lying tip"
+        );
+
+        let (st, _, _) = http_get_raw(addr, &format!("/mempool?asof={asof0}")).await;
+        assert_eq!(st, 404, "asof is not documented on /mempool");
+
+        q.disconnect_tip().unwrap();
+        let (mut h1b, t1b) = coinbase(1, hfk0, Some(hash0));
+        h1b.nonce = h1.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+        let (st, raw, body) = http_get_raw(addr, "/mempool").await;
+        assert_eq!(
+            st, 200,
+            "mempool must not 503 on same-height replace: {body}"
+        );
+        assert!(
+            header_value(&raw, HDR_CHAIN_TIP).is_none(),
+            "mempool must not pin/stamp a chain view"
+        );
+
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -931,6 +1023,23 @@ mod tests {
         assert_eq!(cfg.max_ws_message_bytes, DEFAULT_MAX_WS_MESSAGE_BYTES);
         assert_eq!(cfg.max_track_addresses, DEFAULT_MAX_TRACK_ADDRESSES);
         assert_eq!(cfg.max_track_txs, DEFAULT_MAX_TRACK_TXS);
+    }
+
+    #[test]
+    fn asof_query_is_gated_to_documented_routes() {
+        assert!(path_accepts_asof("/tx/ab/status"));
+        assert!(path_accepts_asof("/tx/ab/outspends"));
+        assert!(path_accepts_asof("/tx/ab/outspend/0"));
+        assert!(path_accepts_asof("/scripthash/ab/utxo"));
+        assert!(path_accepts_asof("/address/bcrt1q/txs/chain/cd"));
+        assert!(!path_accepts_asof("/tx/ab"));
+        assert!(!path_accepts_asof("/mempool"));
+        assert!(!path_accepts_asof("/scripthash/ab/txs/mempool"));
+        assert!(path_never_pins("/mempool"));
+        assert!(path_never_pins("/mempool/txids"));
+        assert!(path_never_pins("/fee-estimates"));
+        assert!(path_never_pins("/tx"));
+        assert!(!path_never_pins("/tx/ab"));
     }
 
     /// Phase A: block-height, header, tx hex, tx status on one fixture store.

@@ -18,6 +18,7 @@ from decimal import Decimal
 from typing import Any
 
 from rpc_proxy import RpcError
+from core_dest import decode_destination
 from rpc_util import (
     COIN,
     ERR_INVALID_ADDRESS,
@@ -305,20 +306,27 @@ class WalletHub:
         return rec.addrs[addr_type]
 
     def getaddressinfo(self, params: Any) -> dict[str, Any]:
-        addr = str(pget(params, 0, "address"))
+        addr = pget(params, 0, "address")
+        if not isinstance(addr, str):
+            raise RpcError(ERR_TYPE, "address must be a string")
+        detail, err, _locs = decode_destination(addr)
+        if detail is None:
+            raise RpcError(ERR_INVALID_ADDRESS, err or "Invalid address")
         rec = self._cur().addr_index.get(addr)
         ismine = rec is not None
-        return {
-            "address": addr,
-            "scriptPubKey": "",
+        out: dict[str, Any] = {
+            "address": detail["address"],
+            "scriptPubKey": detail["scriptPubKey"],
             "ismine": ismine,
             "solvable": ismine,
             "iswatchonly": False,
-            "isscript": False,
-            "iswitness": addr.startswith("bcrt1"),
             "ischange": False,
             "labels": [rec.label] if rec and rec.label else [""],
         }
+        for k in ("isscript", "iswitness", "witness_version", "witness_program"):
+            if k in detail:
+                out[k] = detail[k]
+        return out
 
     def _ours(self, w: Wallet, addr: str | None) -> bool:
         return bool(addr) and addr in w.addr_index

@@ -17,6 +17,8 @@ HERE = Path(__file__).resolve().parent
 CORE_FUNC = HERE.parents[1] / "third_party" / "bitcoin" / "test" / "functional"
 if str(CORE_FUNC) not in sys.path:
     sys.path.insert(0, str(CORE_FUNC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 from test_framework.address import (  # noqa: E402
     address_to_scriptpubkey,
@@ -70,6 +72,8 @@ from test_framework.script_util import (  # noqa: E402
     script_to_p2sh_p2wsh_script,
     script_to_p2wsh_script,
 )
+
+from core_dest import decode_destination  # noqa: E402
 
 ERR_MISC = -1
 ERR_INVALID_ADDRESS = -5
@@ -1162,21 +1166,27 @@ def _wsh_miniscript_desc(raw: bytes) -> str | None:
 
 
 def validateaddress(params: Any) -> dict[str, Any]:
+    if isinstance(params, list) and len(params) == 0:
+        raise RpcError(
+            ERR_MISC, "Return information about the given bitcoin address."
+        )
+    if isinstance(params, dict) and "address" not in params and not (
+        isinstance(params.get("args"), (list, tuple)) and params["args"]
+    ):
+        raise RpcError(
+            ERR_MISC, "Return information about the given bitcoin address."
+        )
     addr = pget(params, 0, "address")
+    if addr is None:
+        raise RpcError(
+            ERR_TYPE, "JSON value of type null is not of expected type string"
+        )
     if not isinstance(addr, str):
         raise RpcError(ERR_TYPE, "address must be a string")
-    try:
-        spk = address_to_scriptpubkey(addr)
-    except Exception:
-        return {"isvalid": False}
-    raw = bytes(spk)
-    return {
-        "isvalid": True,
-        "address": addr,
-        "scriptPubKey": raw.hex(),
-        "isscript": _is_p2sh(raw) or _is_p2wsh(raw),
-        "iswitness": (len(raw) >= 2 and raw[0] in (0, 0x51) and raw[1] in (20, 32, 2)),
-    }
+    detail, err, locs = decode_destination(addr)
+    if detail is None:
+        return {"isvalid": False, "error_locations": locs, "error": err}
+    return {"isvalid": True, **detail}
 
 
 def deriveaddresses(params: Any) -> list[str]:

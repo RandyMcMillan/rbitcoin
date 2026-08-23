@@ -139,5 +139,29 @@ except RpcError as e:
     assert e.code == ERR_TYPE, e.code
     assert e.message == "JSON value of type null is not of expected type string", e.message
 
+# getaddressinfo raises the same DecodeDestination error string (wallet section).
+from core_dest import decode_destination
+from rpc_wallet import WalletHub
+
+ERR_INVALID_ADDRESS = -5
+detail, _err, _locs = decode_destination("bcrt1p424qxxyd0r")
+assert detail is not None and "isscript" not in detail and detail["iswitness"] is True
+
+class _FakeProxy:
+    def register(self, *a, **k):
+        return None
+
+hub = WalletHub(_FakeProxy(), "http://127.0.0.1:9")
+try:
+    hub.getaddressinfo(
+        [
+            "bcrt1s0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7v8n0nx0muaewav25430mtr"
+        ]
+    )
+    raise SystemExit("expected getaddressinfo RpcError")
+except RpcError as e:
+    assert e.code == ERR_INVALID_ADDRESS, e.code
+    assert e.message == "Invalid Bech32 address program size (41 bytes)", e.message
+
 print("rpc_util_validateaddress: ok")
 PY

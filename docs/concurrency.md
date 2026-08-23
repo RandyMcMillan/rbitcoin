@@ -45,7 +45,7 @@ The 2-wave split is sealed age, not an IO flag.
 |------|--------|
 | `peer_session` (split read/write) | Serve reconstruct + accept tip blocks via **`accept_and_connect_block`** → **`confirm_wire_run`** (same load→scripts→commit). Class C tip does **not** join SH `put_create`. |
 | `rbtc-sh-wb` | **One** Class B scripthash appender (tip follow). Confirm enqueues pin identity; this thread `put_create_batch_append` then advances `sh_indexed_through`. |
-| Electrum / Esplora | Confirmed SH reads pin `ChainView` at the SH watermark (not live tip). Headers subscribe is live tip. |
+| Electrum / Esplora | Confirmed SH reads join durable index **plus pending write-behind records** and pin that visible height (live tip while jobs sit in RAM). Headers subscribe is live tip. |
 | Epoch finalize | Single-threaded control path; flushes table maps / fd durability |
 
 ## Index modes (`IndexMode`)

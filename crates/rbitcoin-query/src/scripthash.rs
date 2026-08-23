@@ -405,6 +405,11 @@ impl Query {
                 fks.push(fk);
             }
         }
+        for fk in self.pending_sh_create_fks(scripthash) {
+            if self.confirmed_strong_in(fk, view)? && !fks.contains(&fk) {
+                fks.push(fk);
+            }
+        }
         if let Some(to) = to_height {
             let heights = self.store.tx_height_get_batch(&fks)?;
             if heights.len() != fks.len() {
@@ -822,10 +827,15 @@ impl Query {
         height: Height,
     ) -> Result<Vec<Fk>, QueryError> {
         let entries = self.store.scripthash.create_fks(scripthash)?;
-        if entries.is_empty() {
+        let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
+        for fk in self.pending_sh_create_fks(scripthash) {
+            if let Some(id) = fk.get() {
+                posting.push(id);
+            }
+        }
+        if posting.is_empty() {
             return Ok(Vec::new());
         }
-        let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
         posting.sort_unstable();
         posting.dedup();
         let block_fks = self.block_tx_fks(height)?;

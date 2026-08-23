@@ -380,12 +380,6 @@ where
                             let subs: Vec<[u8; 32]> = sh_subs.iter().copied().collect();
                             let height = t.height;
                             let restatus_all = t.reorg_from_height.is_some();
-                            let sh_caught_up = q
-                                .sh_indexed_through_height()
-                                .is_some_and(|h| h >= height);
-                            if !restatus_all && !sh_caught_up {
-                                continue;
-                            }
                             let notes = tokio::task::spawn_blocking(move || {
                                 let mut out = Vec::new();
                                 for sh in subs {
@@ -2983,7 +2977,7 @@ mod tests {
     }
 
     #[test]
-    fn electrum_sh_stamp_lags_live_tip_until_apply() {
+    fn electrum_sh_stamp_follows_pending_before_durable_apply() {
         use rbitcoin_primitives::{Fk, Height};
         use rbitcoin_query::TxApply;
         use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
@@ -3092,8 +3086,8 @@ mod tests {
         );
         assert!(out.is_ok(), "{out:?}");
         let v = view.unwrap();
-        assert_eq!(v.hash, merkle);
-        assert_eq!(v.height, Height(0));
+        assert_eq!(v.hash, hash1);
+        assert_eq!(v.height, Height(1));
 
         q.apply_sh_pending().unwrap();
         let (out, view) = electrum_at_chain_view(

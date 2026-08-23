@@ -39,10 +39,12 @@ before 1.0).
 ### Changed
 
 - **Tip accept does not wait on scripthash:** Class C publishes `confirmed[]`
-  then enqueues collected SH records; one `rbtc-sh-wb` appender seeds the
-  durable index. Wallet SH reads join **pending RAM records** at live tip so
-  mempool can drop confirmed txs without a hole. Headers subscribe stays
-  live tip. `tip: accept` now `sh_lag=`; worker logs `sh: apply h= wall= lag=`.
+  then enqueues collected SH records onto a RAM head; `rbtc-sh-wb` seeds the
+  durable index only after tip announce (`release_sh_writebehind`). Wallet SH
+  reads join that RAM head at live tip so mempool can drop confirmed txs
+  without a hole. Reorg reaccepts into the mempool overlay before dropping
+  pending. Headers subscribe stays live tip. `tip: accept` now `sh_lag=`;
+  worker logs `sh: apply h= wall= lag=`.
 
 - **SH workers follow free RAM:** recollect and k-way materialize default to
   at most **one worker per 1.5 GiB** host free RAM (Linux `MemAvailable`,

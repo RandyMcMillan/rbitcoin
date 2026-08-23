@@ -582,7 +582,7 @@ mod tests {
         let intake2 = q.block_queue_wave_intake(&[7, 8]);
         assert_eq!(intake2.resolved.len(), 1);
         assert_eq!(intake2.raw.len(), 1);
-        assert_eq!(intake2.raw[0], 8);
+        assert_eq!(intake2.raw[0], (8, 0));
         q.block_queue_drop_resolved_from(7);
         assert!(q.block_queue_resolved(7).is_none());
         assert_eq!(q.block_queue_dequeue_height(8).unwrap(), 1);

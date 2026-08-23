@@ -1552,12 +1552,19 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
+        {
+            let g = self.block_queue.lock().unwrap();
+            if let Some(id) = g.id_for_height(height) {
+                return Ok(BlockQueueOffer { queue_id: id });
+            }
+        }
+        let n_inputs = rbitcoin_store::block_wire_input_count(payload);
         let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
         }
-        let id = g.enqueue_vec(height, hash, header_fk, owned)?;
+        let id = g.enqueue_vec(height, hash, header_fk, owned, n_inputs)?;
         Ok(BlockQueueOffer { queue_id: id })
     }
 
@@ -1569,9 +1576,10 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<u64, QueryError> {
+        let n_inputs = rbitcoin_store::block_wire_input_count(payload);
         let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
-        Ok(g.enqueue_vec(height, hash, header_fk, owned)?)
+        Ok(g.enqueue_vec(height, hash, header_fk, owned, n_inputs)?)
     }
 
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).
@@ -1799,7 +1807,7 @@ impl Query {
             if let Some(w) = g.resolved.get(&h) {
                 out.resolved.push((h, w.clone()));
             } else if g.has_raw(h) {
-                out.raw.push(h);
+                out.raw.push((h, g.input_count_at(h).unwrap_or(0)));
             }
         }
         out

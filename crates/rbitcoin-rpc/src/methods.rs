@@ -1277,6 +1277,17 @@ fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Va
                 1, vsize, fee, 1, vsize, fee, modified, modified, modified, weight,
             ),
         };
+    let (depends, spentby) = match mp.depends_spentby(txid) {
+        Some((d, s)) => (
+            d.into_iter()
+                .map(|t| hash_hex_display(&t.to_byte_array()))
+                .collect::<Vec<_>>(),
+            s.into_iter()
+                .map(|t| hash_hex_display(&t.to_byte_array()))
+                .collect::<Vec<_>>(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
     json!({
         "vsize": vsize,
         "weight": weight,
@@ -1294,6 +1305,8 @@ fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Va
         "ancestorfees": afee,
         "chunkweight": chunk_w,
         "unbroadcast": mp.is_unbroadcast(txid),
+        "depends": depends,
+        "spentby": spentby,
         "fees": {
             "base": sat_btc_json(fee as i64),
             "modified": sat_btc_json(modified),

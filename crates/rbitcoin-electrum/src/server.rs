@@ -23,6 +23,8 @@ use tokio::task::JoinHandle;
 
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
+// Dialect version: trailing `asof:<blockhash>`. Not a dotted-int; `protocol_max` stays 1.4.2.
+const PROTOCOL_ASOF: &str = "1.4.2-asof";
 /// First `server.version` element. Cake Wallet `getNodeIsElectrs()` requires
 /// this string (lowercased) to contain `electrs` before it will probe
 /// `blockchain.tweaks.subscribe [0, 1, false]`.
@@ -341,6 +343,7 @@ where
     let mut header_sub = false;
     let mut sh_subs: HashSet<[u8; 32]> = HashSet::new();
     let mut sh_join: Option<ShJoinSlot> = None;
+    let mut protocol = String::new();
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
     let idle = config.idle_timeout();
@@ -507,6 +510,7 @@ where
                         &mut header_sub,
                         &mut sh_subs,
                         &mut sh_join,
+                        &mut protocol,
                     )
                 } else {
                     let q = Arc::clone(&query);
@@ -518,22 +522,30 @@ where
                     let mut hs = header_sub;
                     let mut shs = sh_subs.clone();
                     let mut slot = sh_join.take();
+                    let mut proto = protocol.clone();
                     let stamp = method_stamps_chain_tip(&method_owned);
                     match tokio::task::spawn_blocking(move || {
                         let (r, view) = if stamp {
-                            electrum_at_chain_view(&q, |q| {
-                                dispatch_with_join(
-                                    &method_owned,
-                                    &params_owned,
-                                    q,
-                                    &cfg,
-                                    &p,
-                                    mp.as_deref(),
-                                    &mut hs,
-                                    &mut shs,
-                                    &mut slot,
-                                )
-                            })
+                            electrum_at_chain_view(
+                                &q,
+                                &method_owned,
+                                &params_owned,
+                                proto.as_str() == PROTOCOL_ASOF,
+                                |q| {
+                                    dispatch_with_join(
+                                        &method_owned,
+                                        &params_owned,
+                                        q,
+                                        &cfg,
+                                        &p,
+                                        mp.as_deref(),
+                                        &mut hs,
+                                        &mut shs,
+                                        &mut slot,
+                                        &mut proto,
+                                    )
+                                },
+                            )
                         } else {
                             (
                                 dispatch_with_join(
@@ -546,6 +558,7 @@ where
                                     &mut hs,
                                     &mut shs,
                                     &mut slot,
+                                    &mut proto,
                                 ),
                                 None,
                             )
@@ -849,30 +862,53 @@ fn rpc_result(id: &Value, result: &Value, view: Option<&ChainView>) -> Value {
     obj
 }
 
-fn electrum_at_chain_view<F>(query: &Query, mut f: F) -> (Result<Value, String>, Option<ChainView>)
+fn electrum_at_chain_view<F>(
+    query: &Query,
+    method: &str,
+    params: &Value,
+    asof_ok: bool,
+    mut f: F,
+) -> (Result<Value, String>, Option<ChainView>)
 where
     F: FnMut(&Query) -> Result<Value, String>,
 {
-    const BOUND: u32 = 8;
-    for _ in 0..BOUND {
-        let view = match query.pin_chain_view() {
-            Ok(v) => v,
-            Err(e) => return (Err(e.to_string()), None),
-        };
-        let Some(view) = view else {
-            return (f(query), None);
-        };
-        let out = f(query);
-        if out.is_err() {
-            return (out, None);
+    match take_trailing_asof(method, params, asof_ok) {
+        Ok((_, Some(hash))) => match query.pin_chain_view_at(&hash) {
+            Ok(Some(view)) => {
+                let out = f(query);
+                match view.still_live(query) {
+                    Ok(true) => (out, Some(view)),
+                    Ok(false) => (Err("asof not on chain".into()), None),
+                    Err(e) => (Err(e.to_string()), None),
+                }
+            }
+            Ok(None) => (Err("asof not on chain".into()), None),
+            Err(e) => (Err(e.to_string()), None),
+        },
+        Ok((_, None)) => {
+            const BOUND: u32 = 8;
+            for _ in 0..BOUND {
+                let view = match query.pin_chain_view() {
+                    Ok(v) => v,
+                    Err(e) => return (Err(e.to_string()), None),
+                };
+                let Some(view) = view else {
+                    return (f(query), None);
+                };
+                let out = f(query);
+                if out.is_err() {
+                    return (out, None);
+                }
+                match view.still_live(query) {
+                    Ok(true) => return (out, Some(view)),
+                    Ok(false) => continue,
+                    Err(e) => return (Err(e.to_string()), None),
+                }
+            }
+            (Err("chain view moved".into()), None)
         }
-        match view.still_live(query) {
-            Ok(true) => return (out, Some(view)),
-            Ok(false) => continue,
-            Err(e) => return (Err(e.to_string()), None),
-        }
+        Err(e) => (Err(e), None),
     }
-    (Err("chain view moved".into()), None)
 }
 
 #[cfg(test)]
@@ -887,8 +923,18 @@ fn dispatch(
     sh_subs: &mut HashSet<[u8; 32]>,
 ) -> Result<Value, String> {
     let mut slot = None;
+    let mut protocol = String::new();
     dispatch_with_join(
-        method, params, query, config, chain, mempool, header_sub, sh_subs, &mut slot,
+        method,
+        params,
+        query,
+        config,
+        chain,
+        mempool,
+        header_sub,
+        sh_subs,
+        &mut slot,
+        &mut protocol,
     )
 }
 
@@ -902,9 +948,15 @@ fn dispatch_with_join(
     header_sub: &mut bool,
     sh_subs: &mut HashSet<[u8; 32]>,
     sh_join: &mut Option<ShJoinSlot>,
+    protocol: &mut String,
 ) -> Result<Value, String> {
     match method {
-        "server.version" => Ok(json!([SERVER_VERSION, PROTOCOL_MAX])),
+        "server.version" => {
+            if protocol.is_empty() {
+                *protocol = negotiate_protocol(params)?;
+            }
+            Ok(json!([SERVER_VERSION, protocol.as_str()]))
+        }
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!(config.banner)),
         "server.donation_address" => Ok(json!(config.donation_address)),
@@ -923,6 +975,8 @@ fn dispatch_with_join(
             "silent_payments": [0],
             "tweaks": true,
             "chain_tip": true,
+            "asof": true,
+            "asof_protocol": PROTOCOL_ASOF,
         })),
         "blockchain.headers.subscribe" => {
             *header_sub = true;
@@ -952,11 +1006,24 @@ fn dispatch_with_join(
             Ok(json!({"count": n, "hex": hexes, "max": 2016}))
         }
         "blockchain.scripthash.get_history" => {
-            let sh = param_scripthash(params, 0)?;
-            let (filter, include_mempool) = parse_get_history_window(params)?;
-            let mut hist = query
-                .scripthash_history_filtered_slot(&sh, &filter, sh_join)
-                .map_err(|e| e.to_string())?;
+            let (params, asof) =
+                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?;
+            let sh = param_scripthash(&params, 0)?;
+            let (filter, mut include_mempool) = parse_get_history_window(&params)?;
+            let mut hist = if let Some(hash) = asof {
+                include_mempool = false;
+                let view = query
+                    .pin_chain_view_at(&hash)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "asof not on chain".to_string())?;
+                query
+                    .scripthash_history_filtered_in(&sh, &filter, &view)
+                    .map_err(|e| e.to_string())?
+            } else {
+                query
+                    .scripthash_history_filtered_slot(&sh, &filter, sh_join)
+                    .map_err(|e| e.to_string())?
+            };
             // Confirmed rows are height-asc from the filter. Mempool (if any) is
             // appended as a tail — Electrum Cash: only when to_height is -1/omitted.
             if include_mempool {
@@ -982,20 +1049,45 @@ fn dispatch_with_join(
             Ok(Value::Array(arr))
         }
         "blockchain.scripthash.get_balance" => {
-            let sh = param_scripthash(params, 0)?;
-            let mut b = query
-                .scripthash_balance_slot(&sh, sh_join)
-                .map_err(|e| e.to_string())?;
-            if let Some(mp) = mempool {
-                b.unconfirmed = mp.scripthash_unconfirmed_delta(&sh);
+            let (params, asof) =
+                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?;
+            let sh = param_scripthash(&params, 0)?;
+            let mut b = if let Some(hash) = asof {
+                let view = query
+                    .pin_chain_view_at(&hash)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "asof not on chain".to_string())?;
+                query
+                    .scripthash_balance_in(&sh, &view)
+                    .map_err(|e| e.to_string())?
+            } else {
+                query
+                    .scripthash_balance_slot(&sh, sh_join)
+                    .map_err(|e| e.to_string())?
+            };
+            if asof.is_none() {
+                if let Some(mp) = mempool {
+                    b.unconfirmed = mp.scripthash_unconfirmed_delta(&sh);
+                }
             }
             Ok(json!({"confirmed": b.confirmed, "unconfirmed": b.unconfirmed}))
         }
         "blockchain.scripthash.listunspent" => {
-            let sh = param_scripthash(params, 0)?;
-            let u =
+            let (params, asof) =
+                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?;
+            let sh = param_scripthash(&params, 0)?;
+            let u = if let Some(hash) = asof {
+                let view = query
+                    .pin_chain_view_at(&hash)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "asof not on chain".to_string())?;
+                query
+                    .scripthash_listunspent_in(&sh, &view)
+                    .map_err(|e| e.to_string())?
+            } else {
                 crate::unspent::scripthash_utxos_with_mempool_slot(query, mempool, &sh, sh_join)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+            };
             let arr: Vec<Value> = u
                 .iter()
                 .map(|x| {
@@ -1194,6 +1286,116 @@ fn param_i64(params: &Value, idx: usize) -> Result<i64, String> {
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .ok_or_else(|| format!("param {idx} expected integer"))
+}
+
+fn method_accepts_asof(method: &str) -> bool {
+    matches!(
+        method,
+        "blockchain.scripthash.get_history"
+            | "blockchain.scripthash.get_balance"
+            | "blockchain.scripthash.listunspent"
+    )
+}
+
+fn parse_blockhash32(s: &str) -> Option<[u8; 32]> {
+    let mut bytes = rbitcoin_primitives::hex_decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    bytes.reverse();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn protocol_tuple(s: &str) -> Option<Vec<u32>> {
+    if s.is_empty() {
+        return None;
+    }
+    s.split('.').map(|p| p.parse().ok()).collect()
+}
+
+fn protocol_string(parts: &[u32]) -> String {
+    parts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn pick_dotted(cmin_s: &str, cmax_s: &str) -> Result<String, String> {
+    let cmin =
+        protocol_tuple(cmin_s).ok_or_else(|| format!("unsupported protocol version {cmin_s}"))?;
+    let cmax =
+        protocol_tuple(cmax_s).ok_or_else(|| format!("unsupported protocol version {cmax_s}"))?;
+    let smin = protocol_tuple(PROTOCOL_MIN).expect("PROTOCOL_MIN");
+    let smax = protocol_tuple(PROTOCOL_MAX).expect("PROTOCOL_MAX");
+    let lo = if cmin < smin { smin } else { cmin };
+    let hi = if cmax < smax { cmax } else { smax };
+    if hi < lo {
+        return Err("unsupported protocol version".into());
+    }
+    Ok(protocol_string(&hi))
+}
+
+fn negotiate_protocol(params: &Value) -> Result<String, String> {
+    let pv = params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .unwrap_or(&Value::Null);
+    if pv.is_null() {
+        return Ok(PROTOCOL_MAX.to_string());
+    }
+    if let Some(s) = pv.as_str() {
+        if s == PROTOCOL_ASOF {
+            return Ok(PROTOCOL_ASOF.to_string());
+        }
+        return pick_dotted(s, s);
+    }
+    let Some(range) = pv.as_array() else {
+        return Err("protocol_version expected string or [min, max]".into());
+    };
+    if range.len() != 2 {
+        return Err("protocol_version range must be [min, max]".into());
+    }
+    let a = range[0]
+        .as_str()
+        .ok_or("protocol_version range expected strings")?;
+    let b = range[1]
+        .as_str()
+        .ok_or("protocol_version range expected strings")?;
+    if a == PROTOCOL_ASOF || b == PROTOCOL_ASOF {
+        return Ok(PROTOCOL_ASOF.to_string());
+    }
+    pick_dotted(a, b)
+}
+
+fn take_trailing_asof(
+    method: &str,
+    params: &Value,
+    asof_ok: bool,
+) -> Result<(Value, Option<[u8; 32]>), String> {
+    if !method_accepts_asof(method) {
+        return Ok((params.clone(), None));
+    }
+    let Some(arr) = params.as_array() else {
+        return Ok((params.clone(), None));
+    };
+    let Some(last) = arr.last().and_then(|v| v.as_str()) else {
+        return Ok((params.clone(), None));
+    };
+    let Some(hex) = last.strip_prefix("asof:") else {
+        return Ok((params.clone(), None));
+    };
+    if !asof_ok {
+        return Err("asof requires protocol 1.4.2-asof".into());
+    }
+    let Some(hash) = parse_blockhash32(hex) else {
+        return Err("asof must be asof:<32-byte hex>".into());
+    };
+    let mut rest = arr.clone();
+    rest.pop();
+    Ok((Value::Array(rest), Some(hash)))
 }
 
 /// Electrum Cash optional height window after scripthash for `get_history`.
@@ -1396,6 +1598,63 @@ mod tests {
         assert_eq!(f.from_height, 1);
         assert_eq!(f.to_height, Some(10));
         assert!(!mp);
+        let asof_hex = "ab".repeat(32);
+        let tagged = format!("asof:{asof_hex}");
+        let (rest, h) = take_trailing_asof(
+            "blockchain.scripthash.get_balance",
+            &json!([sh_hex, tagged]),
+            true,
+        )
+        .unwrap();
+        assert!(h.is_some());
+        assert_eq!(rest, json!([sh_hex]));
+        let (rest_win, h_win) = take_trailing_asof(
+            "blockchain.scripthash.get_history",
+            &json!([sh_hex, 1, 10, tagged]),
+            true,
+        )
+        .unwrap();
+        assert!(h_win.is_some());
+        assert_eq!(rest_win, json!([sh_hex, 1, 10]));
+        let (_, none) =
+            take_trailing_asof("blockchain.scripthash.get_balance", &json!([sh_hex]), true)
+                .unwrap();
+        assert!(none.is_none());
+        let (_, not_hex) = take_trailing_asof(
+            "blockchain.scripthash.get_balance",
+            &json!([sh_hex, asof_hex]),
+            true,
+        )
+        .unwrap();
+        assert!(
+            not_hex.is_none(),
+            "bare trailing hex must not be asof (future positional hash args)"
+        );
+        let (_, leftover_obj) = take_trailing_asof(
+            "blockchain.scripthash.get_balance",
+            &json!([sh_hex, { "other": true }]),
+            true,
+        )
+        .unwrap();
+        assert!(leftover_obj.is_none());
+        let denied = take_trailing_asof(
+            "blockchain.scripthash.get_balance",
+            &json!([sh_hex, tagged]),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            denied.contains("1.4.2-asof"),
+            "asof tag without dialect: {denied}"
+        );
+        assert!(take_trailing_asof(
+            "blockchain.scripthash.get_balance",
+            &json!([sh_hex, "asof:zz"]),
+            true,
+        )
+        .unwrap_err()
+        .contains("asof:<32-byte hex>"));
+
         assert!(parse_get_history_window(&json!([sh_hex, 10, 5]))
             .unwrap_err()
             .contains("from_height"));
@@ -1426,6 +1685,35 @@ mod tests {
         };
         let hex = header_hex(&hdr);
         assert_eq!(hex.len(), 160);
+    }
+
+    #[test]
+    fn negotiate_protocol_intersection_and_asof_dialect() {
+        assert_eq!(negotiate_protocol(&json!([])).unwrap(), PROTOCOL_MAX);
+        assert_eq!(negotiate_protocol(&json!(["c"])).unwrap(), PROTOCOL_MAX);
+        assert_eq!(negotiate_protocol(&json!(["c", "1.4"])).unwrap(), "1.4");
+        assert_eq!(
+            negotiate_protocol(&json!(["c", "1.4.2"])).unwrap(),
+            PROTOCOL_MAX
+        );
+        assert_eq!(
+            negotiate_protocol(&json!(["c", ["1.4", "1.4.2"]])).unwrap(),
+            PROTOCOL_MAX
+        );
+        assert_eq!(
+            negotiate_protocol(&json!(["c", PROTOCOL_ASOF])).unwrap(),
+            PROTOCOL_ASOF
+        );
+        assert_eq!(
+            negotiate_protocol(&json!(["c", ["1.4", PROTOCOL_ASOF]])).unwrap(),
+            PROTOCOL_ASOF
+        );
+        assert!(negotiate_protocol(&json!(["c", "1.5"]))
+            .unwrap_err()
+            .contains("unsupported"));
+        assert!(negotiate_protocol(&json!(["c", ["1.4.3", "1.5"]]))
+            .unwrap_err()
+            .contains("unsupported"));
     }
 
     #[test]
@@ -1505,11 +1793,15 @@ mod tests {
             &mut sh_subs,
         )
         .unwrap();
+        assert_eq!(v[1], PROTOCOL_MAX);
         assert_eq!(features["protocol_min"], PROTOCOL_MIN);
+        assert_eq!(features["protocol_max"], PROTOCOL_MAX);
         assert_eq!(features["server_version"], v[0]);
         assert_eq!(features["silent_payments"], json!([0]));
         assert_eq!(features["tweaks"], json!(true));
         assert_eq!(features["chain_tip"], json!(true));
+        assert_eq!(features["asof"], json!(true));
+        assert_eq!(features["asof_protocol"], PROTOCOL_ASOF);
 
         let probe = dispatch(
             "blockchain.tweaks.subscribe",
@@ -2333,6 +2625,275 @@ mod tests {
     }
 
     #[test]
+    fn asof_scripthash_reads_hide_later_spend() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let merkle = [0xab; 32];
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash: merkle,
+        };
+        let mut create_txid = [0xcb; 32];
+        create_txid[31] = 0;
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid: create_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(10_0000_0000, vec![0x51])],
+        };
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let hash1 = rbitcoin_store::block_header_hash(1, &merkle, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        q.connect_block(
+            Height(1),
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: create_txid,
+                    create_fk,
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
+            }],
+        )
+        .unwrap();
+
+        let sh = electrum_scripthash_hex(&[0x51]);
+        let asof0 = hash_hex_rev(&merkle);
+        let asof1 = hash_hex_rev(&hash1);
+        let tag0 = format!("asof:{asof0}");
+        let tag1 = format!("asof:{asof1}");
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let mut sh_join = None;
+        let mut protocol = String::new();
+
+        let denied = dispatch_with_join(
+            "blockchain.scripthash.get_balance",
+            &json!([sh, tag0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap_err();
+        assert!(
+            denied.contains("1.4.2-asof"),
+            "asof tag before handshake: {denied}"
+        );
+
+        let ver = dispatch_with_join(
+            "server.version",
+            &json!(["test", PROTOCOL_ASOF]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(ver[1], PROTOCOL_ASOF);
+        let locked = dispatch_with_join(
+            "server.version",
+            &json!(["test", "1.4"]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(locked[1], PROTOCOL_ASOF);
+
+        let bal0 = dispatch_with_join(
+            "blockchain.scripthash.get_balance",
+            &json!([sh, tag0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(bal0["confirmed"], 10_0000_0000);
+        assert_eq!(bal0["unconfirmed"], 0);
+        let utxo0 = dispatch_with_join(
+            "blockchain.scripthash.listunspent",
+            &json!([sh, tag0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(utxo0.as_array().unwrap().len(), 1);
+        let hist0 = dispatch_with_join(
+            "blockchain.scripthash.get_history",
+            &json!([sh, tag0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(hist0.as_array().unwrap().len(), 1);
+
+        let bal1 = dispatch_with_join(
+            "blockchain.scripthash.get_balance",
+            &json!([sh, tag1]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(bal1["confirmed"], 0);
+        let utxo1 = dispatch_with_join(
+            "blockchain.scripthash.listunspent",
+            &json!([sh, tag1]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert!(utxo1.as_array().unwrap().is_empty());
+        let hist1 = dispatch_with_join(
+            "blockchain.scripthash.get_history",
+            &json!([sh, tag1]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap();
+        assert_eq!(hist1.as_array().unwrap().len(), 2);
+
+        let err = dispatch_with_join(
+            "blockchain.scripthash.get_balance",
+            &json!([sh, format!("asof:{}", "ee".repeat(32))]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+            &mut sh_join,
+            &mut protocol,
+        )
+        .unwrap_err();
+        assert!(err.contains("asof not on chain"), "unknown asof: {err}");
+        let (out, view) = electrum_at_chain_view(
+            &q,
+            "blockchain.scripthash.get_balance",
+            &json!([sh, tag0]),
+            true,
+            |q| {
+                let mut hs = false;
+                let mut subs = HashSet::new();
+                let mut slot = None;
+                let mut proto = PROTOCOL_ASOF.to_string();
+                dispatch_with_join(
+                    "blockchain.scripthash.get_balance",
+                    &json!([sh, tag0]),
+                    q,
+                    &cfg,
+                    &params,
+                    None,
+                    &mut hs,
+                    &mut subs,
+                    &mut slot,
+                    &mut proto,
+                )
+            },
+        );
+        assert_eq!(out.unwrap()["confirmed"], 10_0000_0000);
+        assert_eq!(view.unwrap().hash, merkle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dispatch_casa_sequence_reuses_sh_join_slot() {
         use rbitcoin_primitives::{Fk, Height};
         use rbitcoin_query::{body_ok_reads, reset_body_ok_reads, TxApply};
@@ -2396,6 +2957,7 @@ mod tests {
         let mut header_sub = false;
         let mut sh_subs = HashSet::new();
         let mut sh_join = None;
+        let mut protocol = String::new();
         let sh = electrum_scripthash_hex(&[0x51]);
         reset_body_ok_reads();
         let bal = dispatch_with_join(
@@ -2408,6 +2970,7 @@ mod tests {
             &mut header_sub,
             &mut sh_subs,
             &mut sh_join,
+            &mut protocol,
         )
         .unwrap();
         assert_eq!(bal["confirmed"].as_i64().unwrap(), 150_0000_0000);
@@ -2424,6 +2987,7 @@ mod tests {
             &mut header_sub,
             &mut sh_subs,
             &mut sh_join,
+            &mut protocol,
         )
         .unwrap();
         assert_eq!(hist.as_array().unwrap().len(), 3);
@@ -2443,6 +3007,7 @@ mod tests {
             &mut header_sub,
             &mut sh_subs,
             &mut sh_join,
+            &mut protocol,
         )
         .unwrap();
         assert_eq!(unspent.as_array().unwrap().len(), 3);

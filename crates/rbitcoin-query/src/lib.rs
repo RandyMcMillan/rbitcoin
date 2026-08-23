@@ -1407,7 +1407,20 @@ impl Query {
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
+        let tip = self.tip_height().map(|h| h.0);
+        self.is_outpoint_spent_at(txid, vout, tip)
+    }
+
+    /// Spentness as of a confirmed height (`None` = empty chain).
+    pub fn is_outpoint_spent_at(
+        &self,
+        txid: &[u8; 32],
+        vout: u32,
+        tip: Option<u32>,
+    ) -> Result<bool, QueryError> {
+        Ok(self
+            .store
+            .has_confirmed_strong_spender_at(txid, vout, tip)?)
     }
 
     /// Spentness by known create fk (confirm pin path — no head probe).
@@ -2116,6 +2129,15 @@ impl Query {
         self.store.spenders(out_txid, out_index)
     }
 
+    pub fn spenders_at(
+        &self,
+        out_txid: &[u8; 32],
+        out_index: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<PointRecord>, QueryError> {
+        self.store.spenders_at(out_txid, out_index, tip)
+    }
+
     pub fn spenders_raw(
         &self,
         out_txid: &[u8; 32],
@@ -2711,6 +2733,125 @@ mod tests {
         assert_eq!(tip1b.height, Height(1));
         assert_eq!(tip1b.hash, h1b.hash);
         assert!(tip1b.still_live(&q).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_at_buried_pin_survives_tip_extension_and_higher_replace() {
+        let (dir, q) = temp_query("chain-view-at");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        assert!(q.pin_chain_view_at(&[0xee; 32]).unwrap().is_none());
+
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let prev1 = q.tip_header_fk().unwrap().unwrap();
+        let (h2, t2) = coinbase_block(2, prev1, Some(h1.hash));
+        q.connect_block(Height(2), &h2, &[t2]).unwrap();
+
+        let buried = q.pin_chain_view_at(&hash0).unwrap().expect("genesis hash");
+        assert_eq!(buried.height, Height(0));
+        assert_eq!(buried.hash, hash0);
+        assert!(buried.still_live(&q).unwrap());
+
+        q.disconnect_tip().unwrap();
+        assert_eq!(q.tip_height(), Some(Height(1)));
+        assert!(
+            buried.still_live(&q).unwrap(),
+            "disconnect of height 2 must not kill a height-0 pin"
+        );
+        assert_eq!(
+            q.pin_chain_view_at(&hash0).unwrap().unwrap().header_fk,
+            buried.header_fk
+        );
+
+        q.disconnect_tip().unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        assert!(buried.still_live(&q).unwrap());
+
+        q.disconnect_tip().unwrap();
+        assert!(
+            !buried.still_live(&q).unwrap(),
+            "disconnect of the pinned height kills the buried view"
+        );
+        assert!(q.pin_chain_view_at(&hash0).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_at_spend_asof_hides_later_spend() {
+        let (dir, q) = temp_query("chain-view-asof-spend");
+        let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
+        ta0.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
+        let create_txid = ta0.tx.txid;
+        let hash0 = h0.hash;
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let view0 = q.pin_chain_view_at(&hash0).unwrap().unwrap();
+
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let hash1 = rbitcoin_store::block_header_hash(1, &hash0, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        q.connect_block(
+            Height(1),
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: create_txid,
+                    create_fk,
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
+            }],
+        )
+        .unwrap();
+        let view1 = q.pin_chain_view_at(&hash1).unwrap().unwrap();
+        let sh = script_hash(&[0x51]);
+
+        assert!(!q.is_outpoint_spent_at(&create_txid, 0, Some(0)).unwrap());
+        assert!(q.is_outpoint_spent_at(&create_txid, 0, Some(1)).unwrap());
+        assert!(q.is_outpoint_spent(&create_txid, 0).unwrap());
+
+        let utxo0 = q.scripthash_listunspent_in(&sh, &view0).unwrap();
+        assert_eq!(utxo0.len(), 1);
+        assert_eq!(utxo0[0].tx_hash, create_txid);
+        assert_eq!(utxo0[0].value, 10_0000_0000);
+        let bal0 = q.scripthash_balance_in(&sh, &view0).unwrap();
+        assert_eq!(bal0.confirmed, 10_0000_0000);
+        let hist0 = q.scripthash_history_in(&sh, &view0).unwrap();
+        assert_eq!(hist0.len(), 1);
+        assert_eq!(hist0[0].txid, create_txid);
+
+        let utxo1 = q.scripthash_listunspent_in(&sh, &view1).unwrap();
+        assert!(utxo1.is_empty(), "spend at height 1 is visible as of 1");
+        let bal1 = q.scripthash_balance_in(&sh, &view1).unwrap();
+        assert_eq!(bal1.confirmed, 0);
+        let hist1 = q.scripthash_history_in(&sh, &view1).unwrap();
+        assert_eq!(hist1.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

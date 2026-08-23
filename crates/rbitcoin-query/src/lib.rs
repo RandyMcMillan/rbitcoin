@@ -1247,7 +1247,7 @@ impl Query {
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
         }
-        q.recover_sh_writebehind();
+        q.recover_sh_writebehind()?;
         Ok(q)
     }
 
@@ -3252,7 +3252,7 @@ mod tests {
         q.confirm_block(Height(1), &h1.hash).unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(0));
         q.sh_pending.lock().unwrap().clear();
-        q.recover_sh_writebehind();
+        q.recover_sh_writebehind().unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(0));
         let sh = script_hash(&[0x51]);
         assert_eq!(
@@ -3264,6 +3264,21 @@ mod tests {
         assert_eq!(q.sh_indexed_through_height(), Some(1));
         assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_sh_writebehind_fails_open_on_missing_header_txs() {
+        let (dir, q) = temp_query("sh-wb-recover-corrupt");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        q.store().confirmed.set(Height(1), Fk(999_999)).unwrap();
+        let err = q.recover_sh_writebehind().expect_err("missing header_txs");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant:") || msg.contains("missing"),
+            "expected invariant/missing body, got {msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

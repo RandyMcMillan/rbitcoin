@@ -78,7 +78,9 @@ impl Query {
     ///
     /// `create_pins` is `create_fk → CreatePin` for creates committed on this write
     /// path. Collect runs after tip (cheap); records sit on the job so queries
-    /// join them before durable seed.
+    /// join them before durable seed. Enqueue is after the tip commit: a collect
+    /// failure can surface after `confirmed[]` advanced; retry is the heal
+    /// (re-confirm at the same height is idempotent).
     pub fn confirm_blocks_run_with_create_pins(
         &self,
         items: &[ConfirmPrepared],
@@ -185,7 +187,13 @@ impl Query {
         let through = self.sh_indexed_through_height();
         let mut jobs = Vec::new();
         for item in items {
-            if through.map(|t| item.height.0 <= t).unwrap_or(false) {
+            let t_filter = std::time::Instant::now();
+            let skip = through.map(|t| item.height.0 <= t).unwrap_or(false);
+            add_sh_part(
+                &sh_stats::SH_FILTER_NS,
+                t_filter.elapsed().as_nanos() as u64,
+            );
+            if skip {
                 continue;
             }
             let t_collect = std::time::Instant::now();
@@ -276,7 +284,10 @@ impl Query {
         loop {
             if let Some(job) = self.take_sh_job_for_apply() {
                 let height = job.height;
-                let result = self.apply_sh_job(job);
+                let result = self.apply_sh_job(job.clone());
+                if result.is_err() {
+                    self.requeue_sh_job_front(job);
+                }
                 self.finish_sh_job(height);
                 result?;
                 continue;
@@ -304,6 +315,11 @@ impl Query {
         let job = pending.pop_front()?;
         *applying = Some(job.clone());
         Some(job)
+    }
+
+    fn requeue_sh_job_front(&self, job: ShPendingJob) {
+        self.sh_pending.lock().unwrap().push_front(job);
+        self.sh_pending_cv.notify_one();
     }
 
     pub(crate) fn finish_sh_job(&self, height: Height) {
@@ -380,27 +396,35 @@ impl Query {
 
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
     /// RAM write-behind lost on restart.
-    pub(crate) fn recover_sh_writebehind(&self) {
-        let recovered = self.recover_sh_indexed_through();
+    pub(crate) fn recover_sh_writebehind(&self) -> Result<(), QueryError> {
+        let recovered = self.recover_sh_indexed_through()?;
         self.set_sh_indexed_through_height(recovered);
         if !self.store.scripthash.has_durable_index() {
-            return;
+            return Ok(());
         }
         let Some(tip) = self.tip_height() else {
-            return;
+            return Ok(());
         };
         let from = recovered.map(|h| h.saturating_add(1)).unwrap_or(0);
         if from > tip.0 {
-            return;
+            return Ok(());
         }
         let mut items = Vec::new();
         for h in from..=tip.0 {
-            let Ok(Some(header_fk)) = self.store.confirmed.get(Height(h)) else {
-                continue;
-            };
-            let Ok(Some(tx_fks)) = self.store.header_txs.get_list(header_fk) else {
-                continue;
-            };
+            let header_fk = self
+                .store
+                .confirmed
+                .get(Height(h))?
+                .ok_or(StoreError::Corrupt(
+                    "invariant: confirmed height missing header",
+                ))?;
+            let tx_fks = self
+                .store
+                .header_txs
+                .get_list(header_fk)?
+                .ok_or(StoreError::Corrupt(
+                    "invariant: confirmed height missing header_txs",
+                ))?;
             items.push(ConfirmPrepared {
                 height: Height(h),
                 header_fk,
@@ -408,29 +432,31 @@ impl Query {
             });
         }
         if !items.is_empty() {
-            let _ = self.enqueue_sh_pending(&items, None);
+            self.enqueue_sh_pending(&items, None)?;
         }
+        Ok(())
     }
 
-    fn recover_sh_indexed_through(&self) -> Option<u32> {
-        let tip = self.tip_height()?;
+    fn recover_sh_indexed_through(&self) -> Result<Option<u32>, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(None);
+        };
         let hwm = self.store.scripthash.include_hwm();
         if hwm == 0 {
             if self.store.scripthash.has_durable_index() {
-                return Some(tip.0);
+                return Ok(Some(tip.0));
             }
-            return None;
+            return Ok(None);
         }
         let mut h = tip.0;
         loop {
-            if let Ok(fks) = self.block_tx_fks(Height(h)) {
-                let max_fk = fks.iter().map(|f| f.0).max().unwrap_or(0);
-                if max_fk <= hwm {
-                    return Some(h);
-                }
+            let fks = self.block_tx_fks(Height(h))?;
+            let max_fk = fks.iter().map(|f| f.0).max().unwrap_or(0);
+            if max_fk <= hwm {
+                return Ok(Some(h));
             }
             if h == 0 {
-                return None;
+                return Ok(None);
             }
             h -= 1;
         }
@@ -699,12 +725,14 @@ pub fn spawn_sh_writebehind(
             let t0 = std::time::Instant::now();
             let h = job.height.0;
             let height = job.height;
-            let apply_err = query.apply_sh_job(job).err();
-            query.finish_sh_job(height);
+            let apply_err = query.apply_sh_job(job.clone()).err();
             if let Some(e) = apply_err {
+                query.requeue_sh_job_front(job);
+                query.finish_sh_job(height);
                 rbitcoin_log::error!("scripthash write-behind h={h}: {e}");
-                continue;
+                return;
             }
+            query.finish_sh_job(height);
             let wall_ms = t0.elapsed().as_millis();
             let lag = query.sh_lag_heights();
             rbitcoin_log::info!("sh: apply h={h} wall={wall_ms}ms lag={lag}");

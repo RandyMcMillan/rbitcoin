@@ -205,7 +205,7 @@ fn history_items_from_joined(
     apply_history_filter(&items, filter)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScriptHashBalance {
     pub confirmed: i64,
     pub unconfirmed: i64,
@@ -893,10 +893,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
         let Some(view) = self.pin_sh_chain_view()? else {
-            return Ok(ScriptHashBalance {
-                confirmed: 0,
-                unconfirmed: 0,
-            });
+            return Ok(ScriptHashBalance::default());
         };
         self.scripthash_balance_in(scripthash, &view)
     }
@@ -937,10 +934,7 @@ impl Query {
         slot: &Option<ShJoinSlot>,
     ) -> Result<ScriptHashBalance, QueryError> {
         let Some(recs) = slot.as_ref() else {
-            return Ok(ScriptHashBalance {
-                confirmed: 0,
-                unconfirmed: 0,
-            });
+            return Ok(ScriptHashBalance::default());
         };
         self.balance_from_joined(&recs.joined)
     }
@@ -1131,13 +1125,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
         let Some(view) = self.pin_sh_chain_view()? else {
-            return Ok(ScriptHashChainStats {
-                tx_count: 0,
-                funded_txo_count: 0,
-                funded_txo_sum: 0,
-                spent_txo_count: 0,
-                spent_txo_sum: 0,
-            });
+            return Ok(ScriptHashChainStats::default());
         };
         self.scripthash_chain_stats_in(scripthash, &view)
     }
@@ -1161,13 +1149,7 @@ impl Query {
     ) -> Result<ScriptHashChainStats, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
         let Some(recs) = slot.as_ref() else {
-            return Ok(ScriptHashChainStats {
-                tx_count: 0,
-                funded_txo_count: 0,
-                funded_txo_sum: 0,
-                spent_txo_count: 0,
-                spent_txo_sum: 0,
-            });
+            return Ok(ScriptHashChainStats::default());
         };
         self.chain_stats_from_joined(&recs.joined)
     }

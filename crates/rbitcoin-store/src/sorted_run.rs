@@ -1831,7 +1831,7 @@ pub const SH_WORKER_FREE_RAM_BYTES: u64 = 3 << 29;
 /// Cap SH workers at 1 per [`SH_WORKER_FREE_RAM_BYTES`] of free RAM (floor 1).
 pub fn sh_workers_for_free_ram(cpus: usize, free_bytes: u64) -> usize {
     let cpus = cpus.clamp(1, 256);
-    let ram_cap = (free_bytes / SH_WORKER_FREE_RAM_BYTES).max(1) as usize;
+    let ram_cap = (free_bytes / SH_WORKER_FREE_RAM_BYTES) as usize;
     cpus.min(ram_cap.clamp(1, 256))
 }
 
@@ -1960,6 +1960,13 @@ pub fn host_mem_available_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// `MemAvailable` as a log label (`"12.3"` GiB, or `"?"` when unknown).
+pub fn free_gib_label() -> String {
+    host_mem_available_bytes()
+        .map(|b| format!("{:.1}", b as f64 / (1u64 << 30) as f64))
+        .unwrap_or_else(|| "?".into())
 }
 
 fn sh_logical_cpus() -> usize {
@@ -2656,6 +2663,8 @@ mod tests {
         let w = sh_workers_capped_by_free_ram();
         assert!((1..=256).contains(&w));
         assert!(w <= sh_logical_cpus());
+        let label = free_gib_label();
+        assert!(label == "?" || label.parse::<f64>().is_ok(), "{label}");
     }
 
     #[test]

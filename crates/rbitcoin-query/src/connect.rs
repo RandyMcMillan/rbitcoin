@@ -319,10 +319,7 @@ impl Query {
         let vis = self
             .sh_indexed_through_height()
             .max(self.sh_pending_max_height())?;
-        match self.tip_height() {
-            Some(tip) => Some(vis.min(tip.0)),
-            None => None,
-        }
+        self.tip_height().map(|tip| vis.min(tip.0))
     }
 
     /// Apply queued SH write-behind jobs in height order (one Class B appender).
@@ -429,7 +426,7 @@ impl Query {
             let (n, timing) = self
                 .store
                 .scripthash
-                .put_create_batch_append(&sh_creates, &mut heads)?;
+                .put_create_batch_append(sh_creates, &mut heads)?;
             sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
             add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
             add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);

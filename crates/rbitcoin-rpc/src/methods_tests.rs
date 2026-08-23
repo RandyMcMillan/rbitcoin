@@ -1015,10 +1015,16 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     assert_eq!(child_entry["descendantcount"], 1);
     assert_eq!(parent_entry["unbroadcast"], false);
     assert_eq!(child_entry["unbroadcast"], false);
+    assert_eq!(parent_entry["depends"], json!([]));
+    assert_eq!(parent_entry["spentby"], json!([child_hex.clone()]));
+    assert_eq!(child_entry["depends"], json!([parent_hex.clone()]));
+    assert_eq!(child_entry["spentby"], json!([]));
 
     let verbose = dispatch(&ctx, "getrawmempool", vec![json!(true)]).unwrap();
     assert_eq!(verbose[&child_hex]["ancestorcount"], 2);
     assert_eq!(verbose[&parent_hex]["descendantcount"], 2);
+    assert_eq!(verbose[&child_hex]["depends"], json!([parent_hex.clone()]));
+    assert_eq!(verbose[&parent_hex]["spentby"], json!([child_hex.clone()]));
 
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(

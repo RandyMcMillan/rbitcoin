@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{ChainView, HistoryFilter, Query, ShJoinSlot};
+use rbitcoin_query::{ChainView, ChainViewKind, HistoryFilter, Query, ShJoinSlot};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -591,10 +591,10 @@ where
                                 &method_owned,
                                 &params_owned,
                                 proto.as_str() == PROTOCOL_ASOF,
-                                |q| {
-                                    dispatch_with_join(
+                                |q, params, view, is_asof| {
+                                    dispatch_pinned(
                                         &method_owned,
-                                        &params_owned,
+                                        params,
                                         q,
                                         &cfg,
                                         &p,
@@ -603,6 +603,8 @@ where
                                         &mut shs,
                                         &mut slot,
                                         &mut proto,
+                                        view,
+                                        is_asof,
                                     )
                                 },
                             )
@@ -922,26 +924,11 @@ fn rpc_result(id: &Value, result: &Value, view: Option<&ChainView>) -> Value {
     obj
 }
 
-fn electrum_pin_for_method(
-    query: &Query,
-    method: &str,
-) -> Result<Option<ChainView>, rbitcoin_query::QueryError> {
+fn electrum_pin_kind(method: &str) -> ChainViewKind {
     if method.starts_with("blockchain.scripthash.") {
-        query.pin_sh_chain_view()
+        ChainViewKind::ScriptHash
     } else {
-        query.pin_chain_view()
-    }
-}
-
-fn electrum_pin_for_method_at(
-    query: &Query,
-    method: &str,
-    hash: &[u8; 32],
-) -> Result<Option<ChainView>, rbitcoin_query::QueryError> {
-    if method.starts_with("blockchain.scripthash.") {
-        query.pin_sh_chain_view_at(hash)
-    } else {
-        query.pin_chain_view_at(hash)
+        ChainViewKind::Tip
     }
 }
 
@@ -953,12 +940,13 @@ fn electrum_at_chain_view<F>(
     mut f: F,
 ) -> (Result<Value, String>, Option<ChainView>)
 where
-    F: FnMut(&Query) -> Result<Value, String>,
+    F: FnMut(&Query, &Value, Option<&ChainView>, bool) -> Result<Value, String>,
 {
+    let kind = electrum_pin_kind(method);
     match take_trailing_asof(method, params, asof_ok) {
-        Ok((_, Some(hash))) => match electrum_pin_for_method_at(query, method, &hash) {
+        Ok((stripped, Some(hash))) => match query.pin_view(kind, Some(&hash)) {
             Ok(Some(view)) => {
-                let out = f(query);
+                let out = f(query, &stripped, Some(&view), true);
                 match view.still_live(query) {
                     Ok(true) => (out, Some(view)),
                     Ok(false) => (Err("asof not on chain".into()), None),
@@ -968,28 +956,14 @@ where
             Ok(None) => (Err("asof not on chain".into()), None),
             Err(e) => (Err(e.to_string()), None),
         },
-        Ok((_, None)) => {
-            const BOUND: u32 = 8;
-            for _ in 0..BOUND {
-                let view = match electrum_pin_for_method(query, method) {
-                    Ok(v) => v,
-                    Err(e) => return (Err(e.to_string()), None),
-                };
-                let Some(view) = view else {
-                    return (f(query), None);
-                };
-                let out = f(query);
-                if out.is_err() {
-                    return (out, None);
-                }
-                match view.still_live(query) {
-                    Ok(true) => return (out, Some(view)),
-                    Ok(false) => continue,
-                    Err(e) => return (Err(e.to_string()), None),
-                }
-            }
-            (Err("chain view moved".into()), None)
-        }
+        Ok((stripped, None)) => match query.run_at_view(kind, |view| {
+            Ok::<_, rbitcoin_query::QueryError>(f(query, &stripped, Some(view), false))
+        }) {
+            Ok((view, inner)) => (inner, Some(view)),
+            Err(e) if matches!(e, StoreError::NotFound) => (f(query, &stripped, None, false), None),
+            Err(e) if matches!(e, StoreError::Stale(_)) => (Err("chain view moved".into()), None),
+            Err(e) => (Err(e.to_string()), None),
+        },
         Err(e) => (Err(e), None),
     }
 }
@@ -1032,6 +1006,26 @@ fn dispatch_with_join(
     sh_subs: &mut HashSet<[u8; 32]>,
     sh_join: &mut Option<ShJoinSlot>,
     protocol: &mut String,
+) -> Result<Value, String> {
+    dispatch_pinned(
+        method, params, query, config, chain, mempool, header_sub, sh_subs, sh_join, protocol,
+        None, false,
+    )
+}
+
+fn dispatch_pinned(
+    method: &str,
+    params: &Value,
+    query: &Query,
+    config: &ElectrumConfig,
+    chain: &ChainParams,
+    mempool: Option<&MempoolHub>,
+    header_sub: &mut bool,
+    sh_subs: &mut HashSet<[u8; 32]>,
+    sh_join: &mut Option<ShJoinSlot>,
+    protocol: &mut String,
+    pinned: Option<&ChainView>,
+    is_asof: bool,
 ) -> Result<Value, String> {
     match method {
         "server.version" => {
@@ -1089,12 +1083,27 @@ fn dispatch_with_join(
             Ok(json!({"count": n, "hex": hexes, "max": 2016}))
         }
         "blockchain.scripthash.get_history" => {
-            let (params, asof) =
-                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?;
+            let (params, asof) = if pinned.is_some() {
+                (params.clone(), None)
+            } else {
+                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?
+            };
             let sh = param_scripthash(&params, 0)?;
             let (filter, mut include_mempool) = parse_get_history_window(&params)?;
-            let mut hist = if let Some(hash) = asof {
+            if is_asof || asof.is_some() {
                 include_mempool = false;
+            }
+            let mut hist = if let Some(view) = pinned {
+                if is_asof {
+                    query
+                        .scripthash_history_filtered_in(&sh, &filter, view)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    query
+                        .scripthash_history_filtered_slot_in(&sh, &filter, sh_join, view)
+                        .map_err(|e| e.to_string())?
+                }
+            } else if let Some(hash) = asof {
                 let view = query
                     .pin_sh_chain_view_at(&hash)
                     .map_err(|e| e.to_string())?
@@ -1132,10 +1141,23 @@ fn dispatch_with_join(
             Ok(Value::Array(arr))
         }
         "blockchain.scripthash.get_balance" => {
-            let (params, asof) =
-                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?;
+            let (params, asof) = if pinned.is_some() {
+                (params.clone(), None)
+            } else {
+                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?
+            };
             let sh = param_scripthash(&params, 0)?;
-            let mut b = if let Some(hash) = asof {
+            let mut b = if let Some(view) = pinned {
+                if is_asof {
+                    query
+                        .scripthash_balance_in(&sh, view)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    query
+                        .scripthash_balance_slot_in(&sh, sh_join, view)
+                        .map_err(|e| e.to_string())?
+                }
+            } else if let Some(hash) = asof {
                 let view = query
                     .pin_sh_chain_view_at(&hash)
                     .map_err(|e| e.to_string())?
@@ -1148,7 +1170,7 @@ fn dispatch_with_join(
                     .scripthash_balance_slot(&sh, sh_join)
                     .map_err(|e| e.to_string())?
             };
-            if asof.is_none() {
+            if !is_asof && asof.is_none() {
                 if let Some(mp) = mempool {
                     b.unconfirmed = mp.scripthash_unconfirmed_delta(&sh);
                 }
@@ -1156,10 +1178,24 @@ fn dispatch_with_join(
             Ok(json!({"confirmed": b.confirmed, "unconfirmed": b.unconfirmed}))
         }
         "blockchain.scripthash.listunspent" => {
-            let (params, asof) =
-                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?;
+            let (params, asof) = if pinned.is_some() {
+                (params.clone(), None)
+            } else {
+                take_trailing_asof(method, params, protocol.as_str() == PROTOCOL_ASOF)?
+            };
             let sh = param_scripthash(&params, 0)?;
-            let u = if let Some(hash) = asof {
+            let u = if let Some(view) = pinned {
+                if is_asof {
+                    query
+                        .scripthash_listunspent_in(&sh, view)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    crate::unspent::scripthash_utxos_with_mempool_slot_in(
+                        query, mempool, &sh, sh_join, view,
+                    )
+                    .map_err(|e| e.to_string())?
+                }
+            } else if let Some(hash) = asof {
                 let view = query
                     .pin_sh_chain_view_at(&hash)
                     .map_err(|e| e.to_string())?
@@ -1228,20 +1264,17 @@ fn dispatch_with_join(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if let Some((fk, _rec)) = query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
-                let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
-                if verbose {
-                    return Ok(json!({
-                        "hex": rbitcoin_primitives::hex_encode(&raw),
-                        "txid": txid_hex(&txid)
-                    }));
-                }
-                return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
-            }
-            if let Some(mp) = mempool {
-                use bitcoin::hashes::Hash;
-                let tid = bitcoin::Txid::from_byte_array(txid);
-                if let Some(tx) = mp.get_tx(&tid) {
-                    let raw = bitcoin::consensus::serialize(&tx);
+                let confirmed_ok = if is_asof {
+                    let view = pinned.ok_or_else(|| "asof not on chain".to_string())?;
+                    query
+                        .store()
+                        .is_confirmed_strong_at(fk, Some(view.height.0))
+                        .map_err(|e| e.to_string())?
+                } else {
+                    true
+                };
+                if confirmed_ok {
+                    let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
                     if verbose {
                         return Ok(json!({
                             "hex": rbitcoin_primitives::hex_encode(&raw),
@@ -1251,11 +1284,32 @@ fn dispatch_with_join(
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
             }
+            if !is_asof {
+                if let Some(mp) = mempool {
+                    use bitcoin::hashes::Hash;
+                    let tid = bitcoin::Txid::from_byte_array(txid);
+                    if let Some(tx) = mp.get_tx(&tid) {
+                        let raw = bitcoin::consensus::serialize(&tx);
+                        if verbose {
+                            return Ok(json!({
+                                "hex": rbitcoin_primitives::hex_encode(&raw),
+                                "txid": txid_hex(&txid)
+                            }));
+                        }
+                        return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
+                    }
+                }
+            }
             Err("tx not found".into())
         }
         "blockchain.transaction.get_merkle" => {
             let txid = param_txid(params, 0)?;
             let height = param_u32(params, 1)?;
+            if let Some(view) = pinned {
+                if height > view.height.0 {
+                    return Err("asof not on chain".into());
+                }
+            }
             let proof = query
                 .merkle_proof(Height(height), &txid)
                 .map_err(|e| e.to_string())?;
@@ -1377,6 +1431,8 @@ fn method_accepts_asof(method: &str) -> bool {
         "blockchain.scripthash.get_history"
             | "blockchain.scripthash.get_balance"
             | "blockchain.scripthash.listunspent"
+            | "blockchain.transaction.get"
+            | "blockchain.transaction.get_merkle"
     )
 }
 
@@ -1699,6 +1755,19 @@ mod tests {
         .unwrap();
         assert!(h_win.is_some());
         assert_eq!(rest_win, json!([sh_hex, 1, 10]));
+        let (rest_tx, h_tx) =
+            take_trailing_asof("blockchain.transaction.get", &json!([sh_hex, tagged]), true)
+                .unwrap();
+        assert!(h_tx.is_some());
+        assert_eq!(rest_tx, json!([sh_hex]));
+        let (rest_merkle, h_merkle) = take_trailing_asof(
+            "blockchain.transaction.get_merkle",
+            &json!([sh_hex, 0, tagged]),
+            true,
+        )
+        .unwrap();
+        assert!(h_merkle.is_some());
+        assert_eq!(rest_merkle, json!([sh_hex, 0]));
         let (_, none) =
             take_trailing_asof("blockchain.scripthash.get_balance", &json!([sh_hex]), true)
                 .unwrap();
@@ -2933,6 +3002,128 @@ mod tests {
         .unwrap();
         assert_eq!(hist1.as_array().unwrap().len(), 2);
 
+        let create_hex = hash_hex_rev(&create_txid);
+        let spend_hex = hash_hex_rev(&spend_txid);
+        let (get_later, _) = electrum_at_chain_view(
+            &q,
+            "blockchain.transaction.get",
+            &json!([spend_hex, tag0]),
+            true,
+            |q, rpc_params, view, is_asof| {
+                assert_eq!(rpc_params, &json!([spend_hex]));
+                let mut hs = false;
+                let mut subs = HashSet::new();
+                let mut slot = None;
+                let mut proto = PROTOCOL_ASOF.to_string();
+                dispatch_pinned(
+                    "blockchain.transaction.get",
+                    rpc_params,
+                    q,
+                    &cfg,
+                    &params,
+                    None,
+                    &mut hs,
+                    &mut subs,
+                    &mut slot,
+                    &mut proto,
+                    view,
+                    is_asof,
+                )
+            },
+        );
+        assert!(
+            get_later.unwrap_err().contains("tx not found"),
+            "asof height 0 must hide the height-1 spend"
+        );
+        let (get_create, _) = electrum_at_chain_view(
+            &q,
+            "blockchain.transaction.get",
+            &json!([create_hex, tag0]),
+            true,
+            |q, rpc_params, view, is_asof| {
+                let mut hs = false;
+                let mut subs = HashSet::new();
+                let mut slot = None;
+                let mut proto = PROTOCOL_ASOF.to_string();
+                dispatch_pinned(
+                    "blockchain.transaction.get",
+                    rpc_params,
+                    q,
+                    &cfg,
+                    &params,
+                    None,
+                    &mut hs,
+                    &mut subs,
+                    &mut slot,
+                    &mut proto,
+                    view,
+                    is_asof,
+                )
+            },
+        );
+        assert!(
+            get_create.unwrap().as_str().unwrap().len() > 10,
+            "asof height 0 still returns the genesis create"
+        );
+        let (merkle_later, _) = electrum_at_chain_view(
+            &q,
+            "blockchain.transaction.get_merkle",
+            &json!([spend_hex, 1, tag0]),
+            true,
+            |q, rpc_params, view, is_asof| {
+                assert_eq!(rpc_params, &json!([spend_hex, 1]));
+                let mut hs = false;
+                let mut subs = HashSet::new();
+                let mut slot = None;
+                let mut proto = PROTOCOL_ASOF.to_string();
+                dispatch_pinned(
+                    "blockchain.transaction.get_merkle",
+                    rpc_params,
+                    q,
+                    &cfg,
+                    &params,
+                    None,
+                    &mut hs,
+                    &mut subs,
+                    &mut slot,
+                    &mut proto,
+                    view,
+                    is_asof,
+                )
+            },
+        );
+        assert!(
+            merkle_later.unwrap_err().contains("asof not on chain"),
+            "merkle height above asof pin must fail"
+        );
+        let (merkle0, _) = electrum_at_chain_view(
+            &q,
+            "blockchain.transaction.get_merkle",
+            &json!([create_hex, 0, tag0]),
+            true,
+            |q, rpc_params, view, is_asof| {
+                let mut hs = false;
+                let mut subs = HashSet::new();
+                let mut slot = None;
+                let mut proto = PROTOCOL_ASOF.to_string();
+                dispatch_pinned(
+                    "blockchain.transaction.get_merkle",
+                    rpc_params,
+                    q,
+                    &cfg,
+                    &params,
+                    None,
+                    &mut hs,
+                    &mut subs,
+                    &mut slot,
+                    &mut proto,
+                    view,
+                    is_asof,
+                )
+            },
+        );
+        assert_eq!(merkle0.unwrap()["block_height"], 0);
+
         let err = dispatch_with_join(
             "blockchain.scripthash.get_balance",
             &json!([sh, format!("asof:{}", "ee".repeat(32))]),
@@ -2952,14 +3143,21 @@ mod tests {
             "blockchain.scripthash.get_balance",
             &json!([sh, tag0]),
             true,
-            |q| {
+            |q, rpc_params, view, is_asof| {
+                assert_eq!(
+                    rpc_params,
+                    &json!([sh]),
+                    "asof must be stripped before dispatch"
+                );
+                assert!(is_asof);
+                assert!(view.is_some());
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
                 let mut proto = PROTOCOL_ASOF.to_string();
-                dispatch_with_join(
+                dispatch_pinned(
                     "blockchain.scripthash.get_balance",
-                    &json!([sh, tag0]),
+                    rpc_params,
                     q,
                     &cfg,
                     &params,
@@ -2968,6 +3166,8 @@ mod tests {
                     &mut subs,
                     &mut slot,
                     &mut proto,
+                    view,
+                    is_asof,
                 )
             },
         );
@@ -3065,14 +3265,14 @@ mod tests {
             "blockchain.scripthash.get_balance",
             &json!([sh]),
             false,
-            |q| {
+            |q, rpc_params, view, is_asof| {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
                 let mut proto = String::new();
-                dispatch_with_join(
+                dispatch_pinned(
                     "blockchain.scripthash.get_balance",
-                    &json!([sh]),
+                    rpc_params,
                     q,
                     &cfg,
                     &params,
@@ -3081,6 +3281,8 @@ mod tests {
                     &mut subs,
                     &mut slot,
                     &mut proto,
+                    view,
+                    is_asof,
                 )
             },
         );
@@ -3095,14 +3297,14 @@ mod tests {
             "blockchain.scripthash.get_balance",
             &json!([sh]),
             false,
-            |q| {
+            |q, rpc_params, view, is_asof| {
                 let mut hs = false;
                 let mut subs = HashSet::new();
                 let mut slot = None;
                 let mut proto = String::new();
-                dispatch_with_join(
+                dispatch_pinned(
                     "blockchain.scripthash.get_balance",
-                    &json!([sh]),
+                    rpc_params,
                     q,
                     &cfg,
                     &params,
@@ -3111,6 +3313,8 @@ mod tests {
                     &mut subs,
                     &mut slot,
                     &mut proto,
+                    view,
+                    is_asof,
                 )
             },
         );

@@ -61,7 +61,7 @@ def rpc_call(url: str, cookie: str, method: str, params=None, timeout: float = 3
 
 # Must match Core `_initialize_chain`: 199 blocks cycling TestNode.PRIV_KEYS[0:3]
 # plus MiniWallet's deterministic P2TR OP_TRUE (blocks 76–100).
-CACHE_MARK = "199-mw1"
+CACHE_MARK = "199-mw1-genesis-mock"
 CACHE_ADDRS = [
     "mjTkW3DjgyZck4KbiRusZsqTgaYTxdSz6z",
     "msX6jQXvxiNhx3Q62PKeLPrhrqZQdSimTg",
@@ -141,6 +141,23 @@ def build_cache(cache: Path) -> int:
                 time.sleep(0.1)
         else:
             print(f"create_cache: RPC not up ({last_err})", file=sys.stderr)
+            return 1
+
+        # Core `_initialize_chain`: setmocktime(genesis tip) so the 199-block
+        # cache ages from 2011, not wall clock. Startup then mines one wall-clock
+        # block; MTP stays old so later setmocktime(now-25h)+generate works.
+        tip = rpc_call(url, cookie, "getbestblockhash").get("result")
+        if not tip:
+            print("create_cache: missing genesis tip hash", file=sys.stderr)
+            return 1
+        hdr = rpc_call(url, cookie, "getblockheader", [tip]).get("result") or {}
+        genesis_time = hdr.get("time")
+        if genesis_time is None:
+            print("create_cache: missing genesis tip time", file=sys.stderr)
+            return 1
+        resp = rpc_call(url, cookie, "setmocktime", [int(genesis_time)])
+        if resp.get("error"):
+            print(f"create_cache: setmocktime: {resp['error']}", file=sys.stderr)
             return 1
 
         # Same payee schedule as Core `_initialize_chain` (25×7 + 24).

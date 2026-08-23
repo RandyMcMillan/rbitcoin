@@ -227,15 +227,19 @@ fn estimatesmartfee_core_param_gates() {
     assert_eq!(e["code"], ERR_MISC);
     assert!(e["message"].as_str().unwrap().contains("estimatesmartfee"));
 
-    let e = dispatch(&ctx, "estimaterawfee", vec![json!(1009)]).unwrap_err();
-    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid conf_target, must be between 1 and 1008"),
-        "{e}"
-    );
+    for method in ["estimatesmartfee", "estimaterawfee"] {
+        for bad in [json!(0), json!(1009)] {
+            let e = dispatch(&ctx, method, vec![bad]).unwrap_err();
+            assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{method}");
+            assert!(
+                e["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Invalid conf_target, must be between 1 and 1008"),
+                "{method} {e}"
+            );
+        }
+    }
 
     // Valid calls must succeed (empty mempool still returns an object).
     let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1)]).unwrap();

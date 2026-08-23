@@ -1575,18 +1575,9 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     Ok(json!(out))
 }
 
-/// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
-fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["conf_target", "estimate_mode"])?;
-    // Core requires conf_target (`rpc_estimatefee.py`).
-    if params.get(0, "conf_target").is_none() {
-        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
-    }
-    if params.pos_len() > 2 {
-        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
-    }
-    let conf_v = params.get(0, "conf_target").unwrap();
-    let conf_target = match conf_v {
+/// Core `ParseConfirmTarget`: integer in `1..=1008`.
+fn parse_conf_target(v: &Value) -> Result<u32, Value> {
+    let conf_target = match v {
         Value::Number(n) => n
             .as_u64()
             .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
@@ -1606,6 +1597,26 @@ fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
             ));
         }
     };
+    if !(1..=1008).contains(&conf_target) {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "Invalid conf_target, must be between 1 and 1008",
+        ));
+    }
+    Ok(conf_target)
+}
+
+/// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
+fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["conf_target", "estimate_mode"])?;
+    // Core requires conf_target (`rpc_estimatefee.py`).
+    if params.get(0, "conf_target").is_none() {
+        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
+    }
+    if params.pos_len() > 2 {
+        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
+    }
+    let conf_target = parse_conf_target(params.get(0, "conf_target").unwrap())?;
     if let Some(mode_v) = params.get(1, "estimate_mode") {
         if !matches!(mode_v, Value::Null) {
             let mode = mode_v.as_str().ok_or_else(|| {
@@ -1641,33 +1652,7 @@ fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> 
     if params.pos_len() > 2 {
         return Err(rpc_error(ERR_MISC, method_help("estimaterawfee")));
     }
-    let conf_v = params.get(0, "conf_target").unwrap();
-    let conf_target = match conf_v {
-        Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
-            .ok_or_else(|| {
-                rpc_error(
-                    ERR_TYPE_ERROR,
-                    "JSON value of type number is not of expected type number",
-                )
-            })? as u32,
-        other => {
-            return Err(rpc_error(
-                ERR_TYPE_ERROR,
-                format!(
-                    "JSON value of type {} is not of expected type number",
-                    json_type_name(other)
-                ),
-            ));
-        }
-    };
-    if !(1..=1008).contains(&conf_target) {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "Invalid conf_target, must be between 1 and 1008",
-        ));
-    }
+    let conf_target = parse_conf_target(params.get(0, "conf_target").unwrap())?;
     if let Some(th) = params.get(1, "threshold") {
         if !matches!(th, Value::Null) && json_u64(th).is_none() && th.as_f64().is_none() {
             return Err(rpc_error(

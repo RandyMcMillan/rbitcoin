@@ -104,6 +104,8 @@ pub struct NodeConfig {
     pub minimum_chain_work: Option<[u8; 32]>,
     /// Core `-mocktime` at start (`None` = wall clock).
     pub mock_time: Option<i64>,
+    /// Core `-maxtipage` seconds (`None` = 24h default on ChainHub).
+    pub max_tip_age_secs: Option<u64>,
     /// Core `-blockversion` GBT override (`None` = default).
     pub block_version: Option<i32>,
     /// Core `-blockmintxfee` as BTC/kvB text (`None` = default 1 sat/kvB).
@@ -152,6 +154,7 @@ impl Default for NodeConfig {
             peer_timeout_secs: None,
             minimum_chain_work: None,
             mock_time: None,
+            max_tip_age_secs: None,
             block_version: None,
             block_min_tx_fee_btc: None,
         }

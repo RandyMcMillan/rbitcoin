@@ -65,6 +65,7 @@ where
     let mut peer_timeout_secs: Option<u64> = None;
     let mut minimum_chain_work: Option<[u8; 32]> = None;
     let mut mock_time: Option<i64> = None;
+    let mut max_tip_age_secs: Option<u64> = None;
     let mut block_version: Option<i32> = None;
     let mut block_min_tx_fee_btc: Option<String> = None;
 
@@ -639,6 +640,31 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 i += 1;
             }
+            other if other.starts_with("--maxtipage=") => {
+                match other["--maxtipage=".len()..].parse::<i64>() {
+                    Ok(n) if n >= 0 => max_tip_age_secs = Some(n as u64),
+                    _ => {
+                        eprintln!("error: bad --maxtipage");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--maxtipage" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --maxtipage requires a number of seconds");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<i64>() {
+                    Ok(n) if n >= 0 => max_tip_age_secs = Some(n as u64),
+                    _ => {
+                        eprintln!("error: bad --maxtipage");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
             other if other.starts_with("--blockversion=") => {
                 match other["--blockversion=".len()..].parse::<i32>() {
                     Ok(n) => block_version = Some(n),
@@ -917,6 +943,9 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
     }
     if let Some(t) = mock_time {
         config.mock_time = Some(t);
+    }
+    if let Some(n) = max_tip_age_secs {
+        config.max_tip_age_secs = Some(n);
     }
     if let Some(v) = block_version {
         config.block_version = Some(v);

@@ -315,13 +315,12 @@ impl ChainHub {
         Ok(sum_work(works.into_iter()))
     }
 
-    /// Core `nMaxTipAge` (24h): tip time vs [`Self::clock`].
+    /// Core `nMaxTipAge` (`-maxtipage`): tip time vs [`Self::clock`].
     pub fn tip_is_stale_for_ibd(&self) -> bool {
-        const MAX_TIP_AGE: u64 = 24 * 60 * 60;
         let Some(h) = self.tip_header() else {
             return true;
         };
-        self.clock.now_secs().saturating_sub(u64::from(h.time)) > MAX_TIP_AGE
+        self.clock.now_secs().saturating_sub(u64::from(h.time)) > self.max_tip_age_secs()
     }
 
     /// Attach mempool once (same Query Arc as this hub).

@@ -1153,6 +1153,20 @@ impl Query {
         };
         self.chain_stats_from_joined(&recs.joined)
     }
+
+    /// Slot-aware [`Self::scripthash_chain_stats`] at a caller-pinned view.
+    pub fn scripthash_chain_stats_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<ScriptHashChainStats, QueryError> {
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        let Some(recs) = slot.as_ref() else {
+            return Ok(ScriptHashChainStats::default());
+        };
+        self.chain_stats_from_joined(&recs.joined)
+    }
 }
 
 #[cfg(test)]

@@ -657,7 +657,7 @@ fn sh_stats_json(
         (st.query.scripthash_chain_stats_in(sh, v)?, view)
     } else {
         match st.query.run_at_view(ChainViewKind::ScriptHash, |v| {
-            st.query.scripthash_chain_stats_in(sh, v)
+            st.with_sh_join(|slot| st.query.scripthash_chain_stats_slot_in(sh, slot, v))
         }) {
             Ok((view, chain)) => (chain, Some(view)),
             Err(StoreError::NotFound) => (ScriptHashChainStats::default(), None),

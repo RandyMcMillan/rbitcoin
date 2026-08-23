@@ -1031,8 +1031,8 @@ where
             Ok::<_, rbitcoin_query::QueryError>(f(query, &stripped, Some(view), false))
         }) {
             Ok((view, inner)) => (inner, Some(view)),
-            Err(e) if matches!(e, StoreError::NotFound) => (f(query, &stripped, None, false), None),
-            Err(e) if matches!(e, StoreError::Stale(_)) => (Err("chain view moved".into()), None),
+            Err(StoreError::NotFound) => (f(query, &stripped, None, false), None),
+            Err(StoreError::Stale(_)) => (Err("chain view moved".into()), None),
             Err(e) => (Err(e.to_string()), None),
         },
         Err(e) => (Err(e), None),

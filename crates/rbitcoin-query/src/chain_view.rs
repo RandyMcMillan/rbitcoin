@@ -35,13 +35,12 @@ impl Query {
         self.pin_chain_view_at(&rec.hash)
     }
 
-    /// Pin the last height whose scripthash creates have been applied.
-    ///
-    /// Wallet confirmed reads (history / balance / utxo) use this, not live
-    /// tip, so they never mix a new `confirmed[]` height with an SH index that
-    /// has not seen it. `None` until the first SH apply.
+    /// Pin the last height SH can serve: durable watermark plus pending
+    /// write-behind records (RAM). Pending fills the gap to live tip so
+    /// mempool can drop confirmed txs without them vanishing from SH reads.
+    /// `None` until the first enqueue or apply.
     pub fn pin_sh_chain_view(&self) -> Result<Option<ChainView>, QueryError> {
-        let Some(h) = self.sh_indexed_through_height() else {
+        let Some(h) = self.sh_visible_through_height() else {
             return Ok(None);
         };
         let Some((_, rec)) = self.header_at_height(Height(h))? else {
@@ -50,8 +49,8 @@ impl Query {
         self.pin_chain_view_at(&rec.hash)
     }
 
-    /// As-of pin for SH reads: best-chain `hash` only if it is at or behind the
-    /// SH watermark. Ahead of SH (or no SH yet) is `None` — same as not on chain.
+    /// As-of pin for SH reads: best-chain `hash` at or behind the visible SH
+    /// height (durable + pending). Ahead of that is `None`.
     pub fn pin_sh_chain_view_at(&self, hash: &[u8; 32]) -> Result<Option<ChainView>, QueryError> {
         let Some(view) = self.pin_chain_view_at(hash)? else {
             return Ok(None);

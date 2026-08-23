@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 /// One height of SH creates waiting for the Class B appender.
 pub(crate) struct ShPendingJob {
     height: Height,
-    txs: Vec<(Fk, Option<CreatePin>)>,
+    records: Vec<ScriptHashRecord>,
 }
 
 /// One height ready for Class C (header + body already archived).
@@ -75,8 +75,8 @@ impl Query {
     /// Like [`Self::confirm_blocks_run`], with optional write-batch create pins.
     ///
     /// `create_pins` is `create_fk → CreatePin` for creates committed on this write
-    /// path. Pin Arcs are cloned onto the SH write-behind job so collect can
-    /// skip Class A body re-read after tip returns.
+    /// path. Collect runs after tip (cheap); records sit on the job so queries
+    /// join them before durable seed.
     pub fn confirm_blocks_run_with_create_pins(
         &self,
         items: &[ConfirmPrepared],
@@ -162,7 +162,7 @@ impl Query {
         crate::class_c_phase_stats::TIP_NS
             .fetch_add(t_tip.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-        self.enqueue_sh_pending(items, create_pins);
+        self.enqueue_sh_pending(items, create_pins)?;
 
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
@@ -175,34 +175,74 @@ impl Query {
         &self,
         items: &[ConfirmPrepared],
         create_pins: Option<&crate::FkMap<CreatePin>>,
-    ) {
+    ) -> Result<(), QueryError> {
         if !self.sh_index_enabled() || self.index_mode().is_direct() {
-            return;
+            return Ok(());
         }
+        use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
         let through = self.sh_indexed_through_height();
         let mut jobs = Vec::new();
         for item in items {
             if through.map(|t| item.height.0 <= t).unwrap_or(false) {
                 continue;
             }
-            let txs = item
-                .tx_fks
-                .iter()
-                .map(|&fk| {
-                    let pin = create_pins.and_then(|m| m.get(&fk).cloned());
-                    (fk, pin)
-                })
-                .collect();
+            let t_collect = std::time::Instant::now();
+            let mut records: Vec<ScriptHashRecord> = Vec::new();
+            records.reserve(item.tx_fks.len().saturating_mul(2));
+            for &fk in &item.tx_fks {
+                let pin = create_pins.and_then(|m| m.get(&fk));
+                self.collect_scripthash_creates(fk, &mut records, pin)?;
+            }
+            add_sh_part(
+                &sh_stats::SH_COLLECT_NS,
+                t_collect.elapsed().as_nanos() as u64,
+            );
             jobs.push(ShPendingJob {
                 height: item.height,
-                txs,
+                records,
             });
         }
         if jobs.is_empty() {
-            return;
+            return Ok(());
         }
         self.sh_pending.lock().unwrap().extend(jobs);
         self.sh_pending_cv.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn pending_sh_create_fks(&self, scripthash: &[u8; 32]) -> Vec<Fk> {
+        let g = self.sh_pending.lock().unwrap();
+        let mut out = Vec::new();
+        for job in g.iter() {
+            for r in &job.records {
+                if r.scripthash == *scripthash {
+                    out.push(r.create_tx_fk);
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn sh_pending_max_height(&self) -> Option<u32> {
+        self.sh_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|j| j.height.0)
+            .max()
+    }
+
+    /// Durable watermark plus pending jobs (RAM records already collected).
+    pub(crate) fn sh_visible_through_height(&self) -> Option<u32> {
+        match (
+            self.sh_indexed_through_height(),
+            self.sh_pending_max_height(),
+        ) {
+            (None, None) => None,
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => Some(a.max(b)),
+        }
     }
 
     /// Apply queued SH write-behind jobs in height order (one Class B appender).
@@ -236,16 +276,7 @@ impl Query {
             return Ok(());
         }
 
-        let t_collect = std::time::Instant::now();
-        let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
-        sh_creates.reserve(job.txs.len().saturating_mul(2));
-        for (tx_fk, pin) in &job.txs {
-            self.collect_scripthash_creates(*tx_fk, &mut sh_creates, pin.as_ref())?;
-        }
-        add_sh_part(
-            &sh_stats::SH_COLLECT_NS,
-            t_collect.elapsed().as_nanos() as u64,
-        );
+        let sh_creates = job.records;
 
         if !sh_creates.is_empty() {
             sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
@@ -318,7 +349,7 @@ impl Query {
             });
         }
         if !items.is_empty() {
-            self.enqueue_sh_pending(&items, None);
+            let _ = self.enqueue_sh_pending(&items, None);
         }
     }
 

@@ -3066,10 +3066,9 @@ mod tests {
         let hist = q.scripthash_history(&sh).unwrap();
         assert_eq!(
             hist.len(),
-            1,
-            "undrained SH must not claim the new tip create: {hist:?}"
+            2,
+            "pending SH records must show the new tip create: {hist:?}"
         );
-        assert_eq!(hist[0].height, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3110,7 +3109,11 @@ mod tests {
         q.recover_sh_writebehind();
         assert_eq!(q.sh_indexed_through_height(), Some(0));
         let sh = script_hash(&[0x51]);
-        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
+        assert_eq!(
+            q.scripthash_history(&sh).unwrap().len(),
+            2,
+            "requeued pending records must be visible before durable apply"
+        );
         q.apply_sh_pending().unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(1));
         assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
@@ -3118,10 +3121,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Default SH reads pin the SH watermark, not live tip — a spend confirmed
-    /// at tip+1 must not change balance/utxo until `apply_sh_pending`.
+    /// Pending write-behind records join at live tip so a confirmed spend is
+    /// visible even though durable SH (and mempool) have already moved on.
     #[test]
-    fn scripthash_reads_pin_sh_watermark_not_live_tip() {
+    fn sh_pending_records_join_at_live_tip_before_apply() {
         let (dir, q) = temp_query("sh-pin-watermark");
         let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
         ta0.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
@@ -3176,23 +3179,24 @@ mod tests {
         assert_eq!(q.sh_indexed_through_height(), Some(0));
         assert!(q.is_outpoint_spent(&create_txid, 0).unwrap());
 
-        let sh_view = q.pin_sh_chain_view().unwrap().expect("SH view at genesis");
-        assert_eq!(sh_view.height, Height(0));
-        assert_eq!(sh_view.hash, hash0);
+        let sh_view = q
+            .pin_sh_chain_view()
+            .unwrap()
+            .expect("SH view follows pending");
+        assert_eq!(sh_view.height, Height(1));
+        assert_eq!(sh_view.hash, hash1);
         let live = q.pin_chain_view().unwrap().expect("live tip");
         assert_eq!(live.height, Height(1));
 
-        let utxos = q.scripthash_listunspent(&sh).unwrap();
-        assert_eq!(
-            utxos.len(),
-            1,
-            "lagging SH view must still show the unspent create"
+        assert!(
+            q.scripthash_listunspent(&sh).unwrap().is_empty(),
+            "pending join at live tip must show the spend (mempool already dropped it)"
         );
-        assert_eq!(utxos[0].tx_hash, create_txid);
-        assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 10_0000_0000);
+        assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 0);
         let hist = q.scripthash_history(&sh).unwrap();
-        assert_eq!(hist.len(), 1);
-        assert_eq!(hist[0].txid, create_txid);
+        assert_eq!(hist.len(), 2);
+        assert!(hist.iter().any(|i| i.txid == create_txid));
+        assert!(hist.iter().any(|i| i.txid == spend_txid));
 
         q.apply_sh_pending().unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(1));

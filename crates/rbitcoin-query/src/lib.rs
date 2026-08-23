@@ -3098,6 +3098,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `apply_sh_pending` must wait out an in-flight job (worker vs generate drain).
+    #[test]
+    fn apply_sh_pending_waits_for_in_flight_job() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("apply-sh-wait-inflight");
+        let q = Arc::new(q);
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+        assert_eq!(q.sh_indexed_through_height(), None);
+
+        let stolen = q.take_sh_job_for_apply().expect("enqueued genesis");
+        let height = Height(0);
+        let q_apply = Arc::clone(&q);
+        let done = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            q_apply.apply_sh_job(stolen).unwrap();
+            q_apply.finish_sh_job(height);
+        });
+        q.apply_sh_pending().unwrap();
+        assert_eq!(
+            q.sh_indexed_through_height(),
+            Some(0),
+            "drain must wait until the in-flight job is watermarked"
+        );
+        done.join().unwrap();
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_sh_pending_two_drainers_cover_both_heights() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("apply-sh-two-drainers");
+        let q = Arc::new(q);
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+        let prev = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev, Some(hash0));
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        q.confirm_block(Height(1), &h1.hash).unwrap();
+
+        let a = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.apply_sh_pending())
+        };
+        let b = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.apply_sh_pending())
+        };
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sh_writebehind_recover_requeues_unapplied_heights() {
         let (dir, q) = temp_query("sh-wb-recover");

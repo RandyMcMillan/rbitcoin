@@ -272,13 +272,23 @@ impl Query {
     /// so SH history is visible immediately after the fixture connect.
     pub fn apply_sh_pending(&self) -> Result<(), QueryError> {
         loop {
-            let Some(job) = self.take_sh_job_for_apply() else {
+            if let Some(job) = self.take_sh_job_for_apply() {
+                let height = job.height;
+                let result = self.apply_sh_job(job);
+                self.finish_sh_job(height);
+                result?;
+                continue;
+            }
+            let pending = self.sh_pending.lock().unwrap();
+            let applying = self.sh_applying.lock().unwrap();
+            if pending.is_empty() && applying.is_none() {
                 return Ok(());
-            };
-            let height = job.height;
-            let result = self.apply_sh_job(job);
-            self.finish_sh_job(height);
-            result?;
+            }
+            drop(applying);
+            let _ = self
+                .sh_pending_cv
+                .wait_timeout(pending, std::time::Duration::from_millis(200))
+                .unwrap();
         }
     }
 
@@ -299,6 +309,7 @@ impl Query {
         if applying.as_ref().is_some_and(|j| j.height == height) {
             *applying = None;
         }
+        self.sh_pending_cv.notify_all();
     }
 
     pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {

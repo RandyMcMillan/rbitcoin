@@ -989,6 +989,14 @@ impl ChainHub {
         Ok(())
     }
 
+    /// Core `UpdateTime`: `max(MTP+1, GetTime())`.
+    fn generate_block_time(&self, tip_h: u32, tip_time: u32) -> u32 {
+        let now = self.clock.now_secs() as u32;
+        let mtp = rbitcoin_consensus::median_time_past(self.query.as_ref(), Height(tip_h))
+            .unwrap_or(tip_time);
+        now.max(mtp.saturating_add(1))
+    }
+
     /// Mine one block paying `script_pubkey` without connecting it.
     ///
     /// Core `generateblock … submit=false` returns the hex for `submitheader`.
@@ -1005,8 +1013,7 @@ impl ChainHub {
             .tip_hash()
             .ok_or(NetError::Protocol("generate: no tip hash"))?;
         let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-        let now = self.clock.now_secs() as u32;
-        let time = tip_time.saturating_add(1).max(now);
+        let time = self.generate_block_time(tip_h, tip_time);
         Ok(mine_regtest_paying(
             prev,
             time,
@@ -1045,8 +1052,7 @@ impl ChainHub {
                 .tip_hash()
                 .ok_or(NetError::Protocol("generate: no tip hash"))?;
             let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-            let now = self.clock.now_secs() as u32;
-            let time = tip_time.saturating_add(1).max(now);
+            let time = self.generate_block_time(tip_h, tip_time);
             let txs = if i == 0 {
                 std::mem::take(&mut extras)
             } else {
@@ -2194,9 +2200,14 @@ mod tests {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
-        let tip_time = 1_700_000_000u32;
-        hub.accept_block(mine(gen, tip_time, 1)).unwrap();
-        let mock = i64::from(tip_time) - 3600;
+        // Three headers so MTP is the middle time, not the tip (len/2).
+        let mid = 1_300_000_000u32;
+        let tip_time = mid + 10_000;
+        let h1 = mine(gen, mid, 1);
+        hub.accept_block(h1.clone()).unwrap();
+        hub.accept_block(mine(h1.block_hash(), tip_time, 2)).unwrap();
+        let mock = i64::from(tip_time) - 3_000;
+        assert!(mock as u32 > mid, "mock must sit above MTP");
         hub.clock.set_mock(mock);
         let hashes = hub
             .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])

@@ -3755,7 +3755,10 @@ fn expect_services_from_conn_matches_core() {
 
 #[test]
 fn handshake_disconnect_log_needles() {
-    assert_eq!(feeler_connection_completed_log(), "feeler connection completed");
+    assert_eq!(
+        feeler_connection_completed_log(),
+        "feeler connection completed"
+    );
     let line = connected_to_self_log("127.0.0.1:18444");
     assert!(line.contains("connected to self"));
     assert!(line.contains("disconnecting"));
@@ -3830,4 +3833,258 @@ fn redundant_verack_is_ignored_and_logged() {
 
         let _ = std::fs::remove_dir_all(dir);
     });
+}
+
+/// `p2p_addrfetch.py`: post-handshake AddrFetch queues getaddr, not getheaders.
+#[test]
+fn addrfetch_post_handshake_queues_getaddr_not_getheaders() {
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+
+    let (dir, q) = tmp_store("addrfetch-getaddr");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let peers = crate::peers::PeerHub::new();
+    // Tip older than 24h so try_start_headers_sync would otherwise start.
+    peers.set_mock_now(1_700_000_000);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let sess = peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        crate::peers::PeerConnType::AddrFetch,
+    );
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    sess.attach_out(out_tx.clone());
+
+    assert!(
+        !maybe_queue_initial_getheaders(&out_tx, &hub, sess.as_ref()),
+        "AddrFetch must not start initial headers sync"
+    );
+    assert!(
+        maybe_queue_addrfetch_getaddr(&out_tx, sess.as_ref()),
+        "AddrFetch must queue getaddr after handshake"
+    );
+
+    let mut saw_getaddr = false;
+    let mut saw_getheaders = false;
+    while let Ok(m) = out_rx.try_recv() {
+        match m {
+            NetworkMessage::GetAddr => saw_getaddr = true,
+            NetworkMessage::GetHeaders(_) => saw_getheaders = true,
+            _ => {}
+        }
+    }
+    assert!(saw_getaddr, "expected GetAddr");
+    assert!(!saw_getheaders, "AddrFetch must not queue GetHeaders");
+    assert!(!sess.stop.load(Ordering::SeqCst));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `p2p_addrfetch.py`: Addr/AddrV2 with >1 entry completes addr-fetch (disconnect).
+#[test]
+fn addrfetch_multi_addr_disconnects() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+    use bitcoin::p2p::message::RawNetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::Network;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        FramedMessage {
+            magic,
+            command: full[4..16].try_into().unwrap(),
+            checksum: full[20..24].try_into().unwrap(),
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let (dir, q) = tmp_store("addrfetch-multi");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let peers = crate::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let sess = peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        crate::peers::PeerConnType::AddrFetch,
+    );
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let mut wants_headers = false;
+    let mut wtxid = false;
+    let mut send_cmpct = false;
+    let mut cmpct_ver = 0u32;
+    let mut pending_headers = HashMap::new();
+    let mut pending_blocks = HashMap::new();
+    let mut pending_cmpct = HashMap::new();
+    let mut from_peer = HashMap::new();
+    let mut ban = 0u32;
+    let one = Address::new(
+        &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 8)), 18444),
+        ServiceFlags::NETWORK,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        handle_peer_frame(
+            frame_for(NetworkMessage::Addr(vec![(1u32, one.clone())])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut HashSet::new(),
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !sess.stop.load(Ordering::SeqCst),
+            "single addr must not disconnect"
+        );
+        assert_eq!(ban, 0);
+
+        handle_peer_frame(
+            frame_for(NetworkMessage::Addr(vec![
+                (1u32, one.clone()),
+                (1u32, one.clone()),
+            ])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut HashSet::new(),
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sess.stop.load(Ordering::SeqCst),
+            "Addr len>1 must complete addr-fetch"
+        );
+
+        let sess2 = peers.register(
+            addr,
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::AddrFetch,
+        );
+        let mut ban2 = 0u32;
+        let v2 = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(192, 0, 0, 8)),
+            port: 18444,
+        };
+        handle_peer_frame(
+            frame_for(NetworkMessage::AddrV2(vec![v2.clone(), v2])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut HashSet::new(),
+            &mut ban2,
+            Some(sess2.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sess2.stop.load(Ordering::SeqCst),
+            "AddrV2 len>1 must complete addr-fetch"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `p2p_addrfetch.py`: AddrFetch disconnects after 300s on the session clock.
+#[test]
+fn addrfetch_times_out_after_300s() {
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+
+    let peers = crate::peers::PeerHub::new();
+    peers.set_mock_now(1_700_000_000);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let sess = peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        crate::peers::PeerConnType::AddrFetch,
+    );
+    assert!(!addrfetch_timed_out(sess.as_ref()));
+    peers.set_mock_now(1_700_000_000 + 295);
+    assert!(!addrfetch_timed_out(sess.as_ref()));
+    peers.set_mock_now(1_700_000_000 + 301);
+    assert!(addrfetch_timed_out(sess.as_ref()));
+    assert!(!sess.stop.load(Ordering::SeqCst));
 }

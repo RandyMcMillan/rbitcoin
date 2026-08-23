@@ -2797,6 +2797,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn exclusive_sh_handoff_mempool_to_pending() {
+        use rbitcoin_store::script_hash;
+
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let genesis = hub
+            .block_at_height(0)
+            .unwrap()
+            .expect("genesis after ensure");
+        let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
+            hub.query.as_ref(),
+            &hub.params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            100,
+            1,
+        );
+        assert_eq!(hub.tip_height(), Some(100));
+        let through = hub.query.sh_indexed_through_height();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let sh = script_hash(spk.as_bytes());
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let spend_id = spend.compute_txid().to_byte_array();
+        mp.accept_tx(&spend).expect("accept spend");
+        let in_mp = |mp: &crate::tx_relay::MempoolHub| {
+            mp.scripthash_mempool(&sh)
+                .iter()
+                .any(|r| r.txid == spend_id)
+        };
+        let in_hist = || {
+            hub.query
+                .scripthash_history(&sh)
+                .unwrap()
+                .iter()
+                .any(|r| r.txid == spend_id)
+        };
+        assert!(in_mp(&mp), "pre-connect: tx must be in mempool overlay");
+        assert!(!in_hist(), "pre-connect: tx must not be confirmed history");
+
+        let block = hub
+            .assemble_block_to_script(spk, vec![spend])
+            .expect("assemble");
+        match hub.accept_block(block).expect("connect spend block") {
+            AcceptOutcome::Accepted { height } => assert_eq!(height, 101),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        assert_eq!(
+            hub.query.sh_indexed_through_height(),
+            through,
+            "accept must not drain durable SH"
+        );
+        assert!(
+            !in_mp(&mp),
+            "post-connect: mempool overlay must not keep the confirmed tx"
+        );
+        assert!(
+            in_hist(),
+            "post-connect: pending SH must show the confirmed tx before durable apply"
+        );
+        let hist_hits = hub
+            .query
+            .scripthash_history(&sh)
+            .unwrap()
+            .iter()
+            .filter(|r| r.txid == spend_id)
+            .count();
+        let mp_hits = mp
+            .scripthash_mempool(&sh)
+            .iter()
+            .filter(|r| r.txid == spend_id)
+            .count();
+        assert_eq!(
+            hist_hits + mp_hits,
+            1,
+            "tx must not vanish or duplicate across overlay and history"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// `mempool_reorg.py`: invalidate below coinbase maturity must empty the spend.
     #[test]
     fn invalidate_evicts_immature_coinbase_spend() {

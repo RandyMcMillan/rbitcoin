@@ -461,7 +461,7 @@ impl Query {
         scripthash: &[u8; 32],
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<(), QueryError> {
-        let Some(view) = self.pin_chain_view()? else {
+        let Some(view) = self.pin_sh_chain_view()? else {
             *slot = None;
             return Ok(());
         };
@@ -753,13 +753,13 @@ impl Query {
     /// applies [`apply_history_filter`]. When `filter.to_height` is set, create
     /// outpoints with `create_height >= to_height` are skipped during expand
     /// (spends of those creates are also ≥ create height, so they cannot fall
-    /// inside the window). Pins the live tip.
+    /// inside the window). Pins the SH watermark, not live tip.
     pub fn scripthash_history_filtered(
         &self,
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let Some(view) = self.pin_chain_view()? else {
+        let Some(view) = self.pin_sh_chain_view()? else {
             return Ok(Vec::new());
         };
         self.scripthash_history_filtered_in(scripthash, filter, &view)
@@ -793,7 +793,7 @@ impl Query {
         filter: &HistoryFilter,
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let Some(view) = self.pin_chain_view()? else {
+        let Some(view) = self.pin_sh_chain_view()? else {
             *slot = None;
             return Ok(Vec::new());
         };
@@ -871,7 +871,7 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
-        let Some(view) = self.pin_chain_view()? else {
+        let Some(view) = self.pin_sh_chain_view()? else {
             return Ok(ScriptHashBalance {
                 confirmed: 0,
                 unconfirmed: 0,
@@ -962,7 +962,7 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
-        let Some(view) = self.pin_chain_view()? else {
+        let Some(view) = self.pin_sh_chain_view()? else {
             return Ok(Vec::new());
         };
         self.scripthash_listunspent_in(scripthash, &view)
@@ -1073,7 +1073,7 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
-        let Some(view) = self.pin_chain_view()? else {
+        let Some(view) = self.pin_sh_chain_view()? else {
             return Ok(ScriptHashChainStats {
                 tx_count: 0,
                 funded_txo_count: 0,

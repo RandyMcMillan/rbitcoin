@@ -206,6 +206,7 @@ impl Query {
                 "node: scripthash already tip-ready (durable head covers tip; no residual runs) — \
                  skip Class A recollect and bulk materialize"
             );
+            self.mark_sh_indexed_through_tip();
             return Ok(0);
         }
 
@@ -376,7 +377,14 @@ impl Query {
                 ));
             }
         }
+        self.mark_sh_indexed_through_tip();
         Ok(n)
+    }
+
+    fn mark_sh_indexed_through_tip(&self) {
+        if let Some(tip) = self.tip_height() {
+            self.set_sh_indexed_through_height(Some(tip.0));
+        }
     }
 
     /// On-disk scripthash sorted-run count (Direct IBD cache).

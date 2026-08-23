@@ -286,6 +286,64 @@ impl Query {
             .retain(|job| job.height.0 < height.0);
     }
 
+    /// Restore SH watermark from durable `include_hwm` and re-queue heights the
+    /// RAM write-behind lost on restart.
+    pub(crate) fn recover_sh_writebehind(&self) {
+        let recovered = self.recover_sh_indexed_through();
+        self.set_sh_indexed_through_height(recovered);
+        if !self.store.scripthash.has_durable_index() {
+            return;
+        }
+        let Some(tip) = self.tip_height() else {
+            return;
+        };
+        let from = recovered.map(|h| h.saturating_add(1)).unwrap_or(0);
+        if from > tip.0 {
+            return;
+        }
+        let mut items = Vec::new();
+        for h in from..=tip.0 {
+            let Ok(Some(header_fk)) = self.store.confirmed.get(Height(h)) else {
+                continue;
+            };
+            let Ok(Some(tx_fks)) = self.store.header_txs.get_list(header_fk) else {
+                continue;
+            };
+            items.push(ConfirmPrepared {
+                height: Height(h),
+                header_fk,
+                tx_fks,
+            });
+        }
+        if !items.is_empty() {
+            self.enqueue_sh_pending(&items, None);
+        }
+    }
+
+    fn recover_sh_indexed_through(&self) -> Option<u32> {
+        let tip = self.tip_height()?;
+        let hwm = self.store.scripthash.include_hwm();
+        if hwm == 0 {
+            if self.store.scripthash.has_durable_index() {
+                return Some(tip.0);
+            }
+            return None;
+        }
+        let mut h = tip.0;
+        loop {
+            if let Ok(fks) = self.block_tx_fks(Height(h)) {
+                let max_fk = fks.iter().map(|f| f.0).max().unwrap_or(0);
+                if max_fk <= hwm {
+                    return Some(h);
+                }
+            }
+            if h == 0 {
+                return None;
+            }
+            h -= 1;
+        }
+    }
+
     /// Append point multimap edges for all non-coinbase inputs of `tx_fk`.
     pub(crate) fn mark_spends_for_tx(
         &self,

@@ -1201,14 +1201,12 @@ impl Query {
         } else {
             (None, 0)
         };
-        // SH watermark: on resume, assume 0..=tip already had SH work committed with tip.
-        let sh_through = store.tip_height().map(|h| h.0 as u64).unwrap_or(u64::MAX);
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
             sh_heads: Mutex::new(HashMap::new()),
-            sh_indexed_through: AtomicU64::new(sh_through),
+            sh_indexed_through: AtomicU64::new(u64::MAX),
             sh_pending: Mutex::new(VecDeque::new()),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
@@ -1240,6 +1238,7 @@ impl Query {
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
         }
+        q.recover_sh_writebehind();
         Ok(q)
     }
 
@@ -3087,6 +3086,117 @@ mod tests {
         let hist = q.scripthash_history(&sh).unwrap();
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].height, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sh_writebehind_recover_requeues_unapplied_heights() {
+        let (dir, q) = temp_query("sh-wb-recover");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        q.confirm_block(Height(1), &h1.hash).unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        q.sh_pending.lock().unwrap().clear();
+        q.recover_sh_writebehind();
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
+        q.apply_sh_pending().unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Default SH reads pin the SH watermark, not live tip — a spend confirmed
+    /// at tip+1 must not change balance/utxo until `apply_sh_pending`.
+    #[test]
+    fn scripthash_reads_pin_sh_watermark_not_live_tip() {
+        let (dir, q) = temp_query("sh-pin-watermark");
+        let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
+        ta0.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
+        let create_txid = ta0.tx.txid;
+        let hash0 = h0.hash;
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_listunspent(&sh).unwrap().len(), 1);
+        assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 10_0000_0000);
+
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let hash1 = rbitcoin_store::block_header_hash(1, &hash0, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        q.commit_class_a_only(
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: create_txid,
+                    create_fk,
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
+            }],
+        )
+        .unwrap();
+        q.confirm_block(Height(1), &hash1).unwrap();
+
+        assert_eq!(q.tip_height(), Some(Height(1)));
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        assert!(q.is_outpoint_spent(&create_txid, 0).unwrap());
+
+        let sh_view = q.pin_sh_chain_view().unwrap().expect("SH view at genesis");
+        assert_eq!(sh_view.height, Height(0));
+        assert_eq!(sh_view.hash, hash0);
+        let live = q.pin_chain_view().unwrap().expect("live tip");
+        assert_eq!(live.height, Height(1));
+
+        let utxos = q.scripthash_listunspent(&sh).unwrap();
+        assert_eq!(
+            utxos.len(),
+            1,
+            "lagging SH view must still show the unspent create"
+        );
+        assert_eq!(utxos[0].tx_hash, create_txid);
+        assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 10_0000_0000);
+        let hist = q.scripthash_history(&sh).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].txid, create_txid);
+
+        q.apply_sh_pending().unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+        let sh_view = q.pin_sh_chain_view().unwrap().expect("SH caught up");
+        assert_eq!(sh_view.height, Height(1));
+        assert_eq!(sh_view.hash, hash1);
+        assert!(q.scripthash_listunspent(&sh).unwrap().is_empty());
+        assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 0);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

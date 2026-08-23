@@ -35,6 +35,21 @@ impl Query {
         self.pin_chain_view_at(&rec.hash)
     }
 
+    /// Pin the last height whose scripthash creates have been applied.
+    ///
+    /// Wallet confirmed reads (history / balance / utxo) use this, not live
+    /// tip, so they never mix a new `confirmed[]` height with an SH index that
+    /// has not seen it. `None` until the first SH apply.
+    pub fn pin_sh_chain_view(&self) -> Result<Option<ChainView>, QueryError> {
+        let Some(h) = self.sh_indexed_through_height() else {
+            return Ok(None);
+        };
+        let Some((_, rec)) = self.header_at_height(Height(h))? else {
+            return Ok(None);
+        };
+        self.pin_chain_view_at(&rec.hash)
+    }
+
     /// Pin a **best-chain** header hash (tip or buried). `None` if it is not
     /// `confirmed[height]` (unknown, archive-only orphan, or disconnected).
     pub fn pin_chain_view_at(&self, hash: &[u8; 32]) -> Result<Option<ChainView>, QueryError> {

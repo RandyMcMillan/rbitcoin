@@ -44,8 +44,8 @@ The 2-wave split is sealed age, not an IO flag.
 | Role | Notes |
 |------|--------|
 | `peer_session` (split read/write) | Serve reconstruct + accept tip blocks via **`accept_and_connect_block`** → **`confirm_wire_run`** (same load→scripts→commit). Class C tip does **not** join SH `put_create`. |
-| `rbtc-sh-wb` | **One** Class B scripthash appender (tip follow). Confirm enqueues pin identity; this thread `put_create_batch_append` then advances `sh_indexed_through`. |
-| Electrum / Esplora | Confirmed SH reads join durable index **plus pending write-behind records** and pin that visible height (live tip while jobs sit in RAM). Headers subscribe is live tip. |
+| `rbtc-sh-wb` | **One** Class B scripthash appender (tip follow). Confirm enqueues RAM records; `connect_at` / `note_confirmed_tip` **release** after `tip_tx`. This thread `put_create_batch_append` only for released heights, then advances `sh_indexed_through`. Apply errors re-queue and halt. |
+| Electrum / Esplora | Confirmed SH reads join durable index **plus a RAM SH head** (pending jobs keyed by scripthash) and pin that visible height (live tip while jobs sit, never above published tip). A tx is in mempool overlay **or** SH (pending/durable), not both and not neither. Reorg reaccepts then drops pending. Headers subscribe is live tip. |
 | Epoch finalize | Single-threaded control path; flushes table maps / fd durability |
 
 ## Index modes (`IndexMode`)

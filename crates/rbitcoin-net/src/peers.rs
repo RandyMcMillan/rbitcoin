@@ -802,6 +802,29 @@ impl PeerHub {
         *self.dial_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
+    /// Placeholder row after TCP connect, before VERSION (Core `CNode` timing).
+    pub fn register_connecting(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        addrbind: SocketAddr,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::ServiceFlags;
+        let ver = VersionMessage {
+            version: bitcoin::p2p::PROTOCOL_VERSION,
+            services: ServiceFlags::NONE,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addrbind, ServiceFlags::NONE),
+            nonce: 0,
+            user_agent: String::new(),
+            start_height: 0,
+            relay: false,
+        };
+        self.register(addr, addrbind, &ver, false, conn_type)
+    }
+
     pub fn register(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -811,6 +834,21 @@ impl PeerHub {
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.register_with_id(id, addr, addrbind, ver, inbound, conn_type)
+    }
+
+    pub fn register_with_id(
+        self: &Arc<Self>,
+        id: u64,
+        addr: SocketAddr,
+        addrbind: SocketAddr,
+        ver: &VersionMessage,
+        inbound: bool,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
+        let _ = self
+            .next_id
+            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
         let services = service_flags_u64(ver.services);
         let connected_at = self.now_secs();
         let peer = Arc::new(LivePeer {

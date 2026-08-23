@@ -2205,7 +2205,8 @@ mod tests {
         let tip_time = mid + 10_000;
         let h1 = mine(gen, mid, 1);
         hub.accept_block(h1.clone()).unwrap();
-        hub.accept_block(mine(h1.block_hash(), tip_time, 2)).unwrap();
+        hub.accept_block(mine(h1.block_hash(), tip_time, 2))
+            .unwrap();
         let mock = i64::from(tip_time) - 3_000;
         assert!(mock as u32 > mid, "mock must sit above MTP");
         hub.clock.set_mock(mock);

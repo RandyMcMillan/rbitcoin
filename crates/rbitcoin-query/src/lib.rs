@@ -1099,6 +1099,8 @@ pub struct Query {
     sh_applying: Mutex<Option<connect::ShPendingJob>>,
     /// `0` = none released; `h+1` = durable apply may run through height `h`.
     sh_released_through: AtomicU32,
+    /// Pending + in-flight SH creates keyed by scripthash (join without scanning jobs).
+    sh_ram_head: Mutex<HashMap<[u8; 32], Vec<Fk>>>,
     /// Serializes the one Class B appender (worker vs generate drain).
     sh_appender: Mutex<()>,
     /// Block-structured confirm parent cache.
@@ -1212,6 +1214,7 @@ impl Query {
             sh_pending_cv: Condvar::new(),
             sh_applying: Mutex::new(None),
             sh_released_through: AtomicU32::new(0),
+            sh_ram_head: Mutex::new(HashMap::new()),
             sh_appender: Mutex::new(()),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
@@ -3110,6 +3113,36 @@ mod tests {
             written1 >= written0,
             "release+apply must be allowed to write durable SH"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ram_sh_head_lookup_is_per_scripthash() {
+        let (dir, q) = temp_query("ram-sh-head");
+        let (h0, mut t0) = coinbase_block(0, Fk::NULL, None);
+        t0.tx.output_count = 2;
+        t0.outputs = vec![
+            OutputRecord::unspent(25_0000_0000, vec![0x51]),
+            OutputRecord::unspent(25_0000_0000, vec![0x52]),
+        ];
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+        let sha = script_hash(&[0x51]);
+        let shb = script_hash(&[0x52]);
+        let fa = q.pending_sh_create_fks(&sha);
+        let fb = q.pending_sh_create_fks(&shb);
+        assert_eq!(fa.len(), 1, "script A must hit only its pending fks");
+        assert_eq!(fb.len(), 1, "script B must hit only its pending fks");
+        assert_eq!(fa, fb, "same create tx funds both scripts");
+        assert!(q.pending_sh_create_fks(&[0u8; 32]).is_empty());
+        q.apply_sh_pending().unwrap();
+        assert!(
+            q.pending_sh_create_fks(&sha).is_empty(),
+            "apply must drop RAM-head keys"
+        );
+        assert_eq!(q.scripthash_history(&sha).unwrap().len(), 1);
+        assert_eq!(q.scripthash_history(&shb).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

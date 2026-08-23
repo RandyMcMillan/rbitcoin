@@ -11,6 +11,26 @@ pub(crate) struct ShPendingJob {
     records: Vec<ScriptHashRecord>,
 }
 
+fn index_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJob) {
+    for r in &job.records {
+        head.entry(r.scripthash).or_default().push(r.create_tx_fk);
+    }
+}
+
+fn unindex_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJob) {
+    for r in &job.records {
+        let Some(v) = head.get_mut(&r.scripthash) else {
+            continue;
+        };
+        if let Some(i) = v.iter().position(|fk| *fk == r.create_tx_fk) {
+            v.swap_remove(i);
+        }
+        if v.is_empty() {
+            head.remove(&r.scripthash);
+        }
+    }
+}
+
 /// One height ready for Class C (header + body already archived).
 ///
 /// Callers that already resolved `header_fk` / `tx_fks` (e.g. multi-block confirm)
@@ -210,7 +230,12 @@ impl Query {
         if jobs.is_empty() {
             return Ok(());
         }
-        self.sh_pending.lock().unwrap().extend(jobs);
+        let mut pending = self.sh_pending.lock().unwrap();
+        let mut head = self.sh_ram_head.lock().unwrap();
+        for job in &jobs {
+            index_sh_ram_head(&mut head, job);
+        }
+        pending.extend(jobs);
         Ok(())
     }
 
@@ -259,24 +284,12 @@ impl Query {
     }
 
     pub(crate) fn pending_sh_create_fks(&self, scripthash: &[u8; 32]) -> Vec<Fk> {
-        let mut out = Vec::new();
-        let push_job = |job: &ShPendingJob, out: &mut Vec<Fk>| {
-            for r in &job.records {
-                if r.scripthash == *scripthash {
-                    out.push(r.create_tx_fk);
-                }
-            }
-        };
-        {
-            let g = self.sh_pending.lock().unwrap();
-            for job in g.iter() {
-                push_job(job, &mut out);
-            }
-        }
-        if let Some(job) = self.sh_applying.lock().unwrap().as_ref() {
-            push_job(job, &mut out);
-        }
-        out
+        self.sh_ram_head
+            .lock()
+            .unwrap()
+            .get(scripthash)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn sh_pending_max_height(&self) -> Option<u32> {
@@ -366,6 +379,14 @@ impl Query {
     }
 
     pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
+        let result = self.apply_sh_job_inner(&job);
+        if result.is_ok() {
+            unindex_sh_ram_head(&mut self.sh_ram_head.lock().unwrap(), &job);
+        }
+        result
+    }
+
+    fn apply_sh_job_inner(&self, job: &ShPendingJob) -> Result<(), QueryError> {
         use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
         let _appender = self.sh_appender.lock().unwrap();
@@ -382,12 +403,12 @@ impl Query {
             return Ok(());
         }
 
-        let sh_creates = job.records;
+        let sh_creates = &job.records;
 
         if !sh_creates.is_empty() {
             sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
             let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
-            for r in &sh_creates {
+            for r in sh_creates {
                 uniq.insert(r.scripthash);
             }
             sh_stats::SH_UNIQUE_N.fetch_add(uniq.len() as u64, Ordering::Relaxed);
@@ -395,7 +416,7 @@ impl Query {
 
         let mut tip_sh_max_fk = 0u64;
         if !sh_creates.is_empty() {
-            for r in &sh_creates {
+            for r in sh_creates {
                 tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
             }
             let mut heads = self.sh_heads.lock().unwrap();
@@ -419,15 +440,30 @@ impl Query {
     }
 
     fn drop_sh_pending_from(&self, height: Height) {
-        self.sh_pending
-            .lock()
-            .unwrap()
-            .retain(|job| job.height.0 < height.0);
+        let mut pending = self.sh_pending.lock().unwrap();
+        let dropped: Vec<ShPendingJob> = pending
+            .iter()
+            .filter(|job| job.height.0 >= height.0)
+            .cloned()
+            .collect();
+        pending.retain(|job| job.height.0 < height.0);
+        drop(pending);
         let mut applying = self.sh_applying.lock().unwrap();
-        if applying.as_ref().is_some_and(|j| j.height.0 >= height.0) {
-            *applying = None;
-        }
+        let applying_job = if applying.as_ref().is_some_and(|j| j.height.0 >= height.0) {
+            applying.take()
+        } else {
+            None
+        };
         drop(applying);
+        {
+            let mut head = self.sh_ram_head.lock().unwrap();
+            for job in &dropped {
+                unindex_sh_ram_head(&mut head, job);
+            }
+            if let Some(job) = applying_job.as_ref() {
+                unindex_sh_ram_head(&mut head, job);
+            }
+        }
         self.clamp_sh_released_before(height);
     }
 

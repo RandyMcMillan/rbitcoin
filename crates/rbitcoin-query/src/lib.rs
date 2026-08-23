@@ -1101,6 +1101,9 @@ pub struct Query {
     /// [`Self::apply_sh_pending`] / the tip-follow worker drain.
     sh_pending: Mutex<VecDeque<connect::ShPendingJob>>,
     sh_pending_cv: Condvar,
+    /// Job popped for apply but not yet watermarked. Readers join this with
+    /// [`Self::sh_pending`] so the pop→watermark window stays at live tip.
+    sh_applying: Mutex<Option<connect::ShPendingJob>>,
     /// Serializes the one Class B appender (worker vs generate drain).
     sh_appender: Mutex<()>,
     /// Block-structured confirm parent cache.
@@ -1212,6 +1215,7 @@ impl Query {
             sh_indexed_through: AtomicU64::new(u64::MAX),
             sh_pending: Mutex::new(VecDeque::new()),
             sh_pending_cv: Condvar::new(),
+            sh_applying: Mutex::new(None),
             sh_appender: Mutex::new(()),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
@@ -3206,6 +3210,87 @@ mod tests {
         assert!(q.scripthash_listunspent(&sh).unwrap().is_empty());
         assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 0);
         assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Worker / drain must not hide pending creates between pop and watermark.
+    ///
+    /// Stealing the job (pop without apply) is the in-flight window today's
+    /// `rbtc-sh-wb` opens: generate's drain sees an empty queue while apply is
+    /// still running, MiniWallet scantxoutset pins the pre-tip watermark, and
+    /// a spent coin looks live while Class C already spent it (orphaned).
+    #[test]
+    fn sh_pending_join_holds_while_job_is_in_flight() {
+        let (dir, q) = temp_query("sh-pending-inflight");
+        let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
+        ta0.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
+        let create_txid = ta0.tx.txid;
+        let hash0 = h0.hash;
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        let sh = script_hash(&[0x51]);
+
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x22;
+        spend_txid[31] = 0xef;
+        let hash1 = rbitcoin_store::block_header_hash(1, &hash0, &[0x22; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x22; 32],
+            hash: hash1,
+        };
+        q.commit_class_a_only(
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: create_txid,
+                    create_fk,
+                    prev_index: 0,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
+            }],
+        )
+        .unwrap();
+        q.confirm_block(Height(1), &hash1).unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        assert!(q.scripthash_listunspent(&sh).unwrap().is_empty());
+
+        // Same transition as rbtc-sh-wb / apply_sh_pending: queue → applying,
+        // durable watermark not advanced yet.
+        let stolen = q.take_sh_job_for_apply();
+        assert!(stolen.is_some(), "confirm must enqueue the spend height");
+        assert!(
+            q.scripthash_listunspent(&sh).unwrap().is_empty(),
+            "in-flight apply window must still join pending at live tip"
+        );
+        assert_eq!(
+            q.pin_sh_chain_view().unwrap().map(|v| v.height),
+            Some(Height(1)),
+            "visible SH height must stay at tip while the job is in flight"
+        );
+
+        let job = stolen.expect("enqueued");
+        q.apply_sh_job(job).unwrap();
+        q.finish_sh_job(Height(1));
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+        assert!(q.scripthash_listunspent(&sh).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

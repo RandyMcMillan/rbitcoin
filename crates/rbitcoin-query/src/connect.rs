@@ -4,6 +4,7 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 /// One height of SH creates waiting for the Class B appender.
+#[derive(Clone)]
 pub(crate) struct ShPendingJob {
     height: Height,
     records: Vec<ScriptHashRecord>,
@@ -211,25 +212,45 @@ impl Query {
     }
 
     pub(crate) fn pending_sh_create_fks(&self, scripthash: &[u8; 32]) -> Vec<Fk> {
-        let g = self.sh_pending.lock().unwrap();
         let mut out = Vec::new();
-        for job in g.iter() {
+        let push_job = |job: &ShPendingJob, out: &mut Vec<Fk>| {
             for r in &job.records {
                 if r.scripthash == *scripthash {
                     out.push(r.create_tx_fk);
                 }
             }
+        };
+        {
+            let g = self.sh_pending.lock().unwrap();
+            for job in g.iter() {
+                push_job(job, &mut out);
+            }
+        }
+        if let Some(job) = self.sh_applying.lock().unwrap().as_ref() {
+            push_job(job, &mut out);
         }
         out
     }
 
     pub(crate) fn sh_pending_max_height(&self) -> Option<u32> {
-        self.sh_pending
+        let queued = self
+            .sh_pending
             .lock()
             .unwrap()
             .iter()
             .map(|j| j.height.0)
-            .max()
+            .max();
+        let applying = self
+            .sh_applying
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|j| j.height.0);
+        match (queued, applying) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(a.max(b)),
+        }
     }
 
     /// Durable watermark plus pending jobs (RAM records already collected).
@@ -251,11 +272,32 @@ impl Query {
     /// so SH history is visible immediately after the fixture connect.
     pub fn apply_sh_pending(&self) -> Result<(), QueryError> {
         loop {
-            let job = self.sh_pending.lock().unwrap().pop_front();
-            let Some(job) = job else {
+            let Some(job) = self.take_sh_job_for_apply() else {
                 return Ok(());
             };
-            self.apply_sh_job(job)?;
+            let height = job.height;
+            let result = self.apply_sh_job(job);
+            self.finish_sh_job(height);
+            result?;
+        }
+    }
+
+    /// Pop queue → `sh_applying` so readers still join pending at live tip.
+    pub(crate) fn take_sh_job_for_apply(&self) -> Option<ShPendingJob> {
+        let mut pending = self.sh_pending.lock().unwrap();
+        let mut applying = self.sh_applying.lock().unwrap();
+        if applying.is_some() {
+            return None;
+        }
+        let job = pending.pop_front()?;
+        *applying = Some(job.clone());
+        Some(job)
+    }
+
+    pub(crate) fn finish_sh_job(&self, height: Height) {
+        let mut applying = self.sh_applying.lock().unwrap();
+        if applying.as_ref().is_some_and(|j| j.height == height) {
+            *applying = None;
         }
     }
 
@@ -317,6 +359,10 @@ impl Query {
             .lock()
             .unwrap()
             .retain(|job| job.height.0 < height.0);
+        let mut applying = self.sh_applying.lock().unwrap();
+        if applying.as_ref().is_some_and(|j| j.height.0 >= height.0) {
+            *applying = None;
+        }
     }
 
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
@@ -619,28 +665,29 @@ pub fn spawn_sh_writebehind(
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            let job = {
-                let mut g = query.sh_pending.lock().unwrap();
-                loop {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    if let Some(job) = g.pop_front() {
-                        break job;
-                    }
-                    let (g2, wait) = query
-                        .sh_pending_cv
-                        .wait_timeout(g, std::time::Duration::from_millis(200))
-                        .unwrap();
-                    g = g2;
-                    if wait.timed_out() {
-                        continue;
-                    }
+            let job = loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(job) = query.take_sh_job_for_apply() {
+                    break job;
+                }
+                let g = query.sh_pending.lock().unwrap();
+                let (g2, wait) = query
+                    .sh_pending_cv
+                    .wait_timeout(g, std::time::Duration::from_millis(200))
+                    .unwrap();
+                drop(g2);
+                if wait.timed_out() {
+                    continue;
                 }
             };
             let t0 = std::time::Instant::now();
             let h = job.height.0;
-            if let Err(e) = query.apply_sh_job(job) {
+            let height = job.height;
+            let apply_err = query.apply_sh_job(job).err();
+            query.finish_sh_job(height);
+            if let Some(e) = apply_err {
                 rbitcoin_log::error!("scripthash write-behind h={h}: {e}");
                 continue;
             }

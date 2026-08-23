@@ -222,6 +222,7 @@ impl Query {
     pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
         use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
+        let _appender = self.sh_appender.lock().unwrap();
         if !self.sh_index_enabled() || self.index_mode().is_direct() {
             return Ok(());
         }

@@ -1101,6 +1101,8 @@ pub struct Query {
     /// [`Self::apply_sh_pending`] / the tip-follow worker drain.
     sh_pending: Mutex<VecDeque<connect::ShPendingJob>>,
     sh_pending_cv: Condvar,
+    /// Serializes the one Class B appender (worker vs generate drain).
+    sh_appender: Mutex<()>,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// In-RAM body queue + lookup-promoted decoded map. One mutex (no ArcSwap).
@@ -1210,6 +1212,7 @@ impl Query {
             sh_indexed_through: AtomicU64::new(u64::MAX),
             sh_pending: Mutex::new(VecDeque::new()),
             sh_pending_cv: Condvar::new(),
+            sh_appender: Mutex::new(()),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
                 q: rbitcoin_store::BlockQueue::open_or_create(&store_path)?,

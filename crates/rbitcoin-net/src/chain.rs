@@ -1730,7 +1730,7 @@ impl ChainHub {
         // UpdateTip). IBD bulk confirm uses note_confirmed_tip without this line;
         // IBD retains periodic progress/perf status instead.
         log_update_tip(height, &hash, &header, n_tx);
-        log_tip_accept_sh(height, n_tx, wall_ns);
+        log_tip_accept_sh(&self.query, height, n_tx, wall_ns);
         let event = TipEvent {
             height,
             hash,
@@ -1903,6 +1903,7 @@ pub struct TipAcceptShInput {
     pub spend_ns: u64,
     pub strong_ns: u64,
     pub tip_ns: u64,
+    pub sh_lag: u32,
     pub sh: rbitcoin_query::class_c_phase_stats::TipShSnap,
 }
 
@@ -1933,12 +1934,13 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     format!(
         "tip: accept h={h} tx={n_tx} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
          class_a={class_a_ms}ms class_c={class_c_ms}ms (strong={strong_ms} tip_set={tip_ms}) \
-         sh={sh_ms}ms \
+         sh={sh_ms}ms sh_lag={sh_lag} \
          (filter={filt_ms} collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
          spend={spend_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
         n_tx = i.n_tx,
+        sh_lag = i.sh_lag,
         pin = sh.pin,
         cold = sh.cold,
         creates = sh.creates,
@@ -1948,7 +1950,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
 }
 
 /// Sample meters after tip accept and emit INFO `tip: accept …` (SH breakdown).
-fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
+fn log_tip_accept_sh(query: &Query, height: u32, n_tx: usize, wall_ns: u64) {
     let (
         _recon,
         _wire,
@@ -1987,6 +1989,7 @@ fn log_tip_accept_sh(height: u32, n_tx: usize, wall_ns: u64) {
         spend_ns,
         strong_ns,
         tip_ns,
+        sh_lag: query.sh_lag_heights(),
         sh,
     });
     info!("{line}");
@@ -2251,6 +2254,7 @@ mod tests {
             spend_ns: 80_000_000,
             strong_ns: 5_000_000,
             tip_ns: 2_000_000,
+            sh_lag: 2,
             sh: rbitcoin_query::class_c_phase_stats::TipShSnap {
                 filter_ns: 1_000_000,
                 collect_ns: 20_000_000,
@@ -2270,7 +2274,8 @@ mod tests {
         assert!(line.contains("class_c=7ms"), "{line}");
         assert!(line.contains("(strong=5 tip_set=2)"), "{line}");
         assert!(line.contains("sh=1726ms"), "{line}"); // 1+20+5+800+600+300
-                                                       // Substep ms are unitless inside the paren (outer fields carry `ms`).
+        assert!(line.contains("sh_lag=2"), "{line}");
+        // Substep ms are unitless inside the paren (outer fields carry `ms`).
         assert!(line.contains("seed=800"), "{line}");
         assert!(line.contains("body=600"), "{line}");
         assert!(line.contains("head=300"), "{line}");

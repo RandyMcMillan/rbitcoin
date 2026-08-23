@@ -37,6 +37,13 @@ before 1.0).
 
 ### Changed
 
+- **Tip accept does not wait on scripthash:** Class C publishes `confirmed[]`
+  then enqueues SH; one `rbtc-sh-wb` appender writes creates and advances
+  `sh_indexed_through`. Electrum/Esplora confirmed SH reads stamp that
+  watermark so clients never mix live tip with a lagging index. Headers
+  subscribe stays live tip. `tip: accept` now `sh_lag=`; worker logs
+  `sh: apply h= wall= lag=`.
+
 - **SH workers follow free RAM:** recollect and k-way materialize default to
   at most **one worker per 1.5 GiB** host free RAM (Linux `MemAvailable`,
   Darwin free+inactive pages, Windows `AvailPhys`; unknown OS → 1 worker).

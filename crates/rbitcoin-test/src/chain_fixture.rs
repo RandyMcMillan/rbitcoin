@@ -66,6 +66,7 @@ pub fn build_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> M
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_height, vec![spend]);
     accept_and_connect_block(query, params, Height(spend_height), &b_spend, ms).unwrap();
     blocks.push(b_spend);
+    query.apply_sh_pending().unwrap();
 
     MatureRegtestChain {
         blocks,
@@ -96,6 +97,7 @@ pub fn pad_empty_from(
         tip = b.block_hash();
         tip_time = b.header.time;
     }
+    query.apply_sh_pending().unwrap();
     (tip, tip_time)
 }
 

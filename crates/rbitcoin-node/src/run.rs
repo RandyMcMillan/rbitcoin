@@ -7,7 +7,7 @@ use rbitcoin_esplora::{run_esplora, EsploraConfig};
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_primitives::Network;
-use rbitcoin_query::Query;
+use rbitcoin_query::{spawn_sh_writebehind, Query};
 use rbitcoin_rpc::{run_rpc, RpcConfig, RpcHandle, RpcRegtest};
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
@@ -320,6 +320,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
     // Tweaks are not write-through in Direct. Once so both sites do not launch two walkers.
+    if config.shindex {
+        spawn_sh_writebehind(Arc::clone(&node.hub.query), Arc::clone(&shutdown.flag));
+    }
     if config.sptweaks && node.hub.query.index_mode().is_tip() {
         spawn_sptweaks_backfill(
             Arc::clone(&node.hub.query),

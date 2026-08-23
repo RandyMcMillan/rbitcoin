@@ -1,6 +1,13 @@
 //! Tip confirm / connect / disconnect.
 
 use super::*;
+use std::sync::atomic::Ordering;
+
+/// One height of SH creates waiting for the Class B appender.
+pub(crate) struct ShPendingJob {
+    height: Height,
+    txs: Vec<(Fk, Option<CreatePin>)>,
+}
 
 /// One height ready for Class C (header + body already archived).
 ///
@@ -46,9 +53,10 @@ impl Query {
     ///
     /// # Class C write order (crash atomicity)
     ///
-    /// Per block we write `strong_tx` (and optional scripthash marks), then
-    /// **last** advance `confirmed[]` for the whole run. The confirmed tip is
-    /// the commit point: [`rbitcoin_store::Store::spenders`] /
+    /// Per block we write `strong_tx`, then **last** advance `confirmed[]` for
+    /// the whole run. Scripthash creates are enqueued after that commit and
+    /// applied by [`Self::apply_sh_pending`]. The confirmed tip is the commit
+    /// point: [`rbitcoin_store::Store::spenders`] /
     /// [`rbitcoin_store::Store::is_confirmed_strong`] only treat a spend as
     /// best-chain once the height fence (confirmed + header_txs) contains the
     /// spender. A hard kill after strong bits but before tip advance leaves
@@ -67,8 +75,8 @@ impl Query {
     /// Like [`Self::confirm_blocks_run`], with optional write-batch create pins.
     ///
     /// `create_pins` is `create_fk → CreatePin` for creates committed on this write
-    /// path. SH collect prefers pin outs (no Class A body re-read) — critical for
-    /// IBD where pins already rode the plan through Class A.
+    /// path. Pin Arcs are cloned onto the SH write-behind job so collect can
+    /// skip Class A body re-read after tip returns.
     pub fn confirm_blocks_run_with_create_pins(
         &self,
         items: &[ConfirmPrepared],
@@ -110,145 +118,32 @@ impl Query {
             }
         }
 
-        // Parallel Class C: strong/height || scripthash collect+append.
-        // Independent tables / caches; join before tip (commit point).
-        // SH may lead tip on kill — queries require is_confirmed_strong.
-        use std::sync::atomic::Ordering;
+        let t_strong = std::time::Instant::now();
         let mut confirmed_pairs = Vec::with_capacity(items.len());
         let mut out = Vec::with_capacity(items.len());
-        let mut strong_err: Option<QueryError> = None;
-        let mut sh_err: Option<QueryError> = None;
-        let mut sh_tip_max_fk = 0u64;
-
-        std::thread::scope(|scope| {
-            let strong_slot =
-                scope.spawn(|| -> Result<(Vec<(Height, Fk)>, Vec<Fk>), QueryError> {
-                    let t_strong = std::time::Instant::now();
-                    let mut pairs = Vec::with_capacity(items.len());
-                    let mut fks = Vec::with_capacity(items.len());
-                    for item in items {
-                        let contiguous = item
-                            .tx_fks
-                            .windows(2)
-                            .all(|w| w[1].0 == w[0].0.saturating_add(1));
-                        if contiguous {
-                            if let Some(&first) = item.tx_fks.first() {
-                                self.store.strong_tx.set_strong_range(
-                                    first,
-                                    item.tx_fks.len() as u32,
-                                    item.header_fk,
-                                )?;
-                            }
-                        } else {
-                            for &tx_fk in &item.tx_fks {
-                                self.store.strong_tx.set_strong(tx_fk, item.header_fk)?;
-                            }
-                        }
-                        pairs.push((item.height, item.header_fk));
-                        fks.push(item.header_fk);
-                    }
-                    crate::class_c_phase_stats::STRONG_NS
-                        .fetch_add(t_strong.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    Ok((pairs, fks))
-                });
-
-            let sh_slot = scope.spawn(|| -> Result<u64, QueryError> {
-                use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
-
-                // Operator shindex off: skip collect/enqueue/durable SH entirely
-                // (tip follow does not need Class B). Direct IBD: no SH until
-                // tip finalize recollect (neither runs nor put_create).
-                if !self.sh_index_enabled() || self.index_mode().is_direct() {
-                    return Ok(0);
+        for item in items {
+            let contiguous = item
+                .tx_fks
+                .windows(2)
+                .all(|w| w[1].0 == w[0].0.saturating_add(1));
+            if contiguous {
+                if let Some(&first) = item.tx_fks.first() {
+                    self.store.strong_tx.set_strong_range(
+                        first,
+                        item.tx_fks.len() as u32,
+                        item.header_fk,
+                    )?;
                 }
-
-                // Tip durable SH: height + create_fk watermarks after tip commit.
-                let t_filter = std::time::Instant::now();
-                let mut sh_new_txs: Vec<u64> = Vec::new();
-                let wave_tx_n: usize = items.iter().map(|i| i.tx_fks.len()).sum();
-                sh_new_txs.reserve(wave_tx_n);
-                let through = self.sh_indexed_through_height();
-                for item in items {
-                    if through.map(|t| item.height.0 <= t).unwrap_or(false) {
-                        continue;
-                    }
-                    for &tx_fk in &item.tx_fks {
-                        sh_new_txs.push(tx_fk.0);
-                    }
-                }
-                add_sh_part(
-                    &sh_stats::SH_FILTER_NS,
-                    t_filter.elapsed().as_nanos() as u64,
-                );
-
-                let t_collect = std::time::Instant::now();
-                let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
-                sh_creates.reserve(sh_new_txs.len().saturating_mul(2));
-                // Prefer write-batch CreatePin outs (same Class A commit) → cold
-                // store. Never resolve via txid — catch-up has no durable head
-                // and tx_run.lookup walks sorted runs per tx.
-                for &tx_id in &sh_new_txs {
-                    let pin = create_pins.and_then(|m| m.get(&Fk(tx_id)));
-                    self.collect_scripthash_creates(Fk(tx_id), &mut sh_creates, pin)?;
-                }
-                add_sh_part(
-                    &sh_stats::SH_COLLECT_NS,
-                    t_collect.elapsed().as_nanos() as u64,
-                );
-
-                if !sh_creates.is_empty() {
-                    sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
-                    let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
-                    for r in &sh_creates {
-                        uniq.insert(r.scripthash);
-                    }
-                    sh_stats::SH_UNIQUE_N.fetch_add(uniq.len() as u64, Ordering::Relaxed);
-                }
-
-                let mut tip_sh_max_fk = 0u64;
-                if !sh_creates.is_empty() {
-                    for r in &sh_creates {
-                        tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
-                    }
-                    let mut heads = self.sh_heads.lock().unwrap();
-                    let (n, timing) = self
-                        .store
-                        .scripthash
-                        .put_create_batch_append(&sh_creates, &mut heads)?;
-                    sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
-                    add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
-                    add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
-                    add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);
-                    add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
-                }
-                Ok(tip_sh_max_fk)
-            });
-
-            match strong_slot.join() {
-                Ok(Ok((pairs, fks))) => {
-                    confirmed_pairs = pairs;
-                    out = fks;
-                }
-                Ok(Err(e)) => strong_err = Some(e),
-                Err(_) => {
-                    strong_err = Some(StoreError::Corrupt("strong/height thread panicked"));
+            } else {
+                for &tx_fk in &item.tx_fks {
+                    self.store.strong_tx.set_strong(tx_fk, item.header_fk)?;
                 }
             }
-            match sh_slot.join() {
-                Ok(Ok(mfk)) => sh_tip_max_fk = mfk,
-                Ok(Err(e)) => sh_err = Some(e),
-                Err(_) => {
-                    sh_err = Some(StoreError::Corrupt("scripthash thread panicked"));
-                }
-            }
-        });
-
-        if let Some(e) = strong_err {
-            return Err(e);
+            confirmed_pairs.push((item.height, item.header_fk));
+            out.push(item.header_fk);
         }
-        if let Some(e) = sh_err {
-            return Err(e);
-        }
+        crate::class_c_phase_stats::STRONG_NS
+            .fetch_add(t_strong.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // Fence first: missing header_txs is Corrupt. Publishing confirmed[]
         // before extend would leave tip ahead of height_of (leftover TipOnly hole).
@@ -264,27 +159,191 @@ impl Query {
         // callers dequeue the body queue. Kill after this returns → tip durable;
         // kill before → BQ still holds blocks for re-drive.
         self.store.flush_class_c_tip()?;
-        // Tip-mode durable SH: height + create_fk watermarks only after tip commit.
-        // Advancing include_hwm + SEAL keeps restart from re-scanning Class A for
-        // creates already written to the durable head during tip follow.
-        // Direct / shindex off: no durable SH writes this path.
-        if self.sh_index_enabled() && self.index_mode().is_tip() {
-            if let Some(last) = items.last() {
-                self.set_sh_indexed_through_height(Some(last.height.0));
-            }
-            if sh_tip_max_fk > 0 {
-                let _ = self.store.scripthash.note_include_hwm(sh_tip_max_fk);
-                let _ = self.sh_run.publish_seal_watermark(sh_tip_max_fk);
-            }
-        }
         crate::class_c_phase_stats::TIP_NS
             .fetch_add(t_tip.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        self.enqueue_sh_pending(items, create_pins);
 
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
         }
 
         Ok(out)
+    }
+
+    fn enqueue_sh_pending(
+        &self,
+        items: &[ConfirmPrepared],
+        create_pins: Option<&crate::FkMap<CreatePin>>,
+    ) {
+        if !self.sh_index_enabled() || self.index_mode().is_direct() {
+            return;
+        }
+        let through = self.sh_indexed_through_height();
+        let mut jobs = Vec::new();
+        for item in items {
+            if through.map(|t| item.height.0 <= t).unwrap_or(false) {
+                continue;
+            }
+            let txs = item
+                .tx_fks
+                .iter()
+                .map(|&fk| {
+                    let pin = create_pins.and_then(|m| m.get(&fk).cloned());
+                    (fk, pin)
+                })
+                .collect();
+            jobs.push(ShPendingJob {
+                height: item.height,
+                txs,
+            });
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        self.sh_pending.lock().unwrap().extend(jobs);
+        self.sh_pending_cv.notify_one();
+    }
+
+    /// Apply queued SH write-behind jobs in height order (one Class B appender).
+    ///
+    /// Production: the tip-follow worker. Tests / [`Self::connect_block`]: drain
+    /// so SH history is visible immediately after the fixture connect.
+    pub fn apply_sh_pending(&self) -> Result<(), QueryError> {
+        loop {
+            let job = self.sh_pending.lock().unwrap().pop_front();
+            let Some(job) = job else {
+                return Ok(());
+            };
+            self.apply_sh_job(job)?;
+        }
+    }
+
+    pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
+        use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
+
+        let _appender = self.sh_appender.lock().unwrap();
+        if !self.sh_index_enabled() || self.index_mode().is_direct() {
+            return Ok(());
+        }
+        if self
+            .sh_indexed_through_height()
+            .is_some_and(|t| job.height.0 <= t)
+        {
+            return Ok(());
+        }
+        if self.store.confirmed.get(job.height)?.is_none() {
+            return Ok(());
+        }
+
+        let t_collect = std::time::Instant::now();
+        let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
+        sh_creates.reserve(job.txs.len().saturating_mul(2));
+        for (tx_fk, pin) in &job.txs {
+            self.collect_scripthash_creates(*tx_fk, &mut sh_creates, pin.as_ref())?;
+        }
+        add_sh_part(
+            &sh_stats::SH_COLLECT_NS,
+            t_collect.elapsed().as_nanos() as u64,
+        );
+
+        if !sh_creates.is_empty() {
+            sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
+            let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
+            for r in &sh_creates {
+                uniq.insert(r.scripthash);
+            }
+            sh_stats::SH_UNIQUE_N.fetch_add(uniq.len() as u64, Ordering::Relaxed);
+        }
+
+        let mut tip_sh_max_fk = 0u64;
+        if !sh_creates.is_empty() {
+            for r in &sh_creates {
+                tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
+            }
+            let mut heads = self.sh_heads.lock().unwrap();
+            let (n, timing) = self
+                .store
+                .scripthash
+                .put_create_batch_append(&sh_creates, &mut heads)?;
+            sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
+            add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
+            add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
+            add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);
+            add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
+        }
+
+        self.set_sh_indexed_through_height(Some(job.height.0));
+        if tip_sh_max_fk > 0 {
+            let _ = self.store.scripthash.note_include_hwm(tip_sh_max_fk);
+            let _ = self.sh_run.publish_seal_watermark(tip_sh_max_fk);
+        }
+        Ok(())
+    }
+
+    fn drop_sh_pending_from(&self, height: Height) {
+        self.sh_pending
+            .lock()
+            .unwrap()
+            .retain(|job| job.height.0 < height.0);
+    }
+
+    /// Restore SH watermark from durable `include_hwm` and re-queue heights the
+    /// RAM write-behind lost on restart.
+    pub(crate) fn recover_sh_writebehind(&self) {
+        let recovered = self.recover_sh_indexed_through();
+        self.set_sh_indexed_through_height(recovered);
+        if !self.store.scripthash.has_durable_index() {
+            return;
+        }
+        let Some(tip) = self.tip_height() else {
+            return;
+        };
+        let from = recovered.map(|h| h.saturating_add(1)).unwrap_or(0);
+        if from > tip.0 {
+            return;
+        }
+        let mut items = Vec::new();
+        for h in from..=tip.0 {
+            let Ok(Some(header_fk)) = self.store.confirmed.get(Height(h)) else {
+                continue;
+            };
+            let Ok(Some(tx_fks)) = self.store.header_txs.get_list(header_fk) else {
+                continue;
+            };
+            items.push(ConfirmPrepared {
+                height: Height(h),
+                header_fk,
+                tx_fks,
+            });
+        }
+        if !items.is_empty() {
+            self.enqueue_sh_pending(&items, None);
+        }
+    }
+
+    fn recover_sh_indexed_through(&self) -> Option<u32> {
+        let tip = self.tip_height()?;
+        let hwm = self.store.scripthash.include_hwm();
+        if hwm == 0 {
+            if self.store.scripthash.has_durable_index() {
+                return Some(tip.0);
+            }
+            return None;
+        }
+        let mut h = tip.0;
+        loop {
+            if let Ok(fks) = self.block_tx_fks(Height(h)) {
+                let max_fk = fks.iter().map(|f| f.0).max().unwrap_or(0);
+                if max_fk <= hwm {
+                    return Some(h);
+                }
+            }
+            if h == 0 {
+                return None;
+            }
+            h -= 1;
+        }
     }
 
     /// Append point multimap edges for all non-coinbase inputs of `tx_fk`.
@@ -416,6 +475,7 @@ impl Query {
     /// Connect a block at `height` (genesis or tip+1): Class A then confirm Class C.
     ///
     /// Cheap store fixture (HeaderRecord + TxApply). Not `confirm_wire_run`.
+    /// Drains SH write-behind so fixture reads see creates immediately.
     pub fn connect_block(
         &self,
         height: Height,
@@ -423,7 +483,9 @@ impl Query {
         txs: &[TxApply],
     ) -> Result<Fk, QueryError> {
         self.commit_class_a_only(header, txs)?;
-        self.confirm_block(height, &header.hash)
+        let fk = self.confirm_block(height, &header.hash)?;
+        self.apply_sh_pending()?;
+        Ok(fk)
     }
 
     /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
@@ -445,6 +507,7 @@ impl Query {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
+        self.drop_sh_pending_from(height);
         let hash = self
             .header_at_height(height)?
             .map(|(_, rec)| rec.hash)
@@ -494,7 +557,9 @@ impl Query {
         }
         self.store.flush_class_c_after_disconnect_tip()?;
 
-        self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
+        if self.sh_indexed_through_height() == Some(height.0) {
+            self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
+        }
         self.truncate_sp_tweaks_through_tip(self.tip_height())?;
         Ok(())
     }
@@ -510,4 +575,47 @@ pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], n_tx: usize) -> 
 
 fn log_disconnect_tip(height: u32, hash: &[u8; 32], n_tx: usize) {
     rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, n_tx));
+}
+
+/// One Class B appender for SH write-behind. Tests drain via [`Query::apply_sh_pending`].
+pub fn spawn_sh_writebehind(
+    query: std::sync::Arc<Query>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("rbtc-sh-wb".into())
+        .spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let job = {
+                let mut g = query.sh_pending.lock().unwrap();
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(job) = g.pop_front() {
+                        break job;
+                    }
+                    let (g2, wait) = query
+                        .sh_pending_cv
+                        .wait_timeout(g, std::time::Duration::from_millis(200))
+                        .unwrap();
+                    g = g2;
+                    if wait.timed_out() {
+                        continue;
+                    }
+                }
+            };
+            let t0 = std::time::Instant::now();
+            let h = job.height.0;
+            if let Err(e) = query.apply_sh_job(job) {
+                rbitcoin_log::error!("scripthash write-behind h={h}: {e}");
+                continue;
+            }
+            let wall_ms = t0.elapsed().as_millis();
+            let lag = query.sh_lag_heights();
+            rbitcoin_log::info!("sh: apply h={h} wall={wall_ms}ms lag={lag}");
+        })
+        .expect("spawn sh write-behind")
 }

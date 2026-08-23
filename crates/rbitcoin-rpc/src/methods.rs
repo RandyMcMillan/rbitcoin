@@ -1848,10 +1848,17 @@ fn generate_with_mempool(
         .generate_to_script(nblocks, script, extras.clone())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
     drain_mempool(ctx, &extras);
+    drain_sh_after_generate(ctx);
     if let Some(c) = ctx.chain.as_ref() {
         c.note_gbt_assembled();
     }
     Ok(hashes_json(&hashes))
+}
+
+fn drain_sh_after_generate(ctx: &RpcContext) {
+    if let Err(e) = ctx.query.apply_sh_pending() {
+        rbitcoin_log::warn!("rpc: SH write-behind drain after generate: {e}");
+    }
 }
 
 fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1928,6 +1935,7 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     let hashes = miner
         .generate_to_script(1, script, extra)
         .map_err(|e| generateblock_validity_error(&e))?;
+    drain_sh_after_generate(ctx);
     let hash = hashes
         .first()
         .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;

@@ -127,15 +127,30 @@ fn asof_hash_from_uri(uri: &axum::http::Uri) -> Result<Option<[u8; 32]>, ()> {
     Ok(None)
 }
 
+fn path_uses_sh_view(path: &str) -> bool {
+    path.starts_with("/address/") || path.starts_with("/scripthash/")
+}
+
 async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let asof = match asof_hash_from_uri(req.uri()) {
         Ok(v) => v,
         Err(()) => return not_found(),
     };
+    let sh_view = path_uses_sh_view(req.uri().path());
     let view = if let Some(hash) = asof {
-        match st.query.pin_chain_view_at(&hash) {
+        let pin = if sh_view {
+            st.query.pin_sh_chain_view_at(&hash)
+        } else {
+            st.query.pin_chain_view_at(&hash)
+        };
+        match pin {
             Ok(Some(v)) => Some(v),
             Ok(None) => return not_found(),
+            Err(e) => return store_err(e),
+        }
+    } else if sh_view {
+        match st.query.pin_sh_chain_view() {
+            Ok(v) => v,
             Err(e) => return store_err(e),
         }
     } else {

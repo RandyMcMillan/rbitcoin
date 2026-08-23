@@ -3708,6 +3708,60 @@ fn oversize_locator_request_disconnect() {
 }
 
 #[test]
+fn desirable_service_flags_match_core() {
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let pruned = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    let none = ServiceFlags::NONE;
+    let net_only = ServiceFlags::NETWORK;
+    let wit_only = ServiceFlags::WITNESS;
+    let limited_wit = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    let limited_wit_v2 = limited_wit | ServiceFlags::P2P_V2;
+
+    assert_eq!(desirable_service_flags(none, 0), full);
+    assert_eq!(desirable_service_flags(net_only, 0), full);
+    assert_eq!(desirable_service_flags(wit_only, 0), full);
+    assert_eq!(desirable_service_flags(full, 0), full);
+    assert!(!has_all_desirable_service_flags(none, 0));
+    assert!(!has_all_desirable_service_flags(net_only, 0));
+    assert!(!has_all_desirable_service_flags(wit_only, 0));
+    assert!(has_all_desirable_service_flags(full, 0));
+
+    assert_eq!(desirable_service_flags(limited_wit, 150), full);
+    assert!(!has_all_desirable_service_flags(limited_wit, 150));
+    assert_eq!(desirable_service_flags(limited_wit, 138), pruned);
+    assert!(has_all_desirable_service_flags(limited_wit, 138));
+    assert!(has_all_desirable_service_flags(limited_wit_v2, 138));
+
+    assert_eq!(
+        expected_services_disconnect_log(0, full.to_u64()),
+        "does not offer the expected services (00000000 offered, 00000009 expected)"
+    );
+    assert_eq!(
+        expected_services_disconnect_log(limited_wit.to_u64(), full.to_u64()),
+        "does not offer the expected services (00000408 offered, 00000009 expected)"
+    );
+}
+
+#[test]
+fn expect_services_from_conn_matches_core() {
+    use crate::peers::PeerConnType;
+    assert!(!expect_services_from_conn(PeerConnType::Inbound));
+    assert!(!expect_services_from_conn(PeerConnType::Manual));
+    assert!(!expect_services_from_conn(PeerConnType::Feeler));
+    assert!(expect_services_from_conn(PeerConnType::OutboundFullRelay));
+    assert!(expect_services_from_conn(PeerConnType::BlockRelay));
+    assert!(expect_services_from_conn(PeerConnType::AddrFetch));
+}
+
+#[test]
+fn handshake_disconnect_log_needles() {
+    assert_eq!(feeler_connection_completed_log(), "feeler connection completed");
+    let line = connected_to_self_log("127.0.0.1:18444");
+    assert!(line.contains("connected to self"));
+    assert!(line.contains("disconnecting"));
+}
+
+#[test]
 fn redundant_verack_is_ignored_and_logged() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;

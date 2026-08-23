@@ -107,6 +107,58 @@ pub fn local_service_flags() -> ServiceFlags {
     crate::seeds::required_seed_services()
 }
 
+/// Core `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` (~24h at 10m spacing).
+pub const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: i64 = 144;
+
+/// Core `CNode::ExpectServicesFromConn`.
+pub fn expect_services_from_conn(typ: crate::peers::PeerConnType) -> bool {
+    matches!(
+        typ,
+        crate::peers::PeerConnType::OutboundFullRelay
+            | crate::peers::PeerConnType::BlockRelay
+            | crate::peers::PeerConnType::AddrFetch
+    )
+}
+
+/// Core `PeerManagerImpl::GetDesirableServiceFlags`.
+pub fn desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> ServiceFlags {
+    if offered.has(ServiceFlags::NETWORK_LIMITED)
+        && tip_depth_blocks < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+    {
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS
+    } else {
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS
+    }
+}
+
+/// Core `PeerManagerImpl::HasAllDesirableServiceFlags`.
+pub fn has_all_desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> bool {
+    let want = desirable_service_flags(offered, tip_depth_blocks);
+    offered.has(want)
+}
+
+pub fn expected_services_disconnect_log(offered: u64, expected: u64) -> String {
+    format!("does not offer the expected services ({offered:08x} offered, {expected:08x} expected)")
+}
+
+pub fn feeler_connection_completed_log() -> &'static str {
+    "feeler connection completed"
+}
+
+pub fn connected_to_self_log(addr: impl std::fmt::Display) -> String {
+    format!("connected to self at {addr}, disconnecting")
+}
+
+/// Core `ApproximateBestBlockDepth`: `(now - tip_time) / pow_target_spacing`.
+pub fn approximate_best_block_depth(hub: &ChainHub) -> i64 {
+    let Some(h) = hub.tip_header() else {
+        return i64::MAX;
+    };
+    let spacing = hub.params.btc.pow_target_spacing.max(1) as i64;
+    let age = hub.clock.now_secs().saturating_sub(u64::from(h.time)) as i64;
+    age / spacing
+}
+
 /// Optional bookkeeping for outbound tip-follow sessions.
 #[derive(Clone, Default)]
 pub struct FollowSessionMeta {
@@ -131,6 +183,24 @@ impl Drop for LiveFollowDec {
     }
 }
 
+/// Optional hub/peers policy for VERSION checks (services + self-connect nonce).
+#[derive(Clone, Copy)]
+pub struct HandshakePolicy<'a> {
+    pub hub: Option<&'a ChainHub>,
+    pub peers: Option<&'a crate::peers::PeerHub>,
+    pub conn_type: crate::peers::PeerConnType,
+}
+
+impl HandshakePolicy<'static> {
+    pub fn plain() -> Self {
+        Self {
+            hub: None,
+            peers: None,
+            conn_type: crate::peers::PeerConnType::OutboundFullRelay,
+        }
+    }
+}
+
 /// Open BIP324 v2 transport + perform the version/verack exchange.
 ///
 /// Returns the peer's version and the encrypted read/write halves. All further
@@ -143,6 +213,7 @@ pub async fn connect_and_handshake(
     start_height: i32,
     inbound: bool,
     user_agent: &str,
+    policy: HandshakePolicy<'_>,
 ) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes), NetError> {
     let (mut reader, mut writer, wire) = open_v2(stream, magic, inbound).await?;
     let their_version = application_handshake(
@@ -154,6 +225,7 @@ pub async fn connect_and_handshake(
         start_height,
         inbound,
         user_agent,
+        policy,
     )
     .await?;
     Ok((their_version, reader, writer, wire))
@@ -193,6 +265,7 @@ pub async fn run_feeler(
             break;
         }
     }
+    rbitcoin_log::info!("{}", feeler_connection_completed_log());
     Ok(())
 }
 
@@ -206,25 +279,51 @@ async fn application_handshake(
     start_height: i32,
     inbound: bool,
     user_agent: &str,
+    policy: HandshakePolicy<'_>,
 ) -> Result<VersionMessage, NetError> {
     let services = local_service_flags();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let our_nonce = rand_nonce();
     let version = VersionMessage {
         version: OUR_PROTOCOL_VERSION.max(PROTOCOL_VERSION),
         services,
         timestamp: now,
         receiver: Address::new(&their_addr, ServiceFlags::NONE),
         sender: Address::new(&our_addr, services),
-        nonce: rand_nonce(),
+        nonce: our_nonce,
         user_agent: user_agent.to_string(),
         start_height,
         relay: true,
     };
 
+    struct OutboundNonceGuard<'a> {
+        peers: Option<&'a crate::peers::PeerHub>,
+        nonce: u64,
+        clear: bool,
+    }
+    impl Drop for OutboundNonceGuard<'_> {
+        fn drop(&mut self) {
+            if self.clear {
+                if let Some(p) = self.peers {
+                    p.clear_outbound_nonce(self.nonce);
+                }
+            }
+        }
+    }
+    let mut nonce_guard = OutboundNonceGuard {
+        peers: None,
+        nonce: our_nonce,
+        clear: false,
+    };
     if !inbound {
+        if let Some(peers) = policy.peers {
+            peers.note_outbound_nonce(our_nonce);
+            nonce_guard.peers = Some(peers);
+            nonce_guard.clear = true;
+        }
         write_v2_msg(writer, NetworkMessage::Version(version.clone())).await?;
     }
 
@@ -243,8 +342,30 @@ async fn application_handshake(
     };
 
     if inbound {
+        if let Some(peers) = policy.peers {
+            if !peers.check_incoming_nonce(their_version.nonce) {
+                rbitcoin_log::info!("{}", connected_to_self_log(their_addr));
+                return Err(NetError::Protocol("connected to self"));
+            }
+        }
         write_v2_msg(writer, NetworkMessage::Version(version)).await?;
+    } else if expect_services_from_conn(policy.conn_type) {
+        if let Some(hub) = policy.hub {
+            let depth = approximate_best_block_depth(hub);
+            if !has_all_desirable_service_flags(their_version.services, depth) {
+                let expected = desirable_service_flags(their_version.services, depth);
+                rbitcoin_log::info!(
+                    "{}",
+                    expected_services_disconnect_log(
+                        their_version.services.to_u64(),
+                        expected.to_u64()
+                    )
+                );
+                return Err(NetError::Protocol("peer missing desirable services"));
+            }
+        }
     }
+
     // BIP339: wtxidrelay MUST be sent after version and before verack when both
     // sides speak ≥70016. Late (post-verack) messages are ignored/invalid.
     if their_version.version >= 70016 {
@@ -263,6 +384,13 @@ async fn application_handshake(
                 write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
             }
             _ => {}
+        }
+    }
+
+    nonce_guard.clear = false;
+    if let Some(peers) = policy.peers {
+        if !inbound {
+            peers.clear_outbound_nonce(our_nonce);
         }
     }
 

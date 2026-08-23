@@ -567,6 +567,8 @@ pub struct PeerHub {
     relay_perm: AtomicBool,
     /// Parallel compact-fill slots per block: up to 2 inbound + 1 outbound.
     cmpct_fills: Mutex<HashMap<BlockHash, (u8, bool)>>,
+    /// Version nonces of outbound sessions still in handshake (Core self-connect).
+    pending_outbound_nonces: Mutex<HashSet<u64>>,
 }
 
 impl PeerHub {
@@ -583,7 +585,32 @@ impl PeerHub {
             noban: AtomicBool::new(false),
             relay_perm: AtomicBool::new(false),
             cmpct_fills: Mutex::new(HashMap::new()),
+            pending_outbound_nonces: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Core: register local version nonce while an outbound handshake is open.
+    pub fn note_outbound_nonce(&self, nonce: u64) {
+        self.pending_outbound_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(nonce);
+    }
+
+    pub fn clear_outbound_nonce(&self, nonce: u64) {
+        self.pending_outbound_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&nonce);
+    }
+
+    /// Core `CConnman::CheckIncomingNonce`: `false` means connected to self.
+    pub fn check_incoming_nonce(&self, nonce: u64) -> bool {
+        !self
+            .pending_outbound_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&nonce)
     }
 
     /// BIP152: at most two inbound `getblocktxn` plus one outbound for a hash.
@@ -1047,6 +1074,17 @@ mod tests {
         assert!(p.stop.load(Ordering::SeqCst));
         hub.unregister(0);
         assert!(hub.snapshot().is_empty());
+    }
+
+    #[test]
+    fn outbound_nonce_detects_self_connect() {
+        let hub = PeerHub::new();
+        assert!(hub.check_incoming_nonce(42));
+        hub.note_outbound_nonce(42);
+        assert!(!hub.check_incoming_nonce(42));
+        assert!(hub.check_incoming_nonce(43));
+        hub.clear_outbound_nonce(42);
+        assert!(hub.check_incoming_nonce(42));
     }
 
     #[test]

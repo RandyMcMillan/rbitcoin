@@ -125,7 +125,7 @@ Single Class A writer is intentional. Multi‑GiB **FdOnly grow** is fallocate-o
 (no remap), but **hash-head rehash** (header / scripthash shards when materializing)
 can still stall the **host** (page cache / disk). Class C tip tables use L2
 write-behind (`flush_class_c_tip` before BQ dequeue); large tables stay L0.
-are small. See **[io-modality.md](./io-modality.md)** for operator IO levers.
+See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline
 

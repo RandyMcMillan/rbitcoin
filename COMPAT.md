@@ -142,7 +142,7 @@ block at the same height). We still do **not** serve a disconnected fork
 hash.
 
 Electrum clients that want as-of send `server.version(name, "1.4.2-asof")`
-(or a `[min, max]` range whose max is that string). Standard Electrum
+(or a `[min, max]` range containing that string). Standard Electrum
 `"1.4"` / `["1.4", "1.4.2"]` stays on dotted-int 1.4.x; an `asof:` tag
 without the dialect is an error. `server.features.protocol_max` remains
 `"1.4.2"` so Electrum dotted-int parsers do not choke; discovery is

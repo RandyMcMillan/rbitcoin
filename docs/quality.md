@@ -83,7 +83,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | Rank | ID | Item | Tag | Done looks like |
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: `fuzz/` `block_wire` + nightly `fuzz.yml` (not a required PR check).** Grow corpus / more targets. Findings 001–021 came from an external fuzzamoto campaign — that is not a substitute for the in-tree job. |
-| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 44 / 267.** COMPAT-done leftovers are `rpc-dialect` (not `rpc-missing`). Next `run` candidates: `mempool_accept` type-check, `mining_basic` weight, `rpc_getblockfrompeer`. Product-never skips stay skip. Unlabeled PRs stay cargo-only; nightly green |
+| 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 53 run / 214 skip (30 rpc-missing, 26 core-log).** COMPAT-done leftovers are `rpc-dialect` (not `rpc-missing`). Next `run` candidates: `mempool_accept` type-check, `mining_basic` weight, `rpc_getblockfrompeer`. Product-never skips stay skip. Unlabeled PRs stay cargo-only; nightly green |
 | 3 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work. **After this:** Electrum 1.6 then 1.7 (`protocol_max` bump in the same work) — [`COMPAT.md`](../COMPAT.md) § Protocol versions |
 | 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
 | 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam |
@@ -99,7 +99,7 @@ in store IO sessions + `script_pool` + confirm `head_drain`.
 | ID | Verdict |
 |----|---------|
 | **Q-30** | Keep rank 1. Still the highest correctness hole; zero in-tree fuzz. External fuzzamoto is not a substitute job. |
-| **Q-41** | Keep rank 2. 38 → **44** `run` (`feature_chain_tiebreaks` and Wave E/e2/e3 leftovers). 223 skips; `rpc-missing` 46 + `core-log` 31 are the only growth matching claimed surface. |
+| **Q-41** | Keep rank 2. 44 → **53** `run`. 214 skips; `rpc-missing` 30 + `core-log` 26 are the only growth matching claimed surface. |
 | **Q-50** | **Closed.** Write/lookup/load inventory includes `drain_join` / `dequeue` / wave nested tokens; `other=` is the explicit residual (`format_info` pins). A fat `other=` on a later IBD is confirm-perf, not a missing-meter program. 2026-08-18 dark-time numbers retired. |
 | **Q-36** | **Closed.** Default INFO is `ibd: progress`; `ibd: perf` / `ibd: sizes` / `perf_dbg` are DEBUG (`log_sample`). |
 | **Q-48** | Keep, rank 3. Waits on rust-bitcoin (**RB-007**). |
@@ -172,7 +172,7 @@ findings 001–022, CI split, map-free README, …) live in
 | **Q-37** | Warm default suite ≤3 min | Required CI `test` **~85 s** (2026-08-17, ubuntu-24.04). Stretch &lt;2 min met on CI-class. Recorded in TESTING.md |
 | **—** | Docs map + one owner per fact | `docs/README.md`; folded store-format / startup-states / future-features / COVERAGE (`#81`) |
 | **—** | Tests assert behavior, not repo text | No `include_str!` of production `.rs` / CONTRIBUTING (`#85`) |
-| **—** | Core functional `run` set | **44** unmodified v31.1 scripts (was 38 at last reaudit, 9 at first green). Remaining growth is **Q-41** |
+| **—** | Core functional `run` set | **53** unmodified v31.1 scripts (was 44 at last reaudit, 9 at first green). Remaining growth is **Q-41** |
 | **Q-15 / Q-42–Q-46** | CLI, inbound config, RPC honesty, Libre-only, IO aliases | 2026-08-16 cruft program |
 | **R-01–R-06** | Mempool snapshot, `script_pool`, remine pads, TxGraph cache, llvm-cov pin, tip-follow store integrity | 2026-08-12. Wall leftover was **Q-37** (now closed) |
 | **Q-16 / Q-20 / Q-23** | Residual env, `cargo deny` CI, optional musl artifact | `env-knobs.md`; required `deny`; musl zip is GitHub Release only |
@@ -215,12 +215,12 @@ included; tree at #177):
 | Release | `nix build .#rbitcoin-musl` → static install |
 | Core corpora | **No allowlist** |
 | Findings 001–022 | All **fixed** |
-| Core functional | **44** unmodified v31.1 scripts `run`; 223 skip (68 `no-wallet`, 46 `rpc-missing`, 31 `core-log`, …) |
+| Core functional | **53** unmodified v31.1 scripts `run`; 214 skip (68 `no-wallet`, 30 `rpc-missing`, 26 `core-log`, …) |
 | Residual `RBITCOIN_*` in crates | Honored set listed in `env-knobs.md` (**Q-16** closed) |
 | On-disk | **Schema 19** (Class A/C still 17 bytes; 18 = MPHF indexes; 19 = SH extent last page). Populated 17 `tx.head`/`scripthash*` refused |
 | Confirm queues | **loadq=14 · scriptq=4 · writeq=14** (hardcoded) |
 | IBD confirm rate | Last instrumented fat-era number **6.4 blk/s** at #126 (2026-08-18). Not re-baselined after loadq/stamp/no-coord/head-drain. Residual meters are named (`other=`) — **Q-50** closed |
-| Fuzz | **None** |
+| Fuzz | **minimal** (`block_wire` nightly; breadth is Q-30) |
 
 ### Grade board (subjective; 2026-08-21)
 
@@ -238,7 +238,7 @@ included; tree at #177):
 | Test reliability/speed | Strong | **Q-37** closed on CI-class; 2 s default-test rule remains |
 | Tip-follow mempool APIs | Strong | **R-01–R-04**; persist sidecars exist (Core persist script still skip → Q-41); INV tick no longer clones the mempool |
 | Wallet-client APIs | Strong | Last-slot SH join + serve-lean identity for Electrum/Esplora; Casa/Sparrow times stay host-only (`rbitcoin-bench`) |
-| Adversarial / findings | Medium–Strong | **001–022** closed; **no fuzz** (**Q-30**); Core functional is the active surface program (**Q-41**) |
+| Adversarial / findings | Medium–Strong | **001–022** closed; **minimal fuzz** (`block_wire` nightly); breadth is **Q-30**. Core functional is the active surface program (**Q-41**) |
 | Perf observability | Strong | Named residuals (`other=` / `drain_join=`) (**Q-50**). Default INFO is `ibd: progress` (**Q-36**) |
 
 ---

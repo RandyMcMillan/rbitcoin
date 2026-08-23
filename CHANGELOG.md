@@ -100,7 +100,7 @@ First **named published** 0.x line. **Not 1.0.** Schema 19 is still bumpable
 skips historical script/sig checks (`--milestone 0` is full scripts).
 `--shindex` default off (required for Electrum/Esplora). BIP324 v2-only.
 GitHub Release: Linux musl (operator) + Windows CRT-static PE + Darwin
-aarch64 zip (ad-hoc signed, not notarized). In-tree `fuzz/` `block_wire`
+aarch64 binaries + SHA256SUMS (ad-hoc signed, not notarized). In-tree `fuzz/` `block_wire`
 nightly job (not a required PR check). P2P DoS is not Core-parity.
 
 ### Added
@@ -114,6 +114,26 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   musl + Windows + Darwin snapshots and attaches them (Linux SBOM included).
   `workflow_dispatch` builds artifacts only. Operator may need to push the
   workflow file.
+
+- **`rbitcoin-bench`:** optional Electrum/Esplora **client** benchmark (not
+  default-members, not musl). Casa sequential median (`get_balance` /
+  `get_history` / `listunspent`), Sparrow batched subscribe+history, fat-key
+  `hot` suite. Embedded `--corpus` lists: `hot` (P2A + public high-tx
+  addresses), `casa`/`sparrow` unique scripts sampled from 77 heights
+  genesis→tip on a mainnet store (not one 200-block window).
+  Stderr progress: 5% steps plus at most one line per 15s, with ETA.
+  `--out FILE` writes a per-key CSV (heights, tx/utxo counts, warm
+  latencies per query). `--suite clients` runs N concurrent small-wallet
+  loads on one OS thread (`--clients`, default 8; corpus default
+  `sparrow`; keys over `--max-txs`/`--max-utxos` dropped).
+  `cargo run -p rbitcoin-bench --features cli --release`.
+
+- **CI Windows / Darwin snapshots:** after a green `ci` run on
+  `master`/`main` (and on `workflow_dispatch`, and on PRs labeled
+  `static-binaries`), workflows `windows` and `macos` upload CRT-static
+  PE and system-dylib Darwin `rbitcoin-node` / `rbitcoin-cli` +
+  `SHA256SUMS` (90 days). Not required checks. `musl` uses the same
+  label. Linux musl stays Nix; Darwin/Windows are native runners.
 
 ### Changed
 
@@ -162,51 +182,6 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   are real. Catalog and SH head bytes are unchanged.
   `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` overrides the 128 MiB default
   (16–512 MiB).
-
-### Fixed
-
-- **Fuzz CI nightly:** `scripts/fuzz-run.sh` / `fuzz.yml` set
-  `RUSTUP_TOOLCHAIN=nightly` so `rust-toolchain.toml` 1.95 cannot feed
-  cargo-fuzz (`-Zsanitizer` is nightly-only).
-
-- **SH materialize last page:** megakey chunking sizes the last extent page
-  for the `ver=2` 24 B header (4072 B stream), not the `ver=1` 4088 B cap.
-  A key whose delta stream sat in 4073..=4088 B overflowed
-  `scripthash page pack: entries exceed page capacity` and aborted bulk
-  materialize.
-
-- **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
-  `unpark` permit (wave publish / detached job). A worker that misses steal
-  and parks after the wake still runs the work. Jobs mutex stays the
-  detached-job queue only.
-
-- **Script steal last-chunk:** `in_wave` increments before `next.fetch_add`,
-  so `is_complete` cannot free wave ctx under a claimer about to `apply`.
-  A lost claim decrements `in_wave` and re-checks completion.
-
-### Added
-
-- **`rbitcoin-bench`:** optional Electrum/Esplora **client** benchmark (not
-  default-members, not musl). Casa sequential median (`get_balance` /
-  `get_history` / `listunspent`), Sparrow batched subscribe+history, fat-key
-  `hot` suite. Embedded `--corpus` lists: `hot` (P2A + public high-tx
-  addresses), `casa`/`sparrow` unique scripts sampled from 77 heights
-  genesis→tip on a mainnet store (not one 200-block window).
-  Stderr progress: 5% steps plus at most one line per 15s, with ETA.
-  `--out FILE` writes a per-key CSV (heights, tx/utxo counts, warm
-  latencies per query). `--suite clients` runs N concurrent small-wallet
-  loads on one OS thread (`--clients`, default 8; corpus default
-  `sparrow`; keys over `--max-txs`/`--max-utxos` dropped).
-  `cargo run -p rbitcoin-bench --features cli --release`.
-
-- **CI Windows / Darwin snapshots:** after a green `ci` run on
-  `master`/`main` (and on `workflow_dispatch`, and on PRs labeled
-  `static-binaries`), workflows `windows` and `macos` upload CRT-static
-  PE and system-dylib Darwin `rbitcoin-node` / `rbitcoin-cli` +
-  `SHA256SUMS` (90 days). Not required checks. `musl` uses the same
-  label. Linux musl stays Nix; Darwin/Windows are native runners.
-
-### Changed
 
 - **Quality reaudit (2026-08-21).** [`docs/quality.md`](docs/quality.md)
   refreshed against #177: schema **19**, Core functional **44/267**,
@@ -339,6 +314,25 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   (was loadq=8 · writeq=20).
 
 ### Fixed
+
+- **Fuzz CI nightly:** `scripts/fuzz-run.sh` / `fuzz.yml` set
+  `RUSTUP_TOOLCHAIN=nightly` so `rust-toolchain.toml` 1.95 cannot feed
+  cargo-fuzz (`-Zsanitizer` is nightly-only).
+
+- **SH materialize last page:** megakey chunking sizes the last extent page
+  for the `ver=2` 24 B header (4072 B stream), not the `ver=1` 4088 B cap.
+  A key whose delta stream sat in 4073..=4088 B overflowed
+  `scripthash page pack: entries exceed page capacity` and aborted bulk
+  materialize.
+
+- **Script pool wake:** idle `rbtc-scripts-*` workers `park` with an epoch +
+  `unpark` permit (wave publish / detached job). A worker that misses steal
+  and parks after the wake still runs the work. Jobs mutex stays the
+  detached-job queue only.
+
+- **Script steal last-chunk:** `in_wave` increments before `next.fetch_add`,
+  so `is_complete` cannot free wave ctx under a claimer about to `apply`.
+  A lost claim decrements `in_wave` and re-checks completion.
 
 - **Darwin / Windows smoke:** schema 17 dir-variant SH body is
   `scripthash.body/NN` + `scripthash.ovf/body`. Snapshot jobs now accept

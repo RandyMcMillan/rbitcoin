@@ -3706,3 +3706,74 @@ fn oversize_locator_request_disconnect() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn redundant_verack_is_ignored_and_logged() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::Network;
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+        let payload = full[24..].to_vec();
+        FramedMessage {
+            magic,
+            command,
+            checksum,
+            payload,
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, q) = tmp_store("redundant-verack");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = false;
+        let mut cmpct_ver = 0u32;
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut ban = 0u32;
+
+        rbitcoin_log::capture_logs(true);
+        handle_peer_frame(
+            frame_for(NetworkMessage::Verack),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut HashSet::new(),
+            &mut ban,
+            None,
+        )
+        .await
+        .unwrap();
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+
+        assert!(
+            logs.iter()
+                .any(|(_, m)| m.contains("ignoring redundant verack message")),
+            "expected Core redundant-verack needle, got {logs:?}"
+        );
+        assert_eq!(ban, 0, "redundant verack must not disconnect");
+
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}

@@ -53,6 +53,9 @@ fn reject_is_mutated(reason: &str) -> bool {
         || reason.contains("wtxid count")
 }
 
+/// Core `DEFAULT_MAX_TIP_AGE` (24h).
+pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
+
 /// Thread-safe chain façade used by peer sessions.
 pub struct ChainHub {
     pub query: Arc<Query>,
@@ -100,6 +103,8 @@ pub struct ChainHub {
     gbt_assembled: AtomicBool,
     /// Core `-blockmintxfee` in sat/kvB. Default 1.
     block_min_tx_fee_sat_kvb: AtomicU64,
+    /// Core `-maxtipage` seconds. Default 24h.
+    max_tip_age_secs: AtomicU64,
     /// Block hashes we already issued getdata for (any peer).
     asked_blocks: RwLock<HashSet<BlockHash>>,
 }
@@ -147,6 +152,7 @@ impl ChainHub {
             block_version: AtomicI32::new(0),
             gbt_assembled: AtomicBool::new(false),
             block_min_tx_fee_sat_kvb: AtomicU64::new(1),
+            max_tip_age_secs: AtomicU64::new(DEFAULT_MAX_TIP_AGE_SECS),
             asked_blocks: RwLock::new(HashSet::new()),
         }
     }
@@ -196,6 +202,15 @@ impl ChainHub {
 
     pub fn block_min_tx_fee_sat_kvb(&self) -> u64 {
         self.block_min_tx_fee_sat_kvb.load(Ordering::Relaxed)
+    }
+
+    /// Core `-maxtipage` (seconds). Default [`DEFAULT_MAX_TIP_AGE_SECS`].
+    pub fn set_max_tip_age_secs(&self, secs: u64) {
+        self.max_tip_age_secs.store(secs, Ordering::Relaxed);
+    }
+
+    pub fn max_tip_age_secs(&self) -> u64 {
+        self.max_tip_age_secs.load(Ordering::Relaxed)
     }
 
     /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
@@ -2172,6 +2187,30 @@ mod tests {
             headers_download_timeout_secs(1_000_000, 0),
             1_000_000 + 900 + 2
         );
+    }
+
+    #[test]
+    fn tip_is_stale_respects_configured_max_tip_age() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let tip_time = 1_700_000_000u32;
+        hub.accept_block(mine(gen, tip_time, 1)).unwrap();
+
+        hub.set_max_tip_age_secs(3600);
+        hub.clock.set_mock(i64::from(tip_time) + 3601);
+        assert!(
+            hub.tip_is_stale_for_ibd(),
+            "tip older than configured max must be stale for IBD"
+        );
+
+        hub.clock.set_mock(i64::from(tip_time) + 3600);
+        assert!(
+            !hub.tip_is_stale_for_ibd(),
+            "tip at exactly max age must leave IBD"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

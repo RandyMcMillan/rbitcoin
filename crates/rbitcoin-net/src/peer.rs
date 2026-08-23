@@ -37,6 +37,9 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 const HEADERS_POLL_SECS: u64 = 120;
 
+/// Core `10 * AVG_ADDRESS_BROADCAST_INTERVAL` (30s) for addr-fetch lifetime.
+const ADDRFETCH_TIMEOUT_SECS: u64 = 300;
+
 /// Core `MAX_BLOCKS_TO_ANNOUNCE`: more than this on a reorg falls back to inv.
 const MAX_BLOCKS_TO_ANNOUNCE: u32 = 8;
 
@@ -483,6 +486,7 @@ pub async fn peer_session_with(
     });
 
     if let Some(s) = meta.session.as_ref() {
+        let _ = maybe_queue_addrfetch_getaddr(&out_tx, s);
         let _ = maybe_queue_initial_getheaders(&out_tx, hub.as_ref(), s);
     } else if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), None, true) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
@@ -525,6 +529,10 @@ pub async fn peer_session_with(
                         inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
                     }
                     if let Some(s) = session.as_ref() {
+                        if addrfetch_timed_out(s) {
+                            rbitcoin_log::debug!("addrfetch connection timeout");
+                            s.request_disconnect();
+                        }
                         match s.take_ping_action(s.clock_now()) {
                             Some(PingAction::Send { nonce }) => {
                                 let _ = queue_out(&out_tx, NetworkMessage::Ping(nonce));
@@ -628,7 +636,11 @@ pub async fn peer_session_with(
                     }
                 }
                 _ = headers_poll.tick() => {
-                    let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
+                    if !session.as_ref().is_some_and(|s| {
+                        s.conn_type == crate::peers::PeerConnType::AddrFetch
+                    }) {
+                        let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
+                    }
                 }
                 ann = async {
                     if let Some(rx) = tx_announce_rx.as_mut() {
@@ -834,6 +846,9 @@ fn maybe_queue_initial_getheaders(
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
 ) -> bool {
+    if session.conn_type == crate::peers::PeerConnType::AddrFetch {
+        return false;
+    }
     if session.is_sync_started() {
         return false;
     }
@@ -848,6 +863,22 @@ fn maybe_queue_initial_getheaders(
         let _ = queue_getheaders(out, hub, Some(session), true);
     }
     started
+}
+
+fn maybe_queue_addrfetch_getaddr(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    session: &crate::peers::LivePeer,
+) -> bool {
+    if session.conn_type != crate::peers::PeerConnType::AddrFetch {
+        return false;
+    }
+    let _ = queue_out(out, NetworkMessage::GetAddr);
+    true
+}
+
+fn addrfetch_timed_out(session: &crate::peers::LivePeer) -> bool {
+    session.conn_type == crate::peers::PeerConnType::AddrFetch
+        && session.clock_now().saturating_sub(session.connected_at()) > ADDRFETCH_TIMEOUT_SECS
 }
 
 fn queue_getheaders(
@@ -1109,9 +1140,21 @@ async fn handle_peer_frame(
         NetworkMessage::SendAddrV2 => {
             // BIP155: we advertise sendaddrv2 pre-verack; inbound advertise is enough.
         }
-        NetworkMessage::AddrV2(_) => {
-            // BIP155 payload. Invalid encodings are rejected at decode; stay
-            // connected on a well-formed (including empty-list) message.
+        NetworkMessage::Addr(list) => {
+            if session.is_some_and(|s| {
+                s.conn_type == crate::peers::PeerConnType::AddrFetch && list.len() > 1
+            }) {
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
+        }
+        NetworkMessage::AddrV2(list) => {
+            if session.is_some_and(|s| {
+                s.conn_type == crate::peers::PeerConnType::AddrFetch && list.len() > 1
+            }) {
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
         }
         NetworkMessage::GetHeaders(gh) => {
             if gh.locator_hashes.len() > MAX_LOCATOR_SZ {

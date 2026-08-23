@@ -119,6 +119,8 @@ pub struct LivePeer {
     failed_cmpct: Mutex<HashSet<BlockHash>>,
     /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
     out_tx: Mutex<Option<mpsc::UnboundedSender<NetworkMessage>>>,
+    /// Unix seconds when this session was registered (Core `m_connected`).
+    connected_at: AtomicU64,
 }
 
 impl LivePeer {
@@ -362,6 +364,10 @@ impl LivePeer {
                     .map(|d| d.as_secs())
                     .unwrap_or(0)
             })
+    }
+
+    pub fn connected_at(&self) -> u64 {
+        self.connected_at.load(Ordering::Relaxed)
     }
 
     /// Core `MaybeSendPing`: timeout first, then RPC-queued / interval probe.
@@ -806,6 +812,7 @@ impl PeerHub {
     ) -> Arc<LivePeer> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let services = service_flags_u64(ver.services);
+        let connected_at = self.now_secs();
         let peer = Arc::new(LivePeer {
             id,
             addr,
@@ -846,6 +853,7 @@ impl PeerHub {
             wire_sent: Mutex::new(None),
             failed_cmpct: Mutex::new(HashSet::new()),
             out_tx: Mutex::new(None),
+            connected_at: AtomicU64::new(connected_at),
         });
         // Handshake already exchanged version + verack (+ maybe ping).
         peer.note_recv("version", 100);

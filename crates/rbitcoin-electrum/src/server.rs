@@ -1193,6 +1193,9 @@ fn dispatch_pinned(
             if include_mempool {
                 if let Some(mp) = mempool {
                     for item in mp.scripthash_mempool(&sh) {
+                        if hist.iter().any(|h| h.txid == item.txid) {
+                            continue;
+                        }
                         hist.push(rbitcoin_query::ScriptHashHistoryItem {
                             height: item.height,
                             txid: item.txid,

@@ -1166,6 +1166,7 @@ impl MempoolHub {
                     self.relay_seq.lock().unwrap().insert(w, 0);
                     let at = self.mock_now.load(Ordering::Relaxed);
                     self.accept_at.lock().unwrap().insert(w, at);
+                    self.index_txid(tx.compute_txid(), tx);
                     n += 1;
                 }
             }

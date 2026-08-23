@@ -11,6 +11,26 @@ pub(crate) struct ShPendingJob {
     records: Vec<ScriptHashRecord>,
 }
 
+fn index_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJob) {
+    for r in &job.records {
+        head.entry(r.scripthash).or_default().push(r.create_tx_fk);
+    }
+}
+
+fn unindex_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJob) {
+    for r in &job.records {
+        let Some(v) = head.get_mut(&r.scripthash) else {
+            continue;
+        };
+        if let Some(i) = v.iter().position(|fk| *fk == r.create_tx_fk) {
+            v.swap_remove(i);
+        }
+        if v.is_empty() {
+            head.remove(&r.scripthash);
+        }
+    }
+}
+
 /// One height ready for Class C (header + body already archived).
 ///
 /// Callers that already resolved `header_fk` / `tx_fks` (e.g. multi-block confirm)
@@ -210,30 +230,66 @@ impl Query {
         if jobs.is_empty() {
             return Ok(());
         }
-        self.sh_pending.lock().unwrap().extend(jobs);
-        self.sh_pending_cv.notify_one();
+        let mut pending = self.sh_pending.lock().unwrap();
+        let mut head = self.sh_ram_head.lock().unwrap();
+        for job in &jobs {
+            index_sh_ram_head(&mut head, job);
+        }
+        pending.extend(jobs);
         Ok(())
     }
 
+    /// Allow the Class B appender to durable-apply jobs through `through`.
+    ///
+    /// Enqueue publishes RAM records; seed waits for this so tip connect and
+    /// block announce do not share disk with `locate_head`.
+    pub fn release_sh_writebehind(&self, through: Height) {
+        let v = through.0.saturating_add(1);
+        self.sh_released_through.fetch_max(v, Ordering::Release);
+        self.sh_pending_cv.notify_one();
+    }
+
+    /// Last height durable apply is allowed to run (`None` until first release).
+    pub fn sh_released_through_height(&self) -> Option<u32> {
+        let v = self.sh_released_through.load(Ordering::Acquire);
+        v.checked_sub(1)
+    }
+
+    fn release_queued_sh_writebehind(&self) {
+        if let Some(h) = self.sh_pending_max_height() {
+            self.release_sh_writebehind(Height(h));
+        }
+    }
+
+    fn clamp_sh_released_before(&self, height: Height) {
+        let cap = height.0;
+        loop {
+            let cur = self.sh_released_through.load(Ordering::Acquire);
+            if cur <= cap {
+                return;
+            }
+            if self
+                .sh_released_through
+                .compare_exchange(cur, cap, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn sh_job_released(&self, job: &ShPendingJob) -> bool {
+        let rel = self.sh_released_through.load(Ordering::Acquire);
+        rel > 0 && job.height.0.saturating_add(1) <= rel
+    }
+
     pub(crate) fn pending_sh_create_fks(&self, scripthash: &[u8; 32]) -> Vec<Fk> {
-        let mut out = Vec::new();
-        let push_job = |job: &ShPendingJob, out: &mut Vec<Fk>| {
-            for r in &job.records {
-                if r.scripthash == *scripthash {
-                    out.push(r.create_tx_fk);
-                }
-            }
-        };
-        {
-            let g = self.sh_pending.lock().unwrap();
-            for job in g.iter() {
-                push_job(job, &mut out);
-            }
-        }
-        if let Some(job) = self.sh_applying.lock().unwrap().as_ref() {
-            push_job(job, &mut out);
-        }
-        out
+        self.sh_ram_head
+            .lock()
+            .unwrap()
+            .get(scripthash)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn sh_pending_max_height(&self) -> Option<u32> {
@@ -257,10 +313,13 @@ impl Query {
         }
     }
 
-    /// Durable watermark plus pending jobs (RAM records already collected).
+    /// Durable watermark plus pending jobs (RAM records already collected),
+    /// never above the live tip (reorg may leave pending jobs until mempool reaccept).
     pub(crate) fn sh_visible_through_height(&self) -> Option<u32> {
-        self.sh_indexed_through_height()
-            .max(self.sh_pending_max_height())
+        let vis = self
+            .sh_indexed_through_height()
+            .max(self.sh_pending_max_height())?;
+        self.tip_height().map(|tip| vis.min(tip.0))
     }
 
     /// Apply queued SH write-behind jobs in height order (one Class B appender).
@@ -268,6 +327,7 @@ impl Query {
     /// Production: the tip-follow worker. Tests / [`Self::connect_block`]: drain
     /// so SH history is visible immediately after the fixture connect.
     pub fn apply_sh_pending(&self) -> Result<(), QueryError> {
+        self.release_queued_sh_writebehind();
         loop {
             if let Some(job) = self.take_sh_job_for_apply() {
                 let height = job.height;
@@ -299,6 +359,10 @@ impl Query {
         if applying.is_some() {
             return None;
         }
+        let job = pending.front()?;
+        if !self.sh_job_released(job) {
+            return None;
+        }
         let job = pending.pop_front()?;
         *applying = Some(job.clone());
         Some(job)
@@ -318,28 +382,36 @@ impl Query {
     }
 
     pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
+        let applied = self.apply_sh_job_inner(&job)?;
+        if applied {
+            unindex_sh_ram_head(&mut self.sh_ram_head.lock().unwrap(), &job);
+        }
+        Ok(())
+    }
+
+    fn apply_sh_job_inner(&self, job: &ShPendingJob) -> Result<bool, QueryError> {
         use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
         let _appender = self.sh_appender.lock().unwrap();
         if !self.sh_index_enabled() || self.index_mode().is_direct() {
-            return Ok(());
+            return Ok(false);
         }
         if self
             .sh_indexed_through_height()
             .is_some_and(|t| job.height.0 <= t)
         {
-            return Ok(());
+            return Ok(false);
         }
         if self.store.confirmed.get(job.height)? != Some(job.header_fk) {
-            return Ok(());
+            return Ok(false);
         }
 
-        let sh_creates = job.records;
+        let sh_creates = &job.records;
 
         if !sh_creates.is_empty() {
             sh_stats::SH_CREATE_N.fetch_add(sh_creates.len() as u64, Ordering::Relaxed);
             let mut uniq = std::collections::HashSet::with_capacity(sh_creates.len());
-            for r in &sh_creates {
+            for r in sh_creates {
                 uniq.insert(r.scripthash);
             }
             sh_stats::SH_UNIQUE_N.fetch_add(uniq.len() as u64, Ordering::Relaxed);
@@ -347,14 +419,14 @@ impl Query {
 
         let mut tip_sh_max_fk = 0u64;
         if !sh_creates.is_empty() {
-            for r in &sh_creates {
+            for r in sh_creates {
                 tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
             }
             let mut heads = self.sh_heads.lock().unwrap();
             let (n, timing) = self
                 .store
                 .scripthash
-                .put_create_batch_append(&sh_creates, &mut heads)?;
+                .put_create_batch_append(sh_creates, &mut heads)?;
             sh_stats::SH_WRITTEN_N.fetch_add(n as u64, Ordering::Relaxed);
             add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
             add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
@@ -367,18 +439,35 @@ impl Query {
             let _ = self.store.scripthash.note_include_hwm(tip_sh_max_fk);
             let _ = self.sh_run.publish_seal_watermark(tip_sh_max_fk);
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn drop_sh_pending_from(&self, height: Height) {
-        self.sh_pending
-            .lock()
-            .unwrap()
-            .retain(|job| job.height.0 < height.0);
+    pub fn drop_sh_pending_from(&self, height: Height) {
+        let mut pending = self.sh_pending.lock().unwrap();
+        let dropped: Vec<ShPendingJob> = pending
+            .iter()
+            .filter(|job| job.height.0 >= height.0)
+            .cloned()
+            .collect();
+        pending.retain(|job| job.height.0 < height.0);
+        drop(pending);
         let mut applying = self.sh_applying.lock().unwrap();
-        if applying.as_ref().is_some_and(|j| j.height.0 >= height.0) {
-            *applying = None;
+        let applying_job = if applying.as_ref().is_some_and(|j| j.height.0 >= height.0) {
+            applying.take()
+        } else {
+            None
+        };
+        drop(applying);
+        {
+            let mut head = self.sh_ram_head.lock().unwrap();
+            for job in &dropped {
+                unindex_sh_ram_head(&mut head, job);
+            }
+            if let Some(job) = applying_job.as_ref() {
+                unindex_sh_ram_head(&mut head, job);
+            }
         }
+        self.clamp_sh_released_before(height);
     }
 
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
@@ -422,6 +511,9 @@ impl Query {
         }
         if !items.is_empty() {
             self.enqueue_sh_pending(&items, None)?;
+            if let Some(last) = items.last() {
+                self.release_sh_writebehind(last.height);
+            }
         }
         Ok(())
     }
@@ -630,11 +722,24 @@ impl Query {
     ///
     /// Every successful tip shrink logs [`format_disconnect_tip_line`] at **warn**.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
+        self.disconnect_tip_with(true)
+    }
+
+    /// Class C disconnect without dropping RAM SH pending (reorg reaccept first).
+    pub fn disconnect_tip_keep_pending(&self) -> Result<(), QueryError> {
+        self.disconnect_tip_with(false)
+    }
+
+    fn disconnect_tip_with(&self, drop_pending: bool) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let _appender = self.sh_appender.lock().unwrap();
-        self.drop_sh_pending_from(height);
+        if drop_pending {
+            self.drop_sh_pending_from(height);
+        } else {
+            self.clamp_sh_released_before(height);
+        }
         let hash = self
             .header_at_height(height)?
             .map(|(_, rec)| rec.hash)

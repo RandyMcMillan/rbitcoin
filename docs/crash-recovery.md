@@ -16,7 +16,7 @@ Best-chain views ignore uncommitted Class C state:
 | 4. Body-queue dequeue for those heights | Only after confirm-write returns Ok |
 | 5. Spend annotations (Direct) | After tip; spentness filters use strong+fence |
 
-`is_confirmed_strong(tx)` ⇔ strong ∧ height fence contains the fk. Queries that mean “on best chain” use this (or equivalent).
+`is_confirmed_strong(tx)` ⇔ strong ∧ height fence contains the fk. Queries that mean “on best chain” use this (or equivalent). Confirmed-tx **API** readers pin that tip (`Query::pin_chain_view` / `still_live`) and retry on disconnect rather than pausing the writer — [`concurrency.md`](./concurrency.md#confirmed-tx-readers-pin--retry-not-a-lock).
 
 On open (in order):
 

@@ -567,6 +567,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 let _ = bridge_tx.send(TipNotify {
                                     height: ev.height,
                                     header_hex: rbitcoin_primitives::hex_encode(buf),
+                                    reorg_from_height: if ev.reorg_branch_len > 0 {
+                                        Some(ev.height.saturating_sub(ev.reorg_branch_len))
+                                    } else {
+                                        None
+                                    },
                                 });
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,

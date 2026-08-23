@@ -1,8 +1,66 @@
-//! Header navigation, locators, height lookup.
+//! Header navigation, locators, height lookup, confirmed-read pin.
 
 use super::*;
 
+/// Published best-chain prefix a confirmed-tx read was built against.
+///
+/// `still_live` is true while `confirmed[height]` is still this `header_fk`.
+/// Tip **extension** leaves a shorter pin live (prefix-stable). Disconnect or
+/// same-height replace of that height does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainView {
+    pub height: Height,
+    pub hash: [u8; 32],
+    pub header_fk: Fk,
+}
+
+impl ChainView {
+    pub fn still_live(&self, query: &Query) -> Result<bool, QueryError> {
+        match query.store.confirmed.get(self.height)? {
+            Some(fk) if fk == self.header_fk => Ok(true),
+            _ => Ok(false),
+        }
+    }
+}
+
 impl Query {
+    /// Capture the published tip as a [`ChainView`], or `None` if the chain is empty.
+    pub fn pin_chain_view(&self) -> Result<Option<ChainView>, QueryError> {
+        let Some(height) = self.tip_height() else {
+            return Ok(None);
+        };
+        let Some(header_fk) = self.store.confirmed.get(height)? else {
+            return Ok(None);
+        };
+        let rec = self.store.get_header(header_fk)?;
+        Ok(Some(ChainView {
+            height,
+            hash: rec.hash,
+            header_fk,
+        }))
+    }
+
+    /// Pin, run `f`, return the body if that pin is still published; else retry.
+    ///
+    /// Bound is 8. Empty chain is [`StoreError::NotFound`]. A pin that never
+    /// stays live is [`StoreError::Stale`], not corruption.
+    pub fn run_at_chain_view<T, F>(&self, mut f: F) -> Result<(ChainView, T), QueryError>
+    where
+        F: FnMut(&ChainView) -> Result<T, QueryError>,
+    {
+        const BOUND: u32 = 8;
+        for _ in 0..BOUND {
+            let Some(view) = self.pin_chain_view()? else {
+                return Err(StoreError::NotFound);
+            };
+            let out = f(&view)?;
+            if view.still_live(self)? {
+                return Ok((view, out));
+            }
+        }
+        Err(StoreError::Stale("chain view moved"))
+    }
+
     pub fn header_at_height(
         &self,
         height: Height,

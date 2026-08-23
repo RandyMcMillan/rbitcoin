@@ -150,6 +150,7 @@ pub use batch_parents::{
     SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
+pub use chain_view::ChainView;
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
@@ -2650,6 +2651,225 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn chain_view_pin_none_on_empty_store() {
+        let (dir, q) = temp_query("chain-view-empty");
+        assert!(q.pin_chain_view().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_pin_live_across_extension_dead_after_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-pin");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+
+        let genesis = q.pin_chain_view().unwrap().expect("genesis tip");
+        assert_eq!(genesis.height, Height(0));
+        assert_eq!(genesis.hash, hash0);
+        assert!(genesis.still_live(&q).unwrap());
+
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        assert!(
+            genesis.still_live(&q).unwrap(),
+            "prefix pin stays live across tip extension"
+        );
+
+        let tip1 = q.pin_chain_view().unwrap().expect("height 1");
+        assert_eq!(tip1.height, Height(1));
+        assert_eq!(tip1.hash, h1.hash);
+        assert!(tip1.still_live(&q).unwrap());
+
+        q.disconnect_tip().unwrap();
+        assert!(
+            !tip1.still_live(&q).unwrap(),
+            "disconnect of pinned height kills the view"
+        );
+        assert!(genesis.still_live(&q).unwrap());
+
+        let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+        h1b.nonce = h1.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+        assert_ne!(h1b.hash, tip1.hash);
+        assert!(
+            !tip1.still_live(&q).unwrap(),
+            "same-height replace must not keep the old pin live"
+        );
+        let tip1b = q.pin_chain_view().unwrap().expect("replacement tip");
+        assert_eq!(tip1b.height, Height(1));
+        assert_eq!(tip1b.hash, h1b.hash);
+        assert!(tip1b.still_live(&q).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_sh_join_slot_miss_on_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-sh-slot");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        let genesis_txid = t0.tx.txid;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+
+        let (h1, mut t1) = coinbase_block(1, prev_fk, Some(hash0));
+        t1.tx.txid[5] = 0xaa;
+        let txid_a = t1.tx.txid;
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let view_a = q.pin_chain_view().unwrap().unwrap();
+
+        let sh = script_hash(&[0x51]);
+        let mut slot = None;
+        let hist_a = q.scripthash_history_slot(&sh, &mut slot).unwrap();
+        let ids_a: Vec<_> = hist_a.iter().map(|i| i.txid).collect();
+        assert!(ids_a.contains(&txid_a), "height-1 A must be in history");
+        assert!(ids_a.contains(&genesis_txid));
+
+        let live = q.scripthash_history_in(&sh, &view_a).unwrap();
+        assert!(live.iter().any(|i| i.txid == txid_a));
+        let genesis_view = ChainView {
+            height: Height(0),
+            hash: hash0,
+            header_fk: prev_fk,
+        };
+        let only_g = q.scripthash_history_in(&sh, &genesis_view).unwrap();
+        let g_ids: Vec<_> = only_g.iter().map(|i| i.txid).collect();
+        assert!(g_ids.contains(&genesis_txid));
+        assert!(
+            !g_ids.contains(&txid_a),
+            "history under a height-0 pin must omit the height-1 create"
+        );
+
+        q.disconnect_tip().unwrap();
+        let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+        h1b.nonce = h1.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        let mut t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+        t1b.tx.txid[5] = 0xbb;
+        let txid_b = t1b.tx.txid;
+        q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+        assert_ne!(txid_a, txid_b);
+        assert_eq!(q.tip_height(), Some(Height(1)));
+
+        let hist_b = q.scripthash_history_slot(&sh, &mut slot).unwrap();
+        let ids_b: Vec<_> = hist_b.iter().map(|i| i.txid).collect();
+        assert!(
+            ids_b.contains(&txid_b),
+            "same-height replace must miss the slot and emit B, got {ids_b:?}"
+        );
+        assert!(
+            !ids_b.contains(&txid_a),
+            "stale slot would still show A after same-height replace: {ids_b:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_run_retries_after_same_height_replace() {
+        let (dir, q) = temp_query("chain-view-retry");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+
+        let mut calls = 0u32;
+        let (view, n) = q
+            .run_at_chain_view(|view| {
+                calls += 1;
+                if calls == 1 {
+                    q.disconnect_tip().unwrap();
+                    let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+                    h1b.nonce = h1.nonce.wrapping_add(7);
+                    h1b.hash = rbitcoin_store::block_header_hash(
+                        h1b.version,
+                        &hash0,
+                        &h1b.merkle_root,
+                        h1b.timestamp,
+                        h1b.bits,
+                        h1b.nonce,
+                    );
+                    let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+                    q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+                    assert!(!view.still_live(&q).unwrap());
+                }
+                Ok(calls)
+            })
+            .unwrap();
+        assert!(calls >= 2, "must retry after the pin died, calls={calls}");
+        assert_eq!(n, calls);
+        assert!(view.still_live(&q).unwrap());
+        assert_eq!(view.hash, q.pin_chain_view().unwrap().unwrap().hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_run_errors_when_always_stale() {
+        let (dir, q) = temp_query("chain-view-stale");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let mut nonce = h1.nonce;
+        let err = q
+            .run_at_chain_view(|_view| {
+                q.disconnect_tip().unwrap();
+                nonce = nonce.wrapping_add(1);
+                let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+                h1b.nonce = nonce;
+                h1b.hash = rbitcoin_store::block_header_hash(
+                    h1b.version,
+                    &hash0,
+                    &h1b.merkle_root,
+                    h1b.timestamp,
+                    h1b.bits,
+                    h1b.nonce,
+                );
+                let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+                q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("chain view moved"),
+            "stale bound must name the move, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("corrupt"),
+            "a moved view is not corruption: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_view_run_not_found_on_empty() {
+        let (dir, q) = temp_query("chain-view-retry-empty");
+        let err = q.run_at_chain_view(|_v| Ok(())).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Finish-path stamp-only notes must not wipe leftover_n for the fail pack.
     #[test]
     fn leftover_last_plan_batch_survives_stamp_only_note() {
@@ -2865,8 +3085,9 @@ mod tests {
         assert_eq!(utxos[0].tx_pos, 1);
         assert_eq!(utxos[0].value, 20_0000_0000);
 
+        let view = q.pin_chain_view().unwrap().unwrap();
         let list_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None, &view)
             .unwrap();
         assert!(
             list_join.iter().any(|r| r.spent && r.spenders.is_empty()),
@@ -2874,7 +3095,7 @@ mod tests {
         );
         assert!(list_join.iter().any(|r| !r.spent));
         let hist_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY, None)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::HISTORY, None, &view)
             .unwrap();
         assert!(
             hist_join.iter().any(|r| r.spent && !r.spenders.is_empty()),
@@ -2894,7 +3115,7 @@ mod tests {
         assert_eq!(stats.spent_txo_sum, 10_0000_0000);
         assert_eq!(body_ok_reads(), 1);
         let stats_join = q
-            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS, None)
+            .join_creates_and_spends(&sh, crate::scripthash::ShJoinNeed::CHAIN_STATS, None, &view)
             .unwrap();
         assert!(
             stats_join.iter().all(|r| r.spenders.is_empty()),

@@ -117,6 +117,7 @@ pub fn pad_empty_from(
         tip = b.block_hash();
         tip_time = b.header.time;
     }
+    query.apply_sh_pending().unwrap();
     (tip, tip_time, cbs)
 }
 

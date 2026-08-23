@@ -1846,17 +1846,10 @@ fn generate_with_mempool(
         .generate_to_script(nblocks, script, extras.clone())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
     drain_mempool(ctx, &extras);
-    drain_sh_after_generate(ctx);
     if let Some(c) = ctx.chain.as_ref() {
         c.note_gbt_assembled();
     }
     Ok(hashes_json(&hashes))
-}
-
-fn drain_sh_after_generate(ctx: &RpcContext) {
-    if let Err(e) = ctx.query.apply_sh_pending() {
-        rbitcoin_log::warn!("rpc: SH write-behind drain after generate: {e}");
-    }
 }
 
 fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1933,7 +1926,6 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     let hashes = miner
         .generate_to_script(1, script, extra)
         .map_err(|e| generateblock_validity_error(&e))?;
-    drain_sh_after_generate(ctx);
     let hash = hashes
         .first()
         .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
@@ -2404,51 +2396,38 @@ fn waitforblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["blockhash", "timeout"])?;
     let want = params.req_str(0, "blockhash")?.to_string();
     let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        let (hash, height) = tip_hash_height(ctx)?;
-        if hash == want {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        if Instant::now() >= deadline {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_for_tip(ctx, timeout_ms, |hash, _height| hash == want)
 }
 
 fn waitforblockheight(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["height", "timeout"])?;
     let want = params.req_u64(0, "height")? as u32;
     let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        let (hash, height) = tip_hash_height(ctx)?;
-        if height >= want {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        if Instant::now() >= deadline {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_for_tip(ctx, timeout_ms, |_hash, height| height >= want)
 }
 
 fn waitfornewblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["timeout"])?;
     let timeout_ms = wait_timeout_ms(params, 0, "timeout")?;
     let (start_hash, _) = tip_hash_height(ctx)?;
+    wait_for_tip(ctx, timeout_ms, |hash, _height| hash != start_hash)
+}
+
+/// `feature_shutdown.py`: stop must wake waiters so in-flight wait RPCs
+/// return the current tip instead of hanging until the connection drops.
+fn wait_for_tip(
+    ctx: &RpcContext,
+    timeout_ms: u64,
+    pred: impl Fn(&str, u32) -> bool,
+) -> Result<Value, Value> {
     let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        // `feature_shutdown.py`: stop must wake waiters so the in-flight
-        // waitfornewblock returns tip height 0 instead of hanging until
-        // the connection drops with a warm-up -28.
         if ctx.stop.load(Ordering::SeqCst) {
             let (hash, height) = tip_hash_height(ctx)?;
             return Ok(json!({ "hash": hash, "height": height }));
         }
         let (hash, height) = tip_hash_height(ctx)?;
-        if hash != start_hash {
+        if pred(&hash, height) {
             return Ok(json!({ "hash": hash, "height": height }));
         }
         if Instant::now() >= deadline {

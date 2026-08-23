@@ -1074,6 +1074,9 @@ impl ChainHub {
                 }
             }
         }
+        if let Err(e) = self.query.apply_sh_pending() {
+            rbitcoin_log::warn!("generate: SH write-behind drain: {e}");
+        }
         Ok(hashes)
     }
 
@@ -2218,6 +2221,23 @@ mod tests {
         assert!(
             t >= mock as u32 && t < tip_time,
             "expected mock-based stamp, got {t} tip={tip_time} mock={mock}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generate_to_script_drains_sh_writebehind() {
+        use bitcoin::ScriptBuf;
+        use rbitcoin_store::script_hash;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let sh = script_hash(script.as_bytes());
+        hub.generate_to_script(1, script, vec![]).expect("generate");
+        let hist = hub.query.scripthash_history(&sh).unwrap();
+        assert!(
+            hist.iter().any(|row| row.height == 1),
+            "generate must drain SH so height-1 coinbase is indexed, got {hist:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

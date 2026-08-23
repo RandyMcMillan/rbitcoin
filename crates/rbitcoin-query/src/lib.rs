@@ -44,7 +44,7 @@ use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
     SpTweaksTable, Store, StoreError, StoreLayout, TxRecord,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -1094,9 +1094,12 @@ pub struct Query {
     tx_index: std::sync::atomic::AtomicBool,
     /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
     sh_heads: Mutex<HashMap<[u8; 32], rbitcoin_store::ShHeadValue>>,
-    /// Last height whose SH creates were enqueued/written **after tip commit**.
+    /// Last height whose SH creates were applied after tip commit.
     /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
     sh_indexed_through: AtomicU64,
+    /// Height-ordered SH write-behind (one Class B appender). Confirm enqueues;
+    /// [`Self::apply_sh_pending`] / the tip-follow worker drain.
+    sh_pending: Mutex<VecDeque<connect::ShPendingJob>>,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// In-RAM body queue + lookup-promoted decoded map. One mutex (no ArcSwap).
@@ -1206,6 +1209,7 @@ impl Query {
             tx_index: std::sync::atomic::AtomicBool::new(true),
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
+            sh_pending: Mutex::new(VecDeque::new()),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
                 q: rbitcoin_store::BlockQueue::open_or_create(&store_path)?,
@@ -1298,8 +1302,8 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Last height with SH creates committed (after tip). `None` if empty chain.
-    pub(crate) fn sh_indexed_through_height(&self) -> Option<u32> {
+    /// Last height with SH creates applied (after tip). `None` if empty chain.
+    pub fn sh_indexed_through_height(&self) -> Option<u32> {
         let v = self.sh_indexed_through.load(AtomicOrdering::Acquire);
         if v == u64::MAX {
             None
@@ -3024,6 +3028,67 @@ mod tests {
             );
             assert_eq!(last.head_hit, 3);
         });
+    }
+
+    /// Tip commit (`confirm_block`) must publish `confirmed[]` without waiting
+    /// on Class B scripthash. Drain is [`Query::apply_sh_pending`] (or
+    /// [`Query::connect_block`], which drains for fixtures).
+    #[test]
+    fn tip_confirm_does_not_advance_sh_watermark() {
+        let (dir, q) = temp_query("tip-confirm-no-sh");
+        assert!(q.index_mode().is_tip());
+        assert!(q.sh_index_enabled());
+
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
+
+        let prev_fk = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        q.confirm_block(Height(1), &h1.hash).unwrap();
+
+        assert_eq!(q.tip_height(), Some(Height(1)));
+        assert_eq!(
+            q.sh_indexed_through_height(),
+            Some(0),
+            "confirm must not advance SH watermark"
+        );
+        let hist = q.scripthash_history(&sh).unwrap();
+        assert_eq!(
+            hist.len(),
+            1,
+            "undrained SH must not claim the new tip create: {hist:?}"
+        );
+        assert_eq!(hist[0].height, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_sh_pending_writes_creates_and_advances_watermark() {
+        let (dir, q) = temp_query("apply-sh-pending");
+        assert!(q.index_mode().is_tip());
+
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        assert_eq!(q.sh_indexed_through_height(), None);
+
+        q.apply_sh_pending().unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        let sh = script_hash(&[0x51]);
+        let hist = q.scripthash_history(&sh).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].height, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

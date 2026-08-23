@@ -1097,6 +1097,8 @@ pub struct Query {
     /// Job popped for apply but not yet watermarked. Readers join this with
     /// [`Self::sh_pending`] so the pop→watermark window stays at live tip.
     sh_applying: Mutex<Option<connect::ShPendingJob>>,
+    /// `0` = none released; `h+1` = durable apply may run through height `h`.
+    sh_released_through: AtomicU32,
     /// Serializes the one Class B appender (worker vs generate drain).
     sh_appender: Mutex<()>,
     /// Block-structured confirm parent cache.
@@ -1209,6 +1211,7 @@ impl Query {
             sh_pending: Mutex::new(VecDeque::new()),
             sh_pending_cv: Condvar::new(),
             sh_applying: Mutex::new(None),
+            sh_released_through: AtomicU32::new(0),
             sh_appender: Mutex::new(()),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
@@ -3079,6 +3082,39 @@ mod tests {
     }
 
     #[test]
+    fn sh_writebehind_does_not_seed_until_release() {
+        let (dir, q) = temp_query("sh-no-seed-until-release");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+
+        assert_eq!(q.sh_indexed_through_height(), None);
+        assert!(
+            q.take_sh_job_for_apply().is_none(),
+            "durable apply must not take an unreleased job"
+        );
+        let sh = script_hash(&[0x51]);
+        assert_eq!(
+            q.scripthash_history(&sh).unwrap().len(),
+            1,
+            "pending records must still be visible before release"
+        );
+        let written0 = class_c_phase_stats::SH_WRITTEN_N.load(std::sync::atomic::Ordering::Relaxed);
+
+        q.release_sh_writebehind(Height(0));
+        q.apply_sh_pending().unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
+        let written1 = class_c_phase_stats::SH_WRITTEN_N.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            written1 >= written0,
+            "release+apply must be allowed to write durable SH"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_sh_pending_writes_creates_and_advances_watermark() {
         let (dir, q) = temp_query("apply-sh-pending");
         assert!(q.index_mode().is_tip());
@@ -3109,6 +3145,7 @@ mod tests {
         q.commit_class_a_only(&h0, &[t0]).unwrap();
         q.confirm_block(Height(0), &h0.hash).unwrap();
         assert_eq!(q.sh_indexed_through_height(), None);
+        q.release_sh_writebehind(Height(0));
 
         let stolen = q.take_sh_job_for_apply().expect("enqueued genesis");
         let height = Height(0);
@@ -3174,6 +3211,7 @@ mod tests {
         t1a.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0xaa])];
         q.commit_class_a_only(&h1a, &[t1a]).unwrap();
         q.confirm_block(Height(1), &h1a.hash).unwrap();
+        q.release_sh_writebehind(Height(1));
         let stolen = q.take_sh_job_for_apply().expect("old branch job");
 
         q.disconnect_tip().unwrap();
@@ -3307,6 +3345,7 @@ mod tests {
         let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
         q.commit_class_a_only(&h1, &[t1]).unwrap();
         let hfk1 = q.confirm_block(Height(1), &h1.hash).unwrap();
+        q.release_sh_writebehind(Height(1));
         let _stolen = q.take_sh_job_for_apply().expect("height-1 job");
         q.finish_sh_job(Height(1));
         assert_eq!(q.tip_height(), Some(Height(1)));
@@ -3443,6 +3482,7 @@ mod tests {
         q.confirm_block(Height(1), &hash1).unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(0));
         assert!(q.scripthash_listunspent(&sh).unwrap().is_empty());
+        q.release_sh_writebehind(Height(1));
 
         // Same transition as rbtc-sh-wb / apply_sh_pending: queue → applying,
         // durable watermark not advanced yet.

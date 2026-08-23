@@ -211,8 +211,45 @@ impl Query {
             return Ok(());
         }
         self.sh_pending.lock().unwrap().extend(jobs);
-        self.sh_pending_cv.notify_one();
         Ok(())
+    }
+
+    /// Allow the Class B appender to durable-apply jobs through `through`.
+    ///
+    /// Enqueue publishes RAM records; seed waits for this so tip connect and
+    /// block announce do not share disk with `locate_head`.
+    pub fn release_sh_writebehind(&self, through: Height) {
+        let v = through.0.saturating_add(1);
+        self.sh_released_through.fetch_max(v, Ordering::Release);
+        self.sh_pending_cv.notify_one();
+    }
+
+    fn release_queued_sh_writebehind(&self) {
+        if let Some(h) = self.sh_pending_max_height() {
+            self.release_sh_writebehind(Height(h));
+        }
+    }
+
+    fn clamp_sh_released_before(&self, height: Height) {
+        let cap = height.0;
+        loop {
+            let cur = self.sh_released_through.load(Ordering::Acquire);
+            if cur <= cap {
+                return;
+            }
+            if self
+                .sh_released_through
+                .compare_exchange(cur, cap, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn sh_job_released(&self, job: &ShPendingJob) -> bool {
+        let rel = self.sh_released_through.load(Ordering::Acquire);
+        rel > 0 && job.height.0.saturating_add(1) <= rel
     }
 
     pub(crate) fn pending_sh_create_fks(&self, scripthash: &[u8; 32]) -> Vec<Fk> {
@@ -268,6 +305,7 @@ impl Query {
     /// Production: the tip-follow worker. Tests / [`Self::connect_block`]: drain
     /// so SH history is visible immediately after the fixture connect.
     pub fn apply_sh_pending(&self) -> Result<(), QueryError> {
+        self.release_queued_sh_writebehind();
         loop {
             if let Some(job) = self.take_sh_job_for_apply() {
                 let height = job.height;
@@ -297,6 +335,10 @@ impl Query {
         let mut pending = self.sh_pending.lock().unwrap();
         let mut applying = self.sh_applying.lock().unwrap();
         if applying.is_some() {
+            return None;
+        }
+        let job = pending.front()?;
+        if !self.sh_job_released(job) {
             return None;
         }
         let job = pending.pop_front()?;
@@ -379,6 +421,8 @@ impl Query {
         if applying.as_ref().is_some_and(|j| j.height.0 >= height.0) {
             *applying = None;
         }
+        drop(applying);
+        self.clamp_sh_released_before(height);
     }
 
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
@@ -422,6 +466,9 @@ impl Query {
         }
         if !items.is_empty() {
             self.enqueue_sh_pending(&items, None)?;
+            if let Some(last) = items.last() {
+                self.release_sh_writebehind(last.height);
+            }
         }
         Ok(())
     }

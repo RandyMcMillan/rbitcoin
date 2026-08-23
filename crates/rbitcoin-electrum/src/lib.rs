@@ -20,5 +20,5 @@ pub use server::{
 };
 pub use unspent::{
     scripthash_mempool_stats, scripthash_mempool_stats_slot, scripthash_utxos_with_mempool,
-    scripthash_utxos_with_mempool_slot, MempoolShStats,
+    scripthash_utxos_with_mempool_slot, scripthash_utxos_with_mempool_slot_in, MempoolShStats,
 };

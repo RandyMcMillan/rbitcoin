@@ -50,9 +50,9 @@ taking on for 1.0:
 
 COMPAT **done** RPCs, P2P, and mempool should be covered by the Core
 functional harness **or** an explicit “we differ on purpose” note (fee
-product, error codes, our mempool files). Today: **44 / 267** `run`; the
-interesting leftovers are dialect, not missing methods. Owner:
-[`core-functional.md`](./core-functional.md), Open **Q-41**.
+product, error codes, our mempool files). Inventory `run` / `skip` counts
+live in [`quality.md`](./quality.md) **Q-41**. Owner:
+[`core-functional.md`](./core-functional.md).
 
 ### Fuzz until junk input is boring
 

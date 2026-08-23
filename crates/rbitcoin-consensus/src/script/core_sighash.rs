@@ -6,24 +6,13 @@
 
 #![cfg(test)]
 
+use super::core_script::decode_hex;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::sha256d;
 use bitcoin::sighash::SighashCache;
 use bitcoin::{ScriptBuf, Transaction};
 use serde_json::Value;
 use std::fs;
-
-fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
-    let h = s.trim();
-    if !h.len().is_multiple_of(2) {
-        return Err(format!("odd hex len {}", h.len()));
-    }
-    let mut out = Vec::with_capacity(h.len() / 2);
-    for i in (0..h.len()).step_by(2) {
-        out.push(u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| e.to_string())?);
-    }
-    Ok(out)
-}
 
 fn load_array() -> Vec<Value> {
     let path = super::core_fixture::stage_core_json("sighash.json");

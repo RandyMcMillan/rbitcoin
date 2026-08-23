@@ -79,7 +79,7 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full**; `listunspent` loads `txid.body` only for unspent creates; one TCP connection reuses the last SH outs+spent join until SH-view **hash** changes. Confirmed methods stamp live tip: RAM pending write-behind records join with durable SH so mempool can drop confirmed txs without a hole. Durable Class B seed still lags. `server.features.chain_tip = true`. Trailing **`asof:<blockhash>`** after the official args (`server.features.asof` / `asof_protocol = 1.4.2-asof`): confirmed rows as of that still-live ancestor **at or behind visible SH** (durable + pending), **no** mempool; stamp is the asof block; unknown hash or ahead of visible SH → `asof not on chain`. Prefix keeps it off the future positional-string landmine. Requires negotiated `1.4.2-asof` (first `server.version` only). Electrum `protocol_max` stays `1.4.2`. |
 | scripthash.get_mempool / subscribe | done | Status on mempool announce **and** when SH applies a height that creates or spends the hash (posting-list probe; no Class A expand on a miss). Headers subscribe still live tip. Reorg (`TipNotify.reorg_from_height`) restatuses every watch even if the new block misses the script. Status preimage is `txid:height:blockhash:` for confirmed rows (mempool rows stay `txid:height:`). |
-| transaction.get / get_merkle | done | get falls back to mempool; confirmed responses stamp `chain_tip` |
+| transaction.get / get_merkle | done | get falls back to mempool unless `asof:`; confirmed responses stamp `chain_tip`. Trailing `asof:<blockhash>` (same dialect as scripthash): get returns the tx only if confirmed at or behind that ancestor (**no** mempool); get_merkle rejects a `height` above the asof pin (`asof not on chain`). |
 | transaction.broadcast | done | Mempool accept + P2P inv. `broadcast_package` is Electrum **1.6** — wait for P2P package relay, then bump (below). |
 | relayfee / estimatefee / histogram | done | Libre min + live median |
 | TLS | external | terminate at reverse proxy; node is plain TCP |
@@ -142,7 +142,7 @@ block at the same height). We still do **not** serve a disconnected fork
 hash.
 
 Electrum clients that want as-of send `server.version(name, "1.4.2-asof")`
-(or a `[min, max]` range whose max is that string). Standard Electrum
+(or a `[min, max]` range containing that string). Standard Electrum
 `"1.4"` / `["1.4", "1.4.2"]` stays on dotted-int 1.4.x; an `asof:` tag
 without the dialect is an error. `server.features.protocol_max` remains
 `"1.4.2"` so Electrum dotted-int parsers do not choke; discovery is

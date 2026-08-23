@@ -951,10 +951,7 @@ impl ShRunBuilder {
         }
 
         let workers = rbitcoin_store::sh_merge_workers();
-        let free_gib = rbitcoin_store::host_mem_available_bytes()
-            .map(|b| b as f64 / (1u64 << 30) as f64)
-            .map(|g| format!("{g:.1}"))
-            .unwrap_or_else(|| "?".into());
+        let free_gib = rbitcoin_store::free_gib_label();
         let t_reduce = Instant::now();
         let max_direct = max_direct_merge();
         let mut direct_kway = false;

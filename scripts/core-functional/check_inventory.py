@@ -44,6 +44,7 @@ VALID_REASONS = frozenset(
 HERE = Path(__file__).resolve().parent
 DEFAULT_INVENTORY = HERE / "inventory.toml"
 DEFAULT_NAMES = HERE / "v31.1-tests.txt"
+ANALOG_RS = HERE.parents[1] / "crates/rbitcoin-test/tests/core_analogs.rs"
 
 
 def load_names_from_dir(tests_dir: Path) -> list[str]:
@@ -71,6 +72,7 @@ def check(inventory_path: Path, disk_names: list[str]) -> list[str]:
     if not isinstance(rows, list):
         return ["inventory: missing [[test]] array"]
 
+    analog_src = ANALOG_RS.read_text() if ANALOG_RS.is_file() else ""
     errors: list[str] = []
     seen: dict[str, int] = {}
     for i, row in enumerate(rows):
@@ -108,6 +110,12 @@ def check(inventory_path: Path, disk_names: list[str]) -> list[str]:
                     errors.append(f"missing analog: {name}")
         else:
             errors.append(f"{name}: status must be run or skip")
+
+        analog = str(row.get("analog") or "").strip()
+        if analog.startswith("core_analogs::"):
+            fn = analog.split("::", 1)[1].strip()
+            if f"fn {fn}(" not in analog_src:
+                errors.append(f"dangling analog: {name} -> {analog}")
 
     inv_names = set(seen)
     disk = set(disk_names)

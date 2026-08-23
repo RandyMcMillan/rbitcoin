@@ -253,7 +253,6 @@ pub(crate) struct IbdPerfSample {
     pub wf_body_store: u64,
     pub wf_store_body_ms: u64,
 
-    pub sh_filter_ms: u64,
     pub sh_collect_ms: u64,
     pub sh_sort_ms: u64,
     pub sh_seed_ms: u64,
@@ -530,7 +529,6 @@ impl Default for IbdPerfSample {
             sh_runs: 0,
             wf_body_store: 0,
             wf_store_body_ms: 0,
-            sh_filter_ms: 0,
             sh_collect_ms: 0,
             sh_sort_ms: 0,
             sh_seed_ms: 0,
@@ -862,7 +860,7 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_assemble_cold_why_and_reset();
     let (prep_wire_arc_ns, prep_struct_ns, prep_header_ns, prep_prepare_ns, prep_filter_plan_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
-    let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
+    let (sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
     let (sh_collect_pin, sh_collect_cold) =
         rbitcoin_query::class_c_phase_stats::sample_sh_collect_src_and_reset();
@@ -984,7 +982,6 @@ pub(crate) fn sample(
         sh_runs,
         wf_body_store,
         wf_store_body_ms: ns_ms(wf_store_body_ns),
-        sh_filter_ms: ns_ms(sh_filter),
         sh_collect_ms: ns_ms(sh_collect),
         sh_sort_ms: ns_ms(sh_sort),
         sh_seed_ms: ns_ms(sh_seed),
@@ -1598,7 +1595,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         ));
     }
     out.push_str(&format!(" | sh collect={}", s.sh_collect_ms));
-    append_nz(&mut out, "filter", s.sh_filter_ms);
     append_nz(&mut out, "sort", s.sh_sort_ms);
     append_nz(&mut out, "seed", s.sh_seed_ms);
     append_nz(&mut out, "body", s.sh_body_ms);
@@ -2354,7 +2350,6 @@ mod tests {
         s.sh_collect_pin = 7;
         s.sh_collect_cold = 3;
         s.sh_collect_ms = 9;
-        s.sh_filter_ms = 1;
         s.sh_sort_ms = 1;
         s.sh_seed_ms = 2;
         s.sh_body_ms = 3;

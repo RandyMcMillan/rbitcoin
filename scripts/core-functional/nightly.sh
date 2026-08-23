@@ -11,6 +11,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
 ./scripts/core-functional/init-submodule.sh
+"$HERE/bitcoind.test.sh"
+"$HERE/rpc_util_validateaddress.test.sh"
+"$HERE/check_inventory_test.sh"
 python3 "$HERE/check_inventory.py" \
   --tests-dir "$ROOT/third_party/bitcoin/test/functional"
 # Warn-only: a newer Core release must not red the job.

@@ -111,18 +111,12 @@ fn p2wpkh_bad_signature_rejects() {
 /// Log: `p2wpkh ecdsa txid=969c4f11…d50d vin=0` (2026-07-25 mainnet IBD).
 #[test]
 fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
+    use super::core_script::decode_hex;
     use bitcoin::consensus::encode::deserialize;
-
-    fn decode_hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
-            .collect()
-    }
 
     // Wire hex from mempool.space for confirmed mainnet tx.
     let hex = include_str!("../../tests/fixtures/mainnet_508011_p2sh_p2wpkh_tx.hex").trim();
-    let raw = decode_hex(hex);
+    let raw = decode_hex(hex).expect("hex");
     let tx: Transaction = deserialize(&raw).expect("tx decode");
     assert_eq!(
         tx.compute_txid().to_string(),
@@ -135,9 +129,9 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
 
     let prevout = TxOut {
         value: Amount::from_sat(99_830_000),
-        script_pubkey: ScriptBuf::from_bytes(decode_hex(
-            "a914e93f9e95f6d5cb1736a94de992d0d18819072fa587",
-        )),
+        script_pubkey: ScriptBuf::from_bytes(
+            decode_hex("a914e93f9e95f6d5cb1736a94de992d0d18819072fa587").expect("spk"),
+        ),
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],

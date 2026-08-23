@@ -1,12 +1,12 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{
-    block_hash_hex, not_found, parse_asof_param, parse_hash32, plain_ok, store_err, AppState,
-    AsOfQuery,
+    block_hash_hex, maybe_attach_view, not_found, parse_hash32, pin_or_reject, plain_ok, store_err,
+    AppState, AsOf,
 };
 use crate::tx_json::{build_tx_json, history_items_to_tx_json, tx_status_json_in, utxo_list_json};
 use axum::body::Bytes;
-use axum::extract::{Path, Query as AxumQuery, State};
+use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -16,8 +16,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network};
 use rbitcoin_primitives::{median_time_past_times, Fk, Height};
-use rbitcoin_query::{ChainView, HistoryFilter, Query};
-use rbitcoin_store::script_hash;
+use rbitcoin_query::{ChainViewKind, HistoryFilter, Query, ScriptHashChainStats};
+use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::str::FromStr;
 
@@ -434,12 +434,8 @@ fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
 pub async fn tx_outspend(
     State(st): State<AppState>,
     Path((txid_hex, vout)): Path<(String, u32)>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     spawn_join(move || {
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
@@ -447,8 +443,12 @@ pub async fn tx_outspend(
         if st.query.tx_fk_by_txid(&txid).ok().flatten().is_none() {
             return not_found();
         }
-        match outspend_json(&st.query, &txid, vout, asof) {
-            Ok(v) => Json(v).into_response(),
+        let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        match outspend_json(&st.query, &txid, vout, view.as_ref()) {
+            Ok(v) => maybe_attach_view(Json(v).into_response(), view),
             Err(e) => store_err(e),
         }
     })
@@ -458,12 +458,8 @@ pub async fn tx_outspend(
 pub async fn tx_outspends(
     State(st): State<AppState>,
     Path(txid_hex): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     spawn_join(move || {
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
@@ -474,18 +470,22 @@ pub async fn tx_outspends(
         }) else {
             return not_found();
         };
+        let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
         let (meta, _) = match st.query.store().get_tx_meta_and_outputs(fk) {
             Ok(v) => v,
             Err(e) => return store_err(e),
         };
         let mut arr = Vec::with_capacity(meta.output_count as usize);
         for vout in 0..meta.output_count {
-            match outspend_json(&st.query, &txid, vout, asof) {
+            match outspend_json(&st.query, &txid, vout, view.as_ref()) {
                 Ok(v) => arr.push(v),
                 Err(e) => return store_err(e),
             }
         }
-        Json(arr).into_response()
+        maybe_attach_view(Json(arr).into_response(), view)
     })
     .await
 }
@@ -494,16 +494,10 @@ fn outspend_json(
     query: &Query,
     txid: &[u8; 32],
     vout: u32,
-    asof: Option<[u8; 32]>,
+    view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    let view = match asof {
-        Some(hash) => query
-            .pin_chain_view_at(&hash)?
-            .ok_or(rbitcoin_store::StoreError::NotFound)?,
-        None => match query.pin_chain_view()? {
-            Some(v) => v,
-            None => return Ok(json!({ "spent": false })),
-        },
+    let Some(view) = view else {
+        return Ok(json!({ "spent": false }));
     };
     let spenders = query.spenders_at(txid, vout, Some(view.height.0))?;
     if spenders.is_empty() {
@@ -511,7 +505,7 @@ fn outspend_json(
     }
     let p = &spenders[0];
     let spend_txid = query.store().txs.body_txid(p.spending_tx_fk)?;
-    let status = tx_status_json_in(query, p.spending_tx_fk, &view)?;
+    let status = tx_status_json_in(query, p.spending_tx_fk, view)?;
     Ok(json!({
         "spent": true,
         "txid": block_hash_hex(&spend_txid),
@@ -527,31 +521,23 @@ pub(crate) async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) ->
     }
 }
 
-fn asof_view(query: &Query, asof: Option<[u8; 32]>) -> Result<Option<ChainView>, Response> {
-    let Some(hash) = asof else {
-        return Ok(None);
-    };
-    match query.pin_sh_chain_view_at(&hash) {
-        Ok(Some(v)) => Ok(Some(v)),
-        Ok(None) => Err(not_found()),
-        Err(e) => Err(store_err(e)),
-    }
+fn sh_pin(
+    st: &AppState,
+    asof: Option<[u8; 32]>,
+) -> Result<Option<rbitcoin_query::ChainView>, Response> {
+    pin_or_reject(&st.query, ChainViewKind::ScriptHash, asof)
 }
 
 pub async fn address_info(
     State(st): State<AppState>,
     Path(addr_s): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => {
             spawn_join(
                 move || match sh_stats_json(&st, &sh, Some(addr_s.as_str()), None, asof) {
-                    Ok(v) => Json(v).into_response(),
+                    Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
                     Err(e) => store_err(e),
                 },
             )
@@ -564,18 +550,14 @@ pub async fn address_info(
 pub async fn scripthash_info(
     State(st): State<AppState>,
     Path(sh_hex): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     spawn_join(
         move || match sh_stats_json(&st, &sh, None, Some(sh_hex.as_str()), asof) {
-            Ok(v) => Json(v).into_response(),
+            Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
             Err(e) => store_err(e),
         },
     )
@@ -585,12 +567,8 @@ pub async fn scripthash_info(
 pub async fn address_utxo(
     State(st): State<AppState>,
     Path(addr_s): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => spawn_join(move || utxo_response(&st, &sh, asof)).await,
         Err(_) => not_found(),
@@ -600,43 +578,59 @@ pub async fn address_utxo(
 pub async fn scripthash_utxo(
     State(st): State<AppState>,
     Path(sh_hex): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
-    };
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
     };
     spawn_join(move || utxo_response(&st, &sh, asof)).await
 }
 
 fn utxo_response(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Response {
-    match asof_view(&st.query, asof) {
-        Ok(Some(view)) => match st.query.scripthash_listunspent_in(sh, &view) {
+    let view = match sh_pin(st, asof) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let resp = if asof.is_some() {
+        let Some(view) = view.as_ref() else {
+            return not_found();
+        };
+        match st.query.scripthash_listunspent_in(sh, view) {
             Ok(list) => match utxo_list_json(&st.query, &list) {
                 Ok(v) => Json(v).into_response(),
                 Err(e) => store_err(e),
             },
             Err(e) => store_err(e),
-        },
-        Ok(None) => st.with_sh_join(|slot| {
-            match rbitcoin_electrum::scripthash_utxos_with_mempool_slot(
-                &st.query,
-                st.mempool.as_deref(),
-                sh,
-                slot,
-            ) {
-                Ok(list) => match utxo_list_json(&st.query, &list) {
-                    Ok(v) => Json(v).into_response(),
-                    Err(e) => store_err(e),
-                },
-                Err(e) => store_err(e),
+        }
+    } else {
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |view| {
+            st.with_sh_join(|slot| {
+                rbitcoin_electrum::scripthash_utxos_with_mempool_slot_in(
+                    &st.query,
+                    st.mempool.as_deref(),
+                    sh,
+                    slot,
+                    view,
+                )
+            })
+        }) {
+            Ok((view, list)) => {
+                return maybe_attach_view(
+                    match utxo_list_json(&st.query, &list) {
+                        Ok(v) => Json(v).into_response(),
+                        Err(e) => store_err(e),
+                    },
+                    Some(view),
+                );
             }
-        }),
-        Err(resp) => resp,
-    }
+            Err(StoreError::NotFound) => match utxo_list_json(&st.query, &[]) {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => store_err(e),
+            },
+            Err(e) => store_err(e),
+        }
+    };
+    maybe_attach_view(resp, view)
 }
 
 pub(crate) fn resolve_address_sh(addr_s: &str, network: Network) -> Result<[u8; 32], ()> {
@@ -651,15 +645,24 @@ fn sh_stats_json(
     address: Option<&str>,
     scripthash_hex: Option<&str>,
     asof: Option<[u8; 32]>,
-) -> Result<Value, rbitcoin_query::QueryError> {
-    let chain = if let Some(hash) = asof {
+) -> Result<(Value, Option<rbitcoin_query::ChainView>), rbitcoin_query::QueryError> {
+    let (chain, view) = if asof.is_some() {
         let view = st
             .query
-            .pin_sh_chain_view_at(&hash)?
-            .ok_or(rbitcoin_store::StoreError::NotFound)?;
-        st.query.scripthash_chain_stats_in(sh, &view)?
+            .pin_view(ChainViewKind::ScriptHash, asof.as_ref())?;
+        if view.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        let v = view.as_ref().unwrap();
+        (st.query.scripthash_chain_stats_in(sh, v)?, view)
     } else {
-        st.with_sh_join(|slot| st.query.scripthash_chain_stats_slot(sh, slot))?
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |v| {
+            st.with_sh_join(|slot| st.query.scripthash_chain_stats_slot_in(sh, slot, v))
+        }) {
+            Ok((view, chain)) => (chain, Some(view)),
+            Err(StoreError::NotFound) => (ScriptHashChainStats::default(), None),
+            Err(e) => return Err(e),
+        }
     };
     let chain_stats = json!({
         "tx_count": chain.tx_count,
@@ -702,32 +705,24 @@ fn sh_stats_json(
     if let Some(h) = scripthash_hex {
         obj["scripthash"] = Value::String(h.to_string());
     }
-    Ok(obj)
+    Ok((obj, view))
 }
 
 pub async fn scripthash_txs_chain(
     State(st): State<AppState>,
     Path(sh_hex): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     spawn_join(move || chain_page(&st, &sh_hex, None, asof)).await
 }
 
 pub async fn scripthash_txs_chain_cursor(
     State(st): State<AppState>,
     Path((sh_hex, last)): Path<(String, String)>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
     let Ok(after) = parse_hash32(&last) else {
         return not_found();
-    };
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
     };
     spawn_join(move || chain_page(&st, &sh_hex, Some(after), asof)).await
 }
@@ -735,12 +730,8 @@ pub async fn scripthash_txs_chain_cursor(
 pub async fn address_txs_chain(
     State(st): State<AppState>,
     Path(addr_s): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => spawn_join(move || chain_page_sh(&st, &sh, None, asof)).await,
         Err(_) => not_found(),
@@ -750,14 +741,10 @@ pub async fn address_txs_chain(
 pub async fn address_txs_chain_cursor(
     State(st): State<AppState>,
     Path((addr_s, last)): Path<(String, String)>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
     let Ok(after) = parse_hash32(&last) else {
         return not_found();
-    };
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
     };
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => spawn_join(move || chain_page_sh(&st, &sh, Some(after), asof)).await,
@@ -769,14 +756,10 @@ pub async fn address_txs_chain_cursor(
 pub async fn scripthash_txs(
     State(st): State<AppState>,
     Path(sh_hex): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
-    };
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
     };
     spawn_join(move || combined_txs(&st, &sh, asof)).await
 }
@@ -784,12 +767,8 @@ pub async fn scripthash_txs(
 pub async fn address_txs(
     State(st): State<AppState>,
     Path(addr_s): Path<String>,
-    AxumQuery(asof): AxumQuery<AsOfQuery>,
+    AsOf(asof): AsOf,
 ) -> Response {
-    let asof = match parse_asof_param(&asof) {
-        Ok(v) => v,
-        Err(()) => return not_found(),
-    };
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => spawn_join(move || combined_txs(&st, &sh, asof)).await,
         Err(_) => not_found(),
@@ -814,29 +793,50 @@ fn chain_page_sh(
     after: Option<[u8; 32]>,
     asof: Option<[u8; 32]>,
 ) -> Response {
+    let view = match sh_pin(st, asof) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let filter = HistoryFilter::esplora_chain_page(after);
-    match asof_view(&st.query, asof) {
-        Ok(Some(view)) => match st.query.scripthash_history_filtered_in(sh, &filter, &view) {
+    let resp = if asof.is_some() {
+        let Some(view) = view.as_ref() else {
+            return not_found();
+        };
+        match st.query.scripthash_history_filtered_in(sh, &filter, view) {
             Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
                 Ok(v) => Json(v).into_response(),
                 Err(e) => store_err(e),
             },
             Err(e) => store_err(e),
-        },
-        Ok(None) => st.with_sh_join(|slot| {
-            match st.query.scripthash_history_filtered_slot(sh, &filter, slot) {
-                Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
-                    Ok(v) => Json(v).into_response(),
-                    Err(e) => store_err(e),
-                },
-                Err(e) => store_err(e),
+        }
+    } else {
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |view| {
+            st.with_sh_join(|slot| {
+                st.query
+                    .scripthash_history_filtered_slot_in(sh, &filter, slot, view)
+            })
+        }) {
+            Ok((view, items)) => {
+                return maybe_attach_view(
+                    match history_items_to_tx_json(&st.query, &items, st.network) {
+                        Ok(v) => Json(v).into_response(),
+                        Err(e) => store_err(e),
+                    },
+                    Some(view),
+                );
             }
-        }),
-        Err(resp) => resp,
-    }
+            Err(StoreError::NotFound) => Json(Vec::<Value>::new()).into_response(),
+            Err(e) => store_err(e),
+        }
+    };
+    maybe_attach_view(resp, view)
 }
 
 fn combined_txs(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Response {
+    let view = match sh_pin(st, asof) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
     let mut out = Vec::new();
     if asof.is_none() {
         if let Some(mp) = st.mempool.as_ref() {
@@ -856,8 +856,11 @@ fn combined_txs(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Respons
         }
     }
     let filter = HistoryFilter::esplora_chain_page(None);
-    match asof_view(&st.query, asof) {
-        Ok(Some(view)) => match st.query.scripthash_history_filtered_in(sh, &filter, &view) {
+    let resp = if asof.is_some() {
+        let Some(view) = view.as_ref() else {
+            return not_found();
+        };
+        match st.query.scripthash_history_filtered_in(sh, &filter, view) {
             Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
                 Ok(chain) => {
                     out.extend(chain);
@@ -866,21 +869,31 @@ fn combined_txs(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Respons
                 Err(e) => store_err(e),
             },
             Err(e) => store_err(e),
-        },
-        Ok(None) => st.with_sh_join(|slot| {
-            match st.query.scripthash_history_filtered_slot(sh, &filter, slot) {
-                Ok(items) => match history_items_to_tx_json(&st.query, &items, st.network) {
-                    Ok(chain) => {
-                        out.extend(chain);
-                        Json(out).into_response()
-                    }
-                    Err(e) => store_err(e),
-                },
-                Err(e) => store_err(e),
+        }
+    } else {
+        match st.query.run_at_view(ChainViewKind::ScriptHash, |view| {
+            st.with_sh_join(|slot| {
+                st.query
+                    .scripthash_history_filtered_slot_in(sh, &filter, slot, view)
+            })
+        }) {
+            Ok((view, items)) => {
+                return maybe_attach_view(
+                    match history_items_to_tx_json(&st.query, &items, st.network) {
+                        Ok(chain) => {
+                            out.extend(chain);
+                            Json(out).into_response()
+                        }
+                        Err(e) => store_err(e),
+                    },
+                    Some(view),
+                );
             }
-        }),
-        Err(resp) => resp,
-    }
+            Err(StoreError::NotFound) => Json(out).into_response(),
+            Err(e) => store_err(e),
+        }
+    };
+    maybe_attach_view(resp, view)
 }
 
 pub async fn mempool_info(State(st): State<AppState>) -> Response {
@@ -1286,7 +1299,7 @@ mod pure_helper_tests {
         };
         let sh = script_hash(&[0x51]);
         reset_body_ok_reads();
-        let info = super::sh_stats_json(&st, &sh, None, None, None).unwrap();
+        let (info, _) = super::sh_stats_json(&st, &sh, None, None, None).unwrap();
         assert_eq!(info["chain_stats"]["tx_count"], 3);
         let after_info = body_ok_reads();
         assert_eq!(after_info, 3);

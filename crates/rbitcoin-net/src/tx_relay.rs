@@ -1875,7 +1875,6 @@ mod tests {
             let z = hub.sample_reset_perf();
             assert_eq!(z.accepts, 0);
             let unused = script_hash(&[0x00]);
-            let _ = hub.sample_reset_perf();
             assert_eq!(hub.scripthash_unconfirmed_delta(&unused), 0);
             let s = hub.sample_reset_perf();
             assert_eq!(s.delta_prevouts, 0);

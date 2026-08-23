@@ -227,15 +227,19 @@ fn estimatesmartfee_core_param_gates() {
     assert_eq!(e["code"], ERR_MISC);
     assert!(e["message"].as_str().unwrap().contains("estimatesmartfee"));
 
-    let e = dispatch(&ctx, "estimaterawfee", vec![json!(1009)]).unwrap_err();
-    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid conf_target, must be between 1 and 1008"),
-        "{e}"
-    );
+    for method in ["estimatesmartfee", "estimaterawfee"] {
+        for bad in [json!(0), json!(1009)] {
+            let e = dispatch(&ctx, method, vec![bad]).unwrap_err();
+            assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{method}");
+            assert!(
+                e["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Invalid conf_target, must be between 1 and 1008"),
+                "{method} {e}"
+            );
+        }
+    }
 
     // Valid calls must succeed (empty mempool still returns an object).
     let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1)]).unwrap();
@@ -457,15 +461,51 @@ fn stop_sets_flag() {
 #[test]
 fn waitfornewblock_returns_on_stop() {
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let stop = Arc::clone(&ctx.stop);
     let h = thread::spawn(move || {
         thread::sleep(Duration::from_millis(30));
         stop.store(true, Ordering::SeqCst);
     });
+    let t0 = Instant::now();
     let got = dispatch(&ctx, "waitfornewblock", vec![json!(5_000)]).unwrap();
     assert_eq!(got["height"], 0);
+    assert!(
+        t0.elapsed() < Duration::from_millis(1_000),
+        "stop must wake the waiter, not the timeout"
+    );
+    h.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn waitforblock_and_height_return_on_stop() {
+    use std::thread;
+    use std::time::{Duration, Instant};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let stop = Arc::clone(&ctx.stop);
+    let h = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        stop.store(true, Ordering::SeqCst);
+    });
+    let t0 = Instant::now();
+    let missing = "00".repeat(32);
+    let got = dispatch(&ctx, "waitforblock", vec![json!(missing), json!(5_000)]).unwrap();
+    assert_eq!(got["height"], 0);
+    assert!(t0.elapsed() < Duration::from_millis(1_000));
+    h.join().unwrap();
+
+    let stop = Arc::clone(&ctx.stop);
+    stop.store(false, Ordering::SeqCst);
+    let h = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        stop.store(true, Ordering::SeqCst);
+    });
+    let t0 = Instant::now();
+    let got = dispatch(&ctx, "waitforblockheight", vec![json!(99), json!(5_000)]).unwrap();
+    assert_eq!(got["height"], 0);
+    assert!(t0.elapsed() < Duration::from_millis(1_000));
     h.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

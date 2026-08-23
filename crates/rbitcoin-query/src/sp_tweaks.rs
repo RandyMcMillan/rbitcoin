@@ -32,6 +32,18 @@ impl Default for ThinTweakRangeLimits {
     }
 }
 
+fn require_thin_body_range(r: Option<(u64, u64)>) -> Result<(u64, u64), StoreError> {
+    match r {
+        None => Err(StoreError::Corrupt(
+            "invariant: thin tweak eligible body missing",
+        )),
+        Some((_, 0)) => Err(StoreError::Corrupt(
+            "invariant: thin tweak eligible body empty",
+        )),
+        Some((off, len)) => Ok((off, len)),
+    }
+}
+
 impl Query {
     pub fn sptweaks_enabled(&self) -> bool {
         self.sptweaks_enabled.load(AtomicOrdering::Acquire)
@@ -93,9 +105,9 @@ impl Query {
         match self.store.confirmed.get(height)? {
             None => return Ok(()),
             Some(fk) if fk != header_fk => {
-                return Err(
-                    StoreError::Corrupt("sp_tweaks put header is not confirmed tip").into(),
-                );
+                return Err(StoreError::Corrupt(
+                    "sp_tweaks put header is not confirmed tip",
+                ));
             }
             Some(_) => {}
         }
@@ -125,9 +137,9 @@ impl Query {
             match self.store.confirmed.get(*height)? {
                 None => return Ok(()),
                 Some(fk) if fk != *header_fk => {
-                    return Err(
-                        StoreError::Corrupt("sp_tweaks put header is not confirmed tip").into(),
-                    );
+                    return Err(StoreError::Corrupt(
+                        "sp_tweaks put header is not confirmed tip",
+                    ));
                 }
                 Some(_) => {}
             }
@@ -247,23 +259,9 @@ impl Query {
             let mut span_off = u64::MAX;
             let mut span_end = 0u64;
             for r in &ranges {
-                let Some((off, len)) = *r else {
-                    return Err(
-                        StoreError::Corrupt("invariant: thin tweak eligible body missing").into(),
-                    );
-                };
-                if len == 0 {
-                    return Err(
-                        StoreError::Corrupt("invariant: thin tweak eligible body missing").into(),
-                    );
-                }
+                let (off, len) = require_thin_body_range(*r)?;
                 span_off = span_off.min(off);
                 span_end = span_end.max(off.saturating_add(len));
-            }
-            if span_off >= span_end {
-                return Err(
-                    StoreError::Corrupt("invariant: thin tweak eligible body missing").into(),
-                );
             }
             let span_len = span_end - span_off;
             self.store.txs.with_body_span(span_off, span_len, |raw| {
@@ -271,7 +269,7 @@ impl Query {
                     let (off, len) = r.unwrap();
                     let rel = (off - span_off) as usize;
                     let sl = raw.get(rel..rel.saturating_add(len as usize)).ok_or(
-                        StoreError::Corrupt("invariant: thin tweak eligible body missing"),
+                        StoreError::Corrupt("invariant: thin tweak eligible body span truncated"),
                     )?;
                     let Some(txid) = txids.get(i).copied().flatten() else {
                         return Err(StoreError::Corrupt(
@@ -340,6 +338,53 @@ mod tests {
         assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
         q.set_sptweaks_enabled(true, Height(0)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_sp_tweaks_rejects_header_fk_mismatch() {
+        let (dir, q) = tmp_q();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let h0 = header(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: [1u8; 32],
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+                }],
+            )
+            .unwrap();
+        let err = q
+            .put_sp_tweaks_block(Height(0), Fk(fk0.0.wrapping_add(1)), &[None])
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("sp_tweaks put header is not confirmed tip"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thin_tweak_body_corrupt_strings_are_distinct() {
+        let missing = require_thin_body_range(None).unwrap_err();
+        let empty = require_thin_body_range(Some((8, 0))).unwrap_err();
+        let ok = require_thin_body_range(Some((8, 16))).unwrap();
+        assert_eq!(ok, (8, 16));
+        let m = format!("{missing}");
+        let e = format!("{empty}");
+        assert!(m.contains("body missing"), "{m}");
+        assert!(e.contains("body empty"), "{e}");
+        assert_ne!(m, e);
     }
 
     #[test]

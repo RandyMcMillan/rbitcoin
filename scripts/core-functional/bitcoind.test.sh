@@ -276,6 +276,17 @@ assert_fail_msg "port 65536 invalid" "Error: Invalid port specified in -port: '6
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=65536
 assert_fail_msg "port 0 invalid" "Error: Invalid port specified in -port: '0'" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=0
+assert_fail_msg "port +18444 invalid" "Error: Invalid port specified in -port: '+18444'" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=+18444
+
+CONF_PORT="$WORKDIR/conf-port-bad"
+mkdir -p "$CONF_PORT"
+printf 'regtest=1\nport=nope\n' >"$CONF_PORT/bitcoin.conf"
+assert_fail_msg "conf port garbage" "Error: Invalid port specified in -port: 'nope'" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$CONF_PORT" -regtest
+printf 'regtest=1\nport=+18444\n' >"$CONF_PORT/bitcoin.conf"
+assert_fail_msg "conf port +18444" "Error: Invalid port specified in -port: '+18444'" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$CONF_PORT" -regtest
 
 # feature_port.py: Core-shaped Bound to lines in debug.log for -listen/-port.
 PORT_DD="$WORKDIR/port-bound"

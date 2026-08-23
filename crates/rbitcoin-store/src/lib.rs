@@ -117,7 +117,7 @@ pub use sharded_hashhead::{
 pub use sorted_run::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, commit_run_to_catalog, crc32,
     detach_run, dynamic_merge_fanin, dynamic_merge_fanin_for, fanin_passes_total,
-    for_each_merged_rec, for_each_merged_rec_opts, for_each_merged_rec_shard,
+    for_each_merged_rec, for_each_merged_rec_opts, for_each_merged_rec_shard, free_gib_label,
     host_mem_available_bytes, list_fanin_reduce_outputs, list_materialize_claims, list_runs,
     load_fanin_checkpoint, lookup_key, merge_runs, merge_runs_to_file,
     merge_runs_to_file_with_policy, merge_runs_with_policy, next_run_path, open_run, read_run_body,

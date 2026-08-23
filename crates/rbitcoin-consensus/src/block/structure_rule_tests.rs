@@ -4,7 +4,8 @@ use super::{
     apply_witness_commitment, bip16_active_from_prev_mtp, bip34_height_script, block_subsidy,
     is_p2sh_script, is_p2wpkh_program, is_p2wsh_program, last_script_push, merkle_root_bytes,
     script_sigop_count, validate_block_structure, validate_block_structure_hashed,
-    validate_block_structure_with_pres, ScriptCheckJob, ValidationContext, BIP16_EXCEPTION_MAINNET,
+    validate_block_structure_with_pres, witness_commitment_script, ScriptCheckJob,
+    ValidationContext, BIP16_EXCEPTION_MAINNET,
 };
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
@@ -516,6 +517,17 @@ fn merkle_root_bytes_single_and_odd() {
     let root3 = merkle_root_bytes(&[a, b, a]);
     assert_ne!(root2, root3);
     assert_eq!(merkle_root_bytes(&[]), [0u8; 32]);
+}
+
+#[test]
+fn witness_commitment_script_honors_reserved() {
+    let wtx = [[0x11u8; 32]];
+    let zero = witness_commitment_script(wtx, &[0u8; 32]);
+    let ones = witness_commitment_script(wtx, &[0xffu8; 32]);
+    assert_ne!(zero, ones);
+    assert_eq!(&zero[..6], &[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]);
+    assert_eq!(zero.len(), 38);
+    assert_eq!(ones.len(), 38);
 }
 
 #[test]

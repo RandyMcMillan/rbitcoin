@@ -205,7 +205,7 @@ fn history_items_from_joined(
     apply_history_filter(&items, filter)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScriptHashBalance {
     pub confirmed: i64,
     pub unconfirmed: i64,
@@ -802,13 +802,24 @@ impl Query {
             *slot = None;
             return Ok(Vec::new());
         };
+        self.scripthash_history_filtered_slot_in(scripthash, filter, slot, &view)
+    }
+
+    /// Slot-aware history at a caller-pinned view.
+    pub fn scripthash_history_filtered_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
         let hit = slot
             .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, &view));
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
         if !hit && filter.to_height.is_some() {
-            return self.scripthash_history_filtered_in(scripthash, filter, &view);
+            return self.scripthash_history_filtered_in(scripthash, filter, view);
         }
-        self.ensure_sh_join_slot_in(scripthash, slot, &view)?;
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
         let recs = &mut slot
             .as_mut()
             .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
@@ -882,10 +893,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashBalance, QueryError> {
         let Some(view) = self.pin_sh_chain_view()? else {
-            return Ok(ScriptHashBalance {
-                confirmed: 0,
-                unconfirmed: 0,
-            });
+            return Ok(ScriptHashBalance::default());
         };
         self.scripthash_balance_in(scripthash, &view)
     }
@@ -907,11 +915,26 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<ScriptHashBalance, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
+        self.scripthash_balance_from_slot(slot)
+    }
+
+    /// Slot-aware [`Self::scripthash_balance`] at a caller-pinned view.
+    pub fn scripthash_balance_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<ScriptHashBalance, QueryError> {
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        self.scripthash_balance_from_slot(slot)
+    }
+
+    fn scripthash_balance_from_slot(
+        &self,
+        slot: &Option<ShJoinSlot>,
+    ) -> Result<ScriptHashBalance, QueryError> {
         let Some(recs) = slot.as_ref() else {
-            return Ok(ScriptHashBalance {
-                confirmed: 0,
-                unconfirmed: 0,
-            });
+            return Ok(ScriptHashBalance::default());
         };
         self.balance_from_joined(&recs.joined)
     }
@@ -997,6 +1020,24 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
+        self.scripthash_listunspent_from_slot(slot)
+    }
+
+    /// Slot-aware [`Self::scripthash_listunspent`] at a caller-pinned view.
+    pub fn scripthash_listunspent_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        self.scripthash_listunspent_from_slot(slot)
+    }
+
+    fn scripthash_listunspent_from_slot(
+        &self,
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let Some(recs) = slot.as_mut() else {
             return Ok(Vec::new());
         };
@@ -1084,13 +1125,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<ScriptHashChainStats, QueryError> {
         let Some(view) = self.pin_sh_chain_view()? else {
-            return Ok(ScriptHashChainStats {
-                tx_count: 0,
-                funded_txo_count: 0,
-                funded_txo_sum: 0,
-                spent_txo_count: 0,
-                spent_txo_sum: 0,
-            });
+            return Ok(ScriptHashChainStats::default());
         };
         self.scripthash_chain_stats_in(scripthash, &view)
     }
@@ -1114,13 +1149,21 @@ impl Query {
     ) -> Result<ScriptHashChainStats, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
         let Some(recs) = slot.as_ref() else {
-            return Ok(ScriptHashChainStats {
-                tx_count: 0,
-                funded_txo_count: 0,
-                funded_txo_sum: 0,
-                spent_txo_count: 0,
-                spent_txo_sum: 0,
-            });
+            return Ok(ScriptHashChainStats::default());
+        };
+        self.chain_stats_from_joined(&recs.joined)
+    }
+
+    /// Slot-aware [`Self::scripthash_chain_stats`] at a caller-pinned view.
+    pub fn scripthash_chain_stats_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<ScriptHashChainStats, QueryError> {
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        let Some(recs) = slot.as_ref() else {
+            return Ok(ScriptHashChainStats::default());
         };
         self.chain_stats_from_joined(&recs.joined)
     }

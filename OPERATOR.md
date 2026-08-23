@@ -31,7 +31,7 @@ builds stay on `nix develop` / `cargo test`; release is always musl static.
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 **GitHub Release** (`v*.*.*` tags) is the operator snapshot: Linux musl +
-Windows CRT-static PE + Darwin aarch64 zip. Merge the version-bump PR into
+Windows CRT-static PE + Darwin aarch64 binaries + SHA256SUMS. Merge the version-bump PR into
 `master` locally (merge commit), then:
 
 ```bash
@@ -46,7 +46,7 @@ they do not upload binaries. Local Linux `target/release/` install is still
 supported. Darwin/Windows are not Nix packages — see
 [`docs/reproducible-builds.md`](docs/reproducible-builds.md).
 
-**Darwin Gatekeeper:** the zip is ad-hoc signed (`codesign -s -`), not
+**Darwin Gatekeeper:** the Darwin binaries are ad-hoc signed (`codesign -s -`), not
 notarized. If Finder or a browser sets quarantine and the binary is killed
 on launch:
 

@@ -228,16 +228,18 @@ pub fn block_has_witness(block: &Block) -> bool {
         .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
 }
 
-/// BIP141 coinbase `OP_RETURN` script for GBT `default_witness_commitment` (nonce = 0).
-pub fn witness_commitment_script(non_cb_wtxids: impl IntoIterator<Item = [u8; 32]>) -> Vec<u8> {
+/// BIP141 coinbase `OP_RETURN` script for GBT `default_witness_commitment`.
+pub fn witness_commitment_script(
+    non_cb_wtxids: impl IntoIterator<Item = [u8; 32]>,
+    reserved: &[u8; 32],
+) -> Vec<u8> {
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    let reserved = [0u8; 32];
     let mut leaves = vec![[0u8; 32]];
     leaves.extend(non_cb_wtxids);
     let witness_root = merkle_root_bytes(&leaves);
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(&witness_root);
-    buf[32..].copy_from_slice(&reserved);
+    buf[32..].copy_from_slice(reserved);
     let hash = sha256d::Hash::hash(&buf);
     let mut spk = Vec::with_capacity(38);
     spk.extend_from_slice(&MAGIC);
@@ -252,22 +254,14 @@ pub fn apply_witness_commitment(block: &mut Block) {
     if !block_has_witness(block) || block.txdata.is_empty() {
         return;
     }
-    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     let reserved = [0u8; 32];
     block.txdata[0].input[0].witness = Witness::from_slice(&[reserved.to_vec()]);
-    let mut leaves = Vec::with_capacity(block.txdata.len());
-    leaves.push([0u8; 32]);
-    for tx in block.txdata.iter().skip(1) {
-        leaves.push(tx.compute_wtxid().to_byte_array());
-    }
-    let witness_root = merkle_root_bytes(&leaves);
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(&witness_root);
-    buf[32..].copy_from_slice(&reserved);
-    let hash = sha256d::Hash::hash(&buf);
-    let mut spk = Vec::with_capacity(38);
-    spk.extend_from_slice(&MAGIC);
-    spk.extend_from_slice(&hash.to_byte_array());
+    let wtxids = block
+        .txdata
+        .iter()
+        .skip(1)
+        .map(|tx| tx.compute_wtxid().to_byte_array());
+    let spk = witness_commitment_script(wtxids, &reserved);
     block.txdata[0].output.push(TxOut {
         value: Amount::ZERO,
         script_pubkey: ScriptBuf::from_bytes(spk),

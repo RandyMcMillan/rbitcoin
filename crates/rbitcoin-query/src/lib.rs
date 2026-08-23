@@ -147,10 +147,10 @@ pub mod process_mem_stats {
 pub use archive::{ArchiveWritePlan, CreatePin};
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
-    SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
+    SharedParentPin, U32Map, U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
-pub use chain_view::ChainView;
+pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
@@ -881,8 +881,6 @@ pub mod class_c_phase_stats {
     pub static SCRIPTHASH_NS: AtomicU64 = AtomicU64::new(0);
     pub static TIP_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// SH: filter which wave txs need create rows.
-    pub static SH_FILTER_NS: AtomicU64 = AtomicU64::new(0);
     /// SH: load creates from Class A for new txs (Direct runs enqueue).
     pub static SH_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     /// SH: sort creates by scripthash (tip append path).
@@ -919,10 +917,9 @@ pub mod class_c_phase_stats {
         )
     }
 
-    /// `(filter, collect, sort, seed, body, head)` nanoseconds.
-    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+    /// `(collect, sort, seed, body, head)` nanoseconds.
+    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64) {
         (
-            SH_FILTER_NS.swap(0, Ordering::Relaxed),
             SH_COLLECT_NS.swap(0, Ordering::Relaxed),
             SH_SORT_NS.swap(0, Ordering::Relaxed),
             SH_SEED_NS.swap(0, Ordering::Relaxed),
@@ -961,7 +958,6 @@ pub mod class_c_phase_stats {
     /// Snapshot for tip-follow accept logs (does **not** reset). Prefer sample_* after.
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct TipShSnap {
-        pub filter_ns: u64,
         pub collect_ns: u64,
         pub sort_ns: u64,
         pub seed_ns: u64,
@@ -975,7 +971,7 @@ pub mod class_c_phase_stats {
     }
 
     impl TipShSnap {
-        /// Sum of durable-append substeps (sort+seed+body+head); filter+collect separate.
+        /// Sum of durable-append substeps (sort+seed+body+head); collect separate.
         pub fn append_ns(&self) -> u64 {
             self.sort_ns
                 .saturating_add(self.seed_ns)
@@ -984,22 +980,19 @@ pub mod class_c_phase_stats {
         }
 
         pub fn total_sh_ns(&self) -> u64 {
-            self.filter_ns
-                .saturating_add(self.collect_ns)
-                .saturating_add(self.append_ns())
+            self.collect_ns.saturating_add(self.append_ns())
         }
     }
 
     /// Sample SH subtimers + counts in one call (resets all SH_* for this module).
     pub fn sample_tip_sh_and_reset() -> TipShSnap {
-        let (filter_ns, collect_ns, sort_ns, seed_ns, body_ns, head_ns) = sample_sh_sub_and_reset();
+        let (collect_ns, sort_ns, seed_ns, body_ns, head_ns) = sample_sh_sub_and_reset();
         let (pin, cold) = sample_sh_collect_src_and_reset();
         let (creates, unique, written) = sample_sh_counts_and_reset();
         // Also clear aggregate SCRIPTHASH_NS / STRONG / TIP if caller only wants SH —
         // tip logger samples strong/tip separately. Leave STRONG/TIP alone here.
         let _ = SCRIPTHASH_NS.swap(0, Ordering::Relaxed);
         TipShSnap {
-            filter_ns,
             collect_ns,
             sort_ns,
             seed_ns,
@@ -1247,7 +1240,7 @@ impl Query {
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
         }
-        q.recover_sh_writebehind();
+        q.recover_sh_writebehind()?;
         Ok(q)
     }
 
@@ -2556,6 +2549,84 @@ mod tests {
         (header, ta)
     }
 
+    fn rehash_header(h: &mut HeaderRecord, parent_hash: &[u8; 32]) {
+        h.hash = rbitcoin_store::block_header_hash(
+            h.version,
+            parent_hash,
+            &h.merkle_root,
+            h.timestamp,
+            h.bits,
+            h.nonce,
+        );
+    }
+
+    fn replace_tip_same_height(
+        q: &Query,
+        height: u32,
+        prev_fk: Fk,
+        parent_hash: [u8; 32],
+        nonce_delta: u32,
+    ) -> (HeaderRecord, TxApply) {
+        q.disconnect_tip().unwrap();
+        let (mut h, t) = coinbase_block(height, prev_fk, Some(parent_hash));
+        h.nonce = h.nonce.wrapping_add(nonce_delta);
+        rehash_header(&mut h, &parent_hash);
+        q.connect_block(Height(height), &h, &[t.clone()]).unwrap();
+        (h, t)
+    }
+
+    fn funded_op_true_coinbase(
+        h: u32,
+        prev: Fk,
+        parent_hash: Option<[u8; 32]>,
+    ) -> (HeaderRecord, TxApply) {
+        let (hdr, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
+        (hdr, ta)
+    }
+
+    fn spend_op_true(
+        hfk0: Fk,
+        hash0: [u8; 32],
+        create_fk: Fk,
+        create_txid: [u8; 32],
+    ) -> (HeaderRecord, TxApply, [u8; 32]) {
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let hash1 = rbitcoin_store::block_header_hash(1, &hash0, &[0x11; 32], 2, 0x207fffff, 1);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: [0x11; 32],
+            hash: hash1,
+        };
+        let spend = TxApply {
+            tx: TxRecord {
+                txid: spend_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: create_txid,
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
+        };
+        (h1, spend, spend_txid)
+    }
+
     #[test]
     fn sampler_stats() {
         // Process-global IBD samplers race under parallel `cargo test`. Prefer
@@ -2632,7 +2703,7 @@ mod tests {
         // class_c counters are process-global; exercise the APIs without exact
         // equality (parallel tests may sample/reset between).
         class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
-        class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);
+        class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_COLLECT_NS, 5);
         class_c_phase_stats::TIP_NS.store(3, AtomicOrdering::Relaxed);
         let _ = class_c_phase_stats::sample_and_reset();
         let _ = class_c_phase_stats::sample_sh_sub_and_reset();
@@ -2689,6 +2760,11 @@ mod tests {
     fn chain_view_pin_none_on_empty_store() {
         let (dir, q) = temp_query("chain-view-empty");
         assert!(q.pin_chain_view().unwrap().is_none());
+        assert!(q.pin_view(ChainViewKind::Tip, None).unwrap().is_none());
+        assert!(q
+            .pin_view(ChainViewKind::ScriptHash, None)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2703,6 +2779,7 @@ mod tests {
         assert_eq!(genesis.height, Height(0));
         assert_eq!(genesis.hash, hash0);
         assert!(genesis.still_live(&q).unwrap());
+        assert_eq!(q.pin_view(ChainViewKind::Tip, None).unwrap(), Some(genesis));
 
         let prev_fk = q.tip_header_fk().unwrap().unwrap();
         let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
@@ -2724,17 +2801,9 @@ mod tests {
         );
         assert!(genesis.still_live(&q).unwrap());
 
-        let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+        let (mut h1b, t1b) = coinbase_block(1, prev_fk, Some(hash0));
         h1b.nonce = h1.nonce.wrapping_add(1);
-        h1b.hash = rbitcoin_store::block_header_hash(
-            h1b.version,
-            &hash0,
-            &h1b.merkle_root,
-            h1b.timestamp,
-            h1b.bits,
-            h1b.nonce,
-        );
-        let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+        rehash_header(&mut h1b, &hash0);
         q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
         assert_ne!(h1b.hash, tip1.hash);
         assert!(
@@ -2795,52 +2864,16 @@ mod tests {
     #[test]
     fn chain_view_at_spend_asof_hides_later_spend() {
         let (dir, q) = temp_query("chain-view-asof-spend");
-        let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
-        ta0.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
+        let (h0, ta0) = funded_op_true_coinbase(0, Fk::NULL, None);
         let create_txid = ta0.tx.txid;
         let hash0 = h0.hash;
         let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
         let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
         let view0 = q.pin_chain_view_at(&hash0).unwrap().unwrap();
 
-        let mut spend_txid = [0u8; 32];
-        spend_txid[0] = 0x11;
-        spend_txid[31] = 0xcd;
-        let hash1 = rbitcoin_store::block_header_hash(1, &hash0, &[0x11; 32], 2, 0x207fffff, 1);
-        let h1 = HeaderRecord {
-            prev_fk: hfk0,
-            version: 1,
-            timestamp: 2,
-            bits: 0x207fffff,
-            nonce: 1,
-            merkle_root: [0x11; 32],
-            hash: hash1,
-        };
-        q.connect_block(
-            Height(1),
-            &h1,
-            &[TxApply {
-                tx: TxRecord {
-                    txid: spend_txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 1,
-                    output_start_fk: Fk::NULL,
-                    output_count: 1,
-                },
-                inputs: vec![InputRecord {
-                    prev_txid: create_txid,
-                    create_fk,
-                    prev_index: 0,
-                    sequence: u32::MAX,
-                    script_sig: vec![],
-                    witness: vec![],
-                }],
-                outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
-            }],
-        )
-        .unwrap();
+        let (h1, spend, _spend_txid) = spend_op_true(hfk0, hash0, create_fk, create_txid);
+        let hash1 = h1.hash;
+        q.connect_block(Height(1), &h1, &[spend]).unwrap();
         let view1 = q.pin_chain_view_at(&hash1).unwrap().unwrap();
         let sh = script_hash(&[0x51]);
 
@@ -2905,17 +2938,9 @@ mod tests {
         );
 
         q.disconnect_tip().unwrap();
-        let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
+        let (mut h1b, mut t1b) = coinbase_block(1, prev_fk, Some(hash0));
         h1b.nonce = h1.nonce.wrapping_add(1);
-        h1b.hash = rbitcoin_store::block_header_hash(
-            h1b.version,
-            &hash0,
-            &h1b.merkle_root,
-            h1b.timestamp,
-            h1b.bits,
-            h1b.nonce,
-        );
-        let mut t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
+        rehash_header(&mut h1b, &hash0);
         t1b.tx.txid[5] = 0xbb;
         let txid_b = t1b.tx.txid;
         q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
@@ -2950,19 +2975,7 @@ mod tests {
             .run_at_chain_view(|view| {
                 calls += 1;
                 if calls == 1 {
-                    q.disconnect_tip().unwrap();
-                    let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
-                    h1b.nonce = h1.nonce.wrapping_add(7);
-                    h1b.hash = rbitcoin_store::block_header_hash(
-                        h1b.version,
-                        &hash0,
-                        &h1b.merkle_root,
-                        h1b.timestamp,
-                        h1b.bits,
-                        h1b.nonce,
-                    );
-                    let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
-                    q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+                    replace_tip_same_height(&q, 1, prev_fk, hash0, 7);
                     assert!(!view.still_live(&q).unwrap());
                 }
                 Ok(calls)
@@ -2984,23 +2997,11 @@ mod tests {
         let prev_fk = q.tip_header_fk().unwrap().unwrap();
         let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
         q.connect_block(Height(1), &h1, &[t1]).unwrap();
-        let mut nonce = h1.nonce;
+        let mut delta = 0u32;
         let err = q
             .run_at_chain_view(|_view| {
-                q.disconnect_tip().unwrap();
-                nonce = nonce.wrapping_add(1);
-                let mut h1b = coinbase_block(1, prev_fk, Some(hash0)).0;
-                h1b.nonce = nonce;
-                h1b.hash = rbitcoin_store::block_header_hash(
-                    h1b.version,
-                    &hash0,
-                    &h1b.merkle_root,
-                    h1b.timestamp,
-                    h1b.bits,
-                    h1b.nonce,
-                );
-                let t1b = coinbase_block(1, prev_fk, Some(hash0)).1;
-                q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+                delta += 1;
+                replace_tip_same_height(&q, 1, prev_fk, hash0, delta);
                 Ok(())
             })
             .unwrap_err();
@@ -3098,19 +3099,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `apply_sh_pending` must wait out an in-flight job (worker vs generate drain).
     #[test]
-    fn sh_writebehind_recover_requeues_unapplied_heights() {
-        let (dir, q) = temp_query("sh-wb-recover");
+    fn apply_sh_pending_waits_for_in_flight_job() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("apply-sh-wait-inflight");
+        let q = Arc::new(q);
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+        assert_eq!(q.sh_indexed_through_height(), None);
+
+        let stolen = q.take_sh_job_for_apply().expect("enqueued genesis");
+        let height = Height(0);
+        let q_apply = Arc::clone(&q);
+        let done = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            q_apply.apply_sh_job(stolen).unwrap();
+            q_apply.finish_sh_job(height);
+        });
+        q.apply_sh_pending().unwrap();
+        assert_eq!(
+            q.sh_indexed_through_height(),
+            Some(0),
+            "drain must wait until the in-flight job is watermarked"
+        );
+        done.join().unwrap();
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_sh_pending_two_drainers_cover_both_heights() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("apply-sh-two-drainers");
+        let q = Arc::new(q);
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.commit_class_a_only(&h0, &[t0]).unwrap();
+        q.confirm_block(Height(0), &h0.hash).unwrap();
+        let prev = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev, Some(hash0));
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        q.confirm_block(Height(1), &h1.hash).unwrap();
+
+        let a = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.apply_sh_pending())
+        };
+        let b = {
+            let q = Arc::clone(&q);
+            std::thread::spawn(move || q.apply_sh_pending())
+        };
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+        let sh = script_hash(&[0x51]);
+        assert_eq!(q.scripthash_history(&sh).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_sh_job_skips_stale_job_after_same_height_replace() {
+        let (dir, q) = temp_query("sh-stale-job");
         let (h0, t0) = coinbase_block(0, Fk::NULL, None);
         let hash0 = h0.hash;
         q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev = q.tip_header_fk().unwrap().unwrap();
+
+        let (h1a, mut t1a) = coinbase_block(1, prev, Some(hash0));
+        t1a.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0xaa])];
+        q.commit_class_a_only(&h1a, &[t1a]).unwrap();
+        q.confirm_block(Height(1), &h1a.hash).unwrap();
+        let stolen = q.take_sh_job_for_apply().expect("old branch job");
+
+        q.disconnect_tip().unwrap();
+        let (mut h1b, mut t1b) = coinbase_block(1, prev, Some(hash0));
+        h1b.nonce = h1a.nonce.wrapping_add(1);
+        rehash_header(&mut h1b, &hash0);
+        t1b.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0xbb])];
+        t1b.tx.txid[30] = 0xbb;
+        q.commit_class_a_only(&h1b, &[t1b]).unwrap();
+        q.confirm_block(Height(1), &h1b.hash).unwrap();
+
+        q.apply_sh_job(stolen).unwrap();
+        q.finish_sh_job(Height(1));
+        q.apply_sh_pending().unwrap();
+
+        let sh_old = script_hash(&[0xaa]);
+        let sh_new = script_hash(&[0xbb]);
+        assert!(
+            q.scripthash_history(&sh_old).unwrap().is_empty(),
+            "stale branch creates must not seed the durable index"
+        );
+        assert_eq!(q.scripthash_history(&sh_new).unwrap().len(), 1);
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disconnect_tip_waits_for_sh_appender() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let (dir, q) = temp_query("sh-disconnect-lock");
+        let q = Arc::new(q);
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+
+        let held = Arc::new(AtomicBool::new(false));
+        let q_hold = Arc::clone(&q);
+        let held_flag = Arc::clone(&held);
+        let holder = std::thread::spawn(move || {
+            let _g = q_hold.sh_appender.lock().unwrap();
+            held_flag.store(true, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        });
+        while !held.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let t0 = std::time::Instant::now();
+        q.disconnect_tip().unwrap();
+        let waited = t0.elapsed();
+        holder.join().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(20),
+            "disconnect must take sh_appender, waited {waited:?}"
+        );
+        assert!(q.tip_height().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sh_writebehind_recover_requeues_unapplied_heights() {
+        let (dir, q) = temp_query("sh-wb-recover");
+        let (mut h0, t0) = coinbase_block(0, Fk::NULL, None);
+        h0.merkle_root = t0.tx.txid;
+        h0.hash = rbitcoin_store::block_header_hash(
+            h0.version,
+            &[0u8; 32],
+            &h0.merkle_root,
+            h0.timestamp,
+            h0.bits,
+            h0.nonce,
+        );
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
         let prev_fk = q.tip_header_fk().unwrap().unwrap();
-        let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        let (mut h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
+        h1.merkle_root = t1.tx.txid;
+        rehash_header(&mut h1, &hash0);
         q.commit_class_a_only(&h1, &[t1]).unwrap();
         q.confirm_block(Height(1), &h1.hash).unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(0));
-        q.sh_pending.lock().unwrap().clear();
-        q.recover_sh_writebehind();
+        q.store().flush_class_c_tip().unwrap();
+        drop(q);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
         assert_eq!(q.sh_indexed_through_height(), Some(0));
         let sh = script_hash(&[0x51]);
         assert_eq!(
@@ -3125,13 +3273,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn recover_sh_writebehind_fails_open_on_interior_missing_header_txs() {
+        let (dir, q) = temp_query("sh-wb-recover-corrupt");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev0 = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
+        let hash1 = h1.hash;
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        let hfk1 = q.confirm_block(Height(1), &hash1).unwrap();
+        let (h2, t2) = coinbase_block(2, hfk1, Some(hash1));
+        q.commit_class_a_only(&h2, &[t2]).unwrap();
+        q.confirm_block(Height(2), &h2.hash).unwrap();
+        assert!(q.store().header_txs.clear_body(hfk1).unwrap());
+        let err = q.recover_sh_writebehind().expect_err("interior hole");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant:") || msg.contains("missing"),
+            "expected invariant/missing body, got {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_sh_writebehind_skips_bodyless_structural_tip() {
+        let (dir, q) = temp_query("sh-wb-recover-tip-nobody");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev0 = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
+        q.commit_class_a_only(&h1, &[t1]).unwrap();
+        let hfk1 = q.confirm_block(Height(1), &h1.hash).unwrap();
+        let _stolen = q.take_sh_job_for_apply().expect("height-1 job");
+        q.finish_sh_job(Height(1));
+        assert_eq!(q.tip_height(), Some(Height(1)));
+        assert!(q.store().header_txs.clear_body(hfk1).unwrap());
+        q.recover_sh_writebehind()
+            .expect("body-less structural tip must not fail open");
+        assert_eq!(q.sh_indexed_through_height(), Some(0));
+        assert!(
+            q.sh_pending_max_height().is_none() || q.sh_pending_max_height().unwrap() < 1,
+            "body-less tip must not be re-queued"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_sh_writebehind_halt_sets_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        crate::connect::request_sh_writebehind_halt(&stop, 7, &"apply failed");
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "apply error must request process stop so the node exits"
+        );
+    }
+
     /// Pending write-behind records join at live tip so a confirmed spend is
     /// visible even though durable SH (and mempool) have already moved on.
     #[test]
     fn sh_pending_records_join_at_live_tip_before_apply() {
         let (dir, q) = temp_query("sh-pin-watermark");
-        let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
-        ta0.outputs = vec![OutputRecord::unspent(10_0000_0000, vec![0x51])];
+        let (h0, ta0) = funded_op_true_coinbase(0, Fk::NULL, None);
         let create_txid = ta0.tx.txid;
         let hash0 = h0.hash;
         let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
@@ -3140,43 +3346,9 @@ mod tests {
         assert_eq!(q.scripthash_listunspent(&sh).unwrap().len(), 1);
         assert_eq!(q.scripthash_balance(&sh).unwrap().confirmed, 10_0000_0000);
 
-        let mut spend_txid = [0u8; 32];
-        spend_txid[0] = 0x11;
-        spend_txid[31] = 0xcd;
-        let hash1 = rbitcoin_store::block_header_hash(1, &hash0, &[0x11; 32], 2, 0x207fffff, 1);
-        let h1 = HeaderRecord {
-            prev_fk: hfk0,
-            version: 1,
-            timestamp: 2,
-            bits: 0x207fffff,
-            nonce: 1,
-            merkle_root: [0x11; 32],
-            hash: hash1,
-        };
-        q.commit_class_a_only(
-            &h1,
-            &[TxApply {
-                tx: TxRecord {
-                    txid: spend_txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 1,
-                    output_start_fk: Fk::NULL,
-                    output_count: 1,
-                },
-                inputs: vec![InputRecord {
-                    prev_txid: create_txid,
-                    create_fk,
-                    prev_index: 0,
-                    sequence: u32::MAX,
-                    script_sig: vec![],
-                    witness: vec![],
-                }],
-                outputs: vec![OutputRecord::unspent(9_0000_0000, vec![0x00])],
-            }],
-        )
-        .unwrap();
+        let (h1, spend, spend_txid) = spend_op_true(hfk0, hash0, create_fk, create_txid);
+        let hash1 = h1.hash;
+        q.commit_class_a_only(&h1, &[spend]).unwrap();
         q.confirm_block(Height(1), &hash1).unwrap();
 
         assert_eq!(q.tip_height(), Some(Height(1)));

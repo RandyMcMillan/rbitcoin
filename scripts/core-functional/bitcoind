@@ -13,6 +13,7 @@ gives consecutive rpcports, so that collided across nodes).
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -37,6 +38,18 @@ def parse_kv(arg: str) -> tuple[str, str | None]:
         k, v = a.split("=", 1)
         return k, v
     return a, None
+
+
+def parse_port(raw: str | None, flag: str) -> str:
+    s = "" if raw is None else str(raw)
+    if re.fullmatch(r"[0-9]+", s) is None:
+        print(f"Error: Invalid port specified in {flag}: '{s}'", file=sys.stderr)
+        raise SystemExit(1)
+    n = int(s)
+    if n < 1 or n > 65535:
+        print(f"Error: Invalid port specified in {flag}: '{s}'", file=sys.stderr)
+        raise SystemExit(1)
+    return str(n)
 
 
 # Flags that change consensus / mempool / peers: forward to rbitcoin-node.
@@ -93,10 +106,6 @@ IGNORE_FLAGS = frozenset(
         "walletdir",
         "wallet",
         "noserver",
-        "disablewallet",
-        "blockmaxweight",
-        "blockreservedweight",
-        "stopatheight",
         # Test-only: refuse public outbound (we already --no-seeds + explicit
         # connect). Not an operator proxy implementation.
         "proxy",
@@ -127,7 +136,6 @@ IGNORE_FLAGS = frozenset(
         "checkblocks",
         # Stop-at-height is a later product; ignore so restart after the
         # future-tip check can proceed to the rest of rpc_blockchain.
-        "stopatheight",
         "rpcthreads",
     }
 )
@@ -222,7 +230,7 @@ def _more_verbose_log_level(cur: str | None, new: str) -> str | None:
 
 def _parse_bind(val: str) -> tuple[str, int | None, bool]:
     """Parse Core -bind=HOST[:PORT][=onion] → (host, port_or_None, is_onion)."""
-    onion = val.endswith("=onion") or "=onion" in val
+    onion = "=onion" in val
     hostport = val.split("=", 1)[0]
     if ":" in hostport:
         host, port_s = hostport.rsplit(":", 1)
@@ -315,20 +323,9 @@ def translate(
         elif key == "wallet":
             wallet_name = val or ""
         elif key == "rpcport":
-            rpcport = val
+            rpcport = parse_port(val, "-rpcport")
         elif key == "port":
-            raw = val if val is not None else ""
-            try:
-                n = int(raw)
-            except ValueError:
-                n = -1
-            if n < 1 or n > 65535:
-                print(
-                    f"Error: Invalid port specified in -port: '{raw}'",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1)
-            p2pport = str(n)
+            p2pport = parse_port(val, "-port")
         elif key == "bind" and val:
             host, bport, onion = _parse_bind(val)
             binds.append((host, bport, onion))
@@ -387,18 +384,13 @@ def translate(
     if conf.get("regtest") in ("1", "true"):
         network = "regtest"
     if rpcport is None:
-        rpcport = conf.get("rpcport")
+        rpcport = parse_port(conf.get("rpcport") or "18443", "-rpcport")
     if p2pport is None:
-        p2pport = conf.get("port")
-    if rpcport is None:
-        rpcport = "18443"
-    if p2pport is None:
-        p2pport = "18444"
+        p2pport = parse_port(conf.get("port") or "18444", "-port")
 
     node_dir = datadir / network
     node_dir.mkdir(parents=True, exist_ok=True)
     maybe_seed_store(node_dir)
-    import shutil
 
     mp = node_dir / "mempool"
     marker = node_dir / ".rbitcoin-nopersistmempool"

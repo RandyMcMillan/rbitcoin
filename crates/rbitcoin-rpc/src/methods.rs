@@ -1575,18 +1575,9 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     Ok(json!(out))
 }
 
-/// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
-fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["conf_target", "estimate_mode"])?;
-    // Core requires conf_target (`rpc_estimatefee.py`).
-    if params.get(0, "conf_target").is_none() {
-        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
-    }
-    if params.pos_len() > 2 {
-        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
-    }
-    let conf_v = params.get(0, "conf_target").unwrap();
-    let conf_target = match conf_v {
+/// Core `ParseConfirmTarget`: integer in `1..=1008`.
+fn parse_conf_target(v: &Value) -> Result<u32, Value> {
+    let conf_target = match v {
         Value::Number(n) => n
             .as_u64()
             .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
@@ -1606,6 +1597,26 @@ fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
             ));
         }
     };
+    if !(1..=1008).contains(&conf_target) {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "Invalid conf_target, must be between 1 and 1008",
+        ));
+    }
+    Ok(conf_target)
+}
+
+/// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
+fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["conf_target", "estimate_mode"])?;
+    // Core requires conf_target (`rpc_estimatefee.py`).
+    if params.get(0, "conf_target").is_none() {
+        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
+    }
+    if params.pos_len() > 2 {
+        return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
+    }
+    let conf_target = parse_conf_target(params.get(0, "conf_target").unwrap())?;
     if let Some(mode_v) = params.get(1, "estimate_mode") {
         if !matches!(mode_v, Value::Null) {
             let mode = mode_v.as_str().ok_or_else(|| {
@@ -1641,33 +1652,7 @@ fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> 
     if params.pos_len() > 2 {
         return Err(rpc_error(ERR_MISC, method_help("estimaterawfee")));
     }
-    let conf_v = params.get(0, "conf_target").unwrap();
-    let conf_target = match conf_v {
-        Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
-            .ok_or_else(|| {
-                rpc_error(
-                    ERR_TYPE_ERROR,
-                    "JSON value of type number is not of expected type number",
-                )
-            })? as u32,
-        other => {
-            return Err(rpc_error(
-                ERR_TYPE_ERROR,
-                format!(
-                    "JSON value of type {} is not of expected type number",
-                    json_type_name(other)
-                ),
-            ));
-        }
-    };
-    if !(1..=1008).contains(&conf_target) {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "Invalid conf_target, must be between 1 and 1008",
-        ));
-    }
+    let conf_target = parse_conf_target(params.get(0, "conf_target").unwrap())?;
     if let Some(th) = params.get(1, "threshold") {
         if !matches!(th, Value::Null) && json_u64(th).is_none() && th.as_f64().is_none() {
             return Err(rpc_error(
@@ -1861,17 +1846,10 @@ fn generate_with_mempool(
         .generate_to_script(nblocks, script, extras.clone())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
     drain_mempool(ctx, &extras);
-    drain_sh_after_generate(ctx);
     if let Some(c) = ctx.chain.as_ref() {
         c.note_gbt_assembled();
     }
     Ok(hashes_json(&hashes))
-}
-
-fn drain_sh_after_generate(ctx: &RpcContext) {
-    if let Err(e) = ctx.query.apply_sh_pending() {
-        rbitcoin_log::warn!("rpc: SH write-behind drain after generate: {e}");
-    }
 }
 
 fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -1948,7 +1926,6 @@ fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     let hashes = miner
         .generate_to_script(1, script, extra)
         .map_err(|e| generateblock_validity_error(&e))?;
-    drain_sh_after_generate(ctx);
     let hash = hashes
         .first()
         .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
@@ -2419,51 +2396,38 @@ fn waitforblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["blockhash", "timeout"])?;
     let want = params.req_str(0, "blockhash")?.to_string();
     let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        let (hash, height) = tip_hash_height(ctx)?;
-        if hash == want {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        if Instant::now() >= deadline {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_for_tip(ctx, timeout_ms, |hash, _height| hash == want)
 }
 
 fn waitforblockheight(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["height", "timeout"])?;
     let want = params.req_u64(0, "height")? as u32;
     let timeout_ms = wait_timeout_ms(params, 1, "timeout")?;
-    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        let (hash, height) = tip_hash_height(ctx)?;
-        if height >= want {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        if Instant::now() >= deadline {
-            return Ok(json!({ "hash": hash, "height": height }));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    wait_for_tip(ctx, timeout_ms, |_hash, height| height >= want)
 }
 
 fn waitfornewblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["timeout"])?;
     let timeout_ms = wait_timeout_ms(params, 0, "timeout")?;
     let (start_hash, _) = tip_hash_height(ctx)?;
+    wait_for_tip(ctx, timeout_ms, |hash, _height| hash != start_hash)
+}
+
+/// `feature_shutdown.py`: stop must wake waiters so in-flight wait RPCs
+/// return the current tip instead of hanging until the connection drops.
+fn wait_for_tip(
+    ctx: &RpcContext,
+    timeout_ms: u64,
+    pred: impl Fn(&str, u32) -> bool,
+) -> Result<Value, Value> {
     let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        // `feature_shutdown.py`: stop must wake waiters so the in-flight
-        // waitfornewblock returns tip height 0 instead of hanging until
-        // the connection drops with a warm-up -28.
         if ctx.stop.load(Ordering::SeqCst) {
             let (hash, height) = tip_hash_height(ctx)?;
             return Ok(json!({ "hash": hash, "height": height }));
         }
         let (hash, height) = tip_hash_height(ctx)?;
-        if hash != start_hash {
+        if pred(&hash, height) {
             return Ok(json!({ "hash": hash, "height": height }));
         }
         if Instant::now() >= deadline {
@@ -2772,7 +2736,7 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         .iter()
         .map(|tx| tx.compute_wtxid().to_byte_array())
         .collect();
-    let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids);
+    let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
     Ok(json!({
         "capabilities": ["proposal"],
         "version": ctx

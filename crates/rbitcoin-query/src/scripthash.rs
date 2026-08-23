@@ -802,13 +802,24 @@ impl Query {
             *slot = None;
             return Ok(Vec::new());
         };
+        self.scripthash_history_filtered_slot_in(scripthash, filter, slot, &view)
+    }
+
+    /// Slot-aware history at a caller-pinned view.
+    pub fn scripthash_history_filtered_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
         let hit = slot
             .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, &view));
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
         if !hit && filter.to_height.is_some() {
-            return self.scripthash_history_filtered_in(scripthash, filter, &view);
+            return self.scripthash_history_filtered_in(scripthash, filter, view);
         }
-        self.ensure_sh_join_slot_in(scripthash, slot, &view)?;
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
         let recs = &mut slot
             .as_mut()
             .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
@@ -907,6 +918,24 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<ScriptHashBalance, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
+        self.scripthash_balance_from_slot(slot)
+    }
+
+    /// Slot-aware [`Self::scripthash_balance`] at a caller-pinned view.
+    pub fn scripthash_balance_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<ScriptHashBalance, QueryError> {
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        self.scripthash_balance_from_slot(slot)
+    }
+
+    fn scripthash_balance_from_slot(
+        &self,
+        slot: &Option<ShJoinSlot>,
+    ) -> Result<ScriptHashBalance, QueryError> {
         let Some(recs) = slot.as_ref() else {
             return Ok(ScriptHashBalance {
                 confirmed: 0,
@@ -997,6 +1026,24 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         self.ensure_sh_join_slot(scripthash, slot)?;
+        self.scripthash_listunspent_from_slot(slot)
+    }
+
+    /// Slot-aware [`Self::scripthash_listunspent`] at a caller-pinned view.
+    pub fn scripthash_listunspent_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        self.scripthash_listunspent_from_slot(slot)
+    }
+
+    fn scripthash_listunspent_from_slot(
+        &self,
+        slot: &mut Option<ShJoinSlot>,
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let Some(recs) = slot.as_mut() else {
             return Ok(Vec::new());
         };

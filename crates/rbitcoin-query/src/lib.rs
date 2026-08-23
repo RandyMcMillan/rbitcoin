@@ -150,7 +150,7 @@ pub use batch_parents::{
     SharedParentPin, U32Map, U64IdentityHasher, U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
-pub use chain_view::ChainView;
+pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
@@ -2689,6 +2689,11 @@ mod tests {
     fn chain_view_pin_none_on_empty_store() {
         let (dir, q) = temp_query("chain-view-empty");
         assert!(q.pin_chain_view().unwrap().is_none());
+        assert!(q.pin_view(ChainViewKind::Tip, None).unwrap().is_none());
+        assert!(q
+            .pin_view(ChainViewKind::ScriptHash, None)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2703,6 +2708,7 @@ mod tests {
         assert_eq!(genesis.height, Height(0));
         assert_eq!(genesis.hash, hash0);
         assert!(genesis.still_live(&q).unwrap());
+        assert_eq!(q.pin_view(ChainViewKind::Tip, None).unwrap(), Some(genesis));
 
         let prev_fk = q.tip_header_fk().unwrap().unwrap();
         let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));

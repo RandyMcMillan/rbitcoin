@@ -23,6 +23,13 @@ impl ChainView {
     }
 }
 
+/// Which published prefix a confirmed-tx read pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainViewKind {
+    Tip,
+    ScriptHash,
+}
+
 impl Query {
     /// Capture the published tip as a [`ChainView`], or `None` if the chain is empty.
     pub fn pin_chain_view(&self) -> Result<Option<ChainView>, QueryError> {
@@ -55,13 +62,27 @@ impl Query {
         let Some(view) = self.pin_chain_view_at(hash)? else {
             return Ok(None);
         };
-        let Some(sh) = self.pin_sh_chain_view()? else {
+        let Some(max_h) = self.sh_visible_through_height() else {
             return Ok(None);
         };
-        if view.height.0 > sh.height.0 {
+        if view.height.0 > max_h {
             return Ok(None);
         }
         Ok(Some(view))
+    }
+
+    /// Pin live tip, visible SH, or a still-live ancestor (`asof`).
+    pub fn pin_view(
+        &self,
+        kind: ChainViewKind,
+        asof: Option<&[u8; 32]>,
+    ) -> Result<Option<ChainView>, QueryError> {
+        match (kind, asof) {
+            (ChainViewKind::Tip, None) => self.pin_chain_view(),
+            (ChainViewKind::Tip, Some(h)) => self.pin_chain_view_at(h),
+            (ChainViewKind::ScriptHash, None) => self.pin_sh_chain_view(),
+            (ChainViewKind::ScriptHash, Some(h)) => self.pin_sh_chain_view_at(h),
+        }
     }
 
     /// Confirmed heights strictly above the SH watermark (`0` when caught up).
@@ -97,13 +118,25 @@ impl Query {
     ///
     /// Bound is 8. Empty chain is [`StoreError::NotFound`]. A pin that never
     /// stays live is [`StoreError::Stale`], not corruption.
-    pub fn run_at_chain_view<T, F>(&self, mut f: F) -> Result<(ChainView, T), QueryError>
+    pub fn run_at_chain_view<T, F>(&self, f: F) -> Result<(ChainView, T), QueryError>
+    where
+        F: FnMut(&ChainView) -> Result<T, QueryError>,
+    {
+        self.run_at_view(ChainViewKind::Tip, f)
+    }
+
+    /// Pin by [`ChainViewKind`], run `f`, retry while that pin stays published.
+    pub fn run_at_view<T, F>(
+        &self,
+        kind: ChainViewKind,
+        mut f: F,
+    ) -> Result<(ChainView, T), QueryError>
     where
         F: FnMut(&ChainView) -> Result<T, QueryError>,
     {
         const BOUND: u32 = 8;
         for _ in 0..BOUND {
-            let Some(view) = self.pin_chain_view()? else {
+            let Some(view) = self.pin_view(kind, None)? else {
                 return Err(StoreError::NotFound);
             };
             let out = f(&view)?;

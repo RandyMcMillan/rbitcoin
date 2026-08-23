@@ -265,15 +265,8 @@ impl Query {
 
     /// Durable watermark plus pending jobs (RAM records already collected).
     pub(crate) fn sh_visible_through_height(&self) -> Option<u32> {
-        match (
-            self.sh_indexed_through_height(),
-            self.sh_pending_max_height(),
-        ) {
-            (None, None) => None,
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (Some(a), Some(b)) => Some(a.max(b)),
-        }
+        self.sh_indexed_through_height()
+            .max(self.sh_pending_max_height())
     }
 
     /// Apply queued SH write-behind jobs in height order (one Class B appender).

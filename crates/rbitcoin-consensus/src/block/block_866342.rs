@@ -5,15 +5,15 @@
 
 #![cfg(test)]
 
-use super::{
-    merkle_root_bytes, validate_block_structure_hashed, ScriptCheckJob, ValidationContext,
-};
+use super::{validate_block_structure_hashed, ScriptCheckJob, ValidationContext};
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
 use crate::params::ChainParams;
+use crate::script::core_script::decode_hex;
+use crate::witness_commitment_script;
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::deserialize;
-use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::hashes::Hash;
 use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
@@ -49,15 +49,6 @@ fn load_block() -> Block {
     deserialize(&raw).expect("block 866342 wire")
 }
 
-fn decode_hex(s: &str) -> Vec<u8> {
-    let h = s.trim();
-    assert!(h.len().is_multiple_of(2), "odd hex");
-    (0..h.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("hex"))
-        .collect()
-}
-
 fn prevouts_from_json_zst(path: &Path) -> Vec<TxOut> {
     let bytes = decode_zstd(path);
     let v: Value = serde_json::from_slice(&bytes).expect("spent_utxos json");
@@ -66,7 +57,7 @@ fn prevouts_from_json_zst(path: &Path) -> Vec<TxOut> {
         .map(|u| {
             let txout = &u["txout"];
             let sats = txout["value"].as_u64().expect("value sats");
-            let spk = decode_hex(txout["script_pubkey"].as_str().expect("spk"));
+            let spk = decode_hex(txout["script_pubkey"].as_str().expect("spk")).expect("spk hex");
             TxOut {
                 value: Amount::from_sat(sats),
                 script_pubkey: ScriptBuf::from_bytes(spk),
@@ -78,41 +69,6 @@ fn prevouts_from_json_zst(path: &Path) -> Vec<TxOut> {
 fn ctx() -> ValidationContext<'static> {
     let params = Box::leak(Box::new(ChainParams::mainnet()));
     ValidationContext::at(params, Height(HEIGHT), Milestone::NONE)
-}
-
-fn patch_witness_commitment(block: &mut Block) {
-    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    let reserved = {
-        let w = block.txdata[0].input[0]
-            .witness
-            .nth(0)
-            .expect("coinbase reserved");
-        let mut a = [0u8; 32];
-        a.copy_from_slice(w);
-        a
-    };
-    let mut leaves = vec![[0u8; 32]];
-    for tx in block.txdata.iter().skip(1) {
-        leaves.push(tx.compute_wtxid().to_byte_array());
-    }
-    let witness_root = merkle_root_bytes(&leaves);
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(&witness_root);
-    buf[32..].copy_from_slice(&reserved);
-    let hash = sha256d::Hash::hash(&buf);
-    let pos = block.txdata[0]
-        .output
-        .iter()
-        .rposition(|o| {
-            let b = o.script_pubkey.as_bytes();
-            b.len() >= 38 && b[..6] == MAGIC
-        })
-        .expect("witness commitment");
-    let mut spk = Vec::with_capacity(38);
-    spk.extend_from_slice(&MAGIC);
-    spk.extend_from_slice(&hash.to_byte_array());
-    block.txdata[0].output[pos].script_pubkey = ScriptBuf::from_bytes(spk);
-    block.header.merkle_root = block.compute_merkle_root().expect("merkle");
 }
 
 fn oversized_866342(mut block: Block) -> Block {
@@ -134,7 +90,32 @@ fn oversized_866342(mut block: Block) -> Block {
         }],
     };
     block.txdata.insert(1, extra);
-    patch_witness_commitment(&mut block);
+    let reserved = {
+        let w = block.txdata[0].input[0]
+            .witness
+            .nth(0)
+            .expect("coinbase reserved");
+        let mut a = [0u8; 32];
+        a.copy_from_slice(w);
+        a
+    };
+    let wtxids = block
+        .txdata
+        .iter()
+        .skip(1)
+        .map(|tx| tx.compute_wtxid().to_byte_array());
+    let spk = witness_commitment_script(wtxids, &reserved);
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    let pos = block.txdata[0]
+        .output
+        .iter()
+        .rposition(|o| {
+            let b = o.script_pubkey.as_bytes();
+            b.len() >= 38 && b[..6] == MAGIC
+        })
+        .expect("witness commitment");
+    block.txdata[0].output[pos].script_pubkey = ScriptBuf::from_bytes(spk);
+    block.header.merkle_root = block.compute_merkle_root().expect("merkle");
     block
 }
 

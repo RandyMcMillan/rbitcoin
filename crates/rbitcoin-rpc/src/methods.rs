@@ -2736,7 +2736,7 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         .iter()
         .map(|tx| tx.compute_wtxid().to_byte_array())
         .collect();
-    let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids);
+    let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
     Ok(json!({
         "capabilities": ["proposal"],
         "version": ctx

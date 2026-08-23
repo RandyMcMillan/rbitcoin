@@ -9,23 +9,12 @@
 
 use crate::block::ScriptCheckJob;
 use crate::script;
+use crate::script::core_script::decode_hex;
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::deserialize;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use serde_json::Value;
 use std::fs;
-
-fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
-    let h = s.trim();
-    if !h.len().is_multiple_of(2) {
-        return Err(format!("odd hex len {}", h.len()));
-    }
-    let mut out = Vec::with_capacity(h.len() / 2);
-    for i in (0..h.len()).step_by(2) {
-        out.push(u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| e.to_string())?);
-    }
-    Ok(out)
-}
 
 fn load_root() -> Value {
     let path = super::core_fixture::stage_core_json("bip341_wallet_vectors.json");
@@ -122,6 +111,7 @@ fn core_bip341_wallet_vectors_all_rows() {
     let mut total = 0u32;
     let mut pass = 0u32;
     let mut fail = 0u32;
+    let mut unknown_leaf = 0u32;
     let mut failures = Vec::new();
 
     let key_path = root
@@ -234,6 +224,7 @@ fn core_bip341_wallet_vectors_all_rows() {
             if lv == 0xc0 {
                 continue;
             }
+            unknown_leaf += 1;
             total += 1;
             let Some(cb) = cbs.get(id).and_then(Value::as_str) else {
                 fail += 1;
@@ -250,11 +241,17 @@ fn core_bip341_wallet_vectors_all_rows() {
         }
     }
 
-    eprintln!("core bip341 wallet: total={total} pass={pass} fail={fail}");
+    eprintln!(
+        "core bip341 wallet: total={total} pass={pass} fail={fail} unknown_leaf={unknown_leaf}"
+    );
     for f in &failures {
         eprintln!("  FAIL {f}");
     }
     assert!(total > 5, "expected several BIP341 spends, total={total}");
+    assert!(
+        unknown_leaf >= 1,
+        "expected at least one unknown-leaf script-path row, unknown_leaf={unknown_leaf}"
+    );
     assert_eq!(fail, 0, "bip341_wallet_vectors.json failures: {fail}");
     assert_eq!(pass, total);
 }

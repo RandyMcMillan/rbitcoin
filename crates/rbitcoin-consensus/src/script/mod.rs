@@ -17,6 +17,8 @@ mod core_bip341;
 #[cfg(test)]
 mod core_fixture;
 #[cfg(test)]
+pub(crate) mod core_script;
+#[cfg(test)]
 mod core_sighash;
 #[cfg(test)]
 mod core_tx_vectors;

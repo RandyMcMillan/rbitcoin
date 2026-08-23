@@ -195,8 +195,28 @@ No `-u` on push (that would retarget the branch remote away from `origin`).
 | **One PR per plan** | Push more commits to the same branch. |
 | **Poll until green** | Do not walk away and call the plan done. |
 | **Done** | Required checks green **and** the PR is up for review. Do not merge unless asked. |
-| **Do not** | Force-push `master`, merge a red PR, collapse `origin` to a single URL, or skip polling because “tests passed locally.” |
+| **Do not** | Force-push `master`, merge a red PR, collapse `origin` to a single URL, skip polling because “tests passed locally,” or invent **empty commits** to poke Actions. |
 | **Workflow YAML** | App cannot push `.github/workflows/*`. Ask the operator to `git push`. |
+
+#### Retrigger CI (no empty commits)
+
+When required checks are green locally and CI only needs a re-run (flake,
+stale run, App cannot `gh run rerun`):
+
+| OK | Not OK |
+|----|--------|
+| GitHub Actions UI **Re-run failed jobs** / **Re-run all jobs** | Empty commit whose only purpose is to wake Actions |
+| `gh run rerun <id> [--failed]` when the token allows it | Noise commits (“ci: bump”, “trigger”) with no product/test change |
+| Amend the tip commit (or rebase) and **force-push the topic branch** with `--force-with-lease` over HTTPS | Force-push `master` / `main` |
+
+```bash
+# Prefer API when the App/token can write Actions:
+gh run rerun <run-id> --failed
+
+# Else: amend tip (no empty commit) and lease-force the topic branch only:
+git commit --amend --no-edit   # or fold a real fix into the tip
+git push --force-with-lease https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
+```
 
 Coverage (≥90% LCOV `LH`/`LF`) is a required CI job — see
 [`TESTING.md`](TESTING.md). If CI `coverage` fails, add a pin and push.

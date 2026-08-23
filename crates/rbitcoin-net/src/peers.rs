@@ -119,6 +119,8 @@ pub struct LivePeer {
     failed_cmpct: Mutex<HashSet<BlockHash>>,
     /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
     out_tx: Mutex<Option<mpsc::UnboundedSender<NetworkMessage>>>,
+    /// Unix seconds when this session was registered (Core `m_connected`).
+    connected_at: AtomicU64,
 }
 
 impl LivePeer {
@@ -364,6 +366,10 @@ impl LivePeer {
             })
     }
 
+    pub fn connected_at(&self) -> u64 {
+        self.connected_at.load(Ordering::Relaxed)
+    }
+
     /// Core `MaybeSendPing`: timeout first, then RPC-queued / interval probe.
     ///
     /// Never-sent peers keep `ping_start_secs == 0`, so any `now_secs` above
@@ -567,6 +573,8 @@ pub struct PeerHub {
     relay_perm: AtomicBool,
     /// Parallel compact-fill slots per block: up to 2 inbound + 1 outbound.
     cmpct_fills: Mutex<HashMap<BlockHash, (u8, bool)>>,
+    /// Version nonces of outbound sessions still in handshake (Core self-connect).
+    pending_outbound_nonces: Mutex<HashSet<u64>>,
 }
 
 impl PeerHub {
@@ -583,7 +591,32 @@ impl PeerHub {
             noban: AtomicBool::new(false),
             relay_perm: AtomicBool::new(false),
             cmpct_fills: Mutex::new(HashMap::new()),
+            pending_outbound_nonces: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Core: register local version nonce while an outbound handshake is open.
+    pub fn note_outbound_nonce(&self, nonce: u64) {
+        self.pending_outbound_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(nonce);
+    }
+
+    pub fn clear_outbound_nonce(&self, nonce: u64) {
+        self.pending_outbound_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&nonce);
+    }
+
+    /// Core `CConnman::CheckIncomingNonce`: `false` means connected to self.
+    pub fn check_incoming_nonce(&self, nonce: u64) -> bool {
+        !self
+            .pending_outbound_nonces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&nonce)
     }
 
     /// BIP152: at most two inbound `getblocktxn` plus one outbound for a hash.
@@ -769,6 +802,29 @@ impl PeerHub {
         *self.dial_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
+    /// Placeholder row after TCP connect, before VERSION (Core `CNode` timing).
+    pub fn register_connecting(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        addrbind: SocketAddr,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::ServiceFlags;
+        let ver = VersionMessage {
+            version: bitcoin::p2p::PROTOCOL_VERSION,
+            services: ServiceFlags::NONE,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addrbind, ServiceFlags::NONE),
+            nonce: 0,
+            user_agent: String::new(),
+            start_height: 0,
+            relay: false,
+        };
+        self.register(addr, addrbind, &ver, false, conn_type)
+    }
+
     pub fn register(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -778,7 +834,23 @@ impl PeerHub {
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.register_with_id(id, addr, addrbind, ver, inbound, conn_type)
+    }
+
+    pub fn register_with_id(
+        self: &Arc<Self>,
+        id: u64,
+        addr: SocketAddr,
+        addrbind: SocketAddr,
+        ver: &VersionMessage,
+        inbound: bool,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
+        let _ = self
+            .next_id
+            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
         let services = service_flags_u64(ver.services);
+        let connected_at = self.now_secs();
         let peer = Arc::new(LivePeer {
             id,
             addr,
@@ -819,6 +891,7 @@ impl PeerHub {
             wire_sent: Mutex::new(None),
             failed_cmpct: Mutex::new(HashSet::new()),
             out_tx: Mutex::new(None),
+            connected_at: AtomicU64::new(connected_at),
         });
         // Handshake already exchanged version + verack (+ maybe ping).
         peer.note_recv("version", 100);
@@ -1047,6 +1120,17 @@ mod tests {
         assert!(p.stop.load(Ordering::SeqCst));
         hub.unregister(0);
         assert!(hub.snapshot().is_empty());
+    }
+
+    #[test]
+    fn outbound_nonce_detects_self_connect() {
+        let hub = PeerHub::new();
+        assert!(hub.check_incoming_nonce(42));
+        hub.note_outbound_nonce(42);
+        assert!(!hub.check_incoming_nonce(42));
+        assert!(hub.check_incoming_nonce(43));
+        hub.clear_outbound_nonce(42);
+        assert!(hub.check_incoming_nonce(42));
     }
 
     #[test]

@@ -1341,6 +1341,16 @@ impl MempoolHub {
         Some(set.into_iter().collect())
     }
 
+    /// Direct in-mempool parents and children (Core `depends` / `spentby`).
+    pub fn depends_spentby(&self, txid: &Txid) -> Option<(Vec<Txid>, Vec<Txid>)> {
+        let g = self.inner.read().unwrap();
+        let e = g.graph.get(txid)?;
+        Some((
+            e.parents.iter().copied().collect(),
+            e.children.iter().copied().collect(),
+        ))
+    }
+
     /// Prefix-maximal mining chunks as `{weight, fee}` points (decreasing feerate).
     pub fn feerate_diagram(&self) -> Vec<(u64, i64)> {
         let deltas = self.fee_deltas.lock().unwrap().clone();

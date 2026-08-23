@@ -53,6 +53,9 @@ fn reject_is_mutated(reason: &str) -> bool {
         || reason.contains("wtxid count")
 }
 
+/// Core `DEFAULT_MAX_TIP_AGE` (24h).
+pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
+
 /// Thread-safe chain façade used by peer sessions.
 pub struct ChainHub {
     pub query: Arc<Query>,
@@ -100,6 +103,8 @@ pub struct ChainHub {
     gbt_assembled: AtomicBool,
     /// Core `-blockmintxfee` in sat/kvB. Default 1.
     block_min_tx_fee_sat_kvb: AtomicU64,
+    /// Core `-maxtipage` seconds. Default 24h.
+    max_tip_age_secs: AtomicU64,
     /// Block hashes we already issued getdata for (any peer).
     asked_blocks: RwLock<HashSet<BlockHash>>,
 }
@@ -147,6 +152,7 @@ impl ChainHub {
             block_version: AtomicI32::new(0),
             gbt_assembled: AtomicBool::new(false),
             block_min_tx_fee_sat_kvb: AtomicU64::new(1),
+            max_tip_age_secs: AtomicU64::new(DEFAULT_MAX_TIP_AGE_SECS),
             asked_blocks: RwLock::new(HashSet::new()),
         }
     }
@@ -196,6 +202,15 @@ impl ChainHub {
 
     pub fn block_min_tx_fee_sat_kvb(&self) -> u64 {
         self.block_min_tx_fee_sat_kvb.load(Ordering::Relaxed)
+    }
+
+    /// Core `-maxtipage` (seconds). Default [`DEFAULT_MAX_TIP_AGE_SECS`].
+    pub fn set_max_tip_age_secs(&self, secs: u64) {
+        self.max_tip_age_secs.store(secs, Ordering::Relaxed);
+    }
+
+    pub fn max_tip_age_secs(&self) -> u64 {
+        self.max_tip_age_secs.load(Ordering::Relaxed)
     }
 
     /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
@@ -300,13 +315,12 @@ impl ChainHub {
         Ok(sum_work(works.into_iter()))
     }
 
-    /// Core `nMaxTipAge` (24h): tip time vs [`Self::clock`].
+    /// Core `nMaxTipAge` (`-maxtipage`): tip time vs [`Self::clock`].
     pub fn tip_is_stale_for_ibd(&self) -> bool {
-        const MAX_TIP_AGE: u64 = 24 * 60 * 60;
         let Some(h) = self.tip_header() else {
             return true;
         };
-        self.clock.now_secs().saturating_sub(u64::from(h.time)) > MAX_TIP_AGE
+        self.clock.now_secs().saturating_sub(u64::from(h.time)) > self.max_tip_age_secs()
     }
 
     /// Attach mempool once (same Query Arc as this hub).
@@ -975,6 +989,14 @@ impl ChainHub {
         Ok(())
     }
 
+    /// Core `UpdateTime`: `max(MTP+1, GetTime())`.
+    fn generate_block_time(&self, tip_h: u32, tip_time: u32) -> u32 {
+        let now = self.clock.now_secs() as u32;
+        let mtp = rbitcoin_consensus::median_time_past(self.query.as_ref(), Height(tip_h))
+            .unwrap_or(tip_time);
+        now.max(mtp.saturating_add(1))
+    }
+
     /// Mine one block paying `script_pubkey` without connecting it.
     ///
     /// Core `generateblock … submit=false` returns the hex for `submitheader`.
@@ -991,8 +1013,7 @@ impl ChainHub {
             .tip_hash()
             .ok_or(NetError::Protocol("generate: no tip hash"))?;
         let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-        let now = self.clock.now_secs() as u32;
-        let time = tip_time.saturating_add(1).max(now);
+        let time = self.generate_block_time(tip_h, tip_time);
         Ok(mine_regtest_paying(
             prev,
             time,
@@ -1031,8 +1052,7 @@ impl ChainHub {
                 .tip_hash()
                 .ok_or(NetError::Protocol("generate: no tip hash"))?;
             let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-            let now = self.clock.now_secs() as u32;
-            let time = tip_time.saturating_add(1).max(now);
+            let time = self.generate_block_time(tip_h, tip_time);
             let txs = if i == 0 {
                 std::mem::take(&mut extras)
             } else {
@@ -2172,6 +2192,58 @@ mod tests {
             headers_download_timeout_secs(1_000_000, 0),
             1_000_000 + 900 + 2
         );
+    }
+
+    #[test]
+    fn generate_uses_mock_when_behind_tip_but_above_mtp() {
+        use bitcoin::ScriptBuf;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        // Three headers so MTP is the middle time, not the tip (len/2).
+        let mid = 1_300_000_000u32;
+        let tip_time = mid + 10_000;
+        let h1 = mine(gen, mid, 1);
+        hub.accept_block(h1.clone()).unwrap();
+        hub.accept_block(mine(h1.block_hash(), tip_time, 2))
+            .unwrap();
+        let mock = i64::from(tip_time) - 3_000;
+        assert!(mock as u32 > mid, "mock must sit above MTP");
+        hub.clock.set_mock(mock);
+        let hashes = hub
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("Core UpdateTime: mock behind tip still mines when mock > MTP");
+        assert_eq!(hashes.len(), 1);
+        let t = hub.tip_header().unwrap().time;
+        assert!(
+            t >= mock as u32 && t < tip_time,
+            "expected mock-based stamp, got {t} tip={tip_time} mock={mock}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tip_is_stale_respects_configured_max_tip_age() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let tip_time = 1_700_000_000u32;
+        hub.accept_block(mine(gen, tip_time, 1)).unwrap();
+
+        hub.set_max_tip_age_secs(3600);
+        hub.clock.set_mock(i64::from(tip_time) + 3601);
+        assert!(
+            hub.tip_is_stale_for_ibd(),
+            "tip older than configured max must be stale for IBD"
+        );
+
+        hub.clock.set_mock(i64::from(tip_time) + 3600);
+        assert!(
+            !hub.tip_is_stale_for_ibd(),
+            "tip at exactly max age must leave IBD"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

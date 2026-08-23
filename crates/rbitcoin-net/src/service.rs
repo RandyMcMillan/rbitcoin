@@ -4,7 +4,7 @@ use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
-use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta};
+use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta, HandshakePolicy};
 use crate::peer_dos::{inbound_semaphore, DEFAULT_MAX_INBOUND};
 use crate::peers::{DialRequest, LivePeer, PeerConnType, PeerHub};
 use crate::v2::{V2Reader, V2Writer};
@@ -146,7 +146,18 @@ impl P2PNode {
                         tokio::spawn(async move {
                             let _session_slot = permit;
                             let (ver, reader, writer, wire) = match connect_and_handshake(
-                                stream, magic_c, our, peer_addr, height, true, &ua,
+                                stream,
+                                magic_c,
+                                our,
+                                peer_addr,
+                                height,
+                                true,
+                                &ua,
+                                HandshakePolicy {
+                                    hub: Some(hub.as_ref()),
+                                    peers: Some(peers.as_ref()),
+                                    conn_type: PeerConnType::Inbound,
+                                },
                             )
                             .await
                             {
@@ -378,9 +389,34 @@ async fn prepare_outbound_session(
     let stream = TcpStream::connect(peer).await?;
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
-    let (ver, reader, writer, wire) =
-        connect_and_handshake(stream, magic, local, peer, height, false, &user_agent).await?;
-    let sess = peers.register(peer, bind, &ver, false, typ);
+    // Core adds CNode before VERSION. Provisional row so getpeerinfo is non-empty
+    // during handshake (p2p_handshake self-connect wait_until + assert_debug_log).
+    let provisional = peers.register_connecting(peer, bind, typ);
+    let provisional_id = provisional.id;
+    let handshake = connect_and_handshake(
+        stream,
+        magic,
+        local,
+        peer,
+        height,
+        false,
+        &user_agent,
+        HandshakePolicy {
+            hub: Some(hub.as_ref()),
+            peers: Some(peers.as_ref()),
+            conn_type: typ,
+        },
+    )
+    .await;
+    let (ver, reader, writer, wire) = match handshake {
+        Ok(x) => x,
+        Err(e) => {
+            peers.unregister(provisional_id);
+            return Err(e);
+        }
+    };
+    peers.unregister(provisional_id);
+    let sess = peers.register_with_id(provisional_id, peer, bind, &ver, false, typ);
     sess.attach_wire(wire);
     let id = sess.id;
     follow_live.fetch_add(1, Ordering::SeqCst);

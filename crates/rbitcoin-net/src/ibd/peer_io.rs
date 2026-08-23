@@ -7,7 +7,7 @@
 use crate::codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE};
 use crate::error::NetError;
 use crate::msg_decode::spawn_decode_then_with_err;
-use crate::peer::connect_and_handshake;
+use crate::peer::{connect_and_handshake, HandshakePolicy};
 use crate::v2::{read_v2_frame_with_progress, write_v2_msg_offload};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
@@ -185,6 +185,7 @@ pub(crate) async fn spawn_peer(
         tip_h.map(|h| h as i32).unwrap_or(0),
         false,
         &ua,
+        HandshakePolicy::plain(),
     )
     .await?;
     let peer_height = u32::try_from(ver.start_height).unwrap_or(0);

@@ -37,6 +37,9 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 const HEADERS_POLL_SECS: u64 = 120;
 
+/// Core `10 * AVG_ADDRESS_BROADCAST_INTERVAL` (30s) for addr-fetch lifetime.
+const ADDRFETCH_TIMEOUT_SECS: u64 = 300;
+
 /// Core `MAX_BLOCKS_TO_ANNOUNCE`: more than this on a reorg falls back to inv.
 const MAX_BLOCKS_TO_ANNOUNCE: u32 = 8;
 
@@ -107,6 +110,58 @@ pub fn local_service_flags() -> ServiceFlags {
     crate::seeds::required_seed_services()
 }
 
+/// Core `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` (~24h at 10m spacing).
+pub const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: i64 = 144;
+
+/// Core `CNode::ExpectServicesFromConn`.
+pub fn expect_services_from_conn(typ: crate::peers::PeerConnType) -> bool {
+    matches!(
+        typ,
+        crate::peers::PeerConnType::OutboundFullRelay
+            | crate::peers::PeerConnType::BlockRelay
+            | crate::peers::PeerConnType::AddrFetch
+    )
+}
+
+/// Core `PeerManagerImpl::GetDesirableServiceFlags`.
+pub fn desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> ServiceFlags {
+    if offered.has(ServiceFlags::NETWORK_LIMITED)
+        && tip_depth_blocks < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+    {
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS
+    } else {
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS
+    }
+}
+
+/// Core `PeerManagerImpl::HasAllDesirableServiceFlags`.
+pub fn has_all_desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> bool {
+    let want = desirable_service_flags(offered, tip_depth_blocks);
+    offered.has(want)
+}
+
+pub fn expected_services_disconnect_log(offered: u64, expected: u64) -> String {
+    format!("does not offer the expected services ({offered:08x} offered, {expected:08x} expected)")
+}
+
+pub fn feeler_connection_completed_log() -> &'static str {
+    "feeler connection completed"
+}
+
+pub fn connected_to_self_log(addr: impl std::fmt::Display) -> String {
+    format!("connected to self at {addr}, disconnecting")
+}
+
+/// Core `ApproximateBestBlockDepth`: `(now - tip_time) / pow_target_spacing`.
+pub fn approximate_best_block_depth(hub: &ChainHub) -> i64 {
+    let Some(h) = hub.tip_header() else {
+        return i64::MAX;
+    };
+    let spacing = hub.params.btc.pow_target_spacing.max(1) as i64;
+    let age = hub.clock.now_secs().saturating_sub(u64::from(h.time)) as i64;
+    age / spacing
+}
+
 /// Optional bookkeeping for outbound tip-follow sessions.
 #[derive(Clone, Default)]
 pub struct FollowSessionMeta {
@@ -131,6 +186,24 @@ impl Drop for LiveFollowDec {
     }
 }
 
+/// Optional hub/peers policy for VERSION checks (services + self-connect nonce).
+#[derive(Clone, Copy)]
+pub struct HandshakePolicy<'a> {
+    pub hub: Option<&'a ChainHub>,
+    pub peers: Option<&'a crate::peers::PeerHub>,
+    pub conn_type: crate::peers::PeerConnType,
+}
+
+impl HandshakePolicy<'static> {
+    pub fn plain() -> Self {
+        Self {
+            hub: None,
+            peers: None,
+            conn_type: crate::peers::PeerConnType::OutboundFullRelay,
+        }
+    }
+}
+
 /// Open BIP324 v2 transport + perform the version/verack exchange.
 ///
 /// Returns the peer's version and the encrypted read/write halves. All further
@@ -143,6 +216,7 @@ pub async fn connect_and_handshake(
     start_height: i32,
     inbound: bool,
     user_agent: &str,
+    policy: HandshakePolicy<'_>,
 ) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes), NetError> {
     let (mut reader, mut writer, wire) = open_v2(stream, magic, inbound).await?;
     let their_version = application_handshake(
@@ -154,6 +228,7 @@ pub async fn connect_and_handshake(
         start_height,
         inbound,
         user_agent,
+        policy,
     )
     .await?;
     Ok((their_version, reader, writer, wire))
@@ -193,6 +268,7 @@ pub async fn run_feeler(
             break;
         }
     }
+    rbitcoin_log::info!("{}", feeler_connection_completed_log());
     Ok(())
 }
 
@@ -206,25 +282,51 @@ async fn application_handshake(
     start_height: i32,
     inbound: bool,
     user_agent: &str,
+    policy: HandshakePolicy<'_>,
 ) -> Result<VersionMessage, NetError> {
     let services = local_service_flags();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let our_nonce = rand_nonce();
     let version = VersionMessage {
         version: OUR_PROTOCOL_VERSION.max(PROTOCOL_VERSION),
         services,
         timestamp: now,
         receiver: Address::new(&their_addr, ServiceFlags::NONE),
         sender: Address::new(&our_addr, services),
-        nonce: rand_nonce(),
+        nonce: our_nonce,
         user_agent: user_agent.to_string(),
         start_height,
         relay: true,
     };
 
+    struct OutboundNonceGuard<'a> {
+        peers: Option<&'a crate::peers::PeerHub>,
+        nonce: u64,
+        clear: bool,
+    }
+    impl Drop for OutboundNonceGuard<'_> {
+        fn drop(&mut self) {
+            if self.clear {
+                if let Some(p) = self.peers {
+                    p.clear_outbound_nonce(self.nonce);
+                }
+            }
+        }
+    }
+    let mut nonce_guard = OutboundNonceGuard {
+        peers: None,
+        nonce: our_nonce,
+        clear: false,
+    };
     if !inbound {
+        if let Some(peers) = policy.peers {
+            peers.note_outbound_nonce(our_nonce);
+            nonce_guard.peers = Some(peers);
+            nonce_guard.clear = true;
+        }
         write_v2_msg(writer, NetworkMessage::Version(version.clone())).await?;
     }
 
@@ -243,8 +345,30 @@ async fn application_handshake(
     };
 
     if inbound {
+        if let Some(peers) = policy.peers {
+            if !peers.check_incoming_nonce(their_version.nonce) {
+                rbitcoin_log::info!("{}", connected_to_self_log(their_addr));
+                return Err(NetError::Protocol("connected to self"));
+            }
+        }
         write_v2_msg(writer, NetworkMessage::Version(version)).await?;
+    } else if expect_services_from_conn(policy.conn_type) {
+        if let Some(hub) = policy.hub {
+            let depth = approximate_best_block_depth(hub);
+            if !has_all_desirable_service_flags(their_version.services, depth) {
+                let expected = desirable_service_flags(their_version.services, depth);
+                rbitcoin_log::info!(
+                    "{}",
+                    expected_services_disconnect_log(
+                        their_version.services.to_u64(),
+                        expected.to_u64()
+                    )
+                );
+                return Err(NetError::Protocol("peer missing desirable services"));
+            }
+        }
     }
+
     // BIP339: wtxidrelay MUST be sent after version and before verack when both
     // sides speak ≥70016. Late (post-verack) messages are ignored/invalid.
     if their_version.version >= 70016 {
@@ -263,6 +387,13 @@ async fn application_handshake(
                 write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
             }
             _ => {}
+        }
+    }
+
+    nonce_guard.clear = false;
+    if let Some(peers) = policy.peers {
+        if !inbound {
+            peers.clear_outbound_nonce(our_nonce);
         }
     }
 
@@ -355,6 +486,7 @@ pub async fn peer_session_with(
     });
 
     if let Some(s) = meta.session.as_ref() {
+        let _ = maybe_queue_addrfetch_getaddr(&out_tx, s);
         let _ = maybe_queue_initial_getheaders(&out_tx, hub.as_ref(), s);
     } else if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), None, true) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
@@ -397,6 +529,10 @@ pub async fn peer_session_with(
                         inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
                     }
                     if let Some(s) = session.as_ref() {
+                        if addrfetch_timed_out(s) {
+                            rbitcoin_log::debug!("addrfetch connection timeout");
+                            s.request_disconnect();
+                        }
                         match s.take_ping_action(s.clock_now()) {
                             Some(PingAction::Send { nonce }) => {
                                 let _ = queue_out(&out_tx, NetworkMessage::Ping(nonce));
@@ -500,7 +636,11 @@ pub async fn peer_session_with(
                     }
                 }
                 _ = headers_poll.tick() => {
-                    let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
+                    if !session.as_ref().is_some_and(|s| {
+                        s.conn_type == crate::peers::PeerConnType::AddrFetch
+                    }) {
+                        let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
+                    }
                 }
                 ann = async {
                     if let Some(rx) = tx_announce_rx.as_mut() {
@@ -706,6 +846,9 @@ fn maybe_queue_initial_getheaders(
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
 ) -> bool {
+    if session.conn_type == crate::peers::PeerConnType::AddrFetch {
+        return false;
+    }
     if session.is_sync_started() {
         return false;
     }
@@ -720,6 +863,22 @@ fn maybe_queue_initial_getheaders(
         let _ = queue_getheaders(out, hub, Some(session), true);
     }
     started
+}
+
+fn maybe_queue_addrfetch_getaddr(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    session: &crate::peers::LivePeer,
+) -> bool {
+    if session.conn_type != crate::peers::PeerConnType::AddrFetch {
+        return false;
+    }
+    let _ = queue_out(out, NetworkMessage::GetAddr);
+    true
+}
+
+fn addrfetch_timed_out(session: &crate::peers::LivePeer) -> bool {
+    session.conn_type == crate::peers::PeerConnType::AddrFetch
+        && session.clock_now().saturating_sub(session.connected_at()) > ADDRFETCH_TIMEOUT_SECS
 }
 
 fn queue_getheaders(
@@ -937,6 +1096,13 @@ async fn handle_peer_frame(
                 rbitcoin_log::info!("redundant version message from peer");
             }
         }
+        NetworkMessage::Verack => {
+            if let Some(s) = session {
+                rbitcoin_log::info!("ignoring redundant verack message from peer={}", s.id);
+            } else {
+                rbitcoin_log::info!("ignoring redundant verack message");
+            }
+        }
         NetworkMessage::Ping(n) => {
             if let Some(s) = session {
                 queue_due_tx_invs(hub, s, from_this_peer, out_tx);
@@ -974,9 +1140,21 @@ async fn handle_peer_frame(
         NetworkMessage::SendAddrV2 => {
             // BIP155: we advertise sendaddrv2 pre-verack; inbound advertise is enough.
         }
-        NetworkMessage::AddrV2(_) => {
-            // BIP155 payload. Invalid encodings are rejected at decode; stay
-            // connected on a well-formed (including empty-list) message.
+        NetworkMessage::Addr(list) => {
+            if session.is_some_and(|s| {
+                s.conn_type == crate::peers::PeerConnType::AddrFetch && list.len() > 1
+            }) {
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
+        }
+        NetworkMessage::AddrV2(list) => {
+            if session.is_some_and(|s| {
+                s.conn_type == crate::peers::PeerConnType::AddrFetch && list.len() > 1
+            }) {
+                punish_disconnect(ban_score, session);
+                return Ok(());
+            }
         }
         NetworkMessage::GetHeaders(gh) => {
             if gh.locator_hashes.len() > MAX_LOCATOR_SZ {

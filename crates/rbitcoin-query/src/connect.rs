@@ -597,6 +597,7 @@ impl Query {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
+        let _appender = self.sh_appender.lock().unwrap();
         self.drop_sh_pending_from(height);
         let hash = self
             .header_at_height(height)?

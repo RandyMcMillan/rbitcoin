@@ -3208,6 +3208,39 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_tip_waits_for_sh_appender() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let (dir, q) = temp_query("sh-disconnect-lock");
+        let q = Arc::new(q);
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+
+        let held = Arc::new(AtomicBool::new(false));
+        let q_hold = Arc::clone(&q);
+        let held_flag = Arc::clone(&held);
+        let holder = std::thread::spawn(move || {
+            let _g = q_hold.sh_appender.lock().unwrap();
+            held_flag.store(true, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        });
+        while !held.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let t0 = std::time::Instant::now();
+        q.disconnect_tip().unwrap();
+        let waited = t0.elapsed();
+        holder.join().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(20),
+            "disconnect must take sh_appender, waited {waited:?}"
+        );
+        assert!(q.tip_height().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sh_writebehind_recover_requeues_unapplied_heights() {
         let (dir, q) = temp_query("sh-wb-recover");
         let (h0, t0) = coinbase_block(0, Fk::NULL, None);

@@ -212,6 +212,29 @@ EOF
 assert_fail_msg "no-prune requires analog" "missing analog: p2p_ping.py" \
   python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
 
+# --- dangling core_analogs:: name ---
+cat >"$WORKDIR/inv.toml" <<'EOF'
+pin = "v31.1"
+core_commit = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+
+[[test]]
+name = "feature_help.py"
+status = "run"
+
+[[test]]
+name = "wallet_basic.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+name = "p2p_ping.py"
+status = "skip"
+reason = "rpc-missing"
+analog = "core_analogs::analog_does_not_exist"
+EOF
+assert_fail_msg "dangling core_analogs" "dangling analog: p2p_ping.py" \
+  python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"
+
 # --- happy path ---
 good_inv "$WORKDIR/inv.toml"
 assert_ok "happy path" python3 "$CHECK" --tests-dir "$TESTS" --inventory "$WORKDIR/inv.toml"

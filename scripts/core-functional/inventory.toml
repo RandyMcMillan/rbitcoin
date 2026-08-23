@@ -50,7 +50,7 @@ analog = "none (no UTXO snapshot)"
 name = "feature_assumevalid.py"
 status = "skip"
 reason = "core-log"
-analog = "core_analogs::analog_milestone_skip_below_check_above"
+analog = "core_analogs::analog_milestone_and_mempool_persist"
 
 [[test]]
 name = "feature_bind_extra.py"
@@ -473,7 +473,7 @@ analog = "follow-up: accept_package"
 name = "mempool_persist.py"
 status = "skip"
 reason = "rpc-dialect"
-analog = "core_analogs::analog_mempool_persist_reopen"
+analog = "core_analogs::analog_milestone_and_mempool_persist"
 
 [[test]]
 name = "mempool_reorg.py"

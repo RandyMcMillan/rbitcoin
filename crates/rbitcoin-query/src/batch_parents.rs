@@ -40,7 +40,7 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
+pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64Map, U64Set};
 
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
@@ -1128,7 +1128,7 @@ pub fn layout_covers_need(
 mod tests {
     use super::*;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_store::{OutputRecord, TxRecord};
+    use rbitcoin_store::{OutputRecord, TxRecord, U64IdentityHasher};
 
     fn tx(id: u8) -> TxRecord {
         let mut txid = [0u8; 32];
@@ -1441,7 +1441,7 @@ mod tests {
     /// Write/lookup structural maps depend on this for the measured CPU win.
     #[test]
     fn u64_identity_hasher_is_raw_key_and_map_roundtrips_pack_scale() {
-        // Shipped path: store identity maps re-exported here; drive U64Map API.
+        // Shipped path: store identity hasher via U64Map API.
         use std::hash::Hasher;
         let mut h = U64IdentityHasher::default();
         h.write_u64(0xdead_beef_cafe_u64);

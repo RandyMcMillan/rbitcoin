@@ -24,26 +24,30 @@ STORE_PLATFORM_FILTERS=(
   io_session_iocp
 )
 # Windows OVERLAPPED + concurrent grow can `pread short` and abort the
-# process (STATUS_STACK_BUFFER_OVERRUN). Still runs on Linux workspace.
-STORE_PLATFORM_SKIPS=(
-  concurrent_readers_during_append_and_grow
-)
+# process (STATUS_STACK_BUFFER_OVERRUN). Windows-only skip; Linux and
+# Darwin run it. CI_OS_SMOKE_UNAME overrides uname for the self-test.
+STORE_PLATFORM_SKIPS=()
+case "${CI_OS_SMOKE_UNAME:-$(uname -s)}" in
+  MINGW* | MSYS* | CYGWIN* | Windows_NT*)
+    STORE_PLATFORM_SKIPS+=(concurrent_readers_during_append_and_grow)
+    ;;
+esac
 
 if [[ "${CI_OS_SMOKE_DRY_RUN:-}" == "1" ]]; then
   echo "smoke=store-platform+node-smoke"
   echo "RBITCOIN_HEAD_SCALE=$RBITCOIN_HEAD_SCALE"
   echo "filters=${STORE_PLATFORM_FILTERS[*]}"
-  echo "skip=${STORE_PLATFORM_SKIPS[*]}"
+  echo "skip=${STORE_PLATFORM_SKIPS[*]:-}"
   exit 0
 fi
 
 skip_args=()
-for s in "${STORE_PLATFORM_SKIPS[@]}"; do
+for s in ${STORE_PLATFORM_SKIPS[@]+"${STORE_PLATFORM_SKIPS[@]}"}; do
   skip_args+=(--skip "$s")
 done
 
 for f in "${STORE_PLATFORM_FILTERS[@]}"; do
-  cargo test -p rbitcoin-store --lib -- "$f" "${skip_args[@]}"
+  cargo test -p rbitcoin-store --lib -- "$f" ${skip_args[@]+"${skip_args[@]}"}
 done
 
 cargo build -p rbitcoin-node -p rbitcoin-cli

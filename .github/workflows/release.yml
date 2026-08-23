@@ -56,6 +56,23 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
 
+      # A hand-pushed tag on the wrong commit must not publish mislabeled
+      # binaries. Same awk as scripts/release.sh cargo_workspace_version.
+      - name: Tag matches Cargo.toml workspace version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag_ver="${GITHUB_REF_NAME#v}"
+          crate_ver="$(awk '
+            /^\[workspace\.package\]$/ { p = 1; next }
+            /^\[/ { p = 0 }
+            p && /^version = "/ { gsub(/version = "|"$/, ""); print; exit }
+          ' Cargo.toml)"
+          if [[ "$tag_ver" != "$crate_ver" ]]; then
+            echo "tag v$tag_ver != Cargo.toml workspace version $crate_ver" >&2
+            exit 1
+          fi
+
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
@@ -101,8 +118,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    outputs:
-      short: ${{ steps.meta.outputs.short }}
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
@@ -127,11 +142,7 @@ jobs:
           toolchain: 1.95.0
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: windows-crt-static
-          workspaces: ". -> target/release-win"
-
+      # No build cache: cached objects must not feed shipped binaries.
       - name: Build CRT-static node + cli
         run: cargo build --release --target x86_64-pc-windows-msvc -p rbitcoin-node -p rbitcoin-cli
 
@@ -152,8 +163,6 @@ jobs:
     name: macos
     runs-on: macos-14
     timeout-minutes: 120
-    outputs:
-      short: ${{ steps.meta.outputs.short }}
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
@@ -177,11 +186,7 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: macos-aarch64
-          workspaces: ". -> target/release-darwin"
-
+      # No build cache: cached objects must not feed shipped binaries.
       - name: Build node + cli
         run: cargo build --release -p rbitcoin-node -p rbitcoin-cli
 

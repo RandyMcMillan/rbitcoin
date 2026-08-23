@@ -16,10 +16,11 @@ ROOT=""
 DRY=0
 PUSH=1
 ALLOW_BRANCH=""
+ALLOW_DIVERGED=0
 REMOTE="origin"
 
 usage() {
-  echo "usage: $0 [--dry-run] [--no-push] [--allow-branch NAME] [--remote NAME] [--root DIR]" >&2
+  echo "usage: $0 [--dry-run] [--no-push] [--allow-branch NAME] [--allow-diverged] [--remote NAME] [--root DIR]" >&2
   exit 2
 }
 
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
       ALLOW_BRANCH="$2"
       shift
       ;;
+    --allow-diverged) ALLOW_DIVERGED=1 ;;
     --remote)
       [[ $# -ge 2 ]] || usage
       REMOTE="$2"
@@ -118,11 +120,25 @@ if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
   die "local tag $tag already exists"
 fi
 if git remote get-url "$REMOTE" >/dev/null 2>&1; then
-  if git ls-remote --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
+  ls_rc=0
+  git ls-remote --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1 || ls_rc=$?
+  if [[ "$ls_rc" -eq 0 ]]; then
     die "remote $REMOTE already has $tag"
+  elif [[ "$ls_rc" -ne 2 ]]; then
+    die "git ls-remote $REMOTE refs/tags/${tag} failed (exit $ls_rc)"
   fi
 elif [[ "$DRY" -eq 0 && "$PUSH" -eq 1 ]]; then
   die "no git remote $REMOTE"
+fi
+
+if [[ "$PUSH" -eq 1 ]]; then
+  git fetch "$REMOTE" "+refs/heads/master:refs/remotes/${REMOTE}/master" \
+    || die "git fetch $REMOTE master failed"
+  remote_master="$(git rev-parse "refs/remotes/${REMOTE}/master")"
+  head="$(git rev-parse HEAD)"
+  if [[ "$head" != "$remote_master" && "$ALLOW_DIVERGED" -ne 1 ]]; then
+    die "HEAD is not ${REMOTE}/master ($head vs $remote_master); pass --allow-diverged"
+  fi
 fi
 
 echo "release: version=$ver tag=$tag branch=$branch dry=$DRY push=$PUSH"

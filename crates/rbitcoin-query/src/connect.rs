@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 #[derive(Clone)]
 pub(crate) struct ShPendingJob {
     height: Height,
+    header_fk: Fk,
     records: Vec<ScriptHashRecord>,
 }
 
@@ -200,6 +201,7 @@ impl Query {
             );
             jobs.push(ShPendingJob {
                 height: item.height,
+                header_fk: item.header_fk,
                 records,
             });
         }
@@ -325,7 +327,7 @@ impl Query {
         {
             return Ok(());
         }
-        if self.store.confirmed.get(job.height)?.is_none() {
+        if self.store.confirmed.get(job.height)? != Some(job.header_fk) {
             return Ok(());
         }
 

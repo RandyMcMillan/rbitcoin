@@ -3162,6 +3162,52 @@ mod tests {
     }
 
     #[test]
+    fn apply_sh_job_skips_stale_job_after_same_height_replace() {
+        let (dir, q) = temp_query("sh-stale-job");
+        let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let prev = q.tip_header_fk().unwrap().unwrap();
+
+        let (h1a, mut t1a) = coinbase_block(1, prev, Some(hash0));
+        t1a.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0xaa])];
+        q.commit_class_a_only(&h1a, &[t1a]).unwrap();
+        q.confirm_block(Height(1), &h1a.hash).unwrap();
+        let stolen = q.take_sh_job_for_apply().expect("old branch job");
+
+        q.disconnect_tip().unwrap();
+        let (mut h1b, mut t1b) = coinbase_block(1, prev, Some(hash0));
+        h1b.nonce = h1a.nonce.wrapping_add(1);
+        h1b.hash = rbitcoin_store::block_header_hash(
+            h1b.version,
+            &hash0,
+            &h1b.merkle_root,
+            h1b.timestamp,
+            h1b.bits,
+            h1b.nonce,
+        );
+        t1b.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0xbb])];
+        t1b.tx.txid[30] = 0xbb;
+        q.commit_class_a_only(&h1b, &[t1b]).unwrap();
+        q.confirm_block(Height(1), &h1b.hash).unwrap();
+
+        q.apply_sh_job(stolen).unwrap();
+        q.finish_sh_job(Height(1));
+        q.apply_sh_pending().unwrap();
+
+        let sh_old = script_hash(&[0xaa]);
+        let sh_new = script_hash(&[0xbb]);
+        assert!(
+            q.scripthash_history(&sh_old).unwrap().is_empty(),
+            "stale branch creates must not seed the durable index"
+        );
+        assert_eq!(q.scripthash_history(&sh_new).unwrap().len(), 1);
+        assert_eq!(q.sh_indexed_through_height(), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sh_writebehind_recover_requeues_unapplied_heights() {
         let (dir, q) = temp_query("sh-wb-recover");
         let (h0, t0) = coinbase_block(0, Fk::NULL, None);

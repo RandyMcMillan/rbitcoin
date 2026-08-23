@@ -224,6 +224,12 @@ impl Query {
         self.sh_pending_cv.notify_one();
     }
 
+    /// Last height durable apply is allowed to run (`None` until first release).
+    pub fn sh_released_through_height(&self) -> Option<u32> {
+        let v = self.sh_released_through.load(Ordering::Acquire);
+        v.checked_sub(1)
+    }
+
     fn release_queued_sh_writebehind(&self) {
         if let Some(h) = self.sh_pending_max_height() {
             self.release_sh_writebehind(Height(h));

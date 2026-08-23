@@ -986,6 +986,9 @@ impl ChainHub {
         }
         drop(confirmed);
         self.notify.notify_waiters();
+        if let Some(&(height, _)) = need_meta.last() {
+            self.query.release_sh_writebehind(Height(height));
+        }
         Ok(())
     }
 
@@ -1762,6 +1765,7 @@ impl ChainHub {
         };
         let _ = self.tip_tx.send(event);
         self.notify.notify_waiters();
+        self.query.release_sh_writebehind(Height(height));
         Ok(())
     }
 
@@ -2793,6 +2797,44 @@ mod tests {
         let tip_h = hub.tip_height().unwrap();
         let b_next = mine(tip, 1_300_001_200, tip_h + 1);
         hub.accept_block(b_next).unwrap();
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn connect_at_releases_sh_after_tip_event() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let genesis = hub
+            .block_at_height(0)
+            .unwrap()
+            .expect("genesis after ensure");
+        rbitcoin_consensus::pad_empty_from(
+            hub.query.as_ref(),
+            &hub.params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            2,
+            0,
+        );
+        assert_eq!(hub.query.sh_indexed_through_height(), Some(2));
+        let mut tip_rx = hub.subscribe_tips();
+        let block = hub
+            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("assemble");
+        match hub.accept_block(block).expect("connect") {
+            AcceptOutcome::Accepted { height } => assert_eq!(height, 3),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        let ev = tip_rx.try_recv().expect("tip event after accept");
+        assert_eq!(ev.height, 3);
+        assert_eq!(hub.query.sh_released_through_height(), Some(3));
+        assert_eq!(
+            hub.query.sh_indexed_through_height(),
+            Some(2),
+            "release must not seed; worker/apply does that"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

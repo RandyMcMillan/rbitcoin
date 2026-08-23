@@ -2189,6 +2189,28 @@ mod tests {
     }
 
     #[test]
+    fn generate_uses_mock_when_behind_tip_but_above_mtp() {
+        use bitcoin::ScriptBuf;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let tip_time = 1_700_000_000u32;
+        hub.accept_block(mine(gen, tip_time, 1)).unwrap();
+        let mock = i64::from(tip_time) - 3600;
+        hub.clock.set_mock(mock);
+        let hashes = hub
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("Core UpdateTime: mock behind tip still mines when mock > MTP");
+        assert_eq!(hashes.len(), 1);
+        let t = hub.tip_header().unwrap().time;
+        assert!(
+            t >= mock as u32 && t < tip_time,
+            "expected mock-based stamp, got {t} tip={tip_time} mock={mock}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn tip_is_stale_respects_configured_max_tip_age() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();

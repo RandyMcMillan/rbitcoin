@@ -27,8 +27,8 @@ assert_ok "dry-run default HEAD_SCALE is tiny" \
   grep -qx "RBITCOIN_HEAD_SCALE=tiny" <<<"$out"
 assert_ok "dry-run lists TableFile advise tests" \
   grep -q "file::advise_tests" <<<"$out"
-assert_ok "dry-run skips Windows concurrent grow/read abort" \
-  grep -q "skip=concurrent_readers_during_append_and_grow" <<<"$out"
+assert_ok "dry-run has no skips off Windows" \
+  grep -qx "skip=" <<<"$out"
 assert_ok "dry-run lists SH RAM / host_mem probes" \
   grep -q "sorted_run::tests::host_mem" <<<"$out"
 assert_ok "dry-run lists Darwin vm page math" \
@@ -43,6 +43,14 @@ assert_ok "dry-run lists pool session tests" \
 out="$(CI_OS_SMOKE_DRY_RUN=1 RBITCOIN_HEAD_SCALE=tiny "$RUN")"
 assert_ok "dry-run honors RBITCOIN_HEAD_SCALE" \
   grep -qx "RBITCOIN_HEAD_SCALE=tiny" <<<"$out"
+
+out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=MINGW64_NT-10.0-20348 "$RUN")"
+assert_ok "Windows dry-run skips concurrent grow/read abort" \
+  grep -qx "skip=concurrent_readers_during_append_and_grow" <<<"$out"
+
+out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Darwin "$RUN")"
+assert_ok "Darwin dry-run runs concurrent grow/read" \
+  grep -qx "skip=" <<<"$out"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ci-os-smoke.test.sh: $PASS passed, $FAIL failed"

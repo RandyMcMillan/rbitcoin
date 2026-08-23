@@ -105,10 +105,11 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C1–C14 | (see prior matrix) | … | structure / locktime / script unit tests |
 | C15 | Core `tx_valid` / `tx_invalid` | accept / reject at listed flags; valid still accepts with extra implemented flags off (FillFlags-implied bits skipped); invalid still rejects with extra **restriction** flags on (not P2SH/WITNESS/TAPROOT class changes) | `script::core_tx_vectors::*` |
 | C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
+| C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
 | C18 | Core `sighash.json` | 32-byte digest via `SighashCache::legacy_signature_hash` | `script::core_sighash::core_sighash_all_rows` |
 | C19 | Core `bip341_wallet_vectors.json` | `verify_job_all_inputs` accept (taproot+witness) | `script::core_bip341::core_bip341_wallet_vectors_all_rows` |
 | C20 | Mainnet 866342 + Floresta prevouts | structure + scripts; overweight 4_000_001 WU rejects | `block::block_866342::*` |
-| C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
+| C21 | Tapscript initial witness 1000 / 520 | `stack size` / `PUSH_SIZE`; OP_SUCCESS overrides | `script_path_rejects_initial_stack_over_max_size` ([023](./external_findings/023-tapscript-initial-stack-limits.md)) |
 
 ## Adding a new rule
 

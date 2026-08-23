@@ -202,6 +202,7 @@ impl Query {
             return;
         }
         self.sh_pending.lock().unwrap().extend(jobs);
+        self.sh_pending_cv.notify_one();
     }
 
     /// Apply queued SH write-behind jobs in height order (one Class B appender).
@@ -218,7 +219,7 @@ impl Query {
         }
     }
 
-    fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
+    pub(crate) fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
         use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
         if !self.sh_index_enabled() || self.index_mode().is_direct() {
@@ -573,4 +574,47 @@ pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], n_tx: usize) -> 
 
 fn log_disconnect_tip(height: u32, hash: &[u8; 32], n_tx: usize) {
     rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, n_tx));
+}
+
+/// One Class B appender for SH write-behind. Tests drain via [`Query::apply_sh_pending`].
+pub fn spawn_sh_writebehind(
+    query: std::sync::Arc<Query>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("rbtc-sh-wb".into())
+        .spawn(move || loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let job = {
+                let mut g = query.sh_pending.lock().unwrap();
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(job) = g.pop_front() {
+                        break job;
+                    }
+                    let (g2, wait) = query
+                        .sh_pending_cv
+                        .wait_timeout(g, std::time::Duration::from_millis(200))
+                        .unwrap();
+                    g = g2;
+                    if wait.timed_out() {
+                        continue;
+                    }
+                }
+            };
+            let t0 = std::time::Instant::now();
+            let h = job.height.0;
+            if let Err(e) = query.apply_sh_job(job) {
+                rbitcoin_log::error!("scripthash write-behind h={h}: {e}");
+                continue;
+            }
+            let wall_ms = t0.elapsed().as_millis();
+            let lag = query.sh_lag_heights();
+            rbitcoin_log::info!("sh: apply h={h} wall={wall_ms}ms lag={lag}");
+        })
+        .expect("spawn sh write-behind")
 }

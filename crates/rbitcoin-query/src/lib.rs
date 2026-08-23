@@ -47,7 +47,7 @@ use rbitcoin_store::{
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 pub type QueryError = StoreError;
 
@@ -153,7 +153,7 @@ pub use catchup::IndexMode;
 pub use chain_view::ChainView;
 pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
-pub use connect::{format_disconnect_tip_line, ConfirmPrepared};
+pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{IdLayer, IdMap, LiveUnion, PublishedIds, TxidHasher};
 pub use recent_creates::{
@@ -1100,6 +1100,7 @@ pub struct Query {
     /// Height-ordered SH write-behind (one Class B appender). Confirm enqueues;
     /// [`Self::apply_sh_pending`] / the tip-follow worker drain.
     sh_pending: Mutex<VecDeque<connect::ShPendingJob>>,
+    sh_pending_cv: Condvar,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// In-RAM body queue + lookup-promoted decoded map. One mutex (no ArcSwap).
@@ -1208,6 +1209,7 @@ impl Query {
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(u64::MAX),
             sh_pending: Mutex::new(VecDeque::new()),
+            sh_pending_cv: Condvar::new(),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
                 q: rbitcoin_store::BlockQueue::open_or_create(&store_path)?,

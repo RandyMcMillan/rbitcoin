@@ -43,8 +43,9 @@ The 2-wave split is sealed age, not an IO flag.
 
 | Role | Notes |
 |------|--------|
-| `peer_session` (split read/write) | Serve reconstruct + accept tip blocks via **`accept_and_connect_block`** → **`confirm_wire_run`** (same load→scripts→commit) |
-| Electrum | Read-mostly; joins Class A + scripthash under `Query` |
+| `peer_session` (split read/write) | Serve reconstruct + accept tip blocks via **`accept_and_connect_block`** → **`confirm_wire_run`** (same load→scripts→commit). Class C tip does **not** join SH `put_create`. |
+| `rbtc-sh-wb` | **One** Class B scripthash appender (tip follow). Confirm enqueues pin identity; this thread `put_create_batch_append` then advances `sh_indexed_through`. |
+| Electrum / Esplora | Confirmed SH reads pin `ChainView` at the SH watermark (not live tip). Headers subscribe is live tip. |
 | Epoch finalize | Single-threaded control path; flushes table maps / fd durability |
 
 ## Index modes (`IndexMode`)
@@ -52,7 +53,7 @@ The 2-wave split is sealed age, not an IO flag.
 | Mode | When | Spentness | Durable `tx.head` / spends | SH |
 |------|------|-----------|----------------------------|-----|
 | **Direct** | IBD (`enter_direct_index_mode`) | confirmed-strong annotations | commit-stage head insert; spend annotate in same stage | append-only target-sized runs + SEAL → bulk at tip |
-| **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | durable write-through after bulk |
+| **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | write-behind after tip commit (may lag live tip by 1+ blocks) |
 
 Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
 (runs → optional fan-in reduce → sliced k-way per prefix shard, workers

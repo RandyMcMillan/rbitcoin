@@ -531,7 +531,7 @@ fn asof_view(query: &Query, asof: Option<[u8; 32]>) -> Result<Option<ChainView>,
     let Some(hash) = asof else {
         return Ok(None);
     };
-    match query.pin_chain_view_at(&hash) {
+    match query.pin_sh_chain_view_at(&hash) {
         Ok(Some(v)) => Ok(Some(v)),
         Ok(None) => Err(not_found()),
         Err(e) => Err(store_err(e)),
@@ -655,7 +655,7 @@ fn sh_stats_json(
     let chain = if let Some(hash) = asof {
         let view = st
             .query
-            .pin_chain_view_at(&hash)?
+            .pin_sh_chain_view_at(&hash)?
             .ok_or(rbitcoin_store::StoreError::NotFound)?;
         st.query.scripthash_chain_stats_in(sh, &view)?
     } else {

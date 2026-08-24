@@ -7,7 +7,7 @@
 
 use super::*;
 use bitcoin::consensus::Decodable;
-use rbitcoin_query::{ResolvedWire, TxPrecompute, TxidHasher};
+use rbitcoin_query::{ResolvedWire, TxPrecompute, TxidHasher, U32Map};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::io::Cursor;
@@ -112,22 +112,23 @@ pub struct BqResolveWaveStats {
     pub decode_ns: u64,
     /// `TxPrecompute::from_tx` after decode (this wave).
     pub precompute_ns: u64,
-    /// `collect_resolve_keys` (this wave).
+    /// `push_resolve_keys` (this wave).
     pub collect_ns: u64,
     /// TipOnly `get_fk_by_txid_batch` + slot sort (this wave).
     pub head_ns: u64,
 }
 
-/// Collect unique external prev_txids (+ pre-BIP34 create txids) from a wire block.
-fn collect_resolve_keys(
+/// Push external prev_txids (+ pre-BIP34 create txids) into the wave set.
+fn push_resolve_keys(
     params: &ChainParams,
     height: u32,
     block: &Block,
     pres: &[TxPrecompute],
-) -> Vec<[u8; 32]> {
+    keys: &mut HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
+) {
     let same_block: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
         pres.iter().map(|p| p.txid).collect();
-    let mut need: Vec<[u8; 32]> = Vec::new();
+    let bip34 = params.bip34_active_at(height);
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
             if inp.previous_output.is_null() {
@@ -137,15 +138,12 @@ fn collect_resolve_keys(
             if prev == [0u8; 32] || same_block.contains(&prev) {
                 continue;
             }
-            need.push(prev);
+            keys.insert(prev);
         }
-        if !params.bip34_active_at(height) {
-            need.push(p.txid);
+        if !bip34 {
+            keys.insert(p.txid);
         }
     }
-    need.sort_unstable();
-    need.dedup();
-    need
 }
 
 fn decode_bq_block(payload: &[u8]) -> Option<Block> {
@@ -183,13 +181,13 @@ pub fn confirm_bq_resolve_wave_with_ids(
 ) -> Result<BqResolveWave, ConsensusError> {
     let t0 = Instant::now();
     let mut stats = BqResolveWaveStats::default();
-    let mut per_height: Vec<(u32, Vec<[u8; 32]>)> = Vec::new();
+    let mut done: Vec<u32> = Vec::new();
     let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
         HashSet::with_hasher(BuildHasherDefault::default());
     let mut wires: Vec<(u32, [u8; 32], ResolvedWire)> = Vec::new();
 
     let intake = query.block_queue_wave_intake(heights);
-    let mut n_inputs_at: HashMap<u32, u32> = HashMap::new();
+    let mut n_inputs_at: U32Map<u32> = U32Map::default();
     let raw_h: HashSet<u32> = intake
         .raw
         .into_iter()
@@ -261,6 +259,9 @@ pub fn confirm_bq_resolve_wave_with_ids(
     }
 
     for &h in &selected {
+        if all_keys.len() >= BQ_RESOLVE_WAVE_MAX_KEYS && !done.is_empty() {
+            break;
+        }
         let hash = query.block_queue_hash_at_height(h).unwrap_or([0u8; 32]);
         let (block, pres) = if let Some(wire) = resolved_by_h.remove(&h) {
             wires.push((h, hash, wire.clone()));
@@ -296,31 +297,22 @@ pub fn confirm_bq_resolve_wave_with_ids(
             continue;
         };
         let t_col = Instant::now();
-        let need = collect_resolve_keys(params, h, block.as_ref(), pres.as_ref());
+        push_resolve_keys(params, h, block.as_ref(), pres.as_ref(), &mut all_keys);
         stats.collect_ns = stats
             .collect_ns
             .saturating_add(t_col.elapsed().as_nanos() as u64);
-        if all_keys.len().saturating_add(need.len()) > BQ_RESOLVE_WAVE_MAX_KEYS
-            && !per_height.is_empty()
-        {
-            break;
-        }
-        for k in &need {
-            all_keys.insert(*k);
-        }
-        per_height.push((h, need));
+        done.push(h);
     }
 
-    let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
-    stats.keys = keys.len() as u32;
+    stats.keys = all_keys.len() as u32;
     let mut layer = rbitcoin_query::IdMap::default();
     let mut need = match ids.as_mut() {
         Some((live, _)) => {
-            let (skipped, need) = live.partition_into_layer(keys.iter(), &mut layer);
+            let (skipped, need) = live.partition_into_layer(all_keys.iter(), &mut layer);
             stats.skipped = skipped;
             need
         }
-        None => keys,
+        None => all_keys.into_iter().collect(),
     };
     let t_head = Instant::now();
     need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
@@ -339,7 +331,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
     if let Some((live, published)) = ids.as_mut() {
-        if let (Some(&(lo, _)), Some(&(hi, _))) = (per_height.first(), per_height.last()) {
+        if let (Some(&lo), Some(&hi)) = (done.first(), done.last()) {
             live.note_span(lo, hi, layer);
         }
         let t_keep = Instant::now();
@@ -354,12 +346,8 @@ pub fn confirm_bq_resolve_wave_with_ids(
             .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    let done: Vec<u32> = per_height.iter().map(|(h, _)| *h).collect();
     let mut items = Vec::with_capacity(done.len());
     for (h, hash, wire) in wires {
-        if !done.contains(&h) {
-            continue;
-        }
         let _ = query.block_queue_take_raw(h);
         query.set_lookup_taken_hi(Some(h));
         items.push((h, hash, wire));
@@ -507,6 +495,58 @@ mod tests {
             .fold(0u32, u32::saturating_add);
         assert_eq!(rbitcoin_store::block_wire_input_count(&serialize(&b1)), n1);
         assert!(n1 >= 2, "coinbase + spend");
+    }
+
+    #[test]
+    fn push_resolve_keys_dedups_same_prev_txid() {
+        let params = ChainParams::regtest();
+        let prev = Txid::from_byte_array([0x11u8; 32]);
+        let spend = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 1,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let height = params.btc.bip34_height;
+        let block = Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 0,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase_tx(height), spend],
+        };
+        let pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+        let mut keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
+            HashSet::with_hasher(BuildHasherDefault::default());
+        push_resolve_keys(&params, height, &block, &pres, &mut keys);
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&prev.to_byte_array()));
     }
 
     #[test]

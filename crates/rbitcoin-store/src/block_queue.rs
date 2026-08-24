@@ -5,9 +5,9 @@
 //! Keeping the same FIFO / height-index structure in process memory trades
 //! **redownload on restart** and peak RAM for a single durable write (Class A).
 //!
-//! **Lifecycle:** enqueue after peer framing (raw payload only — no full block
-//! parse); lookup **promotes** a wave to decoded-only (drops raw, keeps a
-//! charge); **dequeue only after combined confirm-write** (or permanent reject).
+//! **Lifecycle:** enqueue after peer framing (raw payload + stamped Σ inputs;
+//! no full block parse); lookup **takes** raw on emit (`take_raw`);
+//! **dequeue only after combined confirm-write** (or permanent reject).
 //! Restart does **not** rehydrate payloads (queue starts empty).
 //!
 //! **Primary capacity** is soft densify assign in the net layer (no hysteresis):
@@ -94,6 +94,8 @@ pub struct QueuedBlockMeta {
     pub header_fk: u64,
     /// Raw wire length, or decoded charge after promote.
     pub payload_len: u64,
+    /// Σ `tx.input` from [`crate::block_wire_input_count`] at enqueue (`0` if unreadable).
+    pub n_inputs: u32,
     /// Lookup finished TipOnly for this height (load may still leftover-stamp).
     pub resolve_complete: bool,
 }
@@ -119,6 +121,7 @@ struct IndexEntry {
     hash: [u8; 32],
     header_fk: u64,
     body: QueuedBody,
+    n_inputs: u32,
     resolve_complete: bool,
 }
 
@@ -213,16 +216,21 @@ impl BlockQueue {
                 "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
             ));
         }
-        self.enqueue_vec(height, hash, header_fk, payload.to_vec())
+        let n_inputs = crate::block_wire_input_count(payload);
+        self.enqueue_vec(height, hash, header_fk, payload.to_vec(), n_inputs)
     }
 
     /// Enqueue an already-owned payload (copy happened outside the BQ lock).
+    ///
+    /// `n_inputs` is [`crate::block_wire_input_count`] from the caller so the
+    /// walk can run off the BQ mutex (peer offer).
     pub fn enqueue_vec(
         &mut self,
         height: u32,
         hash: [u8; 32],
         header_fk: u64,
         payload: Vec<u8>,
+        n_inputs: u32,
     ) -> Result<u64, StoreError> {
         if !self.can_enqueue(payload.len()) {
             return Err(StoreError::BudgetFull(
@@ -238,6 +246,7 @@ impl BlockQueue {
                 hash,
                 header_fk,
                 body: QueuedBody::Raw(payload),
+                n_inputs,
                 resolve_complete: false,
             },
         );
@@ -349,6 +358,7 @@ impl BlockQueue {
                 hash: e.hash,
                 header_fk: e.header_fk,
                 payload_len: e.body.charge(),
+                n_inputs: e.n_inputs,
                 resolve_complete: e.resolve_complete,
             })
             .collect()
@@ -430,6 +440,11 @@ impl BlockQueue {
     /// Hash of the first queue entry at `height`, if any (no payload clone).
     pub fn hash_at_height(&self, height: u32) -> Option<[u8; 32]> {
         self.entry_for_height(height).map(|e| e.hash)
+    }
+
+    /// Enqueue-stamped Σ inputs (`None` if height missing).
+    pub fn input_count_at(&self, height: u32) -> Option<u32> {
+        self.entry_for_height(height).map(|e| e.n_inputs)
     }
 
     /// One-pass height list for a load pack: stored hash + resolve-complete.
@@ -671,7 +686,30 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].payload_len, 5);
         assert_eq!(m[0].height, 5);
+        assert_eq!(m[0].n_inputs, 0, "junk payload is not a block");
         assert!(!m[0].resolve_complete, "enqueue starts unresolved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enqueue_stamps_wire_input_count() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut payload = vec![0u8; 80];
+        crate::compact::write_compact_size(&mut payload, 1);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        crate::compact::write_compact_size(&mut payload, 1);
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        crate::compact::write_compact_size(&mut payload, 0);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        crate::compact::write_compact_size(&mut payload, 1);
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        crate::compact::write_compact_size(&mut payload, 0);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        q.enqueue(1, [1u8; 32], 1, &payload).unwrap();
+        assert_eq!(q.input_count_at(1), Some(1));
+        assert_eq!(q.list_meta()[0].n_inputs, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

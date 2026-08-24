@@ -8,6 +8,7 @@ mod array_table;
 mod bdz;
 mod binary_fuse8;
 mod block_queue;
+mod block_wire;
 mod bulk_io;
 mod chain;
 mod compact;
@@ -68,6 +69,7 @@ pub use block_queue::take_raw_clone_n;
 pub use block_queue::{
     BlockQueue, QueuedBlock, QueuedBlockMeta, TakenRaw, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
 };
+pub use block_wire::block_wire_input_count;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};

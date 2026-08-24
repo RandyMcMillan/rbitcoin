@@ -1,6 +1,7 @@
 //! BQ-ahead TipOnly parent resolve (lookup wave).
 //!
-//! One [`Store::get_fk_by_txid_batch`] (TipOnly) across a ready-height wave
+//! Pack/hold uses enqueue-stamped Σ inputs (no `Block` decode). Emit runs one
+//! [`Store::get_fk_by_txid_batch`] (TipOnly) across the selected heights
 //! (soft **64000** inputs / hard **1080** blocks). Hits publish as one
 //! [`rbitcoin_query::IdLayer`] on the live union. Does not claim, structure, or stamp.
 
@@ -185,17 +186,81 @@ pub fn confirm_bq_resolve_wave_with_ids(
     let mut per_height: Vec<(u32, Vec<[u8; 32]>)> = Vec::new();
     let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
         HashSet::with_hasher(BuildHasherDefault::default());
-    let mut sum_inputs = 0u32;
     let mut wires: Vec<(u32, [u8; 32], ResolvedWire)> = Vec::new();
 
     let intake = query.block_queue_wave_intake(heights);
-    let raw_h: HashSet<u32> = intake.raw.into_iter().collect();
+    let mut n_inputs_at: HashMap<u32, u32> = HashMap::new();
+    let raw_h: HashSet<u32> = intake
+        .raw
+        .into_iter()
+        .map(|(h, n)| {
+            n_inputs_at.insert(h, n);
+            h
+        })
+        .collect();
     let mut resolved_by_h: HashMap<u32, ResolvedWire> = HashMap::new();
     for (h, wire) in intake.resolved {
+        let n = wire
+            .block
+            .txdata
+            .iter()
+            .map(|tx| tx.input.len() as u32)
+            .fold(0u32, u32::saturating_add);
+        n_inputs_at.insert(h, n);
         resolved_by_h.insert(h, wire);
     }
 
+    let mut selected: Vec<u32> = Vec::new();
+    let mut sum_inputs = 0u32;
     for &h in heights {
+        if !raw_h.contains(&h) && !resolved_by_h.contains_key(&h) {
+            continue;
+        }
+        let n = n_inputs_at.get(&h).copied().unwrap_or(0);
+        selected.push(h);
+        sum_inputs = sum_inputs.saturating_add(n);
+        if bq_resolve_wave_stop_after(
+            sum_inputs,
+            selected.len(),
+            BQ_RESOLVE_WAVE_MAX_INPUTS,
+            BQ_RESOLVE_WAVE_MAX_BLOCKS,
+        ) {
+            break;
+        }
+    }
+
+    if let Some(&first) = selected.first() {
+        let path_lo = query
+            .tip_height()
+            .map(|h| h.0.saturating_add(1))
+            .unwrap_or(0);
+        let win = query.soft_confirm_window();
+        let filling = win >= 144 && (query.block_queue_count() as u32) < win;
+        let more_remain = selected.len() < heights.len() || filling;
+        if bq_resolve_wave_hold_partial(
+            query.block_queue_count() as u32,
+            query.soft_confirm_window(),
+            sum_inputs,
+            selected.len(),
+            path_lo,
+            first,
+            more_remain,
+        ) {
+            stats.work_ns = t0.elapsed().as_nanos() as u64;
+            lookup_stage_stats::note_wave_decode(
+                stats.decode_ns,
+                stats.precompute_ns,
+                stats.collect_ns,
+                stats.head_ns,
+            );
+            return Ok(BqResolveWave {
+                stats,
+                items: Vec::new(),
+            });
+        }
+    }
+
+    for &h in &selected {
         let hash = query.block_queue_hash_at_height(h).unwrap_or([0u8; 32]);
         let (block, pres) = if let Some(wire) = resolved_by_h.remove(&h) {
             wires.push((h, hash, wire.clone()));
@@ -240,58 +305,10 @@ pub fn confirm_bq_resolve_wave_with_ids(
         {
             break;
         }
-        let block_inputs = block
-            .txdata
-            .iter()
-            .map(|tx| tx.input.len() as u32)
-            .fold(0u32, u32::saturating_add);
         for k in &need {
             all_keys.insert(*k);
         }
         per_height.push((h, need));
-        sum_inputs = sum_inputs.saturating_add(block_inputs);
-        if bq_resolve_wave_stop_after(
-            sum_inputs,
-            per_height.len(),
-            BQ_RESOLVE_WAVE_MAX_INPUTS,
-            BQ_RESOLVE_WAVE_MAX_BLOCKS,
-        ) {
-            break;
-        }
-    }
-
-    if let Some(&(first, _)) = per_height.first() {
-        let path_lo = query
-            .tip_height()
-            .map(|h| h.0.saturating_add(1))
-            .unwrap_or(0);
-        // More of *this* asked set still uncollected (decode skip), or the BQ
-        // is still filling under an IBD-sized 1-min window. Do not treat
-        // confirm-inflight heights the caller omitted as joinable.
-        let win = query.soft_confirm_window();
-        let filling = win >= 144 && (query.block_queue_count() as u32) < win;
-        let more_remain = per_height.len() < heights.len() || filling;
-        if bq_resolve_wave_hold_partial(
-            query.block_queue_count() as u32,
-            query.soft_confirm_window(),
-            sum_inputs,
-            per_height.len(),
-            path_lo,
-            first,
-            more_remain,
-        ) {
-            stats.work_ns = t0.elapsed().as_nanos() as u64;
-            lookup_stage_stats::note_wave_decode(
-                stats.decode_ns,
-                stats.precompute_ns,
-                stats.collect_ns,
-                stats.head_ns,
-            );
-            return Ok(BqResolveWave {
-                stats,
-                items: Vec::new(),
-            });
-        }
     }
 
     let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
@@ -476,6 +493,34 @@ mod tests {
     }
 
     #[test]
+    fn wire_input_count_matches_serialized_block() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let n: u32 = genesis
+            .txdata
+            .iter()
+            .map(|tx| tx.input.len() as u32)
+            .fold(0u32, u32::saturating_add);
+        assert_eq!(
+            rbitcoin_store::block_wire_input_count(&serialize(&genesis)),
+            n
+        );
+        let g_cb = genesis.txdata[0].compute_txid();
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
+        );
+        let n1: u32 = b1
+            .txdata
+            .iter()
+            .map(|tx| tx.input.len() as u32)
+            .fold(0u32, u32::saturating_add);
+        assert_eq!(rbitcoin_store::block_wire_input_count(&serialize(&b1)), n1);
+        assert!(n1 >= 2, "coinbase + spend");
+    }
+
+    #[test]
     fn bq_resolve_wave_attaches_tiponly_hits_multi_height() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
@@ -656,8 +701,19 @@ mod tests {
         }
         // win = 0.2 * 60 = 12; ready=8 > 6 → hold the 1-block tail
         let _ = q.block_queue_update_soft_pressure(Some(0.2));
+        let _ = rbitcoin_store::take_raw_clone_n();
         let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
         assert_eq!(st.heights, 0, "fat BQ must not mint a 1-block layer");
+        assert_eq!(
+            st.decode_ns, 0,
+            "hold must not consensus_decode; n_inputs is stamped at enqueue"
+        );
+        assert_eq!(st.precompute_ns, 0, "hold must not TxPrecompute::from_tx");
+        assert_eq!(
+            rbitcoin_store::take_raw_clone_n(),
+            0,
+            "hold must not clone raw payload"
+        );
         assert!(!q.block_queue_is_resolve_complete(8));
         assert!(
             q.block_queue_has_height(8),
@@ -749,11 +805,15 @@ mod tests {
             q.block_queue_mark_resolve_complete(h).unwrap();
         }
         let _ = q.block_queue_update_soft_pressure(Some(3.0));
+        let _ = rbitcoin_store::take_raw_clone_n();
         let st = confirm_bq_resolve_wave(&q, &params, &[15]).unwrap();
         assert_eq!(
             st.heights, 0,
             "a far 1-block layer must hold under 8000 inputs while more remain"
         );
+        assert_eq!(st.decode_ns, 0);
+        assert_eq!(st.precompute_ns, 0);
+        assert_eq!(rbitcoin_store::take_raw_clone_n(), 0);
         assert!(q.block_queue_has_height(15));
         let _ = std::fs::remove_dir_all(&path);
     }

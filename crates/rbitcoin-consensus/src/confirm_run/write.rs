@@ -274,9 +274,7 @@ pub fn confirm_write_phase(
         confirm_phase_stats::TWEAK_NS.fetch_add(tweak_ns, Ordering::Relaxed);
     }
 
-    // No tip GC of sparse pins. Post-write hold keeps pin Arcs in the pipeline
-    // store (scriptq+writeq cap) so milestone skip still adopts.
-    batch.batch_parents.hold_after_commit();
+    // No tip GC of sparse pins (dropped with ScriptOkBatch).
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     confirm_phase_stats::note_last_write(confirm_phase_stats::LastWritePhases {
         n_blocks: n_blocks as u32,

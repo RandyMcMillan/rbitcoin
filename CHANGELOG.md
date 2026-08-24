@@ -55,6 +55,13 @@ before 1.0).
 
 ### Fixed
 
+- **Nightly fuzz vs musl cargo-fuzz:** `taiki-e/install-action`'s
+  `cargo-fuzz` is a musl binary, so `cargo fuzz run` defaulted
+  `--target x86_64-unknown-linux-musl` and ASan refused
+  (`sanitizer is incompatible with statically linked libc`).
+  `scripts/fuzz-run.sh` now passes rustc's host triple (gnu on the
+  GHA runner).
+
 - **Tapscript initial witness stack ([023](docs/external_findings/023-tapscript-initial-stack-limits.md)):**
   after the BIP342 OP_SUCCESS scan, tapscript now rejects an initial
   stack over 1000 items (`stack size`) and any initial element over 520

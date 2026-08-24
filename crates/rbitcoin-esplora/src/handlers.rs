@@ -15,7 +15,7 @@ use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network};
-use rbitcoin_primitives::{median_time_past_times, Fk, Height};
+use rbitcoin_primitives::{median_time_past_times, Height};
 use rbitcoin_query::{ChainViewKind, HistoryFilter, Query, ScriptHashChainStats};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
@@ -35,32 +35,6 @@ fn best_chain_block(
         .reconstruct_archived_block(hash)?
         .ok_or(rbitcoin_store::StoreError::NotFound)?;
     Ok((height, block))
-}
-
-/// Packed-body span + 80-byte header. Not wire-identical to Core/Esplora when
-/// Class A packing differs from consensus encoding; clients that need exact
-/// size/weight use `/block/:hash/raw`.
-fn packed_block_size_weight(
-    query: &Query,
-    header_fk: Fk,
-    tx_count: u32,
-) -> Result<(u64, u64), rbitcoin_query::QueryError> {
-    let packed = if tx_count == 0 {
-        0
-    } else if let Some((first, n)) = query.store().header_txs.get_range(header_fk)? {
-        let last = Fk(first.0.saturating_add(u64::from(n.saturating_sub(1))));
-        match (
-            query.store().tx_body_range(first),
-            query.store().tx_body_range(last),
-        ) {
-            (Ok((o0, _)), Ok((o1, l1))) if o1 >= o0 => o1.saturating_add(l1).saturating_sub(o0),
-            _ => u64::from(n),
-        }
-    } else {
-        0
-    };
-    let size = 80u64.saturating_add(packed.max(1));
-    Ok((size, size.saturating_mul(4)))
 }
 
 /// Esplora `GET /block/:hash` JSON for a **best-chain** header hash.
@@ -85,7 +59,11 @@ pub(crate) fn block_summary_json(
         .get_range(header_fk)?
         .map(|(_, n)| n)
         .unwrap_or(0);
-    let (size, weight) = packed_block_size_weight(query, header_fk, tx_count)?;
+    let block = query
+        .reconstruct_archived_block(hash)?
+        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let size = block.total_size() as u64;
+    let weight = block.weight().to_wu();
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = median_time_past(query, height)?;
@@ -105,7 +83,7 @@ pub(crate) fn block_summary_json(
         },
         "mediantime": mediantime,
         "nonce": rec.nonce,
-        "bits": format!("{:08x}", rec.bits),
+        "bits": rec.bits,
         "difficulty": difficulty,
     }))
 }
@@ -1189,6 +1167,59 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn block_summary_bits_u32_and_witness_size_weight() {
+        let (dir, q) = temp_query();
+        let merkle = [0xcd; 32];
+        let hash = rbitcoin_store::block_header_hash(1, &[0u8; 32], &merkle, 1, 0x207f_ffff, 0);
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207f_ffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash,
+        };
+        let ta = TxApply {
+            tx: TxRecord {
+                txid: [0xce; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x00],
+                witness: vec![vec![0u8; 32]],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let _ = q.connect_block(Height(0), &header, &[ta]).unwrap();
+        let summary = block_summary_json(&q, &hash).expect("summary");
+        assert!(
+            summary["bits"].is_u64(),
+            "Esplora bits is u32, not hex: {}",
+            summary["bits"]
+        );
+        assert_eq!(summary["bits"], 0x207f_ffff);
+        let block = q.reconstruct_archived_block(&hash).unwrap().unwrap();
+        assert_eq!(summary["size"], block.total_size() as u64);
+        assert_eq!(summary["weight"], block.weight().to_wu());
+        assert_ne!(
+            summary["weight"].as_u64().unwrap(),
+            summary["size"].as_u64().unwrap().saturating_mul(4),
+            "witness block weight is not 4×stripped size"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn resolve_address_sh_and_block_summary_surface() {
         // Invalid / wrong-network addresses.
         assert!(resolve_address_sh("not-an-address", Network::Bitcoin).is_err());
@@ -1219,10 +1250,9 @@ mod pure_helper_tests {
         assert!(block_summary_json(&q, &[0x11; 32]).is_err());
         let _ = q.sample_reset_reconstruct_archived();
         let _ = block_summary_json(&q, &hash).expect("summary again");
-        assert_eq!(
-            q.sample_reset_reconstruct_archived(),
-            0,
-            "block JSON must not reconstruct wire"
+        assert!(
+            q.sample_reset_reconstruct_archived() >= 1,
+            "block JSON reconstructs for consensus size/weight"
         );
         assert!(q.reconstruct_archived_block(&hash).unwrap().is_some());
         assert!(q.sample_reset_reconstruct_archived() >= 1);

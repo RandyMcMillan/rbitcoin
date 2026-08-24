@@ -355,7 +355,7 @@ impl SegmentedTxHead {
                 0,
                 crate::address_head::PageHopDump {
                     scan: crate::address_head::ProbeRegionScan {
-                        cands: Vec::new(),
+                        cands: crate::address_head::ProbeCands::default(),
                         hit_empty: true,
                         depth_end: 0,
                         empty_local: 0,

@@ -404,26 +404,43 @@ fn index_sp_tweaks_batch(
 
 /// Per-tx tweak or `None` (ineligible). Same-block prevouts come from `block`.
 ///
-/// Returns `None` only when an **external** spend has no pin (caller falls back
-/// to store). A height with no eligible txs is `Some` of `None`s — that is
-/// not a skip.
+/// Non-P2TR txs are `None` without a prevout walk. Returns `None` (whole
+/// height) only when an **eligible** external spend has no pin — caller falls
+/// back to store. A height with no eligible txs is `Some` of `None`s.
 fn records_from_wire(
     p: &Prepared,
     block: &Block,
     parents: &rbitcoin_query::BatchParents,
 ) -> Option<Vec<Option<[u8; 33]>>> {
-    use crate::silent_payments::tweak_from_tx;
+    use crate::silent_payments::{tweak_from_tx, tx_has_p2tr_output};
     use bitcoin::hashes::Hash;
     use bitcoin::{Amount, ScriptBuf, TxOut};
     use std::collections::HashMap;
+
+    let mut recs: Vec<Option<[u8; 33]>> = vec![None; block.txdata.len()];
+    let eligible: Vec<usize> = block
+        .txdata
+        .iter()
+        .enumerate()
+        .filter(|(_, tx)| tx_has_p2tr_output(tx))
+        .map(|(i, _)| i)
+        .collect();
+    if eligible.is_empty() {
+        return Some(recs);
+    }
 
     let mut by_txid: HashMap<[u8; 32], usize> = HashMap::with_capacity(block.txdata.len());
     for (i, tx) in block.txdata.iter().enumerate() {
         by_txid.insert(tx.compute_txid().to_byte_array(), i);
     }
+    let mut spend_fk: HashMap<([u8; 32], u32), rbitcoin_primitives::Fk> =
+        HashMap::with_capacity(p.spends.len());
+    for &(pt, pv, _, cfk) in &p.spends {
+        spend_fk.entry((pt, pv)).or_insert(cfk);
+    }
 
-    let mut recs = Vec::with_capacity(block.txdata.len());
-    for tx in &block.txdata {
+    for &i in &eligible {
+        let tx = &block.txdata[i];
         let mut prevouts = Vec::with_capacity(tx.input.len());
         for inp in &tx.input {
             if inp.previous_output.is_null() {
@@ -441,13 +458,7 @@ fn records_from_wire(
                 prevouts.push(out.clone());
                 continue;
             }
-            let create_fk = p.spends.iter().find_map(|(pt, pv, _, cfk)| {
-                if *pt == tid && *pv == vout {
-                    Some(*cfk)
-                } else {
-                    None
-                }
-            })?;
+            let create_fk = *spend_fk.get(&(tid, vout))?;
             if create_fk.is_null() {
                 return None;
             }
@@ -462,7 +473,7 @@ fn records_from_wire(
                 script_pubkey: ScriptBuf::from_bytes(script),
             });
         }
-        recs.push(tweak_from_tx(tx, &prevouts).map(|t| t.tweak));
+        recs[i] = tweak_from_tx(tx, &prevouts).map(|t| t.tweak);
     }
     Some(recs)
 }
@@ -575,5 +586,75 @@ mod records_from_wire_tests {
             .expect("same-block prevout is on the wire; pin must not be required");
         assert_eq!(recs.len(), 2);
         assert!(recs.iter().all(|t| t.is_none()), "no P2TR → no tweaks");
+    }
+
+    /// After IBD, tip write-through runs this on every block. A pin miss on a
+    /// non-P2TR tx used to `?` the whole height into `tweaks_for_height` (Class A
+    /// walk + secp) even though `tweak_from_tx` would have returned `None`.
+    #[test]
+    fn ineligible_external_spend_does_not_fail_the_height() {
+        let cb = coinbase();
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                    vout: 1,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![cb, spend],
+        };
+        let p = prepared(850_000, vec![]);
+        let parents = rbitcoin_query::BatchParents::new();
+        let recs = records_from_wire(&p, &block, &parents).expect(
+            "no P2TR output → no prevout walk; pin miss must not store-fallback the height",
+        );
+        assert_eq!(recs.len(), 2);
+        assert!(recs.iter().all(|t| t.is_none()), "no P2TR → no tweaks");
+    }
+
+    #[test]
+    fn p2tr_external_spend_without_pin_still_fails_the_height() {
+        let cb = coinbase();
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&[0x11u8; 32]);
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                    vout: 1,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+        };
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![cb, spend],
+        };
+        let p = prepared(850_000, vec![]);
+        let parents = rbitcoin_query::BatchParents::new();
+        assert!(
+            records_from_wire(&p, &block, &parents).is_none(),
+            "P2TR eligible tx with no pin must still store-fallback"
+        );
     }
 }

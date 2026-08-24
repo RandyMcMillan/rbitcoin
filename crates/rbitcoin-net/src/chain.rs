@@ -1932,6 +1932,8 @@ pub struct TipAcceptShInput {
     pub spend_ns: u64,
     pub strong_ns: u64,
     pub tip_ns: u64,
+    /// BIP-352 tip write-through (`index_sp_tweaks_batch`). Zero when `--sptweaks` is off.
+    pub tweak_ns: u64,
     pub sh_lag: u32,
     pub sh: rbitcoin_query::class_c_phase_stats::TipShSnap,
 }
@@ -1946,6 +1948,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     let spend_ms = i.spend_ns / 1_000_000;
     let strong_ms = i.strong_ns / 1_000_000;
     let tip_ms = i.tip_ns / 1_000_000;
+    let tweak_ms = i.tweak_ns / 1_000_000;
     let sh = &i.sh;
     let sh_ms = sh.total_sh_ns() / 1_000_000;
     let coll_ms = sh.collect_ns / 1_000_000;
@@ -1965,7 +1968,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
          sh={sh_ms}ms sh_lag={sh_lag} \
          (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
-         spend={spend_ms}ms sh/wall={sh_ratio}%",
+         spend={spend_ms}ms tweaks={tweak_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
         n_tx = i.n_tx,
         sh_lag = i.sh_lag,
@@ -2004,6 +2007,8 @@ fn log_tip_accept_sh(query: &Query, height: u32, n_tx: usize, wall_ns: u64) {
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let sh = rbitcoin_query::class_c_phase_stats::sample_tip_sh_and_reset();
     let ca = rbitcoin_query::archive_phase_stats::sample_and_reset();
+    let tweak_ns = rbitcoin_consensus::confirm_phase_stats::TWEAK_NS
+        .swap(0, std::sync::atomic::Ordering::Relaxed);
     // class_c = strong + tip only (parallel SH is not Class C table time).
     let class_c_tables_ns = strong_ns.saturating_add(tip_ns);
     let line = format_tip_accept_sh_line(&TipAcceptShInput {
@@ -2017,6 +2022,7 @@ fn log_tip_accept_sh(query: &Query, height: u32, n_tx: usize, wall_ns: u64) {
         spend_ns,
         strong_ns,
         tip_ns,
+        tweak_ns,
         sh_lag: query.sh_lag_heights(),
         sh,
     });
@@ -2351,6 +2357,7 @@ mod tests {
             spend_ns: 80_000_000,
             strong_ns: 5_000_000,
             tip_ns: 2_000_000,
+            tweak_ns: 400_000_000,
             sh_lag: 2,
             sh: rbitcoin_query::class_c_phase_stats::TipShSnap {
                 collect_ns: 20_000_000,
@@ -2380,6 +2387,7 @@ mod tests {
         assert!(line.contains("written=9400"), "{line}");
         assert!(line.contains("pin=4000"), "{line}");
         assert!(line.contains("cold=12"), "{line}");
+        assert!(line.contains("tweaks=400ms"), "{line}");
         assert!(line.contains("sh/wall=69%"), "{line}");
     }
 

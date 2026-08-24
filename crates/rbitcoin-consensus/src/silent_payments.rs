@@ -445,6 +445,13 @@ fn outpoint_bytes(op: &OutPoint) -> [u8; 36] {
     b
 }
 
+/// True when `tx` has at least one P2TR output (BIP-352 eligible to consider).
+pub(crate) fn tx_has_p2tr_output(tx: &Transaction) -> bool {
+    tx.output
+        .iter()
+        .any(|o| is_p2tr(o.script_pubkey.as_bytes()))
+}
+
 fn taproot_outs(tx: &Transaction) -> Vec<TaprootOut> {
     let mut out = Vec::new();
     for (i, o) in tx.output.iter().enumerate() {

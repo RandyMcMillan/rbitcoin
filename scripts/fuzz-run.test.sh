@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Contract: fuzz runner forces nightly so rust-toolchain.toml 1.95 cannot
-# feed cargo-fuzz (-Zsanitizer). Does not invoke cargo-fuzz.
+# feed cargo-fuzz (-Zsanitizer), and pins --target to rustc host so a
+# musl cargo-fuzz binary does not ASan-build musl. Does not invoke cargo-fuzz.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +28,13 @@ assert_ok "dry-run default toolchain is nightly" \
 out="$(FUZZ_DRY_RUN=1 RUSTUP_TOOLCHAIN=nightly-2026-01-01 "$RUN")"
 assert_ok "dry-run honors an explicit RUSTUP_TOOLCHAIN" \
   grep -qx "RUSTUP_TOOLCHAIN=nightly-2026-01-01" <<<"$out"
+
+host="$(rustc -vV | sed -n 's/^host: //p')"
+out="$(FUZZ_DRY_RUN=1 "$RUN")"
+assert_ok "dry-run pins cargo-fuzz --target to rustc host (not musl)" \
+  grep -qx "CARGO_FUZZ_TARGET=${host}" <<<"$out"
+assert_ok "dry-run target is not musl" \
+  bash -c 'grep -q CARGO_FUZZ_TARGET= <<<"$1" && ! grep -q musl <<<"$1"' _ "$out"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "fuzz-run.test.sh: $PASS passed, $FAIL failed"

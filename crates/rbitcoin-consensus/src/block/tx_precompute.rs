@@ -46,4 +46,20 @@ mod tests {
             .to_byte_array();
         assert_eq!(ours, theirs);
     }
+
+    #[test]
+    fn from_tx_connect_bip143_fails_closed_without_midstate() {
+        let tx = p2wpkh_like();
+        let pre = TxPrecompute::from_tx_connect(&tx);
+        let wscript = bitcoin::script::Script::from_bytes(&[0x51]);
+        let amt = Amount::from_sat(50_000);
+        let err =
+            crate::script::crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x01, &pre)
+                .expect_err("connect-only precompute must not sighash");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invariant: sighash midstate missing"),
+            "got: {msg}"
+        );
+    }
 }

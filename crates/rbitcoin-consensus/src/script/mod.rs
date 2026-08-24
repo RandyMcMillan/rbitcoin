@@ -388,6 +388,10 @@ pub(crate) mod crypto {
         matches!(pk.first(), Some(0x02 | 0x03)) && pk.len() == 33
     }
 
+    fn sighash_midstate(h: Option<[u8; 32]>) -> Result<[u8; 32], ConsensusError> {
+        h.ok_or_else(|| ConsensusError::Script("invariant: sighash midstate missing".into()))
+    }
+
     /// BIP143 signature hash with **raw** `nHashType` (last byte of the sig push).
     ///
     /// `script_code` is the BIP143 scriptCode (for P2WPKH: the
@@ -423,19 +427,19 @@ pub(crate) mod crypto {
         let zero = [0u8; 32];
 
         let hash_prevouts: [u8; 32] = if !anyone_can_pay {
-            pre.hash_prevouts().expect("sighash midstate")
+            sighash_midstate(pre.hash_prevouts())?
         } else {
             zero
         };
 
         let hash_sequence: [u8; 32] = if !anyone_can_pay && base != Single && base != None {
-            pre.hash_sequence().expect("sighash midstate")
+            sighash_midstate(pre.hash_sequence())?
         } else {
             zero
         };
 
         let hash_outputs: [u8; 32] = if base != Single && base != None {
-            pre.hash_outputs().expect("sighash midstate")
+            sighash_midstate(pre.hash_outputs())?
         } else if base == Single && input_index < tx.output.len() {
             let mut eng = sha256d::Hash::engine();
             tx.output[input_index]

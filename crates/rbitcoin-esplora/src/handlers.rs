@@ -1158,7 +1158,7 @@ mod pure_helper_tests {
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x00],
-                witness: vec![],
+                witness: vec![vec![0u8; 32]],
             }],
             outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
         };
@@ -1169,38 +1169,7 @@ mod pure_helper_tests {
     #[test]
     fn block_summary_bits_u32_and_witness_size_weight() {
         let (dir, q) = temp_query();
-        let merkle = [0xcd; 32];
-        let hash = rbitcoin_store::block_header_hash(1, &[0u8; 32], &merkle, 1, 0x207f_ffff, 0);
-        let header = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 0x207f_ffff,
-            nonce: 0,
-            merkle_root: merkle,
-            hash,
-        };
-        let ta = TxApply {
-            tx: TxRecord {
-                txid: [0xce; 32],
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![0x00],
-                witness: vec![vec![0u8; 32]],
-            }],
-            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
-        };
-        let _ = q.connect_block(Height(0), &header, &[ta]).unwrap();
+        let hash = seed_genesis(&q);
         let summary = block_summary_json(&q, &hash).expect("summary");
         assert!(
             summary["bits"].is_u64(),

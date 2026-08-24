@@ -423,19 +423,19 @@ pub(crate) mod crypto {
         let zero = [0u8; 32];
 
         let hash_prevouts: [u8; 32] = if !anyone_can_pay {
-            pre.hash_prevouts()
+            pre.hash_prevouts().expect("sighash midstate")
         } else {
             zero
         };
 
         let hash_sequence: [u8; 32] = if !anyone_can_pay && base != Single && base != None {
-            pre.hash_sequence()
+            pre.hash_sequence().expect("sighash midstate")
         } else {
             zero
         };
 
         let hash_outputs: [u8; 32] = if base != Single && base != None {
-            pre.hash_outputs()
+            pre.hash_outputs().expect("sighash midstate")
         } else if base == Single && input_index < tx.output.len() {
             let mut eng = sha256d::Hash::engine();
             tx.output[input_index]

@@ -21,24 +21,34 @@ pub struct TxPrecompute {
     /// BIP144 serialization (`uses_segwit_serialization`).
     pub has_witness: bool,
     /// Single SHA256 of all outpoints (BIP341 / rust-bitcoin `CommonCache`).
-    pub sha_prevouts: [u8; 32],
-    pub sha_sequences: [u8; 32],
-    pub sha_outputs: [u8; 32],
+    /// `None` after [`Self::from_tx_connect`] (scripts skipped).
+    pub sha_prevouts: Option<[u8; 32]>,
+    pub sha_sequences: Option<[u8; 32]>,
+    pub sha_outputs: Option<[u8; 32]>,
     /// Single SHA256 of spent amounts / scriptPubKeys (after [`Self::finish_spent`]).
     pub sha_amounts: Option<[u8; 32]>,
     pub sha_scriptpubkeys: Option<[u8; 32]>,
 }
 
 impl TxPrecompute {
-    /// One walk of `tx`. Does not hash spent prevouts.
+    /// One walk of `tx` including BIP143/341 midstates. Does not hash spent prevouts.
     pub fn from_tx(tx: &Transaction) -> Self {
+        Self::from_tx_inner(tx, true)
+    }
+
+    /// Ids, sizes, sigops, `out_sum` — no sighash midstates (scripts skipped).
+    pub fn from_tx_connect(tx: &Transaction) -> Self {
+        Self::from_tx_inner(tx, false)
+    }
+
+    fn from_tx_inner(tx: &Transaction, sighash: bool) -> Self {
         let has_witness = uses_segwit_serialization(tx);
 
         let mut txid_eng = sha256d::Hash::engine();
         let mut wtxid_eng = sha256d::Hash::engine();
-        let mut sha_prev = sha256::Hash::engine();
-        let mut sha_seq = sha256::Hash::engine();
-        let mut sha_out = sha256::Hash::engine();
+        let mut sha_prev = sighash.then(sha256::Hash::engine);
+        let mut sha_seq = sighash.then(sha256::Hash::engine);
+        let mut sha_out = sighash.then(sha256::Hash::engine);
         let mut base_size = 0usize;
         let mut total_size = 0usize;
         let mut sigops = 0u64;
@@ -57,7 +67,9 @@ impl TxPrecompute {
         for txin in &tx.input {
             base_size += enc(&mut txid_eng, &txin.previous_output);
             total_size += enc(&mut wtxid_eng, &txin.previous_output);
-            let _ = txin.previous_output.consensus_encode(&mut sha_prev);
+            if let Some(ref mut e) = sha_prev {
+                let _ = txin.previous_output.consensus_encode(e);
+            }
 
             base_size += enc(&mut txid_eng, &txin.script_sig);
             total_size += enc(&mut wtxid_eng, &txin.script_sig);
@@ -65,7 +77,9 @@ impl TxPrecompute {
 
             base_size += enc(&mut txid_eng, &txin.sequence);
             total_size += enc(&mut wtxid_eng, &txin.sequence);
-            let _ = txin.sequence.consensus_encode(&mut sha_seq);
+            if let Some(ref mut e) = sha_seq {
+                let _ = txin.sequence.consensus_encode(e);
+            }
         }
 
         let n_out = VarInt(tx.output.len() as u64);
@@ -74,7 +88,9 @@ impl TxPrecompute {
         for txout in &tx.output {
             base_size += enc(&mut txid_eng, txout);
             total_size += enc(&mut wtxid_eng, txout);
-            let _ = txout.consensus_encode(&mut sha_out);
+            if let Some(ref mut e) = sha_out {
+                let _ = txout.consensus_encode(e);
+            }
             sigops =
                 sigops.saturating_add(script_sigop_count(txout.script_pubkey.as_bytes(), false));
             let v = txout.value.to_sat();
@@ -98,25 +114,25 @@ impl TxPrecompute {
             sigops,
             out_sum,
             has_witness,
-            sha_prevouts: sha256::Hash::from_engine(sha_prev).to_byte_array(),
-            sha_sequences: sha256::Hash::from_engine(sha_seq).to_byte_array(),
-            sha_outputs: sha256::Hash::from_engine(sha_out).to_byte_array(),
+            sha_prevouts: sha_prev.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            sha_sequences: sha_seq.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            sha_outputs: sha_out.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
             sha_amounts: None,
             sha_scriptpubkeys: None,
         }
     }
 
-    /// BIP143 `hashPrevouts` = SHA256(sha_prevouts).
-    pub fn hash_prevouts(&self) -> [u8; 32] {
-        sha256_again(&self.sha_prevouts)
+    /// BIP143 `hashPrevouts` = SHA256(sha_prevouts). `None` after [`Self::from_tx_connect`].
+    pub fn hash_prevouts(&self) -> Option<[u8; 32]> {
+        self.sha_prevouts.as_ref().map(sha256_again)
     }
 
-    pub fn hash_sequence(&self) -> [u8; 32] {
-        sha256_again(&self.sha_sequences)
+    pub fn hash_sequence(&self) -> Option<[u8; 32]> {
+        self.sha_sequences.as_ref().map(sha256_again)
     }
 
-    pub fn hash_outputs(&self) -> [u8; 32] {
-        sha256_again(&self.sha_outputs)
+    pub fn hash_outputs(&self) -> Option<[u8; 32]> {
+        self.sha_outputs.as_ref().map(sha256_again)
     }
 
     pub fn weight_wu(&self) -> u64 {
@@ -210,15 +226,44 @@ mod tests {
         assert_eq!(p.total_size, tx.total_size(), "total_size");
         assert_eq!(p.weight_wu(), tx.weight().to_wu(), "weight");
         assert_eq!(p.sigops, oracle_sigops(tx), "sigops");
-        assert_eq!(p.sha_prevouts, oracle_sha_prevouts(tx), "sha_prevouts");
-        assert_eq!(p.sha_sequences, oracle_sha_sequences(tx), "sha_sequences");
-        assert_eq!(p.sha_outputs, oracle_sha_outputs(tx), "sha_outputs");
+        assert_eq!(
+            p.sha_prevouts,
+            Some(oracle_sha_prevouts(tx)),
+            "sha_prevouts"
+        );
+        assert_eq!(
+            p.sha_sequences,
+            Some(oracle_sha_sequences(tx)),
+            "sha_sequences"
+        );
+        assert_eq!(p.sha_outputs, Some(oracle_sha_outputs(tx)), "sha_outputs");
         assert_eq!(
             p.hash_prevouts(),
-            sha256::Hash::from_byte_array(p.sha_prevouts)
-                .hash_again()
-                .to_byte_array()
+            Some(
+                sha256::Hash::from_byte_array(p.sha_prevouts.unwrap())
+                    .hash_again()
+                    .to_byte_array()
+            )
         );
+    }
+
+    fn assert_connect_matches_ids(tx: &Transaction) {
+        let full = TxPrecompute::from_tx(tx);
+        let c = TxPrecompute::from_tx_connect(tx);
+        assert_eq!(c.txid, full.txid, "txid");
+        assert_eq!(c.wtxid, full.wtxid, "wtxid");
+        assert_eq!(c.base_size, full.base_size, "base_size");
+        assert_eq!(c.total_size, full.total_size, "total_size");
+        assert_eq!(c.weight_wu(), full.weight_wu(), "weight");
+        assert_eq!(c.sigops, full.sigops, "sigops");
+        assert_eq!(c.out_sum, full.out_sum, "out_sum");
+        assert_eq!(c.has_witness, full.has_witness, "has_witness");
+        assert_eq!(c.sha_prevouts, None);
+        assert_eq!(c.sha_sequences, None);
+        assert_eq!(c.sha_outputs, None);
+        assert_eq!(c.hash_prevouts(), None);
+        assert_eq!(c.hash_sequence(), None);
+        assert_eq!(c.hash_outputs(), None);
     }
 
     fn legacy_1in() -> Transaction {
@@ -271,6 +316,26 @@ mod tests {
         };
         assert_matches_rust_bitcoin(&tx);
         assert!(TxPrecompute::from_tx(&tx).has_witness);
+    }
+
+    #[test]
+    fn from_tx_connect_omits_sighash_midstates() {
+        assert_connect_matches_ids(&legacy_1in());
+        assert_connect_matches_ids(&p2wpkh_like());
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert_connect_matches_ids(&tx);
+        assert_eq!(
+            TxPrecompute::from_tx_connect(&tx).wtxid,
+            tx.compute_wtxid().to_byte_array()
+        );
     }
 
     #[test]

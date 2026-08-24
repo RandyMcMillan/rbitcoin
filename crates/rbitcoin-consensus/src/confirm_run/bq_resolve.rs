@@ -623,10 +623,7 @@ mod tests {
             spend_pre.sha_prevouts.is_some(),
             "Milestone::NONE must from_tx (sighash midstates present)"
         );
-        assert_eq!(
-            spend_pre.txid,
-            b1.txdata[1].compute_txid().to_byte_array()
-        );
+        assert_eq!(spend_pre.txid, b1.txdata[1].compute_txid().to_byte_array());
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -927,29 +924,27 @@ mod tests {
             .unwrap();
         let mut live = rbitcoin_query::LiveUnion::new();
         let published = rbitcoin_query::PublishedIds::new();
-        let st1 =
-            confirm_bq_resolve_wave_with_ids(
-                &q,
-                &params,
-                Milestone::NONE,
-                &[1],
-                Some((&mut live, &published)),
-            )
-                .unwrap()
-                .stats;
+        let st1 = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            Milestone::NONE,
+            &[1],
+            Some((&mut live, &published)),
+        )
+        .unwrap()
+        .stats;
         assert_eq!(st1.skipped, 0);
         assert!(st1.hits >= 1);
         assert!(published.get(&g_cb.to_byte_array()).is_some());
-        let st2 =
-            confirm_bq_resolve_wave_with_ids(
-                &q,
-                &params,
-                Milestone::NONE,
-                &[2],
-                Some((&mut live, &published)),
-            )
-                .unwrap()
-                .stats;
+        let st2 = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            Milestone::NONE,
+            &[2],
+            Some((&mut live, &published)),
+        )
+        .unwrap()
+        .stats;
         assert!(
             st2.skipped >= 1,
             "second wave must skip genesis parent already in live_union"

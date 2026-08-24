@@ -339,16 +339,8 @@ pub fn confirm_bq_resolve_wave_with_ids(
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
     if let Some((live, published)) = ids.as_mut() {
-        let mut hits = rbitcoin_query::IdMap::default();
-        for (_h, need) in &per_height {
-            for t in need {
-                if let Some(&v) = layer.get(t) {
-                    hits.insert(*t, v);
-                }
-            }
-        }
         if let (Some(&(lo, _)), Some(&(hi, _))) = (per_height.first(), per_height.last()) {
-            live.note_span(lo, hi, &hits);
+            live.note_span(lo, hi, layer);
         }
         let t_keep = Instant::now();
         let queued = query.block_queue_queued_heights();
@@ -854,6 +846,14 @@ mod tests {
         assert!(
             st2.skipped >= 1,
             "second wave must skip genesis parent already in live_union"
+        );
+        let mut queued = std::collections::BTreeSet::new();
+        queued.insert(2);
+        live.keep_queued_heights(&queued);
+        live.publish(&published);
+        assert!(
+            published.get(&g_cb.to_byte_array()).is_some(),
+            "re-home must survive drop of wave-1 span"
         );
         let _ = std::fs::remove_dir_all(&path);
     }

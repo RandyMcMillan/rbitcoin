@@ -403,7 +403,7 @@ mod tests {
         let mut live = LiveUnion::new();
         let mut hits = IdMap::default();
         hits.insert([0xAAu8; 32], (Fk(9), (8, 16)));
-        live.note_height(3, &hits);
+        live.note_height(3, hits);
         live.publish(q.published_ids());
         assert_eq!(q.published_ids().get(&[0xAAu8; 32]), Some((Fk(9), (8, 16))));
         assert_eq!(q.block_queue_dequeue_height(3).unwrap(), 1);

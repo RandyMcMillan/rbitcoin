@@ -313,6 +313,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Held-session leftover `KIND_BULK_PREAD` must not be harvested as a BDZ
+    /// g-page CQE (`bdz g page bad slot`). Drain the foreign SQE first.
+    #[test]
+    fn index_batch_held_session_drains_foreign_kind_leftover() {
+        use std::io::Write;
+        let dir = tmp("held-leftover");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
+        let ram = BdzMphf::build(&keys).unwrap();
+        let p = dir.join("t.mphf");
+        ram.write_to(&p).unwrap();
+        let fd_mphf = BdzMphf::read_from(&p).unwrap();
+        let serial = fd_mphf
+            .index_batch(&keys[..8], &mut IoCtx::none())
+            .unwrap();
+
+        let leftover_path = dir.join("leftover.bin");
+        let mut leftover_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&leftover_path)
+            .unwrap();
+        leftover_file.write_all(&[0xAAu8; 8]).unwrap();
+        leftover_file.sync_all().unwrap();
+        let leftover_fd = crate::io_handle::IoHandle::from_file(&leftover_file);
+
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        session.begin_batch();
+        let mut leftover_buf = [0u8; 8];
+        let ud = crate::uring_session::pack_ud(
+            crate::uring_session::KIND_BULK_PREAD,
+            session.epoch(),
+            0,
+        );
+        session
+            .push_pread(leftover_fd, 0, &mut leftover_buf, ud)
+            .unwrap();
+        session.submit().unwrap();
+        assert!(
+            session.in_flight() > 0,
+            "foreign SQE must still be pending when BDZ starts"
+        );
+
+        let mut ctx = IoCtx::held(&mut session);
+        let batch = fd_mphf
+            .index_batch(&keys[..8], &mut ctx)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "held index_batch with leftover KIND_BULK_PREAD must drain, not {e}"
+                )
+            });
+        drop(ctx);
+        session.drain_all().unwrap();
+        assert_eq!(batch, serial);
+        assert_eq!(session.in_flight(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tx_head_mphf_open_is_header_only() {
         let dir = tmp("open");

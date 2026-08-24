@@ -1090,6 +1090,54 @@ mod tests {
         (path, f)
     }
 
+    /// `begin_batch` starts a new machine wave: leftover in-flight SQEs from the
+    /// previous wave must be drained first (shared TLS ring).
+    #[test]
+    fn begin_batch_drains_leftover_before_new_epoch() {
+        use std::io::Write;
+        let (path, mut f) = tmp_rw("begin-batch-drain");
+        f.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let mut buf = [0u8; 4];
+        session.begin_batch();
+        let epoch0 = session.epoch();
+        let ud = pack_ud(KIND_BULK_PREAD, epoch0, 0);
+        session.push_pread(fd, 0, &mut buf, ud).unwrap();
+        session.submit().unwrap();
+        assert!(session.in_flight() > 0);
+        session.begin_batch();
+        assert_eq!(
+            session.in_flight(),
+            0,
+            "begin_batch must drain leftover before bumping epoch"
+        );
+        assert_ne!(session.epoch(), epoch0);
+        assert_eq!(&buf, &[0x11, 0x22, 0x33, 0x44]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phantom pending (no kernel SQE) must not leave the session usable.
+    #[test]
+    fn begin_batch_poisons_when_leftover_cannot_drain() {
+        use std::io::Write;
+        let (path, mut f) = tmp_rw("begin-batch-poison");
+        f.write_all(&[1u8]).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        session.pending.insert(99).unwrap();
+        session.begin_batch();
+        let mut buf = [0u8; 1];
+        let r = session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0));
+        assert!(
+            r.is_err(),
+            "push after undrainable leftover must fail, got {r:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Live harvest: pushed user_data comes back; drain leaves in_flight==0.
     #[test]
     fn pool_harvest_returns_user_data_and_drains() {

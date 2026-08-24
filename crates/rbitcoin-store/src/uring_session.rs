@@ -36,7 +36,9 @@ const WAIT_ONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(WAI
 /// [`UringSession::drain_all`] wait: 100 ms × 50 = 5 s. Short enough that a
 /// poisoned ring fails the wave; long enough that 128×4 KiB g-page preads
 /// under Class A write traffic are not a false `undrained`.
+#[cfg(target_os = "linux")]
 const DRAIN_WAIT_NS: u32 = 100_000_000;
+#[cfg(target_os = "linux")]
 const DRAIN_MAX_SPINS: u32 = 50;
 
 /// Which completion backend [`UringSession`] opens.

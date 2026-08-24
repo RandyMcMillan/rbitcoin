@@ -313,18 +313,15 @@ pub fn confirm_bq_resolve_wave_with_ids(
 
     let keys: Vec<[u8; 32]> = all_keys.into_iter().collect();
     stats.keys = keys.len() as u32;
-    let (mut hit_map, need): (
-        HashMap<[u8; 32], (rbitcoin_primitives::Fk, (u64, u64))>,
-        Vec<[u8; 32]>,
-    ) = match ids.as_mut() {
+    let mut layer = rbitcoin_query::IdMap::default();
+    let mut need = match ids.as_mut() {
         Some((live, _)) => {
-            let (known, need) = live.partition(keys.iter());
-            stats.skipped = known.len() as u32;
-            (known.into_iter().collect(), need)
+            let (skipped, need) = live.partition_into_layer(keys.iter(), &mut layer);
+            stats.skipped = skipped;
+            need
         }
-        None => (HashMap::new(), keys),
+        None => keys,
     };
-    let mut need = need;
     let t_head = Instant::now();
     need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
 
@@ -335,17 +332,17 @@ pub fn confirm_bq_resolve_wave_with_ids(
             .map_err(ConsensusError::from)?;
         for (txid, row) in rows {
             if let Some((fk, range)) = row {
-                hit_map.insert(txid, (fk, range));
+                layer.insert(txid, (fk, range));
             }
         }
     }
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
-    stats.hits = hit_map.len() as u32;
+    stats.hits = layer.len() as u32;
     if let Some((live, published)) = ids.as_mut() {
         let mut hits = rbitcoin_query::IdMap::default();
         for (_h, need) in &per_height {
             for t in need {
-                if let Some(&v) = hit_map.get(t) {
+                if let Some(&v) = layer.get(t) {
                     hits.insert(*t, v);
                 }
             }

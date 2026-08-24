@@ -2,7 +2,7 @@
 //!
 //! Lookup prepends one [`IdLayer`] per resolve wave (a span of BQ heights)
 //! and [`publish`](LiveUnion::publish) stores the chain head (`Arc` bump).
-//! [`LiveUnion::get`] / [`partition`](LiveUnion::partition) and load
+//! [`LiveUnion::get`] / [`partition_into_layer`](LiveUnion::partition_into_layer) and load
 //! [`get`](PublishedIds::get) walk newest → older. A layer stays until
 //! **no** height in its span is still on the body queue; drop is splice
 //! only (no union rebuild). [`unpublish`](PublishedIds::unpublish) (store
@@ -153,12 +153,16 @@ impl LiveUnion {
         self.head.as_deref()?.get(txid)
     }
 
-    /// Split `keys` into already-known hits vs TipOnly need.
-    pub fn partition<'a>(
+    /// Re-home union hits into `layer` (this wave's map) and return TipOnly `need`.
+    ///
+    /// `skipped` is TipOnly avoided, not omitted from `layer`. Zero txid is
+    /// never a hit and never appears in `need`.
+    pub fn partition_into_layer<'a>(
         &self,
         keys: impl IntoIterator<Item = &'a [u8; 32]>,
-    ) -> (IdMap, Vec<[u8; 32]>) {
-        let mut known = IdMap::default();
+        layer: &mut IdMap,
+    ) -> (u32, Vec<[u8; 32]>) {
+        let mut skipped = 0u32;
         let mut need = Vec::new();
         for t in keys {
             if *t == [0u8; 32] {
@@ -166,12 +170,13 @@ impl LiveUnion {
             }
             match self.get(t) {
                 Some(hit) => {
-                    known.insert(*t, hit);
+                    layer.insert(*t, hit);
+                    skipped = skipped.saturating_add(1);
                 }
                 None => need.push(*t),
             }
         }
-        (known, need)
+        (skipped, need)
     }
 
     /// Drop layers whose span has no remaining queued height. Does not swap.
@@ -427,9 +432,36 @@ mod tests {
         let t2 = tid(2);
         live.finish_wave(&hits(&[(t1, Fk(10), (1, 2))]), &published);
         assert_eq!(published.get(&t1), Some((Fk(10), (1, 2))));
-        let (known, need) = live.partition([&t1, &t2]);
-        assert_eq!(known.get(&t1).copied(), Some((Fk(10), (1, 2))));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&t1, &t2], &mut layer);
+        assert_eq!(skipped, 1);
+        assert_eq!(layer.get(&t1).copied(), Some((Fk(10), (1, 2))));
         assert_eq!(need, vec![t2]);
+    }
+
+    #[test]
+    fn partition_rehomes_into_layer_without_known_map() {
+        let mut live = LiveUnion::new();
+        let p = tid(1);
+        let fresh = tid(2);
+        live.note_span(1, 1, &hits(&[(p, Fk(10), (1, 2))]));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&p, &fresh], &mut layer);
+        assert_eq!(skipped, 1, "union hit skips TipOnly");
+        assert_eq!(
+            layer.get(&p).copied(),
+            Some((Fk(10), (1, 2))),
+            "this-wave layer must re-home the union parent"
+        );
+        assert!(!layer.contains_key(&fresh));
+        assert_eq!(need, vec![fresh]);
+        let (skipped0, need0) = live.partition_into_layer([&[0u8; 32], &p], &mut IdMap::default());
+        assert_eq!(skipped0, 1);
+        assert!(need0.is_empty(), "zero txid is never TipOnly need");
+        assert!(
+            live.get(&p).is_some(),
+            "older layer still answers get until splice"
+        );
     }
 
     #[test]
@@ -542,8 +574,10 @@ mod tests {
             live.get(&tid(1)).is_none(),
             "dropped layer must not be rebuilt into a live union map"
         );
-        let (known, need) = live.partition([&tid(2), &tid(3)]);
-        assert_eq!(known.get(&tid(2)).copied(), Some((Fk(11), (3, 4))));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&tid(2), &tid(3)], &mut layer);
+        assert_eq!(skipped, 1);
+        assert_eq!(layer.get(&tid(2)).copied(), Some((Fk(11), (3, 4))));
         assert_eq!(need, vec![tid(3)]);
     }
 

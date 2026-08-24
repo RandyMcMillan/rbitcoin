@@ -148,7 +148,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **—** | Headerless SH extent interior pages | Extent is a span-read of the existing 4 KiB delta-page record. Interiors keep `ver`/`n_fks`/`next` so one decoder serves leftovers, tails, and last-page append. Full-page payload is ~0.2% and a schema bump |
 | **—** | Restore `rbtc-script-coord-*` | `ibd-confirm` publishes waves, polls lock-free completion, feeds `scriptq` when steal is empty. Steal workers unpark the publisher. Do not add coordinator threads to keep the pool fed |
 | **—** | Flatten purpose-built io_uring machines | AGENTS.md: fix the machine; do not replace it with batched `pread`/`pwrite` without an explicit ask |
-| **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. Post-write hold is last 18 `BatchParents` pin-Arc maps on `PipelineParentStore` (scriptq+writeq), not a process create FIFO. IBD confirm is body-queue wire → lookup → load. See AGENTS.md |
+| **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD confirm is body-queue wire → lookup → load. See AGENTS.md |
 | **—** | `rbitcoin-bench` default-member / musl / required CI | Optional crate, host A/B against a live store. Not a packaging or coverage gate |
 
 ---

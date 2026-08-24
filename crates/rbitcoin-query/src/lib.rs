@@ -147,7 +147,7 @@ pub mod process_mem_stats {
 pub use archive::{ArchiveWritePlan, CreatePin};
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
-    SharedParentPin, U32Map, U64Map, U64Set, SPENDER_REL_UNKNOWN,
+    SharedParentPin, U32Map, U64Map, U64Set, PIPELINE_PIN_HOLD_BATCHES, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};

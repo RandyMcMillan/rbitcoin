@@ -12,6 +12,8 @@
 //! 2. Local [`BatchParents::insert_owned`] — lock-free HashMap insert (same cost
 //!    class as the pre-share `ParentEntry` path)
 //! 3. [`BatchParents::publish_to_store`] — one lock, publish Weaks / merge races
+//! 4. [`BatchParents::hold_after_commit`] — write keeps a bounded strong ring so
+//!    Weak pins survive script skip (`scriptq` empty) until the next loads adopt
 //!
 //! Assemble/write read pin data through the batch's `Arc`s — **no** global map
 //! lock on the hot path.
@@ -35,7 +37,7 @@ use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -320,26 +322,36 @@ struct PinIndex {
     live: usize,
 }
 
+/// Strong-hold of committed [`BatchParents`] pin Arcs (script skip still shares).
+///
+/// Matches confirm `scriptq` (4) + `writeq` (14). Not a process create FIFO:
+/// drop with this store (disconnect replaces the Arc).
+pub const PIPELINE_PIN_HOLD_BATCHES: usize = 18;
+
 /// Prep-time registry: Weak map so dead pins free when last batch Arc drops.
 ///
 /// Mutex is only for bulk adopt / publish / [`Self::bulk_lookup_txid`] — never
 /// held while assemble walks inputs or write fills layout, and **not** on the
-/// per-parent insert hot path.
+/// per-parent insert hot path. Post-write [`Self::hold_pins`] keeps a bounded
+/// ring of strong Arcs so milestone script skip still hits adopt.
 #[derive(Debug, Default)]
 pub struct PipelineParentStore {
     maps: Mutex<PinIndex>,
+    hold: Mutex<VecDeque<U64Map<Arc<SharedParentPin>>>>,
 }
 
 impl PipelineParentStore {
     pub fn new() -> Self {
         Self {
             maps: Mutex::new(PinIndex::default()),
+            hold: Mutex::new(VecDeque::new()),
         }
     }
 
     /// Live pin with non-zero txid and a stamped `txout` body range.
     ///
-    /// Same Weak lifetime as outs share: last batch `Arc` drop → `None`.
+    /// Same Weak lifetime as outs share: last batch `Arc` drop → `None`, unless
+    /// [`BatchParents::hold_after_commit`] still holds a strong pin.
     /// Zero txid is never indexed. Live pin without `body_range` is a miss
     /// (do not half-skip head).
     pub fn lookup_txid(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
@@ -397,6 +409,22 @@ impl PipelineParentStore {
         (weak_slots, live, bytes)
     }
 
+    /// Keep committed batch pin Arcs so later adopt still hits after write drop.
+    ///
+    /// Evicts the oldest map once over [`PIPELINE_PIN_HOLD_BATCHES`]. Empty maps
+    /// are ignored. Caller must drop the batch's store Arc (see
+    /// [`BatchParents::hold_after_commit`]) so this store can `Drop`.
+    pub(crate) fn hold_pins(&self, pins: U64Map<Arc<SharedParentPin>>) {
+        if pins.is_empty() {
+            return;
+        }
+        let mut g = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+        g.push_back(pins);
+        while g.len() > PIPELINE_PIN_HOLD_BATCHES {
+            g.pop_front();
+        }
+    }
+
     /// Drop dead Weaks now (keeps map from retaining empty slots after pin drop).
     pub fn gc_dead_weaks(&self) {
         let mut g = self.maps.lock().unwrap_or_else(|e| e.into_inner());
@@ -427,6 +455,8 @@ impl PipelineParentStore {
     /// `publish_ids` should list create_fks whose local Arc is new to the store
     /// (typically vacant `insert_owned` results). Pure adopt hits already have a
     /// Weak and need not be re-walked — full-map publish was O(all parents).
+    /// Does **not** retain-walk the Weak map (IBD load pin is the caller). Dead
+    /// slots are dropped by [`Self::gc_dead_weaks`].
     ///
     /// On Arc identity conflict (peer batch won the slot), merge local sparse
     /// fields into the existing Arc and replace the batch handle so both batches
@@ -460,14 +490,6 @@ impl PipelineParentStore {
                         }
                     }
                 }
-            }
-            // Soft GC: drop dead Weaks periodically so the Weak map cannot retain
-            // empty slots for the whole IBD. Threshold keeps some share hits
-            // without unbounded weak growth (was 4k→65k; 16k is a middle ground).
-            if g.by_fk.len() > 16_384 {
-                g.by_fk.retain(|_, w| w.strong_count() > 0);
-                g.by_txid.retain(|_, w| w.strong_count() > 0);
-                g.live = g.by_fk.len();
             }
         }
         for (id, existing, local) in conflicts {
@@ -555,6 +577,18 @@ impl BatchParents {
 
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
+    }
+
+    /// After a successful write, keep this batch's pin Arcs in the pipeline store.
+    ///
+    /// Milestone skip drains `scriptq` immediately; without this ring, Weaks die
+    /// when write drops the batch. Strips the store Arc so the hold cannot cycle.
+    pub fn hold_after_commit(self) {
+        let Self { store, pins, .. } = self;
+        let Some(store) = store else {
+            return;
+        };
+        store.hold_pins(pins);
     }
 
     /// Bulk-adopt live shared pins for `ids` (one store lock). Call before pin fill.
@@ -2083,5 +2117,119 @@ mod tests {
         assert!(bulk.get(&missing_tid).is_none());
         assert!(bulk.get(&zero).is_none());
         let _keep = (live, no_range);
+    }
+
+    fn tx_n(n: u64) -> TxRecord {
+        let mut txid = [0u8; 32];
+        txid[..8].copy_from_slice(&n.to_le_bytes());
+        TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        }
+    }
+
+    /// Publish must not walk/retain the Weak map. Dead slots stay until
+    /// [`PipelineParentStore::gc_dead_weaks`] (mem-stats), not every insert.
+    #[test]
+    fn bulk_publish_does_not_retain_dead_weaks() {
+        let store = Arc::new(PipelineParentStore::new());
+        let n = 16_385usize;
+        let mut bp = BatchParents::with_store(Arc::clone(&store), n);
+        for i in 1..=n as u64 {
+            bp.insert_owned(
+                Fk(i),
+                tx_n(i),
+                vec![(0, out(1))],
+                vec![0],
+                Some(false),
+                None,
+                Vec::new(),
+            );
+        }
+        bp.publish_to_store();
+        drop(bp);
+        assert_eq!(store.live_count(), 0);
+
+        let mut next = BatchParents::with_store(Arc::clone(&store), 1);
+        next.insert_owned(
+            Fk(n as u64 + 1),
+            tx_n(n as u64 + 1),
+            vec![(0, out(2))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        next.publish_to_store();
+        let (weak, _, _) = store.size_snapshot();
+        assert!(
+            weak >= n,
+            "publish must not retain-walk dead Weaks (weak={weak}, need>={n})"
+        );
+        assert_eq!(store.live_count(), 1);
+        drop(next);
+        store.gc_dead_weaks();
+        assert_eq!(store.size_snapshot().0, 0);
+    }
+
+    #[test]
+    fn hold_after_commit_keeps_pins_after_batch_drop() {
+        let store = Arc::new(PipelineParentStore::new());
+        let mut bp = BatchParents::with_store(Arc::clone(&store), 1);
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            Some((100, 40)),
+            Vec::new(),
+        );
+        bp.publish_to_store();
+        bp.hold_after_commit();
+        assert_eq!(store.live_count(), 1);
+
+        let mut later = BatchParents::with_store(Arc::clone(&store), 1);
+        later.adopt_from_store([1]);
+        assert!(
+            later.has_parent_out(Fk(1), 0),
+            "post-write hold must keep outs for the next load adopt"
+        );
+    }
+
+    #[test]
+    fn hold_after_commit_evicts_oldest_past_cap() {
+        let store = Arc::new(PipelineParentStore::new());
+        let cap = PIPELINE_PIN_HOLD_BATCHES;
+        for i in 1..=cap + 1 {
+            let mut bp = BatchParents::with_store(Arc::clone(&store), 1);
+            bp.insert_owned(
+                Fk(i as u64),
+                tx_n(i as u64),
+                vec![(0, out(1))],
+                vec![0],
+                Some(false),
+                Some((i as u64 * 10, 8)),
+                Vec::new(),
+            );
+            bp.publish_to_store();
+            bp.hold_after_commit();
+        }
+        let mut later = BatchParents::with_store(Arc::clone(&store), 2);
+        later.adopt_from_store([1, (cap + 1) as u64]);
+        assert!(
+            !later.has_parent_out(Fk(1), 0),
+            "oldest held batch must drop at cap"
+        );
+        assert!(
+            later.has_parent_out(Fk((cap + 1) as u64), 0),
+            "newest held batch must stay"
+        );
+        assert_eq!(store.live_count(), cap);
     }
 }

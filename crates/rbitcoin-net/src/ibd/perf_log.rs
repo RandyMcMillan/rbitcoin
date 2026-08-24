@@ -10,7 +10,9 @@
 //! | DEBUG | `ibd: sizes …` | RSS + work path + **bq soft/RAM** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_batch head resolve; class_a commit |
 //!
-//! **Pins:** pipeline-local (plan batch_pin / BatchParents).
+//! **Pins:** pipeline-local (plan batch_pin / BatchParents). Write holds the
+//! last `scriptq`+`writeq` (18) committed pin-Arc maps so milestone skip still
+//! shares outs (`pstore live=`).
 //!
 //! Sample **once** per tick and reset all atomics, then format `ibd: progress`
 //! at INFO and meters (`perf` / `sizes` / `perf_dbg`) at DEBUG from the same

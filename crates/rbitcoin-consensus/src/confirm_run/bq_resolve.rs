@@ -6,6 +6,7 @@
 //! [`rbitcoin_query::IdLayer`] on the live union. Does not claim, structure, or stamp.
 
 use super::*;
+use crate::milestone::Milestone;
 use bitcoin::consensus::Decodable;
 use rbitcoin_query::{ResolvedWire, TxPrecompute, TxidHasher, U32Map};
 use std::collections::{HashMap, HashSet};
@@ -110,7 +111,7 @@ pub struct BqResolveWaveStats {
     pub work_ns: u64,
     /// `consensus_decode` of still-raw BQ payloads (this wave).
     pub decode_ns: u64,
-    /// `TxPrecompute::from_tx` after decode (this wave).
+    /// `TxPrecompute::from_tx` / `from_tx_connect` after decode (this wave).
     pub precompute_ns: u64,
     /// `push_resolve_keys` (this wave).
     pub collect_ns: u64,
@@ -164,15 +165,17 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
+    milestone: Milestone,
     heights: &[u32],
 ) -> Result<BqResolveWaveStats, ConsensusError> {
-    Ok(confirm_bq_resolve_wave_with_ids(query, params, heights, None)?.stats)
+    Ok(confirm_bq_resolve_wave_with_ids(query, params, milestone, heights, None)?.stats)
 }
 
 /// [`confirm_bq_resolve_wave`] with a lookup-owned live union.
 pub fn confirm_bq_resolve_wave_with_ids(
     query: &Query,
     params: &ChainParams,
+    milestone: Milestone,
     heights: &[u32],
     mut ids: Option<(
         &mut rbitcoin_query::LiveUnion,
@@ -278,7 +281,15 @@ pub fn confirm_bq_resolve_wave_with_ids(
                 .decode_ns
                 .saturating_add(t_dec.elapsed().as_nanos() as u64);
             let t_pre = Instant::now();
-            let pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+            let pres: Vec<TxPrecompute> = if milestone.skips_scripts_at(h) {
+                block
+                    .txdata
+                    .iter()
+                    .map(TxPrecompute::from_tx_connect)
+                    .collect()
+            } else {
+                block.txdata.iter().map(TxPrecompute::from_tx).collect()
+            };
             stats.precompute_ns = stats
                 .precompute_ns
                 .saturating_add(t_pre.elapsed().as_nanos() as u64);
@@ -577,6 +588,7 @@ mod tests {
         let wave = confirm_bq_resolve_wave_with_ids(
             &q,
             &params,
+            Milestone::NONE,
             &[1, 2],
             Some((&mut live, q.published_ids().as_ref())),
         )
@@ -606,6 +618,49 @@ mod tests {
         assert_eq!((head.lo, head.hi), (1, 2));
         assert!(!q.block_queue_has_height(1));
         assert!(!q.block_queue_has_height(2));
+        let spend_pre = &wave.items[0].2.pres[1];
+        assert!(
+            spend_pre.sha_prevouts.is_some(),
+            "Milestone::NONE must from_tx (sighash midstates present)"
+        );
+        assert_eq!(
+            spend_pre.txid,
+            b1.txdata[1].compute_txid().to_byte_array()
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn bq_resolve_wave_connect_precompute_omits_midstates() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let g_cb = genesis.txdata[0].compute_txid();
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
+        );
+        let expect_txid = TxPrecompute::from_tx(&b1.txdata[1]).txid;
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
+            .unwrap();
+        let mut live = rbitcoin_query::LiveUnion::new();
+        let wave = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            Milestone { height: 100 },
+            &[1],
+            Some((&mut live, q.published_ids().as_ref())),
+        )
+        .unwrap();
+        assert_eq!(wave.items.len(), 1);
+        let spend_pre = &wave.items[0].2.pres[1];
+        assert_eq!(spend_pre.txid, expect_txid);
+        assert_eq!(spend_pre.sha_prevouts, None);
+        assert_eq!(spend_pre.sha_sequences, None);
+        assert_eq!(spend_pre.sha_outputs, None);
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -626,7 +681,7 @@ mod tests {
             prev = b.block_hash();
             heights.push(h);
         }
-        let st = confirm_bq_resolve_wave(&q, &params, &heights).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &heights).unwrap();
         assert_eq!(
             st.heights, 9,
             "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
@@ -731,7 +786,7 @@ mod tests {
         // win = 0.2 * 60 = 12; ready=8 > 6 → hold the 1-block tail
         let _ = q.block_queue_update_soft_pressure(Some(0.2));
         let _ = rbitcoin_store::take_raw_clone_n();
-        let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[8]).unwrap();
         assert_eq!(st.heights, 0, "fat BQ must not mint a 1-block layer");
         assert_eq!(
             st.decode_ns, 0,
@@ -752,7 +807,7 @@ mod tests {
         assert!(q.block_queue_resolved(8).is_none());
 
         let _ = q.block_queue_update_soft_pressure(None);
-        let st = confirm_bq_resolve_wave(&q, &params, &[8]).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[8]).unwrap();
         assert_eq!(st.heights, 1, "unknown window must allow a short wave");
         assert!(!q.block_queue_has_height(8));
         let _ = std::fs::remove_dir_all(&path);
@@ -778,7 +833,7 @@ mod tests {
         }
         // win=12; ready=20 > 6 (fat) but height 1 is path_lo — load is waiting on it.
         let _ = q.block_queue_update_soft_pressure(Some(0.2));
-        let st = confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[1]).unwrap();
         assert_eq!(
             st.heights, 1,
             "unresolved height in the first half of the soft window must emit"
@@ -805,7 +860,7 @@ mod tests {
         // IBD-sized window, BQ still filling (10 < 180). Height 1 is tip+1.
         let _ = q.block_queue_update_soft_pressure(Some(3.0));
         let all: Vec<u32> = (1..=10).collect();
-        let st = confirm_bq_resolve_wave(&q, &params, &all).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &all).unwrap();
         assert_eq!(
             st.heights, 10,
             "tip+1 must emit even under 8000 inputs while the BQ is filling"
@@ -835,7 +890,7 @@ mod tests {
         }
         let _ = q.block_queue_update_soft_pressure(Some(3.0));
         let _ = rbitcoin_store::take_raw_clone_n();
-        let st = confirm_bq_resolve_wave(&q, &params, &[15]).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[15]).unwrap();
         assert_eq!(
             st.heights, 0,
             "a far 1-block layer must hold under 8000 inputs while more remain"
@@ -873,14 +928,26 @@ mod tests {
         let mut live = rbitcoin_query::LiveUnion::new();
         let published = rbitcoin_query::PublishedIds::new();
         let st1 =
-            confirm_bq_resolve_wave_with_ids(&q, &params, &[1], Some((&mut live, &published)))
+            confirm_bq_resolve_wave_with_ids(
+                &q,
+                &params,
+                Milestone::NONE,
+                &[1],
+                Some((&mut live, &published)),
+            )
                 .unwrap()
                 .stats;
         assert_eq!(st1.skipped, 0);
         assert!(st1.hits >= 1);
         assert!(published.get(&g_cb.to_byte_array()).is_some());
         let st2 =
-            confirm_bq_resolve_wave_with_ids(&q, &params, &[2], Some((&mut live, &published)))
+            confirm_bq_resolve_wave_with_ids(
+                &q,
+                &params,
+                Milestone::NONE,
+                &[2],
+                Some((&mut live, &published)),
+            )
                 .unwrap()
                 .stats;
         assert!(
@@ -922,7 +989,7 @@ mod tests {
         q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
             .unwrap();
         // Caller skipped height 2 (claimed / inflight) — only resolve 1.
-        let st = confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
+        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[1]).unwrap();
         assert_eq!(st.heights, 1);
         assert!(!q.block_queue_has_height(1), "emitted height is dequeued");
         assert!(q.block_queue_has_height(2));
@@ -954,6 +1021,7 @@ mod tests {
         let st = confirm_bq_resolve_wave_with_ids(
             &q,
             &params,
+            Milestone::NONE,
             &[2],
             Some((&mut live, q.published_ids().as_ref())),
         )
@@ -1230,7 +1298,7 @@ mod tests {
         let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
             .unwrap();
-        confirm_bq_resolve_wave(&q, &params, &[1]).unwrap();
+        confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[1]).unwrap();
         assert!(!q.block_queue_has_height(1));
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)

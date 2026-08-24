@@ -145,7 +145,7 @@ mempool_size_mb=100
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `.cookie`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
 rarely-read Class A **inwit** stem (`inwit.body` + `inwit.idx/`, ~486 GiB + idx
-on mainnet) on another volume. Pin / spend-annotate / Electrum / Cake do not
+on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not
 read inwit; reconstruct / `getrawtransaction` / block serve do.
 
 ```
@@ -377,7 +377,7 @@ annotations on **`spent.body`** (no `point.head`). Inputs store **`create_fk` +
 vout** (soft `prev_txid` in RAM only).
 
 **Memory rule:** Direct IBD writes durable segmented `tx.head.*` live and spend
-annotations on confirm. Pin/SH/Cake read **`txout` only**; annotate dirties
+annotations on confirm. Pin/SH/tweaks read **`txout` only**; annotate dirties
 **`spent`**. Parent resolve uses parent cache + `tx.head` (open + fuse-gated
 sealed). SH create dedupe is an **O(1) height watermark**; durable SH tables
 bulk-load at tip as sorted files (ingest OA is the only large SH heap). Densify
@@ -526,9 +526,11 @@ multi-hour Class A work casually — [`docs/env-knobs.md`](docs/env-knobs.md).
 
 ## Silent payment tweaks (`--sptweaks`)
 
-Optional **thin** BIP-352 index for Cake-compatible `blockchain.tweaks.subscribe`.
-Default **off**. The Electrum method still exists when off (naive per-height
-walk). Flag on = persist + serve-from-index.
+Optional **thin** BIP-352 index for Electrum `blockchain.tweaks.subscribe`
+(Cake Wallet, [kiss-bdk](https://github.com/kkdao/kiss-bdk); client-side
+scan). Default **off**. The method still exists when off (naive per-height
+walk). Flag on = persist + serve-from-index. Stream shape and Sparrow/Frigate:
+[`COMPAT.md`](./COMPAT.md) (Electrum surface).
 
 **Not built during Direct IBD** (the write thread stays Class A + annotate).
 After catch-up, **SH materialize first** (if `--shindex`), then a background
@@ -545,7 +547,7 @@ On disk (schema 17 dirs; leftover single files are unlinked on startup):
 | `store/sp_tweaks.idx/` | `meta` (`origin` + fmt 3) + `NNNNNN` tip-only `u32` start offs (no `header_fk`) |
 | `store/sp_tweaks.body/` | Matching `NNNNNN` files: per tx `len=0` or `len=33` + compressed `A_tweak`. New pair when the next start would exceed 4 GiB. |
 
-**Not stored:** txids, Taproot outs, values, parent scripts. Cake
+**Not stored:** txids, Taproot outs, values, parent scripts. Notify
 `output_pubkeys` are joined from this block’s **`txout`** body (~12 ms
 sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
 **not** parent-peek (~40–80 blk/s vs ~1.5–3 naive on that VM).
@@ -563,8 +565,8 @@ P2TR/ordinals density rises). The old serial `get_tx_full` path was
 `next_height` is the last complete put. INFO every 10 s:
 `sptweaks: backfill next=… tip=… rate=…/s remain=…`.
 
-Cake’s scan isolate may still hardcode `electrs.cakewallet.com` even after a
-successful probe — see `COMPAT.md`.
+Cake Wallet’s scan isolate may still hardcode `electrs.cakewallet.com` even
+after a successful probe — see `COMPAT.md`.
 
 ## Electrum
 
@@ -576,8 +578,9 @@ security model by itself.
 
 **Requires `--shindex`.** Without it the node refuses to start.
 
-`server.version[0]` is `rbitcoin-electrs <ver>` so Cake `getNodeIsElectrs()`
-will probe silent-payment tweaks. We are **not** electrs — see `COMPAT.md`.
+`server.version[0]` is `rbitcoin-electrs <ver>` so Cake Wallet
+`getNodeIsElectrs()` will probe silent-payment tweaks. Other tweaks clients
+do not need that substring. We are **not** electrs — see `COMPAT.md`.
 
 **Not a graphical explorer.** We serve clients that already know their
 scripthashes / txids; we do **not** aim to back block-explorer search UIs.
@@ -604,7 +607,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
-| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sptweaks` index: multi-height load (default ≤128 heights / ≤8192 eligible txs per wave) then per-height Cake notifies, **one TCP flush per wave**. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `inwit` stays out). Pre-taproot heights are empty maps in waves of ≤1024 (no store). Without index / hole: naive per height (Class A + parent outs). JSON-RPC result is the **first** height (`getTweaks` probe `[0,1,false]` → `{"0": {}}`). Further heights are notifications, then `{"message":"done"}`. `count` is honored through tip. `server.version[0]` contains `electrs`. On 9p-class IO expect slower than local disk. |
+| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sptweaks` index: multi-height load (default ≤128 heights / ≤8192 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `inwit` stays out). Pre-taproot heights are empty maps in waves of ≤1024 (no store). Without index / hole: naive per height (Class A + parent outs). **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}`. `count` is honored through tip. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
 
 ### API request log
 
@@ -619,7 +622,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 during a wallet/bench query storm). Params are truncated (~384 bytes) so
 broadcast hex does not fill the disk.
 
-Use this to see whether Cake is hitting tweaks vs only scripthash history, and which calls take seconds.
+Use this to see whether a client is hitting tweaks vs only scripthash history, and which calls take seconds.
 `wall_ms` is the full handler (including JSON). Scripthash history / balance /
 UTXO / Esplora address stats share one waved Class A + spend join on the
 process `RBITCOIN_IO` session. `--log-level trace` emits

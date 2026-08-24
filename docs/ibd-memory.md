@@ -132,7 +132,7 @@ touches. Census: [`SCHEMA.md`](../SCHEMA.md) (tip 962298, 1.42 B creates).
 | Mode | Must stay hot | Approx | Cold (fault OK) |
 |------|---------------|--------|-----------------|
 | **Tip follow / Electrum serve** | Open `tx.head` + recent `txout`/`spent`/`txid` tails + SH main idx + mempool | **8–16 GiB** page cache + **~2–3 GiB** process | `inwit` (except `getrawtransaction`), sealed `tx.head` older than fuse-skip, archive `txout` |
-| **Comfortable serve** (busy wallets, Cake, RPC reconstruct) | Above + more `txout` + SH body slabs + `txid.body` | **16–32 GiB** | `inwit` except rawtx |
+| **Comfortable serve** (busy wallets, Electrum tweaks, RPC reconstruct) | Above + more `txout` + SH body slabs + `txid.body` | **16–32 GiB** | `inwit` except rawtx |
 | **IBD pin+annotate (no thrash)** | **All** `txout` + **all** `spent` + three `*.idx` + `txid.body` + `tx.head` | **~227 GiB** | **`inwit` (~486 GiB)** — wire still holds witness |
 | **IBD + reconstruct/getdata** | Previous + `inwit` | **~710 GiB** (same order as old packed `tx.body`) | — |
 | **SH tip materialize** | Sliced k-way: n-cpu workers, 256 KiB double-buffered pages on the TLS completion session (submit ahead, wait on promote), no temp pack bodies; ingest OA **~768 MiB** (2²⁵×24 B) | **≪1 GiB** extra heap | No 0.5–1 GiB OA image per shard |

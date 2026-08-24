@@ -26,7 +26,7 @@ use rbitcoin_primitives::{Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Compressed BIP-352 server tweak (Cake wire).
+/// Compressed BIP-352 server tweak (Electrum tweaks wire).
 pub const TWEAK_LEN: u8 = 33;
 const SLOT: u64 = 4;
 /// Schema 17: segmented tip-only idx, original 0/33 body.

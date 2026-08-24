@@ -594,7 +594,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Cake `output_pubkeys` come from `txout` only. One sequential span from
+    /// Notify `output_pubkeys` come from `txout` only. One sequential span from
     /// first..=last eligible in the wave (ineligible txout in the hole is
     /// included; fat **inwit** stays out).
     #[test]

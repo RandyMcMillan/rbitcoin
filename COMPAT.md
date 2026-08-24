@@ -74,8 +74,8 @@ Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below. `server.version` negotiates: omitted → `1.4.2`; `"1.4"` → `1.4`; `["1.4","1.4.2"]` → `1.4.2`; `"1.4.2-asof"` (or a range containing it) → as-of dialect. First call wins. `features.protocol_max` is `1.4.2`; `features.asof_protocol` is `1.4.2-asof`. |
-| blockchain.tweaks.subscribe | done | Cake stream (first height as result, then notifies + `done`). Naive walk, or `--sptweaks` thin index (`len:tweak` only; one `txout` span per wave). Pre-taproot: empty maps in ≤1024-height writes. Isolate may still hardcode `electrs.cakewallet.com` |
+| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below. `server.version` negotiates: omitted → `1.4.2`; `"1.4"` → `1.4`; `["1.4","1.4.2"]` → `1.4.2`; `"1.4.2-asof"` (or a range containing it) → as-of dialect. First call wins. `features.protocol_max` is `1.4.2`; `features.asof_protocol` is `1.4.2-asof`. `features.genesis_hash` is display-order hex (refuse a wrong-chain server before a tweaks scan). `features.tweaks` / `silent_payments` advertise the method; they are not a substitute for the stream. |
+| blockchain.tweaks.subscribe | done | **Stream**, not a one-shot result: JSON-RPC `result` is the **first** height only; remaining heights are unsolicited notifications; `{"message":"done"}` ends the run. Each height carries tweak + txid + taproot `output_pubkeys` (client scans locally; no block fetch). Naive walk, or `--sptweaks` thin index (`len:tweak` only; one `txout` span per wave). Pre-taproot: empty maps in ≤1024-height writes. Clients: Cake Wallet, [kiss-bdk](https://github.com/kkdao/kiss-bdk). Sparrow Silent Payments uses Frigate `blockchain.silentpayments.subscribe` (server-side scan) — **not** this method. Cake isolate may still hardcode `electrs.cakewallet.com`. |
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; **subscribe status always full**; `listunspent` loads `txid.body` only for unspent creates; one TCP connection reuses the last SH outs+spent join until SH-view **hash** changes. Confirmed methods stamp live tip: a RAM SH head (pending write-behind) joins with durable SH so mempool can drop confirmed txs without a hole. Durable Class B seed waits until after tip announce. `get_history` skips mempool rows already in the confirmed list. `server.features.chain_tip = true`. Trailing **`asof:<blockhash>`** after the official args (`server.features.asof` / `asof_protocol = 1.4.2-asof`): confirmed rows as of that still-live ancestor **at or behind visible SH** (durable + pending), **no** mempool; stamp is the asof block; unknown hash or ahead of visible SH → `asof not on chain`. Prefix keeps it off the future positional-string landmine. Requires negotiated `1.4.2-asof` (first `server.version` only). Electrum `protocol_max` stays `1.4.2`. |
 | scripthash.get_mempool / subscribe | done | Status on mempool announce **and** when SH applies a height that creates or spends the hash (posting-list probe; no Class A expand on a miss). Headers subscribe still live tip. Reorg (`TipNotify.reorg_from_height`) restatuses every watch even if the new block misses the script. Status preimage is `txid:height:blockhash:` for confirmed rows (mempool rows stay `txid:height:`). |
@@ -104,8 +104,19 @@ We are **not** electrs. Cake Wallet `getNodeIsElectrs()` lowercases
 `version[0]` and requires the substring `electrs` before it will call
 `blockchain.tweaks.subscribe`. The first element is therefore
 `rbitcoin-electrs <ver>` (`ver` from `workspace.package.version`) so Cake
-will probe tweaks. Isolate may still hardcode `electrs.cakewallet.com`
-after a passing probe.
+will probe tweaks. Other tweaks clients (kiss-bdk) do not need that
+substring; they discover the chain via `server.features.genesis_hash`.
+Cake isolate may still hardcode `electrs.cakewallet.com` after a passing
+probe.
+
+### Tweaks stream vs Sparrow / Frigate
+
+`blockchain.tweaks.subscribe` is a **client-side** BIP-352 scan: the
+server never sees a scan key. A client that treats the JSON-RPC call as
+request/response reads one height and stops. Sparrow’s Silent Payments
+path talks Frigate `blockchain.silentpayments.subscribe` (scan key on
+the server). We do **not** implement that RPC. Sparrow still uses this
+node as a normal Electrum backend (scripthash / history / broadcast).
 | DoS floor | always on | max conn / line / idle / subs / broadcast hex (`ServeLimits`); public bind OK behind proxy |
 
 ### Chain view (confirmed-tx snapshot token)

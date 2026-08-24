@@ -408,15 +408,21 @@ fn stream_g_pages(
             if cqes.is_empty() {
                 session.submit_and_wait_one()?;
                 cqes = session.harvest_ready()?;
+                if cqes.is_empty() {
+                    session.poison();
+                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
+                }
             }
             for (ud, res) in cqes {
-                let (kind, _ep, slot) = crate::uring_session::unpack_ud(ud);
+                let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
                 let slot = slot as usize;
                 if kind != crate::uring_session::KIND_MPHF_G
+                    || ep != epoch
                     || slot >= pool_n
                     || slot_page[slot].is_none()
                 {
-                    return Err(StoreError::Corrupt("bdz g page bad slot"));
+                    session.poison();
+                    return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
                 }
                 in_flight = in_flight.saturating_sub(1);
                 let pi = slot_page[slot].take().unwrap();

@@ -325,9 +325,7 @@ mod tests {
         let p = dir.join("t.mphf");
         ram.write_to(&p).unwrap();
         let fd_mphf = BdzMphf::read_from(&p).unwrap();
-        let serial = fd_mphf
-            .index_batch(&keys[..8], &mut IoCtx::none())
-            .unwrap();
+        let serial = fd_mphf.index_batch(&keys[..8], &mut IoCtx::none()).unwrap();
 
         let leftover_path = dir.join("leftover.bin");
         let mut leftover_file = std::fs::OpenOptions::new()
@@ -362,9 +360,7 @@ mod tests {
         let batch = fd_mphf
             .index_batch(&keys[..8], &mut ctx)
             .unwrap_or_else(|e| {
-                panic!(
-                    "held index_batch with leftover KIND_BULK_PREAD must drain, not {e}"
-                )
+                panic!("held index_batch with leftover KIND_BULK_PREAD must drain, not {e}")
             });
         drop(ctx);
         session.drain_all().unwrap();

@@ -24,7 +24,7 @@ const NUMS_H: [u8; 32] = [
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
-/// One Taproot output listed for Cake `output_pubkeys`.
+/// One Taproot output listed for Electrum tweaks `output_pubkeys`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaprootOut {
     pub vout: u32,
@@ -300,7 +300,7 @@ pub fn tweaks_for_height(
     Ok(out)
 }
 
-/// Cake `TxTweak` from a stored 33-byte tweak + this tx’s packed outs.
+/// Tweaks-wire `TxTweak` from a stored 33-byte tweak + this tx’s packed outs.
 ///
 /// No parent IO. `Some(tweak)` with missing packed outs is corrupt.
 pub fn tweaks_from_thin_and_body(

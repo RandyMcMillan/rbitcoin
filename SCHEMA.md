@@ -280,7 +280,7 @@ spent.body Ss:  8 B × out_count  (flags + u56 field). Multi overflow → spent.
 ```
 
 Empty inwit / zero-out spent: **8-byte zero pad** so idx starts stay strictly monotone.
-Pin / SH / Cake read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
+Pin / SH / Electrum tweaks read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
 Reconstruct zips `txout` + `inwit`. First-page Outs reads are 4 KiB; truncated outs extend
 to the full idx span.
 
@@ -652,7 +652,7 @@ Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
 Hot pin+annotate working set: **txout + spent + three idx + txid + tx.head**
 (~129+32+16+42+8 ≈ **227 GiB**) vs packed **tx.body + idx + txid + head**
 (~663+5+42+8 ≈ **718 GiB**). Reconstruct / `getrawtransaction` also needs
-`inwit` (~486 GiB), which pin/SH/Cake do **not** open.
+`inwit` (~486 GiB), which pin/SH/tweaks do **not** open.
 
 ---
 

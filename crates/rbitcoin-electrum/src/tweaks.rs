@@ -1,4 +1,8 @@
-//! Cake-compatible `blockchain.tweaks.subscribe` (naive, uncached).
+//! `blockchain.tweaks.subscribe` (naive, uncached).
+//!
+//! Stream: JSON-RPC result is the first height; remaining heights are
+//! notifications; `{"message":"done"}` ends the run. Cake Wallet and
+//! kiss-bdk scan locally from tweak + txid + taproot outs.
 
 use rbitcoin_consensus::{tweaks_for_height, ChainParams, TxTweak};
 #[cfg(test)]
@@ -14,7 +18,7 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TweakReq {
     pub start: u32,
-    /// Requested height count (Cake scan sends tip − restore). Served through tip.
+    /// Requested height count (scan sends tip − restore). Served through tip.
     pub count: u32,
 }
 
@@ -81,7 +85,7 @@ pub fn subscribe_range_limits() -> ThinTweakRangeLimits {
     ThinTweakRangeLimits::default()
 }
 
-/// Pre-taproot empty Cake notifies per write (no store). Mainnet genesis→origin
+/// Pre-taproot empty notifies per write (no store). Mainnet genesis→origin
 /// is ~700k heights; one flush per height is the 10/s-class path.
 pub const EMPTY_WAVE_HEIGHTS: u32 = 1024;
 
@@ -95,7 +99,7 @@ pub fn pre_taproot_wave_last(start: u32, last: u32, taproot_h: u32) -> Option<u3
     Some(last.min(taproot_h.saturating_sub(1)).min(cap))
 }
 
-/// One subscribe wave of Cake notify lines starting at `start`.
+/// One subscribe wave of notify lines starting at `start`.
 ///
 /// Pre-taproot: empty height maps, no Class A. Indexed: thin batch. Hole:
 /// one naive/thin height.
@@ -254,8 +258,8 @@ pub fn done_notify() -> Value {
     })
 }
 
-/// JSON-RPC **result** is the **first** height only (Cake `getTweaks` / subscribe
-/// first stream event). Further heights are notifications from the server loop.
+/// JSON-RPC **result** is the **first** height only. Further heights are
+/// notifications from the server loop.
 pub fn subscribe(query: &Query, params: &Value, chain: &ChainParams) -> Result<Value, String> {
     let req = parse_req(params)?;
     let t0 = Instant::now();

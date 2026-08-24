@@ -7,6 +7,7 @@
 //! `server.version[0]` is `rbitcoin-electrs <workspace.package.version>`.
 //! We are not electrs. Cake Wallet `getNodeIsElectrs()` requires the
 //! substring `electrs` before it will probe `blockchain.tweaks.subscribe`.
+//! Other tweaks clients (kiss-bdk) use the same stream without that probe.
 
 mod server;
 mod tweaks;

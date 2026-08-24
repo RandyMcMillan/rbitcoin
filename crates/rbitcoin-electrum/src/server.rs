@@ -652,9 +652,9 @@ where
     Ok(())
 }
 
-/// Cake scan isolate: JSON-RPC result = first height, then one notify per
-/// following height, then `{"message":"done"}`. Honor `count` through tip
-/// (Cake asks for the remaining chain). Answer `server.ping` while computing.
+/// Tweaks stream: JSON-RPC result = first height, then one notify per
+/// following height, then `{"message":"done"}`. Honor `count` through tip.
+/// Answer `server.ping` while computing.
 async fn serve_tweaks_subscribe<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -728,7 +728,7 @@ where
         return Ok(());
     };
     // Remaining heights: pre-taproot empty waves (no store), else budgeted
-    // thin load (one txout span per batch) then Cake notifies. Hole → one height.
+    // thin load (one txout span per batch) then per-height notifies. Hole → one height.
     // `server.ping` must not drop the in-flight wave.
     let mut next = req.start.saturating_add(1);
     let limits = crate::tweaks::subscribe_range_limits();

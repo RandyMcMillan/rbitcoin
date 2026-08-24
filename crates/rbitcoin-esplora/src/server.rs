@@ -1324,11 +1324,12 @@ mod tests {
         assert!(bj.get("difficulty").is_some());
         assert!(bj.get("mediantime").is_some());
         assert_eq!(bj["previousblockhash"], block_hash_hex(&hashes[0]));
-        assert_eq!(
-            q.sample_reset_reconstruct_archived(),
-            0,
-            "/block JSON must not reconstruct wire"
+        assert!(
+            q.sample_reset_reconstruct_archived() >= 1,
+            "/block JSON reconstructs for consensus size/weight"
         );
+        assert!(bj["bits"].is_u64(), "Esplora bits is u32: {}", bj["bits"]);
+        assert_eq!(bj["bits"], 0x207fffff);
 
         // Raw block binary (HTTP body after headers — use binary-aware read).
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -1380,10 +1381,9 @@ mod tests {
         let list1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(list1[0]["height"], 1);
         assert_eq!(list1.len(), 2);
-        assert_eq!(
-            q.sample_reset_reconstruct_archived(),
-            0,
-            "/blocks must not reconstruct wire"
+        assert!(
+            q.sample_reset_reconstruct_archived() >= 1,
+            "/blocks summaries use consensus size/weight"
         );
 
         let txid0 = block_hash_hex(&coinbase_txids[0]);

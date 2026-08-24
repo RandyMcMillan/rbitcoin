@@ -1137,7 +1137,7 @@ pub struct Query {
     ///
     /// Avoids O(tip) header walks on Esplora/P2P `height_of_hash`.
     height_by_hash: Mutex<HeightByHashIndex>,
-    /// `reconstruct_archived_block` calls (Esplora summary must stay 0).
+    /// `reconstruct_archived_block` calls (`/raw` and Esplora size/weight).
     reconstruct_archived: AtomicU64,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     thin_tweak_body_bytes: AtomicU64,

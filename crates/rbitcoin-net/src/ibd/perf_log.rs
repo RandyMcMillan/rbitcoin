@@ -351,7 +351,7 @@ pub(crate) struct IbdPerfSample {
     pub plan_cold_io_ms: u64,
     /// Lookup-wave `consensus_decode` (`decode=`).
     pub lookup_decode_ms: u64,
-    /// Lookup-wave `TxPrecompute::from_tx` (`precompute=`).
+    /// Lookup-wave `TxPrecompute::from_tx` / `from_tx_connect` (`precompute=`).
     pub lookup_precompute_ms: u64,
     /// Lookup-wave TipOnly `get_fk_by_txid_batch` (`wave=… head=`). Not load stamp.
     pub lookup_wave_head_ms: u64,

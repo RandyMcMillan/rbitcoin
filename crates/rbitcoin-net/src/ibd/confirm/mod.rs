@@ -1642,6 +1642,7 @@ pub(crate) fn spawn_confirm_engine(
                     match rbitcoin_consensus::confirm_bq_resolve_wave_with_ids(
                         &hub.query,
                         &hub.params,
+                        hub.milestone,
                         &wave_h,
                         Some((&mut live_union, hub.query.published_ids().as_ref())),
                     ) {

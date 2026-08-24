@@ -618,7 +618,7 @@ pub mod lookup_stage_stats {
     pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
     /// Lookup-wave `consensus_decode` of still-raw BQ payloads.
     pub static DECODE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Lookup-wave `TxPrecompute::from_tx` after decode.
+    /// Lookup-wave `TxPrecompute::from_tx` / `from_tx_connect` after decode.
     pub static PRECOMPUTE_NS: AtomicU64 = AtomicU64::new(0);
     /// Lookup-wave TipOnly `get_fk_by_txid_batch` + slot sort. Not load stamp.
     pub static WAVE_HEAD_NS: AtomicU64 = AtomicU64::new(0);

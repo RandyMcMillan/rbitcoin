@@ -427,6 +427,8 @@ impl PipelineParentStore {
     /// `publish_ids` should list create_fks whose local Arc is new to the store
     /// (typically vacant `insert_owned` results). Pure adopt hits already have a
     /// Weak and need not be re-walked — full-map publish was O(all parents).
+    /// Does **not** retain-walk the Weak map (IBD load pin is the caller). Dead
+    /// slots are dropped by [`Self::gc_dead_weaks`].
     ///
     /// On Arc identity conflict (peer batch won the slot), merge local sparse
     /// fields into the existing Arc and replace the batch handle so both batches
@@ -460,14 +462,6 @@ impl PipelineParentStore {
                         }
                     }
                 }
-            }
-            // Soft GC: drop dead Weaks periodically so the Weak map cannot retain
-            // empty slots for the whole IBD. Threshold keeps some share hits
-            // without unbounded weak growth (was 4k→65k; 16k is a middle ground).
-            if g.by_fk.len() > 16_384 {
-                g.by_fk.retain(|_, w| w.strong_count() > 0);
-                g.by_txid.retain(|_, w| w.strong_count() > 0);
-                g.live = g.by_fk.len();
             }
         }
         for (id, existing, local) in conflicts {
@@ -2083,5 +2077,63 @@ mod tests {
         assert!(bulk.get(&missing_tid).is_none());
         assert!(bulk.get(&zero).is_none());
         let _keep = (live, no_range);
+    }
+
+    fn tx_n(n: u64) -> TxRecord {
+        let mut txid = [0u8; 32];
+        txid[..8].copy_from_slice(&n.to_le_bytes());
+        TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        }
+    }
+
+    /// Publish must not walk/retain the Weak map. Dead slots stay until
+    /// [`PipelineParentStore::gc_dead_weaks`] (mem-stats), not every insert.
+    #[test]
+    fn bulk_publish_does_not_retain_dead_weaks() {
+        let store = Arc::new(PipelineParentStore::new());
+        let n = 16_385usize;
+        let mut bp = BatchParents::with_store(Arc::clone(&store), n);
+        for i in 1..=n as u64 {
+            bp.insert_owned(
+                Fk(i),
+                tx_n(i),
+                vec![(0, out(1))],
+                vec![0],
+                Some(false),
+                None,
+                Vec::new(),
+            );
+        }
+        bp.publish_to_store();
+        drop(bp);
+        assert_eq!(store.live_count(), 0);
+
+        let mut next = BatchParents::with_store(Arc::clone(&store), 1);
+        next.insert_owned(
+            Fk(n as u64 + 1),
+            tx_n(n as u64 + 1),
+            vec![(0, out(2))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        next.publish_to_store();
+        let (weak, _, _) = store.size_snapshot();
+        assert!(
+            weak >= n,
+            "publish must not retain-walk dead Weaks (weak={weak}, need>={n})"
+        );
+        assert_eq!(store.live_count(), 1);
+        drop(next);
+        store.gc_dead_weaks();
+        assert_eq!(store.size_snapshot().0, 0);
     }
 }

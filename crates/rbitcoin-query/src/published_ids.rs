@@ -2,7 +2,7 @@
 //!
 //! Lookup prepends one [`IdLayer`] per resolve wave (a span of BQ heights)
 //! and [`publish`](LiveUnion::publish) stores the chain head (`Arc` bump).
-//! [`LiveUnion::get`] / [`partition`](LiveUnion::partition) and load
+//! [`LiveUnion::get`] / [`partition_into_layer`](LiveUnion::partition_into_layer) and load
 //! [`get`](PublishedIds::get) walk newest → older. A layer stays until
 //! **no** height in its span is still on the body queue; drop is splice
 //! only (no union rebuild). [`unpublish`](PublishedIds::unpublish) (store
@@ -153,12 +153,16 @@ impl LiveUnion {
         self.head.as_deref()?.get(txid)
     }
 
-    /// Split `keys` into already-known hits vs TipOnly need.
-    pub fn partition<'a>(
+    /// Re-home union hits into `layer` (this wave's map) and return TipOnly `need`.
+    ///
+    /// `skipped` is TipOnly avoided, not omitted from `layer`. Zero txid is
+    /// never a hit and never appears in `need`.
+    pub fn partition_into_layer<'a>(
         &self,
         keys: impl IntoIterator<Item = &'a [u8; 32]>,
-    ) -> (IdMap, Vec<[u8; 32]>) {
-        let mut known = IdMap::default();
+        layer: &mut IdMap,
+    ) -> (u32, Vec<[u8; 32]>) {
+        let mut skipped = 0u32;
         let mut need = Vec::new();
         for t in keys {
             if *t == [0u8; 32] {
@@ -166,12 +170,13 @@ impl LiveUnion {
             }
             match self.get(t) {
                 Some(hit) => {
-                    known.insert(*t, hit);
+                    layer.insert(*t, hit);
+                    skipped = skipped.saturating_add(1);
                 }
                 None => need.push(*t),
             }
         }
-        (known, need)
+        (skipped, need)
     }
 
     /// Drop layers whose span has no remaining queued height. Does not swap.
@@ -196,28 +201,26 @@ impl LiveUnion {
     }
 
     /// Prepend one layer covering `lo..=hi` (inclusive).
-    pub fn note_span(&mut self, lo: u32, hi: u32, hits: &IdMap) {
+    ///
+    /// `hits` is this wave's parent identities (re-homed union hits + TipOnly
+    /// misses). Moved into an Arc — no per-entry copy. Zero txid is stripped.
+    pub fn note_span(&mut self, lo: u32, hi: u32, mut hits: IdMap) {
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
         self.head = splice_kept(self.head.take(), |h| h < lo || h > hi);
-        let mut layer_hits = IdMap::default();
-        for (t, &v) in hits {
-            if *t == [0u8; 32] {
-                continue;
-            }
-            layer_hits.insert(*t, v);
+        hits.remove(&[0u8; 32]);
+        if hits.is_empty() {
+            return;
         }
-        if !layer_hits.is_empty() {
-            self.head = Some(Arc::new(IdLayer {
-                lo,
-                hi,
-                hits: Arc::new(layer_hits),
-                older: self.head.take(),
-            }));
-        }
+        self.head = Some(Arc::new(IdLayer {
+            lo,
+            hi,
+            hits: Arc::new(hits),
+            older: self.head.take(),
+        }));
     }
 
     /// Prepend a single-height layer (tests / one-shot).
-    pub fn note_height(&mut self, height: u32, hits: &IdMap) {
+    pub fn note_height(&mut self, height: u32, hits: IdMap) {
         self.note_span(height, height, hits);
     }
 
@@ -227,7 +230,7 @@ impl LiveUnion {
     }
 
     /// Insert hits under a synthetic single-height wave, publish the chain head.
-    pub fn finish_wave(&mut self, hits: &IdMap, published: &PublishedIds) -> u32 {
+    pub fn finish_wave(&mut self, hits: IdMap, published: &PublishedIds) -> u32 {
         let height = self.next_wave;
         self.next_wave = self.next_wave.saturating_add(1);
         self.note_height(height, hits);
@@ -425,18 +428,69 @@ mod tests {
         let mut live = LiveUnion::new();
         let t1 = tid(1);
         let t2 = tid(2);
-        live.finish_wave(&hits(&[(t1, Fk(10), (1, 2))]), &published);
+        live.finish_wave(hits(&[(t1, Fk(10), (1, 2))]), &published);
         assert_eq!(published.get(&t1), Some((Fk(10), (1, 2))));
-        let (known, need) = live.partition([&t1, &t2]);
-        assert_eq!(known.get(&t1).copied(), Some((Fk(10), (1, 2))));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&t1, &t2], &mut layer);
+        assert_eq!(skipped, 1);
+        assert_eq!(layer.get(&t1).copied(), Some((Fk(10), (1, 2))));
         assert_eq!(need, vec![t2]);
+    }
+
+    #[test]
+    fn partition_rehomes_into_layer_without_known_map() {
+        let mut live = LiveUnion::new();
+        let p = tid(1);
+        let fresh = tid(2);
+        live.note_span(1, 1, hits(&[(p, Fk(10), (1, 2))]));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&p, &fresh], &mut layer);
+        assert_eq!(skipped, 1, "union hit skips TipOnly");
+        assert_eq!(
+            layer.get(&p).copied(),
+            Some((Fk(10), (1, 2))),
+            "this-wave layer must re-home the union parent"
+        );
+        assert!(!layer.contains_key(&fresh));
+        assert_eq!(need, vec![fresh]);
+        let (skipped0, need0) = live.partition_into_layer([&[0u8; 32], &p], &mut IdMap::default());
+        assert_eq!(skipped0, 1);
+        assert!(need0.is_empty(), "zero txid is never TipOnly need");
+        assert!(
+            live.get(&p).is_some(),
+            "older layer still answers get until splice"
+        );
+    }
+
+    #[test]
+    fn rehome_survives_oldest_layer_drop() {
+        let published = PublishedIds::new();
+        let mut live = LiveUnion::new();
+        let p = tid(1);
+        live.note_span(1, 1, hits(&[(p, Fk(10), (1, 2))]));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&p, &tid(2)], &mut layer);
+        assert_eq!(skipped, 1);
+        assert_eq!(need, vec![tid(2)]);
+        live.note_span(2, 2, layer);
+        live.keep_heights(|h| h != 1);
+        live.publish(&published);
+        assert_eq!(
+            published.get(&p),
+            Some((Fk(10), (1, 2))),
+            "re-homed parent must survive drop of oldest span"
+        );
+        assert!(
+            published.get(&tid(2)).is_none(),
+            "unresolved this-wave key is not in the layer"
+        );
     }
 
     #[test]
     fn publish_reuses_layer_arc_when_unchanged() {
         let published = PublishedIds::new();
         let mut live = LiveUnion::new();
-        live.finish_wave(&hits(&[(tid(1), Fk(10), (1, 2))]), &published);
+        live.finish_wave(hits(&[(tid(1), Fk(10), (1, 2))]), &published);
         let a = published.load().expect("published");
         live.publish(&published);
         let b = published.load().expect("published");
@@ -453,11 +507,11 @@ mod tests {
         let shared = tid(1);
         let only1 = tid(2);
         let w1 = live.finish_wave(
-            &hits(&[(shared, Fk(10), (1, 2)), (only1, Fk(11), (3, 4))]),
+            hits(&[(shared, Fk(10), (1, 2)), (only1, Fk(11), (3, 4))]),
             &published,
         );
         let w2 = live.finish_wave(
-            &hits(&[(shared, Fk(10), (1, 2)), (tid(3), Fk(12), (5, 6))]),
+            hits(&[(shared, Fk(10), (1, 2)), (tid(3), Fk(12), (5, 6))]),
             &published,
         );
         let kept_hits = Arc::clone(&published.load().expect("head").hits);
@@ -492,7 +546,7 @@ mod tests {
     fn keep_queued_or_horizon_holds_after_bq_drop() {
         let published = PublishedIds::new();
         let mut live = LiveUnion::new();
-        live.note_span(10, 12, &hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.note_span(10, 12, hits(&[(tid(1), Fk(10), (1, 2))]));
         live.publish(&published);
         let empty = std::collections::BTreeSet::new();
         live.keep_queued_or_horizon(&empty, 20, 16);
@@ -514,7 +568,7 @@ mod tests {
     fn keep_span_while_any_height_in_range_queued() {
         let published = PublishedIds::new();
         let mut live = LiveUnion::new();
-        live.note_span(3, 5, &hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.note_span(3, 5, hits(&[(tid(1), Fk(10), (1, 2))]));
         live.publish(&published);
         live.keep_heights(|h| h != 3);
         live.publish(&published);
@@ -534,16 +588,18 @@ mod tests {
     #[test]
     fn note_span_and_keep_walk_layers_without_union_rebuild() {
         let mut live = LiveUnion::new();
-        live.note_span(1, 1, &hits(&[(tid(1), Fk(10), (1, 2))]));
-        live.note_span(2, 2, &hits(&[(tid(2), Fk(11), (3, 4))]));
+        live.note_span(1, 1, hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.note_span(2, 2, hits(&[(tid(2), Fk(11), (3, 4))]));
         live.keep_heights(|h| h == 2);
         assert_eq!(live.get(&tid(2)), Some((Fk(11), (3, 4))));
         assert!(
             live.get(&tid(1)).is_none(),
             "dropped layer must not be rebuilt into a live union map"
         );
-        let (known, need) = live.partition([&tid(2), &tid(3)]);
-        assert_eq!(known.get(&tid(2)).copied(), Some((Fk(11), (3, 4))));
+        let mut layer = IdMap::default();
+        let (skipped, need) = live.partition_into_layer([&tid(2), &tid(3)], &mut layer);
+        assert_eq!(skipped, 1);
+        assert_eq!(layer.get(&tid(2)).copied(), Some((Fk(11), (3, 4))));
         assert_eq!(need, vec![tid(3)]);
     }
 
@@ -551,10 +607,10 @@ mod tests {
     fn store_none_hides_until_next_publish() {
         let published = PublishedIds::new();
         let mut live = LiveUnion::new();
-        live.finish_wave(&hits(&[(tid(1), Fk(10), (1, 2))]), &published);
+        live.finish_wave(hits(&[(tid(1), Fk(10), (1, 2))]), &published);
         published.unpublish();
         assert!(published.get(&tid(1)).is_none());
-        live.finish_wave(&hits(&[(tid(1), Fk(10), (1, 2))]), &published);
+        live.finish_wave(hits(&[(tid(1), Fk(10), (1, 2))]), &published);
         assert_eq!(published.get(&tid(1)), Some((Fk(10), (1, 2))));
     }
 }

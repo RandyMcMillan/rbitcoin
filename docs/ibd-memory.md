@@ -31,7 +31,7 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Published identity union** | Per-wave parent maps still on the BQ (`ArcSwap` of the layer-chain head; get walks, no union rebuild) | Lookup drops a layer once no height in its span remains on the BQ. Disconnect stores `None`. Not a process FIFO. |
+| **Published identity union** | Per-wave map of **this wave's** parent identities (re-home union hits + TipOnly misses; `ArcSwap` of the layer-chain head; get walks, no union rebuild) | Lookup drops a layer once no height in **its span** remains on the BQ. Disconnect stores `None`. Not a process FIFO. |
 | **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range) |
 | **RecentCreates identity ring** | `txid → fk+range` only; expire EWMA(`lookup_taken_hi − tip`)+25% (floor 32, cap 32×144) | Write notes per height then **one** `flush_recent_creates` (and expire) after Class A+idx; disconnect `drop_from` + flush. Sizes: `recent=… live=/pub=/ov= fifo=`. Not a pin/outs FIFO |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |

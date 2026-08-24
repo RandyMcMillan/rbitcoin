@@ -49,6 +49,8 @@ pub const PAGE_SLOTS: u64 = 1 << PAGE_SLOT_BITS;
 
 /// Hard cap — full in-page exploration (never leave the page).
 pub const MAX_PROBE: u32 = 1024;
+/// Occupied `(depth, fk)` stored inline in [`ProbeCands`] before a spill `Vec`.
+pub const PROBE_CANDS_INLINE: usize = 8;
 
 /// Max bytes of one head page load (1024 × 8 B). 4 B entries use half.
 pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
@@ -316,11 +318,61 @@ pub(crate) struct PageHopDump {
     pub occupied: u32,
 }
 
+/// Occupied `(depth, encoded_fk)` from one hop. Inline for the common 1–2
+/// cand path; heap only past [`PROBE_CANDS_INLINE`].
+#[derive(Debug, Clone)]
+pub struct ProbeCands {
+    inline: [(u32, u64); PROBE_CANDS_INLINE],
+    n: u8,
+    spill: Vec<(u32, u64)>,
+}
+
+impl Default for ProbeCands {
+    fn default() -> Self {
+        Self {
+            inline: [(0, 0); PROBE_CANDS_INLINE],
+            n: 0,
+            spill: Vec::new(),
+        }
+    }
+}
+
+impl ProbeCands {
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.n as usize).saturating_add(self.spill.len())
+    }
+
+    #[inline]
+    pub fn push(&mut self, depth: u32, fk: u64) {
+        let i = self.n as usize;
+        if i < PROBE_CANDS_INLINE {
+            self.inline[i] = (depth, fk);
+            self.n = (i + 1) as u8;
+            return;
+        }
+        self.spill.push((depth, fk));
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &(u32, u64)> {
+        self.inline[..self.n as usize]
+            .iter()
+            .chain(self.spill.iter())
+    }
+}
+
+impl PartialEq for ProbeCands {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
 /// Result of hopping through one loaded page.
 #[derive(Debug, Clone)]
 pub struct ProbeRegionScan {
     /// Occupied create_fks with absolute probe depth (home = 0).
-    pub cands: Vec<(u32, u64)>,
+    pub cands: ProbeCands,
     /// Saw an empty slot (probe chain ends).
     pub hit_empty: bool,
     /// Depth of empty slot if [`Self::hit_empty`], else depths explored without empty.
@@ -341,7 +393,7 @@ pub fn hop_scan_page(
 ) -> ProbeRegionScan {
     let mask = page_slots - 1;
     let max_d = max_probe.min(page_slots as u32);
-    let mut cands = Vec::new();
+    let mut cands = ProbeCands::default();
     for d in 0..max_d {
         let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask;
         let Some(e) = entry_from_page_buf(page_buf, local, entry_bytes) else {
@@ -355,7 +407,7 @@ pub fn hop_scan_page(
                 empty_local: local,
             };
         }
-        cands.push((d, e));
+        cands.push(d, e);
     }
     ProbeRegionScan {
         cands,
@@ -422,7 +474,7 @@ pub fn insert_fk_into_page_buf(
     let h1 = h1_in_page(txid, bits);
     let h2 = h2_in_page(txid, bits);
     let scan = hop_scan_page(page_buf, entry_bytes, h1, h2, nslots, MAX_PROBE);
-    for &(_d, e) in &scan.cands {
+    for &(_d, e) in scan.cands.iter() {
         if e == new_u {
             return Ok(InsertPageOutcome {
                 wrote_new: false,
@@ -1006,7 +1058,7 @@ impl AddressHead {
                         let h1p = h1_in_page(txid, bits);
                         let h2p = h2_in_page(txid, bits);
                         let scan = hop_scan_page(&buf[..n], es, h1p, h2p, nslots, MAX_PROBE);
-                        out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                        out[orig] = scan.cands.iter().map(|&(_, e)| Fk(e)).collect();
                     }
                 }
             }
@@ -1129,7 +1181,7 @@ impl AddressHead {
                             let h1p = h1_in_page(txid, bits);
                             let h2p = h2_in_page(txid, bits);
                             let scan = hop_scan_page(page, es, h1p, h2p, nslots, MAX_PROBE);
-                            out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                            out[orig] = scan.cands.iter().map(|&(_, e)| Fk(e)).collect();
                         }
                     }
                     free_slots.push(slot);
@@ -1253,9 +1305,32 @@ mod tests {
         // slot 2 empty
         let s = hop_scan_page(&buf, 4, 0, 1, 4, MAX_PROBE);
         assert!(s.hit_empty);
-        assert_eq!(s.cands, vec![(0, 1), (1, 2)]);
+        assert_eq!(
+            s.cands.iter().copied().collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2)]
+        );
         assert_eq!(s.depth_end, 2);
         assert_eq!(s.empty_local, 2);
+    }
+
+    #[test]
+    fn hop_scan_page_spills_past_inline_cap() {
+        let n = PROBE_CANDS_INLINE + 1;
+        let page_slots = 16usize;
+        let mut buf = vec![0u8; page_slots * 4];
+        for i in 0..n {
+            let fk = (i as u32) + 1;
+            buf[i * 4..i * 4 + 4].copy_from_slice(&fk.to_le_bytes());
+        }
+        let s = hop_scan_page(&buf, 4, 0, 1, page_slots as u64, MAX_PROBE);
+        assert_eq!(s.cands.len(), n);
+        assert_eq!(
+            s.cands.iter().last().copied(),
+            Some(((n as u32) - 1, n as u64))
+        );
+        let got: Vec<_> = s.cands.iter().copied().collect();
+        let expect: Vec<_> = (0..n as u32).map(|d| (d, u64::from(d) + 1)).collect();
+        assert_eq!(got, expect);
     }
 
     #[test]

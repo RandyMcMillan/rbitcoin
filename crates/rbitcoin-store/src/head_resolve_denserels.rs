@@ -158,7 +158,7 @@ fn diagnose_txid_probe(
     let h1 = h1_in_page(&mixed, bits);
     let h2 = h2_in_page(&mixed, bits);
     let mut rel_meta = std::collections::HashMap::new();
-    for &(d, rel) in &hop.scan.cands {
+    for &(d, rel) in hop.scan.cands.iter() {
         let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask;
         rel_meta.insert(rel, (d, local));
     }

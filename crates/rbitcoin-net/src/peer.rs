@@ -253,7 +253,7 @@ pub async fn connect_and_handshake(
 /// Core VERSION/VERACK bound: 60s from TCP accept. Timeout drops the stream.
 pub const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub async fn inbound_connect_and_handshake(
+pub(crate) async fn inbound_connect_and_handshake(
     stream: TcpStream,
     magic: Magic,
     our_addr: SocketAddr,

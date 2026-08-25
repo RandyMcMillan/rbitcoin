@@ -153,5 +153,10 @@ bind.
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load |
 | `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
+| `optimistic_assemble_unstamped_parent_is_invariant` | Optimistic assemble: pin miss is lookup invariant, not head recover |
+| `parent_pin_stamp_take_from_plan_moves_maps` | S0 `take_from_plan` does not invert `create_by_txid` |
+| `plan_batch_one_fill_missing_when_parents_already_stamped` | one `fill_missing_parent_ranges` when packed adds no new fks |
+| `direct_write_skips_create_pin_map_recent_matches_idx` | Direct skips `write_create_pins`; RecentCreates body range = idx |
+| `pin_takes_stamp_parent_vouts` / `plan_batch_same_header_vouts_skipped_cross_height_pinned` | pin takes stamp vouts; same-header creates not pinned |
 | `confirm_engine_pins_spend_of_just_written_pack` | IBD load: child spend of just-written pack (187 denserels miss) |
 | `confirm_reject_blacklist_surface` | fk mismatch / connect height not tip+1 soft requeue |

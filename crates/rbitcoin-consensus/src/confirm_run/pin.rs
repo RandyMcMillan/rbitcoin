@@ -6,9 +6,8 @@ use super::*;
 ///
 /// Sources: plan/in-flight offline denserels → RecentCreates create_pin →
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
-/// reads head / `tx.idx` / `txid.body`. Write [`ensure_spend_abs_layouts`] stamps
-/// `spent.idx` ranges for archived parents — load does not idx-batch the full
-/// parent set.
+/// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
+/// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is holes-only.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,

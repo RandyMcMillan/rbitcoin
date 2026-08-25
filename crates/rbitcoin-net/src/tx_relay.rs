@@ -1577,17 +1577,6 @@ impl MempoolHub {
             .collect()
     }
 
-    /// Mining-order chunk snapshot for diagnostics / future templates.
-    pub fn mining_frontier_snapshot(&self) -> Vec<(u64, u64, u64, usize)> {
-        self.maybe_refresh_fee_snapshot();
-        self.fee_snapshot
-            .load()
-            .chunks
-            .iter()
-            .map(|c| (c.fee_rate_sat_per_kvb(), c.weight, c.fee_sat, c.txids.len()))
-            .collect()
-    }
-
     /// Weight (WU) ranking strictly above `rate_sat_per_kvb` (published chunks).
     pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
         self.maybe_refresh_fee_snapshot();
@@ -2097,7 +2086,6 @@ mod tests {
         let _ = hub.take_chunks_rebuilds();
         let _ = hub.fee_histogram();
         let _ = hub.estimate_fee_btc_per_kb(2);
-        let _ = hub.mining_frontier_snapshot();
         let n = hub.take_chunks_rebuilds();
         assert!(
             n <= 1,

@@ -74,7 +74,7 @@ spend annotations.
 | Role exclusivity | One appender, one annotator — not a global store mutex |
 | `tx.head` insert | **Sole writer**: page-coalesced `pwrite` + `published_len` Release (no CAS, no CPU fence). Role exclusivity — not multi-inserter safe |
 | `tx.head` segment seal | Roll opens the next OA immediately; BDZ+fuse8 runs on a sidecar. Lookup probes every unsealed OA until publish. Write joins the sidecar only on the *next* roll, `flush`, or `Drop` (not on the rolling insert). |
-| Process `rehash_gate` | Rare multi‑GiB open-hash rehash (host freeze prevention) |
+| `header.head` overflow | Insert past 7/8 rolls `header.head.gN` (new empty file). Occupied rewrite is open-only on an undersized single gen. |
 | `ChainHub::confirmed` | `RwLock<HashSet>` for O(1) `has_block` (IBD assign path) |
 
 There is **no** global “pause queries during confirm write.” Tip-as-commit +
@@ -122,8 +122,8 @@ API tokens: [`COMPAT.md`](../COMPAT.md) (Esplora headers, Electrum JSON-RPC extr
 ## Host freezes / IO storms
 
 Single Class A writer is intentional. Multi‑GiB **FdOnly grow** is fallocate-only
-(no remap), but **hash-head rehash** (header / scripthash shards when materializing)
-can still stall the **host** (page cache / disk). Class C tip tables use L2
+(no remap). Hash heads do not rewrite occupied tables while serving; a leftover
+undersized `header.head` may rewrite **once on open**. Class C tip tables use L2
 write-behind (`flush_class_c_tip` before BQ dequeue); large tables stay L0.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.
 

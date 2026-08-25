@@ -33,8 +33,8 @@ What the node actually runs. This is the map; findings follow.
 |-------|-----------|--------|
 | `TableFile` | fallocate + published HWM (Release) | body → idx → count/HWM; readers use HWM only |
 | `VarTable` / `ArrayTable` | append / dense slots + L2 write-behind | Class A/C. Seqlock on `(count, body_end)` |
-| `HashHead` / `ScriptHashHead` | 24-byte OA, 16-byte prefix key, linear probe | in-place rehash (zero + reinsert). Load 7/8 |
-| `ShardedHashHead` | hex-named shards | same OA per shard |
+| `HashHead` | 24-byte OA, 16-byte prefix key, linear probe | load 7/8; insert full → sibling gen (`header.head.gN`) or Corrupt. Open-only rewrite of undersized single gen |
+| `ScriptHashHead` | 32-byte OA ingest | seals at 0.80; no occupied rewrite while serving |
 | `AddressHead` | 4 KiB pages of relative fks | torn 4-byte writes accepted; body-txid verifies |
 | Sealed `tx.head` | BDZ MPHF + fuse8 filter | FdOnly `g`; fingerprints in RAM |
 | `binary_fuse8` | 3-hash XOR fingerprint | `contains` indexes fingerprints unchecked |
@@ -169,26 +169,6 @@ bits, else walk back to last non-min-diff block. Nearly every testnet3 header
 off a retarget boundary would fail. Mainnet unaffected.
 
 **Fix:** `params.allow_min_difficulty_blocks` like Core `GetNextWorkRequired`.
-
-### High — store / concurrency
-
-#### S-H1. ✔ HashHead / ScriptHashHead readers race in-place rehash
-
-`crates/rbitcoin-store/src/hashhead.rs`: `get_all_prefix` (~412) snapshots
-`slots` then probes lockless. `rehash_to` (~720) reads occupied, `zero_range`s
-the whole table (~765), publishes new `slots` (~768), reinserts. `rehash_gate`
-serializes rehashers only.
-
-A concurrent `get` can probe old geometry over zeros (false miss) or new
-geometry mid-reinsert; 16-byte key + 8-byte packed value are not atomic, so a
-reader can pair a key prefix with a stale fk. Downstream body-txid verify
-bounds tx.head; **header hash index** (`ShardedHashHead`) has no such check —
-`get_by_hash` can miss a live header during IBD ingest vs RPC/net.
-
-Same shape: `scripthash_head.rs` `get_many` vs `rehash_to`.
-
-**Fix:** generation/seqlock around probe (retry if gen changed), or rebuild
-into a fresh file and swap the fd.
 
 ### High — P2P / DoS / indexes
 
@@ -501,7 +481,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
-| store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
+| store | 0 | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
 | consensus + primitives | 4 (BIP342 weight, sigops pushdata, P2SH parser, testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
@@ -521,14 +501,13 @@ then IBD CPU.
 1. **C-H1 BIP342 validation weight** + **C-H2 sigop pushdata** + **C-H3 P2SH
    eval_script** — consensus; pin with Core-shaped fixtures. Closest to
    `docs/quality.md` pillar 1.
-2. **S-H1 HashHead seqlock/epoch** — false misses during grow.
-3. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
-4. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
-5. Electrum status **ordering**; decide COMPAT vs spec for the extra
+2. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
+3. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
+4. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
-6. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-7. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
-   v2 decode, and MTP ring are closed.
+5. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+6. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
+   v2 decode, MTP ring, and HashHead online rehash (S-H1) are closed.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
 pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
@@ -549,3 +528,4 @@ leaving a stale High row in §2–6.
 - **P8** — v2 `parse_v2_contents` does not sha256d; `FramedMessage::decode` is command+payload (checksum unused). [#245](https://github.com/reardencode/rbitcoin/pull/245).
 - **P10** — densify `densify_scan_lo` skips BQ-ready / inflight / archived prefix; pending still walked. [#245](https://github.com/reardencode/rbitcoin/pull/245).
 - **P16** — fence-tip MTP is an 11-slot ring on extend; pop rebuilds; historical heights still 11-read. [#245](https://github.com/reardencode/rbitcoin/pull/245).
+- **S-H1** — HashHead / ScriptHashHead no longer rewrite occupied tables while serving. Header overflow rolls `header.head.gN`; ingest SH seals at 0.80. Undersized single-gen `header.head` rewrites on open only. `rehash_to` / `rehash_gate` / `ShardedHashHead` deleted.

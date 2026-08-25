@@ -54,6 +54,14 @@ before 1.0).
 
 ### Changed
 
+- **Algo-review S-H1:** HashHead / ScriptHashHead no longer rewrite occupied
+  tables while serving. Mainnet `header.head` creates at 2²² slots (~96 MiB
+  sparse). Overflow rolls `header.head.gN`. Undersized single-gen files
+  rewrite on open. Ingest SH seals at 0.80. `ShardedHashHead`,
+  `HeadRole::ScriptHash`, and `rehash_gate` are deleted. Leftover 256-way
+  `header.head/` is Layout refuse. Closed
+  [`docs/algo-review.md`](docs/algo-review.md) S-H1.
+
 - **Algo-review P7/P8/P10/P16:** leftover TipOnly fence snapshot is
   `Arc` (COW on extend). Densify assign resumes after the BQ-ready
   prefix. BIP324 v2 decode is command+payload (no sha256d checksum, no

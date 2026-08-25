@@ -1,6 +1,6 @@
 # Which head file is which
 
-One map for `address_head` / `hashhead` / `sharded` / `segmented` / `scripthash_head`.
+One map for `address_head` / `hashhead` / `segmented` / `scripthash_head`.
 Confirm stages (lookup / load / scripts / write) and allowed IO live in
 [`invariants.md`](./invariants.md). Roles: [`concurrency.md`](./concurrency.md).
 On-disk bytes: [`SCHEMA.md`](../SCHEMA.md).
@@ -8,7 +8,8 @@ On-disk bytes: [`SCHEMA.md`](../SCHEMA.md).
 ## Picture
 
 ```text
-header.hash ──► header.head          HashHead (often 1 shard)
+header.hash ──► header.head          HashHead gen 0 (2²² mainnet; 64 tiny)
+            ──► header.head.gN       overflow gens (same slots; probe newest first)
                     16 B prefix + 8 B fk; .mlt if multi
 
 txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead
@@ -26,12 +27,12 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no 
 
 | Module | On disk | Key → value | Who reads it |
 |--------|---------|-------------|--------------|
-| `HashHead` + `ShardedHashHead` | `header.head` | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
+| `HashHead` | `header.head` (+ `.gN`) | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
 | `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.rel|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁶** keys/range (no OA). Open keeps fuse8 in RAM; BDZ `g` is FdOnly (4 KiB page stream). | Confirm **lookup** stamp after live pin miss |
 | Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators. BDZ `g` FdOnly; tags/val already FdOnly. | After tip bulk |
 | Ingest + L0/L1 ovf | `scripthash.ovf/ingest`, L0 `SHSR`, L1 MPHF, `ovf/body` | Same pack8 key for incremental / post-seal new keys | Tip; lookup ingest → L0 → L1 → main |
 
-`tx.head` is **not** a `HashHead`. `HeadRole` is only Header and ScriptHash.
+`tx.head` is **not** a `HashHead`. `HeadRole` is only Header. Sorted/MPHF SH shards are `sh_main_shard_count` (tiny=1, mainnet=64), not a HashHead. Leftover 256-way `header.head/` is Layout refuse.
 
 ## Lookup path (txid → create_fk)
 

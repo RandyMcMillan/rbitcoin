@@ -261,6 +261,9 @@ log a one-line warn, migrate or refuse with a clear message — do not silently
 - Multi-list record: `create_fk:u64 | next:u64` (prepended; newest first).
 - Lookups that need exact identity: `get_all` + **body verify**.
 - Rehash at load **7/8** (earlier eras rehashed more aggressively, e.g. ~1/2).
+  Current writer: insert past 7/8 is full; `header.head` rolls `header.head.gN`
+  instead of rewriting occupied slots. Open-grow of an undersized single gen
+  is the only occupied rewrite (exclusive, no concurrent probes).
 
 ### Why
 
@@ -269,7 +272,9 @@ log a one-line warn, migrate or refuse with a clear message — do not silently
 
 ### Still current
 
-- This model remains for **`header.head`** and generic `HashHead`.
+- Slot format remains for **`header.head`** and generic `HashHead`.
+- Overflow is sibling generations, not in-place rehash (writer policy, no
+  schema bump).
 - **Not** how scripthash create multisets are stored (those use hybrid slabs).
 - **Not** how v9+ `tx.head` works (keyless u32/u64 address table).
 

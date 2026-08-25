@@ -1382,7 +1382,7 @@ fn merge_cursors_inner(
         return Ok(());
     }
     if let Some(s) = session.as_mut() {
-        s.begin_batch();
+        s.begin_batch()?;
         let mut pushed = false;
         for i in 0..cursors.len() {
             if cursors[i].is_some() && try_submit_ahead_at(cursors, i, s)? {

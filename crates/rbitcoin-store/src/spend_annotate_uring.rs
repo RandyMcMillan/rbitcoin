@@ -75,7 +75,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
     }
 
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        session.begin_batch();
+        session.begin_batch()?;
         let epoch = session.epoch();
         let mut pending: VecDeque<usize> = (0..work.len()).collect();
         let mut abs_busy: U64Set = U64Set::default();
@@ -548,7 +548,7 @@ fn put_spend_batch_pure_write_uring(
     }
 
     let run = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        session.begin_batch();
+        session.begin_batch()?;
         let epoch = session.epoch();
         let mut pending: VecDeque<usize> = (0..groups.len()).collect();
         let nslots = MAX_SLOTS.min(groups.len().max(1));

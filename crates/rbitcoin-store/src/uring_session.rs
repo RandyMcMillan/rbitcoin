@@ -119,7 +119,7 @@ pub struct UringSession {
     epoch: u16,
     kind: SessionKind,
     /// Set on undrained leftover, unexpected CQE, CQ overflow, or wait timeout.
-    /// Push/begin_batch fail closed; [`with_thread_local`] drops the TLS ring.
+    /// Push and [`Self::begin_batch`] fail closed; [`with_thread_local`] drops the TLS ring.
     poisoned: bool,
 }
 
@@ -242,15 +242,15 @@ impl UringSession {
     /// Held TLS rings run probe → idx → BDZ g-pages → rel preads on one
     /// session. A previous machine that swallowed `drain_all` leaves CQEs in
     /// `pending`; the next wave must not harvest them as its own kind/slot.
-    pub fn begin_batch(&mut self) {
-        if self.poisoned {
-            return;
+    /// Poisoned or undrainable leftover is `Err` — callers must not push.
+    pub fn begin_batch(&mut self) -> Result<(), StoreError> {
+        self.check_live()?;
+        if !self.pending.is_empty() {
+            self.drain_all()?;
         }
-        if !self.pending.is_empty() && self.drain_all().is_err() {
-            self.poison();
-            return;
-        }
+        self.check_live()?;
         self.epoch = self.epoch.wrapping_add(1);
+        Ok(())
     }
 
     /// Push a pread SQE. Buffer must stay live until the CQE is harvested.
@@ -395,6 +395,7 @@ impl UringSession {
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
+                ring.submission().sync();
                 let ts = io_uring::types::Timespec::new().sec(WAIT_ONE_TIMEOUT_SECS);
                 let args = io_uring::types::SubmitArgs::new().timespec(&ts);
                 loop {
@@ -450,13 +451,15 @@ impl UringSession {
     /// same harvest are still returned after the error is noted; callers must
     /// treat `Err` as fatal and drain.
     pub fn harvest_ready(&mut self) -> Result<Vec<(u64, i32)>, StoreError> {
+        #[cfg(target_os = "linux")]
+        let mut overflow = 0u32;
         let raw = match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
-                {
+                overflow = {
                     let cq = ring.completion();
-                    cq_overflow_result(cq.overflow())?;
-                }
+                    cq.overflow()
+                };
                 ring.completion().sync();
                 ring.completion()
                     .map(|cqe| (cqe.user_data(), cqe.result()))
@@ -466,6 +469,11 @@ impl UringSession {
             #[cfg(windows)]
             SessionBackend::Iocp(eng) => eng.harvest_ready(),
         };
+        #[cfg(target_os = "linux")]
+        if overflow != 0 {
+            self.poison();
+            cq_overflow_result(overflow)?;
+        }
         let mut out = Vec::new();
         let mut unexpected = false;
         for (ud, res) in raw {
@@ -489,57 +497,138 @@ impl UringSession {
     /// harvest of only-ready CQEs is not enough — the kernel may still write
     /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
     pub fn drain_all(&mut self) -> Result<(), StoreError> {
-        match &mut self.backend {
+        self.drain_all_harvest()?;
+        if let Err(e) = self.pending.assert_drained() {
+            let already = self.poisoned;
+            self.poisoned = true;
+            if !already {
+                self.note_invariant(UringInvariant::Undrained);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn drain_all_harvest(&mut self) -> Result<(), StoreError> {
+        enum Harvest {
+            Uds(Vec<u64>),
             #[cfg(target_os = "linux")]
-            SessionBackend::Uring(ring) => {
-                let mut spins = 0u32;
-                while !self.pending.is_empty() && spins < DRAIN_MAX_SPINS {
-                    spins += 1;
-                    let ts = io_uring::types::Timespec::new().nsec(DRAIN_WAIT_NS);
-                    let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-                    match ring.submitter().submit_with_args(1, &args) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            if e.raw_os_error() != Some(libc::ETIME) && map_enter_err(&e).is_some()
-                            {
-                                let _ = ring.submit();
-                            }
+            Uring,
+            #[cfg(windows)]
+            IocpErr(StoreError),
+        }
+        let harvested = match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(_) => Harvest::Uring,
+            SessionBackend::Pool(pool) => {
+                pool.wait_idle();
+                Harvest::Uds(pool.harvest_ready().into_iter().map(|(ud, _)| ud).collect())
+            }
+            #[cfg(windows)]
+            SessionBackend::Iocp(eng) => match eng.wait_idle() {
+                Ok(()) => Harvest::Uds(eng.harvest_ready().into_iter().map(|(ud, _)| ud).collect()),
+                Err(e) => Harvest::IocpErr(e),
+            },
+        };
+        match harvested {
+            Harvest::Uds(uds) => self.apply_drain_cqes(uds),
+            #[cfg(target_os = "linux")]
+            Harvest::Uring => self.drain_all_uring(),
+            #[cfg(windows)]
+            Harvest::IocpErr(e) => Err(e),
+        }
+    }
+
+    fn apply_drain_cqes(&mut self, uds: Vec<u64>) -> Result<(), StoreError> {
+        let mut unexpected = false;
+        for ud in uds {
+            if self.pending.expect_cqe(ud).is_err() {
+                unexpected = true;
+            }
+        }
+        if unexpected {
+            self.poison();
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn note_invariant(&self, kind: UringInvariant) {
+        kind.counter()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+        rbitcoin_log::warn!(
+            "store: io_uring invariant {} pending={} epoch={} thread={thread} (Corrupt; not a TipOnly miss)",
+            kind.label(),
+            self.pending.len(),
+            self.epoch,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drain_all_uring(&mut self) -> Result<(), StoreError> {
+        let mut unexpected = false;
+        let mut overflow = 0u32;
+        let mut enter_err = None;
+        {
+            let SessionBackend::Uring(ring) = &mut self.backend else {
+                return Ok(());
+            };
+            ring.submission().sync();
+            let mut spins = 0u32;
+            while !self.pending.is_empty() && spins < DRAIN_MAX_SPINS {
+                spins += 1;
+                let ts = io_uring::types::Timespec::new().nsec(DRAIN_WAIT_NS);
+                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                match ring.submitter().submit_with_args(1, &args) {
+                    Ok(_) => {}
+                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => {}
+                    Err(e) => {
+                        if let Some(err) = map_enter_err(&e) {
+                            enter_err = Some(err);
+                            break;
                         }
                     }
-                    {
-                        let cq = ring.completion();
-                        let _ = cq_overflow_result(cq.overflow());
-                    }
-                    ring.completion().sync();
-                    for cqe in ring.completion() {
-                        let _ = self.pending.expect_cqe(cqe.user_data());
+                }
+                overflow = {
+                    let cq = ring.completion();
+                    cq.overflow()
+                };
+                ring.completion().sync();
+                for cqe in ring.completion() {
+                    if self.pending.expect_cqe(cqe.user_data()).is_err() {
+                        unexpected = true;
                     }
                 }
+                if overflow != 0 || unexpected {
+                    break;
+                }
+            }
+            if enter_err.is_none() && !unexpected && overflow == 0 {
                 let _ = ring.submit();
                 ring.completion().sync();
                 for cqe in ring.completion() {
-                    let _ = self.pending.expect_cqe(cqe.user_data());
-                }
-            }
-            SessionBackend::Pool(pool) => {
-                pool.wait_idle();
-                for (ud, _) in pool.harvest_ready() {
-                    let _ = self.pending.expect_cqe(ud);
-                }
-            }
-            #[cfg(windows)]
-            SessionBackend::Iocp(eng) => {
-                eng.wait_idle()?;
-                for (ud, _) in eng.harvest_ready() {
-                    let _ = self.pending.expect_cqe(ud);
+                    if self.pending.expect_cqe(cqe.user_data()).is_err() {
+                        unexpected = true;
+                    }
                 }
             }
         }
-        let drained = self.pending.assert_drained();
-        if drained.is_err() {
+        if let Some(err) = enter_err {
             self.poisoned = true;
+            return Err(err);
         }
-        drained
+        if unexpected {
+            self.poison();
+            return Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"));
+        }
+        if overflow != 0 {
+            self.poisoned = true;
+            cq_overflow_result(overflow)?;
+        }
+        Ok(())
     }
 }
 
@@ -778,12 +867,6 @@ static URING_METERS: UringMeters = UringMeters {
     idx_range_missing: std::sync::atomic::AtomicU64::new(0),
 };
 
-static WARNED_UNEXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static WARNED_UNDRAINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(any(test, target_os = "linux"))]
-static WARNED_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static WARNED_IDX_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Clone, Copy)]
 pub(crate) enum UringInvariant {
     UnexpectedCqe,
@@ -804,16 +887,6 @@ impl UringInvariant {
         }
     }
 
-    fn warned(self) -> &'static std::sync::atomic::AtomicBool {
-        match self {
-            Self::UnexpectedCqe => &WARNED_UNEXPECTED,
-            Self::Undrained => &WARNED_UNDRAINED,
-            #[cfg(any(test, target_os = "linux"))]
-            Self::CqOverflow => &WARNED_OVERFLOW,
-            Self::IdxRangeMissing => &WARNED_IDX_RANGE,
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::UnexpectedCqe => "unexpected_cqe",
@@ -828,15 +901,12 @@ impl UringInvariant {
 pub(crate) fn note_uring_invariant(kind: UringInvariant) {
     kind.counter()
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if !kind
-        .warned()
-        .swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        rbitcoin_log::warn!(
-            "store: io_uring invariant {} (Corrupt; not a TipOnly miss)",
-            kind.label()
-        );
-    }
+    let thread = std::thread::current();
+    let thread = thread.name().unwrap_or("unnamed");
+    rbitcoin_log::warn!(
+        "store: io_uring invariant {} thread={thread} (Corrupt; not a TipOnly miss)",
+        kind.label()
+    );
 }
 
 #[cfg(test)]
@@ -890,7 +960,6 @@ impl UringPending {
         if self.is_empty() {
             Ok(())
         } else {
-            note_uring_invariant(UringInvariant::Undrained);
             Err(StoreError::Corrupt("invariant: io_uring undrained"))
         }
     }
@@ -1017,6 +1086,28 @@ mod tests {
     #[test]
     fn drain_all_ok_when_empty() {
         assert!(UringPending::new().assert_drained().is_ok());
+    }
+
+    /// A CQE whose `user_data` was removed from `pending` is not a silent
+    /// drain success — it is leftover harvest (`unexpected cqe`).
+    #[test]
+    fn drain_all_unmatched_cqe_is_corrupt() {
+        use std::io::Write;
+        let (path, mut f) = tmp_rw("drain-unmatched");
+        f.write_all(&[0x11u8; 4]).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let mut buf = [0u8; 4];
+        session.push_pread(fd, 0, &mut buf, 10).unwrap();
+        session.submit().unwrap();
+        session.pending.expect_cqe(10).unwrap();
+        match session.drain_all() {
+            Err(StoreError::Corrupt("invariant: io_uring unexpected cqe")) => {}
+            other => panic!("unmatched drain CQE must be Corrupt, got {other:?}"),
+        }
+        assert!(session.is_poisoned());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1159,6 +1250,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Push publishes the SQ tail on `SubmissionQueue` drop; drain must still
+    /// complete those SQEs without a separate `sync_submission`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn drain_all_completes_unsynced_pushed_preads() {
+        if !crate::bulk_io::io_uring_enabled() {
+            return;
+        }
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-uring-drain-unsynced-{}",
+            std::process::id()
+        ));
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("tmp");
+        f.write_all(&[0xCDu8; 64]).unwrap();
+        f.sync_all().unwrap();
+        let fd = f.as_raw_fd();
+
+        let mut session = UringSession::try_open(32).expect("uring");
+        let mut buf = vec![0u8; 64];
+        session
+            .push_pread(fd, 0, buf.as_mut_slice(), 1)
+            .expect("push");
+        assert!(session.in_flight() > 0);
+        session.drain_all().expect("drain unsynced SQEs");
+        assert_eq!(session.in_flight(), 0);
+        assert_eq!(buf[0], 0xCD);
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn tmp_rw(tag: &str) -> (std::path::PathBuf, std::fs::File) {
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-session-{tag}-{}-{}",
@@ -1189,13 +1318,13 @@ mod tests {
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         let mut buf = [0u8; 4];
-        session.begin_batch();
+        session.begin_batch().unwrap();
         let epoch0 = session.epoch();
         let ud = pack_ud(KIND_BULK_PREAD, epoch0, 0);
         session.push_pread(fd, 0, &mut buf, ud).unwrap();
         session.submit().unwrap();
         assert!(session.in_flight() > 0);
-        session.begin_batch();
+        session.begin_batch().unwrap();
         assert_eq!(
             session.in_flight(),
             0,
@@ -1216,7 +1345,11 @@ mod tests {
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         session.pending.insert(99).unwrap();
-        session.begin_batch();
+        match session.begin_batch() {
+            Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
+            other => panic!("begin_batch must fail closed on undrainable leftover, got {other:?}"),
+        }
+        assert!(session.is_poisoned());
         let mut buf = [0u8; 1];
         let r = session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0));
         assert!(

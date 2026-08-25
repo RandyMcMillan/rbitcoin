@@ -340,7 +340,7 @@ mod tests {
         let leftover_fd = crate::io_handle::IoHandle::from_file(&leftover_file);
 
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
-        session.begin_batch();
+        session.begin_batch().unwrap();
         let mut leftover_buf = [0u8; 8];
         let ud = crate::uring_session::pack_ud(
             crate::uring_session::KIND_BULK_PREAD,

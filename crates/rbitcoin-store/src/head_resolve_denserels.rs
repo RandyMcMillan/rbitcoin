@@ -397,82 +397,67 @@ fn resolve_fk_and_range_pread(
 /// Kind tag for idx-page SQEs on the held plan session (`pack_ud` kind byte).
 const UD_KIND_IDX: u8 = crate::uring_session::KIND_IDX;
 
-/// Fill idx page buffers via held session; returns true if all pages complete.
+/// Fill idx page buffers via held session. Poison / leftover / undrained is
+/// `Err` — do not libc-fallback on this ring (BDZ g-pages share it).
 fn fill_idx_pages(
     sess: &mut UringSession,
     pages: &[crate::tx_idx::IdxPagePlan],
     bufs: &mut [Vec<u8>],
-) -> bool {
-    // Staged SQEs on the held plan ring (no nested TLS bulk_io session).
-    let flags = 0i32;
-    sess.begin_batch();
-    for (i, page) in pages.iter().enumerate() {
-        let ud = crate::uring_session::pack_ud(UD_KIND_IDX, sess.epoch(), i as u32);
-        if sess
-            .push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, flags)
-            .is_err()
-        {
-            let _ = sess.drain_all();
-            return false;
-        }
+) -> Result<(), StoreError> {
+    if pages.is_empty() {
+        return Ok(());
     }
-    sess.sync_submission();
-    let mut results = vec![i32::MIN; pages.len()];
-    let need = pages.len();
-    let mut done = 0usize;
-    while done < need {
-        let mut cqes = match sess.harvest_ready() {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = sess.drain_all();
-                return false;
-            }
-        };
-        if cqes.is_empty() {
-            if sess.submit_and_wait_one().is_err() {
-                let _ = sess.drain_all();
-                return false;
-            }
-            cqes = match sess.harvest_ready() {
-                Ok(c) => c,
-                Err(_) => {
-                    let _ = sess.drain_all();
-                    return false;
-                }
-            };
+    sess.begin_batch()?;
+    let epoch = sess.epoch();
+    let run = (|| -> Result<(), StoreError> {
+        for (i, page) in pages.iter().enumerate() {
+            let ud = crate::uring_session::pack_ud(UD_KIND_IDX, epoch, i as u32);
+            sess.push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, 0)?;
+        }
+        sess.sync_submission();
+        let mut results = vec![i32::MIN; pages.len()];
+        let need = pages.len();
+        let mut done = 0usize;
+        while done < need {
+            let mut cqes = sess.harvest_ready()?;
             if cqes.is_empty() {
-                let _ = sess.drain_all();
-                return false;
+                sess.submit_and_wait_one()?;
+                cqes = sess.harvest_ready()?;
+                if cqes.is_empty() {
+                    sess.poison();
+                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
+                }
+            } else {
+                sess.submit()?;
             }
-        } else if sess.submit().is_err() {
-            let _ = sess.drain_all();
-            return false;
-        }
-        for (ud, res) in cqes {
-            let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
-            if kind != UD_KIND_IDX || ep != sess.epoch() || (slot as usize) >= results.len() {
-                sess.poison();
-                let _ = sess.drain_all();
-                return false;
-            }
-            if results[slot as usize] != i32::MIN {
-                let _ = sess.drain_all();
-                return false;
-            }
-            results[slot as usize] = res;
-            done += 1;
-        }
-    }
-    for (i, &res) in results.iter().enumerate() {
-        if res < 0 || (res as usize) < pages[i].want {
-            let page = &pages[i];
-            let rc = page.fd.pread(page.page_off, &mut bufs[i][..page.want]);
-            if rc < 0 || (rc as usize) < page.want {
-                return false;
+            for (ud, res) in cqes {
+                let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
+                let slot = slot as usize;
+                if kind != UD_KIND_IDX
+                    || ep != epoch
+                    || slot >= results.len()
+                    || results[slot] != i32::MIN
+                {
+                    sess.poison();
+                    return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
+                }
+                results[slot] = res;
+                done += 1;
             }
         }
-    }
-    sess.drain_all().is_ok()
+        for (i, &res) in results.iter().enumerate() {
+            if res < 0 || (res as usize) < pages[i].want {
+                let page = &pages[i];
+                let rc = page.fd.pread(page.page_off, &mut bufs[i][..page.want]);
+                if rc < 0 || (rc as usize) < page.want {
+                    return Err(StoreError::Corrupt("invariant: idx page fill failed"));
+                }
+            }
+        }
+        Ok(())
+    })();
+    sess.drain_all()?;
+    run
 }
 
 /// Dedup idx OS pages by `(fd, page_off)` so a wave fills each page once.
@@ -526,12 +511,13 @@ fn body_ranges_batched(
         return Ok(vec![None; fks.len()]);
     }
     let mut bufs: Vec<Vec<u8>> = uniq.iter().map(|p| vec![0u8; p.want]).collect();
-    let filled = match ctx.session() {
-        Some(sess) => fill_idx_pages(sess, &uniq, &mut bufs),
-        None => false,
-    };
-    if !filled && !fill_idx_pages_libc(&uniq, &mut bufs) {
-        return Ok(vec![None; fks.len()]);
+    match ctx.session() {
+        Some(sess) => fill_idx_pages(sess, &uniq, &mut bufs)?,
+        None => {
+            if !fill_idx_pages_libc(&uniq, &mut bufs) {
+                return Err(StoreError::Corrupt("invariant: idx page fill failed"));
+            }
+        }
     }
     let mut page_ix = std::collections::HashMap::with_capacity(uniq.len());
     for (i, p) in uniq.iter().enumerate() {
@@ -560,7 +546,7 @@ fn body_ranges_batched(
         }
         match plan.decode_range(&page_refs) {
             Ok((off, len)) if len > 0 => out.push(Some((off, len))),
-            Ok(_) | Err(StoreError::Corrupt(_)) => out.push(None),
+            Ok(_) => out.push(None),
             Err(e) => return Err(e),
         }
     }
@@ -878,6 +864,25 @@ mod tests {
         .unwrap();
         assert_eq!(pread_hits, 1);
         assert_eq!(out.len(), 1);
+    }
+
+    /// Held-session idx fill must not libc-succeed on a poisoned ring (that
+    /// leaves leftover CQEs for BDZ g-pages on the same TLS session).
+    #[test]
+    fn poisoned_held_idx_fill_fails_closed() {
+        let (dir, t, _txids) = seed_table(8);
+        let mut session = crate::uring_session::UringSession::try_open_kind(
+            crate::uring_session::SessionKind::Pool,
+            32,
+        )
+        .expect("pool");
+        session.poison();
+        let mut ctx = crate::IoCtx::held(&mut session);
+        match body_ranges_batched(&t, &[Fk(1)], &mut ctx) {
+            Err(StoreError::Corrupt("invariant: io_uring session poisoned")) => {}
+            other => panic!("poisoned held idx fill must fail closed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

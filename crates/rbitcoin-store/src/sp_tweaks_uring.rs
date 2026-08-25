@@ -85,7 +85,7 @@ fn run_preads(
     if jobs.is_empty() {
         return Ok(());
     }
-    session.begin_batch();
+    session.begin_batch()?;
     let epoch = session.epoch();
     let n = jobs.len();
     let mut next = 0usize;

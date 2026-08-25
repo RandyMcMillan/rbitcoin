@@ -204,7 +204,7 @@ fn assert_bad_block(err: ConsensusError, needle: &str) {
 fn bip30_rejects_unspent_connected_sibling() {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, Query, U32Map, U64Map};
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, Query, U32Map};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
     use std::sync::Once;
 
@@ -264,8 +264,8 @@ fn bip30_rejects_unspent_connected_sibling() {
         &mut OutPointSet::default(),
         &BatchParents::new(),
         &mut U32Map::default(),
-        &mut U64Map::default(),
         &FkMap::default(),
+        &mut Vec::new(),
     )
     .expect_err("unspent sibling must trip BIP30");
     let msg = format!("{err}");
@@ -1799,14 +1799,13 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     {
         use super::structural_validate_spends;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map, U64Map};
+        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
         let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
         let parents = BatchParents::new();
         let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
         let mut pending = OutPointSet::default();
         let mut mtp = U32Map::default();
-        let mut meta = U64Map::default();
         let err = structural_validate_spends(
             &q,
             &b_n1,
@@ -1817,8 +1816,8 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &mut pending,
             &parents,
             &mut mtp,
-            &mut meta,
             &FkMap::default(),
+            &mut Vec::new(),
         )
         .expect_err("missing denserels abs must hard-fail");
         let msg = format!("{err}");

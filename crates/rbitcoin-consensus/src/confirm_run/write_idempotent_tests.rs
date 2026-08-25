@@ -1135,31 +1135,7 @@ fn pin_and_ensure_journey() {
         "unexpected err: {msg}"
     );
 
-    let prepared_pc = [Prepared {
-        height: Height(1),
-        header_fk: Fk(1),
-        tx_fks: vec![Fk(10)],
-        jobs: vec![],
-        spends: vec![([1u8; 32], 0, Fk(10), Fk(2))],
-        fees: 0,
-        check_scripts: false,
-        time: 1,
-        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-        hash: [2u8; 32],
-        prev_mtp: 0,
-    }];
-    let err = post_commit(
-        &q,
-        &prepared_pc,
-        &BatchParents::new(),
-        &rbitcoin_query::U64Map::default(),
-    )
-    .expect_err("missing denserels");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("invariant") && msg.contains("denserels"),
-        "unexpected err: {msg}"
-    );
+    post_commit(&q, &[]).expect("empty annotate list does not consult BatchParents");
 
     let parent_tx = rec_tx(0x11, 1);
     let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
@@ -2440,7 +2416,6 @@ fn structural_pinned_without_abs_is_invariant_error() {
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
     let mut pending = OutPointSet::default();
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
-    let mut meta_by_abs = rbitcoin_query::U64Map::default();
     let err = structural_validate_spends(
         &q,
         &block,
@@ -2451,8 +2426,8 @@ fn structural_pinned_without_abs_is_invariant_error() {
         &mut pending,
         &bp,
         &mut mtp,
-        &mut meta_by_abs,
         &rbitcoin_query::FkMap::default(),
+        &mut Vec::new(),
     )
     .expect_err("pinned without abs must be invariant");
     let msg = format!("{err}");

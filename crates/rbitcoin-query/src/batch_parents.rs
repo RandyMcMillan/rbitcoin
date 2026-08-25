@@ -1133,14 +1133,14 @@ impl BatchParents {
         Some(abs)
     }
 
-    /// Unique `(create_id, vout, abs)` for spend edges. Missing abs is Corrupt.
+    /// Unique `(create_id, vout, abs, spend_fk)` for spend edges. Missing abs is Corrupt.
     pub fn spend_abs_jobs(
         &self,
-        edges: impl IntoIterator<Item = (Fk, u32)>,
-    ) -> Result<Vec<(u64, u32, u64)>, StoreError> {
+        edges: impl IntoIterator<Item = (Fk, u32, Fk)>,
+    ) -> Result<Vec<(u64, u32, u64, Fk)>, StoreError> {
         let mut out = Vec::new();
         let mut seen = U64Set::default();
-        for (fk, vout) in edges {
+        for (fk, vout, sfk) in edges {
             if fk.is_null() {
                 continue;
             }
@@ -1153,7 +1153,7 @@ impl BatchParents {
                 ));
             };
             if seen.insert(abs) {
-                out.push((id, vout, abs));
+                out.push((id, vout, abs, sfk));
             }
         }
         Ok(out)
@@ -2307,10 +2307,13 @@ mod tests {
         bp.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
         bp.set_spent_range_only(Fk(1), (1000, 24));
         let jobs = bp
-            .spend_abs_jobs([(Fk(1), 0), (Fk::NULL, 0), (Fk(1), 0)])
+            .spend_abs_jobs([(Fk(1), 0, Fk(9)), (Fk::NULL, 0, Fk(9)), (Fk(1), 0, Fk(9))])
             .expect("abs");
-        assert_eq!(jobs, vec![(1, 0, rbitcoin_store::spent_abs(1000, 0))]);
-        let err = bp.spend_abs_jobs([(Fk(2), 0)]).unwrap_err();
+        assert_eq!(
+            jobs,
+            vec![(1, 0, rbitcoin_store::spent_abs(1000, 0), Fk(9))]
+        );
+        let err = bp.spend_abs_jobs([(Fk(2), 0, Fk(9))]).unwrap_err();
         assert!(
             err.to_string().contains("missing pin denserels/abs"),
             "got {err}"

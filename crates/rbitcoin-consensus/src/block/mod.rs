@@ -637,7 +637,6 @@ pub fn validate_block_connect(
     // Empty BatchParents → missing abs → Err (cold forbidden).
     let mut structural_pending = rbitcoin_query::OutPointSet::default();
     let mut mtp_cache = U32Map::default();
-    let mut meta_by_abs = U64Map::default();
     let _ = structural_validate_spends(
         query,
         block,
@@ -648,8 +647,8 @@ pub fn validate_block_connect(
         &mut structural_pending,
         &batch_parents,
         &mut mtp_cache,
-        &mut meta_by_abs,
         &FkMap::default(),
+        &mut Vec::new(),
     )?;
     Ok(())
 }
@@ -1496,11 +1495,22 @@ pub(crate) struct StructuralPhaseNs {
 /// load does not walk create height for every parent. Heights: bulk fence.
 /// Coin MTP only for time-type relative locks on version ≥2 txs (v1 skipped).
 ///
+/// Write-path spend annotate: abs + structural meta, no pin `get_spender_abs`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpendAnnotateJob {
+    pub abs: u64,
+    pub field: rbitcoin_primitives::Fk,
+    pub flags: u8,
+    pub create_fk: rbitcoin_primitives::Fk,
+    pub vout: u32,
+    pub spend_fk: rbitcoin_primitives::Fk,
+}
+
 /// **Spentness:** pin denserels → abs + bulk 8-byte meta. Sparse durable-**spent**
 /// set (not unspent). Missing abs / short meta is hard `Err`. **Multi-list** after
 /// reorg annotate is a protocol cold walk (`has_confirmed_strong_spender_create`)
-/// — not a hard fail (tip-follow reorgs leave multi flags by design). Snapshots
-/// `(field, flags)` into `meta_by_abs` for pure-write annotate.
+/// — not a hard fail (tip-follow reorgs leave multi flags by design). Emits
+/// [`SpendAnnotateJob`] for pure-write annotate.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -1516,8 +1526,8 @@ pub(crate) fn structural_validate_spends(
     pending_spent: &mut rbitcoin_query::OutPointSet,
     batch_parents: &rbitcoin_query::BatchParents,
     mtp_cache: &mut U32Map<u32>,
-    meta_by_abs: &mut U64Map<(rbitcoin_primitives::Fk, u8)>,
     run_create_height: &FkMap<u32>,
+    annotate: &mut Vec<SpendAnnotateJob>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::collections::HashSet;
     use std::time::Instant;
@@ -1580,8 +1590,30 @@ pub(crate) fn structural_validate_spends(
     // not a soft cold spentness path.
     let t_abs = Instant::now();
     let abs_jobs = batch_parents
-        .spend_abs_jobs(spends.iter().map(|&(_, vout, _, cfk)| (cfk, vout)))
+        .spend_abs_jobs(spends.iter().map(|&(_, vout, sfk, cfk)| (cfk, vout, sfk)))
         .map_err(ConsensusError::from)?;
+    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
+        let mut v: Vec<rbitcoin_primitives::Fk> = abs_jobs
+            .iter()
+            .map(|(id, _, _, _)| rbitcoin_primitives::Fk(*id))
+            .collect();
+        v.sort_unstable_by_key(|f| f.0);
+        v.dedup();
+        v
+    };
+    let durable_heights = query
+        .store()
+        .tx_height_get_batch(&unique_create_fks)
+        .map_err(ConsensusError::from)?;
+    let height_by_id: U64Map<u32> = unique_create_fks
+        .iter()
+        .zip(durable_heights.into_iter())
+        .filter_map(|(fk, h)| {
+            let id = fk.get()?;
+            let h = h.or_else(|| run_create_height.get(fk).copied())?;
+            Some((id, h))
+        })
+        .collect();
     // Sparse durable **spent** set (honest IBD: almost all outs unspent).
     // Present ⇒ confirmed-strong spent; missing ⇒ unspent.
     let mut durable_spent: HashSet<(u64, u32)> = HashSet::new();
@@ -1591,7 +1623,7 @@ pub(crate) fn structural_validate_spends(
 
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
-        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
+        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a, _)| *a).collect();
         let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();
         let metas = query
@@ -1608,13 +1640,44 @@ pub(crate) fn structural_validate_spends(
             )));
         }
         let t_strong = Instant::now();
-        for (i, &(id, vout, abs)) in abs_jobs.iter().enumerate() {
+        let mut field_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
+        let mut field_seen = rbitcoin_query::U64Set::default();
+        for row in &metas {
+            let Some((field, _)) = row else {
+                continue;
+            };
+            if field.is_null() {
+                continue;
+            }
+            if let Some(fid) = field.get() {
+                if field_seen.insert(fid) {
+                    field_fks.push(*field);
+                }
+            }
+        }
+        let field_heights = query
+            .store()
+            .tx_height_get_batch(&field_fks)
+            .map_err(ConsensusError::from)?;
+        let field_h_by_id: U64Map<u32> = field_fks
+            .iter()
+            .zip(field_heights.into_iter())
+            .filter_map(|(fk, h)| Some((fk.get()?, h?)))
+            .collect();
+        for (i, &(id, vout, abs, sfk)) in abs_jobs.iter().enumerate() {
             let Some((field, flags)) = metas[i] else {
                 return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
                     "invariant: structural spender meta short/OOB (cold forbidden)",
                 )));
             };
-            meta_by_abs.insert(abs, (field, flags));
+            annotate.push(SpendAnnotateJob {
+                abs,
+                field,
+                flags,
+                create_fk: rbitcoin_primitives::Fk(id),
+                vout,
+                spend_fk: sfk,
+            });
             let multi = flags & rbitcoin_store::output_flags::MULTI_SPENDER != 0;
             if multi {
                 // Protocol path (docs/invariants.md): reorg / second annotate leaves a
@@ -1647,14 +1710,8 @@ pub(crate) fn structural_validate_spends(
             // at ancient strong fks (e.g. create@961404 / field@22671) — that is
             // not consensus PrevoutSpent. Ignore impossible meta (load/annotate
             // corruption), do not soft-recover via wire re-check.
-            let create_h = query
-                .store()
-                .tx_height_get(rbitcoin_primitives::Fk(id))
-                .map_err(ConsensusError::from)?;
-            let spend_h = query
-                .store()
-                .tx_height_get(field)
-                .map_err(ConsensusError::from)?;
+            let create_h = height_by_id.get(&id).copied();
+            let spend_h = field.get().and_then(|fid| field_h_by_id.get(&fid).copied());
             if let (Some(ch), Some(sh)) = (create_h, spend_h) {
                 if sh < ch {
                     continue;
@@ -1696,31 +1753,6 @@ pub(crate) fn structural_validate_spends(
 
     // Coinbase = create_fk == first_tx_fk at that height — never `tx.body`.
     let t_create = Instant::now();
-    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
-        let mut v: Vec<rbitcoin_primitives::Fk> = abs_jobs
-            .iter()
-            .map(|(id, _, _)| rbitcoin_primitives::Fk(*id))
-            .collect();
-        v.sort_unstable_by_key(|f| f.0);
-        v.dedup();
-        v
-    };
-    let durable_heights = query
-        .store()
-        .tx_height_get_batch(&unique_create_fks)
-        .map_err(ConsensusError::from)?;
-    let height_by_id: U64Map<u32> = unique_create_fks
-        .iter()
-        .zip(durable_heights.into_iter())
-        .filter_map(|(fk, h)| {
-            let id = fk.get()?;
-            // Durable height, else this confirm run's earlier (or same) block.
-            // Missing both: rejected / never-connected Class A (015).
-            let h = h.or_else(|| run_create_height.get(fk).copied())?;
-            Some((id, h))
-        })
-        .collect();
-
     let mut height_list: Vec<u32> = height_by_id.values().copied().collect();
     height_list.sort_unstable();
     height_list.dedup();
@@ -1729,35 +1761,27 @@ pub(crate) fn structural_validate_spends(
         .coinbase_fk_at_heights(&height_list)
         .map_err(ConsensusError::from)?;
 
-    let mut seen_create: rbitcoin_query::U64Set =
-        rbitcoin_query::U64Set::with_capacity_and_hasher(abs_jobs.len(), Default::default());
-    for &(_ptid, _vout, _sfk, create_fk) in spends {
-        if create_fk.is_null() {
-            continue;
-        }
+    for create_fk in &unique_create_fks {
         let Some(id) = create_fk.get() else {
             continue;
         };
-        if !seen_create.insert(id) {
-            continue;
-        }
         let Some(&durable_h) = height_by_id.get(&id) else {
             return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
         };
 
-        if batch_parents.get_parent_coinbase(create_fk) == Some(false) {
-            create_height_by_fk.insert(create_fk, durable_h);
+        if batch_parents.get_parent_coinbase(*create_fk) == Some(false) {
+            create_height_by_fk.insert(*create_fk, durable_h);
             continue;
         }
 
-        let is_cb = batch_parents.get_parent_coinbase(create_fk) == Some(true)
+        let is_cb = batch_parents.get_parent_coinbase(*create_fk) == Some(true)
             || coinbase_fk_by_height
                 .get(&durable_h)
-                .is_some_and(|cb| *cb == create_fk);
+                .is_some_and(|cb| *cb == *create_fk);
         if is_cb && ctx.height.0 < durable_h.saturating_add(maturity) {
             return Err(ConsensusError::BadTx("coinbase immature"));
         }
-        create_height_by_fk.insert(create_fk, durable_h);
+        create_height_by_fk.insert(*create_fk, durable_h);
     }
     let create_h_ns = t_create.elapsed().as_nanos() as u64;
 

@@ -498,13 +498,13 @@ impl UringSession {
     /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
     pub fn drain_all(&mut self) -> Result<(), StoreError> {
         self.drain_all_harvest()?;
-        if !self.pending.is_empty() {
+        if let Err(e) = self.pending.assert_drained() {
             let already = self.poisoned;
             self.poisoned = true;
             if !already {
                 self.note_invariant(UringInvariant::Undrained);
             }
-            return Err(StoreError::Corrupt("invariant: io_uring undrained"));
+            return Err(e);
         }
         Ok(())
     }
@@ -960,7 +960,6 @@ impl UringPending {
         if self.is_empty() {
             Ok(())
         } else {
-            note_uring_invariant(UringInvariant::Undrained);
             Err(StoreError::Corrupt("invariant: io_uring undrained"))
         }
     }

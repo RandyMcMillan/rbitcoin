@@ -547,5 +547,5 @@ leaving a stale High row in §2–6.
 - **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). [#244](https://github.com/reardencode/rbitcoin/pull/244).
 - **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. [#244](https://github.com/reardencode/rbitcoin/pull/244). Durable `nChainWork` column not done.
 - **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).
-- **§6.20** — `has_spender_rels` deleted; `has_abs_layout` is the spent_range predicate. `confirm/stamp-spent-reuse-thin` (this PR).
-- Lookup now stamps `spent.idx` ranges (stage table already required it); load copies onto pins; write ensure is holes-only. Not in the 2026-08-25 Open tables. `confirm/stamp-spent-reuse-thin`.
+- **§6.20** — `has_spender_rels` deleted; `has_abs_layout` is the spent_range predicate. [#246](https://github.com/reardencode/rbitcoin/pull/246).
+- Lookup now stamps `spent.idx` ranges (stage table already required it); load copies onto pins; write ensure is holes-only. Not in the 2026-08-25 Open tables. [#246](https://github.com/reardencode/rbitcoin/pull/246).

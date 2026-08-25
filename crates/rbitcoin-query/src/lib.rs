@@ -9,6 +9,7 @@ mod confirm_load;
 mod confirm_parent_cache;
 mod connect;
 mod in_flight;
+mod layer_chain;
 mod published_ids;
 mod recent_creates;
 mod reconstruct;

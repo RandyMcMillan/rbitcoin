@@ -9,6 +9,7 @@
 //! `None`) drops visibility for new readers; a reader holding the old
 //! `Arc` still sees hits.
 
+use crate::layer_chain::{self, ChainLayer};
 use arc_swap::ArcSwapOption;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
@@ -71,27 +72,12 @@ pub type OutPointSet =
 pub type IdMap = HashMap<[u8; 32], (Fk, (u64, u64)), BuildHasherDefault<TxidHasher>>;
 
 /// One lookup wave's hits (`lo..=hi` BQ heights) plus the older chain.
-#[derive(Debug)]
-pub struct IdLayer {
-    pub lo: u32,
-    pub hi: u32,
-    pub hits: Arc<IdMap>,
-    pub older: Option<Arc<IdLayer>>,
-}
+pub type IdLayer = ChainLayer<(), IdMap>;
 
 impl IdLayer {
     /// Newest-first walk. First layer that has `txid` wins.
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
-        let mut layer = self;
-        loop {
-            if let Some(&v) = layer.hits.get(txid) {
-                return Some(v);
-            }
-            match layer.older.as_deref() {
-                Some(older) => layer = older,
-                None => return None,
-            }
-        }
+        self.walk(|layer| layer.hits.get(txid).copied())
     }
 }
 
@@ -116,12 +102,8 @@ impl PublishedIds {
 
     /// Replace the chain with a single layer (tests / one-shot stamp).
     pub fn publish(&self, map: Arc<IdMap>) {
-        self.inner.store(Some(Arc::new(IdLayer {
-            lo: 0,
-            hi: 0,
-            hits: map,
-            older: None,
-        })));
+        self.inner
+            .store(Some(ChainLayer::prepend(None, 0, 0, (), map)));
     }
 
     pub(crate) fn publish_head(&self, head: Option<Arc<IdLayer>>) {
@@ -207,7 +189,7 @@ impl LiveUnion {
 
     /// Drop layers whose span has no remaining queued height. Does not swap.
     pub fn keep_heights(&mut self, keep: impl Fn(u32) -> bool) {
-        self.head = splice_kept(self.head.take(), keep);
+        self.head = layer_chain::splice_kept(self.head.take(), |l| span_kept(l.lo, l.hi, &keep));
     }
 
     /// Same as [`Self::keep_heights`] using a queued-height set (`range`, not `lo..=hi`).
@@ -234,17 +216,20 @@ impl LiveUnion {
     /// misses). Moved into an Arc — no per-entry copy. Zero txid is stripped.
     pub fn note_span(&mut self, lo: u32, hi: u32, mut hits: IdMap) {
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-        self.head = splice_kept(self.head.take(), |h| h < lo || h > hi);
+        self.head = layer_chain::splice_kept(self.head.take(), |l| {
+            span_kept(l.lo, l.hi, &|h| h < lo || h > hi)
+        });
         hits.remove(&[0u8; 32]);
         if hits.is_empty() {
             return;
         }
-        self.head = Some(Arc::new(IdLayer {
+        self.head = Some(ChainLayer::prepend(
+            self.head.take(),
             lo,
             hi,
-            hits: Arc::new(hits),
-            older: self.head.take(),
-        }));
+            (),
+            Arc::new(hits),
+        ));
     }
 
     /// Prepend a single-height layer (tests / one-shot).
@@ -274,41 +259,6 @@ fn span_kept(lo: u32, hi: u32, keep: &impl Fn(u32) -> bool) -> bool {
 /// True when any height in `queued` falls in `lo..=hi` (no 1080-wide walk).
 pub fn span_overlaps_queued(lo: u32, hi: u32, queued: &std::collections::BTreeSet<u32>) -> bool {
     queued.range(lo..=hi).next().is_some()
-}
-
-/// Rebuild the chain keeping nodes that still have a queued height in span.
-/// Kept hit maps are `Arc`-cloned; suffix nodes whose `older` is unchanged
-/// are reused.
-fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option<Arc<IdLayer>> {
-    let mut nodes = Vec::new();
-    let mut cur = head;
-    while let Some(n) = cur {
-        let older = n.older.clone();
-        nodes.push(n);
-        cur = older;
-    }
-    let mut new_head: Option<Arc<IdLayer>> = None;
-    for n in nodes.into_iter().rev() {
-        if !span_kept(n.lo, n.hi, &keep) {
-            continue;
-        }
-        let older_ok = match (n.older.as_ref(), new_head.as_ref()) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if older_ok {
-            new_head = Some(n);
-        } else {
-            new_head = Some(Arc::new(IdLayer {
-                lo: n.lo,
-                hi: n.hi,
-                hits: Arc::clone(&n.hits),
-                older: new_head,
-            }));
-        }
-    }
-    new_head
 }
 
 fn layer_in_horizon(hi: u32, tip: u32, horizon: u32) -> bool {
@@ -351,35 +301,7 @@ fn splice_queued_pred(
     head: Option<Arc<IdLayer>>,
     keep_span: impl Fn(u32, u32) -> bool,
 ) -> Option<Arc<IdLayer>> {
-    let mut nodes = Vec::new();
-    let mut cur = head;
-    while let Some(n) = cur {
-        let older = n.older.clone();
-        nodes.push(n);
-        cur = older;
-    }
-    let mut new_head: Option<Arc<IdLayer>> = None;
-    for n in nodes.into_iter().rev() {
-        if !keep_span(n.lo, n.hi) {
-            continue;
-        }
-        let older_ok = match (n.older.as_ref(), new_head.as_ref()) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if older_ok {
-            new_head = Some(n);
-        } else {
-            new_head = Some(Arc::new(IdLayer {
-                lo: n.lo,
-                hi: n.hi,
-                hits: Arc::clone(&n.hits),
-                older: new_head,
-            }));
-        }
-    }
-    new_head
+    layer_chain::splice_kept(head, |l| keep_span(l.lo, l.hi))
 }
 
 #[cfg(test)]

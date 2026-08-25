@@ -46,7 +46,7 @@ wire / body-queue
             IO: txout.body — NEVER head / idx / txid.body / inwit)
   → scripts (pure CPU — NEVER any store IO)
   → Class A commit (if ArchiveWritePlan present)
-  → ensure abs (stamp spent_range; post-condition: every spend has abs)
+  → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
   → abs spend annotate (put_spend_batch_by_abs_meta on spent.body only)
@@ -66,11 +66,11 @@ IO** (head / idx), not load pin.
 
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
-| Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid | Missing → hard Err at stamp / pin contract |
+| Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have `spent.idx` range on the stamp (in-flight outs skip idx) | Missing → hard Err at stamp / pin contract |
 | Parent create_fk union | **in-flight** (prune **after** pin + scripts handoff: drain inserted fk span **and** `fence.covers_fk_span`) → **published live_union** (height-layered chain, `ArcSwap` of the head, get walks; no union rebuild) → **RecentCreates** (write-published Arc layers: `txid → fk+range` **and** optional `CreatePin`; drop when `class_a_hi >= until`; stamp carries CreatePin, pin does not re-walk) → **TipOnly** (connected **and** idx `body_range`; older-than-window leftover). One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs) (S0 plan and plan=None). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp. Each new layer is this wave's parent identities (re-home union hits + TipOnly misses); `skipped=` skips TipOnly IO, not the layer row. Lookup drops a layer once no height in **its span** remains on the BQ and the span does not overlap `(tip, taken_hi]`. Disconnect `store(None)` immediately and clears the lookup union and recent ring from that height. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent). Identity without idx range → `Corrupt("invariant: idx range missing after identity")`, not a miss |
 | io_uring harvest | Pending `user_data` set + kind/epoch. Unexpected CQE, undrained leftover, CQ overflow, wait timeout. Held-session `begin_batch` drains leftover before a new kind/epoch wave and fails closed (`Err`) if undrained or poisoned. Drain does not ignore unmatched CQE / CQ overflow. Held idx fill must not libc-fallback on a dirty ring | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Poison + drop TLS ring. Ring-unavailable still pread-fallback |
-| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err | **No** idx cold outs on load; **no** `spent.idx` on pin; **no** `inwit` on pin |
-| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. **Sole** `spent.idx` stamper (`tx_spent_range_batch`) | Idx stamp of `spent.body` ranges; incomplete → `invariant:` |
+| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no idx IO) | **No** idx cold outs on load; **no** `spent.idx` IO on pin; **no** `inwit` on pin |
+| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup already stamped archived parents; write `tx_spent_range_batch` only for unstamped fks (same-batch after Class A, holes) | Idx stamp of remaining `spent.body` ranges; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
 | Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
@@ -104,7 +104,7 @@ published idx window.
 
 | State | Class A for tip+1 | Headers | Parent head | Handler (lookup cleans) |
 |-------|-------------------|---------|-------------|-------------------------|
-| **S0 fresh tip+1** | absent | present | parents on head | plan=Some: plan_batch stamps fk+txout/spent range+txid; load `txout` by range |
+| **S0 fresh tip+1** | absent | present | parents on head | plan=Some: plan_batch stamps fk+txout/spent range+txid + parent vouts; load `txout` by range, copies spent_range |
 | **S1 already-archived** | body present (plan=None) | present | parents on head | lookup still stamps parent fk+ranges+txid (idx/head); load `txout` only |
 | **S2 tip-ahead pack** | prior pack uncommitted | — | parents in in_flight | plan uses in_flight create_fk; **must** also stamp ranges (idx) when body exists, or use offline CreatePin |
 | **S3 short catch-up** | mixed S0/S1 over gap | present | mostly cold | ordered claim tip+1 only for write; lookup may plan ahead with reserved HWM |
@@ -146,7 +146,9 @@ bind.
 | `pin_for_wire_incomplete_outs_is_invariant_error` | `pin_for_wire_batch` incomplete outs → cold miss |
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
-| `write_ensure_stamps_spent_range_after_load_pin` | pin-then-ensure fills abs; load pin has no `spent.idx` |
+| `write_ensure_stamps_spent_range_after_load_pin` / `pin_and_ensure_journey` | load pin copies lookup `spent.idx` range; ensure fills holes (same-batch still no abs until Class A) |
+| `fill_missing_parent_ranges_stamps_spent_idx_for_archived` | lookup stamp carries `spent.idx` for TipOnly leftover |
+| `spend_abs_jobs_unique_and_missing_is_corrupt` | pin arithmetic abs list; missing → Corrupt |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load |

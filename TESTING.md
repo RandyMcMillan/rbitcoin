@@ -216,7 +216,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
 | `store_table_header_and_idx_corrupt` | Store | Table header/head corrupt open |
-| `chain_connect_reorg_and_growth` | Query | Synthetic growth + disconnect (rehash) |
+| `chain_connect_reorg_and_growth` | Query | Synthetic growth + disconnect (header gen roll) |
 | `consensus_mature_chain_spend_and_reconstruct` | Consensus+query | **One** mature mine: spend, local prev_fk, double-spend, reopen reconstruct |
 | `ibd_parallel_archive_idempotent_confirm_without_tx_head` | Query+consensus | Out-of-order archive, re-archive idempotent, head-off prevout+maturity |
 | `resume_head_off_warms_cache_for_external_prev` | Query+consensus | Resume head-off: warm Class A cache fixes external-prev missing prevout |

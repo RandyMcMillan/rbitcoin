@@ -346,8 +346,10 @@ After ingest load ≥ ~0.80, ingest seals to sorted ovf and rolls. Legacy
 full-size `scripthash.ovf.head` is removed on open. Existing main keys update
 `value16` in place.
 
-New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
-256-way), **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
+New stores: **header.head** = **single** open-address file (~96 MiB sparse at
+2²² slots; overflow `header.head.gN`). Leftover 256-way `header.head/` is
+**refused** — wipe `store/header.head` and `store/header.body` and reindex.
+**scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
 heads (`tx.head/meta` + open `NNNNNN` OA, sealed `NNNNNN.mphf|.rel|.fuse8`).
 Capacity ends at **80% of head slots** (~26.8 M creates at 25-bit): seal
 builds MPHF + dense rel + **binary fuse8**, unlinks OA, then opens a new
@@ -877,7 +879,8 @@ nice -n 10 ionice -c 3 ./target/release/rbitcoin-node \
   --log-level info
 ```
 
-Correlate freezes: `grep 'hash-head rehash' your.log`.
+Hash-head in-place rehash is gone. An undersized leftover `header.head` may
+rewrite once at open (`store: header.head open-grow`).
 
 ## Consensus notes (historical mainnet)
 

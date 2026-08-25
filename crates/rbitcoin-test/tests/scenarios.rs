@@ -453,7 +453,7 @@ fn store_table_header_and_idx_corrupt() {
     let _ = (SCHEMA_VERSION, STORE_MAGIC);
 }
 
-// ─── Synthetic store growth (no PoW; still triggers hash rehash) ─────────────
+// ─── Synthetic store growth (no PoW; tiny header.head rolls a generation) ───
 
 #[test]
 fn chain_connect_reorg_and_growth() {
@@ -463,7 +463,7 @@ fn chain_connect_reorg_and_growth() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
 
-    // Default hash head is 64 slots; 80 blocks (header+tx keys) forces rehash.
+    // Default hash head is 64 slots; 80 blocks (header keys) force header.head.g1.
     // Merkle root must match the Class A txid(s) so tip-window revalidate on reopen
     // (VERIFY_TIP_BLOCKS) does not false-positive shrink the tip.
     const N: u32 = 80;

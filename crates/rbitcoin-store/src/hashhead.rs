@@ -1,7 +1,8 @@
-//! Growable hash head: key **prefix** (16 bytes) → record fk (u64), with multi-fk chains.
+//! Fixed-capacity hash head: key **prefix** (16 bytes) → record fk (u64), with multi-fk chains.
 //!
-//! Linear probing over a power-of-two slot table. Rehashes (doubles slots) when
-//! load factor exceeds [`MAX_LOAD_NUM`]/[`MAX_LOAD_DEN`].
+//! Linear probing over a power-of-two slot table. Load may not exceed
+//! [`MAX_LOAD_NUM`]/[`MAX_LOAD_DEN`]; overflow is [`StoreError::Corrupt`], not
+//! an in-place rehash. Header generations roll a new file instead.
 //!
 //! **16-byte keys** (first 16 of full 32-byte hash) cut head size ~40%. Callers that
 //! need exact identity (tx.head, header.head) **verify** by loading the body.
@@ -19,7 +20,6 @@ use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 /// Open-address key length (prefix of full 32-byte hash).
 pub const HEAD_KEY_LEN: usize = 16;
@@ -64,11 +64,8 @@ fn unpack_value(v: u64) -> (bool, Fk) {
 }
 /// Max chunks held in the insert cache (~1.25 MiB).
 const CHUNK_CACHE_MAX: usize = 256;
-/// Aggregate rehash chatter at DEBUG this often; per-event is TRACE.
-const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
-/// Single rehash still WARN if clear size or wall time exceeds these (host risk).
-const REHASH_WARN_BYTES: u64 = 64 * 1024 * 1024;
-const REHASH_WARN_MS: u128 = 500;
+
+pub(crate) const HASH_HEAD_FULL: &str = "invariant: hash head full";
 
 /// Which hash-head file (drives mainnet pre-size).
 ///
@@ -77,7 +74,6 @@ const REHASH_WARN_MS: u128 = 500;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadRole {
     Header,
-    ScriptHash,
 }
 
 /// Disk pre-size policy for hash heads.
@@ -88,7 +84,7 @@ pub enum HeadRole {
 pub enum HeadScale {
     /// Minimal (64 slots) — unit/integration tests.
     Tiny,
-    /// Full-mainnet IBD: sharded heads with moderate **per-shard** sparse start.
+    /// Full-mainnet IBD: `header.head` starts at 2²² slots (~96 MiB sparse).
     Mainnet,
 }
 
@@ -159,15 +155,12 @@ impl HeadScale {
         }
     }
 
-    /// Default initial slots for a **single** hash-head file (legacy / unsharded).
-    /// Sharded creates use [`crate::sharded_hashhead::initial_slots_per_shard`].
+    /// Default initial slots for a **single** hash-head file.
     pub fn initial_slots(self, role: HeadRole) -> u64 {
         match self {
             HeadScale::Tiny => DEFAULT_SLOTS,
-            // Unsharded fallback only (legacy single-file). Prefer sharded layout.
             HeadScale::Mainnet => match role {
-                HeadRole::Header => 1 << 20,
-                HeadRole::ScriptHash => 1 << 22,
+                HeadRole::Header => 1 << 22,
             },
         }
     }
@@ -175,12 +168,11 @@ impl HeadScale {
 
 /// Effective initial slots for `role` (env scale + optional per-role override).
 ///
-/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_SCRIPTHASH`
-/// (decimal slot count, rounded up to power of two).
+/// Override: `RBITCOIN_HEAD_SLOTS_HEADER` (decimal slot count, rounded up to
+/// power of two).
 pub fn initial_slots_for(role: HeadRole) -> u64 {
     let env_key = match role {
         HeadRole::Header => "RBITCOIN_HEAD_SLOTS_HEADER",
-        HeadRole::ScriptHash => "RBITCOIN_HEAD_SLOTS_SCRIPTHASH",
     };
     if let Ok(s) = std::env::var(env_key) {
         if let Ok(n) = s.parse::<u64>() {
@@ -188,6 +180,16 @@ pub fn initial_slots_for(role: HeadRole) -> u64 {
         }
     }
     HeadScale::from_env().initial_slots(role)
+}
+
+/// Sorted/MPHF `scripthash.head/NN` + sharded body count (not a HashHead).
+pub const SH_MAIN_SHARDS_MAINNET: usize = 64;
+
+pub fn sh_main_shard_count() -> usize {
+    match HeadScale::from_env() {
+        HeadScale::Tiny => 1,
+        HeadScale::Mainnet => SH_MAIN_SHARDS_MAINNET,
+    }
 }
 
 /// Append-only multi-fk list for a single 16-byte head key (prefix / BIP30).
@@ -297,29 +299,6 @@ pub struct HashHead {
 struct HashState {
     slots: u64,
     occupied: u64,
-}
-
-/// Process-wide rehash rollup (many small shard rehashes during IBD materialize).
-struct RehashStats {
-    events: u64,
-    keys: u64,
-    bytes_cleared: u64,
-    elapsed_ms: u64,
-    max_clear_bytes: u64,
-    window_start: Instant,
-}
-
-impl RehashStats {
-    fn new() -> Self {
-        Self {
-            events: 0,
-            keys: 0,
-            bytes_cleared: 0,
-            elapsed_ms: 0,
-            max_clear_bytes: 0,
-            window_start: Instant::now(),
-        }
-    }
 }
 
 impl HashHead {
@@ -437,11 +416,26 @@ impl HashHead {
 
     /// Number of occupied hash slots (open-address load observer).
     #[cfg(test)]
-    pub fn occupied(&self) -> u64 {
+    pub(crate) fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }
 
+    pub(crate) fn slots(&self) -> u64 {
+        self.state.lock().unwrap().slots
+    }
+
+    #[inline]
+    pub(crate) fn max_occupied(slots: u64) -> u64 {
+        slots.saturating_mul(MAX_LOAD_NUM) / MAX_LOAD_DEN
+    }
+
+    pub(crate) fn at_load_cap(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.occupied >= Self::max_occupied(s.slots)
+    }
+
     /// Minimum power-of-two slot count so `keys` stay under load factor 7/8.
+    #[cfg(test)]
     fn slots_for_keys(keys: u64) -> u64 {
         if keys == 0 {
             return DEFAULT_SLOTS;
@@ -454,10 +448,10 @@ impl HashHead {
         min.next_power_of_two().max(DEFAULT_SLOTS)
     }
 
-    /// Ensure capacity for roughly `additional` new keys (load factor 7/8).
+    /// Ensure an **empty** table can hold `additional` keys (load 7/8).
     ///
-    /// Grows to the **target** slot count in a single rehash (not one
-    /// double-at-a-time loop).
+    /// Occupied tables do not grow; overflow is [`HASH_HEAD_FULL`].
+    #[cfg(test)]
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -471,7 +465,10 @@ impl HashHead {
         if need <= slots {
             return Ok(());
         }
-        self.rehash_to(need)
+        if occupied != 0 {
+            return Err(StoreError::Corrupt(HASH_HEAD_FULL));
+        }
+        self.grow_empty_to(need)
     }
 
     /// First mapped fk for this full key prefix (newest in multi lists).
@@ -491,6 +488,7 @@ impl HashHead {
         Ok(prev)
     }
 
+    #[cfg(test)]
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         self.insert_many_with(entries, |_| {})
     }
@@ -509,10 +507,8 @@ impl HashHead {
 
     /// Slot-sorted, chunk-buffered apply (pread → mutate → pwrite dirty chunks).
     ///
-    /// When the table is **empty** (first load / run materialize into a cold
-    /// shard), builds the open-addressing table in RAM and writes it in one
-    /// sequential pass — same idea as the offline SH bulk builder (no RMW of
-    /// zero pages, no growth rehash cascade mid-batch).
+    /// When the table is **empty**, builds the open-addressing table in RAM and
+    /// writes it in one sequential pass. Does not grow an occupied table.
     fn insert_many_file(
         &self,
         entries: &[([u8; 32], Fk)],
@@ -521,7 +517,6 @@ impl HashHead {
         if entries.is_empty() {
             return Ok(());
         }
-        self.reserve_additional(entries.len() as u64)?;
 
         let occupied = self.state.lock().unwrap().occupied;
         if occupied == 0 {
@@ -532,48 +527,36 @@ impl HashHead {
         let slots_now = self.state.lock().unwrap().slots;
         work.sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots_now));
 
+        let cap = Self::max_occupied(slots_now);
         let mut i = 0usize;
+        let mut cache = SlotPageCache::new(self, slots_now);
         while i < work.len() {
-            let slots = self.state.lock().unwrap().slots;
-            // Re-sort remaining if a rehash changed the slot map.
-            if i > 0 {
-                work[i..]
-                    .sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots));
+            let (key, fk) = work[i];
+            debug_assert!(!fk.is_null());
+            if self.state.lock().unwrap().occupied >= cap && self.get(&key)?.is_none() {
+                cache.flush()?;
+                return Err(StoreError::Corrupt(HASH_HEAD_FULL));
             }
-            let mut cache = SlotPageCache::new(self, slots);
-            let mut need_rehash = false;
-            while i < work.len() {
-                let (key, fk) = work[i];
-                debug_assert!(!fk.is_null());
-                match cache.try_insert_merge(&key, fk)? {
-                    InsertResult::Done { prev, new_slot } => {
-                        if new_slot {
-                            let mut state = self.state.lock().unwrap();
-                            state.occupied = state.occupied.saturating_add(1);
+            match cache.try_insert_merge(&key, fk)? {
+                InsertResult::Done { prev, new_slot } => {
+                    if new_slot {
+                        let mut state = self.state.lock().unwrap();
+                        if state.occupied >= cap {
+                            cache.flush()?;
+                            return Err(StoreError::Corrupt(HASH_HEAD_FULL));
                         }
-                        on_prev(prev);
-                        i += 1;
+                        state.occupied = state.occupied.saturating_add(1);
                     }
-                    InsertResult::NeedRehash => {
-                        need_rehash = true;
-                        break;
-                    }
+                    on_prev(prev);
+                    i += 1;
+                }
+                InsertResult::NeedRehash => {
+                    cache.flush()?;
+                    return Err(StoreError::Corrupt(HASH_HEAD_FULL));
                 }
             }
-            cache.flush()?;
-            if need_rehash {
-                // Probe failed at current size — jump at least 2×, more if a large
-                // remainder is still waiting.
-                let (slots, occupied) = {
-                    let state = self.state.lock().unwrap();
-                    (state.slots, state.occupied)
-                };
-                let remain = (work.len() - i) as u64;
-                let need = Self::slots_for_keys(occupied.saturating_add(remain))
-                    .max(slots.saturating_mul(2));
-                self.rehash_to(need)?;
-            }
         }
+        cache.flush()?;
         Ok(())
     }
 
@@ -631,8 +614,10 @@ impl HashHead {
                 slot = (slot + 1) & (slots - 1);
             }
             if !placed {
-                // Should not happen after reserve_additional for unique-ish keys.
-                return Err(StoreError::Corrupt("hash head bulk_fill full"));
+                return Err(StoreError::Corrupt(HASH_HEAD_FULL));
+            }
+            if occupied > Self::max_occupied(slots) {
+                return Err(StoreError::Corrupt(HASH_HEAD_FULL));
             }
         }
 
@@ -641,88 +626,34 @@ impl HashHead {
         Ok(())
     }
 
-    /// Process-wide rehash serialization (shared with scripthash heads).
-    fn rehash_gate() -> &'static std::sync::Mutex<()> {
-        open_address::rehash_gate()
-    }
-
-    /// Process-wide rehash counters (sharded heads rehash many small files).
-    fn rehash_stats() -> &'static Mutex<RehashStats> {
-        static S: std::sync::OnceLock<Mutex<RehashStats>> = std::sync::OnceLock::new();
-        S.get_or_init(|| Mutex::new(RehashStats::new()))
-    }
-
-    /// Note one completed rehash; TRACE always, WARN only if large/slow, DEBUG rollup.
-    fn note_rehash(
-        path: &std::path::Path,
-        old_slots: u64,
-        new_slots: u64,
-        occupied: u64,
-        elapsed: Duration,
-    ) {
-        let new_bytes = SLOT_SIZE as u64 * new_slots;
-        let ms = elapsed.as_millis();
-        rbitcoin_log::trace!(
-            "store: hash-head rehash path={} {}→{} slots occupied={} clear≈{:.1} MiB elapsed={:?}",
-            path.display(),
-            old_slots,
-            new_slots,
-            occupied,
-            new_bytes as f64 / (1024.0 * 1024.0),
-            elapsed
-        );
-        if new_bytes >= REHASH_WARN_BYTES || ms >= REHASH_WARN_MS {
-            rbitcoin_log::warn!(
-                "store: hash-head rehash LARGE path={} {}→{} slots occupied={} (~{:.1} GiB) elapsed={:?}",
-                path.display(),
-                old_slots,
-                new_slots,
-                occupied,
-                new_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                elapsed
-            );
-        }
-        let mut s = Self::rehash_stats().lock().unwrap();
-        s.events = s.events.saturating_add(1);
-        s.keys = s.keys.saturating_add(occupied);
-        s.bytes_cleared = s.bytes_cleared.saturating_add(new_bytes);
-        s.elapsed_ms = s.elapsed_ms.saturating_add(ms as u64);
-        if new_bytes > s.max_clear_bytes {
-            s.max_clear_bytes = new_bytes;
-        }
-        if s.window_start.elapsed() < SPILL_DEBUG_INTERVAL {
-            return;
-        }
-        if s.events == 0 {
-            s.window_start = Instant::now();
-            return;
-        }
-        rbitcoin_log::debug!(
-            "store: hash-head rehash summary events={} keys={} clear≈{:.1} MiB max_clear≈{:.1} MiB wall_ms={} window={:?}",
-            s.events,
-            s.keys,
-            s.bytes_cleared as f64 / (1024.0 * 1024.0),
-            s.max_clear_bytes as f64 / (1024.0 * 1024.0),
-            s.elapsed_ms,
-            s.window_start.elapsed()
-        );
-        *s = RehashStats::new();
-    }
-
-    /// Grow to `new_slots` (power of two) and reinsert only **occupied** entries.
-    ///
-    /// **Host freeze risk:** multi‑GiB heads (e.g. large `tx.head` shards) used to
-    /// zero-fill the whole table with `write_at` — a multi‑second IO storm. We now
-    /// punch a hole (or sparse-clear) then reinsert only live keys.
-    ///
-    /// Serialized process-wide so paced materialize never runs two rehashes at once.
-    /// Per-shard chatter is TRACE + periodic DEBUG summary (WARN only if large/slow).
-    fn rehash_to(&self, new_slots: u64) -> Result<(), StoreError> {
+    /// Expand an **empty** table to `new_slots` (power of two). Occupied tables
+    /// must not call this (that is the old in-place rehash).
+    #[cfg(test)]
+    fn grow_empty_to(&self, new_slots: u64) -> Result<(), StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
-        let _rehash_serial = Self::rehash_gate()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let (old_slots, occupied) = {
+            let state = self.state.lock().unwrap();
+            (state.slots, state.occupied)
+        };
+        if occupied != 0 {
+            return Err(StoreError::Corrupt(HASH_HEAD_FULL));
+        }
+        if new_slots <= old_slots {
+            return Ok(());
+        }
+        let new_bytes = SLOT_SIZE as u64 * new_slots;
+        let need = FILE_HEADER_LEN as u64 + new_bytes;
+        self.file.ensure_capacity(need)?;
+        self.file.set_logical_len(need)?;
+        self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
+        self.state.lock().unwrap().slots = new_slots;
+        Ok(())
+    }
 
+    /// Occupied rewrite to a larger power-of-two. **Only** from
+    /// `HeaderHead::open` (no concurrent probes).
+    pub(crate) fn rewrite_to_slots(&self, new_slots: u64) -> Result<(), StoreError> {
+        let new_slots = new_slots.max(2).next_power_of_two();
         let (old_slots, occupied) = {
             let state = self.state.lock().unwrap();
             (state.slots, state.occupied)
@@ -731,12 +662,10 @@ impl HashHead {
             return Ok(());
         }
         let new_bytes = SLOT_SIZE as u64 * new_slots;
-        let t0 = Instant::now();
-
         let mut entries: Vec<(HeadKey, u64)> = Vec::new();
         entries
             .try_reserve_exact(occupied as usize)
-            .map_err(|_| StoreError::Corrupt("hash head rehash OOM"))?;
+            .map_err(|_| StoreError::Corrupt("hash head rewrite OOM"))?;
         let mut buf = vec![0u8; SLOT_SIZE * 4096];
         let mut slot = 0u64;
         while slot < old_slots {
@@ -763,7 +692,6 @@ impl HashHead {
         self.file.ensure_capacity(need)?;
         self.file.set_logical_len(need)?;
         self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
-
         {
             let mut state = self.state.lock().unwrap();
             state.slots = new_slots;
@@ -778,18 +706,18 @@ impl HashHead {
                 InsertResult::Done { .. } => {}
                 InsertResult::NeedRehash => {
                     cache.flush()?;
-                    return Err(StoreError::Corrupt("hash rehash failed"));
+                    return Err(StoreError::Corrupt("hash head rewrite failed"));
                 }
             }
         }
         cache.flush()?;
         self.state.lock().unwrap().occupied = n_entries;
-        Self::note_rehash(
-            self.file.path(),
+        rbitcoin_log::warn!(
+            "store: header.head open-grow path={} {}→{} slots occupied={}",
+            self.file.path().display(),
             old_slots,
             new_slots,
-            n_entries,
-            t0.elapsed(),
+            n_entries
         );
         Ok(())
     }
@@ -859,7 +787,6 @@ impl<'a> SlotPageCache<'a> {
         Ok(InsertResult::NeedRehash)
     }
 
-    /// Place a pre-packed slot value during rehash (no multi merge).
     fn try_place_raw(&mut self, key: &HeadKey, packed: u64) -> Result<InsertResult, StoreError> {
         let mut slot = HashHead::hash_slot(key, self.slots);
         for _ in 0..self.slots {
@@ -872,7 +799,6 @@ impl<'a> SlotPageCache<'a> {
                 });
             }
             if &k == key {
-                // Should not collide during rehash of unique prefixes.
                 self.write_slot(slot, key, packed)?;
                 return Ok(InsertResult::Done {
                     prev: Some(Fk(old)),
@@ -1009,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_load_inserts_without_early_rehash() {
+    fn dense_load_inserts_until_full_without_rehash() {
         let path = tmp_path();
         let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
         for i in 0u64..50 {
@@ -1022,11 +948,24 @@ mod tests {
             key[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
         }
+        let mut overflow = None;
         for i in 50u64..70 {
             let mut key = [0u8; 32];
             key[0..8].copy_from_slice(&i.to_le_bytes());
-            h.insert(&key, Fk(i + 1)).unwrap();
+            match h.insert(&key, Fk(i + 1)) {
+                Ok(_) => continue,
+                Err(e) => {
+                    overflow = Some(e);
+                    break;
+                }
+            }
         }
+        let err = overflow.expect("64-slot head must refuse past 7/8");
+        assert!(
+            matches!(err, StoreError::Corrupt(HASH_HEAD_FULL)),
+            "got {err}"
+        );
+        assert_eq!(h.slots(), 64);
         assert_eq!(h.get(&[0u8; 32]).unwrap(), Some(Fk(1)));
         cleanup_hh(&path);
     }
@@ -1035,7 +974,7 @@ mod tests {
     fn persist_survives_reopen() {
         let path = tmp_path();
         {
-            let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+            let h = HashHead::create_with_slots(&path, 256).unwrap();
             let mut batch = Vec::new();
             for i in 0u64..100 {
                 let mut key = [0u8; 32];
@@ -1133,9 +1072,9 @@ mod tests {
 
     #[test]
     fn mainnet_scale_slot_targets() {
-        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::ScriptHash), 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash) >= 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Header) >= 64);
+        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Header), 64);
+        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 22);
+        assert_eq!(sh_main_shard_count(), 1);
     }
 
     #[test]
@@ -1153,7 +1092,7 @@ mod tests {
     #[test]
     fn slot_sorted_batch_matches_sequential_inserts() {
         let path = tmp_path();
-        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        let h = HashHead::create_with_slots(&path, 1024).unwrap();
         let mut batch = Vec::new();
         for i in 0u64..500 {
             let mut key = [0u8; 32];
@@ -1231,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_survives_rehash() {
+    fn multi_list_survives_when_head_is_full() {
         let path = tmp_path();
         let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
         let mut k1 = [0u8; 32];
@@ -1240,14 +1179,18 @@ mod tests {
         k2[20] = 9;
         h.insert(&k1, Fk(100)).unwrap();
         h.insert(&k2, Fk(200)).unwrap();
-        // Force growth
-        let mut batch = Vec::new();
-        for i in 0u64..200 {
+        let mut n = 0u64;
+        loop {
             let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&(i + 1000).to_le_bytes());
-            batch.push((key, Fk(i + 1)));
+            key[0..8].copy_from_slice(&(n + 1000).to_le_bytes());
+            match h.insert(&key, Fk(n + 1)) {
+                Ok(_) => n += 1,
+                Err(StoreError::Corrupt(HASH_HEAD_FULL)) => break,
+                Err(e) => panic!("unexpected {e}"),
+            }
+            assert!(n < 64, "must refuse before rewriting slots");
         }
-        h.insert_many(&batch).unwrap();
+        assert_eq!(h.slots(), 64);
         let all = h.get_all(&k1).unwrap();
         assert!(all.contains(&Fk(100)) && all.contains(&Fk(200)));
         cleanup_hh(&path);
@@ -1273,11 +1216,10 @@ mod tests {
             HeadScale::Tiny.initial_slots(HeadRole::Header),
             DEFAULT_SLOTS
         );
-        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 20);
-        assert_eq!(
-            HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash),
-            1 << 22
-        );
+        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 22);
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(sh_main_shard_count(), SH_MAIN_SHARDS_MAINNET);
+        });
         assert_eq!(initial_slots_for(HeadRole::Header), DEFAULT_SLOTS);
         let full = [0xABu8; 32];
         let p = head_key_prefix(&full);

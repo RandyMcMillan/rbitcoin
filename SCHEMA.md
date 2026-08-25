@@ -144,7 +144,7 @@ itself changed.
 <datadir>/
   store/
     meta                         # store magic + schema version
-    header.body / header.head    # Class A headers + hash index
+    header.body / header.head    # Class A headers + hash index (overflow: header.head.gN)
     txout.body / txout.idx/                         # Class A outs (hot)
     inwit.body / inwit.idx/                         # Class A inputs+witness (cold)
     inwit.reloc                  # optional: inwit lives under --datadir-cold/store
@@ -251,9 +251,13 @@ Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`)
 
 ### `header.head`
 
-Open-address hash head (see [Hash heads](#hash-heads-headerhead--generic)): key = 16 B prefix of block hash → header fk. Multi-list for prefix collisions. Rehash at load **7/8**.
+Open-address hash head (see [Hash heads](#hash-heads-headerhead--generic)): key = 16 B prefix of block hash → header fk. Multi-list for prefix collisions. Load ceiling **7/8**; overflow is a sibling generation, not an in-place rehash.
 
-**Decision:** single file (not 256-way shards) with modest pre-size — header count is small vs txs.
+**Create:** single file. Mainnet **2²²** slots (~96 MiB sparse, ~3.67 M headers at 7/8). Tiny tests use 64 slots so generation roll is exercised.
+
+**Overflow:** `header.head.g1`, `.g2`, … same slot count as create. Probe newest-first. No schema bump — same 24 B OA slot format.
+
+**Open:** leftover `header.head/` directory (old 256-way shards) is **Layout refuse** (wipe `header.head` and `header.body`, reindex). A **single** file smaller than the create target is rewritten on open (no concurrent probes).
 
 ---
 
@@ -472,7 +476,7 @@ Not `tx.head` — see [`docs/heads.md`](./docs/heads.md).
 - Packed value: sole fk (high bit clear), or `MULTI_BIT | list_fk` → sibling `.mlt` (`create_fk:u64 | next:u64`, newest first).
 - Multi-list: 16 B prefix collisions and BIP30-style multiples.
 - Identity: `get_all` candidates + **body verify**.
-- Rehash when load would exceed **7/8**.
+- Insert past **7/8** is full: `header.head` rolls a sibling generation at the same slot count. Occupied tables are never rewritten while serving. Undersized **single-gen** files rewrite to the create target **on open**. Leftover 256-way `header.head/` is **Layout refuse**.
 
 **Not** used for `tx.head` (keyless address) or for scripthash **create lists** (slabs; megakey page chains).
 

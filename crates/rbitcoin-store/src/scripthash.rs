@@ -8,8 +8,7 @@ use crate::compact::uleb128_len;
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
-use crate::hashhead::HeadRole;
-use crate::hashhead::HeadScale;
+use crate::hashhead::{sh_main_shard_count, HeadScale};
 use crate::io_backend::ReadIoBackend;
 #[cfg(test)]
 use crate::scripthash_head::ShardedScriptHashHead;
@@ -34,7 +33,6 @@ use crate::scripthash_slabs::{
     slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
 };
 use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
-use crate::sharded_hashhead::shard_count_for_role;
 use crate::sorted_run::{list_materialize_claims, list_runs};
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
@@ -733,7 +731,7 @@ enum KeyHome {
 
 impl ScriptHashTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
-        let n_shards = shard_count_for_role(HeadRole::ScriptHash).max(1);
+        let n_shards = sh_main_shard_count().max(1);
         let body_dir = sh_body_path(dir);
         std::fs::create_dir_all(&body_dir).map_err(|e| StoreError::io(&body_dir, e))?;
         let mut bodies = Vec::with_capacity(n_shards);
@@ -773,7 +771,7 @@ impl ScriptHashTable {
             return Err(StoreError::Layout(leftover_oa_wipe_msg()));
         }
         let head_path = dir.join("scripthash.head");
-        let expected = shard_count_for_role(HeadRole::ScriptHash);
+        let expected = sh_main_shard_count();
         if leftover_live_oa_main(&head_path) && !sorted_main_present(dir, expected) {
             return Err(StoreError::Layout(leftover_oa_wipe_msg()));
         }
@@ -1693,10 +1691,25 @@ impl ScriptHashTable {
             }
         }
         if !ingest_ups.is_empty() {
+            self.ingest_insert_many(&ingest_ups)?;
+        }
+        Ok(())
+    }
+
+    fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+        let mut i = 0usize;
+        while i < ups.len() {
+            let room = self.ingest.lock().unwrap().room_before_seal();
+            if room == 0 {
+                self.seal_ingest()?;
+                continue;
+            }
+            let n = (room as usize).min(ups.len() - i);
             {
                 let g = self.ingest.lock().unwrap();
-                g.insert_many(&ingest_ups)?;
+                g.insert_many(&ups[i..i + n])?;
             }
+            i += n;
             self.maybe_seal_ingest()?;
         }
         Ok(())

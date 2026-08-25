@@ -28,8 +28,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
 | `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS` | 26 | Wipe/empty-head MPHF range `2^bits` (25 low-RAM; clamp 6..=26) |
 | `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Per-stem idx soft rollover (do not set above 32 GiB hard span). Does **not** cut `tx.head`. |
-| `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots |
-| `RBITCOIN_HEAD_SLOTS_SCRIPTHASH` | scale default | SH hash-head initial slots |
+| `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots (power of two) |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
 | `RBITCOIN_SH_RECOLLECT_WORKERS` | min(n-cpu, free-RAM/1.5 GiB) | SH recollect parallelism (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |

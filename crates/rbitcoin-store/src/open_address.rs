@@ -2,11 +2,9 @@
 //!
 //! Both tables use 16-byte key prefixes, linear probing, and the same FNV-1a
 //! primary hash. Full strategy merge (one generic table) is deferred; this
-//! module keeps probe math / load / rehash serialization from drifting.
+//! module keeps probe math / load factor from drifting.
 
-use std::sync::{Mutex, OnceLock};
-
-/// Rehash when occupied/slots ≥ 7/8.
+/// Occupied/slots ceiling; insert past this is full (not an in-place rehash).
 pub const MAX_LOAD_NUM: u64 = 7;
 pub const MAX_LOAD_DEN: u64 = 8;
 
@@ -30,14 +28,6 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 pub fn primary_slot(key: &[u8; 16], slots: u64) -> u64 {
     debug_assert!(slots.is_power_of_two() && slots >= 2);
     fnv1a_64(key) & (slots - 1)
-}
-
-/// Process-wide: at most one open-address rehash at a time (IBD materialize must
-/// not stack multi-shard resizes into one host freeze). Shared by tx/header
-/// heads and scripthash heads.
-pub fn rehash_gate() -> &'static Mutex<()> {
-    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(test)]

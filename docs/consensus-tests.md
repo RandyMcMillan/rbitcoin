@@ -116,6 +116,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C20 | Mainnet 866342 + Floresta prevouts | structure + scripts; overweight 4_000_001 WU rejects | `block::block_866342::*` |
 | C21 | Tapscript initial witness 1000 / 520 | `stack size` / `PUSH_SIZE`; OP_SUCCESS overrides | `script_path_rejects_initial_stack_over_max_size` ([023](./external_findings/023-tapscript-initial-stack-limits.md)) |
 | C25 | BIP342 tapscript validation weight | `tapscript validation weight` | `script_path_rejects_tapscript_validation_weight` |
+| C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
 
 ## Adding a new rule
 

@@ -139,6 +139,9 @@ before 1.0).
 
 ### Fixed
 
+- **P2SH scriptSig matches Core EvalScript + IsPushOnly:** `OP_1NEGATE` is a
+  valid push; scriptSig >10 000 bytes is rejected. Finding 006 520-byte pin kept.
+
 - **BIP342 tapscript validation-weight budget:** script-path CHECKSIG /
   CHECKSIGADD with a non-empty signature subtracts 50 from
   `50 + witness_serialized_size`; remaining `< 0` fails (Core

@@ -70,7 +70,7 @@ What the node actually runs. This is the map; findings follow.
 |-------|-----------|--------|
 | `eval_script` | Core-shaped opcode walk | tapscript OP_SUCCESS pre-scan, 520 B stack |
 | CHECKSIG | DER lax + optional BIP66; Schnorr BIP340 | BIP342 validation-weight budget |
-| P2SH | bespoke `push_only_items` parser | not `eval_script` of scriptSig |
+| P2SH | `eval_script` scriptSig then IsPushOnly | last stack item is redeem |
 | Sigops | `script_sigop_count` byte walk | truncated PUSHDATA2/4 stops (Core `GetOp`) |
 | Signet | challenge script + witness commitment | first-match prefix, not last 38-byte BIP141 |
 
@@ -115,19 +115,6 @@ What the node actually runs. This is the map; findings follow.
 These are the ones worth a plan. ✔ = re-read against current source.
 
 ### High — consensus
-
-#### C-H3. P2SH scriptSig parser diverges from Core (reject-valid + accept-invalid)
-
-`crates/rbitcoin-consensus/src/script/nested.rs` `push_only_items` /
-`split_script_sig_redeem` (~137–183), used by `verify_p2sh_legacy` (~85).
-
-- `OP_1NEGATE` (0x4f) rejected as not-a-push; Core `IsPushOnly` accepts every
-  opcode `≤ OP_16`. **Reject-valid** post-BIP16.
-- scriptSig is not run through `eval_script`, so 10 000-byte script and
-  1000-item stack limits never apply. **Accept-invalid**.
-
-`eval_script_sig_pushes` in `interpreter.rs` already handles 0x4f. One
-implementation at the lowest owner: evaluate scriptSig, snapshot stack.
 
 #### C-H4. Testnet 20-minute min-difficulty rule absent
 
@@ -387,9 +374,8 @@ a mainnet miss).
 
 Do not flatten io_uring machines. Do not add a process pin FIFO.
 
-1. **P2SH:** delete `push_only_items`; `eval_script` the scriptSig (fixes C-H3).
-2. **Signet commitment:** reuse BIP141 reverse scan (fixes C-M6).
-3. **Chain work:** one cumulative index (fixes N-H3 + RPC P2).
+1. **Signet commitment:** reuse BIP141 reverse scan (fixes C-M6).
+2. **Chain work:** one cumulative index (fixes N-H3 + RPC P2).
 4. **Wtxid:** secondary `HashMap` (fixes N-H2).
 5. **Mempool eviction:** `BinaryHeap` of cluster worst-rate (fixes P3).
 6. **Mempool slots:** free list (fixes P13).
@@ -471,7 +457,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
 | store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
-| consensus + primitives | 2 (P2SH parser, testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
+| consensus + primitives | 1 (testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
@@ -487,8 +473,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **C-H3 P2SH eval_script** — consensus; pin with Core-shaped fixtures. Closest to
-   `docs/quality.md` pillar 1.
+1. **C-H4 testnet min-difficulty** — remaining consensus High.
 2. **S-H1 HashHead seqlock/epoch** — false misses during grow.
 3. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
 4. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
@@ -508,6 +493,9 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-H3.** P2SH scriptSig is `eval_script` + IsPushOnly (`OP_1NEGATE` accepted;
+  >10 000-byte scriptSig rejected). Pins: `p2sh_legacy_op_1negate_scriptsig_accepted`,
+  `p2sh_legacy_scriptsig_over_10k_rejected`. This PR.
 - **C-H1.** BIP342 tapscript validation-weight budget (`50 + witness size`,
   −50 per nonempty CHECKSIG*). Pin: `script_path_rejects_tapscript_validation_weight`.
   This PR.

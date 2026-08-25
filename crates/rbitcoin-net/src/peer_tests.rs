@@ -4615,3 +4615,45 @@ fn pending_header_walk_is_ram_then_one_store_lookup() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn inbound_handshake_timeout_after_silence() {
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _silent = TcpStream::connect(addr).await.unwrap();
+    let (stream, peer) = listener.accept().await.unwrap();
+
+    let handle = tokio::spawn(async move {
+        connect_and_handshake_timed(
+            Duration::from_millis(50),
+            stream,
+            Magic::REGTEST,
+            addr,
+            peer,
+            0,
+            true,
+            "/rbitcoin:test/",
+            HandshakePolicy::plain(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!handle.is_finished(), "must still wait during handshake");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handle.is_finished(),
+        "silence past the bound must end handshake"
+    );
+    match handle.await.unwrap() {
+        Err(NetError::Timeout) => {}
+        Err(e) => panic!("expected Timeout, got {e}"),
+        Ok(_) => panic!("handshake succeeded on a silent peer"),
+    }
+}
+
+#[test]
+fn inbound_handshake_timeout_is_core_60s() {
+    assert_eq!(INBOUND_HANDSHAKE_TIMEOUT, Duration::from_secs(60));
+}

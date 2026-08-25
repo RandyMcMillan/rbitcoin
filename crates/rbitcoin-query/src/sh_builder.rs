@@ -26,15 +26,11 @@ pub enum ShTipMaterializeMode {
     /// Resume interrupted cold (progress present). Dir-variant: sealed
     /// `head/NN` stays; `next_shard` is the lowest unsealed hole.
     ColdResume { next_shard: u32 },
-    /// Durable head present: batch-warm residual runs only — **never** reinit.
-    WarmOnly,
+    /// Durable head, or empty catalog: do not pack. Leftover runs are discarded.
+    Skip,
 }
 
 /// Select materialize mode. **Never** returns FullCold when head already holds durable data.
-///
-/// Intentional full cold (FORCE / empty-head recollect) runs only after load has
-/// reinit'd the head empty. Incomplete catalogs are fixed *before* this (Class A
-/// recollect). Sticky FORCE alone never overrides a live durable head.
 pub fn select_sh_tip_materialize_mode(
     head_empty: bool,
     entry_count: u64,
@@ -43,18 +39,16 @@ pub fn select_sh_tip_materialize_mode(
     stream_run_count: usize,
 ) -> ShTipMaterializeMode {
     let n_shards = n_shards.max(1);
-    // Interrupted cold: progress is present and not past the last shard.
-    // `next_shard == 0` is a hole at shard 0 with later heads already sealed.
     if let Some(ns) = progress_next_shard {
         if ns < n_shards {
             return ShTipMaterializeMode::ColdResume { next_shard: ns };
         }
     }
     if !head_empty || entry_count > 0 {
-        return ShTipMaterializeMode::WarmOnly;
+        return ShTipMaterializeMode::Skip;
     }
     if stream_run_count == 0 {
-        return ShTipMaterializeMode::WarmOnly;
+        return ShTipMaterializeMode::Skip;
     }
     ShTipMaterializeMode::FullCold
 }
@@ -748,52 +742,25 @@ impl ShRunBuilder {
             progress.as_ref().map(|p| p.next_shard),
         );
 
-        if matches!(mode, ShTipMaterializeMode::WarmOnly) {
+        if matches!(mode, ShTipMaterializeMode::Skip) {
             info!(
-                "node: scripthash warm apply residual runs={} (protecting durable head; no reinit)",
+                "node: scripthash skip materialize (durable head or empty stream); \
+                 discarding leftover runs={}",
                 stream_inputs.len()
             );
-            let t0 = Instant::now();
-            // Inclusion HWM before deleting run files.
-            let mut max_fk = store.scripthash.include_hwm();
-            for r in stream_inputs.iter().chain(pending_after.iter()) {
-                if let Ok(body) = rbitcoin_store::read_run_body(r) {
-                    max_fk = max_fk.max(max_fk_in_body(&body));
-                }
-            }
-            let n_warm = apply_runs_to_live_sh(store, &stream_inputs, cancel)?;
-            let mut n_deferred = 0u64;
-            if !pending_after.is_empty() {
-                info!(
-                    "node: scripthash applying {} deferred run(s) after warm residual",
-                    pending_after.len()
-                );
-                n_deferred = apply_runs_to_live_sh(store, &pending_after, cancel)?;
-                for r in &pending_after {
-                    let _ = std::fs::remove_file(&r.path);
-                }
-            }
             for run in &claimed {
                 let _ = std::fs::remove_file(&run.path);
             }
             for run in &stream_inputs {
                 let _ = std::fs::remove_file(&run.path);
             }
+            for r in &pending_after {
+                let _ = std::fs::remove_file(&r.path);
+            }
             let _ = std::fs::remove_dir_all(&merge_dir);
             clear_runs_dir(&runs_dir);
-            if max_fk > 0 {
-                let _ = store.scripthash.note_include_hwm(max_fk);
-                let _ = store_seal(&runs_dir, max_fk);
-                self.sealed_fk.store(max_fk, Ordering::Release);
-            }
-            info!(
-                "node: scripthash warm residual done written≈{} deferred≈{n_deferred} \
-                 include_hwm={max_fk} elapsed={:?}",
-                n_warm,
-                t0.elapsed()
-            );
             let _ = (claim_ns, reduce_ns);
-            return Ok(n_warm.saturating_add(n_deferred));
+            return Ok(0);
         }
 
         let resume_from = match &mode {
@@ -827,7 +794,7 @@ impl ShRunBuilder {
                 debug_assert_eq!(store.scripthash.entry_count(), 0);
                 debug_assert!(store.scripthash.head_is_empty());
             }
-            ShTipMaterializeMode::WarmOnly => unreachable!("warm handled above"),
+            ShTipMaterializeMode::Skip => unreachable!("skip handled above"),
         }
         let reinit_ns = t_reinit.elapsed().as_nanos() as u64;
         info!(
@@ -1548,20 +1515,18 @@ mod tests {
 
     #[test]
     fn select_mode_never_full_cold_when_head_has_data() {
-        // Regression: residual run after finished cold must not FullCold.
         assert_eq!(
             select_sh_tip_materialize_mode(false, 3_741_517_546, None, 64, 1),
-            ShTipMaterializeMode::WarmOnly
+            ShTipMaterializeMode::Skip
         );
         assert_eq!(
             select_sh_tip_materialize_mode(true, 100, None, 64, 1),
-            ShTipMaterializeMode::WarmOnly
+            ShTipMaterializeMode::Skip
         );
         assert_eq!(
             select_sh_tip_materialize_mode(true, 0, None, 64, 10),
             ShTipMaterializeMode::FullCold
         );
-        // Mid multi-shard cold: progress wins even with partial entry_count.
         assert_eq!(
             select_sh_tip_materialize_mode(false, 1e9 as u64, Some(40), 64, 32),
             ShTipMaterializeMode::ColdResume { next_shard: 40 }
@@ -1570,15 +1535,13 @@ mod tests {
             select_sh_tip_materialize_mode(false, 1e9 as u64, Some(0), 64, 1),
             ShTipMaterializeMode::ColdResume { next_shard: 0 }
         );
-        // Empty head + streams → FullCold (FORCE prep reinit's before this).
         assert_eq!(
             select_sh_tip_materialize_mode(true, 0, None, 64, 1),
             ShTipMaterializeMode::FullCold
         );
-        // Complete progress (next == n_shards) + residual → warm, not resume past end.
         assert_eq!(
             select_sh_tip_materialize_mode(false, 100, Some(64), 64, 1),
-            ShTipMaterializeMode::WarmOnly
+            ShTipMaterializeMode::Skip
         );
     }
 

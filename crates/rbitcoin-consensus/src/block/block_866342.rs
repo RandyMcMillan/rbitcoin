@@ -28,6 +28,8 @@ const HEIGHT: u32 = 866_342;
 const BLOCK_HASH: &str = "000000000000000000014ce9ba7c6760053c3c82ce6ab43d60afb101d3c8f1f1";
 const HAPPY_WEIGHT_WU: u64 = 3_993_209;
 const OVERWEIGHT_WU: u64 = 4_000_001;
+// Floresta packs declare 128 MiB; ruzstd 0.9 default max is 100 MiB.
+const FIXTURE_ZSTD_WINDOW: u64 = 128 * 1024 * 1024;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/block_866342")
@@ -36,7 +38,8 @@ fn fixture_dir() -> PathBuf {
 fn decode_zstd(path: &Path) -> Vec<u8> {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("missing fixture {path:?}: {e}"));
     let mut decoder =
-        ruzstd::decoding::StreamingDecoder::new(f).unwrap_or_else(|e| panic!("zstd {path:?}: {e}"));
+        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(f, FIXTURE_ZSTD_WINDOW)
+            .unwrap_or_else(|e| panic!("zstd {path:?}: {e}"));
     let mut out = Vec::new();
     decoder
         .read_to_end(&mut out)

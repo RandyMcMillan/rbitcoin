@@ -416,13 +416,16 @@ fn witness_sigop_count(tx: &Transaction, prev_spks: &[&[u8]]) -> u64 {
     n
 }
 
-fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool) -> u64 {
+fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool, segwit: bool) -> u64 {
     const WITNESS_SCALE: u64 = 4;
     let mut n = 0u64;
     if bip16 {
         n = n.saturating_add(p2sh_sigops_one(inp, spk).saturating_mul(WITNESS_SCALE));
     }
-    n.saturating_add(witness_sigops_one(inp, spk))
+    if segwit {
+        n = n.saturating_add(witness_sigops_one(inp, spk));
+    }
+    n
 }
 
 /// GBT `sigops`: Core `GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR`.
@@ -435,13 +438,15 @@ pub fn tx_gbt_sigops(tx: &Transaction) -> u64 {
 
 /// Full Core-style sigop cost for one tx given prevout scripts (BIP16 + BIP141).
 #[cfg(test)]
-fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool) -> u64 {
+fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool, segwit: bool) -> u64 {
     const WITNESS_SCALE: u64 = 4;
     let mut cost = legacy_sigop_count(tx).saturating_mul(WITNESS_SCALE);
     if bip16 {
         cost = cost.saturating_add(p2sh_sigop_count(tx, prev_spks).saturating_mul(WITNESS_SCALE));
     }
-    cost = cost.saturating_add(witness_sigop_count(tx, prev_spks));
+    if segwit {
+        cost = cost.saturating_add(witness_sigop_count(tx, prev_spks));
+    }
     cost
 }
 
@@ -1265,6 +1270,7 @@ fn assemble_block_prevouts_mode(
                     ctx.height.0,
                     mode == AssembleMode::Full,
                     bip16_for_jobs,
+                    flag_segwit,
                     build_script_jobs,
                     &mut acc,
                 )?;
@@ -1967,6 +1973,7 @@ fn resolve_prevout(
     // Optimistic: prevout value/script only. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
     bip16: bool,
+    segwit: bool,
     need_script_buf: bool,
     acc: &mut AsmPrevoutAcc,
 ) -> Result<ResolvedPrevout, ConsensusError> {
@@ -1981,7 +1988,7 @@ fn resolve_prevout(
             acc.same_n = acc.same_n.saturating_add(1);
             return Ok(ResolvedPrevout {
                 txout: o.clone(),
-                input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16),
+                input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16, segwit),
                 coinbase_height: None,
                 create_height: if resolve_create_heights {
                     spend_height
@@ -2026,7 +2033,7 @@ fn resolve_prevout(
                             ScriptBuf::new()
                         },
                     },
-                    input_sigops: prevout_spk_sigops(inp, script, bip16),
+                    input_sigops: prevout_spk_sigops(inp, script, bip16, segwit),
                 }
             },
         ) {
@@ -2137,7 +2144,7 @@ fn resolve_prevout(
                 confirm_phase_stats::tl_note_cold_why_not_pin();
             }
         }
-        let input_sigops = prevout_spk_sigops(inp, &out.script, bip16);
+        let input_sigops = prevout_spk_sigops(inp, &out.script, bip16, segwit);
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),

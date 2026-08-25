@@ -1,8 +1,8 @@
 //! sigop_cost_tests (peeled from block.rs).
 
 use super::{
-    is_p2sh_script, last_script_push, p2sh_sigop_count, script_sigop_count, tx_gbt_sigops,
-    tx_sigop_cost, witness_sigop_count,
+    is_p2sh_script, last_script_push, p2sh_sigop_count, prevout_spk_sigops, script_sigop_count,
+    tx_gbt_sigops, tx_sigop_cost, witness_sigop_count,
 };
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
@@ -160,7 +160,7 @@ fn p2sh_and_witness_sigop_paths() {
         script_pubkey: ScriptBuf::from_bytes(spk2),
     }];
     assert!(p2sh_sigop_count(&tx2, &spks(&prev2)) >= 1);
-    assert!(tx_sigop_cost(&tx2, &spks(&prev2), true) >= 4);
+    assert!(tx_sigop_cost(&tx2, &spks(&prev2), true, true) >= 4);
     // Nested P2SH without redeem push → continue (0 witness sigops).
     let tx3 = Transaction {
         version: TxVersion::TWO,
@@ -254,7 +254,7 @@ fn p2sh_sigops_from_redeem() {
     }];
     assert_eq!(p2sh_sigop_count(&tx, &spks(&prevouts)), 1);
     // legacy×4 + p2sh×4 = 0 + 4 (no legacy CHECKSIG in ss/spk for bare count of redeem)
-    let cost = tx_sigop_cost(&tx, &spks(&prevouts), true);
+    let cost = tx_sigop_cost(&tx, &spks(&prevouts), true, true);
     // scriptSig has push only (0 legacy), output OP_1 (0), p2sh redeem 1×4 = 4
     assert_eq!(cost, 4);
 }
@@ -285,6 +285,38 @@ fn witness_p2wpkh_counts_one() {
         script_pubkey: ScriptBuf::from_bytes(spk),
     }];
     assert_eq!(witness_sigop_count(&tx, &spks(&prevouts)), 1);
+}
+
+#[test]
+fn witness_sigops_gated_on_segwit() {
+    let mut spk = vec![0x00, 0x14];
+    spk.extend([0u8; 20]);
+    let inp = TxIn {
+        previous_output: OutPoint {
+            txid: Txid::from_byte_array([2; 32]),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    assert_eq!(prevout_spk_sigops(&inp, &spk, false, false), 0);
+    assert_eq!(prevout_spk_sigops(&inp, &spk, false, true), 1);
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![inp],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let prevouts = vec![TxOut {
+        value: Amount::from_sat(10),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    }];
+    assert_eq!(tx_sigop_cost(&tx, &spks(&prevouts), false, false), 0);
+    assert_eq!(tx_sigop_cost(&tx, &spks(&prevouts), false, true), 1);
 }
 
 #[test]

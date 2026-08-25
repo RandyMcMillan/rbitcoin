@@ -139,6 +139,10 @@ before 1.0).
 
 ### Fixed
 
+- **Witness sigops only after segwit:** `GetTransactionSigOpCost` witness
+  component is gated on `segwit_active_at` (pre-segwit P2WPKH-shaped prevouts
+  no longer add 1).
+
 - **P2SH sigops match Core GetSigOpCount(scriptSig):** opcode `> OP_16` yields 0.
 
 - **Regtest subsidy halves every 150 blocks** (Core `nSubsidyHalvingInterval`).

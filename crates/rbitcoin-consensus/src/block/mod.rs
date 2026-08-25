@@ -1025,7 +1025,7 @@ impl AsmPrevoutAcc {
 /// once per block (no per-input Instant / atomics).
 ///
 /// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] +
-/// [`rbitcoin_query::BatchThin`], then shared outs FIFO / durable store.
+/// [`rbitcoin_query::BatchThin`]. Optimistic miss is `invariant:` (no head recover).
 ///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
 ///
@@ -1205,7 +1205,11 @@ fn assemble_block_prevouts_mode(
             } else {
                 Vec::new()
             };
-            let mut input_create_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
+            let mut input_create_heights: Vec<u32> = if mode == AssembleMode::Full {
+                Vec::with_capacity(tx.input.len())
+            } else {
+                Vec::new()
+            };
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
             let mut tx_in_sigops = 0u64;
 
@@ -1233,14 +1237,20 @@ fn assemble_block_prevouts_mode(
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key.0).copied())
                     .or_else(|| {
-                        query
-                            .tx_fk_by_txid_tip(op.txid.as_byte_array())
-                            .ok()
-                            .flatten()
+                        if mode == AssembleMode::Full {
+                            query
+                                .tx_fk_by_txid_tip(op.txid.as_byte_array())
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        }
                     });
                 let pin_live = match prev_fk {
-                    Some(fk) => batch_parents.has_parent_out(fk, op.vout),
-                    None => false,
+                    Some(fk) if mode == AssembleMode::Full => {
+                        batch_parents.has_parent_out(fk, op.vout)
+                    }
+                    _ => false,
                 };
                 // Durable spentness: Full mode only. Optimistic defers to structural
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
@@ -2092,6 +2102,11 @@ fn resolve_prevout(
         }
     }
 
+    if !resolve_create_heights {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: lookup stage miss (assemble parent create_fk)",
+        )));
+    }
     let head_fk = query
         .tx_fk_by_txid_tip(&prev_txid)
         .map_err(ConsensusError::from)?;

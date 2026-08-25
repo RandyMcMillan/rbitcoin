@@ -1098,6 +1098,102 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Optimistic IBD: unstamped parent must not recover via `tx_fk_by_txid_tip`.
+#[test]
+fn optimistic_assemble_unstamped_parent_is_invariant() {
+    use super::assemble_block_prevouts;
+    use crate::accept_and_connect_block;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-assemble-unstamped-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let parent_txid = genesis.txdata[0].compute_txid();
+    let spend = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut block = Block {
+        header: Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: genesis.header.time + 600,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![coinbase(1), spend],
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    let p = Box::leak(Box::new(params));
+    let ctx = ValidationContext::at(p, Height(1), Milestone { height: 840_000 });
+    let parents = BatchParents::new();
+    let thin = BatchThin::default();
+    let mut spent = OutPointSet::default();
+    let mut creates = super::PendingCreates::default();
+    let create_txids: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let bh = block.header.block_hash().to_byte_array();
+    let spend_fks = [Fk(1), Fk(2)];
+    let err = assemble_block_prevouts(
+        &q,
+        &block,
+        &ctx,
+        Some(&spend_fks),
+        &mut spent,
+        &mut creates,
+        &parents,
+        &thin,
+        &create_txids,
+        genesis.header.time,
+        &bh,
+        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, genesis.header.time),
+        None,
+        None,
+    )
+    .err()
+    .expect("unstamped parent must not head-recover");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invariant") && msg.contains("lookup stage miss"),
+        "got {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 #[test]
 fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     use super::assemble_block_prevouts;
@@ -1207,10 +1303,7 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// N1: cold-path reason counters for pin→assemble leakage classes.
-///
-/// Drives [`super::resolve_prevout`] (same crate) so each miss class is
-/// forced without re-implementing path logic in the test.
+/// N1: Optimistic miss is lookup invariant; pin hit / identity / vout still classified.
 #[test]
 fn n1_assemble_cold_why_reasons() {
     use super::resolve_prevout;
@@ -1293,10 +1386,18 @@ fn n1_assemble_cold_why_reasons() {
     let _ = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
     let _ = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
 
-    // ── null_fk: no hint; head still finds parent → cold ──────────
+    fn assert_lookup_miss(err: ConsensusError) {
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("lookup stage miss"),
+            "got {msg}"
+        );
+    }
+
+    // ── null_fk: Optimistic must not recover via head ─────────────
     {
         let parents = BatchParents::new();
-        resolve_prevout(
+        let err = resolve_prevout(
             &q,
             &empty_block,
             op,
@@ -1313,17 +1414,15 @@ fn n1_assemble_cold_why_reasons() {
             true,
             &mut super::AsmPrevoutAcc::default(),
         )
-        .expect("null_fk cold");
-        let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
-        let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
-        assert_eq!(why, (1, 0, 0, 0), "null_fk why={why:?}");
-        assert_eq!(cold_n, 1, "cold_n={cold_n}");
+        .err()
+        .expect("null_fk optimistic");
+        assert_lookup_miss(err);
     }
 
     // ── not_pin: correct fk, empty BatchParents ───────────────────
     {
         let parents = BatchParents::new();
-        resolve_prevout(
+        let err = resolve_prevout(
             &q,
             &empty_block,
             op,
@@ -1340,11 +1439,9 @@ fn n1_assemble_cold_why_reasons() {
             true,
             &mut super::AsmPrevoutAcc::default(),
         )
-        .expect("not_pin cold");
-        let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
-        let (_batch_n, cold_n) = confirm_phase_stats::sample_tl_batch_cold_n_and_reset();
-        assert_eq!(why, (0, 1, 0, 0), "not_pin why={why:?}");
-        assert_eq!(cold_n, 1, "cold_n");
+        .err()
+        .expect("not_pin optimistic");
+        assert_lookup_miss(err);
     }
 
     // ── batch hit: no cold ────────────────────────────────────────

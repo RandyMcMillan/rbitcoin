@@ -624,6 +624,13 @@ impl ShRunBuilder {
         Ok(())
     }
 
+    /// Drop leftover catalog / `.mat` / merge files. **Keeps `SEAL`** (resume
+    /// watermark). Used when a durable head exists: residual runs are not merged.
+    pub fn discard_residual_runs(&self) {
+        clear_runs_dir(&self.runs_dir);
+        let _ = std::fs::create_dir_all(&self.runs_dir);
+    }
+
     /// Wipe on-disk catalog runs + SEAL=0 (does not touch durable SH head).
     fn wipe_catalog_and_seal(&self) -> Result<(), StoreError> {
         clear_runs_dir(&self.runs_dir);

@@ -114,6 +114,15 @@ impl Query {
         self.set_tx_index(true);
     }
 
+    /// True when a durable SH head already exists — catch-up / restart must
+    /// **write-behind** (same as tip follow), never Class A recollect or WarmOnly.
+    ///
+    /// Residual `scripthash.runs` next to a live head are leftover (cancelled
+    /// WarmOnly / crash); they are discarded, not merged.
+    pub fn sh_use_writebehind(&self) -> bool {
+        self.sh_index_enabled() && self.store.scripthash.has_durable_index()
+    }
+
     /// True when durable SH already covers Class A through tip (safe to stay in
     /// Tip mode on restart — no Direct recollect / bulk materialize).
     ///
@@ -200,13 +209,34 @@ impl Query {
             ShPreMaterializeAction, SH_SEAL_LAG_OK,
         };
 
-        if !sh_force_rebuild() && self.sh_is_tip_ready() {
+        if !sh_force_rebuild() && self.sh_use_writebehind() {
+            let residual = self.sh_run.on_disk_run_count();
+            self.sh_run.discard_residual_runs();
+            if residual > 0 {
+                rbitcoin_log::info!(
+                    "node: scripthash durable head — discarding {residual} leftover run(s); \
+                     gap uses write-behind (no Class A recollect / WarmOnly)"
+                );
+            }
+            // Legacy head without include_hwm: SEAL is the inclusion floor.
+            self.sh_run.refresh_seal();
+            let seal = self.sh_run.sealed_max_create_fk();
+            if self.store.scripthash.include_hwm() == 0 && seal > 0 {
+                self.store.scripthash.note_include_hwm(seal)?;
+            }
             self.sync_sh_seal_from_include_hwm()?;
-            rbitcoin_log::info!(
-                "node: scripthash already tip-ready (durable head covers tip; no residual runs) — \
-                 skip Class A recollect and bulk materialize"
-            );
-            self.mark_sh_indexed_through_tip();
+            if self.sh_is_tip_ready() {
+                rbitcoin_log::info!(
+                    "node: scripthash already tip-ready (durable head covers tip) — \
+                     skip Class A recollect and bulk materialize"
+                );
+                self.mark_sh_indexed_through_tip();
+            } else {
+                rbitcoin_log::info!(
+                    "node: scripthash durable head with HWM/SEAL lag — skip collect; \
+                     recover/write-behind fills the height gap"
+                );
+            }
             return Ok(0);
         }
 
@@ -1558,6 +1588,79 @@ mod tests {
         // Second finalize is a no-op fast path.
         assert_eq!(q.finalize_sh_runs().unwrap(), 0);
         assert!(q.sh_is_tip_ready());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Durable head + lagging include_hwm + leftover run: skip recollect/WarmOnly.
+    ///
+    /// Mainnet 2026-08-25: short Tip catch-up then WarmOnly re-applied creates
+    /// already in the head → `fk stream zero delta`.
+    #[test]
+    fn durable_head_hwm_lag_skips_recollect() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-hwm-lag-skip-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        seed_direct_chain(&q, 6);
+        let n0 = q.finalize_sh_runs().unwrap();
+        assert!(n0 > 0 || q.store.scripthash.has_durable_index());
+        assert!(q.store.scripthash.has_durable_index());
+        let count_before = q.store.scripthash.entry_count();
+        let tip_max = q.store.txs.count();
+        assert!(tip_max >= 6);
+
+        // Write-behind applied fewer heights than Class A (HWM file is monotonic
+        // on the store API — plant the lag the way a crash leaves it).
+        let lag = tip_max.saturating_sub(3).max(1);
+        std::fs::write(
+            dir.join(rbitcoin_store::INCLUDE_HWM_NAME),
+            lag.to_le_bytes(),
+        )
+        .unwrap();
+        assert!(
+            q.store.scripthash.include_hwm() < tip_max,
+            "planted HWM lag hwm={} tip_max={tip_max}",
+            q.store.scripthash.include_hwm()
+        );
+
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_rec(&[0xee; 32], Fk(99)));
+        write_sorted_run(
+            &next_run_path(&runs_dir, 50),
+            SH_RUN_KEY_LEN,
+            SH_RUN_REC_LEN,
+            &body,
+        )
+        .unwrap();
+        assert!(q.sh_run.on_disk_run_count() > 0);
+        assert!(
+            !q.sh_is_tip_ready(),
+            "strict HWM/run check is still false (the old tripwire)"
+        );
+        assert!(
+            q.sh_use_writebehind(),
+            "durable head must choose write-behind even when HWM lags"
+        );
+
+        let n1 = q.finalize_sh_runs().unwrap();
+        assert_eq!(n1, 0, "must not recollect/WarmOnly onto a live head");
+        assert_eq!(
+            q.store.scripthash.entry_count(),
+            count_before,
+            "leftover run must not be applied onto the live head"
+        );
+        assert_eq!(q.scripthash_run_count(), 0, "leftover runs discarded");
+        assert_eq!(
+            q.store.scripthash.include_hwm(),
+            lag,
+            "skip must not bump HWM from the leftover run"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

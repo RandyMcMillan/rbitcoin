@@ -133,6 +133,10 @@ pub(crate) struct IbdWorkState {
     pub reorg: IbdReorgState,
     /// Loop turns since last [`Self::hygiene`].
     hygiene_counter: u32,
+    /// First height ≥ path_lo densify should walk (filled prefix skip).
+    pub densify_scan_lo: u32,
+    /// Last Full-assign `path_lo`; drop watermark when the tip shrinks.
+    pub assign_path_lo: u32,
 }
 
 impl IbdWorkState {
@@ -181,6 +185,8 @@ impl IbdWorkState {
             relative_slow_suspect: None,
             reorg: IbdReorgState::new(),
             hygiene_counter: 0,
+            densify_scan_lo: 0,
+            assign_path_lo: 0,
         }
     }
 

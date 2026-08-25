@@ -206,7 +206,13 @@ pub(crate) fn assign_work_ordered(
         fetched_hi,
     );
 
-    let densify = collect_height_band(st, hub, path_lo, band_hi, room.max(1));
+    if path_lo < st.assign_path_lo {
+        st.densify_scan_lo = path_lo;
+    }
+    st.assign_path_lo = path_lo;
+    st.densify_scan_lo = st.densify_scan_lo.max(path_lo);
+    let densify_lo = path_lo.max(st.densify_scan_lo);
+    let densify = collect_height_band(st, hub, densify_lo, band_hi, room.max(1));
     if densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -271,16 +277,40 @@ fn collect_height_band(
     }
     let hi = hi.min(st.max_ordered_height.max(lo));
     let mut walked = 0usize;
+    let mut prefix = lo;
+    let mut tracking = true;
     for ht in lo..=hi {
         if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
         walked += 1;
-        if let Some(h) = need_hash_at(st, hub, ht) {
+        let need = need_hash_at(st, hub, ht);
+        if tracking {
+            if need.is_none() && densify_prefix_filled(st, hub, ht) {
+                prefix = ht.saturating_add(1);
+            } else {
+                tracking = false;
+            }
+        }
+        if let Some(h) = need {
             out.push_back(h);
         }
     }
+    st.densify_scan_lo = prefix.max(st.densify_scan_lo);
     out
+}
+
+fn densify_prefix_filled(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> bool {
+    let Some(&h) = st.height_to_hash.get(&ht) else {
+        return false;
+    };
+    if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
+        return true;
+    }
+    if st.inflight.contains_key(&h) {
+        return true;
+    }
+    st.body.is_known_archived(&h)
 }
 
 /// Body-queue wire at `ht` for `want`: `Ready` when matching; wrong first-wins
@@ -1483,6 +1513,48 @@ mod tests {
             "under free bytes: densify past 1-min window; issued={issued_hts:?}"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Filled BQ prefix must advance densify_scan_lo so the next tick skips it.
+    #[test]
+    fn densify_watermark_skips_bq_ready_prefix() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 128;
+        cfg.per_peer = 64;
+
+        for ht in 1u32..=80 {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.height_to_hash.insert(ht, hash);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+            st.body.mark_missing(hash);
+        }
+        for ht in 1u32..=40 {
+            hub.query
+                .block_queue_enqueue(ht, h(ht).to_byte_array(), ht as u64, b"x")
+                .unwrap();
+            st.body.mark_pending(h(ht));
+        }
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
+        assert!(
+            st.densify_scan_lo >= 41,
+            "BQ-ready 1..=40 must bump scan_lo; scan_lo={}",
+            st.densify_scan_lo
+        );
+        let issued_low = st
+            .inflight
+            .keys()
+            .filter_map(|hash| st.hash_height.get(hash).copied())
+            .filter(|&ht| ht <= 40)
+            .count();
+        assert_eq!(issued_low, 0, "must not getdata heights already on BQ");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -478,7 +478,10 @@ fn records_from_wire(
             if create_fk.is_null() {
                 return None;
             }
-            let (val, script, _) = parents.get_parent_txout_parts(create_fk, vout)?;
+            let (val, script) =
+                parents.get_parent_txout_parts(create_fk, vout, |val, script, _| {
+                    (val, script.to_vec())
+                })?;
             let value = if val < 0 {
                 Amount::ZERO
             } else {

@@ -13,7 +13,7 @@ pub(super) fn assemble_run(
     batch_thin: &rbitcoin_query::BatchThin,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
-    let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
     let mut pending_creates = crate::block::PendingCreates::default();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(metas.len());
@@ -208,7 +208,7 @@ pub(super) fn structural_run(
 ) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
     use crate::block::StructuralPhaseNs;
     let t0 = Instant::now();
-    let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     for p in prepared {
         if p.height.0 > 0 {

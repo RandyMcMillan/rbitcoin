@@ -173,9 +173,8 @@ fn assert_bad_block(err: ConsensusError, needle: &str) {
 fn bip30_rejects_unspent_connected_sibling() {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, FkMap, Query, U32Map, U64Map};
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, Query, U32Map, U64Map};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::collections::HashSet;
     use std::sync::Once;
 
     static ONCE: Once = Once::new();
@@ -231,7 +230,7 @@ fn bip30_rejects_unspent_connected_sibling() {
         Some(&[Fk(2)]),
         &[],
         0,
-        &mut HashSet::new(),
+        &mut OutPointSet::default(),
         &BatchParents::new(),
         &mut U32Map::default(),
         &mut U64Map::default(),
@@ -787,8 +786,7 @@ fn bip34_height_script_small_and_op_n() {
 fn assemble_full_mode_spend_and_bip68() {
     use super::{assemble_block_prevouts_mode, AssembleMode};
     use crate::accept_and_connect_block;
-    use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::HashSet;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -879,7 +877,7 @@ fn assemble_full_mode_spend_and_bip68() {
     let ctx = ctx_h(4);
     let parents = BatchParents::new();
     let thin = BatchThin::default();
-    let mut spent = HashSet::new();
+    let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let create_txids: Vec<[u8; 32]> = block
         .txdata
@@ -912,8 +910,7 @@ fn assemble_full_mode_spend_and_bip68() {
 #[test]
 fn assemble_rejects_empty_and_fk_mismatch() {
     use super::assemble_block_prevouts;
-    use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::HashSet;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -935,7 +932,7 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let empty = block_with(vec![]);
     let parents = BatchParents::new();
     let thin = BatchThin::default();
-    let mut spent = HashSet::new();
+    let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let zero = [0u8; 32];
     let err = assemble_block_prevouts(
@@ -1024,8 +1021,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     use super::assemble_block_prevouts;
     use crate::confirm_phase_stats;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::HashSet;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1046,7 +1042,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     let ctx = ctx_h(1);
     let parents = BatchParents::new();
     let thin = BatchThin::default();
-    let mut spent = HashSet::new();
+    let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let b = block_with(vec![coinbase(1)]);
     let tids: Vec<[u8; 32]> = b
@@ -1082,6 +1078,115 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     assert_eq!(in_n, 0, "coinbase has no prevouts");
     assert_eq!(batch_n, 0);
     assert_eq!(same_n, 0);
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
+    use super::assemble_block_prevouts;
+    use bitcoin::hashes::{sha256, Hash};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query, ThinInput};
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-assemble-ms-sigops-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    let ws = vec![0xacu8; 80_001];
+    let h = sha256::Hash::hash(&ws);
+    let mut spk = vec![0x00, 0x20];
+    spk.extend_from_slice(h.as_byte_array());
+    let mut parent_txid = [0u8; 32];
+    parent_txid[0] = 0x42;
+    let rec = TxRecord {
+        txid: parent_txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let mut parents = BatchParents::new();
+    parents.insert_owned(
+        Fk(7),
+        rec,
+        vec![(0, OutputRecord::unspent(50_0000_0000, spk))],
+        vec![0],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[&ws]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let b = block_with(vec![coinbase(1), spend]);
+    let params = Box::leak(Box::new(ChainParams::regtest()));
+    let ctx = ValidationContext::at(params, Height(1), Milestone { height: 100 });
+    assert!(ctx.milestone.skips_scripts_at(ctx.height.0));
+    let spend_fk = Fk(100);
+    let mut thin = BatchThin::default();
+    thin.insert(
+        spend_fk.0,
+        vec![ThinInput {
+            create_fk: Some(7),
+            prev_index: 0,
+        }],
+    );
+    let mut spent = OutPointSet::default();
+    let mut creates = super::PendingCreates::default();
+    let tids: Vec<[u8; 32]> = b
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let bh = b.header.block_hash().to_byte_array();
+    let err = assemble_block_prevouts(
+        &q,
+        &b,
+        &ctx,
+        Some(&[Fk::NULL, spend_fk]),
+        &mut spent,
+        &mut creates,
+        &parents,
+        &thin,
+        &tids,
+        0,
+        &bh,
+        true,
+        None,
+        None,
+    )
+    .err()
+    .expect("over-budget pin P2WSH must reject");
+    assert_bad_block(err, "bad-blk-sigops");
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -1157,6 +1262,12 @@ fn n1_assemble_cold_why_reasons() {
         txid: last_cb,
         vout: 0,
     };
+    let dummy_in = TxIn {
+        previous_output: op,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
     let empty_block = block_with(vec![coinbase(4)]);
     let txid_index = super::TxidMap::<usize>::default();
     let mut cb_cache: rbitcoin_query::FkMap<Option<u32>> = rbitcoin_query::FkMap::default();
@@ -1172,6 +1283,7 @@ fn n1_assemble_cold_why_reasons() {
             &q,
             &empty_block,
             op,
+            &dummy_in,
             None,
             &txid_index,
             0,
@@ -1179,6 +1291,8 @@ fn n1_assemble_cold_why_reasons() {
             &parents,
             4,
             false,
+            false,
+            true,
             &mut super::AsmPrevoutAcc::default(),
         )
         .expect("null_fk cold");
@@ -1195,6 +1309,7 @@ fn n1_assemble_cold_why_reasons() {
             &q,
             &empty_block,
             op,
+            &dummy_in,
             Some(last_cb_fk),
             &txid_index,
             0,
@@ -1202,6 +1317,8 @@ fn n1_assemble_cold_why_reasons() {
             &parents,
             4,
             false,
+            false,
+            true,
             &mut super::AsmPrevoutAcc::default(),
         )
         .expect("not_pin cold");
@@ -1219,13 +1336,16 @@ fn n1_assemble_cold_why_reasons() {
         parents.put_resolved(last_cb_fk, rec, &[(0, out)], &[0], Some(true));
         // Ensure pin txid matches wire.
         assert_eq!(
-            parents.get_parent_txout_parts(last_cb_fk, 0).unwrap().2,
+            parents
+                .get_parent_txout_parts(last_cb_fk, 0, |_, _, t| t)
+                .unwrap(),
             parent_txid
         );
         resolve_prevout(
             &q,
             &empty_block,
             op,
+            &dummy_in,
             Some(last_cb_fk),
             &txid_index,
             0,
@@ -1233,6 +1353,8 @@ fn n1_assemble_cold_why_reasons() {
             &parents,
             4,
             false,
+            false,
+            true,
             &mut super::AsmPrevoutAcc::default(),
         )
         .expect("batch hit");
@@ -1254,6 +1376,7 @@ fn n1_assemble_cold_why_reasons() {
             &q,
             &empty_block,
             op,
+            &dummy_in,
             Some(last_cb_fk),
             &txid_index,
             0,
@@ -1261,6 +1384,8 @@ fn n1_assemble_cold_why_reasons() {
             &parents,
             4,
             false,
+            false,
+            true,
             &mut super::AsmPrevoutAcc::default(),
         ) {
             Ok(_) => panic!("mismatch must hard-fail"),
@@ -1283,11 +1408,14 @@ fn n1_assemble_cold_why_reasons() {
         let out = OutputRecord::unspent(1, vec![0x51]);
         parents.put_resolved(last_cb_fk, rec, &[(1, out)], &[1], Some(true));
         assert!(parents.contains(last_cb_fk));
-        assert!(parents.get_parent_txout_parts(last_cb_fk, 0).is_none());
+        assert!(parents
+            .get_parent_txout_parts(last_cb_fk, 0, |_, _, _| ())
+            .is_none());
         let err = match resolve_prevout(
             &q,
             &empty_block,
             op,
+            &dummy_in,
             Some(last_cb_fk),
             &txid_index,
             0,
@@ -1295,6 +1423,8 @@ fn n1_assemble_cold_why_reasons() {
             &parents,
             4,
             false,
+            false,
+            true,
             &mut super::AsmPrevoutAcc::default(),
         ) {
             Ok(_) => panic!("vout_miss must hard-fail"),
@@ -1517,13 +1647,12 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     {
         use super::structural_validate_spends;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{BatchParents, FkMap, U32Map, U64Map};
-        use std::collections::HashSet;
+        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map, U64Map};
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
         let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
         let parents = BatchParents::new();
         let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
-        let mut pending = HashSet::new();
+        let mut pending = OutPointSet::default();
         let mut mtp = U32Map::default();
         let mut meta = U64Map::default();
         let err = structural_validate_spends(

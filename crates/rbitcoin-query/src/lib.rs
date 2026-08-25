@@ -1124,8 +1124,10 @@ pub struct Query {
     soft_confirm_window: AtomicU32,
     /// Last contiguous height lookup dequeued into loadq (`u32::MAX` = none).
     lookup_taken_hi: AtomicU32,
-    /// EWMA of `lookup_taken_hi − tip` for RecentCreates horizon.
-    recent_lead_ewma: AtomicU32,
+    /// Max height included in a lookup resolve wave (`u32::MAX` = none).
+    lookup_started_hi: AtomicU32,
+    /// Max height whose Class A append committed (`u32::MAX` = none).
+    class_a_hi: AtomicU32,
     /// Post-IBD SH catalog (Class A recollect spills; no IBD memtable).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -1232,7 +1234,8 @@ impl Query {
             block_queue_pressure: AtomicBool::new(false),
             soft_confirm_window: AtomicU32::new(0),
             lookup_taken_hi: AtomicU32::new(u32::MAX),
-            recent_lead_ewma: AtomicU32::new(0),
+            lookup_started_hi: AtomicU32::new(u32::MAX),
+            class_a_hi: AtomicU32::new(u32::MAX),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -1278,6 +1281,14 @@ impl Query {
         self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
         self.recent_creates.drop_from(height);
         self.recent_creates.publish_if_dirty();
+        let rewind = if height == 0 {
+            None
+        } else {
+            Some(height.saturating_sub(1))
+        };
+        self.set_lookup_taken_hi(rewind);
+        self.set_lookup_started_hi(rewind);
+        self.set_class_a_hi(rewind);
         self.block_queue_drop_resolved_from(height);
     }
 
@@ -1527,6 +1538,34 @@ impl Query {
             .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
+    pub fn lookup_started_hi(&self) -> Option<u32> {
+        let h = self.lookup_started_hi.load(AtomicOrdering::Relaxed);
+        if h == u32::MAX {
+            None
+        } else {
+            Some(h)
+        }
+    }
+
+    pub fn set_lookup_started_hi(&self, hi: Option<u32>) {
+        self.lookup_started_hi
+            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+    }
+
+    pub fn class_a_hi(&self) -> Option<u32> {
+        let h = self.class_a_hi.load(AtomicOrdering::Relaxed);
+        if h == u32::MAX {
+            None
+        } else {
+            Some(h)
+        }
+    }
+
+    pub fn set_class_a_hi(&self, hi: Option<u32>) {
+        self.class_a_hi
+            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+    }
+
     /// Densify / offer: height is already in the confirm pipeline.
     pub fn lookup_already_taken(&self, height: u32) -> bool {
         Self::lookup_taken_covers(height, self.lookup_taken_hi())
@@ -1678,30 +1717,23 @@ impl Query {
         self.recent_creates.note_pins(height, rows);
     }
 
-    /// Rebuild the RecentCreates snapshot if note/expire/drop dirtied it.
+    /// Prepend pending notes as one layer (`until = started.max(hi)`) then drop
+    /// layers with `until <= class_a_hi`.
     pub fn flush_recent_creates(&self) {
-        self.recent_creates.publish_if_dirty();
+        let started = self.lookup_started_hi().unwrap_or(0);
+        self.recent_creates.publish_layer(started);
+        self.recent_creates
+            .drop_ready(self.class_a_hi().unwrap_or(0));
     }
 
-    /// Drop fifo rows past [`recent_creates_horizon`] relative to `tip_hint`.
     pub fn expire_recent_creates(&self, tip_hint: u32) {
         self.expire_recent_creates_defer(tip_hint);
         self.flush_recent_creates();
     }
 
-    /// Expire without rebuilding the snapshot (write batch flushes once).
-    pub fn expire_recent_creates_defer(&self, tip_hint: u32) {
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(tip_hint);
-        let tip = tip.max(tip_hint);
-        let taken = self.lookup_taken_hi().unwrap_or(tip);
-        let span = taken.saturating_sub(tip);
-        let ewma = crate::recent_creates_ewma_step(
-            self.recent_lead_ewma.load(AtomicOrdering::Relaxed),
-            span,
-        );
-        self.recent_lead_ewma.store(ewma, AtomicOrdering::Relaxed);
-        let horizon = crate::recent_creates_horizon(ewma);
-        self.recent_creates.expire_to_horizon(tip, horizon);
+    pub fn expire_recent_creates_defer(&self, _tip_hint: u32) {
+        self.recent_creates
+            .drop_ready(self.class_a_hi().unwrap_or(0));
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.
@@ -2528,6 +2560,51 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(dir.join("store")).unwrap();
         (dir, q)
+    }
+
+    #[test]
+    fn lookup_started_hi_none_until_set() {
+        let (dir, q) = temp_query("started-hi");
+        assert!(q.lookup_started_hi().is_none());
+        assert!(q.class_a_hi().is_none());
+        q.set_lookup_started_hi(Some(4));
+        q.set_class_a_hi(Some(2));
+        assert_eq!(q.lookup_started_hi(), Some(4));
+        assert_eq!(q.class_a_hi(), Some(2));
+        q.set_lookup_started_hi(None);
+        assert!(q.lookup_started_hi().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn note_disconnect_rewinds_started_and_class_a_with_taken() {
+        let (dir, q) = temp_query("disco-hwm");
+        q.set_lookup_taken_hi(Some(12));
+        q.set_lookup_started_hi(Some(12));
+        q.set_class_a_hi(Some(10));
+        q.note_disconnect_height(8);
+        assert_eq!(q.lookup_taken_hi(), Some(7));
+        assert_eq!(q.lookup_started_hi(), Some(7));
+        assert_eq!(q.class_a_hi(), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_recent_creates_tags_until_from_lookup_started_hi() {
+        let (dir, q) = temp_query("flush-until");
+        let mut tid = [0u8; 32];
+        tid[0] = 1;
+        q.set_lookup_started_hi(Some(40));
+        q.note_recent_creates_rows(10, [(tid, Fk(1), (1, 2))]);
+        q.flush_recent_creates();
+        assert_eq!(q.recent_creates().get(&tid), Some((Fk(1), (1, 2))));
+        q.set_class_a_hi(Some(39));
+        q.flush_recent_creates();
+        assert_eq!(q.recent_creates().get(&tid), Some((Fk(1), (1, 2))));
+        q.set_class_a_hi(Some(40));
+        q.flush_recent_creates();
+        assert!(q.recent_creates().get(&tid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write-gate-safe: non-null `prev` requires `parent_hash` committed in header hash.

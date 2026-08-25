@@ -120,6 +120,7 @@ impl RecentCreates {
             hi = hi.max(e.height);
         }
         drop(g);
+        let until = until.max(hi);
         let older = self.head.load_full();
         self.head.store(Some(ChainLayer::prepend(
             older,

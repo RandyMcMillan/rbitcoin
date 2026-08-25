@@ -794,7 +794,12 @@ impl PeerHub {
             p.request_tx_inv();
         }
         drop(g);
-        self.check_headers_sync_timeouts(ts);
+        self.on_session_heartbeat();
+    }
+
+    /// Session 50ms heartbeat: replace a stalling initial-headers-sync peer.
+    pub(crate) fn on_session_heartbeat(&self) {
+        self.check_headers_sync_timeouts(self.now_secs());
     }
 
     pub fn queue_pings(&self) {
@@ -1234,6 +1239,56 @@ mod tests {
         assert!(!p1.is_sync_started());
         // After the sync peer leaves, another inbound may start.
         assert!(hub.try_start_headers_sync(&p2, now, 1_231_006_505));
+    }
+
+    #[test]
+    fn session_heartbeat_disconnects_stalling_headers_sync() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let _outbound = hub.register(
+            b,
+            b,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        // Deadline is computed from the `now` passed to try_start, not the hub
+        // clock. Start 16 minutes behind wall time with a tip of the same age
+        // so variable timeout is 0: deadline = wall − 60s.
+        let wall = hub.now_secs();
+        let start = wall.saturating_sub(16 * 60);
+        assert!(hub.try_start_headers_sync(&inbound, start, start));
+        assert!(inbound.is_sync_started());
+        assert!(!inbound.stop.load(Ordering::SeqCst));
+        hub.on_session_heartbeat();
+        assert!(
+            inbound.stop.load(Ordering::SeqCst),
+            "stalling inbound must disconnect when another preferred peer exists"
+        );
+    }
+
+    #[test]
+    fn session_heartbeat_keeps_sole_preferred_headers_sync_peer() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let outbound = hub.register(
+            a,
+            a,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        let wall = hub.now_secs();
+        let start = wall.saturating_sub(16 * 60);
+        assert!(hub.try_start_headers_sync(&outbound, start, start));
+        hub.on_session_heartbeat();
+        assert!(
+            !outbound.stop.load(Ordering::SeqCst),
+            "must not disconnect the only preferred download peer"
+        );
+        assert!(outbound.is_sync_started());
     }
 
     #[test]

@@ -570,6 +570,9 @@ pub async fn peer_session_with(
                             }
                             None => {}
                         }
+                        if let Some(ph) = s.hub() {
+                            ph.on_session_heartbeat();
+                        }
                         queue_due_tx_invs(hub.as_ref(), s, &from_this_peer, &out_tx);
                         let _ = maybe_queue_initial_getheaders(&out_tx, hub.as_ref(), s);
                         match s.pending_sendcmpct.swap(0, Ordering::Relaxed) {

@@ -50,18 +50,63 @@ const CB_UNKNOWN: u8 = 0;
 const CB_FALSE: u8 = 1;
 const CB_TRUE: u8 = 2;
 
-/// Immutable sparse need outs (compose → publish, never mutate).
+/// Immutable pin outs (compose → publish, never mutate).
 #[derive(Debug, Clone)]
-struct PinOuts {
-    outs: Vec<(u32, OutputRecord)>,
-    checked: Vec<u32>,
+enum PinOuts {
+    /// Plan / in-flight / RecentCreates: share the CreatePin Arc.
+    Full {
+        pin: crate::CreatePin,
+        checked: Vec<u32>,
+    },
+    /// Range-fill: owned sparse decoded outs.
+    Sparse {
+        outs: Vec<(u32, OutputRecord)>,
+        checked: Vec<u32>,
+    },
 }
 
 impl PinOuts {
     fn new(live: Vec<(u32, OutputRecord)>, checked: Vec<u32>) -> Self {
-        Self {
+        Self::Sparse {
             outs: ensure_outs_sorted(live),
             checked: ensure_checked_sorted(checked),
+        }
+    }
+
+    fn full(pin: crate::CreatePin, checked: Vec<u32>) -> Self {
+        Self::Full {
+            pin,
+            checked: ensure_checked_sorted(checked),
+        }
+    }
+
+    fn checked(&self) -> &[u32] {
+        match self {
+            Self::Full { checked, .. } | Self::Sparse { checked, .. } => checked,
+        }
+    }
+
+    fn with_checked(&self, checked: Vec<u32>) -> Self {
+        let checked = ensure_checked_sorted(checked);
+        match self {
+            Self::Full { pin, .. } => Self::Full {
+                pin: std::sync::Arc::clone(pin),
+                checked,
+            },
+            Self::Sparse { outs, .. } => Self::Sparse {
+                outs: outs.clone(),
+                checked,
+            },
+        }
+    }
+
+    fn get(&self, vout: u32) -> Option<&OutputRecord> {
+        match self {
+            Self::Full { pin, .. } => pin.1.get(vout as usize),
+            Self::Sparse { outs, .. } => {
+                let i = outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
+                Some(&outs[i].1)
+            }
         }
     }
 
@@ -69,31 +114,85 @@ impl PinOuts {
         if need.is_empty() {
             return true;
         }
-        if self.checked.is_empty() {
+        let checked = self.checked();
+        if checked.is_empty() {
             return false;
         }
-        need.iter().all(|v| checked_contains(&self.checked, *v))
+        need.iter().all(|v| checked_contains(checked, *v))
     }
 
     fn has_all_live(&self, live: &[(u32, OutputRecord)]) -> bool {
-        live.iter()
-            .all(|(v, _)| self.outs.binary_search_by_key(v, |(dv, _)| *dv).is_ok())
+        live.iter().all(|(v, _)| self.get(*v).is_some())
+    }
+
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        match self {
+            Self::Full { pin, .. } => pin.1.len(),
+            Self::Sparse { outs, .. } => outs.len(),
+        }
+    }
+
+    fn sparse_live(&self) -> Vec<(u32, OutputRecord)> {
+        match self {
+            Self::Sparse { outs, .. } => outs.clone(),
+            Self::Full { pin, checked, .. } => checked
+                .iter()
+                .filter_map(|&v| pin.1.get(v as usize).cloned().map(|o| (v, o)))
+                .collect(),
+        }
     }
 
     /// Compose wider need coverage (new half; does not mutate `self`).
     fn compose(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) -> Self {
-        let mut outs = self.outs.clone();
-        for (v, o) in live {
-            if outs.binary_search_by_key(&v, |(dv, _)| *dv).is_err() {
-                outs.push((v, o));
+        match self {
+            Self::Full { pin, checked: ch } => {
+                let extra = live.iter().any(|(v, _)| pin.1.get(*v as usize).is_none());
+                if extra {
+                    let mut outs = self.sparse_live();
+                    for (v, o) in live {
+                        if outs.binary_search_by_key(&v, |(dv, _)| *dv).is_err() {
+                            outs.push((v, o));
+                        }
+                    }
+                    outs.sort_unstable_by_key(|(v, _)| *v);
+                    let mut next_ch = ch.clone();
+                    next_ch.extend_from_slice(checked);
+                    next_ch.sort_unstable();
+                    next_ch.dedup();
+                    Self::Sparse {
+                        outs,
+                        checked: next_ch,
+                    }
+                } else {
+                    let mut next_ch = ch.clone();
+                    next_ch.extend_from_slice(checked);
+                    next_ch.sort_unstable();
+                    next_ch.dedup();
+                    Self::Full {
+                        pin: std::sync::Arc::clone(pin),
+                        checked: next_ch,
+                    }
+                }
+            }
+            Self::Sparse { outs, checked: ch } => {
+                let mut next_outs = outs.clone();
+                for (v, o) in live {
+                    if next_outs.binary_search_by_key(&v, |(dv, _)| *dv).is_err() {
+                        next_outs.push((v, o));
+                    }
+                }
+                next_outs.sort_unstable_by_key(|(v, _)| *v);
+                let mut next_ch = ch.clone();
+                next_ch.extend_from_slice(checked);
+                next_ch.sort_unstable();
+                next_ch.dedup();
+                Self::Sparse {
+                    outs: next_outs,
+                    checked: next_ch,
+                }
             }
         }
-        outs.sort_unstable_by_key(|(v, _)| *v);
-        let mut ch = self.checked.clone();
-        ch.extend_from_slice(checked);
-        ch.sort_unstable();
-        ch.dedup();
-        Self { outs, checked: ch }
     }
 }
 
@@ -224,6 +323,29 @@ impl SharedParentPin {
             tx,
             coinbase: AtomicU8::new(cb),
             outs: PinHalf::new(PinOuts::new(live, checked)),
+            layout: PinHalf::new(ParentLayout::new(body_range, spender_rels)),
+        }
+    }
+
+    fn new_full(
+        fk: Fk,
+        pin: crate::CreatePin,
+        checked: Vec<u32>,
+        coinbase: Option<bool>,
+        body_range: Option<(u64, u64)>,
+        spender_rels: Vec<(u32, u32)>,
+    ) -> Self {
+        let cb = match coinbase {
+            Some(true) => CB_TRUE,
+            Some(false) => CB_FALSE,
+            None => CB_UNKNOWN,
+        };
+        let tx = pin.0.clone();
+        Self {
+            fk,
+            tx,
+            coinbase: AtomicU8::new(cb),
+            outs: PinHalf::new(PinOuts::full(pin, checked)),
             layout: PinHalf::new(ParentLayout::new(body_range, spender_rels)),
         }
     }
@@ -510,7 +632,7 @@ impl PipelineParentStore {
         for (id, existing, local) in conflicts {
             let src_outs = local.load_outs();
             let src_lay = local.load_layout();
-            existing.merge_outs(src_outs.outs.clone(), &src_outs.checked);
+            existing.merge_outs(src_outs.sparse_live(), src_outs.checked());
             existing.set_coinbase_if_known(local.coinbase_opt());
             existing.maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
             pins.insert(id, existing);
@@ -706,6 +828,58 @@ impl BatchParents {
         }
     }
 
+    /// Vacant insert from a plan/in-flight [`crate::CreatePin`] (refcount only).
+    pub fn insert_create_pin(
+        &mut self,
+        fk: Fk,
+        pin: crate::CreatePin,
+        checked: Vec<u32>,
+        coinbase: Option<bool>,
+        body_range: Option<(u64, u64)>,
+        spender_rels: Vec<(u32, u32)>,
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        match self.pins.entry(id) {
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let p = o.get();
+                let outs = p.load_outs();
+                let need_outs = !checked.is_empty() && !outs.covers_need(&checked);
+                if need_outs {
+                    let live = {
+                        let (_tx, rows) = pin.as_ref();
+                        checked
+                            .iter()
+                            .filter_map(|&v| rows.get(v as usize).cloned().map(|o| (v, o)))
+                            .collect::<Vec<_>>()
+                    };
+                    p.apply_pin_delta(
+                        Some((live, checked.as_slice())),
+                        coinbase,
+                        body_range,
+                        &spender_rels,
+                    );
+                    drop(outs);
+                    self.invalidate_sticky(id);
+                } else {
+                    p.apply_meta_only(coinbase, body_range, &spender_rels);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(Arc::new(SharedParentPin::new_full(
+                    fk,
+                    pin,
+                    checked,
+                    coinbase,
+                    body_range,
+                    spender_rels,
+                )));
+                self.publish_ids.push(id);
+            }
+        }
+    }
+
     /// Test / convenience: clone from slices into the map.
     pub fn put_resolved(
         &mut self,
@@ -730,8 +904,8 @@ impl BatchParents {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
         let outs = e.load_outs();
-        let i = outs.outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
-        Some((e.tx.clone(), outs.outs[i].1.clone()))
+        let o = outs.get(vout)?;
+        Some((e.tx.clone(), o.clone()))
     }
 
     /// Assemble hot path: value + borrowed script bytes + parent txid.
@@ -783,8 +957,7 @@ impl BatchParents {
         } else {
             e.load_outs()
         };
-        let i = outs.outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
-        let o = &outs.outs[i].1;
+        let o = outs.get(vout)?;
         Some(f(o.value, o.script.as_slice(), e.tx.txid))
     }
 
@@ -824,13 +997,13 @@ impl BatchParents {
         // RCU must recompute checked from `cur` (not a stale pre-load snap):
         // concurrent prep merge_outs can add peer need-vouts between load and
         // publish; replacing with a snap-built list clobbered those vouts.
-        let mut need_for_sparse: Vec<u32> = e.load_outs().checked.clone();
+        let mut need_for_sparse: Vec<u32> = e.load_outs().checked().to_vec();
         let may_grow_checked =
             need_for_sparse.is_empty() && extra_need.is_empty() && !dense_rels.is_empty()
                 || !extra_need.is_empty();
         if may_grow_checked {
             e.publish_outs(|cur| {
-                let mut checked = cur.checked.clone();
+                let mut checked = cur.checked().to_vec();
                 if checked.is_empty() && extra_need.is_empty() && !dense_rels.is_empty() {
                     checked = (0..dense_rels.len() as u32).collect();
                 }
@@ -839,16 +1012,13 @@ impl BatchParents {
                     checked.sort_unstable();
                     checked.dedup();
                 }
-                if checked == cur.checked {
+                if checked == cur.checked() {
                     return None;
                 }
-                Some(PinOuts {
-                    outs: cur.outs.clone(),
-                    checked,
-                })
+                Some(cur.with_checked(checked))
             });
             self.invalidate_sticky(id);
-            need_for_sparse = e.load_outs().checked.clone();
+            need_for_sparse = e.load_outs().checked().to_vec();
         }
         let sparse = sparse_spender_rels(dense_rels, &need_for_sparse);
         let lay = e.load_layout();
@@ -894,17 +1064,14 @@ impl BatchParents {
         };
         if !extra_need.is_empty() {
             e.publish_outs(|cur| {
-                let mut checked = cur.checked.clone();
+                let mut checked = cur.checked().to_vec();
                 checked.extend_from_slice(extra_need);
                 checked.sort_unstable();
                 checked.dedup();
-                if checked == cur.checked {
+                if checked == cur.checked() {
                     return None;
                 }
-                Some(PinOuts {
-                    outs: cur.outs.clone(),
-                    checked,
-                })
+                Some(cur.with_checked(checked))
             });
             self.invalidate_sticky(id);
         }
@@ -1015,10 +1182,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        e.load_outs()
-            .outs
-            .binary_search_by_key(&vout, |(v, _)| *v)
-            .is_ok()
+        e.load_outs().get(vout).is_some()
     }
 
     pub fn pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
@@ -1058,7 +1222,8 @@ impl BatchParents {
                     if !Arc::ptr_eq(o.get(), &src) {
                         let src_outs = src.load_outs();
                         let src_lay = src.load_layout();
-                        o.get().merge_outs(src_outs.outs.clone(), &src_outs.checked);
+                        o.get()
+                            .merge_outs(src_outs.sparse_live(), src_outs.checked());
                         o.get().set_coinbase_if_known(src.coinbase_opt());
                         o.get()
                             .maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
@@ -1076,26 +1241,22 @@ impl BatchParents {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
         let body = e.load_outs();
-        let covered =
-            !body.checked.is_empty() && vouts.iter().all(|v| checked_contains(&body.checked, *v));
+        let covered = !body.checked().is_empty()
+            && vouts.iter().all(|v| checked_contains(body.checked(), *v));
         if covered {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Ok(i) = body.outs.binary_search_by_key(&v, |(ov, _)| *ov) {
-                    live.push((v, body.outs[i].1.clone()));
+                if let Some(o) = body.get(v) {
+                    live.push((v, o.clone()));
                 }
             }
             return Some((e.tx.clone(), live, true));
         }
-        if !body.outs.is_empty()
-            && vouts
-                .iter()
-                .all(|v| body.outs.binary_search_by_key(v, |(ov, _)| *ov).is_ok())
-        {
+        if vouts.iter().all(|v| body.get(*v).is_some()) {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Ok(i) = body.outs.binary_search_by_key(&v, |(ov, _)| *ov) {
-                    live.push((v, body.outs[i].1.clone()));
+                if let Some(o) = body.get(v) {
+                    live.push((v, o.clone()));
                 }
             }
             return Some((e.tx.clone(), live, false));
@@ -1204,6 +1365,33 @@ mod tests {
         OutputRecord::unspent(v, vec![0x51])
     }
 
+    /// Vacant CreatePin insert must keep the script allocation (no PinOuts clone).
+    #[test]
+    fn insert_create_pin_shares_script_bytes() {
+        use crate::CreatePin;
+        use std::sync::Arc;
+        let script = vec![0x51u8; 4096];
+        let pin: CreatePin = Arc::new((tx(9), vec![OutputRecord::unspent(50, script)]));
+        let expect = pin.1[0].script.as_ptr();
+        let mut bp = BatchParents::new();
+        bp.insert_create_pin(
+            Fk(9),
+            Arc::clone(&pin),
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let got = bp
+            .get_parent_txout_parts(Fk(9), 0, |v, sc, t| {
+                assert_eq!(v, 50);
+                assert_eq!(t[0], 9);
+                sc.as_ptr()
+            })
+            .expect("full pin prevout");
+        assert_eq!(got, expect, "CreatePin insert must not clone script bytes");
+    }
+
     #[test]
     fn extend_from_merges_disjoint_and_same_fk() {
         let mut a = BatchParents::new();
@@ -1296,7 +1484,7 @@ mod tests {
         let pin_ptr = {
             let e = bp.pins.get(&9).expect("pin");
             let outs = e.load_outs();
-            outs.outs[0].1.script.as_ptr()
+            outs.get(0).expect("vout 0").script.as_ptr()
         };
         let hit = bp
             .get_parent_txout_parts(Fk(9), 0, |value, spk, txid| {
@@ -1621,8 +1809,8 @@ mod tests {
             "real compose promotes Frozen to Rcu"
         );
         let new = pin.load_outs();
-        assert_eq!(old.outs.len(), 1, "old snap must not gain vouts");
-        assert_eq!(old.checked, vec![0]);
+        assert_eq!(old.live_len(), 1, "old snap must not gain vouts");
+        assert_eq!(old.checked(), &[0]);
         assert!(new.covers_need(&[0, 1]));
         assert!(!Arc::ptr_eq(&old, &new));
     }
@@ -1954,11 +2142,11 @@ mod tests {
         let after_outs = pin.load_outs();
         let after_lay = pin.load_layout();
         // Source snapshots unchanged.
-        assert_eq!(before_outs.outs.len(), 1);
-        assert_eq!(before_outs.checked, vec![0]);
+        assert_eq!(before_outs.live_len(), 1);
+        assert_eq!(before_outs.checked(), &[0]);
         assert_eq!(before_lay.spender_rels, vec![(0, 10)]);
         // Published halves have the union.
-        assert_eq!(after_outs.outs.len(), 2);
+        assert_eq!(after_outs.live_len(), 2);
         assert!(after_outs.covers_need(&[0, 1]));
         assert_eq!(after_lay.spender_rels, vec![(0, 10), (1, 20)]);
         assert!(

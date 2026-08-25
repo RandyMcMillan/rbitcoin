@@ -1644,6 +1644,90 @@ fn pin_takes_stamp_parent_vouts() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Cross-height same-pack CreatePin must pin without cloning parent scripts.
+#[test]
+fn pin_for_wire_create_pin_shares_script_bytes() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-createpin-share-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    let script = vec![0x51u8; 4096];
+    let parent_tx = TxRecord {
+        txid: [0x41u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let pin: CreatePin = Arc::new((parent_tx.clone(), vec![OutputRecord::unspent(50, script)]));
+    let expect = pin.1[0].script.as_ptr();
+    let child_tx = TxRecord {
+        txid: [0x42u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![
+        (
+            Arc::clone(&pin),
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        ),
+        (
+            Arc::new((child_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            vec![InputRecord {
+                prev_txid: parent_tx.txid,
+                create_fk: Fk(1),
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        ),
+    ];
+    plan.planned_fks = vec![Fk(1), Fk(2)];
+    plan.batch_pin = vec![Arc::clone(&pin), Arc::clone(&plan.packed[1].0)];
+    plan.per_header_ranges = vec![(Fk(10), Fk(1), 1), (Fk(11), Fk(2), 1)];
+    plan.external_parent_vouts.insert(1, vec![0]);
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+        .expect("cross-height CreatePin pin");
+    let got = parents
+        .get_parent_txout_parts(Fk(1), 0, |v, sc, _| {
+            assert_eq!(v, 50);
+            sc.as_ptr()
+        })
+        .expect("pinned parent");
+    assert_eq!(
+        got, expect,
+        "plan CreatePin pin must not clone OutputRecord scripts"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Need a high vout from a multi-out parent (need-vouts only, not full n_out).
 #[test]
 fn pin_sparse_need_high_vout_only() {

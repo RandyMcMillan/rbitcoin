@@ -214,11 +214,7 @@ pub(super) fn pin_for_wire_batch(
         }
         if let Some(pin) = plan_by_id.get(id) {
             let (tx, outs) = pin.as_ref();
-            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
-                .iter()
-                .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-                .collect();
-            if live.len() != need.len() {
+            if !need.iter().all(|&v| outs.get(v as usize).is_some()) {
                 still_need.insert(*id, need.clone());
                 continue;
             }
@@ -228,10 +224,9 @@ pub(super) fn pin_for_wire_batch(
                 None
             };
             let plan_range = parent_pin.ranges.get(id).copied();
-            batch_parents.insert_owned(
+            batch_parents.insert_create_pin(
                 fk,
-                tx.clone(),
-                live,
+                std::sync::Arc::clone(pin),
                 need.clone(),
                 cb,
                 plan_range,

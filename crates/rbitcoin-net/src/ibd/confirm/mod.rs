@@ -1705,7 +1705,18 @@ pub(crate) fn spawn_confirm_engine(
                             feed.notify();
                         }
                         Ok(_) => {}
-                        Err(e) => warn!("ibd: bq resolve wave: {e}"),
+                        Err(e) => {
+                            let backpressure = matches!(
+                                &e,
+                                rbitcoin_consensus::ConsensusError::Store(se)
+                                    if se.is_io_backpressure()
+                            );
+                            if backpressure {
+                                debug!("ibd: bq resolve wave: {e}");
+                            } else {
+                                warn!("ibd: bq resolve wave: {e}");
+                            }
+                        }
                     }
                     confirm_thr_stats::add_lookup_stamp(t_wave.elapsed());
                 }

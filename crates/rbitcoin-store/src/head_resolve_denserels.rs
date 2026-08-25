@@ -410,15 +410,14 @@ fn fill_idx_pages(
     sess.begin_batch()?;
     let epoch = sess.epoch();
     let run = (|| -> Result<(), StoreError> {
-        for (i, page) in pages.iter().enumerate() {
-            let ud = crate::uring_session::pack_ud(UD_KIND_IDX, epoch, i as u32);
-            sess.push_pread_flags(page.fd, page.page_off, &mut bufs[i], ud, 0)?;
-        }
-        sess.sync_submission();
         let mut results = vec![i32::MIN; pages.len()];
         let need = pages.len();
         let mut done = 0usize;
-        while done < need {
+        let mut next = 0usize;
+        let take_cqes = |sess: &mut UringSession,
+                         results: &mut [i32],
+                         done: &mut usize|
+         -> Result<(), StoreError> {
             let mut cqes = sess.harvest_ready()?;
             if cqes.is_empty() {
                 sess.submit_and_wait_one()?;
@@ -442,8 +441,22 @@ fn fill_idx_pages(
                     return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
                 }
                 results[slot] = res;
-                done += 1;
+                *done += 1;
             }
+            Ok(())
+        };
+        while done < need {
+            while next < need && sess.free_sq() > 0 {
+                let i = next;
+                next += 1;
+                let ud = crate::uring_session::pack_ud(UD_KIND_IDX, epoch, i as u32);
+                sess.push_pread_flags(pages[i].fd, pages[i].page_off, &mut bufs[i], ud, 0)?;
+            }
+            sess.sync_submission();
+            if sess.in_flight() == 0 {
+                break;
+            }
+            take_cqes(sess, &mut results, &mut done)?;
         }
         for (i, &res) in results.iter().enumerate() {
             if res < 0 || (res as usize) < pages[i].want {
@@ -1310,5 +1323,50 @@ mod tests {
         assert_eq!(got[1].1, Some((near, batch[1].unwrap())));
         assert_eq!(got[2].1, Some((far, batch[2].unwrap())));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Idx fill must submit/harvest in `free_sq` windows. Pushing every unique
+    /// page before any CQE trips `io_session SQ full` on a 1080-high leftover
+    /// wave (default-milestone IBD).
+    #[test]
+    fn fill_idx_pages_windows_past_ring_depth() {
+        use std::io::Write;
+        let n = 48usize;
+        let page = 64usize;
+        let path = tmp("idx-sq-window").join("idx.bin");
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut blob = vec![0u8; n * page];
+        for i in 0..n {
+            blob[i * page] = i as u8;
+        }
+        f.write_all(&blob).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let pages: Vec<crate::tx_idx::IdxPagePlan> = (0..n)
+            .map(|i| crate::tx_idx::IdxPagePlan {
+                fd,
+                page_off: (i * page) as u64,
+                want: page,
+            })
+            .collect();
+        let mut bufs: Vec<Vec<u8>> = pages.iter().map(|p| vec![0u8; p.want]).collect();
+        let mut sess = crate::uring_session::UringSession::try_open(32).expect("session");
+        assert!(
+            n > sess.entries() as usize,
+            "fixture must exceed ring depth"
+        );
+        fill_idx_pages(&mut sess, &pages, &mut bufs)
+            .expect("idx fill must window SQ; SQ full is not store corruption");
+        for (i, b) in bufs.iter().enumerate() {
+            assert_eq!(b[0], i as u8, "page {i}");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

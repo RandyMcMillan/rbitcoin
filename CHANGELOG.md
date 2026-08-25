@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **`load_thr stamp=` nest:** `ibd: perf` prints
+  `stamp=Nms(pack=Xms head=Yms)`. `head=` is leftover TipOnly
+  (`prep_head_fk_ns`). After a lookup wave publishes a parent, load
+  stamp leftover for that parent is 0 — pack stays on load.
+
 - **Algo-review S-H1:** HashHead / ScriptHashHead no longer rewrite occupied
   tables while serving. Mainnet `header.head` creates at 2²² slots (~96 MiB
   sparse). Overflow rolls `header.head.gN`. Undersized single-gen files

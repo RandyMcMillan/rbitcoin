@@ -106,6 +106,36 @@ impl ArchiveWritePlan {
         self.external_parent_txids.get(&create_fk_id).copied()
     }
 
+    /// Same-header create: assemble uses the wire `TxOut` (do not pin).
+    #[inline]
+    pub fn create_in_header_ranges(
+        per_header: &[(Fk, Fk, u32)],
+        spend: Fk,
+        create_id: u64,
+    ) -> bool {
+        let Some(sid) = spend.get() else {
+            return false;
+        };
+        for &(_, first, n) in per_header {
+            let Some(start) = first.get() else {
+                continue;
+            };
+            let end = start.saturating_add(u64::from(n));
+            if sid >= start && sid < end {
+                return create_id >= start && create_id < end;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn create_in_spend_header(&self, spend: Fk, create_id: u64) -> bool {
+        if self.per_header_ranges.is_empty() {
+            return self.planned_fks.iter().any(|f| f.get() == Some(create_id));
+        }
+        Self::create_in_header_ranges(&self.per_header_ranges, spend, create_id)
+    }
+
     /// Drop stamp staging (ranges + txid reverse) after pin.
     ///
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
@@ -504,10 +534,12 @@ impl Query {
                     }
                 }
                 if let Some(pid) = inp.create_fk.get() {
-                    external_parent_vouts
-                        .entry(pid)
-                        .or_default()
-                        .push(inp.prev_index);
+                    if !ArchiveWritePlan::create_in_header_ranges(&per_header_ranges, tx_fk, pid) {
+                        external_parent_vouts
+                            .entry(pid)
+                            .or_default()
+                            .push(inp.prev_index);
+                    }
                     if !batch_create_ids.contains(&pid)
                         && !external_parent_txids.contains_key(&pid)
                         && inp.prev_txid != [0u8; 32]
@@ -1367,6 +1399,41 @@ mod tests {
         assert_eq!(batch_pin_len, 1);
         assert_eq!(q.tx_body_count(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same-header spend is not a pin parent; later header in the pack is.
+    #[test]
+    fn plan_batch_same_header_vouts_skipped_cross_height_pinned() {
+        let (dir, q) = temp_query("plan-same-header-vouts");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        let child = child_spend(parent_txid, 0xcd);
+        let mut same = vec![(Fk(1), vec![parent.clone(), child.clone()])];
+        let plan_same = q
+            .archive_plan_batch_from_store(&mut same, 1, &crate::InFlightView::empty(), None)
+            .expect("same header");
+        assert_eq!(plan_same.planned_fks, vec![Fk(1), Fk(2)]);
+        assert!(
+            plan_same.external_parent_vouts.get(&1).is_none(),
+            "same-header create must not be in parent_vouts"
+        );
+
+        let mut cross = vec![
+            (Fk(10), vec![parent]),
+            (Fk(11), vec![child_spend(parent_txid, 0xce)]),
+        ];
+        let plan_cross = q
+            .archive_plan_batch_from_store(&mut cross, 1, &crate::InFlightView::empty(), None)
+            .expect("cross height");
+        assert_eq!(
+            plan_cross
+                .external_parent_vouts
+                .get(&1)
+                .map(|v| v.as_slice()),
+            Some(&[0u32][..]),
+            "later header in the pack must pin the earlier create"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

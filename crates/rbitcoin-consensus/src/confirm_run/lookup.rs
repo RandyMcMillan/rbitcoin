@@ -243,7 +243,7 @@ pub fn confirm_wire_load_from_plan(
     let t_load = Instant::now();
     let PlanStampOutcome {
         mut plan,
-        parent_pin,
+        mut parent_pin,
         metas,
         wire_blocks,
         ..
@@ -254,7 +254,7 @@ pub fn confirm_wire_load_from_plan(
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
-        &parent_pin,
+        &mut parent_pin,
         &metas,
         &wire_blocks,
         ifo,

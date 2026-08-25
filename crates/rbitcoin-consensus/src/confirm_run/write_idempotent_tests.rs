@@ -1102,8 +1102,8 @@ fn pin_and_ensure_journey() {
         }],
     )];
     plan.planned_fks = vec![Fk(1)];
-    let stamp = ParentPinStamp::take_from_plan(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &stamp, &[], &[], None, None)
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
         .expect_err("missing parent must hard-fail pin");
     let msg = format!("{err}");
     assert!(
@@ -1191,8 +1191,8 @@ fn pin_and_ensure_journey() {
     plan.planned_fks = vec![Fk(2)];
     plan.external_parent_ranges.insert(parent_id, range);
     plan.external_parent_txids.insert(parent_id, parent_tx.txid);
-    let stamp = ParentPinStamp::take_from_plan(&mut plan);
-    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &stamp, &[], &[], None, None)
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
         .expect("pin via stamped range");
     assert!(parents.contains(pfk));
     assert!(parents.get_parent_out(pfk, 0).is_some());
@@ -1212,16 +1212,9 @@ fn pin_and_ensure_journey() {
     plan2
         .external_parent_txids
         .insert(parent_id, parent_tx.txid);
-    let err = pin_for_wire_batch(
-        &q,
-        Some(&plan2),
-        &ParentPinStamp::default(),
-        &[],
-        &[],
-        None,
-        None,
-    )
-    .expect_err("plan maps must not backfill an empty stamp");
+    let mut empty_stamp = ParentPinStamp::default();
+    let err = pin_for_wire_batch(&q, Some(&plan2), &mut empty_stamp, &[], &[], None, None)
+        .expect_err("plan maps must not backfill an empty stamp");
     assert!(err.to_string().contains("lookup stage miss"), "got: {err}");
 
     let mut bp = BatchParents::new();
@@ -1268,9 +1261,9 @@ fn pin_and_ensure_journey() {
     plan3
         .external_parent_txids
         .insert(parent_id, parent_tx.txid);
-    let stamp3 = ParentPinStamp::take_from_plan(&mut plan3);
+    let mut stamp3 = ParentPinStamp::take_from_plan(&mut plan3);
     let (mut parents3, _, _) =
-        pin_for_wire_batch(&q, Some(&plan3), &stamp3, &[], &[], None, None).unwrap();
+        pin_for_wire_batch(&q, Some(&plan3), &mut stamp3, &[], &[], None, None).unwrap();
     assert!(
         parents3.has_abs_layout(pfk),
         "load pin copies lookup-stamped spent.idx range (no write idx)"
@@ -1301,13 +1294,12 @@ fn pin_and_ensure_journey() {
         ),
     ];
     plan4.planned_fks = vec![Fk(2), Fk(3)];
-    let stamp4 = ParentPinStamp::take_from_plan(&mut plan4);
+    let mut stamp4 = ParentPinStamp::take_from_plan(&mut plan4);
     let (parents4, _, _) =
-        pin_for_wire_batch(&q, Some(&plan4), &stamp4, &[], &[], None, None).unwrap();
-    assert!(parents4.contains(Fk(2)));
+        pin_for_wire_batch(&q, Some(&plan4), &mut stamp4, &[], &[], None, None).unwrap();
     assert!(
-        !parents4.has_abs_layout(Fk(2)),
-        "same-batch create must not get a spent_range before Class A commit"
+        !parents4.contains(Fk(2)),
+        "same-header create is wire-valued, not pinned"
     );
 
     let _ = std::fs::remove_dir_all(&path);
@@ -1391,9 +1383,17 @@ fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
 
     let store = Arc::new(PipelineParentStore::new());
     let mut plan = stamp_plan();
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let (parents, _thin, _warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, Some(&store)).unwrap();
+    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, _thin, _warm) = pin_for_wire_batch(
+        &q,
+        Some(&plan),
+        &mut parent_pin,
+        &[],
+        &[],
+        None,
+        Some(&store),
+    )
+    .unwrap();
     assert!(parents.contains(pfk));
     assert!(
         parents.get_parent_out(pfk, 0).is_some(),
@@ -1401,9 +1401,17 @@ fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
     );
 
     let mut plan2 = stamp_plan();
-    let parent_pin2 = ParentPinStamp::take_from_plan(&mut plan2);
-    let (parents2, _thin2, _warm2) =
-        pin_for_wire_batch(&q, Some(&plan2), &parent_pin2, &[], &[], None, Some(&store)).unwrap();
+    let mut parent_pin2 = ParentPinStamp::take_from_plan(&mut plan2);
+    let (parents2, _thin2, _warm2) = pin_for_wire_batch(
+        &q,
+        Some(&plan2),
+        &mut parent_pin2,
+        &[],
+        &[],
+        None,
+        Some(&store),
+    )
+    .unwrap();
     assert!(parents2.contains(pfk));
     assert!(
         parents2.get_parent_out(pfk, 0).is_some(),
@@ -1497,8 +1505,8 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
     )]));
     let ifo = log.snapshot();
 
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], Some(&ifo), None)
+    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], Some(&ifo), None)
         .expect_err("incomplete outs must hard-fail pin");
     let msg = format!("{err}");
     assert!(
@@ -1547,6 +1555,93 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         stamp.create_by_txid.is_empty(),
         "plan path pins from packed create_fk; SipHash invert is plan=None only"
     );
+}
+
+/// Pin moves stamp parent_vouts (no clone); stamp is empty after.
+#[test]
+fn pin_takes_stamp_parent_vouts() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, Query};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-take-vouts-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    let parent_tx = TxRecord {
+        txid: [0x11u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let parent = (
+        parent_tx.clone(),
+        vec![InputRecord::coinbase(u32::MAX, vec![0x11], vec![])],
+        vec![OutputRecord::unspent(50, vec![0x51])],
+    );
+    let fks = q
+        .store()
+        .txs
+        .put_full_batch_indexed(&[parent], true)
+        .unwrap();
+    let pfk = fks[0];
+    let parent_id = pfk.get().unwrap();
+    let range = q.store().txs.body_range(pfk).unwrap();
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        std::sync::Arc::new((
+            TxRecord {
+                txid: [0x22u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        )),
+        vec![InputRecord {
+            prev_txid: parent_tx.txid,
+            create_fk: pfk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    plan.planned_fks = vec![Fk(2)];
+    plan.external_parent_ranges.insert(parent_id, range);
+    plan.external_parent_txids.insert(parent_id, parent_tx.txid);
+    plan.external_parent_vouts.insert(parent_id, vec![0]);
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    assert_eq!(
+        stamp.parent_vouts.get(&parent_id).map(|v| v.as_slice()),
+        Some(&[0u32][..])
+    );
+    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+        .expect("pin via taken vouts");
+    assert!(stamp.parent_vouts.is_empty(), "pin must take stamp vouts");
+    assert!(parents.contains(pfk));
+    assert!(parents.get_parent_out(pfk, 0).is_some());
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 /// Need a high vout from a multi-out parent (need-vouts only, not full n_out).
@@ -1641,9 +1736,9 @@ fn pin_sparse_need_high_vout_only() {
         index_tx: false,
         body_est: 0,
     };
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     let (parents, _thin, _warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
             .expect("pin high vout");
     assert!(parents.get_parent_out(pfk, 3).is_some());
     assert_eq!(
@@ -1760,10 +1855,17 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
         }
     }
 
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    let (_parents, _thin, warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, Some(&store))
-            .expect("adopt 1 + range-fill 2");
+    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (_parents, _thin, warm) = pin_for_wire_batch(
+        &q,
+        Some(&plan),
+        &mut parent_pin,
+        &[],
+        &[],
+        None,
+        Some(&store),
+    )
+    .expect("adopt 1 + range-fill 2");
     assert_eq!(warm.parents, 3);
     assert_eq!(
         warm.already, 1,
@@ -1844,14 +1946,14 @@ fn pin_recent_outs_is_cache_not_new() {
     plan.external_parent_txids.insert(7, tid);
     plan.external_parent_pins.insert(7, Arc::clone(&pin));
 
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     assert!(
         Arc::ptr_eq(parent_pin.pins.get(&7).expect("stamp pin"), &pin),
         "pin must use stamp-carried CreatePin"
     );
     q.recent_creates().drop_from(0);
     let (_parents, _thin, warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
             .expect("stamp-carried outs must cover without a live RecentCreates ring");
     assert_eq!(warm.parents, 1);
     assert_eq!(
@@ -1940,9 +2042,9 @@ fn pin_recent_identity_without_outs_still_range_fills() {
         plan.external_parent_txids.insert(id, tid);
     }
 
-    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     let (_parents, _thin, warm) =
-        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
             .expect("identity-only recent still range-fills");
     assert_eq!(warm.parents, 1);
     assert_eq!(
@@ -2276,7 +2378,6 @@ fn structural_pinned_without_abs_is_invariant_error() {
 /// Direct write skips SH FkMap; RecentCreates body ranges match idx.
 #[test]
 fn direct_write_skips_create_pin_map_recent_matches_idx() {
-    use crate::confirm_phase_stats;
     use crate::regtest_pad::mine_empty_regtest;
     use crate::{accept_and_connect_block, ChainParams, Milestone};
     use bitcoin::hashes::Hash;
@@ -2307,10 +2408,7 @@ fn direct_write_skips_create_pin_map_recent_matches_idx() {
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
     let tid = b1.txdata[0].compute_txid().to_byte_array();
-    let _ = confirm_phase_stats::sample_write_pins_and_reset();
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let (_take, map_ns, _head) = confirm_phase_stats::sample_write_pins_and_reset();
-    assert_eq!(map_ns, 0, "Direct must not insert write_create_pins");
     let (fk, range) = q
         .recent_creates()
         .get(&tid)

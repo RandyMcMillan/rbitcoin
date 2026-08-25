@@ -109,6 +109,8 @@ pub struct MempoolGraphStats {
 #[derive(Debug)]
 pub struct TxGraph {
     entries: HashMap<Txid, TxEntry>,
+    /// Live wtxid → txid (last insert wins). BIP339 inv must not scan `entries`.
+    by_wtxid: HashMap<Wtxid, Txid>,
     /// Mempool-created outpoints spent by another mempool tx.
     spends: HashMap<OutPoint, Txid>,
     /// **All** outpoints spent by live mempool txs (chain UTXOs + mempool), for RBF conflicts.
@@ -134,6 +136,7 @@ impl Default for TxGraph {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            by_wtxid: HashMap::new(),
             spends: HashMap::new(),
             conflicts: HashMap::new(),
             created: HashSet::new(),
@@ -177,6 +180,14 @@ impl TxGraph {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
+        self.by_wtxid.contains_key(wtxid)
+    }
+
+    pub fn txid_for_wtxid(&self, wtxid: &Wtxid) -> Option<Txid> {
+        self.by_wtxid.get(wtxid).copied()
     }
 
     /// Sample-and-reset cluster-linearize count (fee-refresh tests).
@@ -415,6 +426,7 @@ impl TxGraph {
             });
         }
         self.total_weight = self.total_weight.saturating_add(weight);
+        self.by_wtxid.insert(e.wtxid, txid);
         self.entries.insert(txid, e);
         // Children accepted while we were confirmed (reorg re-accept).
         for (vout, _) in tx.output.iter().enumerate() {
@@ -443,6 +455,9 @@ impl TxGraph {
         self.invalidate_chunk_cache();
         let e = self.entries.remove(txid)?;
         self.total_weight = self.total_weight.saturating_sub(e.weight);
+        if self.by_wtxid.get(&e.wtxid) == Some(txid) {
+            self.by_wtxid.remove(&e.wtxid);
+        }
         for p in &e.parents {
             if let Some(pe) = self.entries.get_mut(p) {
                 pe.children.remove(txid);
@@ -819,6 +834,7 @@ impl TxGraph {
     pub fn rebuild_from(&mut self, items: Vec<(TxEntry, Transaction)>) {
         self.invalidate_chunk_cache();
         self.entries.clear();
+        self.by_wtxid.clear();
         self.spends.clear();
         self.conflicts.clear();
         self.created.clear();
@@ -910,6 +926,56 @@ mod tests {
         assert_eq!(c.members.len(), 1);
         assert_eq!(c.linearization, vec![id]);
         assert_eq!(c.chunks.len(), 1);
+    }
+
+    #[test]
+    fn wtxid_index_insert_remove_and_loser_collision() {
+        let mut g = TxGraph::new();
+        let a = make_tx(None, 1, 1);
+        let b = make_tx(None, 1, 2);
+        let ea = entry_for(&a, 100, 0);
+        let eb = entry_for(&b, 100, 1);
+        let wa = ea.wtxid;
+        let wb = eb.wtxid;
+        let ida = ea.txid;
+        let idb = eb.txid;
+        assert_ne!(wa, wb);
+        g.insert(ea, &a);
+        g.insert(eb, &b);
+        assert!(g.contains_wtxid(&wa));
+        assert!(g.contains_wtxid(&wb));
+        assert_eq!(g.txid_for_wtxid(&wa), Some(ida));
+        assert_eq!(g.txid_for_wtxid(&wb), Some(idb));
+        assert!(g.remove(&ida, &a).is_some());
+        assert!(!g.contains_wtxid(&wa));
+        assert_eq!(g.txid_for_wtxid(&wb), Some(idb));
+
+        let c = make_tx(None, 1, 3);
+        let d = make_tx(None, 1, 4);
+        let ec = entry_for(&c, 10, 2);
+        let mut ed = entry_for(&d, 10, 3);
+        let collide = ec.wtxid;
+        ed.wtxid = collide;
+        let idc = ec.txid;
+        let idd = ed.txid;
+        g.insert(ec, &c);
+        g.insert(ed, &d);
+        assert_eq!(g.txid_for_wtxid(&collide), Some(idd), "last insert wins");
+        assert!(g.remove(&idc, &c).is_some());
+        assert_eq!(
+            g.txid_for_wtxid(&collide),
+            Some(idd),
+            "removing the loser must not drop the winner"
+        );
+        assert!(g.remove(&idd, &d).is_some());
+        assert!(!g.contains_wtxid(&collide));
+
+        let e = make_tx(None, 1, 5);
+        let ee = entry_for(&e, 1, 4);
+        let we = ee.wtxid;
+        g.rebuild_from(vec![(ee, e.clone())]);
+        assert_eq!(g.txid_for_wtxid(&we), Some(e.compute_txid()));
+        assert!(!g.contains_wtxid(&wb));
     }
 
     #[test]

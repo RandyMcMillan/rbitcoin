@@ -1363,8 +1363,8 @@ mod tests {
     }
 
     #[test]
-    fn materialize_warm_merges_residual_into_nonempty_table() {
-        // Durable head + residual runs → warm merge; never FullCold wipe.
+    fn materialize_skips_residual_on_nonempty_table() {
+        // Durable head + residual runs → discard runs; never FullCold wipe.
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1391,7 +1391,8 @@ mod tests {
         write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
         let n1 = b.finalize_and_bulk_materialize(&store).unwrap();
         assert!(n1 >= 30);
-        assert!(store.scripthash.entry_count() >= 30);
+        let count_before = store.scripthash.entry_count();
+        assert!(count_before >= 30);
         assert_eq!(store.scripthash.entries(&first_sh).unwrap().len(), 1);
 
         let mut body2 = Vec::new();
@@ -1405,18 +1406,19 @@ mod tests {
         let path2 = next_run_path(&runs_dir, 2);
         let run2 = write_sorted_run(&path2, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body2).unwrap();
         let _ = claim_run_for_materialize(&run2).unwrap();
-        assert!(store.scripthash.entry_count() > 0);
 
         let n2 = b.finalize_and_bulk_materialize(&store).unwrap();
-        assert!(n2 >= 40, "warm inserted={n2}");
-        // 30 prior + 40 residual (disjoint keys/fks); prior key still present.
-        assert_eq!(store.scripthash.entry_count(), 70);
+        assert_eq!(n2, 0, "must not WarmOnly residual onto a live head");
+        assert_eq!(store.scripthash.entry_count(), count_before);
         assert_eq!(
             store.scripthash.entries(&first_sh).unwrap().len(),
             1,
-            "warm residual must not wipe durable head"
+            "skip must not wipe durable head"
         );
-        assert_eq!(store.scripthash.entries(&residual_sh).unwrap().len(), 1);
+        assert!(
+            store.scripthash.entries(&residual_sh).unwrap().is_empty(),
+            "leftover run must not be merged"
+        );
         assert!(list_materialize_claims(&runs_dir).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

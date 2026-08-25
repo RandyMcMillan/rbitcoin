@@ -145,15 +145,11 @@ pub(super) fn pin_for_wire_batch(
     }
 
     let t_recent = Instant::now();
-    let recent = query.recent_creates().snapshot();
     for (id, need) in &parent_vouts {
         if plan_by_id.contains_key(id) {
             continue;
         }
-        let Some(txid) = parent_pin.create_txid(*id) else {
-            continue;
-        };
-        let Some(pin) = recent.create_pin(&txid) else {
+        let Some(pin) = parent_pin.pins.get(id).cloned() else {
             continue;
         };
         let (_tx, outs) = pin.as_ref();

@@ -9,6 +9,7 @@
 //! `None`) drops visibility for new readers; a reader holding the old
 //! `Arc` still sees hits.
 
+use crate::layer_chain::{self, ChainLayer};
 use arc_swap::ArcSwapOption;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
@@ -71,27 +72,12 @@ pub type OutPointSet =
 pub type IdMap = HashMap<[u8; 32], (Fk, (u64, u64)), BuildHasherDefault<TxidHasher>>;
 
 /// One lookup wave's hits (`lo..=hi` BQ heights) plus the older chain.
-#[derive(Debug)]
-pub struct IdLayer {
-    pub lo: u32,
-    pub hi: u32,
-    pub hits: Arc<IdMap>,
-    pub older: Option<Arc<IdLayer>>,
-}
+pub type IdLayer = ChainLayer<(), IdMap>;
 
 impl IdLayer {
     /// Newest-first walk. First layer that has `txid` wins.
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
-        let mut layer = self;
-        loop {
-            if let Some(&v) = layer.hits.get(txid) {
-                return Some(v);
-            }
-            match layer.older.as_deref() {
-                Some(older) => layer = older,
-                None => return None,
-            }
-        }
+        self.walk(|layer| layer.hits.get(txid).copied())
     }
 }
 
@@ -116,12 +102,8 @@ impl PublishedIds {
 
     /// Replace the chain with a single layer (tests / one-shot stamp).
     pub fn publish(&self, map: Arc<IdMap>) {
-        self.inner.store(Some(Arc::new(IdLayer {
-            lo: 0,
-            hi: 0,
-            hits: map,
-            older: None,
-        })));
+        self.inner
+            .store(Some(ChainLayer::prepend(None, 0, 0, (), map)));
     }
 
     pub(crate) fn publish_head(&self, head: Option<Arc<IdLayer>>) {
@@ -207,7 +189,7 @@ impl LiveUnion {
 
     /// Drop layers whose span has no remaining queued height. Does not swap.
     pub fn keep_heights(&mut self, keep: impl Fn(u32) -> bool) {
-        self.head = splice_kept(self.head.take(), keep);
+        self.head = layer_chain::splice_kept(self.head.take(), |l| span_kept(l.lo, l.hi, &keep));
     }
 
     /// Same as [`Self::keep_heights`] using a queued-height set (`range`, not `lo..=hi`).
@@ -215,17 +197,15 @@ impl LiveUnion {
         self.head = splice_queued(self.head.take(), queued);
     }
 
-    /// Keep layers that still overlap the BQ, overlap `(tip, taken_hi]`
-    /// (taken onto loadq, already off BQ), **or** whose `hi` is inside
-    /// `tip − horizon` (RecentCreates window). Identity only.
-    pub fn keep_queued_or_horizon(
+    /// Keep layers that still overlap the BQ or `(tip, taken_hi]`
+    /// (taken onto loadq, already off BQ). Identity only.
+    pub fn keep_queued_or_taken(
         &mut self,
         queued: &std::collections::BTreeSet<u32>,
         tip: u32,
-        horizon: u32,
         taken_hi: Option<u32>,
     ) {
-        self.head = splice_queued_or_horizon(self.head.take(), queued, tip, horizon, taken_hi);
+        self.head = splice_queued_or_taken(self.head.take(), queued, tip, taken_hi);
     }
 
     /// Prepend one layer covering `lo..=hi` (inclusive).
@@ -234,17 +214,20 @@ impl LiveUnion {
     /// misses). Moved into an Arc — no per-entry copy. Zero txid is stripped.
     pub fn note_span(&mut self, lo: u32, hi: u32, mut hits: IdMap) {
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-        self.head = splice_kept(self.head.take(), |h| h < lo || h > hi);
+        self.head = layer_chain::splice_kept(self.head.take(), |l| {
+            span_kept(l.lo, l.hi, &|h| h < lo || h > hi)
+        });
         hits.remove(&[0u8; 32]);
         if hits.is_empty() {
             return;
         }
-        self.head = Some(Arc::new(IdLayer {
+        self.head = Some(ChainLayer::prepend(
+            self.head.take(),
             lo,
             hi,
-            hits: Arc::new(hits),
-            older: self.head.take(),
-        }));
+            (),
+            Arc::new(hits),
+        ));
     }
 
     /// Prepend a single-height layer (tests / one-shot).
@@ -276,56 +259,14 @@ pub fn span_overlaps_queued(lo: u32, hi: u32, queued: &std::collections::BTreeSe
     queued.range(lo..=hi).next().is_some()
 }
 
-/// Rebuild the chain keeping nodes that still have a queued height in span.
-/// Kept hit maps are `Arc`-cloned; suffix nodes whose `older` is unchanged
-/// are reused.
-fn splice_kept(head: Option<Arc<IdLayer>>, keep: impl Fn(u32) -> bool) -> Option<Arc<IdLayer>> {
-    let mut nodes = Vec::new();
-    let mut cur = head;
-    while let Some(n) = cur {
-        let older = n.older.clone();
-        nodes.push(n);
-        cur = older;
-    }
-    let mut new_head: Option<Arc<IdLayer>> = None;
-    for n in nodes.into_iter().rev() {
-        if !span_kept(n.lo, n.hi, &keep) {
-            continue;
-        }
-        let older_ok = match (n.older.as_ref(), new_head.as_ref()) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if older_ok {
-            new_head = Some(n);
-        } else {
-            new_head = Some(Arc::new(IdLayer {
-                lo: n.lo,
-                hi: n.hi,
-                hits: Arc::clone(&n.hits),
-                older: new_head,
-            }));
-        }
-    }
-    new_head
-}
-
-fn layer_in_horizon(hi: u32, tip: u32, horizon: u32) -> bool {
-    horizon > 0 && tip.saturating_sub(hi) < horizon
-}
-
-fn splice_queued_or_horizon(
+fn splice_queued_or_taken(
     head: Option<Arc<IdLayer>>,
     queued: &std::collections::BTreeSet<u32>,
     tip: u32,
-    horizon: u32,
     taken_hi: Option<u32>,
 ) -> Option<Arc<IdLayer>> {
     splice_queued_pred(head, |lo, hi| {
-        span_overlaps_queued(lo, hi, queued)
-            || layer_in_horizon(hi, tip, horizon)
-            || span_overlaps_taken(lo, hi, tip, taken_hi)
+        span_overlaps_queued(lo, hi, queued) || span_overlaps_taken(lo, hi, tip, taken_hi)
     })
 }
 
@@ -351,35 +292,7 @@ fn splice_queued_pred(
     head: Option<Arc<IdLayer>>,
     keep_span: impl Fn(u32, u32) -> bool,
 ) -> Option<Arc<IdLayer>> {
-    let mut nodes = Vec::new();
-    let mut cur = head;
-    while let Some(n) = cur {
-        let older = n.older.clone();
-        nodes.push(n);
-        cur = older;
-    }
-    let mut new_head: Option<Arc<IdLayer>> = None;
-    for n in nodes.into_iter().rev() {
-        if !keep_span(n.lo, n.hi) {
-            continue;
-        }
-        let older_ok = match (n.older.as_ref(), new_head.as_ref()) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        };
-        if older_ok {
-            new_head = Some(n);
-        } else {
-            new_head = Some(Arc::new(IdLayer {
-                lo: n.lo,
-                hi: n.hi,
-                hits: Arc::clone(&n.hits),
-                older: new_head,
-            }));
-        }
-    }
-    new_head
+    layer_chain::splice_kept(head, |l| keep_span(l.lo, l.hi))
 }
 
 #[cfg(test)]
@@ -620,46 +533,39 @@ mod tests {
     }
 
     #[test]
-    fn keep_queued_or_horizon_holds_after_bq_drop() {
+    fn keep_queued_drops_off_bq_without_taken() {
         let published = PublishedIds::new();
         let mut live = LiveUnion::new();
         live.note_span(10, 12, hits(&[(tid(1), Fk(10), (1, 2))]));
         live.publish(&published);
         let empty = std::collections::BTreeSet::new();
-        live.keep_queued_or_horizon(&empty, 20, 16, None);
-        live.publish(&published);
-        assert_eq!(
-            published.get(&tid(1)),
-            Some((Fk(10), (1, 2))),
-            "layer hi=12 must stay while tip-hi < horizon"
-        );
-        live.keep_queued_or_horizon(&empty, 40, 16, None);
+        live.keep_queued_or_taken(&empty, 20, None);
         live.publish(&published);
         assert!(
             published.get(&tid(1)).is_none(),
-            "layer must drop once tip-hi >= horizon and BQ empty"
+            "off-BQ layer with no taken overlap must drop"
         );
     }
 
     #[test]
-    fn keep_queued_or_horizon_holds_taken_off_bq_span() {
+    fn keep_queued_or_taken_holds_taken_off_bq_span() {
         let published = PublishedIds::new();
         let mut live = LiveUnion::new();
         live.note_span(10, 12, hits(&[(tid(1), Fk(10), (1, 2))]));
         live.publish(&published);
         let empty = std::collections::BTreeSet::new();
-        live.keep_queued_or_horizon(&empty, 5, 0, Some(12));
+        live.keep_queued_or_taken(&empty, 5, Some(12));
         live.publish(&published);
         assert_eq!(
             published.get(&tid(1)),
             Some((Fk(10), (1, 2))),
-            "taken (off-BQ) span overlapping (tip, taken_hi] must stay even at horizon=0"
+            "taken (off-BQ) span overlapping (tip, taken_hi] must stay"
         );
-        live.keep_queued_or_horizon(&empty, 12, 0, Some(12));
+        live.keep_queued_or_taken(&empty, 12, Some(12));
         live.publish(&published);
         assert!(
             published.get(&tid(1)).is_none(),
-            "layer must drop once tip has caught taken_hi and horizon is 0"
+            "layer must drop once tip has caught taken_hi"
         );
     }
 

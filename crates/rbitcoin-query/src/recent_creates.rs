@@ -1,51 +1,20 @@
-//! Height-FIFO identity ring: just-confirmed `txid → (create_fk, body_range)`
-//! plus optional [`CreatePin`] outs (Arc-shared with in-flight / `batch_pin`).
+//! Write-published identity + optional [`CreatePin`] as an Arc layer chain.
 //!
-//! Write publishes after Class A + idx. Load stamp probes this **after**
-//! published live-union and **before** leftover TipOnly. [`RecentSnap::get`]
-//! stays `(fk, range)` and does **not** clone the pin Arc. Load pin uses
-//! [`RecentSnap::create_pin`].
-//!
-//! Expire is `pop_front` of whole heights. Horizon is
-//! [`recent_creates_horizon`] on an EWMA of `lookup_taken_hi − tip`
-//! (floor 32, cap `32*144`).
-//!
-//! Overlay + tombstones hold unflushed notes. [`RecentCreates::publish_if_dirty`]
-//! builds **one** published [`Arc`] (confirm write: once per batch). There is no
-//! second live HashMap. Load [`get`](RecentCreates::get) / [`RecentSnap::get`]
-//! see overlay first so stamp hits unflushed notes without cloning.
+//! Same splice/prepend as live_union ([`crate::layer_chain`]). One layer per
+//! [`RecentCreates::publish_layer`]. Load snapshot walks pending then the head.
+//! [`RecentSnap::get`] is fk+range; [`RecentSnap::create_pin`] clones the pin Arc.
 
+use crate::layer_chain::{self, ChainLayer};
 use crate::published_ids::TxidHasher;
 use crate::CreatePin;
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 use rbitcoin_primitives::Fk;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 
-/// Floor so a cold / empty lead still covers one pipeline of 1-high batches.
-pub const RECENT_CREATES_HORIZON_FLOOR: u32 = 32;
-/// Cap: 32 load-sized batches × 144-block hard pack.
-pub const RECENT_CREATES_HORIZON_CAP: u32 = 32 * 144;
-
-/// One EWMA step: `(3·ewma + span) / 4`. Cold `ewma == 0` starts at `span`.
-#[inline]
-pub fn recent_creates_ewma_step(ewma: u32, span: u32) -> u32 {
-    if ewma == 0 {
-        span
-    } else {
-        ewma.saturating_mul(3).saturating_add(span) / 4
-    }
-}
-
-/// Heights to retain: EWMA lead, clamped to floor/cap.
-#[inline]
-pub fn recent_creates_horizon(ewma_lead: u32) -> u32 {
-    ewma_lead.clamp(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_CAP)
-}
-
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
-type DeadSet = HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>;
+type RecentLayer = ChainLayer<u32, LiveMap>;
 
 #[derive(Clone)]
 struct LiveEnt {
@@ -56,65 +25,55 @@ struct LiveEnt {
 }
 
 struct Inner {
-    overlay: LiveMap,
-    dead: DeadSet,
-    fifo: VecDeque<(u32, Vec<[u8; 32]>)>,
-    dirty: bool,
+    pending: LiveMap,
 }
 
-/// Published live map plus the unflushed overlay for one stamp pack.
+/// Pending notes plus the published layer head.
 #[derive(Clone)]
 pub struct RecentSnap {
-    published: std::sync::Arc<LiveMap>,
-    overlay: std::sync::Arc<LiveMap>,
-    dead: std::sync::Arc<DeadSet>,
+    head: Option<Arc<RecentLayer>>,
+    pending: std::sync::Arc<LiveMap>,
 }
 
 impl RecentSnap {
-    pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
+    fn ent(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64), Option<CreatePin>)> {
         if *txid == [0u8; 32] {
             return None;
         }
-        if self.dead.contains(txid) {
-            return None;
+        if let Some(e) = self.pending.get(txid) {
+            return Some((e.fk, e.range, e.outs.clone()));
         }
-        if let Some(e) = self.overlay.get(txid) {
-            return Some((e.fk, e.range));
-        }
-        self.published.get(txid).map(|e| (e.fk, e.range))
+        self.head.as_ref()?.walk(|layer| {
+            layer
+                .hits
+                .get(txid)
+                .map(|e| (e.fk, e.range, e.outs.clone()))
+        })
+    }
+
+    pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
+        self.ent(txid).map(|(fk, range, _)| (fk, range))
     }
 
     /// Arc-clone the create pin when the note carried one. Identity-only notes
-    /// return `None` (load pin then cold-fills). Does not run on [`Self::get`].
+    /// return `None` (load pin then cold-fills).
     pub fn create_pin(&self, txid: &[u8; 32]) -> Option<CreatePin> {
-        if *txid == [0u8; 32] {
-            return None;
-        }
-        if self.dead.contains(txid) {
-            return None;
-        }
-        if let Some(e) = self.overlay.get(txid) {
-            return e.outs.clone();
-        }
-        self.published.get(txid).and_then(|e| e.outs.clone())
+        self.ent(txid).and_then(|(_, _, outs)| outs)
     }
 }
 
 /// Write-published, load-read identity ring.
 pub struct RecentCreates {
-    live: ArcSwap<LiveMap>,
+    head: ArcSwapOption<RecentLayer>,
     inner: Mutex<Inner>,
 }
 
 impl Default for RecentCreates {
     fn default() -> Self {
         Self {
-            live: ArcSwap::from_pointee(LiveMap::default()),
+            head: ArcSwapOption::empty(),
             inner: Mutex::new(Inner {
-                overlay: LiveMap::default(),
-                dead: DeadSet::default(),
-                fifo: VecDeque::new(),
-                dirty: false,
+                pending: LiveMap::default(),
             }),
         }
     }
@@ -125,155 +84,115 @@ impl RecentCreates {
         Self::default()
     }
 
-    /// Merge overlay/dead into one new published Arc. No second live HashMap.
-    ///
-    /// No-op when clean. Confirm write flushes once after all height notes + expire.
-    pub fn publish_if_dirty(&self) {
+    /// Freeze pending into one layer and prepend. No-op when pending is empty.
+    /// Does not clone older `hits` Arcs.
+    pub fn publish_layer(&self, until: u32) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if !g.dirty {
+        if g.pending.is_empty() {
             return;
         }
-        let published = self.live.load_full();
-        let mut next = (*published).clone();
-        for (k, e) in g.overlay.iter() {
-            next.insert(*k, e.clone());
+        let hits = std::mem::take(&mut g.pending);
+        let mut lo = u32::MAX;
+        let mut hi = 0u32;
+        for e in hits.values() {
+            lo = lo.min(e.height);
+            hi = hi.max(e.height);
         }
-        for k in g.dead.iter() {
-            next.remove(k);
-        }
-        self.live.store(Arc::new(next));
-        g.overlay.clear();
-        g.dead.clear();
-        g.dirty = false;
+        drop(g);
+        let until = until.max(hi);
+        let older = self.head.load_full();
+        self.head.store(Some(ChainLayer::prepend(
+            older,
+            lo,
+            hi,
+            until,
+            Arc::new(hits),
+        )));
     }
 
-    /// Insert creates at `height`. Last write wins if the txid is already live.
-    ///
-    /// Does not rebuild the snapshot — call [`Self::publish_if_dirty`].
-    /// Identity-only (no outs). [`Self::note_pins`] carries a [`CreatePin`].
+    /// Merge pending into a layer that is never drop_ready until Class A HWMs exist.
+    pub fn publish_if_dirty(&self) {
+        self.publish_layer(u32::MAX);
+    }
+
+    /// Drop layers with `until <= class_a_hi`. Kept nodes reuse `hits` Arc.
+    pub fn drop_ready(&self, class_a_hi: u32) {
+        let head = self.head.load_full();
+        let next = layer_chain::splice_kept(head, |l| l.meta > class_a_hi);
+        self.head.store(next);
+    }
+
     pub fn note(&self, height: u32, rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>) {
         self.note_pins(height, rows.into_iter().map(|(t, f, r)| (t, f, r, None)));
     }
 
-    /// Same as [`Self::note`] with optional [`CreatePin`] (Arc clone, not script bytes).
     pub fn note_pins(
         &self,
         height: u32,
         rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64), Option<CreatePin>)>,
     ) {
-        let mut keys: Vec<[u8; 32]> = Vec::new();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         for (txid, fk, range, outs) in rows {
             if txid == [0u8; 32] {
                 continue;
             }
-            let ent = LiveEnt {
-                fk,
-                range,
-                height,
-                outs,
-            };
-            g.overlay.insert(txid, ent);
-            g.dead.remove(&txid);
-            keys.push(txid);
+            g.pending.insert(
+                txid,
+                LiveEnt {
+                    fk,
+                    range,
+                    height,
+                    outs,
+                },
+            );
         }
-        if keys.is_empty() {
-            return;
-        }
-        g.fifo.push_back((height, keys));
-        g.dirty = true;
     }
 
-    /// Drop heights `≤ through` (inclusive). A key stays if a newer height
-    /// re-noted it (last-write `LiveEnt.height`).
+    /// Drop published keys / pending with `LiveEnt.height ≤ through`.
     pub fn expire_through(&self, through: u32) {
-        let published = self.live.load_full();
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut changed = false;
-        while let Some(&(h, _)) = g.fifo.front() {
-            if h > through {
-                break;
-            }
-            let (_, keys) = g.fifo.pop_front().expect("front");
-            for t in keys {
-                if let Some(ent) = g.overlay.get(&t) {
-                    if ent.height <= through {
-                        g.overlay.remove(&t);
-                        g.dead.insert(t);
-                        changed = true;
-                    }
-                    continue;
-                }
-                if let Some(ent) = published.get(&t) {
-                    if ent.height <= through {
-                        g.dead.insert(t);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if changed {
-            g.dirty = true;
-        }
-    }
-
-    /// Forget heights `≤ tip − horizon`. No-op while `tip < horizon` so a
-    /// genesis-height note is not dropped on the first packs.
-    pub fn expire_to_horizon(&self, tip: u32, horizon: u32) {
-        if tip < horizon {
-            return;
-        }
-        self.expire_through(tip - horizon);
+        self.filter_pending(|e| e.height > through);
+        self.filter_layers(|l| l.hi > through, |e| e.height > through);
     }
 
     /// Disconnect: drop heights `≥ height`.
     pub fn drop_from(&self, height: u32) {
-        let published = self.live.load_full();
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.fifo.retain(|(h, _)| *h < height);
-        let mut changed = false;
-        let mut drop_ov: Vec<[u8; 32]> = Vec::new();
-        g.overlay.retain(|t, ent| {
-            if ent.height < height {
-                true
-            } else {
-                drop_ov.push(*t);
-                false
-            }
-        });
-        for t in drop_ov {
-            g.dead.insert(t);
-            changed = true;
-        }
-        for (t, ent) in published.iter() {
-            if ent.height >= height {
-                g.dead.insert(*t);
-                changed = true;
-            }
-        }
-        if changed {
-            g.dirty = true;
-        }
+        self.filter_pending(|e| e.height < height);
+        self.filter_layers(|l| l.lo < height, |e| e.height < height);
     }
 
-    /// Point get. Zero txid is never a hit. Lock-free snapshot load.
+    fn filter_pending(&self, keep: impl Fn(&LiveEnt) -> bool) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.pending.retain(|_, e| keep(e));
+    }
+
+    fn filter_layers(
+        &self,
+        keep_layer: impl Fn(&RecentLayer) -> bool,
+        keep_ent: impl Fn(&LiveEnt) -> bool,
+    ) {
+        let head = self.head.load_full();
+        self.head.store(filter_chain(head, &keep_layer, &keep_ent));
+    }
+
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
         self.snapshot().get(txid)
     }
 
-    /// Snapshot then [`RecentSnap::create_pin`].
     pub fn create_pin(&self, txid: &[u8; 32]) -> Option<CreatePin> {
         self.snapshot().create_pin(txid)
     }
 
-    /// Published Arc plus a small overlay (do not `load` per parent).
     pub fn snapshot(&self) -> RecentSnap {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         RecentSnap {
-            published: self.live.load_full(),
-            overlay: Arc::new(g.overlay.clone()),
-            dead: Arc::new(g.dead.clone()),
+            head: self.head.load_full(),
+            pending: Arc::new(g.pending.clone()),
         }
+    }
+
+    #[cfg(test)]
+    fn head_hits_arc(&self) -> Option<Arc<LiveMap>> {
+        self.head.load_full().map(|h| Arc::clone(&h.hits))
     }
 
     /// Occupancy for `ibd: sizes`.
@@ -282,40 +201,102 @@ impl RecentCreates {
         (d.0, d.1)
     }
 
-    /// `(heights, live, pub, overlay, fifo_keys)`.
+    /// `(layers, live_keys, pub_keys, pending_keys, live_keys)`.
     pub fn size_detail(&self) -> (usize, usize, usize, usize, usize) {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let fifo_keys = g.fifo.iter().map(|(_, k)| k.len()).sum();
-        let pub_k = self.live.load().len();
-        (
-            g.fifo.len(),
-            pub_k.saturating_add(g.overlay.len()),
-            pub_k,
-            g.overlay.len(),
-            fifo_keys,
-        )
+        let pending = g.pending.len();
+        drop(g);
+        let mut layers = 0usize;
+        let mut pub_k = 0usize;
+        let mut cur = self.head.load_full();
+        while let Some(layer) = cur {
+            layers = layers.saturating_add(1);
+            pub_k = pub_k.saturating_add(layer.hits.len());
+            cur = layer.older.clone();
+        }
+        let live = pub_k.saturating_add(pending);
+        (layers, live, pub_k, pending, live)
     }
 
-    /// Heap bytes of live [`CreatePin`] payloads (overlay + published, overlay wins).
     pub fn approx_pin_bytes(&self) -> u64 {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let published = self.live.load();
         let mut n = 0u64;
-        for e in g.overlay.values() {
+        for e in g.pending.values() {
             if let Some(p) = &e.outs {
                 n = n.saturating_add(crate::archive::create_pin_approx_bytes(p) as u64);
             }
         }
-        for (k, e) in published.iter() {
-            if g.overlay.contains_key(k) || g.dead.contains(k) {
-                continue;
+        drop(g);
+        let mut cur = self.head.load_full();
+        while let Some(layer) = cur {
+            for e in layer.hits.values() {
+                if let Some(p) = &e.outs {
+                    n = n.saturating_add(crate::archive::create_pin_approx_bytes(p) as u64);
+                }
             }
-            if let Some(p) = &e.outs {
-                n = n.saturating_add(crate::archive::create_pin_approx_bytes(p) as u64);
-            }
+            cur = layer.older.clone();
         }
         n
     }
+}
+
+fn layer_ents_all(l: &RecentLayer, keep: impl Fn(&LiveEnt) -> bool) -> bool {
+    l.hits.values().all(keep)
+}
+
+fn layer_ents_any(l: &RecentLayer, keep: impl Fn(&LiveEnt) -> bool) -> bool {
+    l.hits.values().any(keep)
+}
+
+fn filter_chain(
+    head: Option<Arc<RecentLayer>>,
+    keep_layer: &impl Fn(&RecentLayer) -> bool,
+    keep_ent: &impl Fn(&LiveEnt) -> bool,
+) -> Option<Arc<RecentLayer>> {
+    let mut nodes = Vec::new();
+    let mut cur = head;
+    while let Some(n) = cur {
+        let older = n.older.clone();
+        nodes.push(n);
+        cur = older;
+    }
+    let mut new_head: Option<Arc<RecentLayer>> = None;
+    for n in nodes.into_iter().rev() {
+        if keep_layer(&n) && layer_ents_all(&n, keep_ent) {
+            new_head = Some(ChainLayer::prepend(
+                new_head,
+                n.lo,
+                n.hi,
+                n.meta,
+                Arc::clone(&n.hits),
+            ));
+            continue;
+        }
+        if !layer_ents_any(&n, keep_ent) {
+            continue;
+        }
+        let mut hits = LiveMap::default();
+        let mut lo = u32::MAX;
+        let mut hi = 0u32;
+        for (k, e) in n.hits.iter() {
+            if keep_ent(e) {
+                lo = lo.min(e.height);
+                hi = hi.max(e.height);
+                hits.insert(*k, e.clone());
+            }
+        }
+        if hits.is_empty() {
+            continue;
+        }
+        new_head = Some(ChainLayer::prepend(
+            new_head,
+            lo,
+            hi,
+            n.meta,
+            Arc::new(hits),
+        ));
+    }
+    new_head
 }
 
 #[cfg(test)]
@@ -329,53 +310,42 @@ mod tests {
     }
 
     #[test]
-    fn horizon_is_ewma_clamped_not_plus_quarter() {
-        assert_eq!(recent_creates_ewma_step(0, 40), 40);
-        assert_eq!(recent_creates_ewma_step(40, 40), 40);
-        assert_eq!(recent_creates_horizon(0), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(40), 40);
-        assert_eq!(recent_creates_horizon(10_000), RECENT_CREATES_HORIZON_CAP);
-        let mut e = 0u32;
-        for _ in 0..8 {
-            e = recent_creates_ewma_step(e, 40);
-        }
-        let h = recent_creates_horizon(e);
-        assert_eq!(h, 40, "settled horizon={h}");
-    }
-
-    #[test]
-    fn two_height_notes_are_two_fifo_rows() {
+    fn recent_layer_publish_prepends_without_cloning_older_hits() {
         let r = RecentCreates::new();
         r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        r.publish_layer(100);
+        let first = r.head_hits_arc().expect("head");
         r.note(11, [(tid(2), Fk(2), (3, 4))]);
-        assert_eq!(
-            r.size_snapshot(),
-            (2, 2),
-            "one fifo row per prepared height, not one per write batch"
+        r.publish_layer(101);
+        let older = r
+            .head
+            .load_full()
+            .expect("head")
+            .older
+            .clone()
+            .expect("older");
+        assert!(
+            Arc::ptr_eq(&older.hits, &first),
+            "second publish must prepend, not clone the older hits Arc"
         );
+        assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
+        assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
     }
 
     #[test]
-    fn size_detail_counts_live_and_pub_separately() {
+    fn recent_layer_drop_ready_splices_older_keeps_newer_hits_arc() {
         let r = RecentCreates::new();
         r.note(10, [(tid(1), Fk(1), (1, 2))]);
-        let (h, live, pub_k, ov, fifo) = r.size_detail();
-        assert_eq!(h, 1);
-        assert_eq!(live, 1);
-        assert_eq!(pub_k, 0, "unpublished notes are not on the ArcSwap");
-        assert_eq!(ov, 1);
-        assert_eq!(fifo, 1);
-        r.publish_if_dirty();
-        let (_, live, pub_k, ov, fifo) = r.size_detail();
-        assert_eq!(live, 1);
-        assert_eq!(pub_k, 1);
-        assert_eq!(ov, 0);
-        assert_eq!(fifo, 1);
-        let a = r.snapshot();
-        let b = r.snapshot();
+        r.publish_layer(10);
+        r.note(11, [(tid(2), Fk(2), (3, 4))]);
+        r.publish_layer(40);
+        let newer = r.head_hits_arc().expect("newer");
+        r.drop_ready(10);
+        assert!(r.get(&tid(1)).is_none(), "until=10 must drop at class_a 10");
+        assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
         assert!(
-            std::sync::Arc::ptr_eq(&a.published, &b.published),
-            "flush must not keep a second live HashMap; snapshots share the Arc"
+            Arc::ptr_eq(&r.head_hits_arc().expect("kept"), &newer),
+            "kept layer hits Arc must not be cloned on splice"
         );
     }
 
@@ -387,25 +357,31 @@ mod tests {
         r.note(11, [(tid(2), Fk(2), (3, 4))]);
         let mid = r.snapshot();
         assert!(
-            std::sync::Arc::ptr_eq(&before.published, &mid.published),
-            "note must not clone the live map; publish_if_dirty is the snapshot rebuild"
+            match (&before.head, &mid.head) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            },
+            "note must not publish a layer; publish_layer is the prepend"
         );
         assert_eq!(
             r.get(&tid(1)),
             Some((Fk(1), (1, 2))),
-            "dirty overlay must serve get before publish_if_dirty"
+            "pending must serve get before publish_layer"
         );
         assert_eq!(mid.get(&tid(2)), Some((Fk(2), (3, 4))));
-        assert_eq!(r.size_snapshot(), (2, 2));
         r.publish_if_dirty();
         assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
         assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
         let after = r.snapshot();
-        assert!(!std::sync::Arc::ptr_eq(&before.published, &after.published));
+        assert!(after.head.is_some());
         r.publish_if_dirty();
         assert!(
-            std::sync::Arc::ptr_eq(&after.published, &r.snapshot().published),
-            "second publish_if_dirty is a no-op when clean"
+            Arc::ptr_eq(
+                after.head.as_ref().unwrap(),
+                r.snapshot().head.as_ref().unwrap()
+            ),
+            "second publish_if_dirty is a no-op when pending is empty"
         );
     }
 
@@ -439,25 +415,8 @@ mod tests {
             "re-noted at 11 must survive expire of 10"
         );
         assert_eq!(r.get(&tid(3)), Some((Fk(3), (5, 6))));
-        let (heights, keys) = r.size_snapshot();
-        assert_eq!(heights, 1);
+        let (_layers, keys) = r.size_snapshot();
         assert_eq!(keys, 2);
-    }
-
-    #[test]
-    fn expire_to_horizon_keeps_until_tip_covers_window() {
-        let r = RecentCreates::new();
-        r.note(0, [(tid(1), Fk(1), (1, 2))]);
-        r.publish_if_dirty();
-        r.expire_to_horizon(16, RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(
-            r.get(&tid(1)),
-            Some((Fk(1), (1, 2))),
-            "tip below horizon must not drop genesis-height notes"
-        );
-        r.expire_to_horizon(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_FLOOR);
-        r.publish_if_dirty();
-        assert!(r.get(&tid(1)).is_none());
     }
 
     #[test]
@@ -504,14 +463,14 @@ mod tests {
         let pin = dummy_pin(vec![0x51, 0xaa, 0xbb]);
         r.note_pins(10, [(tid(1), Fk(7), (100, 8), Some(Arc::clone(&pin)))]);
         assert!(
-            Arc::ptr_eq(&r.create_pin(&tid(1)).expect("overlay pin"), &pin),
-            "two notes without flush: overlay create_pin hits the same Arc"
+            Arc::ptr_eq(&r.create_pin(&tid(1)).expect("pending pin"), &pin),
+            "pending create_pin hits the same Arc"
         );
         r.publish_if_dirty();
         let flushed = r.create_pin(&tid(1)).expect("published pin");
         assert!(
             Arc::ptr_eq(&flushed, &pin),
-            "flush clones the HashMap of Arcs, not script bytes"
+            "publish prepends an Arc of the map, not script bytes"
         );
         assert_eq!(r.get(&tid(1)), Some((Fk(7), (100, 8))));
         r.expire_through(10);

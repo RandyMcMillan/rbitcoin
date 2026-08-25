@@ -228,7 +228,7 @@ onto loadq). Tip-batch getdata races up to 4 peers
 half-median outlier only after ~60s warm-up and only when the peer pack is not
 tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
 
-**Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO on IBD (no `PipelineParentStore`). Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** live in a height-bounded RecentCreates ring (`clamp(ewma(taken−tip), 32, 32×144)`; take per load-batch). Not a coins cache.
+**Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO on IBD (no `PipelineParentStore`). Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** live in RecentCreates Arc layers (drop when Class A covers lookup-started). Not a coins cache.
 
 **Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).

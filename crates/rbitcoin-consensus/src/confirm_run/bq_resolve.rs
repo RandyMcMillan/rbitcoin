@@ -157,8 +157,7 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 ///
 /// When `ids` is `Some`, skip TipOnly for keys already in the live union and
 /// publish **one** layer for the whole wave (`lo..=hi`). The layer stays while
-/// any height in the span is still on the BQ, overlaps `(tip, taken_hi]`,
-/// **or** `hi` is inside the RecentCreates horizon.
+/// any height in the span is still on the BQ or overlaps `(tip, taken_hi]`.
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
@@ -359,6 +358,10 @@ pub fn confirm_bq_resolve_wave_capped(
     }
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
+    if let Some(&hi) = done.last() {
+        let started = query.lookup_started_hi().unwrap_or(0).max(hi);
+        query.set_lookup_started_hi(Some(started));
+    }
     if let Some((live, published)) = ids.as_mut() {
         if let (Some(&lo), Some(&hi)) = (done.first(), done.last()) {
             live.note_span(lo, hi, layer);
@@ -366,10 +369,7 @@ pub fn confirm_bq_resolve_wave_capped(
         let t_keep = Instant::now();
         let queued = query.block_queue_queued_heights();
         let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-        let taken = query.lookup_taken_hi().unwrap_or(tip);
-        let span = taken.saturating_sub(tip);
-        let horizon = rbitcoin_query::recent_creates_horizon(span);
-        live.keep_queued_or_horizon(&queued, tip, horizon, query.lookup_taken_hi());
+        live.keep_queued_or_taken(&queued, tip, query.lookup_taken_hi());
         live.publish(published);
         crate::confirm_phase_stats::LOOKUP_KEEP_NS
             .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1403,6 +1403,11 @@ mod tests {
             "resolve must not bump taken_hi before load-batch send; got {:?}",
             q.lookup_taken_hi()
         );
+        assert_eq!(
+            q.lookup_started_hi(),
+            Some(4),
+            "resolve wave must bump started_hi to processed hi"
+        );
         assert!(
             q.block_queue_has_height(4),
             "unsent wave tail must stay on the BQ"
@@ -1414,6 +1419,11 @@ mod tests {
         q.block_queue_dequeue_height(1).unwrap();
         q.set_lookup_taken_hi(Some(1));
         assert_eq!(q.lookup_taken_hi(), Some(1));
+        assert_eq!(
+            q.lookup_started_hi(),
+            Some(4),
+            "take must not rewind started_hi"
+        );
         assert!(!q.block_queue_has_height(1));
         assert!(q.block_queue_has_height(4));
         let _ = std::fs::remove_dir_all(&path);

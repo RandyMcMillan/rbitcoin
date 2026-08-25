@@ -38,6 +38,11 @@ before 1.0).
 
 ### Changed
 
+- **RecentCreates layers:** write publishes one Arc layer per Class A batch
+  (shared splice with live_union; no full-map clone). Drop when Class A has
+  covered `lookup_started_hi` at publish. Stamp carries CreatePin so pin does
+  not re-walk the ring. [`docs/ibd-memory.md`](docs/ibd-memory.md).
+
 - **Headers sync locator:** a full 2000-header reply continues `getheaders`
   from that last hash (not our tip locator). Periodic poll skips a peer
   whose best-known header is already on our chain behind tip, or a

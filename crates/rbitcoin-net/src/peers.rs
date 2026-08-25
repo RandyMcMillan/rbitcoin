@@ -1030,6 +1030,22 @@ impl PeerHub {
         self.dial(addr, typ)
     }
 
+    /// Outbound full-relay sessions eligible for stale-tip slot rotation.
+    /// Empty when this hub is `noban` (functional keep-alive).
+    pub fn outbound_full_relay_ids(&self) -> Vec<u64> {
+        if self.is_noban() {
+            return Vec::new();
+        }
+        let mut ids: Vec<u64> = self
+            .live_peers()
+            .into_iter()
+            .filter(|p| p.conn_type == PeerConnType::OutboundFullRelay && !p.inbound)
+            .map(|p| p.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn disconnect_id(&self, id: u64) -> bool {
         if let Some(p) = self.get(id) {
             p.request_disconnect();
@@ -1057,6 +1073,14 @@ impl PeerHub {
         tx.send(DialRequest { addr, typ })
             .map_err(|_| "dialer closed".to_string())
     }
+}
+
+/// Pick one live outbound id to drop so a stale-tip extra can dial.
+pub fn pick_stale_follow_evict(ids: &[u64], salt: u64) -> Option<u64> {
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ids[(salt as usize) % ids.len()])
 }
 
 fn service_flags_u64(f: ServiceFlags) -> u64 {
@@ -1307,5 +1331,53 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn pick_stale_follow_evict_none_on_empty() {
+        assert!(pick_stale_follow_evict(&[], 7).is_none());
+    }
+
+    #[test]
+    fn pick_stale_follow_evict_picks_only_from_candidates() {
+        let ids = [3u64, 9, 12];
+        for salt in 0..16u64 {
+            let got = pick_stale_follow_evict(&ids, salt).unwrap();
+            assert!(ids.contains(&got), "salt={salt} got={got}");
+        }
+        assert_eq!(pick_stale_follow_evict(&ids, 0), Some(3));
+        assert_eq!(pick_stale_follow_evict(&ids, 1), Some(9));
+        assert_eq!(pick_stale_follow_evict(&ids, 2), Some(12));
+        assert_eq!(pick_stale_follow_evict(&ids, 3), Some(3));
+    }
+
+    #[test]
+    fn outbound_full_relay_ids_skips_inbound_and_noban() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+        let c = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3);
+        let _in = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let out = hub.register(
+            b,
+            b,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        let _br = hub.register(
+            c,
+            c,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::BlockRelay,
+        );
+        let ids = hub.outbound_full_relay_ids();
+        assert_eq!(ids, vec![out.id]);
+        hub.set_noban(true);
+        assert!(
+            hub.outbound_full_relay_ids().is_empty(),
+            "noban hub must not offer rotate victims"
+        );
     }
 }

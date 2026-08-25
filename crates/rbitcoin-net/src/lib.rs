@@ -37,7 +37,8 @@ pub use peer_dos::{
     DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE,
 };
 pub use peers::{
-    parse_peer_addr, DialRequest, LivePeer, PeerConnType, PeerHub, PeerInfo, PingAction,
+    parse_peer_addr, pick_stale_follow_evict, DialRequest, LivePeer, PeerConnType, PeerHub,
+    PeerInfo, PingAction,
 };
 pub use rbitcoin_mempool::MempoolGraphStats;
 pub use seeds::{

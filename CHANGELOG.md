@@ -38,6 +38,10 @@ before 1.0).
 
 ### Changed
 
+- **Idx fill windows io_uring SQ:** unique `tx.idx` page preads harvest when
+  the session is at in-flight cap (same shape as BDZ / bulk_io). SQ full is
+  `BudgetFull`, not `corrupt record`. Lookup retries it at debug, not WARN.
+
 - **RecentCreates layers:** write publishes one Arc layer per Class A batch
   (shared splice with live_union; no full-map clone). Drop when Class A has
   covered `lookup_started_hi` at publish. Stamp carries CreatePin so pin does

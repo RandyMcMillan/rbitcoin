@@ -36,6 +36,11 @@ impl StoreError {
             source,
         }
     }
+
+    /// Ring in-flight cap — not on-disk corruption. Do not WARN as `corrupt record`.
+    pub fn is_io_backpressure(&self) -> bool {
+        matches!(self, StoreError::BudgetFull(m) if m.contains("SQ"))
+    }
 }
 
 impl fmt::Display for StoreError {
@@ -117,5 +122,14 @@ mod tests {
         for e in &arms {
             assert!(e.source().is_none());
         }
+
+        let sq = StoreError::BudgetFull("io_session SQ (in_flight cap)");
+        assert!(sq.is_io_backpressure());
+        assert!(
+            !sq.to_string().contains("corrupt"),
+            "SQ full must not print as corrupt record: {}",
+            sq
+        );
+        assert!(!StoreError::Corrupt("broken").is_io_backpressure());
     }
 }

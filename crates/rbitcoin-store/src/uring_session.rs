@@ -282,7 +282,7 @@ impl UringSession {
         }
         self.check_live()?;
         if self.pending.len() >= self.entries as usize {
-            return Err(StoreError::Corrupt("io_session SQ full (in_flight cap)"));
+            return Err(StoreError::BudgetFull("io_session SQ (in_flight cap)"));
         }
         self.pending.insert(user_data)?;
         let handle = fd.into();
@@ -304,7 +304,7 @@ impl UringSession {
                 unsafe {
                     if ring.submission().push(&sqe).is_err() {
                         let _ = self.pending.expect_cqe(user_data);
-                        return Err(StoreError::Corrupt("io_uring SQ full"));
+                        return Err(StoreError::BudgetFull("io_uring SQ"));
                     }
                 }
                 Ok(())
@@ -344,7 +344,7 @@ impl UringSession {
         }
         self.check_live()?;
         if self.pending.len() >= self.entries as usize {
-            return Err(StoreError::Corrupt("io_session SQ full (in_flight cap)"));
+            return Err(StoreError::BudgetFull("io_session SQ (in_flight cap)"));
         }
         self.pending.insert(user_data)?;
         let handle = fd.into();
@@ -366,7 +366,7 @@ impl UringSession {
                 unsafe {
                     if ring.submission().push(&sqe).is_err() {
                         let _ = self.pending.expect_cqe(user_data);
-                        return Err(StoreError::Corrupt("io_uring SQ full"));
+                        return Err(StoreError::BudgetFull("io_uring SQ"));
                     }
                 }
                 Ok(())

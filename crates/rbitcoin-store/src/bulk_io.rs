@@ -428,7 +428,12 @@ fn pread_batch_on_session_inner(
         }
 
         for (ud, res) in cqes {
-            let (_kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
+            let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
+            if kind != crate::uring_session::KIND_BULK_PREAD || ep != epoch {
+                session.poison();
+                let _ = session.drain_all();
+                return false;
+            }
             let i = slot as usize;
             if i < ops.len() {
                 ops[i].result = res;
@@ -447,7 +452,9 @@ fn pread_batch_on_session_inner(
             any_fail = true;
         }
     }
-    let _ = session.drain_all();
+    if session.drain_all().is_err() {
+        return false;
+    }
 
     !any_fail
 }
@@ -538,7 +545,12 @@ fn pwrite_batch_on_session(
         }
 
         for (ud, res) in cqes {
-            let (_kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
+            let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
+            if kind != crate::uring_session::KIND_BULK_PWRITE || ep != epoch {
+                session.poison();
+                let _ = session.drain_all();
+                return false;
+            }
             let i = slot as usize;
             if i < ops.len() {
                 ops[i].result = res;
@@ -548,7 +560,9 @@ fn pwrite_batch_on_session(
     }
 
     let ok = finish_pwrite_wave(ops);
-    let _ = session.drain_all();
+    if session.drain_all().is_err() {
+        return false;
+    }
     ok
 }
 

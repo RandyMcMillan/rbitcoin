@@ -155,11 +155,33 @@ impl PoolEngine {
         q.drain(..).collect()
     }
 
-    pub(crate) fn wait_one_cqe(&self) {
+    /// Wait until a CQE is ready or `timeout`. Returns false on timeout with
+    /// nothing in the CQ (lost SQE / phantom pending).
+    pub(crate) fn wait_one_cqe_timeout(&self, timeout: std::time::Duration) -> bool {
         let mut q = self.cq.cqes.lock().unwrap_or_else(|e| e.into_inner());
-        while q.is_empty() && self.cq.inflight.load(Ordering::Acquire) != 0 {
-            q = self.cq.cqe_cv.wait(q).unwrap_or_else(|e| e.into_inner());
+        if !q.is_empty() {
+            return true;
         }
+        if self.cq.inflight.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while q.is_empty() && self.cq.inflight.load(Ordering::Acquire) != 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (qq, wr) = self
+                .cq
+                .cqe_cv
+                .wait_timeout(q, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            q = qq;
+            if wr.timed_out() && q.is_empty() {
+                return false;
+            }
+        }
+        !q.is_empty()
     }
 
     pub(crate) fn wait_idle(&self) {

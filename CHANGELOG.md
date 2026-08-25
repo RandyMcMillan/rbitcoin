@@ -55,6 +55,8 @@ before 1.0).
 
 ### Fixed
 
+- **Held io_uring leftover CQE vs BDZ g-pages:** lookup TipOnly resolve shares one TLS ring across OA probe, idx, sealed MPHF `g` pages, and rel preads. A swallowed `drain_all` left `KIND_BULK_PREAD` in `pending`; the next `stream_g_pages` harvested it as `bdz g page bad slot` and could park on unbounded `submit_and_wait`. `begin_batch` now drains leftover SQEs first; machines match `(kind, epoch, slot)`; undrained/unexpected/wait-timeout poison the session and drop the TLS ring. Caps `submit_and_wait_one` at 5 s.
+
 - **Nightly fuzz vs musl cargo-fuzz:** `taiki-e/install-action`'s
   `cargo-fuzz` is a musl binary, so `cargo fuzz run` defaulted
   `--target x86_64-unknown-linux-musl` and ASan refused

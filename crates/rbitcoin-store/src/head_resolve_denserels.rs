@@ -449,8 +449,9 @@ fn fill_idx_pages(
             return false;
         }
         for (ud, res) in cqes {
-            let (kind, _epoch, slot) = crate::uring_session::unpack_ud(ud);
-            if kind != UD_KIND_IDX || (slot as usize) >= results.len() {
+            let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
+            if kind != UD_KIND_IDX || ep != sess.epoch() || (slot as usize) >= results.len() {
+                sess.poison();
                 let _ = sess.drain_all();
                 return false;
             }
@@ -471,7 +472,7 @@ fn fill_idx_pages(
             }
         }
     }
-    true
+    sess.drain_all().is_ok()
 }
 
 /// Dedup idx OS pages by `(fd, page_off)` so a wave fills each page once.

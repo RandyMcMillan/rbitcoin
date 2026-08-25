@@ -28,6 +28,19 @@ use std::path::Path;
 /// if a caller requests more (none currently do).
 pub const DEFAULT_ENTRIES: u32 = 128;
 
+/// Cap for [`UringSession::submit_and_wait_one`]. Lost CQEs must fail the wave
+/// instead of parking the lookup thread for the rest of IBD.
+const WAIT_ONE_TIMEOUT_SECS: u64 = 5;
+const WAIT_ONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(WAIT_ONE_TIMEOUT_SECS);
+
+/// [`UringSession::drain_all`] wait: 100 ms × 50 = 5 s. Short enough that a
+/// poisoned ring fails the wave; long enough that 128×4 KiB g-page preads
+/// under Class A write traffic are not a false `undrained`.
+#[cfg(target_os = "linux")]
+const DRAIN_WAIT_NS: u32 = 100_000_000;
+#[cfg(target_os = "linux")]
+const DRAIN_MAX_SPINS: u32 = 50;
+
 /// Which completion backend [`UringSession`] opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
@@ -105,6 +118,9 @@ pub struct UringSession {
     pending: UringPending,
     epoch: u16,
     kind: SessionKind,
+    /// Set on undrained leftover, unexpected CQE, CQ overflow, or wait timeout.
+    /// Push/begin_batch fail closed; [`with_thread_local`] drops the TLS ring.
+    poisoned: bool,
 }
 
 impl UringSession {
@@ -178,6 +194,7 @@ impl UringSession {
             pending: UringPending::new(),
             epoch: 0,
             kind,
+            poisoned: false,
         })
     }
 
@@ -203,7 +220,36 @@ impl UringSession {
         self.epoch
     }
 
+    #[inline]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    fn check_live(&self) -> Result<(), StoreError> {
+        if self.poisoned {
+            Err(StoreError::Corrupt("invariant: io_uring session poisoned"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drain leftover in-flight SQEs, then bump harvest epoch.
+    ///
+    /// Held TLS rings run probe → idx → BDZ g-pages → rel preads on one
+    /// session. A previous machine that swallowed `drain_all` leaves CQEs in
+    /// `pending`; the next wave must not harvest them as its own kind/slot.
     pub fn begin_batch(&mut self) {
+        if self.poisoned {
+            return;
+        }
+        if !self.pending.is_empty() && self.drain_all().is_err() {
+            self.poison();
+            return;
+        }
         self.epoch = self.epoch.wrapping_add(1);
     }
 
@@ -234,6 +280,7 @@ impl UringSession {
         if buf.is_empty() {
             return Ok(());
         }
+        self.check_live()?;
         if self.pending.len() >= self.entries as usize {
             return Err(StoreError::Corrupt("io_session SQ full (in_flight cap)"));
         }
@@ -295,6 +342,7 @@ impl UringSession {
         if buf.is_empty() {
             return Ok(());
         }
+        self.check_live()?;
         if self.pending.len() >= self.entries as usize {
             return Err(StoreError::Corrupt("io_session SQ full (in_flight cap)"));
         }
@@ -337,21 +385,41 @@ impl UringSession {
     }
 
     /// Submit pending SQEs and wait for at least one CQE. Does not harvest.
+    ///
+    /// Bounded: a lost CQE / phantom pending must not park lookup forever.
     pub fn submit_and_wait_one(&mut self) -> Result<(), StoreError> {
+        self.check_live()?;
+        if self.pending.is_empty() {
+            return Ok(());
+        }
         match &mut self.backend {
             #[cfg(target_os = "linux")]
-            SessionBackend::Uring(ring) => loop {
-                match ring.submit_and_wait(1) {
-                    Ok(_) => return Ok(()),
-                    Err(e) => {
-                        if let Some(err) = map_enter_err(&e) {
-                            return Err(err);
+            SessionBackend::Uring(ring) => {
+                let ts = io_uring::types::Timespec::new().sec(WAIT_ONE_TIMEOUT_SECS);
+                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+                loop {
+                    match ring.submitter().submit_with_args(1, &args) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => {
+                            if e.raw_os_error() == Some(libc::ETIME) {
+                                self.poisoned = true;
+                                return Err(StoreError::Corrupt(
+                                    "invariant: io_uring wait timeout",
+                                ));
+                            }
+                            if let Some(err) = map_enter_err(&e) {
+                                self.poisoned = true;
+                                return Err(err);
+                            }
                         }
                     }
                 }
-            },
+            }
             SessionBackend::Pool(pool) => {
-                pool.wait_one_cqe();
+                if !pool.wait_one_cqe_timeout(WAIT_ONE_TIMEOUT) {
+                    self.poisoned = true;
+                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
+                }
                 Ok(())
             }
             #[cfg(windows)]
@@ -407,6 +475,7 @@ impl UringSession {
             }
         }
         if unexpected {
+            self.poison();
             Err(StoreError::Corrupt("invariant: io_uring unexpected cqe"))
         } else {
             Ok(out)
@@ -423,20 +492,23 @@ impl UringSession {
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
-                // Timed waits: leftover phantom pending must not block forever.
                 let mut spins = 0u32;
-                let max_spins = self.entries.saturating_mul(4).max(64);
-                while !self.pending.is_empty() && spins < max_spins {
+                while !self.pending.is_empty() && spins < DRAIN_MAX_SPINS {
                     spins += 1;
-                    let ts = io_uring::types::Timespec::new().nsec(1_000_000);
+                    let ts = io_uring::types::Timespec::new().nsec(DRAIN_WAIT_NS);
                     let args = io_uring::types::SubmitArgs::new().timespec(&ts);
                     match ring.submitter().submit_with_args(1, &args) {
                         Ok(_) => {}
                         Err(e) => {
-                            if map_enter_err(&e).is_some() {
+                            if e.raw_os_error() != Some(libc::ETIME) && map_enter_err(&e).is_some()
+                            {
                                 let _ = ring.submit();
                             }
                         }
+                    }
+                    {
+                        let cq = ring.completion();
+                        let _ = cq_overflow_result(cq.overflow());
                     }
                     ring.completion().sync();
                     for cqe in ring.completion() {
@@ -463,7 +535,11 @@ impl UringSession {
                 }
             }
         }
-        self.pending.assert_drained()
+        let drained = self.pending.assert_drained();
+        if drained.is_err() {
+            self.poisoned = true;
+        }
+        drained
     }
 }
 
@@ -589,12 +665,24 @@ pub fn with_thread_local<R>(
                     *slot = Some(UringSession::try_open(open_n)?);
                 }
                 let session = slot.as_mut().expect("session just ensured");
+                if session.is_poisoned() {
+                    let _ = slot.take();
+                    *slot = Some(UringSession::try_open(min_entries.max(DEFAULT_ENTRIES))?);
+                }
+                let session = slot.as_mut().expect("session just ensured");
                 if session.in_flight() != 0 {
                     session.drain_all()?;
                 }
                 let out = f(session);
+                let poisoned = session.is_poisoned();
                 if session.in_flight() != 0 {
-                    session.drain_all()?;
+                    let d = session.drain_all();
+                    if d.is_err() || session.is_poisoned() {
+                        let _ = slot.take();
+                    }
+                    d?;
+                } else if poisoned {
+                    let _ = slot.take();
                 }
                 Ok(out)
             });
@@ -1088,6 +1176,54 @@ mod tests {
             .open(&path)
             .expect("tmp");
         (path, f)
+    }
+
+    /// `begin_batch` starts a new machine wave: leftover in-flight SQEs from the
+    /// previous wave must be drained first (shared TLS ring).
+    #[test]
+    fn begin_batch_drains_leftover_before_new_epoch() {
+        use std::io::Write;
+        let (path, mut f) = tmp_rw("begin-batch-drain");
+        f.write_all(&[0x11, 0x22, 0x33, 0x44]).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let mut buf = [0u8; 4];
+        session.begin_batch();
+        let epoch0 = session.epoch();
+        let ud = pack_ud(KIND_BULK_PREAD, epoch0, 0);
+        session.push_pread(fd, 0, &mut buf, ud).unwrap();
+        session.submit().unwrap();
+        assert!(session.in_flight() > 0);
+        session.begin_batch();
+        assert_eq!(
+            session.in_flight(),
+            0,
+            "begin_batch must drain leftover before bumping epoch"
+        );
+        assert_ne!(session.epoch(), epoch0);
+        assert_eq!(&buf, &[0x11, 0x22, 0x33, 0x44]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phantom pending (no kernel SQE) must not leave the session usable.
+    #[test]
+    fn begin_batch_poisons_when_leftover_cannot_drain() {
+        use std::io::Write;
+        let (path, mut f) = tmp_rw("begin-batch-poison");
+        f.write_all(&[1u8]).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        session.pending.insert(99).unwrap();
+        session.begin_batch();
+        let mut buf = [0u8; 1];
+        let r = session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0));
+        assert!(
+            r.is_err(),
+            "push after undrainable leftover must fail, got {r:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Live harvest: pushed user_data comes back; drain leaves in_flight==0.

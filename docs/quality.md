@@ -86,13 +86,10 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 53 run / 214 skip (30 rpc-missing, 26 core-log).** COMPAT-done leftovers are `rpc-dialect` (not `rpc-missing`). Next `run` candidates: `mempool_accept` type-check, `mining_basic` weight, `rpc_getblockfrompeer`. Product-never skips stay skip. Unlabeled PRs stay cargo-only; nightly green |
 | 3 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work. **After this:** Electrum 1.6 then 1.7 (`protocol_max` bump in the same work) — [`COMPAT.md`](../COMPAT.md) § Protocol versions |
 | 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam |
-| 6 | **Q-51** | ast-grep structural lints | code | `sgconfig.yml` + `lint/ast-grep/` first rules + `scripts/ast-grep.sh` + required CI job (fmt-class). First rules: discarded `tokio::spawn`, `mem::forget`/`Box::leak`, dropped `thread::spawn`. Not a clippy clone. |
-| 7 | **Q-52** | CRAP report on coverage LCOV | test | After the ≥90% LCOV gate, `coverage.sh` runs `cargo crap --workspace --summary` and writes `coverage/crap.json` when `cargo-crap` is on `PATH`. No `--fail-above 30` (clippy still allows `cognitive_complexity`; at ≥90% line coverage CRAP equals CC). |
-| 8 | **Q-53** | Miri on primitives | reliability | Nightly/`workflow_dispatch` `miri.yml` like `fuzz.yml`; `./scripts/miri.sh` → `cargo miri test -p rbitcoin-primitives`. Not a required PR check. Never `--workspace`. |
-| 9 | **Q-54** | Grow ast-grep rules from `ibd-memory.md` | code | One rule per named cap that is easy to delete: `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each rule has `lint/ast-grep/fixtures/{good,bad}/`. Peel god-files (**R-10**) only if a rule needs a seam. |
-| 10 | **Q-55** | CRAP `--fail-regression` | test | Commit `crap_baseline.json` (`--format json --sort file`) from a green coverage artifact. PRs fail if a function’s CRAP rises. Still no `--fail-above 30` while clippy allows `cognitive_complexity`. |
-| 11 | **Q-56** | Miri islands beyond primitives | reliability | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack_ud-style integers) that do not pull secp/store. Never workspace miri. |
+| 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam. **Q-54** may need a seam if a cap rule cannot match a god-file. |
+| 6 | **Q-54** | Grow ast-grep rules from `ibd-memory.md` | code | One rule per named cap that is easy to delete: `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each rule has `lint/ast-grep/fixtures/{good,bad}/`. Peel god-files (**R-10**) only if a rule needs a seam. |
+| 7 | **Q-55** | CRAP `--fail-regression` | test | Commit `crap_baseline.json` (`--format json --sort file`) from a green coverage artifact. PRs fail if a function’s CRAP rises. Still no `--fail-above 30` while clippy allows `cognitive_complexity`. |
+| 8 | **Q-56** | Miri islands beyond primitives | reliability | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack_ud-style integers) that do not pull secp/store. Never workspace miri. |
 
 ### Still valid? (this reaudit)
 
@@ -170,6 +167,9 @@ findings 001–022, CI split, map-free README, …) live in
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-51** | ast-grep structural lints | `sgconfig.yml` + `lint/ast-grep/` first rules (`detached-tokio-spawn`, `mem-forget-or-leak`, `thread-spawn-dropped`) + `scripts/ast-grep.sh`. Required CI job `ast-grep` (fmt-class). Grow named-cap rules: **Q-54**. |
+| **Q-52** | CRAP report on coverage LCOV | `scripts/coverage-crap.sh` after the ≥90% gate; `coverage/crap.json`. No `--fail-above 30`. Regression gate: **Q-55**. |
+| **Q-53** | Miri on primitives | `scripts/miri.sh` → `cargo miri test -p rbitcoin-primitives`. Nightly `miri.yml` like `fuzz.yml` (not required). Islands: **Q-56**. |
 | **—** | Schema 18/19 indexes | Sealed MPHF `g` is FdOnly (#161). SH extent pack8 mode 11; last-page stream **4072 B** for the `ver=2` header (#177). Class A / C stay 17 bytes. 17 populated `tx.head`/`scripthash*` still refused |
 | **—** | Confirm scripts + write-behind | Park/unpark steal (#173). `ibd-confirm` publishes waves (no coordinators, #174). Process-wide `ibd-confirm-head` drain (#176). BIP141 nonce skipped pre-SegWit (#175) |
 | **—** | Wallet-client SH join | Serve-lean `txid.body` identity (#168). Last-slot Electrum/Esplora join + tip probe (#170/#171). Optional `rbitcoin-bench` (#164–#172; not default-members) |
@@ -216,8 +216,8 @@ included; tree at #177):
 | `#[test]` / `#[tokio::test]` | **~1.69k** |
 | `TODO` / `FIXME` / `#[allow(` | **0** / **0** / **2** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
-| Required CI | `fmt`, `deny`, `clippy`, `test`, `windows`, `macos`, `multinode`, `coverage` (+ CodeQL) |
-| Extra CI | `release.yml` on `v*.*.*` / dispatch; `fuzz.yml` nightly; `core-functional.yml` nightly / labeled PR (not required) |
+| Required CI | `fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`, `macos`, `multinode`, `coverage` (+ CodeQL) |
+| Extra CI | `release.yml` on `v*.*.*` / dispatch; `fuzz.yml` nightly; `miri.yml` nightly primitives; `core-functional.yml` nightly / labeled PR (not required) |
 | rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.23.x** |
 | Host cargo silos | `target/dev` (test) / `target/cov` (coverage) |

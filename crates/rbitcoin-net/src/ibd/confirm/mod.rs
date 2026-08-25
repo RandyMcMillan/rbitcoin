@@ -21,8 +21,6 @@ struct LoadAheadState {
     next_tx_start: u64,
     /// Append-only published packs (lookup thread only mutates via note/prune/clear).
     in_flight: rbitcoin_query::InFlightLog,
-    /// Shared sparse parent pins for concurrent load/scripts/write batches.
-    parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
     /// Lookup-published identity union (wave hits still live in the BQ window).
     published: std::sync::Arc<rbitcoin_query::PublishedIds>,
     /// Last height successfully loaded (still in pipeline or already committed).
@@ -37,7 +35,6 @@ impl LoadAheadState {
         Self {
             next_tx_start: next,
             in_flight: rbitcoin_query::InFlightLog::new(),
-            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             published: std::sync::Arc::clone(hub.query.published_ids()),
             last_loaded: None,
             disconnect_gen_seen: 0,
@@ -76,17 +73,10 @@ impl LoadAheadState {
         self.publish_mem_stats();
     }
 
-    /// Publish InFlight + PipelineParentStore occupancy for `ibd: sizes`.
+    /// Publish InFlight occupancy for `ibd: sizes`. IBD has no process pstore.
     fn publish_mem_stats(&self) {
         let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
-        let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-        if weak > 4096 {
-            self.parent_store.gc_dead_weaks();
-            let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-            rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
-            return;
-        }
-        rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
+        rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, 0, 0, 0);
     }
 
     fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WireLoadPipeline {
@@ -102,7 +92,7 @@ impl LoadAheadState {
             parent_hash,
             next_tx_start: self.next_tx_start,
             in_flight: self.in_flight.snapshot(),
-            parent_store: std::sync::Arc::clone(&self.parent_store),
+            parent_store: None,
             published: std::sync::Arc::clone(&self.published),
         }
     }
@@ -190,7 +180,6 @@ impl LoadAheadState {
 
     fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
-        self.parent_store = std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new());
         self.publish_mem_stats();
         self.last_loaded = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
@@ -622,6 +611,10 @@ impl ConfirmQueueDepths {
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
+    }
+
+    pub(crate) fn load_depth(&self) -> usize {
+        self.lookup_to_load.load(Ordering::Relaxed)
     }
 
     /// Max queue depths since last call; resets HWMs to 0.
@@ -1630,21 +1623,39 @@ pub(crate) fn spawn_confirm_engine(
                 } else {
                     tip.unwrap_or(0).saturating_add(1)
                 };
-                let wave_h = hub.query.block_queue_unresolved_heights(
-                    path_lo,
-                    &skip,
-                    rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS,
-                );
+                let remaining = load_queue_cap().saturating_sub(queues_lookup.load_depth());
+                if remaining == 0 {
+                    let t_wait = Instant::now();
+                    let g = feed.inner.lock().unwrap();
+                    if feed.stopped() {
+                        break;
+                    }
+                    let (_gg, _) = feed.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+                    confirm_thr_stats::add_lookup_send_wait(t_wait.elapsed());
+                    confirm_thr_stats::add_lookup_claim(t_wait.elapsed());
+                    continue;
+                }
+                let max_blocks = remaining
+                    .saturating_mul(CONFIRM_RUN_MAX_BLOCKS)
+                    .min(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS);
+                let max_inputs = (remaining as u32)
+                    .saturating_mul(confirm_batch_max_inputs())
+                    .min(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_INPUTS);
+                let wave_h = hub
+                    .query
+                    .block_queue_unresolved_heights(path_lo, &skip, max_blocks);
                 confirm_thr_stats::add_lookup_other(t_sel.elapsed());
                 let mut did = false;
                 if !wave_h.is_empty() {
                     let t_wave = Instant::now();
-                    match rbitcoin_consensus::confirm_bq_resolve_wave_with_ids(
+                    match rbitcoin_consensus::confirm_bq_resolve_wave_capped(
                         &hub.query,
                         &hub.params,
                         hub.milestone,
                         &wave_h,
                         Some((&mut live_union, hub.query.published_ids().as_ref())),
+                        max_blocks,
+                        max_inputs,
                     ) {
                         Ok(wave) if !wave.items.is_empty() => {
                             did = true;
@@ -1659,7 +1670,11 @@ pub(crate) fn spawn_confirm_engine(
                                 CONFIRM_RUN_MAX_BLOCKS,
                             );
                             let mut i = 0usize;
+                            let mut sent = 0usize;
                             for n in parts {
+                                if sent >= remaining {
+                                    break;
+                                }
                                 let end = i.saturating_add(n).min(wave.items.len());
                                 if i >= end {
                                     break;
@@ -1670,10 +1685,21 @@ pub(crate) fn spawn_confirm_engine(
                                 let n = chunk.len();
                                 let wire: usize =
                                     chunk.iter().map(|(_, _, w)| w.block.total_size()).sum();
-                                if load_tx.send(LoadBatch { items: chunk }).is_err() {
+                                if load_tx
+                                    .send(LoadBatch {
+                                        items: chunk.clone(),
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if rbitcoin_consensus::take_wave_items_for_load(&hub.query, &chunk)
+                                    .is_err()
+                                {
                                     break;
                                 }
                                 queues_lookup.note_load_send(n, wire);
+                                sent = sent.saturating_add(1);
                                 confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
                             }
                             feed.notify();

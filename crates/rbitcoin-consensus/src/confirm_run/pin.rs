@@ -4,10 +4,11 @@ use super::*;
 
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
-/// Sources: plan/in-flight offline denserels → **txout body by range** from
-/// [`ParentPinStamp`] (lookup-stamped). Load never reads head / `tx.idx` /
-/// `txid.body`. Write [`ensure_spend_abs_layouts`] stamps `spent.idx` ranges
-/// for archived parents — load does not idx-batch the full parent set.
+/// Sources: plan/in-flight offline denserels → RecentCreates create_pin →
+/// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
+/// reads head / `tx.idx` / `txid.body`. Write [`ensure_spend_abs_layouts`] stamps
+/// `spent.idx` ranges for archived parents — load does not idx-batch the full
+/// parent set.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -141,6 +142,29 @@ pub(super) fn pin_for_wire_batch(
             plan_by_id.insert(*id, std::sync::Arc::clone(pin));
             n_same_batch = n_same_batch.saturating_add(1);
         }
+    }
+
+    let t_recent = Instant::now();
+    let recent = query.recent_creates().snapshot();
+    for (id, need) in &parent_vouts {
+        if plan_by_id.contains_key(id) {
+            continue;
+        }
+        let Some(txid) = parent_pin.create_txid(*id) else {
+            continue;
+        };
+        let Some(pin) = recent.create_pin(&txid) else {
+            continue;
+        };
+        let (_tx, outs) = pin.as_ref();
+        if !need.iter().all(|&v| outs.get(v as usize).is_some()) {
+            continue;
+        }
+        plan_by_id.insert(*id, pin);
+    }
+    let recent_outs_ns = t_recent.elapsed().as_nanos() as u64;
+    if recent_outs_ns > 0 {
+        confirm_load_stats::PIN_RECENT_OUTS_NS.fetch_add(recent_outs_ns, Ordering::Relaxed);
     }
 
     let mut batch_parents = match pipeline_parent_store {

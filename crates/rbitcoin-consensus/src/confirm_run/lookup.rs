@@ -7,7 +7,7 @@ use super::*;
 pub struct DenserelsWarmStats {
     /// Unique external parent creates considered (stamped create_fk, not same-batch).
     pub parents: u32,
-    /// Already covered via in-flight / same-batch / pstore adopt.
+    /// Already covered via in-flight / same-batch / RecentCreates outs / pstore adopt.
     pub already: u32,
     /// Cold denserels body loads (`txout` by stamped range). Always 0 on the
     /// shipped pin path — range-fill is `PIN_NEW`, not this field.
@@ -230,7 +230,7 @@ pub fn confirm_wire_load_from_plan(
     } = stamped;
 
     let ifo = pipeline.map(|p| &p.in_flight);
-    let parent_store = pipeline.map(|p| &p.parent_store);
+    let parent_store = pipeline.and_then(|p| p.parent_store.as_ref());
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),

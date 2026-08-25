@@ -228,7 +228,7 @@ onto loadq). Tip-batch getdata races up to 4 peers
 half-median outlier only after ~60s warm-up and only when the peer pack is not
 tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
 
-**Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity** (`txid → fk+range`) lives in a height-bounded RecentCreates ring (not outs).
+**Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO on IBD (no `PipelineParentStore`). Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** live in a height-bounded RecentCreates ring (`clamp(ewma(taken−tip), 32, 32×144)`; take per load-batch). Not a coins cache.
 
 **Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
@@ -279,7 +279,7 @@ pages after annotate does not protect `txout`. See
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads. Open segment is 4 B OA; roll opens the next OA immediately and seals the previous (**MPHF + u32 rel + fuse8**) on a sidecar. Wipe/empty rebuild writes MPHF directly (default **2²⁶** keys; `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS=25` for low RAM). Legacy mono-head datadirs require reindex |
-| Confirm stages | **lookup · load · scripts · write** | Real queues **loadq=14 · scriptq=4 · writeq=14**. Lookup takes BQ in height order (stops at a hole after `lookup_taken_hi`), dequeues raw, and fills loadq with load-sized batches (8000 inputs / 144 blocks). IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights; hard **min 8000** when more unresolved heights remain. Wave table: [`docs/concurrency.md`](docs/concurrency.md). |
+| Confirm stages | **lookup · load · scripts · write** | Real queues **loadq=14 · scriptq=4 · writeq=14**. Lookup takes BQ in height order (stops at a hole after `lookup_taken_hi`), parks resolved rows, and dequeues **per load-batch send** (8000 inputs / 144 blocks). IBD **lookup** TipOnly-resolves remaining-loadq × load pack (safety cap **64000** inputs / **1080** heights); hard **min 8000** when more unresolved heights remain. Wave table: [`docs/concurrency.md`](docs/concurrency.md). |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

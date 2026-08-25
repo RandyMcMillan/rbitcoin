@@ -79,6 +79,8 @@ pub struct ProcessOwnedSizes {
     pub recent_overlay_keys: usize,
     /// Fifo txid copies (one vec per height).
     pub recent_fifo_keys: usize,
+    /// Live CreatePin payload bytes (not 96 B/key).
+    pub recent_pin_bytes: u64,
     /// PublishedIds / LiveUnion layer chain (shared Arcs; count once).
     pub union_layers: usize,
     pub union_keys: usize,
@@ -92,7 +94,7 @@ pub struct ProcessOwnedSizes {
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
 ///
-/// Updated after each plan note/prune (InFlightLog + PipelineParentStore).
+/// Updated after each plan note/prune (InFlightLog). IBD pstore counts stay 0.
 /// Sampled by the ~5s IBD sizes line.
 pub mod process_mem_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,6 +195,8 @@ pub mod confirm_load_stats {
     pub static PIN_ADOPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Post cold-range denserels: insert_owned into BatchParents (not IO).
     pub static PIN_RANGE_FILL_NS: AtomicU64 = AtomicU64::new(0);
+    /// RecentCreates create_pin probe (after in-flight / same-batch, before range fill).
+    pub static PIN_RECENT_OUTS_NS: AtomicU64 = AtomicU64::new(0);
     /// Final pin contract (contains + pin_covered) wall.
     pub static PIN_CONTRACT_NS: AtomicU64 = AtomicU64::new(0);
     /// Pipeline store publish (bulk Weak insert + conflict merge) wall.
@@ -241,6 +245,7 @@ pub mod confirm_load_stats {
         pub plan_pin_ns: u64,
         pub pin_adopt_ns: u64,
         pub pin_range_fill_ns: u64,
+        pub pin_recent_outs_ns: u64,
         pub pin_contract_ns: u64,
         pub pin_publish_ns: u64,
         pub cold_io_ns: u64,
@@ -337,6 +342,7 @@ pub mod confirm_load_stats {
             plan_pin_ns: PLAN_PIN_NS.swap(0, Ordering::Relaxed),
             pin_adopt_ns: PIN_ADOPT_NS.swap(0, Ordering::Relaxed),
             pin_range_fill_ns: PIN_RANGE_FILL_NS.swap(0, Ordering::Relaxed),
+            pin_recent_outs_ns: PIN_RECENT_OUTS_NS.swap(0, Ordering::Relaxed),
             pin_contract_ns: PIN_CONTRACT_NS.swap(0, Ordering::Relaxed),
             pin_publish_ns: PIN_PUBLISH_NS.swap(0, Ordering::Relaxed),
             cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
@@ -1660,6 +1666,15 @@ impl Query {
         self.recent_creates.note(height, rows);
     }
 
+    /// Same as [`Self::note_recent_creates_rows`] with optional [`CreatePin`] Arcs.
+    pub fn note_recent_creates_pins(
+        &self,
+        height: u32,
+        rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64), Option<CreatePin>)>,
+    ) {
+        self.recent_creates.note_pins(height, rows);
+    }
+
     /// Rebuild the RecentCreates snapshot if note/expire/drop dirtied it.
     pub fn flush_recent_creates(&self) {
         self.recent_creates.publish_if_dirty();
@@ -1894,6 +1909,7 @@ impl Query {
             recent_pub_keys: rec.2,
             recent_overlay_keys: rec.3,
             recent_fifo_keys: rec.4,
+            recent_pin_bytes: self.recent_creates.approx_pin_bytes(),
             union_layers,
             union_keys,
             h2h_keys,

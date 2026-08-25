@@ -38,6 +38,13 @@ before 1.0).
 
 ### Changed
 
+- **Tip-follow peer set:** disconnect sessions whose connecting header tip
+  cannot beat us and is more than 288 blocks behind (BIP-110-class minority
+  forks). Stale-tip extras no longer grow past `max_outbound`; at cap a
+  random outbound is rotated for a new addrman addr. GetData reconstruct
+  queues at most 16 full blocks per session; per-peer `pending_blocks`
+  evicts at 128. [`docs/ibd-memory.md`](docs/ibd-memory.md).
+
 - **Cargo.lock compatible bumps:** `bitcoin-consensus-encoding` 1.2.0,
   `cc` 1.4.4, `find-msvc-tools` 0.1.11, `futures-channel` 0.3.34,
   `http-body-util` 0.1.5, `log` 0.4.34, `rand` 0.8.8, `syn` 3.0.4,

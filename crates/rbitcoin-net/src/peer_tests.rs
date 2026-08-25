@@ -4088,3 +4088,320 @@ fn addrfetch_times_out_after_300s() {
     assert!(addrfetch_timed_out(sess.as_ref()));
     assert!(!sess.stop.load(Ordering::SeqCst));
 }
+
+#[test]
+fn pending_blocks_insert_evicts_at_cap() {
+    let mut pending = HashMap::new();
+    let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    for i in 0u32..(MAX_PENDING_BLOCKS_FOR_TEST as u32 + 1) {
+        let mut b = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        b.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array({
+            let mut m = [0u8; 32];
+            m[0] = (i >> 24) as u8;
+            m[1] = (i >> 16) as u8;
+            m[2] = (i >> 8) as u8;
+            m[3] = i as u8;
+            m
+        });
+        b.header.bits = bits;
+        let h = b.block_hash();
+        stash_pending_block(&mut pending, h, b);
+    }
+    assert_eq!(pending.len(), MAX_PENDING_BLOCKS_FOR_TEST);
+}
+
+#[test]
+fn try_queue_served_block_false_at_cap() {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let n = AtomicUsize::new(MAX_SERVE_BLOCKS);
+    let gen = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let queued = try_queue_served_block(&out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
+    assert!(!queued);
+    assert!(out_rx.try_recv().is_err());
+    assert_eq!(n.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
+}
+
+#[test]
+fn announced_tip_is_hopeless_less_and_288_behind() {
+    use std::cmp::Ordering;
+    assert!(announced_tip_is_hopeless(
+        964_000,
+        961_638,
+        Some(Ordering::Less)
+    ));
+    assert!(!announced_tip_is_hopeless(
+        964_000,
+        963_900,
+        Some(Ordering::Less)
+    ));
+    assert!(!announced_tip_is_hopeless(
+        964_000,
+        961_638,
+        Some(Ordering::Greater)
+    ));
+    assert!(!announced_tip_is_hopeless(100, 1, Some(Ordering::Less)));
+    assert!(!announced_tip_is_hopeless(
+        964_000,
+        961_638,
+        Some(Ordering::Equal)
+    ));
+    assert!(!announced_tip_is_hopeless(964_000, 961_638, None));
+}
+
+#[test]
+fn connecting_ancient_weaker_headers_request_disconnect() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::{CompactTarget, Network, Target, TxMerkleNode};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::Ordering;
+    use tokio::runtime::Builder;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            checksum,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    fn mine_header(prev: BlockHash, merkle: [u8; 32], time: u32) -> Header {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut hdr = Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::from_byte_array(merkle),
+            time,
+            bits,
+            nonce: 0,
+        };
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            hdr.nonce = nonce;
+            if hdr.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        hdr
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, q) = tmp_store("ancient-fork-headers");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(300, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        assert!(hub.tip_height().unwrap() >= 300);
+
+        let gen = hub
+            .query
+            .wire_header_at_height(rbitcoin_primitives::Height(0))
+            .unwrap();
+        let side = mine_header(gen.block_hash(), [0x9e; 32], gen.time.saturating_add(600));
+
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let sess = peers.register(
+            addr,
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::OutboundFullRelay,
+        );
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = false;
+        let mut cmpct_ver = 2u32;
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut ban = 0u32;
+        handle_peer_frame(
+            frame_for(NetworkMessage::Headers(vec![side])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ban, 0, "ancient fork must not ban-score");
+        assert!(
+            sess.stop.load(Ordering::SeqCst),
+            "hopeless ancient advertised tip must disconnect"
+        );
+
+        let sess_keep = peers.register(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::OutboundFullRelay,
+        );
+        peers.set_noban(true);
+        let mut ban = 0u32;
+        let mut pending_headers = HashMap::new();
+        handle_peer_frame(
+            frame_for(NetworkMessage::Headers(vec![side])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            Some(sess_keep.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !sess_keep.stop.load(Ordering::SeqCst),
+            "noban must keep the session on an ancient weaker fork"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use bitcoin::Network;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::runtime::Builder;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            checksum,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, q) = tmp_store("serve-inflight-cap");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let hashes = hub
+            .generate_to_script(20, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        assert!(hashes.len() >= 20);
+
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let sess = peers.register(
+            addr,
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::OutboundFullRelay,
+        );
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = false;
+        let mut cmpct_ver = 2u32;
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut ban = 0u32;
+        let inv: Vec<Inventory> = hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
+        handle_peer_frame(
+            frame_for(NetworkMessage::GetData(inv)),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        let mut n_block = 0usize;
+        while let Ok(msg) = out_rx.try_recv() {
+            if matches!(msg, NetworkMessage::Block(_)) {
+                n_block += 1;
+            }
+        }
+        assert!(
+            n_block <= MAX_SERVE_BLOCKS,
+            "queued {n_block} blocks over cap {MAX_SERVE_BLOCKS}"
+        );
+        assert_eq!(n_block, MAX_SERVE_BLOCKS);
+        assert_eq!(sess.serve_inflight.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}

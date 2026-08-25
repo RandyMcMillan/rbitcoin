@@ -45,6 +45,18 @@ Tests that need a clean process must call these **same** entry points (or drop t
 owning `Query` / pipeline), not a secret test-only free-all that masks production
 leaks.
 
+## Tip-follow / P2P serve (process heap)
+
+Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
+
+| Structure | Cap / bound | Production clear / evict |
+|-----------|-------------|---------------------------|
+| **Hopeless advertised tip** | Connecting headers with `header_branch_vs_tip` **Less** and announced height **+ 288 < our tip** | `request_disconnect` (no ban). `noban` keeps the session. |
+| **`follow_live`** | ≤ `max_outbound` | Stale extra at cap **rotates** one random outbound full-relay (not `noban`) then dials a replacement. |
+| **GetData serve inflight** | **16** full `Block`/`CmpctBlock` per session writer | Writer decrements after send; extra inv hashes not reconstructed. |
+| **`pending_blocks`** | **128** decoded bodies / session | Insert evicts one existing hash at cap. Unsolicited BIP130 window still 16. |
+| **Hub `held_bodies`** | **320** | Existing; side-branch hold for most-work apply. |
+
 ## Soft budgets: request-limited only (invariant)
 
 **We never stop accepting block data a peer sends for a block we already

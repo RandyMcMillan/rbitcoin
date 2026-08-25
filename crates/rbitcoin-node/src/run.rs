@@ -892,14 +892,31 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             last_tip_change = Instant::now();
             let extra = addrman.take_outbound_offset(1, seed_offset);
             seed_offset = seed_offset.saturating_add(1);
+            if extra.is_empty() {
+                continue;
+            }
+            if stale_follow_needs_room(follow_live, max_out) {
+                let ids = node.peers.outbound_full_relay_ids();
+                let salt = node.hub.clock.now_secs();
+                let Some(evict_id) = rbitcoin_net::pick_stale_follow_evict(&ids, salt) else {
+                    continue;
+                };
+                node.peers.disconnect_id(evict_id);
+                info!(
+                    "node: stale tip — replacing outbound {evict_id} with {}",
+                    extra[0]
+                );
+            }
             for peer in extra {
                 if shutdown.requested() {
                     break;
                 }
                 if catch_up_complete {
-                    info!(
-                        "node: tip may be stale (height={tip}, no update ≥{STALE_TIP_SECS}s, follow_live={follow_live}) — connecting {peer} for a higher tip"
-                    );
+                    if !stale_follow_needs_room(follow_live, max_out) {
+                        info!(
+                            "node: tip may be stale (height={tip}, no update ≥{STALE_TIP_SECS}s, follow_live={follow_live}) — connecting {peer} for a higher tip"
+                        );
+                    }
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
@@ -1234,6 +1251,10 @@ pub(crate) fn tip_follow_wake_kind(wake: &TipFollowWake, last_tip: u32) -> TipFo
 ///
 /// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale. A one-shot
 /// `sleep` in the same `select!` is reset on every such wake and never fires.
+pub(crate) fn stale_follow_needs_room(follow_live: usize, max_outbound: usize) -> bool {
+    follow_live >= max_outbound.max(1)
+}
+
 pub(crate) fn tip_follow_checks_stale(kind: TipFollowWakeKind) -> bool {
     matches!(
         kind,
@@ -1282,6 +1303,16 @@ mod tests {
 
     /// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale redial.
     /// A one-shot sleep in the same `select!` is reset on every such wake.
+    #[test]
+    fn stale_follow_needs_room_at_max_outbound() {
+        assert!(!stale_follow_needs_room(0, 16));
+        assert!(!stale_follow_needs_room(15, 16));
+        assert!(stale_follow_needs_room(16, 16));
+        assert!(stale_follow_needs_room(31, 16));
+        assert!(stale_follow_needs_room(1, 1));
+        assert!(!stale_follow_needs_room(0, 1));
+    }
+
     #[test]
     fn tip_follow_checks_stale_on_perf_and_rpc_stop() {
         assert!(

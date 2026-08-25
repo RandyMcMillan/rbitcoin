@@ -100,10 +100,25 @@ const MAX_PENDING_HEADERS: usize = 8_000;
 /// competing branch; apply is `ChainHub::accept_received_block` (see
 /// `docs/architecture.md` most-work chain selection).
 const MAX_PENDING_BLOCKS: usize = 128;
+/// Max reconstructed full bodies queued on one session writer (IBD window).
+pub(crate) const MAX_SERVE_BLOCKS: usize = 16;
 
 /// Test/assert surface for the tip-follow pending-body cap (equals production).
 #[cfg(test)]
 pub(crate) const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
+
+fn stash_pending_block(
+    pending: &mut HashMap<BlockHash, bitcoin::Block>,
+    hash: BlockHash,
+    block: bitcoin::Block,
+) {
+    if pending.len() >= MAX_PENDING_BLOCKS && !pending.contains_key(&hash) {
+        if let Some(k) = pending.keys().next().copied() {
+            pending.remove(&k);
+        }
+    }
+    pending.insert(hash, block);
+}
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
@@ -477,9 +492,20 @@ pub async fn peer_session_with(
         s.attach_out(out_tx.clone());
     }
 
+    let writer_session = meta.session.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            if write_v2_msg_offload(&mut writer, msg).await.is_err() {
+            let full = matches!(
+                msg,
+                NetworkMessage::Block(_) | NetworkMessage::CmpctBlock(_)
+            );
+            let err = write_v2_msg_offload(&mut writer, msg).await.is_err();
+            if full {
+                if let Some(s) = &writer_session {
+                    s.serve_inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            if err {
                 break;
             }
         }
@@ -1195,16 +1221,27 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::GetData(inv) => {
+            let inflight = session.map(|s| &s.serve_inflight);
             for item in inv.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
+                            continue;
+                        }
                         if let Some(block) =
                             block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
                         {
-                            queue_out(out_tx, NetworkMessage::Block(block))?;
+                            let _ = try_queue_served_block(
+                                out_tx,
+                                inflight,
+                                NetworkMessage::Block(block),
+                            )?;
                         }
                     }
                     Inventory::CompactBlock(h) => {
+                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
+                            continue;
+                        }
                         if let Some(block) =
                             block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
                         {
@@ -1220,14 +1257,19 @@ async fn handle_peer_frame(
                                 .map(|ht| ht.0)
                                 .unwrap_or(0);
                             if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
-                                queue_out(out_tx, NetworkMessage::Block(block))?;
+                                let _ = try_queue_served_block(
+                                    out_tx,
+                                    inflight,
+                                    NetworkMessage::Block(block),
+                                )?;
                             } else {
                                 let ver = (*peer_cmpct_version).max(1).min(2);
                                 if let Ok(hsi) =
                                     HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &[0])
                                 {
-                                    queue_out(
+                                    let _ = try_queue_served_block(
                                         out_tx,
+                                        inflight,
                                         NetworkMessage::CmpctBlock(CmpctBlock {
                                             compact_block: hsi,
                                         }),
@@ -1477,6 +1519,17 @@ async fn handle_peer_frame(
                     // (`p2p_headers_sync_with_minchainwork` height=14).
                     let announced_h = announced_headers_height(hub, pending_headers, last);
                     let noban = session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_noban()));
+                    let branch = header_branch_vs_tip(hub, pending_headers, last);
+                    let our_tip = hub.tip_height().unwrap_or(0);
+                    if announced_tip_is_hopeless(our_tip, announced_h, branch) && !noban {
+                        rbitcoin_log::info!(
+                            "p2p: disconnect stale fork tip announced={announced_h} our={our_tip}"
+                        );
+                        if let Some(s) = session {
+                            s.request_disconnect();
+                        }
+                        return Ok(());
+                    }
                     if !header_path_meets_minwork(hub, pending_headers, last) {
                         if noban {
                             persist_pending_header_path(hub, pending_headers, last);
@@ -1498,7 +1551,7 @@ async fn handle_peer_frame(
                                 pending_blocks,
                                 requested_blocks,
                             );
-                            match header_branch_vs_tip(hub, pending_headers, last) {
+                            match branch {
                                 Some(std::cmp::Ordering::Less) => want.clear(),
                                 // BIP130 cap is for unsolicited announcements only.
                                 // A getheaders reply (rejoin / catch-up) must fetch
@@ -1567,7 +1620,7 @@ async fn handle_peer_frame(
             requested_blocks.remove(&hash);
             pending_headers.entry(hash).or_insert(block.header);
             if !any_header_path_meets_minwork(hub, pending_headers, hash) {
-                pending_blocks.insert(hash, block.clone());
+                stash_pending_block(pending_blocks, hash, block.clone());
                 return Ok(());
             }
             match hub.accept_received_block(block.clone()) {
@@ -2043,6 +2096,21 @@ fn header_path_join(
     None
 }
 
+/// Headers more than this many blocks behind our tip are not useful for
+/// tip-follow (Core `NODE_NETWORK_LIMITED` window, ~2 days).
+pub(crate) const ANCIENT_TIP_BLOCKS: u32 = 288;
+
+/// Connecting header path that cannot beat our tip and whose announced height
+/// is more than [`ANCIENT_TIP_BLOCKS`] behind — BIP-110-class minority fork.
+pub(crate) fn announced_tip_is_hopeless(
+    our_tip: u32,
+    announced_h: u32,
+    branch: Option<std::cmp::Ordering>,
+) -> bool {
+    matches!(branch, Some(std::cmp::Ordering::Less))
+        && announced_h.saturating_add(ANCIENT_TIP_BLOCKS) < our_tip
+}
+
 /// Compare announced header-chain length (equal-bits ≈ work) to our path
 /// from the same ancestor. `None` if the header walk does not reach our chain.
 fn header_branch_vs_tip(
@@ -2200,6 +2268,29 @@ fn queue_out(
 ) -> Result<(), NetError> {
     out.send(msg)
         .map_err(|_| NetError::Protocol("peer write half closed"))
+}
+
+/// Queue a reconstructed `Block`/`CmpctBlock` if this session is under the serve cap.
+///
+/// `None` inflight (tests without a session) always queues.
+pub(crate) fn try_queue_served_block(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    inflight: Option<&AtomicUsize>,
+    msg: NetworkMessage,
+) -> Result<bool, NetError> {
+    if let Some(n) = inflight {
+        if n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS {
+            return Ok(false);
+        }
+        n.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = queue_out(out, msg) {
+            n.fetch_sub(1, Ordering::SeqCst);
+            return Err(e);
+        }
+        return Ok(true);
+    }
+    queue_out(out, msg)?;
+    Ok(true)
 }
 
 /// Try to accept pending blocks that connect to tip or form a better branch.

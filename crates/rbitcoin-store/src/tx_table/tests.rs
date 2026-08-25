@@ -1586,7 +1586,7 @@ fn inwit_and_txout_secret_xor_roundtrip() {
         encode_inwit_with_secret(&inputs, &mut plain, None);
         plain
     });
-    let (dtx, douts) = decode_packed_tx_outs_only(&txout).unwrap();
+    let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&txout).unwrap();
     // Without secret, script stays obfuscated.
     assert_ne!(douts[0].script, outputs[0].script);
     let (dtx2, douts2, _) =
@@ -1676,7 +1676,7 @@ fn short_or_truncated_packed_body_rejected() {
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
-        decode_packed_tx_outs_only(&raw),
+        decode_packed_tx_outs_with_spender_rels(&raw),
         Err(StoreError::Corrupt(_))
     ));
 }
@@ -1880,11 +1880,9 @@ fn packed_encode_decode_flags_and_error_arms() {
     let mut inwit = Vec::new();
     encode_inwit_with_secret(&inputs, &mut inwit, None);
     assert_eq!(scan_inwit_prevouts(&inwit, m.input_count).unwrap().len(), 2);
-    let (m3, outs_only) = decode_packed_tx_outs_only(&raw).unwrap();
-    assert_eq!(m3.txid, [0u8; 32]);
-    assert_eq!(outs_only.len(), 2);
     let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
     assert_eq!(m4.txid, [0u8; 32]);
+    assert_eq!(outs_rels.len(), 2);
     assert_eq!(rels.len(), 2);
     // spender fields cleared
     assert!(outs_rels.iter().all(|o| o.spender_field.is_null()));

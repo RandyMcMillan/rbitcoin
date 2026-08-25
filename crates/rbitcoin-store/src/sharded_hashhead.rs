@@ -186,6 +186,7 @@ impl ShardedHashHead {
     }
 
     /// Sum of occupied slots across shards (load observer / sizes).
+    #[cfg(test)]
     #[inline]
     pub fn occupied(&self) -> u64 {
         self.shards.iter().map(|s| s.occupied()).sum()

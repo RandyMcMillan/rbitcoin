@@ -1,0 +1,40 @@
+# Nightly Miri for rbitcoin-primitives only (Q-53).
+# Not a required PR check. Product rustc stays 1.95; this job uses nightly
+# only to drive Miri. Never cargo miri test --workspace.
+#
+# Operator may need to push this workflow file (GitHub App often cannot).
+
+name: miri
+
+on:
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  primitives:
+    name: primitives
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+
+      - name: cargo miri test -p rbitcoin-primitives
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: ./scripts/miri.sh

@@ -173,6 +173,22 @@ Dependencies are not attributed to us.
    shipped path that drives the real entry point.
 4. Re-run `./scripts/coverage.sh` until line coverage is **≥ 90%**.
 
+## Structural lints, CRAP, Miri
+
+These do **not** measure operator RSS ([`docs/ibd-memory.md`](./docs/ibd-memory.md)
+owns caps). They catch the *shapes* of unbounded heap / leaked tasks, untested
+complexity, and UB in pure code. Roadmap: [`docs/quality.md`](./docs/quality.md)
+**Q-51–Q-56**.
+
+| Tool | How to run | CI |
+|------|------------|----|
+| **ast-grep** | `./scripts/ast-grep.sh` (needs `ast-grep` on `PATH`; `nix-shell` / `nix develop` provide it). Fixture self-test: `./scripts/ast-grep.test.sh` | Required job `ast-grep` |
+| **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`; report-only (no `--fail-above`) |
+| **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
+
+Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
+not write `target/`.
+
 ### Mature-chain fixtures
 
 Electrum hub tests and `MempoolHub` accept harnesses use

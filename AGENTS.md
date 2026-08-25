@@ -160,8 +160,10 @@ Actions is the workspace/coverage/clippy gate.
 
 ### Push, PR, poll CI
 
-Required jobs: **`fmt`**, **`deny`**, **`clippy`**, **`test`**, **`windows`**,
-**`macos`**, **`multinode`**, **`coverage`**. `windows` / `macos` are native
+Required jobs: **`fmt`**, **`deny`**, **`clippy`**, **`ast-grep`**, **`test`**,
+**`windows`**, **`macos`**, **`multinode`**, **`coverage`**. Structural scan is
+`./scripts/ast-grep.sh` (rules live in `lint/ast-grep/`; do not copy them here).
+`windows` / `macos` are native
 store + `--smoke` (not operator zips). Operator binaries are GitHub Releases
 (`release.yml`). Label **`core-functional`** when the PR touches the Core
 functional harness.

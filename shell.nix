@@ -24,6 +24,7 @@ pkgs.mkShell {
     llvmPackages.bintools
     llvmPackages.llvm
     cargo-llvm-cov
+    ast-grep
     pkg-config
     # used in coverage.sh
     python3

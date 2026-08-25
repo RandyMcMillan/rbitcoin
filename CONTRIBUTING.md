@@ -43,9 +43,9 @@
 ## Workflow
 
 Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
-checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`, `test`,
-`multinode`, `coverage`) so a red run shows which gate failed without digging
-into a monolithic job log.
+checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`,
+`ast-grep`, `test`, `multinode`, `coverage`) so a red run shows which gate
+failed without digging into a monolithic job log.
 
 **Agents** implement on a **git worktree** topic branch, commit per plan step,
 and open **one PR** per plan. They do **not** run the full workspace suite or

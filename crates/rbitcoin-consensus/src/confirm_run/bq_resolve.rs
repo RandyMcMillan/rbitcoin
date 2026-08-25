@@ -370,10 +370,7 @@ pub fn confirm_bq_resolve_wave_capped(
         let t_keep = Instant::now();
         let queued = query.block_queue_queued_heights();
         let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-        let taken = query.lookup_taken_hi().unwrap_or(tip);
-        let span = taken.saturating_sub(tip);
-        let horizon = rbitcoin_query::recent_creates_horizon(span);
-        live.keep_queued_or_horizon(&queued, tip, horizon, query.lookup_taken_hi());
+        live.keep_queued_or_taken(&queued, tip, query.lookup_taken_hi());
         live.publish(published);
         crate::confirm_phase_stats::LOOKUP_KEEP_NS
             .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);

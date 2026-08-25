@@ -27,6 +27,10 @@ use crate::error::ConsensusError;
 const MAX_STACK_SIZE: usize = 1000;
 /// Core `MAX_SCRIPT_ELEMENT_SIZE` (push / witness stack item cap).
 pub(crate) const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+/// BIP342 `VALIDATION_WEIGHT_OFFSET` / `VALIDATION_WEIGHT_PER_SIGOP_PASSED`.
+const TAPSCRIPT_VALIDATION_WEIGHT_OFFSET: i64 = 50;
+const TAPSCRIPT_VALIDATION_WEIGHT_PER_SIGOP: i64 = 50;
+
 /// Legacy / witness-v0 script size cap (BIP16 / BIP141). **Not** applied in tapscript
 /// (BIP342: size only bounded by block weight).
 const MAX_SCRIPT_SIZE_LEGACY: usize = 10_000;
@@ -180,6 +184,8 @@ pub(crate) struct EvalContext<'a> {
     cache: RefCell<Option<SighashCache<&'a Transaction>>>,
     /// Structure/lookup midstates (WitnessV0 BIP143). Tests `new` compute once.
     pre: std::sync::Arc<rbitcoin_query::TxPrecompute>,
+    /// BIP342 remaining validation weight (`50 + witness serialized size`).
+    validation_weight_left: Cell<i64>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -263,6 +269,7 @@ impl<'a> EvalContext<'a> {
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(None),
             pre,
+            validation_weight_left: Cell::new(tapscript_init_weight(tx, input_index, sig_version)),
         }
     }
 
@@ -971,6 +978,18 @@ fn op_checksig_tapscript(
     Ok(())
 }
 
+fn tapscript_init_weight(tx: &Transaction, input_index: usize, sig_version: SigVersion) -> i64 {
+    if sig_version != SigVersion::TapScript {
+        return 0;
+    }
+    let size = tx
+        .input
+        .get(input_index)
+        .map(|inp| bitcoin::consensus::encode::serialize(&inp.witness).len() as i64)
+        .unwrap_or(0);
+    TAPSCRIPT_VALIDATION_WEIGHT_OFFSET + size
+}
+
 /// Shared BIP342 CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD validation core.
 fn tapscript_sig_result(
     sig: &[u8],
@@ -979,6 +998,13 @@ fn tapscript_sig_result(
 ) -> Result<TapSigResult, ConsensusError> {
     if pubkey.is_empty() {
         return Err(ConsensusError::Script("tapscript empty pubkey".into()));
+    }
+    if !sig.is_empty() {
+        let left = ctx.validation_weight_left.get() - TAPSCRIPT_VALIDATION_WEIGHT_PER_SIGOP;
+        ctx.validation_weight_left.set(left);
+        if left < 0 {
+            return Err(ConsensusError::Script("tapscript validation weight".into()));
+        }
     }
     // Unknown public key type (not 32 bytes): treat signature as valid (soft-fork hook).
     if pubkey.len() != 32 {

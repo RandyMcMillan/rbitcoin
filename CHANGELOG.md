@@ -139,6 +139,11 @@ before 1.0).
 
 ### Fixed
 
+- **BIP342 tapscript validation-weight budget:** script-path CHECKSIG /
+  CHECKSIGADD with a non-empty signature subtracts 50 from
+  `50 + witness_serialized_size`; remaining `< 0` fails (Core
+  `SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT`).
+
 - **Truncated PUSHDATA2/4 no longer counts leftover opcodes as sigops:**
   `script_sigop_count` stops when the length field or body overruns, matching
   Core `GetOp` / `GetSigOpCount` (`[0x4d, 0xac]` is 0, not 1).

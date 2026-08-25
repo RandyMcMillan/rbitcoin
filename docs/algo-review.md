@@ -69,7 +69,7 @@ What the node actually runs. This is the map; findings follow.
 | Piece | Algorithm | Notes |
 |-------|-----------|--------|
 | `eval_script` | Core-shaped opcode walk | tapscript OP_SUCCESS pre-scan, 520 B stack |
-| CHECKSIG | DER lax + optional BIP66; Schnorr BIP340 | **no BIP342 validation-weight budget** |
+| CHECKSIG | DER lax + optional BIP66; Schnorr BIP340 | BIP342 validation-weight budget |
 | P2SH | bespoke `push_only_items` parser | not `eval_script` of scriptSig |
 | Sigops | `script_sigop_count` byte walk | truncated PUSHDATA2/4 stops (Core `GetOp`) |
 | Signet | challenge script + witness commitment | first-match prefix, not last 38-byte BIP141 |
@@ -115,25 +115,6 @@ What the node actually runs. This is the map; findings follow.
 These are the ones worth a plan. ✔ = re-read against current source.
 
 ### High — consensus
-
-#### C-H1. ✔ Missing BIP342 tapscript validation-weight budget
-
-`crates/rbitcoin-consensus/src/script/interpreter.rs` (`tapscript_sig_result`
-~974, `checksig_schnorr` ~1325, `OP_CHECKSIGADD` 0xba ~782).
-`crates/rbitcoin-consensus/src/script/p2tr.rs` script-path eval (~152).
-
-BIP342: per-input budget `50 + witness_serialized_size`, minus 50 for every
-executed CHECKSIG/CHECKSIGADD with a **non-empty** signature; negative fails
-(`script/interpreter.cpp` `EvalChecksigTapscript`). This engine has no budget
-field. A tapscript with many CHECKSIGs and a small witness is **accepted here
-and rejected by Core** — hard split on mainnet post-709632.
-
-Core's own `feature_taproot.py` has `ERR_TAPSCRIPT_VALIDATION_WEIGHT` (in-tree
-as `third_party/bitcoin/test/functional/feature_taproot.py`).
-
-**Fix:** thread `i64` remaining weight through `EvalContext`; subtract 50 on
-non-empty sig; fail if `< 0`. Pin with a synthetic tapscript over the 80 000
-sigop-style fixture pattern already used for milestone sigops.
 
 #### C-H3. P2SH scriptSig parser diverges from Core (reject-valid + accept-invalid)
 
@@ -490,7 +471,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
 | store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
-| consensus + primitives | 3 (BIP342 weight, P2SH parser, testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
+| consensus + primitives | 2 (P2SH parser, testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
@@ -506,8 +487,8 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **C-H1 BIP342 validation weight** + **C-H3 P2SH eval_script** — consensus;
-   pin with Core-shaped fixtures. Closest to `docs/quality.md` pillar 1.
+1. **C-H3 P2SH eval_script** — consensus; pin with Core-shaped fixtures. Closest to
+   `docs/quality.md` pillar 1.
 2. **S-H1 HashHead seqlock/epoch** — false misses during grow.
 3. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
 4. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
@@ -527,6 +508,9 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-H1.** BIP342 tapscript validation-weight budget (`50 + witness size`,
+  −50 per nonempty CHECKSIG*). Pin: `script_path_rejects_tapscript_validation_weight`.
+  This PR.
 - **C-H2.** `script_sigop_count` stops on truncated PUSHDATA2/4 (Core `GetOp`).
   Pin: `truncated_pushdata2_does_not_count_leftover_checksig`. This PR.
 - **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). [#244](https://github.com/reardencode/rbitcoin/pull/244).

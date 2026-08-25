@@ -122,6 +122,12 @@ pub mod confirm_phase_stats {
     pub static WRITE_DRAIN_JOIN_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-thread body-queue dequeue after a successful confirm.
     pub static WRITE_DEQUEUE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Clone `planned_fks` + pin Arcs before Class A (`pins=` take=).
+    pub static WRITE_PLAN_TAKE_NS: AtomicU64 = AtomicU64::new(0);
+    /// `write_create_pins` FkMap insert after Class A (`pins=` map=).
+    pub static WRITE_CREATE_MAP_NS: AtomicU64 = AtomicU64::new(0);
+    /// `take_pending_queued` + `submit_head_insert` (`head_sub=`).
+    pub static WRITE_HEAD_SUB_NS: AtomicU64 = AtomicU64::new(0);
     /// Ensure path: creates filled from pin layout (no Class A body IO).
     pub static ENSURE_RES_HIT: AtomicU64 = AtomicU64::new(0);
     /// Ensure path: cold denserels body loads.
@@ -312,6 +318,16 @@ pub mod confirm_phase_stats {
         (
             WRITE_DRAIN_JOIN_NS.swap(0, Ordering::Relaxed),
             WRITE_DEQUEUE_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// `(plan_take, create_map, head_sub)` write-other classification walls.
+    #[inline]
+    pub fn sample_write_pins_and_reset() -> (u64, u64, u64) {
+        (
+            WRITE_PLAN_TAKE_NS.swap(0, Ordering::Relaxed),
+            WRITE_CREATE_MAP_NS.swap(0, Ordering::Relaxed),
+            WRITE_HEAD_SUB_NS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -866,6 +882,11 @@ mod coverage_tests {
         TWEAK_NS.store(42, Ordering::Relaxed);
         assert_eq!(sample_tweak_and_reset(), 42);
         assert_eq!(sample_tweak_and_reset(), 0);
+        WRITE_PLAN_TAKE_NS.store(11, Ordering::Relaxed);
+        WRITE_CREATE_MAP_NS.store(22, Ordering::Relaxed);
+        WRITE_HEAD_SUB_NS.store(33, Ordering::Relaxed);
+        assert_eq!(sample_write_pins_and_reset(), (11, 22, 33));
+        assert_eq!(sample_write_pins_and_reset(), (0, 0, 0));
         RECONSTRUCT_NS.store(5, Ordering::Relaxed);
         RECONSTRUCT_WIRE_NS.store(7, Ordering::Relaxed);
         CONNECT_NS.store(1, Ordering::Relaxed);

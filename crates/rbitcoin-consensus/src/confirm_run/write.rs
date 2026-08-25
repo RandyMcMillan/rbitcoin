@@ -117,8 +117,11 @@ pub fn confirm_write_phase(
     let mut write_create_pins: FkMap<rbitcoin_query::CreatePin> = FkMap::default();
     let mut class_a_ns = 0u64;
     let mut ensure_ns = 0u64;
+    let mut plan_take_ns = 0u64;
+    let mut create_map_ns = 0u64;
     if let Some(plan) = batch.archive_plan.take() {
         if !plan.is_empty() {
+            let t_take = Instant::now();
             let planned_fks = plan.planned_fks.clone();
             let pins: Vec<rbitcoin_query::CreatePin> =
                 if plan.batch_pin.len() == plan.planned_fks.len() {
@@ -129,6 +132,7 @@ pub fn confirm_write_phase(
                         .map(|(pin, _)| std::sync::Arc::clone(pin))
                         .collect()
                 };
+            plan_take_ns = t_take.elapsed().as_nanos() as u64;
             let t_ca = Instant::now();
             let committed = query
                 .archive_commit_plan_defer_head(plan)
@@ -137,10 +141,12 @@ pub fn confirm_write_phase(
             // Layout + SH pins only after a real append. Idempotent skip (Class A
             // already present) uses store denserels via ensure / class_c cold pins.
             if committed {
+                let t_map = Instant::now();
                 write_create_pins.reserve(planned_fks.len());
                 for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
                     write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
                 }
+                create_map_ns = t_map.elapsed().as_nanos() as u64;
                 let t_ens = Instant::now();
                 fill_planned_create_layout_after_commit(
                     query,
@@ -211,11 +217,22 @@ pub fn confirm_write_phase(
     if ensure_ns > 0 {
         confirm_phase_stats::ENSURE_LAYOUT_NS.fetch_add(ensure_ns, Ordering::Relaxed);
     }
+    if plan_take_ns > 0 {
+        confirm_phase_stats::WRITE_PLAN_TAKE_NS.fetch_add(plan_take_ns, Ordering::Relaxed);
+    }
+    if create_map_ns > 0 {
+        confirm_phase_stats::WRITE_CREATE_MAP_NS.fetch_add(create_map_ns, Ordering::Relaxed);
+    }
 
     // Drain write-behind tx.head overlapping structural + Class C (one inserter).
+    let t_head = Instant::now();
     let queued = query.store().txs.take_pending_queued();
     let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
     let drain = super::head_drain::submit_head_insert(query.store(), queued);
+    let head_sub_ns = t_head.elapsed().as_nanos() as u64;
+    if head_sub_ns > 0 {
+        confirm_phase_stats::WRITE_HEAD_SUB_NS.fetch_add(head_sub_ns, Ordering::Relaxed);
+    }
 
     let overlap = (|| -> Result<_, ConsensusError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.

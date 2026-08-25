@@ -11,6 +11,11 @@ before 1.0).
 
 ### Added
 
+- **Write `other=` classification:** `ibd: perf` names `pins=take+map`
+  (plan Arc copies + create-pin FkMap) and `head_sub=` (tx.head drain
+  submit). They join the write inventory so `other=` is the leftover
+  residual. [`crates/rbitcoin-net/src/ibd/perf_log.rs`](crates/rbitcoin-net/src/ibd/perf_log.rs).
+
 - **Structural lint / CRAP / Miri:** required `ast-grep` scan for discarded
   `tokio::spawn`, `mem::forget`/`Box::leak`, and dropped `thread::spawn`;
   `coverage.sh` prints a cargo-crap summary after the ≥90% LCOV gate (no

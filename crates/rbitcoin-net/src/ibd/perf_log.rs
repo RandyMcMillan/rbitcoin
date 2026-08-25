@@ -30,8 +30,8 @@
 //!   is that same ns. Recv/send are wait. Publisher parks; it does not `wait_done`
 //!   on steal workers.
 //! - **write** = Class A + ensure + structural + class_c + spend + tweaks + tip GC
-//!   + `recent_pub=` / `drain_join=` / `dequeue=`. `other=` is write-thread work
-//!   minus that inventory.
+//!   + `recent_pub=` / `pins=` / `head_sub=` / `drain_join=` / `dequeue=`.
+//!   `other=` is write-thread work minus that inventory.
 //!
 //! **Inventory rule:** new work on lookup / load / scripts / write (or a sidecar
 //! the write thread joins) must add a named token here in the **same commit**.
@@ -52,9 +52,10 @@ use rbitcoin_query::ProcessOwnedSizes;
 /// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
 ///
 /// Inventory: `class_a` + `ensure` + `struct` + `class_c` + `sh` + `spend`
-/// + `tweaks` + `tip_gc` + `recent_pub` + `drain_join` + `dequeue`.
-/// `other=` is write-thread work minus this inventory. Subtimers (spent_sub,
-/// ann, class_a_sub) stay on the outer sample until a later nest.
+/// + `tweaks` + `tip_gc` + `recent_pub` + `pins` + `head_sub` + `drain_join`
+/// + `dequeue`. `other=` is write-thread work minus this inventory.
+/// Subtimers (spent_sub, ann, class_a_sub, pins take/map) stay on the outer
+/// sample until a later nest.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WriteStageSample {
     /// `archive_commit_plan`
@@ -84,6 +85,12 @@ pub(crate) struct WriteStageSample {
     /// RecentCreates note+expire+one snapshot (`recent_pub=`)
     pub recent_pub_ms: u64,
     pub recent_pub_ns: u64,
+    /// Write-thread pin Arc copies: plan take + create-pin FkMap (`pins=`)
+    pub pins_ms: u64,
+    pub pins_ns: u64,
+    /// `take_pending_queued` + `submit_head_insert` (`head_sub=`)
+    pub head_sub_ms: u64,
+    pub head_sub_ns: u64,
     /// `class_c_commit` join/flush minus tables (`class_c_join=`)
     pub class_c_join_ms: u64,
     pub class_c_join_ns: u64,
@@ -96,7 +103,7 @@ pub(crate) struct WriteStageSample {
 }
 
 impl WriteStageSample {
-    /// Sum of the eight write inventory tokens (ms).
+    /// Sum of the exclusive write inventory tokens (ms).
     pub fn stage_ms(&self) -> u64 {
         self.class_a_ms
             .saturating_add(self.ensure_ms)
@@ -107,6 +114,8 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ms)
             .saturating_add(self.cache_tip_ms)
             .saturating_add(self.recent_pub_ms)
+            .saturating_add(self.pins_ms)
+            .saturating_add(self.head_sub_ms)
             .saturating_add(self.class_c_join_ms)
             .saturating_add(self.drain_join_ms)
             .saturating_add(self.dequeue_ms)
@@ -123,6 +132,8 @@ impl WriteStageSample {
             .saturating_add(self.tweak_ns)
             .saturating_add(self.cache_tip_ns)
             .saturating_add(self.recent_pub_ns)
+            .saturating_add(self.pins_ns)
+            .saturating_add(self.head_sub_ns)
             .saturating_add(self.class_c_join_ns)
             .saturating_add(self.drain_join_ns)
             .saturating_add(self.dequeue_ns)
@@ -171,6 +182,10 @@ pub(crate) struct IbdPerfSample {
     /// RecentCreates idx vs snapshot clone (`recent_idx=` / `recent_clone=`).
     pub recent_idx_ms: u64,
     pub recent_clone_ms: u64,
+    /// `pins=` part: planned_fks clone + pin Arc vec before Class A.
+    pub pins_take_ms: u64,
+    /// `pins=` part: write_create_pins FkMap insert after Class A.
+    pub pins_map_ms: u64,
     /// Assemble subtimers (ms; sum ≈ connect/assemble).
     pub asm_prevout_ms: u64,
     pub asm_sigop_ms: u64,
@@ -476,6 +491,8 @@ impl Default for IbdPerfSample {
             ensure_cold_n: 0,
             recent_idx_ms: 0,
             recent_clone_ms: 0,
+            pins_take_ms: 0,
+            pins_map_ms: 0,
             asm_prevout_ms: 0,
             asm_sigop_ms: 0,
             asm_final_ms: 0,
@@ -835,6 +852,9 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_write_recent_parts_and_reset();
     let (drain_join_ns, dequeue_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_write_residuals_and_reset();
+    let (pins_take_ns, pins_map_ns, head_sub_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_write_pins_and_reset();
+    let pins_ns = pins_take_ns.saturating_add(pins_map_ns);
     let class_c_join_ns = rbitcoin_consensus::confirm_phase_stats::sample_class_c_join_and_reset();
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
@@ -919,6 +939,10 @@ pub(crate) fn sample(
             cache_tip_ns,
             recent_pub_ms: ns_ms(recent_pub_ns),
             recent_pub_ns,
+            pins_ms: ns_ms(pins_ns),
+            pins_ns,
+            head_sub_ms: ns_ms(head_sub_ns),
+            head_sub_ns,
             class_c_join_ms: ns_ms(class_c_join_ns),
             class_c_join_ns,
             drain_join_ms: ns_ms(drain_join_ns),
@@ -930,6 +954,8 @@ pub(crate) fn sample(
         ensure_cold_n,
         recent_idx_ms: ns_ms(recent_idx_ns),
         recent_clone_ms: ns_ms(recent_clone_ns),
+        pins_take_ms: ns_ms(pins_take_ns),
+        pins_map_ms: ns_ms(pins_map_ns),
         asm_prevout_ms: ns_ms(asm_prevout_ns),
         asm_sigop_ms: ns_ms(asm_sigop_ns),
         asm_final_ms: ns_ms(asm_final_ns),
@@ -1468,7 +1494,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         " | write class_a={}ms ensure={}ms(pin={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
          class_c={}ms class_c_join={}ms sh={}ms spend={}ms tweaks={}ms tip_gc={}ms recent_pub={}ms(idx={} clone={}) \
-         drain_join={}ms dequeue={}ms other={}ms \
+         pins={}ms(take={} map={}) head_sub={}ms drain_join={}ms dequeue={}ms other={}ms \
          ann={}ms/n={} pread_skip={} pread={} \
          meta={}ms/n={}",
         s.write.class_a_ms,
@@ -1492,6 +1518,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.write.recent_pub_ms,
         s.recent_idx_ms,
         s.recent_clone_ms,
+        s.write.pins_ms,
+        s.pins_take_ms,
+        s.pins_map_ms,
+        s.write.head_sub_ms,
         s.write.drain_join_ms,
         s.write.dequeue_ms,
         s.thr_write_work_ms.saturating_sub(write_stage_ms(s)),
@@ -1563,7 +1593,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let mut out = format!(
         "ibd: perf_dbg us/blk load={} (pre_asm={} assemble={}) script={} write={} \
          class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
-         spend={}(r={} i={} skip={}) tweaks={} tip_gc={} recent_pub={} drain_join={} dequeue={}",
+         spend={}(r={} i={} skip={}) tweaks={} tip_gc={} recent_pub={} pins={} head_sub={} drain_join={} dequeue={}",
         us(prep_ns),
         us(s.load_ns),
         us(s.connect_ns),
@@ -1584,6 +1614,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.write.tweak_ns),
         us(s.write.cache_tip_ns),
         us(s.write.recent_pub_ns),
+        us(s.write.pins_ns),
+        us(s.write.head_sub_ns),
         us(s.write.drain_join_ns),
         us(s.write.dequeue_ns),
     );
@@ -1982,7 +2014,7 @@ mod tests {
         assert_eq!(
             write.stage_ms(),
             255,
-            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc+recent_pub+drain_join+dequeue"
+            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+tip_gc+recent_pub+pins+head_sub+drain_join+dequeue"
         );
         let mut s = IbdPerfSample::default();
         s.write = write;
@@ -1997,6 +2029,29 @@ mod tests {
         assert!(line.contains("drain_join=0ms"), "{line}");
         assert!(line.contains("dequeue=0ms"), "{line}");
         assert!(line.contains("other=0ms"), "{line}");
+    }
+
+    #[test]
+    fn write_other_classifies_pins_and_head_sub() {
+        let mut s = IbdPerfSample::default();
+        s.thr_write_work_ms = 500;
+        s.write.pins_ms = 300;
+        s.write.pins_ns = 300_000_000;
+        s.write.head_sub_ms = 50;
+        s.write.head_sub_ns = 50_000_000;
+        s.pins_take_ms = 200;
+        s.pins_map_ms = 100;
+        let line = format_info(&s);
+        assert!(line.contains("pins=300ms(take=200 map=100)"), "{line}");
+        assert!(line.contains("head_sub=50ms"), "{line}");
+        assert!(line.contains("write=350ms"), "{line}");
+        assert!(
+            line.contains("other=150ms"),
+            "pins+head_sub must leave the write-thread residual: {line}"
+        );
+        let dbg = format_debug(&s);
+        assert!(dbg.contains("pins="), "{dbg}");
+        assert!(dbg.contains("head_sub="), "{dbg}");
     }
 
     #[test]

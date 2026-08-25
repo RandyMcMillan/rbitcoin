@@ -38,6 +38,11 @@ before 1.0).
 
 ### Changed
 
+- **Headers sync locator:** a full 2000-header reply continues `getheaders`
+  from that last hash (not our tip locator). Periodic poll skips a peer
+  whose best-known header is already on our chain behind tip, or a
+  connecting fork that cannot beat us. [`docs/ibd-memory.md`](docs/ibd-memory.md).
+
 - **Tip-follow peer set:** disconnect sessions whose connecting header tip
   cannot beat us and is more than 288 blocks behind (BIP-110-class minority
   forks). Stale-tip extras no longer grow past `max_outbound`; at cap a

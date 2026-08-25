@@ -223,6 +223,10 @@ impl LivePeer {
         *self.best_known.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
     }
 
+    pub fn best_known(&self) -> Option<BlockHash> {
+        *self.best_known.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn header_marks(&self) -> (Option<BlockHash>, Option<BlockHash>) {
         (
             *self

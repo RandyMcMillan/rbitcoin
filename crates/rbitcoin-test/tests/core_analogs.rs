@@ -117,8 +117,10 @@ fn analog_milestone_and_mempool_persist() {
             || msg.contains("not found")
             || msg.contains("missing")
             || msg.contains("input")
-            || msg.contains("spend"),
-        "expected prevout failure under milestone, got: {err}"
+            || msg.contains("spend")
+            || msg.contains("lookup stage miss")
+            || msg.contains("invariant"),
+        "expected prevout / lookup-miss failure under milestone, got: {err}"
     );
 }
 

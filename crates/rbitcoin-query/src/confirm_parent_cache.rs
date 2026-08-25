@@ -122,16 +122,6 @@ impl ConfirmParentCache {
             .map(|a| (**a).clone())
     }
 
-    /// Arc-publish get (refcount only — prefer when callers can hold Arc).
-    pub fn get_header_plan_arc(&self, height: u32) -> Option<Arc<HeaderPlanCache>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .headers
-            .get(&height)
-            .map(Arc::clone)
-    }
-
     pub fn get_tx_fks_for_hash(&self, hash: &[u8; 32]) -> Option<Vec<Fk>> {
         let g = self.inner.lock().unwrap();
         let h = *g.hash_to_height.get(hash)?;
@@ -171,15 +161,14 @@ mod tests {
         assert_eq!(c.header_plan_count(), 0);
     }
 
-    /// Header plans are Arc-published: replace installs a new Arc; tip GC drops it.
+    /// Header plans are replaced, not mutated in place; tip GC drops them.
     #[test]
-    fn header_plan_arc_publish_and_tip_gc() {
+    fn header_plan_replace_and_tip_gc() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.put_header_plan(1, Fk(1), header_rec([1u8; 32]), vec![Fk(10)], [0u8; 32]);
-        let a1 = c.get_header_plan_arc(1).expect("plan");
+        let a1 = c.get_header_plan(1).expect("plan");
         assert_eq!(a1.tx_fks, vec![Fk(10)]);
-        // Replace publishes a new Arc (not rewrite-in-place of the old body).
         c.put_header_plan(
             1,
             Fk(1),
@@ -187,14 +176,11 @@ mod tests {
             vec![Fk(11), Fk(12)],
             [0u8; 32],
         );
-        let a2 = c.get_header_plan_arc(1).expect("replaced");
+        let a2 = c.get_header_plan(1).expect("replaced");
         assert_eq!(a2.tx_fks, vec![Fk(11), Fk(12)]);
-        assert!(!std::sync::Arc::ptr_eq(&a1, &a2));
-        // Old Arc still valid for holder; cache holds only a2.
-        assert_eq!(a1.tx_fks, vec![Fk(10)]);
         assert_eq!(c.header_plan_count(), 1);
         c.advance_tip(1);
-        assert!(c.get_header_plan_arc(1).is_none());
+        assert!(c.get_header_plan(1).is_none());
         assert_eq!(c.header_plan_count(), 0);
     }
 

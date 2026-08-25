@@ -78,6 +78,21 @@ before 1.0).
   `RBITCOIN_SH_MERGE_WORKERS` still override (`1` = serial). Start logs
   include `free_GiB=`.
 
+### Removed
+
+- **Dead production APIs:** SH catalog materialize is always k-way (no
+  fan-in reduce / CHECKPOINT / READY, no `RBITCOIN_SH_MERGE_FANIN` /
+  `TARGET_RUN_BYTES` / `MAX_DIRECT_MERGE`). One catalog write policy (no
+  L0 / paced IBD / DURABLE alias). Unused Store `*_at` body helpers,
+  `header_head_occupied`, `header_body_contains`, `flush_index_tables`,
+  `for_each_strong`, `BlockQueue::load_all`. `RBITCOIN_IO=mmap` is no
+  longer a silent pread. No-op SH `stop_and_drain_spills` and unused
+  `archive_plan_batch_from` / `archive_plan_batch_owned` wrappers.
+  Unused `NodeClock::mock_value`, `ChainParams::min_difficulty_target`,
+  `outbound_for_ibd`, `InvalidHashSet::{mark_path,is_invalid_fn}`,
+  `MempoolHub::mining_frontier_snapshot`, `ConfirmParentCache::get_header_plan_arc`,
+  `NodeConfig::with_datadir_cold`. RecentCreates identity **and** outs stay.
+
 ### Fixed
 
 - **Tip `--sptweaks` write-through:** after backfill completes, every tip

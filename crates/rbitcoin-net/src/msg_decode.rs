@@ -109,22 +109,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message::NetworkMessage;
     use bitcoin::p2p::Magic;
     use bitcoin::Network;
     use std::sync::{Arc, Mutex};
 
     fn verack_frame() -> FramedMessage {
-        let magic = Magic::from(Network::Regtest);
-        let payload = Vec::<u8>::new();
-        let dig = bitcoin::hashes::sha256d::Hash::hash(&payload);
-        let ba = dig.to_byte_array();
         FramedMessage {
-            magic,
+            magic: Magic::from(Network::Regtest),
             command: *b"verack\0\0\0\0\0\0",
-            checksum: [ba[0], ba[1], ba[2], ba[3]],
-            payload,
+            payload: Vec::new(),
         }
     }
 

@@ -463,32 +463,32 @@ When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
 - **C-M5.** Script-pool `failed` uses Acquire loads / Release store (with
-  existing increment-then-check). This PR.
+  existing increment-then-check). #247.
 - **C-M6.** Signet last exact 38-byte BIP141 commitment + Core
   `BLOCK_SCRIPT_VERIFY_FLAGS` (P2SH|WITNESS|DERSIG|NULLDUMMY, no CLEANSTACK).
   Pins: `witness_commitment_index_last_exact_38_byte`,
   `signet_challenge_op_true_twice_is_not_cleanstack`,
-  `signet_challenge_p2wpkh_empty_witness_rejected`. This PR.
+  `signet_challenge_p2wpkh_empty_witness_rejected`. #247.
 - **C-M4.** `assemble_run` runs future-time + BIP34/66/65 nVersion on every
   block (`check_header_version_and_future_time`). Pins:
   `check_header_version_and_future_time_regtest`,
-  `assemble_second_block_rejects_stale_nversion`. This PR.
+  `assemble_second_block_rejects_stale_nversion`. #247.
 - **C-M7.** Witness sigops only after segwit (`prevout_spk_sigops` / `flag_segwit`).
-  Pin: `witness_sigops_gated_on_segwit`. This PR.
-- **C-M3.** P2SH sigops abort on scriptSig opcode `> OP_16` (`p2sh_sigops_non_push_scriptsig_is_zero`). This PR.
-- **C-M2.** Regtest subsidy halves every 150 (`p1_block_subsidy_halvings`). This PR.
-- **C-M1.** Coinbase empty `vout` rejected (`s13_rejects_coinbase_empty_vout`). This PR.
+  Pin: `witness_sigops_gated_on_segwit`. #247.
+- **C-M3.** P2SH sigops abort on scriptSig opcode `> OP_16` (`p2sh_sigops_non_push_scriptsig_is_zero`). #247.
+- **C-M2.** Regtest subsidy halves every 150 (`p1_block_subsidy_halvings`). #247.
+- **C-M1.** Coinbase empty `vout` rejected (`s13_rejects_coinbase_empty_vout`). #247.
 - **C-H4.** Testnet 20-minute min-difficulty (`allow_min_difficulty_blocks`)
   and walk-back to last non-powLimit bits. Pin: `testnet_min_difficulty_after_20_minute_gap`.
-  This PR.
+  #247.
 - **C-H3.** P2SH scriptSig is `eval_script` + IsPushOnly (`OP_1NEGATE` accepted;
   >10 000-byte scriptSig rejected). Pins: `p2sh_legacy_op_1negate_scriptsig_accepted`,
-  `p2sh_legacy_scriptsig_over_10k_rejected`. This PR.
+  `p2sh_legacy_scriptsig_over_10k_rejected`. #247.
 - **C-H1.** BIP342 tapscript validation-weight budget (`50 + witness size`,
   −50 per nonempty CHECKSIG*). Pin: `script_path_rejects_tapscript_validation_weight`.
-  This PR.
+  #247.
 - **C-H2.** `script_sigop_count` stops on truncated PUSHDATA2/4 (Core `GetOp`).
-  Pin: `truncated_pushdata2_does_not_count_leftover_checksig`. This PR.
+  Pin: `truncated_pushdata2_does_not_count_leftover_checksig`. #247.
 - **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). [#244](https://github.com/reardencode/rbitcoin/pull/244).
 - **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. [#244](https://github.com/reardencode/rbitcoin/pull/244). Durable `nChainWork` column not done.
 - **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).

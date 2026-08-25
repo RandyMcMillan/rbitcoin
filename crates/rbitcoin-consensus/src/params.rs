@@ -129,6 +129,18 @@ impl ChainParams {
         self.btc.no_pow_retargeting
     }
 
+    pub fn allow_min_difficulty_blocks(&self) -> bool {
+        self.btc.allow_min_difficulty_blocks
+    }
+
+    pub fn subsidy_halving_interval(&self) -> u32 {
+        if self.network == Network::Regtest {
+            150
+        } else {
+            210_000
+        }
+    }
+
     /// Coinbase maturity in blocks (Core default).
     pub fn coinbase_maturity(&self) -> u32 {
         100
@@ -565,6 +577,7 @@ mod tests {
         assert_eq!(tn.taproot_height(), 2_011_968);
         assert_eq!(tn.coinbase_maturity(), 100);
         assert!(!tn.no_pow_retargeting());
+        assert!(tn.allow_min_difficulty_blocks());
         assert!(tn.difficulty_adjustment_interval() > 0);
         assert!(tn.bip34_active_at(tn.btc.bip34_height));
         assert!(tn.bip65_active_at(tn.btc.bip65_height));

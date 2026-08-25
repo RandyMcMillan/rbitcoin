@@ -11,8 +11,8 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, Block, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
+use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
-use crate::script::interpreter::{self, EvalContext, SigVersion};
 
 /// BIP325 magic prefix inside the witness commitment push.
 const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
@@ -164,19 +164,7 @@ fn push_data(out: &mut Vec<u8>, data: &[u8]) {
 }
 
 fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
-    for (i, out) in coinbase.output.iter().enumerate() {
-        let b = out.script_pubkey.as_bytes();
-        if b.len() >= 6 && b[0] == 0x6a {
-            if find_subslice(b, &[0xaa, 0x21, 0xa9, 0xed]).is_some() {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+    crate::block::witness_commitment_vout_index(coinbase)
 }
 
 /// Extract signet solution after SIGNET_HEADER; return (solution, rewritten script).
@@ -365,36 +353,23 @@ fn verify_challenge_spend(
     to_sign: &Transaction,
     challenge: &Script,
 ) -> Result<(), ConsensusError> {
-    let prevout = &to_spend.output[0];
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    interpreter::eval_script_sig_pushes(to_sign.input[0].script_sig.as_script(), &mut stack)
-        .map_err(|_| ConsensusError::BadBlock("signet solution invalid"))?;
-    let wit = &to_sign.input[0].witness;
-    for i in 0..wit.len() {
-        if let Some(item) = wit.nth(i) {
-            stack.push(item.to_vec());
-        }
-    }
-
-    let prevouts = [prevout.clone()];
-    let ctx = EvalContext::new(
-        to_sign,
-        0,
-        prevout.value,
-        &prevouts,
-        challenge,
-        SigVersion::Base,
+    let prevout = TxOut {
+        value: to_spend.output[0].value,
+        script_pubkey: ScriptBuf::from_bytes(challenge.as_bytes().to_vec()),
+    };
+    let mut job = ScriptCheckJob::new(
+        vec![prevout],
+        to_sign.clone(),
+        false,
+        false,
+        true,
+        true,
+        false,
     );
-    match interpreter::eval_script(challenge, &mut stack, &ctx) {
-        Ok(need_clean) => {
-            if need_clean {
-                interpreter::require_clean_true(&stack)
-                    .map_err(|_| ConsensusError::BadBlock("signet solution invalid"))?;
-            }
-            Ok(())
-        }
-        Err(_) => Err(ConsensusError::BadBlock("signet solution invalid")),
-    }
+    job.null_dummy = true;
+    job.witness_active = true;
+    crate::script::verify_job_all_inputs(&job)
+        .map_err(|_| ConsensusError::BadBlock("signet solution invalid"))
 }
 
 #[cfg(test)]
@@ -665,8 +640,96 @@ mod tests {
         let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
         let block: Block = deserialize(raw).unwrap();
         assert!(witness_commitment_index(&block.txdata[0]).is_some());
-        assert!(find_subslice(b"hello world", b"world").is_some());
-        assert!(find_subslice(b"abc", b"xyz").is_none());
+    }
+
+    fn bip141_commitment_spk(hash_byte: u8) -> Vec<u8> {
+        let mut v = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        v.extend(std::iter::repeat_n(hash_byte, 32));
+        v
+    }
+
+    fn coinbase_outputs(spks: Vec<Vec<u8>>) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: spks
+                .into_iter()
+                .map(|script_pubkey| TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(script_pubkey),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn witness_commitment_index_last_exact_38_byte() {
+        let first = bip141_commitment_spk(0x00);
+        let last = bip141_commitment_spk(0x11);
+        let tx = coinbase_outputs(vec![first, last]);
+        assert_eq!(witness_commitment_index(&tx), Some(1));
+
+        let substring = vec![0x6a, 0x04, 0xaa, 0x21, 0xa9, 0xed];
+        let tx = coinbase_outputs(vec![substring, bip141_commitment_spk(0x22)]);
+        assert_eq!(witness_commitment_index(&tx), Some(1));
+
+        let only_sub = coinbase_outputs(vec![vec![0x6a, 0x04, 0xaa, 0x21, 0xa9, 0xed]]);
+        assert!(witness_commitment_index(&only_sub).is_none());
+    }
+
+    fn challenge_pair(spk: ScriptBuf) -> (Transaction, Transaction) {
+        let to_spend = Transaction {
+            version: bitcoin::transaction::Version::non_standard(0),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ZERO,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: spk,
+            }],
+        };
+        let txid = to_spend.compute_txid();
+        let to_sign = Transaction {
+            version: bitcoin::transaction::Version::non_standard(0),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ZERO,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+            }],
+        };
+        (to_spend, to_sign)
+    }
+
+    #[test]
+    fn signet_challenge_op_true_twice_is_not_cleanstack() {
+        let challenge = ScriptBuf::from_bytes(vec![0x51, 0x51]);
+        let (to_spend, to_sign) = challenge_pair(challenge.clone());
+        verify_challenge_spend(&to_spend, &to_sign, challenge.as_script()).unwrap();
+    }
+
+    #[test]
+    fn signet_challenge_p2wpkh_empty_witness_rejected() {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend([0u8; 20]);
+        let challenge = ScriptBuf::from_bytes(spk);
+        let (to_spend, to_sign) = challenge_pair(challenge.clone());
+        assert!(verify_challenge_spend(&to_spend, &to_sign, challenge.as_script()).is_err());
     }
 
     #[test]

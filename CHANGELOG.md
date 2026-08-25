@@ -139,6 +139,43 @@ before 1.0).
 
 ### Fixed
 
+- **Script-pool wave `failed` is Acquire/Release:** a worker cannot enter
+  a wave after the publisher observed `in_wave == 0` (ARM).
+
+- **Signet matches Core BIP141 last-commitment + challenge flags:** last
+  exact 38-byte `6a24aa21a9ed` output; verify with P2SH, WITNESS, DERSIG,
+  NULLDUMMY (not CLEANSTACK / Base-only eval).
+
+- **Assemble checks future-time and BIP34/66/65 nVersion on every block,**
+  not only headers-first `validate_header` (pipelined / multi-block confirm).
+
+- **Witness sigops only after segwit:** `GetTransactionSigOpCost` witness
+  component is gated on `segwit_active_at` (pre-segwit P2WPKH-shaped prevouts
+  no longer add 1).
+
+- **P2SH sigops match Core GetSigOpCount(scriptSig):** opcode `> OP_16` yields 0.
+
+- **Regtest subsidy halves every 150 blocks** (Core `nSubsidyHalvingInterval`).
+
+- **Coinbase (and every tx) with empty vout is rejected:** Core
+  `bad-txns-vout-empty`, including the coinbase.
+
+- **Testnet 20-minute min-difficulty:** off-interval headers with
+  `time > prev + 2×spacing` use powLimit bits; otherwise walk back to the last
+  non-min-diff block (Core `GetNextWorkRequired`).
+
+- **P2SH scriptSig matches Core EvalScript + IsPushOnly:** `OP_1NEGATE` is a
+  valid push; scriptSig >10 000 bytes is rejected. Finding 006 520-byte pin kept.
+
+- **BIP342 tapscript validation-weight budget:** script-path CHECKSIG /
+  CHECKSIGADD with a non-empty signature subtracts 50 from
+  `50 + witness_serialized_size`; remaining `< 0` fails (Core
+  `SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT`).
+
+- **Truncated PUSHDATA2/4 no longer counts leftover opcodes as sigops:**
+  `script_sigop_count` stops when the length field or body overruns, matching
+  Core `GetOp` / `GetSigOpCount` (`[0x4d, 0xac]` is 0, not 1).
+
 - **SIGINT after `clean exit` no longer waits on peer header walks:** tip-follow
   sessions walked pending headers with a store lookup per step (`knows_header` /
   `header_height`), so a 2000-header stale-fork reply could peg the Tokio

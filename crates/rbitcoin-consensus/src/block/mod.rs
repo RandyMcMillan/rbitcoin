@@ -165,6 +165,9 @@ pub fn validate_block_structure_with_pres(
 
     const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
+        if tx.output.is_empty() {
+            return Err(ConsensusError::BadTx("no outputs"));
+        }
         for o in &tx.output {
             if o.value.to_sat() > MAX_MONEY {
                 return Err(ConsensusError::BadBlock("bad-txns-vout-toolarge"));
@@ -210,13 +213,25 @@ pub fn validate_block_structure_with_pres(
 }
 
 fn coinbase_has_witness_commitment(block: &Block) -> bool {
+    block
+        .txdata
+        .first()
+        .and_then(witness_commitment_vout_index)
+        .is_some()
+}
+
+/// Last BIP141 `OP_RETURN` witness commitment (exact 38-byte `6a24aa21a9ed` prefix).
+pub(crate) fn witness_commitment_vout_index(coinbase: &Transaction) -> Option<usize> {
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    block.txdata.first().is_some_and(|cb| {
-        cb.output.iter().any(|o| {
-            let b = o.script_pubkey.as_bytes();
-            b.len() >= 38 && b[0..6] == MAGIC
+    coinbase
+        .output
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, out)| {
+            let b = out.script_pubkey.as_bytes();
+            (b.len() >= 38 && b[..6] == MAGIC).then_some(i)
         })
-    })
 }
 
 /// True if any input carries witness data.
@@ -285,44 +300,64 @@ pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
 
 pub(crate) use rbitcoin_primitives::script_sigop_count;
 
-/// Last data push in a script (P2SH redeem / witness script).
+/// Last push in a script for P2SH/BIP141 sigops (Core `CScript::GetSigOpCount(scriptSig)`).
+///
+/// Opcode `> OP_16` or a truncated push → no redeem (0 sigops). OP_N / OP_1NEGATE
+/// count as an empty push.
 fn last_script_push(script: &[u8]) -> Option<&[u8]> {
     let mut i = 0usize;
-    let mut last: Option<(usize, usize)> = None;
+    let mut last: &[u8] = &[];
     while i < script.len() {
         let opcode = script[i];
         i += 1;
-        let (start, len) = if opcode <= 0x4b {
+        if opcode > 0x60 {
+            return None;
+        }
+        if opcode <= 0x4b {
             let push = opcode as usize;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
-        } else if opcode == 0x4c && i < script.len() {
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
+        } else if opcode == 0x4c {
+            if i >= script.len() {
+                return None;
+            }
             let push = script[i] as usize;
             i += 1;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
-        } else if opcode == 0x4d && i + 1 < script.len() {
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
+        } else if opcode == 0x4d {
+            if i + 1 >= script.len() {
+                return None;
+            }
             let push = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
             i += 2;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
-        } else if opcode == 0x4e && i + 3 < script.len() {
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
+        } else if opcode == 0x4e {
+            if i + 3 >= script.len() {
+                return None;
+            }
             let push = u32::from_le_bytes(script[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
             i += 4;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
         } else {
-            continue;
-        };
-        if start + len <= script.len() {
-            last = Some((start, len));
+            last = &[];
         }
     }
-    last.map(|(s, l)| &script[s..s + l])
+    Some(last)
 }
 
 fn is_p2sh_script(spk: &[u8]) -> bool {
@@ -393,13 +428,16 @@ fn witness_sigop_count(tx: &Transaction, prev_spks: &[&[u8]]) -> u64 {
     n
 }
 
-fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool) -> u64 {
+fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool, segwit: bool) -> u64 {
     const WITNESS_SCALE: u64 = 4;
     let mut n = 0u64;
     if bip16 {
         n = n.saturating_add(p2sh_sigops_one(inp, spk).saturating_mul(WITNESS_SCALE));
     }
-    n.saturating_add(witness_sigops_one(inp, spk))
+    if segwit {
+        n = n.saturating_add(witness_sigops_one(inp, spk));
+    }
+    n
 }
 
 /// GBT `sigops`: Core `GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR`.
@@ -412,13 +450,15 @@ pub fn tx_gbt_sigops(tx: &Transaction) -> u64 {
 
 /// Full Core-style sigop cost for one tx given prevout scripts (BIP16 + BIP141).
 #[cfg(test)]
-fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool) -> u64 {
+fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool, segwit: bool) -> u64 {
     const WITNESS_SCALE: u64 = 4;
     let mut cost = legacy_sigop_count(tx).saturating_mul(WITNESS_SCALE);
     if bip16 {
         cost = cost.saturating_add(p2sh_sigop_count(tx, prev_spks).saturating_mul(WITNESS_SCALE));
     }
-    cost = cost.saturating_add(witness_sigop_count(tx, prev_spks));
+    if segwit {
+        cost = cost.saturating_add(witness_sigop_count(tx, prev_spks));
+    }
     cost
 }
 
@@ -429,21 +469,13 @@ fn check_witness_commitment_with_wtxids(
     block: &Block,
     precomputed_non_cb: &[[u8; 32]],
 ) -> Result<(), ConsensusError> {
-    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     let coinbase = &block.txdata[0];
-    let mut commitment: Option<[u8; 32]> = None;
-    for out in coinbase.output.iter().rev() {
-        let b = out.script_pubkey.as_bytes();
-        if b.len() >= 38 && b[0..6] == MAGIC {
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&b[6..38]);
-            commitment = Some(h);
-            break;
-        }
-    }
-    let Some(committed) = commitment else {
+    let Some(cidx) = witness_commitment_vout_index(coinbase) else {
         return Err(ConsensusError::BadBlock("missing witness commitment"));
     };
+    let b = coinbase.output[cidx].script_pubkey.as_bytes();
+    let mut committed = [0u8; 32];
+    committed.copy_from_slice(&b[6..38]);
 
     if precomputed_non_cb.len() != block.txdata.len().saturating_sub(1) {
         return Err(ConsensusError::BadBlock("wtxid count mismatch"));
@@ -1159,12 +1191,12 @@ fn assemble_block_prevouts_mode(
         if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
             return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
         }
+        if tx.output.is_empty() {
+            return Err(ConsensusError::BadTx("no outputs"));
+        }
         if ti > 0 {
             if tx.input.is_empty() {
                 return Err(ConsensusError::BadTx("no inputs"));
-            }
-            if tx.output.is_empty() {
-                return Err(ConsensusError::BadTx("no outputs"));
             }
 
             let mut value_in = 0i64;
@@ -1242,6 +1274,7 @@ fn assemble_block_prevouts_mode(
                     ctx.height.0,
                     mode == AssembleMode::Full,
                     bip16_for_jobs,
+                    flag_segwit,
                     build_script_jobs,
                     &mut acc,
                 )?;
@@ -1817,9 +1850,10 @@ pub(crate) fn verify_one_script_job(job: &ScriptCheckJob) -> Result<(), Consensu
     }
 }
 
-/// Halving subsidy (mainnet schedule; regtest uses same formula with params).
-pub fn block_subsidy(height: u32, _params: &ChainParams) -> i64 {
-    let halvings = height / 210_000;
+/// Halving subsidy. Regtest interval is 150; other networks 210_000 (Core).
+pub fn block_subsidy(height: u32, params: &ChainParams) -> i64 {
+    let interval = params.subsidy_halving_interval();
+    let halvings = height / interval;
     if halvings >= 64 {
         return 0;
     }
@@ -1943,6 +1977,7 @@ fn resolve_prevout(
     // Optimistic: prevout value/script only. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
     bip16: bool,
+    segwit: bool,
     need_script_buf: bool,
     acc: &mut AsmPrevoutAcc,
 ) -> Result<ResolvedPrevout, ConsensusError> {
@@ -1957,7 +1992,7 @@ fn resolve_prevout(
             acc.same_n = acc.same_n.saturating_add(1);
             return Ok(ResolvedPrevout {
                 txout: o.clone(),
-                input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16),
+                input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16, segwit),
                 coinbase_height: None,
                 create_height: if resolve_create_heights {
                     spend_height
@@ -2002,7 +2037,7 @@ fn resolve_prevout(
                             ScriptBuf::new()
                         },
                     },
-                    input_sigops: prevout_spk_sigops(inp, script, bip16),
+                    input_sigops: prevout_spk_sigops(inp, script, bip16, segwit),
                 }
             },
         ) {
@@ -2113,7 +2148,7 @@ fn resolve_prevout(
                 confirm_phase_stats::tl_note_cold_why_not_pin();
             }
         }
-        let input_sigops = prevout_spk_sigops(inp, &out.script, bip16);
+        let input_sigops = prevout_spk_sigops(inp, &out.script, bip16, segwit);
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),

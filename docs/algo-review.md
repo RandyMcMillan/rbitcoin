@@ -61,7 +61,7 @@ What the node actually runs. This is the map; findings follow.
 | Confirm queues | loadq=14, scriptq=4, writeq=14 | bounded sync channels |
 | Script pool | lock-free steal waves | `in_wave` + `failed` atomics |
 | Merkle | Bitcoin duplicate-last | CVE-2012-2459 covered by whole-block txid set |
-| Difficulty | Core retarget + 4× clamps | testnet 20-min min-diff **absent** |
+| Difficulty | Core retarget + 4× clamps | testnet 20-min min-diff |
 | MTP | 11-header median | store walk per header |
 
 ### Script engine
@@ -69,9 +69,9 @@ What the node actually runs. This is the map; findings follow.
 | Piece | Algorithm | Notes |
 |-------|-----------|--------|
 | `eval_script` | Core-shaped opcode walk | tapscript OP_SUCCESS pre-scan, 520 B stack |
-| CHECKSIG | DER lax + optional BIP66; Schnorr BIP340 | **no BIP342 validation-weight budget** |
-| P2SH | bespoke `push_only_items` parser | not `eval_script` of scriptSig |
-| Sigops | `script_sigop_count` byte walk | truncated PUSHDATA2/4 re-scanned as opcodes |
+| CHECKSIG | DER lax + optional BIP66; Schnorr BIP340 | BIP342 validation-weight budget |
+| P2SH | `eval_script` scriptSig then IsPushOnly | last stack item is redeem |
+| Sigops | `script_sigop_count` byte walk | truncated PUSHDATA2/4 stops (Core `GetOp`) |
 | Signet | challenge script + witness commitment | first-match prefix, not last 38-byte BIP141 |
 
 ### Net / IBD (`rbitcoin-net`)
@@ -106,69 +106,13 @@ What the node actually runs. This is the map; findings follow.
 |-------|-----------|--------|
 | CLI / conf | hand-rolled parsers | `milestone=0` in conf indistinguishable from unset |
 | Log | global level, no module filter | `format_args` not gated |
-| `script_sigop_count` | opcode walk | PUSHDATA2/4 truncated-length diverge from Core |
+| `script_sigop_count` | opcode walk | truncated PUSHDATA2/4 stops (Core `GetOp`) |
 
 ---
 
 ## 2. Highest-priority findings
 
 These are the ones worth a plan. ✔ = re-read against current source.
-
-### High — consensus
-
-#### C-H1. ✔ Missing BIP342 tapscript validation-weight budget
-
-`crates/rbitcoin-consensus/src/script/interpreter.rs` (`tapscript_sig_result`
-~974, `checksig_schnorr` ~1325, `OP_CHECKSIGADD` 0xba ~782).
-`crates/rbitcoin-consensus/src/script/p2tr.rs` script-path eval (~152).
-
-BIP342: per-input budget `50 + witness_serialized_size`, minus 50 for every
-executed CHECKSIG/CHECKSIGADD with a **non-empty** signature; negative fails
-(`script/interpreter.cpp` `EvalChecksigTapscript`). This engine has no budget
-field. A tapscript with many CHECKSIGs and a small witness is **accepted here
-and rejected by Core** — hard split on mainnet post-709632.
-
-Core's own `feature_taproot.py` has `ERR_TAPSCRIPT_VALIDATION_WEIGHT` (in-tree
-as `third_party/bitcoin/test/functional/feature_taproot.py`).
-
-**Fix:** thread `i64` remaining weight through `EvalContext`; subtract 50 on
-non-empty sig; fail if `< 0`. Pin with a synthetic tapscript over the 80 000
-sigop-style fixture pattern already used for milestone sigops.
-
-#### C-H2. ✔ `script_sigop_count` reinterprets truncated PUSHDATA2/4 as opcodes
-
-`crates/rbitcoin-primitives/src/script_sigops.rs:20-25`.
-
-If `OP_PUSHDATA2`/`OP_PUSHDATA4` does not have enough remaining bytes for the
-length field, the branch is skipped and the leftover bytes are counted as
-opcodes. Core `GetOp` fails and `GetSigOpCount` **stops**. Example: `[0x4d,
-0xac]` → Core 0, here 1 (`OP_CHECKSIG`). Feeds block `MAX_BLOCK_SIGOPS` and
-GBT. Attacker-controlled scriptPubKey.
-
-**Fix:** `break` when length bytes (or body) overrun, matching Core.
-
-#### C-H3. P2SH scriptSig parser diverges from Core (reject-valid + accept-invalid)
-
-`crates/rbitcoin-consensus/src/script/nested.rs` `push_only_items` /
-`split_script_sig_redeem` (~137–183), used by `verify_p2sh_legacy` (~85).
-
-- `OP_1NEGATE` (0x4f) rejected as not-a-push; Core `IsPushOnly` accepts every
-  opcode `≤ OP_16`. **Reject-valid** post-BIP16.
-- scriptSig is not run through `eval_script`, so 10 000-byte script and
-  1000-item stack limits never apply. **Accept-invalid**.
-
-`eval_script_sig_pushes` in `interpreter.rs` already handles 0x4f. One
-implementation at the lowest owner: evaluate scriptSig, snapshot stack.
-
-#### C-H4. Testnet 20-minute min-difficulty rule absent
-
-`crates/rbitcoin-consensus/src/header.rs:281-315` `expected_next_bits`.
-`no_pow_retargeting()` is honored (regtest). Off-interval blocks **always**
-reuse prev bits. Testnet3: if `block.time > prev.time + 20 min` → `powLimit`
-bits, else walk back to last non-min-diff block. Nearly every testnet3 header
-off a retarget boundary would fail. Mainnet unaffected.
-
-**Fix:** `params.allow_min_difficulty_blocks` like Core `GetNextWorkRequired`.
 
 ### High — store / concurrency
 
@@ -285,24 +229,7 @@ will loop.
 
 ### Consensus
 
-- **C-M1.** Coinbase with zero outputs accepted (`block/mod.rs` ~1162):
-  `vout.empty()` check is inside `ti > 0`. Core rejects all empty vout.
-- **C-M2.** `block_subsidy` ignores `ChainParams` (`block/mod.rs` ~1848):
-  hardcoded 210 000. Regtest halves every 150 in Core.
-- **C-M3.** P2SH sigop `last_script_push` skips non-push opcodes instead of
-  returning 0. Observable under milestone (scripts skipped).
-- **C-M4.** Pipelined `assemble_run` skips future-time and BIP34/66/65
-  nVersion; relies on headers-first having run `validate_header`. Tip-ahead
-  / block-first is the gap.
-- **C-M5.** Script-pool `failed` is `Relaxed`; worker can enter a wave after
-  the publisher observed `in_wave == 0` (ARM). Increment-then-check +
-  Acquire/Release.
-- **C-M6.** Signet: first output with 6-byte magic vs Core last 38-byte
-  BIP141 prefix; `SigVersion::Base` for challenge; `null_dummy: false`;
-  CLEANSTACK extra. Default 1-of-2 signet honest path OK; custom/adversarial
-  diverges. Reuse `block/mod.rs` reverse commitment scan.
-- **C-M7.** Witness sigops counted pre-segwit (`prevout_spk_sigops`).
-  Overcount-only.
+*(none remaining)*
 
 ### Query
 
@@ -418,9 +345,7 @@ a mainnet miss).
 
 Do not flatten io_uring machines. Do not add a process pin FIFO.
 
-1. **P2SH:** delete `push_only_items`; `eval_script` the scriptSig (fixes C-H3).
-2. **Signet commitment:** reuse BIP141 reverse scan (fixes C-M6).
-3. **Chain work:** one cumulative index (fixes N-H3 + RPC P2).
+2. **Chain work:** one cumulative index (fixes N-H3 + RPC P2).
 4. **Wtxid:** secondary `HashMap` (fixes N-H2).
 5. **Mempool eviction:** `BinaryHeap` of cluster worst-rate (fixes P3).
 6. **Mempool slots:** free list (fixes P13).
@@ -502,7 +427,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
 | store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
-| consensus + primitives | 4 (BIP342 weight, sigops pushdata, P2SH parser, testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
+| consensus + primitives | 0 | pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
@@ -518,16 +443,13 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **C-H1 BIP342 validation weight** + **C-H2 sigop pushdata** + **C-H3 P2SH
-   eval_script** — consensus; pin with Core-shaped fixtures. Closest to
-   `docs/quality.md` pillar 1.
-2. **S-H1 HashHead seqlock/epoch** — false misses during grow.
-3. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
-4. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
-5. Electrum status **ordering**; decide COMPAT vs spec for the extra
+1. **S-H1 HashHead seqlock/epoch** — false misses during grow.
+2. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
+3. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
+4. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
-6. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-7. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
+5. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+6. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
    v2 decode, and MTP ring are closed.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
@@ -540,6 +462,33 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-M5.** Script-pool `failed` uses Acquire loads / Release store (with
+  existing increment-then-check). #247.
+- **C-M6.** Signet last exact 38-byte BIP141 commitment + Core
+  `BLOCK_SCRIPT_VERIFY_FLAGS` (P2SH|WITNESS|DERSIG|NULLDUMMY, no CLEANSTACK).
+  Pins: `witness_commitment_index_last_exact_38_byte`,
+  `signet_challenge_op_true_twice_is_not_cleanstack`,
+  `signet_challenge_p2wpkh_empty_witness_rejected`. #247.
+- **C-M4.** `assemble_run` runs future-time + BIP34/66/65 nVersion on every
+  block (`check_header_version_and_future_time`). Pins:
+  `check_header_version_and_future_time_regtest`,
+  `assemble_second_block_rejects_stale_nversion`. #247.
+- **C-M7.** Witness sigops only after segwit (`prevout_spk_sigops` / `flag_segwit`).
+  Pin: `witness_sigops_gated_on_segwit`. #247.
+- **C-M3.** P2SH sigops abort on scriptSig opcode `> OP_16` (`p2sh_sigops_non_push_scriptsig_is_zero`). #247.
+- **C-M2.** Regtest subsidy halves every 150 (`p1_block_subsidy_halvings`). #247.
+- **C-M1.** Coinbase empty `vout` rejected (`s13_rejects_coinbase_empty_vout`). #247.
+- **C-H4.** Testnet 20-minute min-difficulty (`allow_min_difficulty_blocks`)
+  and walk-back to last non-powLimit bits. Pin: `testnet_min_difficulty_after_20_minute_gap`.
+  #247.
+- **C-H3.** P2SH scriptSig is `eval_script` + IsPushOnly (`OP_1NEGATE` accepted;
+  >10 000-byte scriptSig rejected). Pins: `p2sh_legacy_op_1negate_scriptsig_accepted`,
+  `p2sh_legacy_scriptsig_over_10k_rejected`. #247.
+- **C-H1.** BIP342 tapscript validation-weight budget (`50 + witness size`,
+  −50 per nonempty CHECKSIG*). Pin: `script_path_rejects_tapscript_validation_weight`.
+  #247.
+- **C-H2.** `script_sigop_count` stops on truncated PUSHDATA2/4 (Core `GetOp`).
+  Pin: `truncated_pushdata2_does_not_count_leftover_checksig`. #247.
 - **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). [#244](https://github.com/reardencode/rbitcoin/pull/244).
 - **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. [#244](https://github.com/reardencode/rbitcoin/pull/244). Durable `nChainWork` column not done.
 - **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).

@@ -2676,9 +2676,6 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
             Network::Testnet => rbitcoin_consensus::ChainParams::testnet(),
             Network::Mainnet => rbitcoin_consensus::ChainParams::mainnet(),
         });
-    let bits = rbitcoin_consensus::expected_next_bits(ctx.query.as_ref(), &params, Height(next_h))
-        .map(|c| c.to_consensus())
-        .unwrap_or(tip_bits);
     let now = ctx
         .chain
         .as_ref()
@@ -2690,6 +2687,14 @@ fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
                 .unwrap_or(0)
         });
     let curtime = tip_time.saturating_add(1).max(now);
+    let bits = rbitcoin_consensus::expected_next_bits(
+        ctx.query.as_ref(),
+        &params,
+        Height(next_h),
+        curtime,
+    )
+    .map(|c| c.to_consensus())
+    .unwrap_or(tip_bits);
     let mintime = if tip_h == 0 {
         tip_time
     } else {
@@ -2800,10 +2805,14 @@ fn gbt_check_proposal(ctx: &RpcContext, block: &Block) -> Result<(), String> {
             Network::Testnet => rbitcoin_consensus::ChainParams::testnet(),
             Network::Mainnet => rbitcoin_consensus::ChainParams::mainnet(),
         });
-    let expected =
-        rbitcoin_consensus::expected_next_bits(ctx.query.as_ref(), &params, Height(height))
-            .map(|c| c.to_consensus())
-            .unwrap_or(tip_rec.bits);
+    let expected = rbitcoin_consensus::expected_next_bits(
+        ctx.query.as_ref(),
+        &params,
+        Height(height),
+        block.header.time,
+    )
+    .map(|c| c.to_consensus())
+    .unwrap_or(tip_rec.bits);
     if block.header.bits.to_consensus() != expected {
         return Err("bad-diffbits".into());
     }

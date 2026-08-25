@@ -1,8 +1,8 @@
 //! sigop_cost_tests (peeled from block.rs).
 
 use super::{
-    is_p2sh_script, last_script_push, p2sh_sigop_count, script_sigop_count, tx_gbt_sigops,
-    tx_sigop_cost, witness_sigop_count,
+    is_p2sh_script, last_script_push, p2sh_sigop_count, prevout_spk_sigops, script_sigop_count,
+    tx_gbt_sigops, tx_sigop_cost, witness_sigop_count,
 };
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
@@ -43,25 +43,48 @@ fn gbt_sigops_scales_legacy_checksig() {
 
 #[test]
 fn last_push_pushdata_and_non_push_skip() {
-    // OP_PUSHDATA1 / 2 / 4 last push + non-push opcode continues.
-    let mut sc = vec![0x51]; // OP_1 (not a data push for last_script_push)
-    sc.extend_from_slice(&[0x4c, 0x02, 0xab, 0xcd]); // PUSHDATA1 2
+    let mut sc = vec![0x51];
+    sc.extend_from_slice(&[0x4c, 0x02, 0xab, 0xcd]);
     assert_eq!(last_script_push(&sc), Some(&[0xabu8, 0xcd][..]));
 
-    let mut sc2 = vec![0x4d, 0x02, 0x00, 0x11, 0x22]; // PUSHDATA2
-    sc2.extend_from_slice(&[0xac]); // CHECKSIG after
-    assert_eq!(last_script_push(&sc2), Some(&[0x11u8, 0x22][..]));
+    let mut sc2 = vec![0x4d, 0x02, 0x00, 0x11, 0x22];
+    sc2.extend_from_slice(&[0xac]);
+    assert!(last_script_push(&sc2).is_none());
 
-    let sc3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xee]; // PUSHDATA4 len=1
+    let sc3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xee];
     assert_eq!(last_script_push(&sc3), Some(&[0xeeu8][..]));
 
-    // Truncated push ignored.
     assert!(last_script_push(&[0x4c, 0x05, 0x01]).is_none());
     assert!(last_script_push(&[0x4e, 0x10, 0x00, 0x00, 0x00]).is_none());
+    assert_eq!(last_script_push(&[0x02, 0xaa, 0xbb, 0x51]), Some(&[][..]));
     assert!(is_p2sh_script(&[
         0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x87
     ]));
     assert!(!is_p2sh_script(&[0x51]));
+}
+
+#[test]
+fn p2sh_sigops_non_push_scriptsig_is_zero() {
+    let redeem = vec![0xac; 20];
+    let mut ss = vec![redeem.len() as u8];
+    ss.extend_from_slice(&redeem);
+    ss.push(0x61);
+    let mut p2sh = vec![0xa9, 0x14];
+    p2sh.extend_from_slice(&[0u8; 20]);
+    p2sh.push(0x87);
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(ss),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![],
+    };
+    let spk = p2sh.as_slice();
+    assert_eq!(p2sh_sigop_count(&tx, &[spk]), 0);
 }
 
 #[test]
@@ -137,7 +160,7 @@ fn p2sh_and_witness_sigop_paths() {
         script_pubkey: ScriptBuf::from_bytes(spk2),
     }];
     assert!(p2sh_sigop_count(&tx2, &spks(&prev2)) >= 1);
-    assert!(tx_sigop_cost(&tx2, &spks(&prev2), true) >= 4);
+    assert!(tx_sigop_cost(&tx2, &spks(&prev2), true, true) >= 4);
     // Nested P2SH without redeem push → continue (0 witness sigops).
     let tx3 = Transaction {
         version: TxVersion::TWO,
@@ -231,7 +254,7 @@ fn p2sh_sigops_from_redeem() {
     }];
     assert_eq!(p2sh_sigop_count(&tx, &spks(&prevouts)), 1);
     // legacy×4 + p2sh×4 = 0 + 4 (no legacy CHECKSIG in ss/spk for bare count of redeem)
-    let cost = tx_sigop_cost(&tx, &spks(&prevouts), true);
+    let cost = tx_sigop_cost(&tx, &spks(&prevouts), true, true);
     // scriptSig has push only (0 legacy), output OP_1 (0), p2sh redeem 1×4 = 4
     assert_eq!(cost, 4);
 }
@@ -262,6 +285,38 @@ fn witness_p2wpkh_counts_one() {
         script_pubkey: ScriptBuf::from_bytes(spk),
     }];
     assert_eq!(witness_sigop_count(&tx, &spks(&prevouts)), 1);
+}
+
+#[test]
+fn witness_sigops_gated_on_segwit() {
+    let mut spk = vec![0x00, 0x14];
+    spk.extend([0u8; 20]);
+    let inp = TxIn {
+        previous_output: OutPoint {
+            txid: Txid::from_byte_array([2; 32]),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    assert_eq!(prevout_spk_sigops(&inp, &spk, false, false), 0);
+    assert_eq!(prevout_spk_sigops(&inp, &spk, false, true), 1);
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![inp],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let prevouts = vec![TxOut {
+        value: Amount::from_sat(10),
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    }];
+    assert_eq!(tx_sigop_cost(&tx, &spks(&prevouts), false, false), 0);
+    assert_eq!(tx_sigop_cost(&tx, &spks(&prevouts), false, true), 1);
 }
 
 #[test]
@@ -457,7 +512,7 @@ fn job_tx_traits_and_shared_mut_panic() {
     }));
     assert!(r.is_err(), "shared JobTx must panic on DerefMut");
 
-    let p = ChainParams::regtest();
+    let p = ChainParams::mainnet();
     assert_eq!(block_subsidy(0, &p), 50 * 100_000_000);
     assert_eq!(block_subsidy(210_000, &p), 25 * 100_000_000);
     assert_eq!(block_subsidy(6_930_000, &p), 0);

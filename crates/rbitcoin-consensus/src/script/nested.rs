@@ -38,7 +38,7 @@ pub(crate) fn try_p2sh_nested_segwit(
     }
 
     let script_sig = &tx.input[input_index].script_sig;
-    let items = match push_only_items(script_sig) {
+    let items = match p2sh_script_sig_stack(job, input_index, tx) {
         Ok(i) => i,
         Err(e) => return Some(Err(e)),
     };
@@ -87,8 +87,11 @@ pub(crate) fn verify_p2sh_legacy(
     input_index: usize,
     tx: &Transaction,
 ) -> Result<(), ConsensusError> {
-    let input = &tx.input[input_index];
-    let (mut stack, redeem) = split_script_sig_redeem(input.script_sig.as_script())?;
+    let mut stack = p2sh_script_sig_stack(job, input_index, tx)?;
+    if stack.is_empty() {
+        return Err(ConsensusError::Script("p2sh empty scriptSig".into()));
+    }
+    let redeem = stack.pop().unwrap();
     check_p2sh_redeem_hash(job.prevouts[input_index].script_pubkey.as_bytes(), &redeem)?;
 
     let redeem_script = Script::from_bytes(&redeem);
@@ -98,6 +101,37 @@ pub(crate) fn verify_p2sh_legacy(
         interpreter::require_true_top(&stack)?;
     }
     Ok(())
+}
+
+/// Core `CScript::IsPushOnly`: every opcode ≤ OP_16 (includes OP_1NEGATE / OP_RESERVED).
+fn script_is_push_only(script: &Script) -> bool {
+    for ins in script.instructions() {
+        match ins {
+            Ok(Instruction::PushBytes(_)) => {}
+            Ok(Instruction::Op(op)) => {
+                if op.to_u8() > 0x60 {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn p2sh_script_sig_stack(
+    job: &ScriptCheckJob,
+    input_index: usize,
+    tx: &Transaction,
+) -> Result<Vec<Vec<u8>>, ConsensusError> {
+    let script_sig = tx.input[input_index].script_sig.as_script();
+    let ctx = EvalContext::from_job(job, tx, input_index, script_sig, SigVersion::Base);
+    let mut stack = Vec::new();
+    let _ = interpreter::eval_script(script_sig, &mut stack, &ctx)?;
+    if !script_is_push_only(script_sig) {
+        return Err(ConsensusError::Script("p2sh scriptSig op".into()));
+    }
+    Ok(stack)
 }
 
 /// P2SH spk shape + HASH160(redeem) match (shared by nested and legacy paths).
@@ -114,15 +148,6 @@ fn check_p2sh_redeem_hash(spk: &[u8], redeem: &[u8]) -> Result<(), ConsensusErro
     Ok(())
 }
 
-/// Core `MAX_SCRIPT_ELEMENT_SIZE` on a collected push (P2SH scriptSig path).
-#[inline]
-fn push_item_checked(bytes: &[u8]) -> Result<Vec<u8>, ConsensusError> {
-    if bytes.len() > interpreter::MAX_SCRIPT_ELEMENT_SIZE {
-        return Err(ConsensusError::Script("PUSH_SIZE".into()));
-    }
-    Ok(bytes.to_vec())
-}
-
 /// Minimal `CScript() << data` encoding for data lengths 0..=75 (witness-program redeems).
 fn minimal_push_encoding(data: &[u8]) -> Vec<u8> {
     // Witness-program scripts are 4..=42 bytes → always direct OP_PUSHBYTES_n.
@@ -131,55 +156,6 @@ fn minimal_push_encoding(data: &[u8]) -> Vec<u8> {
     v.push(data.len() as u8);
     v.extend_from_slice(data);
     v
-}
-
-/// Collect push-only items from scriptSig (OP_0 / OP_1..16 / PushBytes). Non-push → Err.
-/// Enforces [`interpreter::MAX_SCRIPT_ELEMENT_SIZE`] on every data push (Core EvalScript).
-fn push_only_items(
-    script_sig: &bitcoin::script::ScriptBuf,
-) -> Result<Vec<Vec<u8>>, ConsensusError> {
-    let mut items = Vec::new();
-    for ins in script_sig.instructions() {
-        match ins.map_err(|_| ConsensusError::Script("p2sh scriptSig".into()))? {
-            Instruction::PushBytes(b) => items.push(push_item_checked(b.as_bytes())?),
-            Instruction::Op(op) => {
-                let n = op.to_u8();
-                if n == 0x00 {
-                    items.push(vec![]);
-                } else if (0x51..=0x60).contains(&n) {
-                    items.push(vec![n - 0x50]);
-                } else {
-                    return Err(ConsensusError::Script("p2sh scriptSig op".into()));
-                }
-            }
-        }
-    }
-    Ok(items)
-}
-
-/// All pushes except the last form the initial stack; last push is redeemScript.
-fn split_script_sig_redeem(script: &Script) -> Result<(Vec<Vec<u8>>, Vec<u8>), ConsensusError> {
-    let mut items = Vec::new();
-    for ins in script.instructions() {
-        match ins.map_err(|_| ConsensusError::Script("p2sh scriptSig".into()))? {
-            Instruction::PushBytes(b) => items.push(push_item_checked(b.as_bytes())?),
-            Instruction::Op(op) => {
-                let n = op.to_u8();
-                if n == 0x00 {
-                    items.push(vec![]);
-                } else if (0x51..=0x60).contains(&n) {
-                    items.push(vec![n - 0x50]);
-                } else {
-                    return Err(ConsensusError::Script("p2sh scriptSig op".into()));
-                }
-            }
-        }
-    }
-    if items.is_empty() {
-        return Err(ConsensusError::Script("p2sh empty scriptSig".into()));
-    }
-    let redeem = items.pop().unwrap();
-    Ok((items, redeem))
 }
 
 #[cfg(test)]
@@ -246,35 +222,37 @@ mod tests {
         }
     }
 
+    fn stack_for(ss: ScriptBuf) -> Result<Vec<Vec<u8>>, ConsensusError> {
+        let mut tx = dummy_tx();
+        tx.input[0].script_sig = ss;
+        let job = job_for(tx, p2sh_spk(&[0x51]), true);
+        p2sh_script_sig_stack(&job, 0, &*job.tx)
+    }
+
     #[test]
     fn push_only_and_split_helpers() {
-        // Multi-push collects both items
-        let multi = ScriptBuf::from_bytes(vec![0x01, 0xaa, 0x01, 0xbb]);
         assert_eq!(
-            push_only_items(&multi).unwrap(),
+            stack_for(ScriptBuf::from_bytes(vec![0x01, 0xaa, 0x01, 0xbb])).unwrap(),
             vec![vec![0xaa], vec![0xbb]]
         );
-        // OP_1 as push
-        let op = ScriptBuf::from_bytes(vec![0x51]);
-        assert_eq!(push_only_items(&op).unwrap(), vec![vec![0x01]]);
-        // Single push
-        let one = ScriptBuf::from_bytes(vec![0x02, 0xde, 0xad]);
-        assert_eq!(push_only_items(&one).unwrap(), vec![vec![0xde, 0xad]]);
-        // Malformed truncated push → Err
-        let bad = ScriptBuf::from_bytes(vec![0x05, 0x01]);
-        assert!(push_only_items(&bad).is_err());
-        // Non-push opcode → Err
-        assert!(push_only_items(&ScriptBuf::from_bytes(vec![0xac])).is_err());
+        assert_eq!(
+            stack_for(ScriptBuf::from_bytes(vec![0x51])).unwrap(),
+            vec![vec![0x01]]
+        );
+        assert_eq!(
+            stack_for(ScriptBuf::from_bytes(vec![0x02, 0xde, 0xad])).unwrap(),
+            vec![vec![0xde, 0xad]]
+        );
+        assert!(stack_for(ScriptBuf::from_bytes(vec![0x05, 0x01])).is_err());
+        assert!(stack_for(ScriptBuf::from_bytes(vec![0xac])).is_err());
+        assert!(!script_is_push_only(Script::from_bytes(&[0xac])));
+        assert!(script_is_push_only(Script::from_bytes(&[0x4f, 0x51])));
 
-        // split: OP_0 and OP_1 as stack items
-        let ss = Script::from_bytes(&[0x00, 0x51, 0x01, 0xac]);
-        let (stack, redeem) = split_script_sig_redeem(ss).unwrap();
-        assert_eq!(stack, vec![vec![], vec![0x01]]);
+        let mut items = stack_for(ScriptBuf::from_bytes(vec![0x00, 0x51, 0x01, 0xac])).unwrap();
+        let redeem = items.pop().unwrap();
+        assert_eq!(items, vec![vec![], vec![0x01]]);
         assert_eq!(redeem, vec![0xac]);
-        // empty
-        assert!(split_script_sig_redeem(Script::from_bytes(&[])).is_err());
-        // unexpected op
-        assert!(split_script_sig_redeem(Script::from_bytes(&[0xac])).is_err());
+        assert!(stack_for(ScriptBuf::new()).unwrap().is_empty());
     }
 
     /// Finding 006: Core MAX_SCRIPT_ELEMENT_SIZE on every P2SH scriptSig push.
@@ -298,13 +276,46 @@ mod tests {
         let err = verify_p2sh_legacy(&job, 0, &*job.tx).expect_err("PUSH_SIZE");
         let msg = format!("{err}");
         assert!(
-            msg.contains("PUSH_SIZE") || msg.contains("520") || msg.contains("element"),
+            msg.contains("PUSH_SIZE")
+                || msg.contains("520")
+                || msg.contains("element")
+                || msg.contains("push too large"),
             "expected PUSH_SIZE-class error, got {err}"
         );
+    }
 
-        // Collector helpers fail the same way.
-        assert!(push_only_items(&job.tx.input[0].script_sig).is_err());
-        assert!(split_script_sig_redeem(job.tx.input[0].script_sig.as_script()).is_err());
+    #[test]
+    fn p2sh_legacy_op_1negate_scriptsig_accepted() {
+        let redeem = vec![0x75, 0x51];
+        let mut ss = vec![0x4f];
+        ss.push(redeem.len() as u8);
+        ss.extend_from_slice(&redeem);
+        let mut tx = dummy_tx();
+        tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
+        let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
+        verify_p2sh_legacy(&job, 0, &*job.tx).expect("OP_1NEGATE is a P2SH push");
+    }
+
+    #[test]
+    fn p2sh_legacy_scriptsig_over_10k_rejected() {
+        let redeem = vec![0x51];
+        let mut ss = vec![0x00; 43];
+        for _ in 0..131 {
+            ss.push(0x4b);
+            ss.extend_from_slice(&[0u8; 75]);
+        }
+        ss.push(redeem.len() as u8);
+        ss.extend_from_slice(&redeem);
+        assert_eq!(ss.len(), 10_001);
+        let mut tx = dummy_tx();
+        tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
+        let job = job_for(tx.clone(), p2sh_spk(&redeem), true);
+        let err = verify_p2sh_legacy(&job, 0, &*job.tx).expect_err("script too large");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("script too large"),
+            "expected script too large, got {msg}"
+        );
     }
 
     /// Finding 007 (a): non-minimal redeem push → WITNESS_MALLEATED_P2SH.
@@ -869,11 +880,9 @@ mod tests {
         };
         assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_ok());
 
-        // OP_0 as first stack item in split (covers n==0x00 branch already hit);
-        // also OP_16 small-int push.
-        let ss_op = Script::from_bytes(&[0x00, 0x60, 0x01, 0x51]);
-        let (stack, redeem) = split_script_sig_redeem(ss_op).unwrap();
-        assert_eq!(stack, vec![vec![], vec![0x10]]);
+        let mut items = stack_for(ScriptBuf::from_bytes(vec![0x00, 0x60, 0x01, 0x51])).unwrap();
+        let redeem = items.pop().unwrap();
+        assert_eq!(items, vec![vec![], vec![0x10]]);
         assert_eq!(redeem, vec![0x51]);
     }
 }

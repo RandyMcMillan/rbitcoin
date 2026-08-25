@@ -265,6 +265,27 @@ mod bip341_tests {
         assert!(msg.contains("stack size"), "expected stack size, got {msg}");
     }
 
+    #[test]
+    fn script_path_rejects_tapscript_validation_weight() {
+        let dummy = vec![0x01u8];
+        let sigs3: [&[u8]; 3] = [&dummy, &dummy, &dummy];
+        let leaf3: Vec<u8> = [
+            0x01, 0xaa, 0xac, 0x75, 0x01, 0xaa, 0xac, 0x75, 0x01, 0xaa, 0xac,
+        ]
+        .to_vec();
+        let (job, _) = make_script_path_spend_with(&leaf3, &sigs3);
+        let err = script::verify_job_all_inputs(&job).expect_err("3 CHECKSIGs over budget");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("validation weight"),
+            "expected validation weight, got {msg}"
+        );
+
+        let leaf1 = [0x01u8, 0xaa, 0xac];
+        let (job, _) = make_script_path_spend_with(&leaf1, &[&dummy]);
+        script::verify_job_all_inputs(&job).expect("1 CHECKSIG within budget");
+    }
+
     /// Core ExecuteWitnessScript: every initial tapscript witness element ≤ 520.
     #[test]
     fn script_path_rejects_initial_element_over_520() {

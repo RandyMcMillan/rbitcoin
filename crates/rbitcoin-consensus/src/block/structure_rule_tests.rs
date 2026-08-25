@@ -531,13 +531,17 @@ fn witness_commitment_script_honors_reserved() {
 
 #[test]
 fn p1_block_subsidy_halvings() {
-    let p = params();
-    assert_eq!(block_subsidy(0, &p), 50_0000_0000);
-    assert_eq!(block_subsidy(209_999, &p), 50_0000_0000);
-    assert_eq!(block_subsidy(210_000, &p), 25_0000_0000);
-    assert_eq!(block_subsidy(419_999, &p), 25_0000_0000);
-    assert_eq!(block_subsidy(420_000, &p), 12_5000_0000);
-    assert_eq!(block_subsidy(210_000 * 64, &p), 0);
+    let main = ChainParams::mainnet();
+    assert_eq!(block_subsidy(0, &main), 50_0000_0000);
+    assert_eq!(block_subsidy(209_999, &main), 50_0000_0000);
+    assert_eq!(block_subsidy(210_000, &main), 25_0000_0000);
+    assert_eq!(block_subsidy(419_999, &main), 25_0000_0000);
+    assert_eq!(block_subsidy(420_000, &main), 12_5000_0000);
+    assert_eq!(block_subsidy(210_000 * 64, &main), 0);
+
+    let rt = ChainParams::regtest();
+    assert_eq!(block_subsidy(149, &rt), 50_0000_0000);
+    assert_eq!(block_subsidy(150, &rt), 25_0000_0000);
 }
 
 #[test]
@@ -579,7 +583,7 @@ fn script_sigop_count_and_last_push_helpers() {
         last_script_push(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0x77]),
         Some(&[0x77][..])
     );
-    assert!(last_script_push(&[]).is_none());
+    assert_eq!(last_script_push(&[]), Some(&[][..]));
     // Program shape helpers
     let mut p2sh = vec![0xa9, 0x14];
     p2sh.extend_from_slice(&[0u8; 20]);
@@ -630,6 +634,19 @@ fn s10_rejects_vout_toolarge() {
     let b = block_with(vec![cb]);
     let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
     assert_bad_block(err, "toolarge");
+}
+
+#[test]
+fn s13_rejects_coinbase_empty_vout() {
+    let mut cb = coinbase(0);
+    cb.output.clear();
+    let b = block_with(vec![cb]);
+    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no outputs") || msg.contains("vout-empty"),
+        "expected empty vout reject, got {msg}"
+    );
 }
 
 #[test]
@@ -1292,6 +1309,7 @@ fn n1_assemble_cold_why_reasons() {
             4,
             false,
             false,
+            false,
             true,
             &mut super::AsmPrevoutAcc::default(),
         )
@@ -1316,6 +1334,7 @@ fn n1_assemble_cold_why_reasons() {
             &mut cb_cache,
             &parents,
             4,
+            false,
             false,
             false,
             true,
@@ -1354,6 +1373,7 @@ fn n1_assemble_cold_why_reasons() {
             4,
             false,
             false,
+            false,
             true,
             &mut super::AsmPrevoutAcc::default(),
         )
@@ -1383,6 +1403,7 @@ fn n1_assemble_cold_why_reasons() {
             &mut cb_cache,
             &parents,
             4,
+            false,
             false,
             false,
             true,
@@ -1422,6 +1443,7 @@ fn n1_assemble_cold_why_reasons() {
             &mut cb_cache,
             &parents,
             4,
+            false,
             false,
             false,
             true,

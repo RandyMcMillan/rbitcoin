@@ -71,14 +71,14 @@ impl Wave {
     }
 
     fn claim_chunk(&self) -> Option<Range<usize>> {
-        if self.failed.load(Ordering::Relaxed) {
+        if self.failed.load(Ordering::Acquire) {
             return None;
         }
         // `in_wave` before `next`: a last-chunk claimer is visible to
         // `is_complete` before `next >= n`, so the publisher cannot free ctx
         // under a worker about to `apply`.
         self.in_wave.fetch_add(1, Ordering::AcqRel);
-        if self.failed.load(Ordering::Relaxed) {
+        if self.failed.load(Ordering::Acquire) {
             self.in_wave.fetch_sub(1, Ordering::AcqRel);
             self.notify_if_complete();
             return None;
@@ -100,7 +100,7 @@ impl Wave {
 
     fn is_complete(&self) -> bool {
         let claimed_out =
-            self.next.load(Ordering::Relaxed) >= self.n || self.failed.load(Ordering::Relaxed);
+            self.next.load(Ordering::Relaxed) >= self.n || self.failed.load(Ordering::Acquire);
         claimed_out && self.in_wave.load(Ordering::Acquire) == 0
     }
 
@@ -108,12 +108,12 @@ impl Wave {
         // SAFETY: `in_wave` was incremented before `next`; publisher keeps
         // `ctx` live until `is_complete` (then `OwnedWave` Drop unpublished).
         for i in range {
-            if self.failed.load(Ordering::Relaxed) {
+            if self.failed.load(Ordering::Acquire) {
                 break;
             }
             let r = unsafe { (self.apply.f)(self.apply.ctx, i) };
             if let Err(e) = r {
-                self.failed.store(true, Ordering::Relaxed);
+                self.failed.store(true, Ordering::Release);
                 let mut g = self.first_err.lock().unwrap_or_else(|p| p.into_inner());
                 if g.is_none() {
                     *g = Some(e);
@@ -126,7 +126,7 @@ impl Wave {
     }
 
     fn has_unclaimed(&self) -> bool {
-        !self.failed.load(Ordering::Relaxed) && self.next.load(Ordering::Relaxed) < self.n
+        !self.failed.load(Ordering::Acquire) && self.next.load(Ordering::Relaxed) < self.n
     }
 
     fn wait_done(&self) {

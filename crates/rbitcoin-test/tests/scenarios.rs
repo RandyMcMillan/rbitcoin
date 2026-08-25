@@ -1376,7 +1376,8 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     // Consensus header helpers on the same pad (no second open).
     let mtp = rbitcoin_consensus::median_time_past(&q, Height(sample_tip)).unwrap();
     assert!(mtp > 0, "mtp={mtp}");
-    let bits = rbitcoin_consensus::expected_next_bits(&q, &params, Height(sample_tip + 1)).unwrap();
+    let bits =
+        rbitcoin_consensus::expected_next_bits(&q, &params, Height(sample_tip + 1), 0).unwrap();
     let tip_bits = q
         .header_at_height(Height(sample_tip))
         .unwrap()

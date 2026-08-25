@@ -80,7 +80,7 @@ fn h3_rejects_timestamp_not_after_mtp() {
     let mtp = median_time_past(&q, Height(11)).unwrap();
     let mut bad = mine_regtest_block(tip, mtp, 12, vec![]); // time == mtp → reject
                                                             // ensure bits match expected (regtest copies prev)
-    let expected = expected_next_bits(&q, &params, Height(12)).unwrap();
+    let expected = expected_next_bits(&q, &params, Height(12), bad.header.time).unwrap();
     bad.header.bits = expected;
     let target = bitcoin::Target::from_compact(expected);
     for nonce in 0..u32::MAX {
@@ -161,7 +161,7 @@ fn h8_rejects_timestamp_too_far_in_future() {
         .unwrap_or(1_700_000_000)
         .saturating_add(3 * 60 * 60);
     let mut bad = mine_regtest_block(g.block_hash(), far, 1, vec![]);
-    let expected = expected_next_bits(&q, &params, Height(1)).unwrap();
+    let expected = expected_next_bits(&q, &params, Height(1), far).unwrap();
     bad.header.bits = expected;
     let target = bitcoin::Target::from_compact(expected);
     for nonce in 0..u32::MAX {

@@ -780,13 +780,19 @@ fn expected_bits_extending_height0_and_no_retarget() {
     std::fs::create_dir_all(&path).unwrap();
     let q = Query::open_or_create(&path).unwrap();
     let params = ChainParams::regtest();
-    let gbits =
-        expected_bits_extending(&q, &params, Height(0), CompactTarget::from_consensus(0), 0)
-            .unwrap();
+    let gbits = expected_bits_extending(
+        &q,
+        &params,
+        Height(0),
+        CompactTarget::from_consensus(0),
+        0,
+        0,
+    )
+    .unwrap();
     assert_eq!(gbits, crate::params::genesis_block(&params).header.bits);
     // No-pow-retargeting: any height returns prev_bits.
     let prev = CompactTarget::from_consensus(0x207f_ffff);
-    let b = expected_bits_extending(&q, &params, Height(2016), prev, 100).unwrap();
+    let b = expected_bits_extending(&q, &params, Height(2016), prev, 100, 0).unwrap();
     assert_eq!(b, prev);
 
     // ScriptOkBatch empty surfaces (mirror LoadedBatch).
@@ -924,10 +930,11 @@ fn expected_bits_extending_uses_header_plan_when_period_start_above_tip() {
     let retarget_h = Height(4032); // 2 * interval — needs first @ 2016
     assert_eq!(retarget_h.0 % interval, 0);
 
-    let got = expected_bits_extending(&q, &params, retarget_h, prev_bits, prev_time).expect(
-        "period-start on ConfirmParentCache must satisfy retarget bits \
+    let got = expected_bits_extending(&q, &params, retarget_h, prev_bits, prev_time, prev_time)
+        .expect(
+            "period-start on ConfirmParentCache must satisfy retarget bits \
              (tip-ahead multi-block); confirmed-only lookup is the mainnet bug",
-    );
+        );
     // Sanity: result is a real CompactTarget (same construction as production).
     let timespan = prev_time.saturating_sub(first_rec.timestamp) as u64;
     let expect = CompactTarget::from_next_work_required(prev_bits, timespan, &params.btc);

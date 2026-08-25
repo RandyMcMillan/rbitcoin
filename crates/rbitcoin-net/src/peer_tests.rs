@@ -4090,6 +4090,27 @@ fn addrfetch_times_out_after_300s() {
 }
 
 #[test]
+fn pending_blocks_insert_evicts_at_cap() {
+    let mut pending = HashMap::new();
+    let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    for i in 0u32..(MAX_PENDING_BLOCKS_FOR_TEST as u32 + 1) {
+        let mut b = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        b.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array({
+            let mut m = [0u8; 32];
+            m[0] = (i >> 24) as u8;
+            m[1] = (i >> 16) as u8;
+            m[2] = (i >> 8) as u8;
+            m[3] = i as u8;
+            m
+        });
+        b.header.bits = bits;
+        let h = b.block_hash();
+        stash_pending_block(&mut pending, h, b);
+    }
+    assert_eq!(pending.len(), MAX_PENDING_BLOCKS_FOR_TEST);
+}
+
+#[test]
 fn try_queue_served_block_false_at_cap() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let n = AtomicUsize::new(MAX_SERVE_BLOCKS);

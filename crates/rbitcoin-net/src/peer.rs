@@ -107,6 +107,19 @@ pub(crate) const MAX_SERVE_BLOCKS: usize = 16;
 #[cfg(test)]
 pub(crate) const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
 
+fn stash_pending_block(
+    pending: &mut HashMap<BlockHash, bitcoin::Block>,
+    hash: BlockHash,
+    block: bitcoin::Block,
+) {
+    if pending.len() >= MAX_PENDING_BLOCKS && !pending.contains_key(&hash) {
+        if let Some(k) = pending.keys().next().copied() {
+            pending.remove(&k);
+        }
+    }
+    pending.insert(hash, block);
+}
+
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
     crate::seeds::required_seed_services()
@@ -1609,7 +1622,7 @@ async fn handle_peer_frame(
             requested_blocks.remove(&hash);
             pending_headers.entry(hash).or_insert(block.header);
             if !any_header_path_meets_minwork(hub, pending_headers, hash) {
-                pending_blocks.insert(hash, block.clone());
+                stash_pending_block(pending_blocks, hash, block.clone());
                 return Ok(());
             }
             match hub.accept_received_block(block.clone()) {

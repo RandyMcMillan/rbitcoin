@@ -1018,6 +1018,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// After a lookup wave publishes parent P, load stamp of a child spending P
+    /// must not TipOnly-head P again (`HEAD_NEED=0`). Occupancy go/no-go for
+    /// moving `plan_batch` onto lookup: leftover-0 means pack on load is fine.
+    #[test]
+    fn load_stamp_after_wave_has_zero_leftover_head() {
+        use rbitcoin_primitives::Height;
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let g_cb = genesis.txdata[0].compute_txid();
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
+        );
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
+            .unwrap();
+        let mut live = rbitcoin_query::LiveUnion::new();
+        let published = q.published_ids();
+        let wave = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            Milestone::NONE,
+            &[1],
+            Some((&mut live, published.as_ref())),
+        )
+        .unwrap();
+        assert!(wave.stats.hits >= 1);
+        assert!(
+            published.get(&g_cb.to_byte_array()).is_some(),
+            "wave must publish genesis parent into live_union"
+        );
+        let ext = rbitcoin_query::stamp_external_parents(
+            q.store(),
+            &[g_cb.to_byte_array()],
+            &rbitcoin_query::InFlightView::empty(),
+            published.as_ref(),
+            q.recent_creates().as_ref(),
+        )
+        .expect("stamp helper after wave");
+        assert_eq!(
+            ext.head_need_n, 0,
+            "load stamp must not TipOnly-head a wave-published parent"
+        );
+        let items = [(Height(1), std::sync::Arc::new(b1), None)];
+        let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
+            .expect("stamp after wave");
+        let plan = stamped.plan.expect("new body needs a plan");
+        let spend = plan
+            .packed
+            .iter()
+            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+            .expect("spend");
+        let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
+        assert_eq!(inp.prev_txid, g_cb.to_byte_array());
+        assert!(!inp.create_fk.is_null());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn bq_resolve_wave_skips_claimed_height() {
         let (path, q) = tmp_query();

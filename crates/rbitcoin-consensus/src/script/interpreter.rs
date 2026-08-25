@@ -189,6 +189,7 @@ pub(crate) struct EvalContext<'a> {
 }
 
 impl<'a> EvalContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         tx: &'a Transaction,
         input_index: usize,
@@ -210,6 +211,7 @@ impl<'a> EvalContext<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_flags(
         tx: &'a Transaction,
         input_index: usize,
@@ -350,6 +352,7 @@ pub(crate) fn require_true_top(stack: &[Vec<u8>]) -> Result<(), ConsensusError> 
 /// non-push opcodes in scriptSig (e.g. `OP_CODESEPARATOR` + `CHECKMULTISIG` at
 /// mainnet height 163685). Callers that need BIP16 push-only must use this
 /// helper; bare paths use full [`eval_script`] on scriptSig.
+#[cfg(test)]
 pub(crate) fn eval_script_sig_pushes(
     script: &Script,
     stack: &mut Vec<Vec<u8>>,

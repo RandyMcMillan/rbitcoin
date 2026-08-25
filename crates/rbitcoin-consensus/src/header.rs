@@ -462,7 +462,7 @@ pub(crate) fn min_difficulty_or_walk(
     let interval = params.difficulty_adjustment_interval();
     let mut h = height.0 - 1;
     let mut bits = prev_bits;
-    while h % interval != 0 && bits == limit {
+    while !h.is_multiple_of(interval) && bits == limit {
         if h == 0 {
             break;
         }

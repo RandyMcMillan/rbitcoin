@@ -58,7 +58,8 @@ before 1.0).
   scan under the lock). Best-chain cumulative work is a RAM prefix
   (~32 B × tip), not a genesis walk per unrequested body / `chainwork`.
   Mempool `worst_chunk` is an ordered cluster-rate index. Closed
-  [`docs/algo-review.md`](docs/algo-review.md) P1/P2/P3 and N-H2/N-H3.
+  [`docs/algo-review.md`](docs/algo-review.md) P1/P2/P3 and N-H2/N-H3
+  ([#244](https://github.com/reardencode/rbitcoin/pull/244)).
 
 - **BQ assign-stop 1 GiB:** `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` no longer
   refuse enqueue. Default 1 GiB densify assign-stop (`0` = unlimited): fill

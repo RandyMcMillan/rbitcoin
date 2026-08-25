@@ -545,6 +545,6 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
-- **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). This PR.
-- **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. This PR. Durable `nChainWork` column not done.
-- **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. This PR.
+- **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). [#244](https://github.com/reardencode/rbitcoin/pull/244).
+- **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. [#244](https://github.com/reardencode/rbitcoin/pull/244). Durable `nChainWork` column not done.
+- **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).

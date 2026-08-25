@@ -58,6 +58,7 @@ Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
 | **Hub `held_bodies`** | **320** | Existing; side-branch hold for most-work apply. |
 | **getheaders continuation** | full 2000-header reply locates from last hash | Next batch after that hash, not a replay from our tip. |
 | **headers poll** | skip if `best_known` cannot beat our tip | 120s `getheaders` only for peers that can still add work. |
+| **Chainwork prefix** | `Vec<Work>` `prefix[h] = work through h` (~32 B × tip; ≈28–32 MiB at 900k) | Process cache. Extend/truncate to `query.tip_height()`. Not durable. Restart rebuilds on first `chain_work`. |
 
 ## Soft budgets: request-limited only (invariant)
 

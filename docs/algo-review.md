@@ -82,8 +82,8 @@ What the node actually runs. This is the map; findings follow.
 | IBD assign | densify walk, `FAR_SCAN_BUDGET` 65 536 | request-limited soft budget |
 | Compact blocks | short-id + prefilled interleave | prefilled index validation weaker than Core |
 | AddrMan | unbounded `HashMap` | no tried/new bucket caps |
-| Tx relay | graph + per-peer announced set | wtxid lookup is linear; `relay_seq`/`accept_at` not unindexed |
-| Chain work | sum `header.work()` genesis→tip | no `nChainWork` |
+| Tx relay | graph + per-peer announced set | wtxid map on `TxGraph`; `relay_seq`/`accept_at` not unindexed |
+| Chain work | RAM prefix `work through h` | rebuilt from wire headers; no durable `nChainWork` |
 | `BlockCache` | `Vec` of hashes | prefix eviction O(chain) |
 | Peer rate limit | **fixed** 1 s window | documented as sliding |
 | Eviction of pending/held | `HashMap::keys().next()` | random, not FIFO |
@@ -92,7 +92,7 @@ What the node actually runs. This is the map; findings follow.
 
 | Piece | Algorithm | Notes |
 |-------|-----------|--------|
-| Mempool graph | clusters + linearization + chunks | eviction = min-rate chunk, rebuilt each iteration |
+| Mempool graph | clusters + linearization + chunks | eviction = min-rate chunk from `(rate, rep)` index |
 | Orphanage | count + weight FIFO | no 20-minute expiry |
 | Mempool store | slot file + body image | `persist_all` rewrites whole files; body after slots |
 | Fee estimator | log buckets | |
@@ -200,25 +200,6 @@ peer that still answers pings is never replaced. Core runs this every message
 pass.
 
 **Fix:** call from the 50 ms session tick or a 1 s hub timer.
-
-#### N-H2. ✔ `contains_wtxid` / `get_tx_by_wtxid` are O(mempool) per inv item
-
-`crates/rbitcoin-net/src/tx_relay.rs:751-766`. `peer.rs` calls `contains_wtxid`
-per `Inventory::WTx`. One 50 000-item inv × 100k mempool under the mempool
-lock is hundreds of millions of compares and blocks every other mempool user.
-
-**Fix:** `HashMap<Wtxid, Txid>` maintained on accept/remove.
-
-#### N-H3. ✔ `work_from_fork_to_tip` walks every header from genesis
-
-`crates/rbitcoin-net/src/chain.rs:1838-1855`. Allocates `Vec<Work>` of tip
-length (~28 MiB at height ~900k) and one store read per height. Callers
-include `unrequested_weaker_than_tip` on every unrequested block/cmpct
-(`peer.rs`) — unauthenticated O(N) CPU+IO. Same shape in RPC `chainwork_hex`
-(`methods.rs` ~844).
-
-**Fix:** persist cumulative work at connect (`CBlockIndex::nChainWork`);
-O(1) tip, O(fork depth) on reorg.
 
 #### N-H4. Inbound handshake holds a slot with no deadline
 
@@ -387,9 +368,6 @@ Grouped by cost at mainnet scale. Many overlap §2–3.
 
 | ID | Where | Cost | Standard replacement |
 |----|--------|------|----------------------|
-| P1 | `contains_wtxid` | O(inv × mempool) under lock | `HashMap<Wtxid, Txid>` |
-| P2 | `work_from_fork_to_tip` / RPC chainwork | O(height) per call | cumulative work column |
-| P3 | Mempool `worst_chunk` per eviction | O(k · N · cluster) | min-heap of cluster rates |
 | P4 | BDZ `index_batch_fd` fill | O(pages × keys) | pre-group by page |
 | P5 | `HashHead::bulk_fill_empty` | full table in RAM + dense write | dirty 4 KiB pages only |
 | P6 | SH `insert_many` `entries.iter().find` | O(N²) ingest | `HashMap` once |
@@ -531,9 +509,9 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
 | consensus + primitives | 4 (BIP342 weight, sigops pushdata, P2SH parser, testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
-| net | 4 (headers timeout, wtxid scan, chainwork walk, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
-| mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | worst_chunk, free slot, persist_all |
-| rpc | 2 (active pop, testmempoolaccept) | submitblock gate, gettxout, hashps, unbounded batch | chainwork, GBT depends, longpoll |
+| net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
+| mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
+| rpc | 2 (active pop, testmempoolaccept) | submitblock gate, gettxout, hashps, unbounded batch | GBT depends, longpoll |
 | electrum | 1 (status **order** vs get_history) | mempool_stats | status full-history, announce O(subs) |
 | esplora | 0 | stub mempool JSON, WS on runtime, sh_join slot | `/blocks` reconstruct |
 | node/cli/log/bench | 0 | milestone=0 conf, minrelay silent, frozen AddrMan | log gating, api_log mutex |
@@ -549,14 +527,12 @@ then IBD CPU.
    eval_script** — consensus; pin with Core-shaped fixtures. Closest to
    `docs/quality.md` pillar 1.
 2. **S-H1 HashHead seqlock/epoch** — false misses during grow.
-3. **N-H2 wtxid index** + **N-H3 cumulative chainwork** (also RPC) —
-   unauthenticated amplification.
-4. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
-5. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
-6. Electrum status **ordering**; decide COMPAT vs spec for the extra
+3. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
+4. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
+5. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
-7. Mempool persist order, eviction heap, `relay_seq` unindex, AddrMan cap.
-8. IBD: fence `Arc`, densify watermark, v2 decode without checksum reframe,
+6. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+7. IBD: fence `Arc`, densify watermark, v2 decode without checksum reframe,
    Esplora `/blocks` summaries.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
@@ -566,5 +542,9 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 
 ## 11. Closed in later PRs
 
-Empty at land. When a finding is fixed, move its ID here with the PR number
-instead of leaving a stale High row in §2–6.
+When a finding is fixed, move its ID here with the PR number instead of
+leaving a stale High row in §2–6.
+
+- **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). This PR.
+- **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. This PR. Durable `nChainWork` column not done.
+- **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. This PR.

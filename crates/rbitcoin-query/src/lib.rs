@@ -80,6 +80,8 @@ pub struct ProcessOwnedSizes {
     pub recent_overlay_keys: usize,
     /// Fifo txid copies (one vec per height).
     pub recent_fifo_keys: usize,
+    /// Live CreatePin payload bytes (not 96 B/key).
+    pub recent_pin_bytes: u64,
     /// PublishedIds / LiveUnion layer chain (shared Arcs; count once).
     pub union_layers: usize,
     pub union_keys: usize,
@@ -93,7 +95,7 @@ pub struct ProcessOwnedSizes {
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
 ///
-/// Updated after each plan note/prune (InFlightLog + PipelineParentStore).
+/// Updated after each plan note/prune (InFlightLog). IBD pstore counts stay 0.
 /// Sampled by the ~5s IBD sizes line.
 pub mod process_mem_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1909,6 +1911,7 @@ impl Query {
             recent_pub_keys: rec.2,
             recent_overlay_keys: rec.3,
             recent_fifo_keys: rec.4,
+            recent_pin_bytes: self.recent_creates.approx_pin_bytes(),
             union_layers,
             union_keys,
             h2h_keys,

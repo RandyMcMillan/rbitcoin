@@ -295,6 +295,27 @@ impl RecentCreates {
             fifo_keys,
         )
     }
+
+    /// Heap bytes of live [`CreatePin`] payloads (overlay + published, overlay wins).
+    pub fn approx_pin_bytes(&self) -> u64 {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let published = self.live.load();
+        let mut n = 0u64;
+        for e in g.overlay.values() {
+            if let Some(p) = &e.outs {
+                n = n.saturating_add(crate::archive::create_pin_approx_bytes(p) as u64);
+            }
+        }
+        for (k, e) in published.iter() {
+            if g.overlay.contains_key(k) || g.dead.contains(k) {
+                continue;
+            }
+            if let Some(p) = &e.outs {
+                n = n.saturating_add(crate::archive::create_pin_approx_bytes(p) as u64);
+            }
+        }
+        n
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +518,19 @@ mod tests {
         r.publish_if_dirty();
         assert!(r.get(&tid(1)).is_none());
         assert!(r.create_pin(&tid(1)).is_none());
+    }
+
+    #[test]
+    fn recent_size_counts_pin_bytes() {
+        let r = RecentCreates::new();
+        let script = vec![0x51; 400];
+        let pin = dummy_pin(script.clone());
+        r.note_pins(10, [(tid(1), Fk(7), (100, 8), Some(pin))]);
+        let n = r.approx_pin_bytes();
+        assert!(
+            n >= script.len() as u64,
+            "size must count pin script bytes, not 96 B/key; got {n}"
+        );
+        assert!(n > 96, "96 B/key identity estimate must not be the payload");
     }
 }

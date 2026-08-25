@@ -1137,7 +1137,7 @@ mod tests {
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: view,
-            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+            parent_store: None,
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
@@ -1231,7 +1231,7 @@ mod tests {
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: log.snapshot(),
-            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
+            parent_store: None,
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];

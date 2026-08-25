@@ -21,8 +21,6 @@ struct LoadAheadState {
     next_tx_start: u64,
     /// Append-only published packs (lookup thread only mutates via note/prune/clear).
     in_flight: rbitcoin_query::InFlightLog,
-    /// Shared sparse parent pins for concurrent load/scripts/write batches.
-    parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
     /// Lookup-published identity union (wave hits still live in the BQ window).
     published: std::sync::Arc<rbitcoin_query::PublishedIds>,
     /// Last height successfully loaded (still in pipeline or already committed).
@@ -37,7 +35,6 @@ impl LoadAheadState {
         Self {
             next_tx_start: next,
             in_flight: rbitcoin_query::InFlightLog::new(),
-            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
             published: std::sync::Arc::clone(hub.query.published_ids()),
             last_loaded: None,
             disconnect_gen_seen: 0,
@@ -76,17 +73,10 @@ impl LoadAheadState {
         self.publish_mem_stats();
     }
 
-    /// Publish InFlight + PipelineParentStore occupancy for `ibd: sizes`.
+    /// Publish InFlight occupancy for `ibd: sizes`. IBD has no process pstore.
     fn publish_mem_stats(&self) {
         let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
-        let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-        if weak > 4096 {
-            self.parent_store.gc_dead_weaks();
-            let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
-            rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
-            return;
-        }
-        rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
+        rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, 0, 0, 0);
     }
 
     fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WireLoadPipeline {
@@ -102,7 +92,7 @@ impl LoadAheadState {
             parent_hash,
             next_tx_start: self.next_tx_start,
             in_flight: self.in_flight.snapshot(),
-            parent_store: std::sync::Arc::clone(&self.parent_store),
+            parent_store: None,
             published: std::sync::Arc::clone(&self.published),
         }
     }
@@ -190,7 +180,6 @@ impl LoadAheadState {
 
     fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
-        self.parent_store = std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new());
         self.publish_mem_stats();
         self.last_loaded = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);

@@ -1810,12 +1810,8 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let if_mib = o.inflight_bytes / (1024 * 1024);
     let ps_mib = o.pstore_bytes / (1024 * 1024);
-    // txid + fk + range + hash overhead — identity only, no outs.
-    // One published map + overlay + fifo. live is published⊕overlay (not a second map).
-    let recent_bytes = (o.recent_pub_keys as u64)
-        .saturating_mul(96)
-        .saturating_add((o.recent_overlay_keys as u64).saturating_mul(96))
-        .saturating_add((o.recent_fifo_keys as u64).saturating_mul(32));
+    // CreatePin payload bytes (Arc-shared with in-flight while overlapping).
+    let recent_bytes = o.recent_pin_bytes;
     let recent_mib = recent_bytes / (1024 * 1024);
     let union_bytes = (o.union_keys as u64).saturating_mul(88);
     let union_mib = union_bytes / (1024 * 1024);

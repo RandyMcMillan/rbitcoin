@@ -147,8 +147,10 @@ pub struct WireLoadPipeline {
     /// pipeline (body-ahead-of-head). Built via [`rbitcoin_query::InFlightLog::snapshot`].
     pub in_flight: rbitcoin_query::InFlightView,
     /// Pipeline-wide sparse parent pin store (Weak map; load get-or-insert only).
-    /// Batches hold `Arc` handles so concurrent stages share one payload per create.
-    pub parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
+    /// `None` on IBD (RecentCreates outs + in-flight). Tip-follow may still set
+    /// `Some`. Batches hold `Arc` handles so concurrent stages share one payload
+    /// per create when a store is present.
+    pub parent_store: Option<std::sync::Arc<rbitcoin_query::PipelineParentStore>>,
     /// Lookup-published parent identity union (wave hits still live in the BQ window).
     pub published: std::sync::Arc<rbitcoin_query::PublishedIds>,
 }
@@ -427,7 +429,7 @@ pub fn confirm_wire_load_phase_pipelined(
     let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
     let inflight = pipeline.map(|p| &p.in_flight);
-    let parent_store = pipeline.map(|p| &p.parent_store);
+    let parent_store = pipeline.and_then(|p| p.parent_store.as_ref());
     let parent_pin = match plan.as_mut() {
         Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, inflight)?,

@@ -230,7 +230,7 @@ pub fn confirm_wire_load_from_plan(
     } = stamped;
 
     let ifo = pipeline.map(|p| &p.in_flight);
-    let parent_store = pipeline.map(|p| &p.parent_store);
+    let parent_store = pipeline.and_then(|p| p.parent_store.as_ref());
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),

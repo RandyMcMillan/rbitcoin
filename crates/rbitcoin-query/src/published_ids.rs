@@ -414,17 +414,13 @@ mod tests {
     #[test]
     fn outpoint_hasher_mixes_vout() {
         use std::collections::HashSet;
-        use std::hash::{BuildHasher, BuildHasherDefault, Hash};
+        use std::hash::{BuildHasher, BuildHasherDefault};
         let mut prefix = [0u8; 32];
         prefix[..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
         let mut other = prefix;
         other[8] = 0xaa;
         let build = BuildHasherDefault::<OutPointHasher>::default();
-        let hash_of = |txid: [u8; 32], vout: u32| {
-            let mut h = build.build_hasher();
-            (txid, vout).hash(&mut h);
-            h.finish()
-        };
+        let hash_of = |txid: [u8; 32], vout: u32| build.hash_one(&(txid, vout));
         assert_ne!(
             hash_of(prefix, 0),
             hash_of(prefix, 1),

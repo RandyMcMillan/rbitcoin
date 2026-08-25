@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@1.95.0
       # Prebuilt cargo-deny — do not cargo install. Pin Action commit (CodeQL).
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           # 0.18.x cannot parse rustsec CVSS 4.0 advisories (2026).
           tool: cargo-deny@0.20.2
@@ -183,7 +183,7 @@ jobs:
           workspaces: ". -> target/cov"
       # Prebuilt binary — do not `cargo install` (compiles llvm-cov from crates.io).
       # Pin commit (CodeQL: unpinned 3rd-party Action tags are not immutable).
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: cargo-llvm-cov@0.6.14
       - name: coverage (line gate)

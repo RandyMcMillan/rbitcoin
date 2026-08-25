@@ -40,6 +40,8 @@ const DEFAULT_SLOTS: u64 = 64;
 const SLOTS_PER_CHUNK: u64 = 128;
 const CHUNK_CACHE_MAX: usize = 256;
 
+pub(crate) const SH_HEAD_FULL: &str = "invariant: scripthash head full";
+
 /// Corrupt message when on-disk SH head shard count ≠ current layout (e.g. 16-way vs 64-way).
 #[cfg(test)]
 pub const SH_HEAD_SHARD_COUNT_MISMATCH: &str =
@@ -430,10 +432,8 @@ impl ScriptHashHead {
         if upserts.is_empty() {
             return Ok(());
         }
-        self.reserve_additional(upserts.len() as u64)?;
-
         // Bulk-fill only when occupancy is known empty — never when open skipped
-        // the scan (would overwrite a live multi‑GiB table).
+        // the scan (would overwrite a live multi‑GiB table). Does not grow.
         {
             let state = self.state.lock().unwrap();
             if state.occ_known && state.occupied == 0 {
@@ -446,52 +446,45 @@ impl ScriptHashHead {
         let slots_now = self.state.lock().unwrap().slots;
         work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
 
+        let cap = slots_now.saturating_mul(MAX_LOAD_NUM) / MAX_LOAD_DEN;
         let mut i = 0usize;
+        let mut cache = SlotPageCache::new(self, slots_now);
         while i < work.len() {
-            let slots = self.state.lock().unwrap().slots;
-            if i > 0 {
-                work[i..].sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots));
-            }
-            let mut cache = SlotPageCache::new(self, slots);
-            let mut need_rehash = false;
-            while i < work.len() {
-                let (key, ref val) = work[i];
-                let enc = pack8_bytes(val)?;
-                match cache.try_insert(&key, &enc, true)? {
-                    InsertResult::Done(was_empty) => {
-                        if was_empty {
-                            let mut state = self.state.lock().unwrap();
-                            // Only bump when known; unknown open stays unknown (is_empty
-                            // false, no bulk-fill) rather than inventing a wrong count.
-                            if state.occ_known {
-                                state.occupied = state.occupied.saturating_add(1);
-                            }
-                        }
-                        i += 1;
-                    }
-                    InsertResult::NeedSlot => {
-                        need_rehash = true;
-                        break;
-                    }
+            let (key, ref val) = work[i];
+            let at_cap = {
+                let st = self.state.lock().unwrap();
+                st.occ_known && st.occupied >= cap
+            };
+            if at_cap {
+                let mut full = [0u8; 32];
+                full[..SH_HEAD_KEY_LEN].copy_from_slice(&key);
+                if self.get(&full)?.is_none() {
+                    cache.flush()?;
+                    return Err(StoreError::Corrupt(SH_HEAD_FULL));
                 }
             }
-            cache.flush()?;
-            if need_rehash {
-                let (slots, occupied, occ_known) = {
-                    let state = self.state.lock().unwrap();
-                    (state.slots, state.occupied, state.occ_known)
-                };
-                // NeedSlot with unknown occupancy: double slots via rehash scan.
-                let remain = (work.len() - i) as u64;
-                let need = if occ_known {
-                    Self::slots_for_keys(occupied.saturating_add(remain))
-                        .max(slots.saturating_mul(2))
-                } else {
-                    slots.saturating_mul(2).max(Self::slots_for_keys(remain))
-                };
-                self.rehash_to(need)?;
+            let enc = pack8_bytes(val)?;
+            match cache.try_insert(&key, &enc, true)? {
+                InsertResult::Done(was_empty) => {
+                    if was_empty {
+                        let mut state = self.state.lock().unwrap();
+                        if state.occ_known {
+                            if state.occupied >= cap {
+                                cache.flush()?;
+                                return Err(StoreError::Corrupt(SH_HEAD_FULL));
+                            }
+                            state.occupied = state.occupied.saturating_add(1);
+                        }
+                    }
+                    i += 1;
+                }
+                InsertResult::NeedSlot => {
+                    cache.flush()?;
+                    return Err(StoreError::Corrupt(SH_HEAD_FULL));
+                }
             }
         }
+        cache.flush()?;
         // Seal sidecar after batch when count is authoritative.
         {
             let state = self.state.lock().unwrap();
@@ -625,6 +618,16 @@ impl ScriptHashHead {
         Some(state.occupied as f64 / state.slots as f64)
     }
 
+    /// How many new keys can land before ingest should seal (0 → seal first).
+    pub fn room_before_seal(&self) -> u64 {
+        let st = self.state.lock().unwrap();
+        if !st.occ_known || st.slots == 0 {
+            return 0;
+        }
+        let cap = ((st.slots as f64) * Self::SH_SEAL_LOAD).ceil() as u64;
+        cap.saturating_sub(st.occupied)
+    }
+
     fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
         debug_assert!(self.is_known_empty());
         let slots = self.state.lock().unwrap().slots;
@@ -700,10 +703,9 @@ impl ScriptHashHead {
         let need = Self::slots_for_keys(occupied.saturating_add(additional));
         if need > slots {
             if occupied == 0 {
-                // Cold bulk: grow empty table without scanning zeros.
                 self.grow_empty_to(need)?;
             } else {
-                self.rehash_to(need)?;
+                return Err(StoreError::Corrupt(SH_HEAD_FULL));
             }
         }
         Ok(())
@@ -760,7 +762,7 @@ impl ScriptHashHead {
             (state.slots, state.occupied)
         };
         if occupied != 0 {
-            return self.rehash_to(new_slots);
+            return Err(StoreError::Corrupt(SH_HEAD_FULL));
         }
         if new_slots <= old_slots {
             return Ok(());
@@ -772,85 +774,6 @@ impl ScriptHashHead {
         // Zero full body (new region may reuse stale bytes past old logical len).
         self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
         self.state.lock().unwrap().slots = new_slots;
-        Ok(())
-    }
-
-    fn rehash_to(&self, new_slots: u64) -> Result<(), StoreError> {
-        let new_slots = new_slots.max(2).next_power_of_two();
-        // Share process-wide gate with HashHead (no stacked multi-table freezes).
-        let _rehash_serial = open_address::rehash_gate()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let (old_slots, occupied) = {
-            let state = self.state.lock().unwrap();
-            (state.slots, state.occupied)
-        };
-        if new_slots <= old_slots {
-            return Ok(());
-        }
-        let new_bytes = SH_HEAD_SLOT_SIZE as u64 * new_slots;
-        let t0 = Instant::now();
-
-        let mut entries: Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> = Vec::new();
-        entries
-            .try_reserve_exact(occupied as usize)
-            .map_err(|_| StoreError::Corrupt("scripthash head rehash OOM"))?;
-        let mut buf = vec![0u8; SH_HEAD_SLOT_SIZE * 1024];
-        let mut slot = 0u64;
-        while slot < old_slots {
-            let n = ((old_slots - slot) as usize).min(1024);
-            let off = FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64;
-            let bytes = n * SH_HEAD_SLOT_SIZE;
-            self.file.read_at(off, &mut buf[..bytes])?;
-            for i in 0..n {
-                let base = i * SH_HEAD_SLOT_SIZE;
-                let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] = buf
-                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
-                    .try_into()
-                    .unwrap();
-                if !is_empty_slot(&k, &v) {
-                    entries.push((k, v));
-                }
-            }
-            slot += n as u64;
-        }
-
-        let need = FILE_HEADER_LEN as u64 + new_bytes;
-        self.file.ensure_capacity(need)?;
-        self.file.set_logical_len(need)?;
-        self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
-        {
-            let mut state = self.state.lock().unwrap();
-            state.slots = new_slots;
-            state.occupied = 0;
-            // Mid-rehash: authoritative empty of the *new* image until refill.
-            state.occ_known = true;
-        }
-
-        entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
-        let n_entries = entries.len() as u64;
-        let mut cache = SlotPageCache::new(self, new_slots);
-        for (k, v) in &entries {
-            match cache.try_insert(k, v, true)? {
-                InsertResult::Done(_) => {}
-                InsertResult::NeedSlot => {
-                    cache.flush()?;
-                    return Err(StoreError::Corrupt("scripthash head rehash failed"));
-                }
-            }
-        }
-        cache.flush()?;
-        // Rehash walks every old slot — count is authoritative even if open was unknown.
-        self.set_occupied_known(n_entries);
-        rbitcoin_log::trace!(
-            "store: scripthash head rehash path={} {}→{} slots occupied={} elapsed={:?}",
-            self.file.path().display(),
-            old_slots,
-            new_slots,
-            n_entries,
-            t0.elapsed()
-        );
         Ok(())
     }
 
@@ -1652,10 +1575,16 @@ mod tests {
         let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
         h.reserve_additional(0).unwrap();
         h.reserve_additional(200).unwrap(); // cold grow empty
+        assert!(h.slots() >= 256);
+        let _ = std::fs::remove_file(&path);
+        let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
         let mut k = [0u8; 32];
         k[0] = 9;
         h.insert(&k, &ShHeadValue::inline_one(Fk(1))).unwrap();
-        h.reserve_additional(50).unwrap(); // rehash when occupied
+        assert!(matches!(
+            h.reserve_additional(50),
+            Err(StoreError::Corrupt(SH_HEAD_FULL))
+        ));
         let _ = std::fs::remove_file(&path);
 
         // Sharded facade: live install + OOB.
@@ -1683,54 +1612,42 @@ mod tests {
     }
 
     #[test]
-    fn scripthash_head_rehash_bulk_and_for_each() {
+    fn scripthash_head_insert_many_full_without_rehash() {
         let path = std::env::temp_dir().join(format!(
-            "rbitcoin-shhead-rehash-{}",
+            "rbitcoin-shhead-full-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
-        let h = ScriptHashHead::create_with_slots(&path, 8).unwrap(); // tiny → force rehash
+        let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
         h.insert_many(&[]).unwrap();
-        // Empty values clear path
         let mut k0 = [0u8; 32];
         k0[0] = 1;
         h.insert(&k0, &ShHeadValue::Empty).unwrap();
-        assert!(!h.clear_key(&k0).unwrap()); // miss
+        assert!(!h.clear_key(&k0).unwrap());
 
-        let mut batch = Vec::new();
-        for i in 0u64..40 {
+        let mut n = 0u64;
+        loop {
             let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            let val = if i % 3 == 0 {
-                ShHeadValue::slab(0, 2, 4096 + i)
-            } else if i % 3 == 1 {
-                ShHeadValue::inline_one(Fk(i + 1))
-            } else {
-                ShHeadValue::paged(4112 + i * 4096, 4112 + i * 4096)
-            };
-            batch.push((key, val));
+            key[0..8].copy_from_slice(&n.to_le_bytes());
+            match h.insert(&key, &ShHeadValue::inline_one(Fk(n + 1))) {
+                Ok(()) => n += 1,
+                Err(StoreError::Corrupt(SH_HEAD_FULL)) => break,
+                Err(e) => panic!("unexpected {e}"),
+            }
+            assert!(n < 16, "must not grow 8-slot ingest OA");
         }
-        h.insert_many(&batch).unwrap();
-        // bulk path already used on first fill; re-insert more for rehash
-        let mut more = Vec::new();
-        for i in 40u64..80 {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            more.push((key, ShHeadValue::inline_one(Fk(i + 1))));
-        }
-        h.insert_many(&more).unwrap();
+        assert_eq!(h.slots(), 8);
         let mut seen = 0u64;
-        h.for_each_occupied(|full, val| {
+        h.for_each_occupied(|_full, val| {
             assert!(!val.is_empty());
-            assert!(full.iter().any(|&b| b != 0) || full == [0u8; 32]);
             seen += 1;
             Ok(())
         })
         .unwrap();
-        assert!(seen >= 70);
+        assert!(seen >= 1);
         h.flush().unwrap();
         h.flush_async().unwrap();
         drop(h);

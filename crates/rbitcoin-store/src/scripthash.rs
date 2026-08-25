@@ -1693,10 +1693,28 @@ impl ScriptHashTable {
             }
         }
         if !ingest_ups.is_empty() {
+            self.ingest_insert_many(&ingest_ups)?;
+        }
+        Ok(())
+    }
+
+    fn ingest_insert_many(
+        &self,
+        ups: &[([u8; 32], ShHeadValue)],
+    ) -> Result<(), StoreError> {
+        let mut i = 0usize;
+        while i < ups.len() {
+            let room = self.ingest.lock().unwrap().room_before_seal();
+            if room == 0 {
+                self.seal_ingest()?;
+                continue;
+            }
+            let n = (room as usize).min(ups.len() - i);
             {
                 let g = self.ingest.lock().unwrap();
-                g.insert_many(&ingest_ups)?;
+                g.insert_many(&ups[i..i + n])?;
             }
+            i += n;
             self.maybe_seal_ingest()?;
         }
         Ok(())

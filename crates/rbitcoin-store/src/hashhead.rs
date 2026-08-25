@@ -640,6 +640,78 @@ impl HashHead {
         Ok(())
     }
 
+    /// Occupied rewrite to a larger power-of-two. **Only** from
+    /// `HeaderHead::open` (no concurrent probes).
+    pub(crate) fn rewrite_to_slots(&self, new_slots: u64) -> Result<(), StoreError> {
+        let new_slots = new_slots.max(2).next_power_of_two();
+        let (old_slots, occupied) = {
+            let state = self.state.lock().unwrap();
+            (state.slots, state.occupied)
+        };
+        if new_slots <= old_slots {
+            return Ok(());
+        }
+        let new_bytes = SLOT_SIZE as u64 * new_slots;
+        let mut entries: Vec<(HeadKey, u64)> = Vec::new();
+        entries
+            .try_reserve_exact(occupied as usize)
+            .map_err(|_| StoreError::Corrupt("hash head rewrite OOM"))?;
+        let mut buf = vec![0u8; SLOT_SIZE * 4096];
+        let mut slot = 0u64;
+        while slot < old_slots {
+            let n = ((old_slots - slot) as usize).min(4096);
+            let off = FILE_HEADER_LEN as u64 + slot * SLOT_SIZE as u64;
+            let bytes = n * SLOT_SIZE;
+            self.file.read_at(off, &mut buf[..bytes])?;
+            for i in 0..n {
+                let base = i * SLOT_SIZE;
+                let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
+                let packed = u64::from_le_bytes(
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
+                        .try_into()
+                        .unwrap(),
+                );
+                if !is_empty_slot(&k, packed) {
+                    entries.push((k, packed));
+                }
+            }
+            slot += n as u64;
+        }
+
+        let need = FILE_HEADER_LEN as u64 + new_bytes;
+        self.file.ensure_capacity(need)?;
+        self.file.set_logical_len(need)?;
+        self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.slots = new_slots;
+            state.occupied = 0;
+        }
+
+        entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
+        let n_entries = entries.len() as u64;
+        let mut cache = SlotPageCache::new(self, new_slots);
+        for (k, packed) in entries {
+            match cache.try_place_raw(&k, packed)? {
+                InsertResult::Done { .. } => {}
+                InsertResult::NeedRehash => {
+                    cache.flush()?;
+                    return Err(StoreError::Corrupt("hash head rewrite failed"));
+                }
+            }
+        }
+        cache.flush()?;
+        self.state.lock().unwrap().occupied = n_entries;
+        rbitcoin_log::warn!(
+            "store: header.head open-grow path={} {}→{} slots occupied={}",
+            self.file.path().display(),
+            old_slots,
+            new_slots,
+            n_entries
+        );
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.multi.flush()?;
         self.file.flush()
@@ -697,6 +769,29 @@ impl<'a> SlotPageCache<'a> {
                     } else {
                         Some(old_head)
                     },
+                    new_slot: false,
+                });
+            }
+            slot = (slot + 1) & (self.slots - 1);
+        }
+        Ok(InsertResult::NeedRehash)
+    }
+
+    fn try_place_raw(&mut self, key: &HeadKey, packed: u64) -> Result<InsertResult, StoreError> {
+        let mut slot = HashHead::hash_slot(key, self.slots);
+        for _ in 0..self.slots {
+            let (k, old) = self.read_slot(slot)?;
+            if is_empty_slot(&k, old) {
+                self.write_slot(slot, key, packed)?;
+                return Ok(InsertResult::Done {
+                    prev: None,
+                    new_slot: true,
+                });
+            }
+            if &k == key {
+                self.write_slot(slot, key, packed)?;
+                return Ok(InsertResult::Done {
+                    prev: Some(Fk(old)),
                     new_slot: false,
                 });
             }

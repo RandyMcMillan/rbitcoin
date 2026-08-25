@@ -125,6 +125,9 @@ impl HeaderHead {
             gens.push(HashHead::open(p)?);
             i += 1;
         }
+        if gens.len() == 1 && gens[0].slots() < target_slots {
+            gens[0].rewrite_to_slots(target_slots)?;
+        }
         Ok(Self {
             base,
             target_slots,
@@ -500,6 +503,51 @@ mod tests {
         assert_eq!(first.1.hash, hashes[0]);
         assert_eq!(last.1.hash, hashes[79]);
         assert_eq!(t.ensure(&sample(hashes[0])).unwrap(), first.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_head_open_grows_undersized_single_gen() {
+        let dir = tmp();
+        let hashes: Vec<[u8; 32]> = (0u32..5)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0..4].copy_from_slice(&i.to_le_bytes());
+                h[8] = 0x3c;
+                h
+            })
+            .collect();
+        {
+            let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
+            for (i, hash) in hashes.iter().enumerate() {
+                let rec = sample(*hash);
+                let off = FILE_HEADER_LEN as u64 + (i as u64) * HEADER_RECORD_LEN as u64;
+                body.write_at(off, &rec.encode()).unwrap();
+            }
+            body.set_logical_len(FILE_HEADER_LEN as u64 + 5 * HEADER_RECORD_LEN as u64)
+                .unwrap();
+            body.flush().unwrap();
+            let h = HashHead::create_with_slots(dir.join("header.head"), 32).unwrap();
+            for (i, hash) in hashes.iter().enumerate() {
+                h.insert(hash, Fk(i as u64 + 1)).unwrap();
+            }
+            h.flush().unwrap();
+            assert_eq!(h.slots(), 32);
+        }
+        let t = HeaderTable::open(&dir).unwrap();
+        for hash in &hashes {
+            assert_eq!(t.get_by_hash(hash).unwrap().unwrap().1.hash, *hash);
+        }
+        for i in 5u32..40 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&i.to_le_bytes());
+            hash[8] = 0x3c;
+            t.ensure(&sample(hash)).unwrap();
+        }
+        assert!(
+            !dir.join("header.head.g1").is_file(),
+            "open-grow to 64 slots must absorb 40 headers without rolling"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -15,7 +15,7 @@ use rbitcoin_query::Query;
 
 use crate::{
     accept_and_connect_block, apply_witness_commitment, bip34_height_script, block_has_witness,
-    ChainParams, Milestone,
+    block_subsidy, ChainParams, Milestone,
 };
 
 /// Mine one empty-ish regtest block (trivial bits).
@@ -89,7 +89,7 @@ fn coinbase_paying(height: u32, script_pubkey: ScriptBuf) -> Transaction {
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000),
+            value: Amount::from_sat(block_subsidy(height, &ChainParams::regtest()) as u64),
             script_pubkey,
         }],
     }
@@ -166,5 +166,22 @@ mod tests {
         assert_eq!(b.header.prev_blockhash, genesis.block_hash());
         let target = Target::from_compact(b.header.bits);
         assert!(b.header.validate_pow(target).is_ok());
+    }
+
+    #[test]
+    fn mine_empty_regtest_uses_regtest_halving_subsidy() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let prev = genesis.block_hash();
+        let t = genesis.header.time + 1;
+        let b149 = mine_empty_regtest(prev, t, 149);
+        let b150 = mine_empty_regtest(prev, t, 150);
+        assert_eq!(
+            b149.txdata[0].output[0].value,
+            Amount::from_sat(50_0000_0000)
+        );
+        assert_eq!(
+            b150.txdata[0].output[0].value,
+            Amount::from_sat(25_0000_0000)
+        );
     }
 }

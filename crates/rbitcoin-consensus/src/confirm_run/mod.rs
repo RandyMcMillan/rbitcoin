@@ -334,14 +334,6 @@ pub fn confirm_wire_load_phase_pipelined(
                 .put_header(&header_rec)
                 .map_err(ConsensusError::from)?
         };
-        let prev_bytes = block.header.prev_blockhash.to_byte_array();
-        query.confirm_parent_cache().put_header_plan(
-            height.0,
-            header_fk,
-            header_rec.clone(),
-            Vec::new(),
-            prev_bytes,
-        );
         ns_header = ns_header.saturating_add(t.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);
@@ -436,7 +428,7 @@ pub fn confirm_wire_load_phase_pipelined(
         Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, inflight)?,
     };
-    let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
+    let (batch_parents, spend_edges, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &mut parent_pin,
@@ -473,9 +465,9 @@ pub fn confirm_wire_load_phase_pipelined(
         metas,
         &wire_blocks,
         &batch_parents,
-        &batch_thin,
+        &spend_edges,
     )?;
-    drop(batch_thin);
+    drop(spend_edges);
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {

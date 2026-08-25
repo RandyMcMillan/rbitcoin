@@ -204,7 +204,7 @@ fn assert_bad_block(err: ConsensusError, needle: &str) {
 fn bip30_rejects_unspent_connected_sibling() {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, Query, U32Map, U64Map};
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, Query, U32Map};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
     use std::sync::Once;
 
@@ -264,8 +264,8 @@ fn bip30_rejects_unspent_connected_sibling() {
         &mut OutPointSet::default(),
         &BatchParents::new(),
         &mut U32Map::default(),
-        &mut U64Map::default(),
         &FkMap::default(),
+        &mut Vec::new(),
     )
     .expect_err("unspent sibling must trip BIP30");
     let msg = format!("{err}");
@@ -834,7 +834,7 @@ fn bip34_height_script_small_and_op_n() {
 fn assemble_full_mode_spend_and_bip68() {
     use super::{assemble_block_prevouts_mode, AssembleMode};
     use crate::accept_and_connect_block;
-    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
+    use rbitcoin_query::{BatchParents, OutPointSet, Query, SpendEdges};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -924,7 +924,7 @@ fn assemble_full_mode_spend_and_bip68() {
     }
     let ctx = ctx_h(4);
     let parents = BatchParents::new();
-    let thin = BatchThin::default();
+    let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let create_txids: Vec<[u8; 32]> = block
@@ -958,7 +958,7 @@ fn assemble_full_mode_spend_and_bip68() {
 #[test]
 fn assemble_rejects_empty_and_fk_mismatch() {
     use super::assemble_block_prevouts;
-    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
+    use rbitcoin_query::{BatchParents, OutPointSet, Query, SpendEdges};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -979,7 +979,7 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let ctx = ctx_h(1);
     let empty = block_with(vec![]);
     let parents = BatchParents::new();
-    let thin = BatchThin::default();
+    let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let zero = [0u8; 32];
@@ -1069,7 +1069,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     use super::assemble_block_prevouts;
     use crate::confirm_phase_stats;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
+    use rbitcoin_query::{BatchParents, OutPointSet, Query, SpendEdges};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1089,7 +1089,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     let q = Query::open_or_create(&path).unwrap();
     let ctx = ctx_h(1);
     let parents = BatchParents::new();
-    let thin = BatchThin::default();
+    let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let b = block_with(vec![coinbase(1)]);
@@ -1135,7 +1135,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     use super::assemble_block_prevouts;
     use crate::accept_and_connect_block;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
+    use rbitcoin_query::{BatchParents, OutPointSet, Query, SpendEdges};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1189,7 +1189,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     let p = Box::leak(Box::new(params));
     let ctx = ValidationContext::at(p, Height(1), Milestone { height: 840_000 });
     let parents = BatchParents::new();
-    let thin = BatchThin::default();
+    let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let create_txids: Vec<[u8; 32]> = block
@@ -1230,7 +1230,7 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     use super::assemble_block_prevouts;
     use bitcoin::hashes::{sha256, Hash};
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query, ThinInput};
+    use rbitcoin_query::{BatchParents, OutPointSet, Query, SpendEdge, SpendEdges};
     use rbitcoin_store::{OutputRecord, TxRecord};
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -1296,12 +1296,14 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     let ctx = ValidationContext::at(params, Height(1), Milestone { height: 100 });
     assert!(ctx.milestone.skips_scripts_at(ctx.height.0));
     let spend_fk = Fk(100);
-    let mut thin = BatchThin::default();
+    let mut thin = SpendEdges::default();
     thin.insert(
         spend_fk.0,
-        vec![ThinInput {
-            create_fk: Some(7),
-            prev_index: 0,
+        vec![SpendEdge {
+            prev_txid: parent_txid,
+            vout: 0,
+            spend_fk,
+            create_fk: Fk(7),
         }],
     );
     let mut spent = OutPointSet::default();
@@ -1797,14 +1799,13 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     {
         use super::structural_validate_spends;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map, U64Map};
+        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
         let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
         let parents = BatchParents::new();
         let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
         let mut pending = OutPointSet::default();
         let mut mtp = U32Map::default();
-        let mut meta = U64Map::default();
         let err = structural_validate_spends(
             &q,
             &b_n1,
@@ -1815,8 +1816,8 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &mut pending,
             &parents,
             &mut mtp,
-            &mut meta,
             &FkMap::default(),
+            &mut Vec::new(),
         )
         .expect_err("missing denserels abs must hard-fail");
         let msg = format!("{err}");

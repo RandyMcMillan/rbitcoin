@@ -20,60 +20,51 @@ pub struct DenserelsWarmStats {
 /// Lookup-stamped external parent material for load body denserels.
 ///
 /// **Lookup** fills this via `tx.head` / `tx.idx` / `txid.body` (never `tx.body`).
-/// **Load** denserels by range using only these maps (+ plan offline pins).
-/// Integer create_fk maps use [`U64Map`] (identity hasher) — pack-scale win over SipHash.
+/// **Load** denserels by range using only [`rbitcoin_query::ParentIdent`] (+ plan offline pins).
+/// Integer create_fk map uses [`U64Map`] (identity hasher) — pack-scale win over SipHash.
 #[derive(Debug, Default, Clone)]
 pub struct ParentPinStamp {
-    /// create_fk_id → Class A body range.
-    pub ranges: U64Map<(u64, u64)>,
-    /// create_fk_id → spent.body range (`spent.idx`; archived parents).
-    pub spent_ranges: U64Map<(u64, u64)>,
-    /// create_fk_id → create txid (wire / sidefile at lookup).
-    pub txids: U64Map<[u8; 32]>,
-    /// prev_txid → create_fk_id (plan=None thin edges without head on load).
-    pub create_by_txid:
-        HashMap<[u8; 32], u64, std::hash::BuildHasherDefault<rbitcoin_query::TxidHasher>>,
-    /// RecentCreates outs stamped at lookup (pin-time; not a second ring walk).
-    pub pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
+    /// prev_txid → create_fk_id (plan=None edges; empty after `take_from_plan`).
+    pub resolved: HashMap<[u8; 32], u64, std::hash::BuildHasherDefault<rbitcoin_query::TxidHasher>>,
+    /// create_fk_id → identity (txid + optional body/spent/pin).
+    pub idents: rbitcoin_query::U64Map<rbitcoin_query::ParentIdent>,
     /// create_fk_id → spent need-vouts (packed at lookup; load pin reuses).
     pub parent_vouts: U64Map<Vec<u32>>,
 }
 
 impl ParentPinStamp {
-    /// Move plan stamp maps into the load stamp (no 100k-entry clone).
+    /// Move plan stamp identity into the load stamp (no 100k-entry clone).
+    ///
+    /// `resolved` stays empty: plan path pins from packed `create_fk`.
     pub(crate) fn take_from_plan(plan: &mut rbitcoin_query::ArchiveWritePlan) -> Self {
-        Self::from_maps(
-            std::mem::take(&mut plan.external_parent_ranges),
-            std::mem::take(&mut plan.external_parent_spent_ranges),
-            std::mem::take(&mut plan.external_parent_txids),
-            std::mem::take(&mut plan.external_parent_pins),
-            std::mem::take(&mut plan.external_parent_vouts),
-        )
-    }
-
-    fn from_maps(
-        ranges: rbitcoin_query::U64Map<(u64, u64)>,
-        spent_ranges: rbitcoin_query::U64Map<(u64, u64)>,
-        txids: rbitcoin_query::U64Map<[u8; 32]>,
-        pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
-        parent_vouts: U64Map<Vec<u32>>,
-    ) -> Self {
         Self {
-            ranges,
-            spent_ranges,
-            txids,
-            create_by_txid: HashMap::with_hasher(Default::default()),
-            pins,
-            parent_vouts,
+            resolved: HashMap::with_hasher(Default::default()),
+            idents: std::mem::take(&mut plan.external_parents),
+            parent_vouts: std::mem::take(&mut plan.external_parent_vouts),
         }
     }
 
     #[inline]
     pub(super) fn create_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
-        self.txids
+        self.idents
             .get(&create_fk_id)
-            .copied()
+            .map(|p| p.txid)
             .filter(|t| *t != [0u8; 32])
+    }
+
+    #[inline]
+    pub(super) fn body_range(&self, create_fk_id: u64) -> Option<(u64, u64)> {
+        self.idents.get(&create_fk_id).and_then(|p| p.body)
+    }
+
+    #[inline]
+    pub(super) fn spent_range(&self, create_fk_id: u64) -> Option<(u64, u64)> {
+        self.idents.get(&create_fk_id).and_then(|p| p.spent)
+    }
+
+    #[inline]
+    pub(super) fn create_pin(&self, create_fk_id: u64) -> Option<&rbitcoin_query::CreatePin> {
+        self.idents.get(&create_fk_id).and_then(|p| p.pin.as_ref())
     }
 }
 
@@ -185,43 +176,37 @@ pub(super) fn stamp_parent_pin_archived(
     )
     .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
-        ranges: ext.ranges,
-        spent_ranges: ext.spent_ranges,
-        txids: ext.txids,
-        create_by_txid: HashMap::with_capacity_and_hasher(
+        resolved: HashMap::with_capacity_and_hasher(
             ext.resolved.len().saturating_add(same_batch.len()),
             Default::default(),
         ),
-        pins: ext.pins,
+        idents: ext.idents,
         parent_vouts: U64Map::default(),
     };
     for (tid, fk) in ext.resolved {
         if let Some(id) = fk.get() {
-            stamp.create_by_txid.insert(tid, id);
+            stamp.resolved.insert(tid, id);
         }
     }
     for (tid, id) in same_batch {
-        stamp.create_by_txid.insert(tid, id);
-        stamp.txids.insert(id, tid);
+        stamp.resolved.insert(tid, id);
+        stamp
+            .idents
+            .entry(id)
+            .or_insert_with(|| rbitcoin_query::ParentIdent::new(tid))
+            .txid = tid;
     }
     // plan=None same-batch creates have no CreatePin offline — idx body_range.
-    rbitcoin_query::fill_missing_parent_ranges(
-        query.store(),
-        ifo,
-        &mut stamp.ranges,
-        &mut stamp.spent_ranges,
-        &stamp.txids,
-    )
-    .map_err(ConsensusError::from)?;
+    rbitcoin_query::fill_missing_parent_ranges(query.store(), ifo, &mut stamp.idents)
+        .map_err(ConsensusError::from)?;
     // Identities are stamped from wire prev_txid at insert time — never soft-fill
     // from txid.body here (that would be a dual path after lookup promised identity).
-    for (&id, tid) in &stamp.txids {
-        if *tid == [0u8; 32] {
+    for ident in stamp.idents.values() {
+        if ident.txid == [0u8; 32] {
             return Err(ConsensusError::Store(StoreError::Corrupt(
                 "invariant: plan=None parent stamp zero create identity",
             )));
         }
-        let _ = id;
     }
     Ok(stamp)
 }
@@ -251,7 +236,7 @@ pub fn confirm_wire_load_from_plan(
 
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.and_then(|p| p.parent_store.as_ref());
-    let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
+    let (batch_parents, spend_edges, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &mut parent_pin,
@@ -273,9 +258,9 @@ pub fn confirm_wire_load_from_plan(
         metas,
         &wire_blocks,
         &batch_parents,
-        &batch_thin,
+        &spend_edges,
     )?;
-    drop(batch_thin);
+    drop(spend_edges);
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {
@@ -399,14 +384,6 @@ pub(super) fn wire_lookup_phase(
                 .put_header(&header_rec)
                 .map_err(ConsensusError::from)?
         };
-        let prev_bytes = block.header.prev_blockhash.to_byte_array();
-        query.confirm_parent_cache().put_header_plan(
-            height.0,
-            header_fk,
-            header_rec.clone(),
-            Vec::new(),
-            prev_bytes,
-        );
         prepare_ns = prepare_ns.saturating_add(t_prep.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);
@@ -873,9 +850,15 @@ mod tests {
             None,
         )
         .expect("archived stamp");
-        assert_eq!(stamp.ranges.get(&88), helper.ranges.get(&88));
-        assert_eq!(stamp.txids.get(&88), helper.txids.get(&88));
-        assert_eq!(stamp.create_by_txid.get(&parent_txid), Some(&88));
+        assert_eq!(
+            stamp.body_range(88),
+            helper.idents.get(&88).and_then(|p| p.body)
+        );
+        assert_eq!(
+            stamp.create_txid(88),
+            helper.idents.get(&88).map(|p| p.txid)
+        );
+        assert_eq!(stamp.resolved.get(&parent_txid), Some(&88));
         let _ = std::fs::remove_dir_all(&path);
     }
 

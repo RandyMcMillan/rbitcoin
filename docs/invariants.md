@@ -75,7 +75,7 @@ IO** (head / idx), not load pin.
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
 | Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
 | Tip-ahead cascade | `fk mismatch` / `connect height not tip+1` after tip+1 fail | **Soft requeue** (not permanent blacklist) |
-| Spend annotate | Abs-only `put_spend_batch_by_abs_meta`; cold OOB/IO is hard Err | No ranged/by_create annotate tiers |
+| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Cold OOB/IO is hard Err | No ranged/by_create annotate tiers; no second spend walk |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
 | Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |
 
@@ -112,7 +112,7 @@ published idx window.
 
 | Error | State | Root | Fix |
 |-------|-------|------|-----|
-| `lookup stage miss (load cold denserels forbidden)` | S0/S3 | Load Forbid + parents without plan range | Lookup always fills `external_parent_ranges`; load outs by `txout` range only |
+| `lookup stage miss (load cold denserels forbidden)` | S0/S3 | Load Forbid + parents without plan range | Lookup always fills `external_parents` body; load outs by `txout` range only |
 | `put_full_batch fk mismatch` | S4 cascade | Tip-ahead plan after tip+1 reject | Soft requeue for fk mismatch / connect height not tip+1 |
 | `parent create_fk unresolved` | S2 | Leftover union miss | **Permanent.** Fix publish order. Do not soft-requeue. |
 | false PrevoutSpent | identity | schema-13 zero pin id | plan reverse map / lookup `txid.body` only |
@@ -154,7 +154,7 @@ bind.
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load |
 | `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
 | `optimistic_assemble_unstamped_parent_is_invariant` | Optimistic assemble: pin miss is lookup invariant, not head recover |
-| `parent_pin_stamp_take_from_plan_moves_maps` | S0 `take_from_plan` does not invert `create_by_txid` |
+| `parent_pin_stamp_take_from_plan_moves_maps` | S0 `take_from_plan` leaves `resolved` empty (no txid→fk invert) |
 | `plan_batch_one_fill_missing_when_parents_already_stamped` | one `fill_missing_parent_ranges` when packed adds no new fks |
 | `direct_write_skips_create_pin_map_recent_matches_idx` | Direct skips `write_create_pins`; RecentCreates body range = idx |
 | `pin_takes_stamp_parent_vouts` / `plan_batch_same_header_vouts_skipped_cross_height_pinned` | pin takes stamp vouts; same-header creates not pinned |

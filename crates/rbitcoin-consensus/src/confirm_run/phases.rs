@@ -10,7 +10,7 @@ pub(super) fn assemble_run(
     metas: Vec<BodyMeta>,
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
-    batch_thin: &rbitcoin_query::BatchThin,
+    spend_edges: &rbitcoin_query::SpendEdges,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
@@ -177,7 +177,7 @@ pub(super) fn assemble_run(
             &mut pending_spent,
             &mut pending_creates,
             batch_parents,
-            batch_thin,
+            spend_edges,
             &meta.txids,
             prev_mtp,
             &block_hash,
@@ -219,7 +219,7 @@ pub(super) fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
-    meta_by_abs: &mut rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
+    annotate: &mut Vec<crate::block::SpendAnnotateJob>,
 ) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
     use crate::block::StructuralPhaseNs;
     let t0 = Instant::now();
@@ -249,8 +249,8 @@ pub(super) fn structural_run(
             &mut pending_spent,
             batch_parents,
             &mut mtp_cache,
-            meta_by_abs,
             &run_create_height,
+            annotate,
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);
@@ -310,63 +310,39 @@ pub(super) fn class_c_commit(
 
 /// Returns `(spend_ann_ns, tip_gc_ns)` measured with local `Instant`s.
 ///
-/// Pure-write annotate: body meta from `meta_by_abs` (structural snapshot);
-/// no body pread. Backend from global `RBITCOIN_IO`.
+/// Pure-write annotate from structural abs+meta jobs (no pin `get_spender_abs`).
 pub(super) fn post_commit(
     query: &Query,
-    prepared: &[Prepared],
-    batch_parents: &rbitcoin_query::BatchParents,
-    meta_by_abs: &rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)>,
+    annotate: &[crate::block::SpendAnnotateJob],
 ) -> Result<(u64, u64), ConsensusError> {
-    // Load pin must supply denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
-    if query.spend_index_enabled() {
+    if query.spend_index_enabled() && !annotate.is_empty() {
         let mut abs_edges: Vec<(u64, rbitcoin_primitives::Fk, u32, rbitcoin_primitives::Fk)> =
-            Vec::new();
-        let mut known: Vec<(rbitcoin_primitives::Fk, u8)> = Vec::new();
-        let mut n_skip = 0u64;
-        for p in prepared {
-            for &(_txid, vout, sfk, cfk) in &p.spends {
-                if sfk.is_null() || cfk.is_null() {
-                    n_skip = n_skip.saturating_add(1);
-                    continue;
-                }
-                let Some(abs) = batch_parents.get_spender_abs(cfk, vout) else {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: spend annotate missing pin denserels/abs",
-                    )));
-                };
-                let Some(&(field, flags)) = meta_by_abs.get(&abs) else {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: spend annotate missing structural meta (cold forbidden)",
-                    )));
-                };
-                abs_edges.push((abs, cfk, vout, sfk));
-                known.push((field, flags));
-            }
+            Vec::with_capacity(annotate.len());
+        let mut known: Vec<(rbitcoin_primitives::Fk, u8)> = Vec::with_capacity(annotate.len());
+        for job in annotate {
+            abs_edges.push((job.abs, job.create_fk, job.vout, job.spend_fk));
+            known.push((job.field, job.flags));
         }
-        confirm_phase_stats::SPEND_ANNOTATE_SKIP.fetch_add(n_skip, Ordering::Relaxed);
-        if !abs_edges.is_empty() {
-            let backend = spend_ann_backend_next();
-            let t_ann = Instant::now();
-            let cold = query
-                .store()
-                .put_spend_batch_by_abs_meta_known(&abs_edges, &known, backend)
-                .map_err(ConsensusError::from)?;
-            if !cold.is_empty() {
-                return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: spend annotate abs cold (OOB or IO); load/layout bug",
-                )));
-            }
-            let ann_ns = t_ann.elapsed().as_nanos() as u64;
-            confirm_phase_stats::SPEND_ANN_NS.fetch_add(ann_ns, Ordering::Relaxed);
-            confirm_phase_stats::SPEND_ANN_N.fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
-            let _ = backend;
-            confirm_phase_stats::SPEND_ANNOTATE_RANGED
-                .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
-            confirm_phase_stats::SPEND_ANN_PREAD_SKIP
-                .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+        let backend = spend_ann_backend_next();
+        let t_ann = Instant::now();
+        let cold = query
+            .store()
+            .put_spend_batch_by_abs_meta_known(&abs_edges, &known, backend)
+            .map_err(ConsensusError::from)?;
+        if !cold.is_empty() {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: spend annotate abs cold (OOB or IO); load/layout bug",
+            )));
         }
+        let ann_ns = t_ann.elapsed().as_nanos() as u64;
+        confirm_phase_stats::SPEND_ANN_NS.fetch_add(ann_ns, Ordering::Relaxed);
+        confirm_phase_stats::SPEND_ANN_N.fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+        let _ = backend;
+        confirm_phase_stats::SPEND_ANNOTATE_RANGED
+            .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+        confirm_phase_stats::SPEND_ANN_PREAD_SKIP
+            .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
     }
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);

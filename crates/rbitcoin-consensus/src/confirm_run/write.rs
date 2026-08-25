@@ -233,8 +233,7 @@ pub fn confirm_write_phase(
 
     let overlap = (|| -> Result<_, ConsensusError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
-        let mut meta_by_abs: rbitcoin_query::U64Map<(rbitcoin_primitives::Fk, u8)> =
-            rbitcoin_query::U64Map::default();
+        let mut annotate = Vec::new();
         let t_struct = Instant::now();
         let struct_ph = structural_run(
             query,
@@ -243,7 +242,7 @@ pub fn confirm_write_phase(
             &batch.prepared,
             &batch.wire_blocks,
             &batch.batch_parents,
-            &mut meta_by_abs,
+            &mut annotate,
         )?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
@@ -262,8 +261,7 @@ pub fn confirm_write_phase(
                 .fetch_add(class_c_join_ns, Ordering::Relaxed);
         }
 
-        let (spend_ann_ns, tip_gc_ns) =
-            post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
+        let (spend_ann_ns, tip_gc_ns) = post_commit(query, &annotate)?;
         Ok((
             out,
             n_blocks,

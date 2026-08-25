@@ -19,18 +19,17 @@ pub(super) fn pin_for_wire_batch(
 ) -> Result<
     (
         rbitcoin_query::BatchParents,
-        rbitcoin_query::BatchThin,
+        rbitcoin_query::SpendEdges,
         DenserelsWarmStats,
     ),
     ConsensusError,
 > {
     use rbitcoin_query::confirm_load_stats;
-    use rbitcoin_query::ThinInput;
     use std::sync::atomic::Ordering;
 
     let t_pin = Instant::now();
     let t_thin = Instant::now();
-    let mut batch_thin: rbitcoin_query::BatchThin = rbitcoin_query::BatchThin::default();
+    let mut spend_edges: rbitcoin_query::SpendEdges = rbitcoin_query::SpendEdges::default();
     let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let mut n_same_batch = 0u32;
     let mut vouts_from_stamp = false;
@@ -62,28 +61,34 @@ pub(super) fn pin_for_wire_batch(
             let mut edges = Vec::with_capacity(ins.len());
             for inp in ins {
                 if inp.is_coinbase() || inp.prev_index == u32::MAX {
-                    edges.push(ThinInput {
-                        create_fk: None,
-                        prev_index: u32::MAX,
+                    edges.push(rbitcoin_query::SpendEdge {
+                        prev_txid: [0u8; 32],
+                        vout: u32::MAX,
+                        spend_fk: rbitcoin_primitives::Fk(sid),
+                        create_fk: rbitcoin_primitives::Fk::NULL,
                     });
                     continue;
                 }
                 if let Some(pid) = inp.create_fk.get() {
-                    edges.push(ThinInput {
-                        create_fk: Some(pid),
-                        prev_index: inp.prev_index,
+                    edges.push(rbitcoin_query::SpendEdge {
+                        prev_txid: inp.prev_txid,
+                        vout: inp.prev_index,
+                        spend_fk: rbitcoin_primitives::Fk(sid),
+                        create_fk: inp.create_fk,
                     });
                     if fill_vouts && !plan.create_in_spend_header(*fk, pid) {
                         parent_vouts.entry(pid).or_default().push(inp.prev_index);
                     }
                 } else {
-                    edges.push(ThinInput {
-                        create_fk: None,
-                        prev_index: inp.prev_index,
+                    edges.push(rbitcoin_query::SpendEdge {
+                        prev_txid: inp.prev_txid,
+                        vout: inp.prev_index,
+                        spend_fk: rbitcoin_primitives::Fk(sid),
+                        create_fk: rbitcoin_primitives::Fk::NULL,
                     });
                 }
             }
-            batch_thin.insert(sid, edges);
+            spend_edges.insert(sid, edges);
         }
         if !fill_vouts {
             parent_vouts = std::mem::take(&mut parent_pin.parent_vouts);
@@ -99,28 +104,34 @@ pub(super) fn pin_for_wire_batch(
                 let mut edges = Vec::with_capacity(tx.input.len());
                 for inp in &tx.input {
                     if inp.previous_output.is_null() {
-                        edges.push(ThinInput {
-                            create_fk: None,
-                            prev_index: u32::MAX,
+                        edges.push(rbitcoin_query::SpendEdge {
+                            prev_txid: [0u8; 32],
+                            vout: u32::MAX,
+                            spend_fk: rbitcoin_primitives::Fk(sfk),
+                            create_fk: rbitcoin_primitives::Fk::NULL,
                         });
                         continue;
                     }
                     let prev_txid = inp.previous_output.txid.to_byte_array();
                     let vout = inp.previous_output.vout;
-                    if let Some(&pid) = parent_pin.create_by_txid.get(&prev_txid) {
-                        edges.push(ThinInput {
-                            create_fk: Some(pid),
-                            prev_index: vout,
+                    if let Some(&pid) = parent_pin.resolved.get(&prev_txid) {
+                        edges.push(rbitcoin_query::SpendEdge {
+                            prev_txid,
+                            vout,
+                            spend_fk: rbitcoin_primitives::Fk(sfk),
+                            create_fk: rbitcoin_primitives::Fk(pid),
                         });
                         parent_vouts.entry(pid).or_default().push(vout);
                         continue;
                     }
-                    edges.push(ThinInput {
-                        create_fk: None,
-                        prev_index: vout,
+                    edges.push(rbitcoin_query::SpendEdge {
+                        prev_txid,
+                        vout,
+                        spend_fk: rbitcoin_primitives::Fk(sfk),
+                        create_fk: rbitcoin_primitives::Fk::NULL,
                     });
                 }
-                batch_thin.insert(sfk, edges);
+                spend_edges.insert(sfk, edges);
             }
         }
     }
@@ -158,7 +169,7 @@ pub(super) fn pin_for_wire_batch(
         if plan_by_id.contains_key(id) {
             continue;
         }
-        let Some(pin) = parent_pin.pins.get(id).cloned() else {
+        let Some(pin) = parent_pin.create_pin(*id).cloned() else {
             continue;
         };
         let (_tx, outs) = pin.as_ref();
@@ -204,7 +215,7 @@ pub(super) fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                let plan_range = parent_pin.ranges.get(id).copied();
+                let plan_range = parent_pin.body_range(*id);
                 if cb.is_some() || plan_range.is_some() {
                     batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                 }
@@ -214,11 +225,7 @@ pub(super) fn pin_for_wire_batch(
         }
         if let Some(pin) = plan_by_id.get(id) {
             let (tx, outs) = pin.as_ref();
-            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
-                .iter()
-                .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-                .collect();
-            if live.len() != need.len() {
+            if !need.iter().all(|&v| outs.get(v as usize).is_some()) {
                 still_need.insert(*id, need.clone());
                 continue;
             }
@@ -227,11 +234,10 @@ pub(super) fn pin_for_wire_batch(
             } else {
                 None
             };
-            let plan_range = parent_pin.ranges.get(id).copied();
-            batch_parents.insert_owned(
+            let plan_range = parent_pin.body_range(*id);
+            batch_parents.insert_create_pin(
                 fk,
-                tx.clone(),
-                live,
+                std::sync::Arc::clone(pin),
                 need.clone(),
                 cb,
                 plan_range,
@@ -252,7 +258,7 @@ pub(super) fn pin_for_wire_batch(
             Vec::new();
         let pending = std::mem::take(&mut still_need);
         for (id, need) in pending {
-            let Some(range) = parent_pin.ranges.get(&id).copied() else {
+            let Some(range) = parent_pin.body_range(id) else {
                 still_need.insert(id, need);
                 continue;
             };
@@ -327,7 +333,7 @@ pub(super) fn pin_for_wire_batch(
     }
 
     for (id, _) in &parent_vouts {
-        if let Some(sr) = parent_pin.spent_ranges.get(id).copied() {
+        if let Some(sr) = parent_pin.spent_range(*id) {
             batch_parents.set_spent_range_only(rbitcoin_primitives::Fk(*id), sr);
         }
     }
@@ -427,7 +433,7 @@ pub(super) fn pin_for_wire_batch(
         same_batch: n_same_batch,
         work_ns: pin_ns,
     };
-    Ok((batch_parents, batch_thin, warm))
+    Ok((batch_parents, spend_edges, warm))
 }
 
 /// Ensure spend abs for every spend edge on the write batch.

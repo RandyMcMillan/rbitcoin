@@ -229,6 +229,77 @@ impl HeightFence {
     }
 }
 
+/// Last 11 confirmed header timestamps ending at the fence tip (BIP113 window).
+///
+/// Sequential extend is O(1). Non-sequential / pop → caller rebuilds from
+/// confirmed headers (reorgs, open). Historical MTP does not use this.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MtpRing {
+    times: [u32; 11],
+    /// Valid prefix `0..=11`.
+    len: u8,
+    /// Height of `times[len-1]` when `len > 0`.
+    tip: u32,
+}
+
+impl MtpRing {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Append if `height` is genesis on an empty ring, or `tip+1`.
+    pub fn try_push(&mut self, height: u32, time: u32) -> bool {
+        if self.len == 0 {
+            if height != 0 {
+                return false;
+            }
+            self.times[0] = time;
+            self.len = 1;
+            self.tip = 0;
+            return true;
+        }
+        if height != self.tip.saturating_add(1) {
+            return false;
+        }
+        if (self.len as usize) < 11 {
+            self.times[self.len as usize] = time;
+            self.len += 1;
+        } else {
+            self.times.copy_within(1..11, 0);
+            self.times[10] = time;
+        }
+        self.tip = height;
+        true
+    }
+
+    pub fn set_window(&mut self, tip: u32, times: &[u32]) {
+        let n = times.len().min(11);
+        if n == 0 {
+            *self = Self::empty();
+            return;
+        }
+        self.times[..n].copy_from_slice(&times[..n]);
+        self.len = n as u8;
+        self.tip = tip;
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::empty();
+    }
+
+    /// Window for BIP113 at `height` when this ring ends there.
+    pub fn window_at(&self, height: u32) -> Option<(u8, [u32; 11])> {
+        if self.len == 0 || height != self.tip {
+            return None;
+        }
+        let expect = (height.saturating_add(1)).min(11) as u8;
+        if self.len != expect {
+            return None;
+        }
+        Some((self.len, self.times))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +310,33 @@ mod tests {
             count,
             height,
         }
+    }
+
+    #[test]
+    fn mtp_ring_sequential_shift_and_tip_only() {
+        let mut r = MtpRing::empty();
+        for h in 0..12u32 {
+            assert!(r.try_push(h, 1_000 + h * 10), "push {h}");
+        }
+        let (n, buf) = r.window_at(11).expect("tip window");
+        assert_eq!(n, 11);
+        assert_eq!(
+            &buf[..11],
+            &[1010, 1020, 1030, 1040, 1050, 1060, 1070, 1080, 1090, 1100, 1110]
+        );
+        assert!(
+            r.window_at(10).is_none(),
+            "historical height is not the ring"
+        );
+        assert!(!r.try_push(13, 9), "hole is not sequential");
+        assert!(r.window_at(11).is_some());
+        r.clear();
+        assert!(r.window_at(11).is_none());
+        assert!(!r.try_push(5, 1), "cold ring only accepts genesis");
+        assert!(r.try_push(0, 42));
+        let (n, buf) = r.window_at(0).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 42);
     }
 
     #[test]

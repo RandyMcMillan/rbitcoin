@@ -1,7 +1,7 @@
 use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
-use crate::height_fence::HeightFence;
+use crate::height_fence::{HeightFence, MtpRing};
 use crate::point_table::{self, PointRecord};
 use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
@@ -171,6 +171,8 @@ pub struct Store {
     pub header_txs: HeaderTxsTable,
     /// Resident create-height fence (confirmed[] + header_txs). No `tx_height.body`.
     height_fence: std::sync::RwLock<HeightFence>,
+    /// BIP113 window at the fence tip (extend O(1); pop rebuilds).
+    mtp_ring: std::sync::RwLock<MtpRing>,
 }
 
 /// How txid → Class A fk picks among rows with the same txid.
@@ -233,6 +235,7 @@ impl Store {
             strong_tx: StrongTxTable::create(&path)?,
             header_txs: HeaderTxsTable::create(&path)?,
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
+            mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             path,
             cold_path,
         })
@@ -331,7 +334,7 @@ impl Store {
             write_inwit_reloc(&path)?;
         }
         let cold_path = layout.is_split().then(|| inwit_dir);
-        Ok(Self {
+        let store = Self {
             headers: HeaderTable::open(&path)?,
             txs,
             spenders: SpenderTable::open(&path)?,
@@ -340,9 +343,12 @@ impl Store {
             strong_tx: StrongTxTable::open(&path)?,
             header_txs,
             height_fence: std::sync::RwLock::new(height_fence),
+            mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             path,
             cold_path,
-        })
+        };
+        store.rebuild_mtp_ring()?;
+        Ok(store)
     }
 
     pub fn open_or_create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
@@ -388,6 +394,52 @@ impl Store {
         self.height_fence.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn mtp_write(&self) -> std::sync::RwLockWriteGuard<'_, MtpRing> {
+        self.mtp_ring.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// BIP113 times for `height` when it is the fence tip and the ring is warm.
+    pub fn mtp_times_at(&self, height: Height) -> Option<(u8, [u32; 11])> {
+        self.mtp_ring
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .window_at(height.0)
+    }
+
+    fn mtp_push(&self, height: u32, time: u32) {
+        let pushed = self.mtp_write().try_push(height, time);
+        if pushed {
+            return;
+        }
+        let _ = self.rebuild_mtp_ring();
+        let _ = self.mtp_write().try_push(height, time);
+    }
+
+    fn rebuild_mtp_ring(&self) -> Result<(), StoreError> {
+        let Some(tip) = self.confirmed.tip_height() else {
+            self.mtp_write().clear();
+            return Ok(());
+        };
+        let start = tip.0.saturating_sub(10);
+        let mut times = Vec::with_capacity((tip.0 - start + 1) as usize);
+        for h in start..=tip.0 {
+            let Some(fk) = self.confirmed.get(Height(h))? else {
+                self.mtp_write().clear();
+                return Ok(());
+            };
+            let rec = match self.headers.get(fk) {
+                Ok(r) => r,
+                Err(_) => {
+                    self.mtp_write().clear();
+                    return Ok(());
+                }
+            };
+            times.push(rec.timestamp);
+        }
+        self.mtp_write().set_window(tip.0, &times);
+        Ok(())
+    }
+
     /// Highest create_fk in a connected fence run (`0` if empty).
     pub fn fence_max_connected_fk(&self) -> u64 {
         self.fence().max_connected_fk()
@@ -423,7 +475,7 @@ impl Store {
     pub fn rebuild_height_fence(&self) -> Result<(), StoreError> {
         let f = HeightFence::from_confirmed(&self.confirmed, &self.header_txs)?;
         *self.fence_write() = f;
-        Ok(())
+        self.rebuild_mtp_ring()
     }
 
     /// Append this height’s Class A run to the live fence.
@@ -441,13 +493,19 @@ impl Store {
         if n == 0 || first.is_null() {
             return Err(StoreError::Corrupt("height fence: header_txs range empty"));
         }
+        let time = self.headers.get(header_fk).ok().map(|r| r.timestamp);
         self.fence_write().extend(height.0, first, n);
+        match time {
+            Some(t) => self.mtp_push(height.0, t),
+            None => self.mtp_write().clear(),
+        }
         Ok(())
     }
 
     /// After tip shrink: drop the disconnected height’s run.
     pub fn height_fence_pop_tip(&self, height: Height) {
         self.fence_write().pop_height(height.0);
+        let _ = self.rebuild_mtp_ring();
     }
 
     /// Header write gate: unique by full hash; reject false `prev_fk` edges.

@@ -4,7 +4,7 @@
 //! primary hash. Full strategy merge (one generic table) is deferred; this
 //! module keeps probe math / load factor from drifting.
 
-/// Rehash when occupied/slots ≥ 7/8.
+/// Occupied/slots ceiling; insert past this is full (not an in-place rehash).
 pub const MAX_LOAD_NUM: u64 = 7;
 pub const MAX_LOAD_DEN: u64 = 8;
 

@@ -564,10 +564,7 @@ fn ingest_oa_slots_mainnet_is_2_25() {
 fn create_does_not_write_oa_stub() {
     let dir = tmp();
     let t = ScriptHashTable::create(&dir).unwrap();
-    assert_eq!(
-        t.head_shard_count(),
-        shard_count_for_role(HeadRole::ScriptHash)
-    );
+    assert_eq!(t.head_shard_count(), crate::hashhead::sh_main_shard_count());
     drop(t);
     assert!(
         !dir.join("scripthash.head.oa_stub").exists(),
@@ -579,10 +576,7 @@ fn create_does_not_write_oa_stub() {
         !dir.join("scripthash.head.oa_stub").exists(),
         "open must unlink leftover oa_stub"
     );
-    assert_eq!(
-        t.head_shard_count(),
-        shard_count_for_role(HeadRole::ScriptHash)
-    );
+    assert_eq!(t.head_shard_count(), crate::hashhead::sh_main_shard_count());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

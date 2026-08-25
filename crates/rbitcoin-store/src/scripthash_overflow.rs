@@ -474,7 +474,6 @@ pub fn wipe_legacy_fullsize_overflow(store_dir: &Path) -> Result<(), StoreError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hashhead::HeadRole;
     use crate::scripthash_layout::ShHeadValue;
     use rbitcoin_primitives::Fk;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -497,8 +496,7 @@ mod tests {
     fn ovf_segment_slots_equals_one_main_shard() {
         let dir = tmp();
         // Tiny default SH: often 1 shard × 64 slots (or multi-shard under scale).
-        let main =
-            ShardedScriptHashHead::create_for_role(dir.join("main"), HeadRole::ScriptHash).unwrap();
+        let main = ShardedScriptHashHead::create_for_role(dir.join("main")).unwrap();
         let ovf_slots = ovf_segment_slots(&main);
         assert_eq!(ovf_slots, main.slots_per_shard());
         if main.shard_count() > 1 {

@@ -74,7 +74,6 @@ pub(crate) const HASH_HEAD_FULL: &str = "invariant: hash head full";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadRole {
     Header,
-    ScriptHash,
 }
 
 /// Disk pre-size policy for hash heads.
@@ -85,7 +84,7 @@ pub enum HeadRole {
 pub enum HeadScale {
     /// Minimal (64 slots) — unit/integration tests.
     Tiny,
-    /// Full-mainnet IBD: sharded heads with moderate **per-shard** sparse start.
+    /// Full-mainnet IBD: `header.head` starts at 2²² slots (~24 MiB).
     Mainnet,
 }
 
@@ -156,15 +155,12 @@ impl HeadScale {
         }
     }
 
-    /// Default initial slots for a **single** hash-head file (legacy / unsharded).
-    /// Sharded creates use [`crate::sharded_hashhead::initial_slots_per_shard`].
+    /// Default initial slots for a **single** hash-head file.
     pub fn initial_slots(self, role: HeadRole) -> u64 {
         match self {
             HeadScale::Tiny => DEFAULT_SLOTS,
-            // Unsharded fallback only (legacy single-file). Prefer sharded layout.
             HeadScale::Mainnet => match role {
                 HeadRole::Header => 1 << 22,
-                HeadRole::ScriptHash => 1 << 22,
             },
         }
     }
@@ -172,12 +168,11 @@ impl HeadScale {
 
 /// Effective initial slots for `role` (env scale + optional per-role override).
 ///
-/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_SCRIPTHASH`
-/// (decimal slot count, rounded up to power of two).
+/// Override: `RBITCOIN_HEAD_SLOTS_HEADER` (decimal slot count, rounded up to
+/// power of two).
 pub fn initial_slots_for(role: HeadRole) -> u64 {
     let env_key = match role {
         HeadRole::Header => "RBITCOIN_HEAD_SLOTS_HEADER",
-        HeadRole::ScriptHash => "RBITCOIN_HEAD_SLOTS_SCRIPTHASH",
     };
     if let Ok(s) = std::env::var(env_key) {
         if let Ok(n) = s.parse::<u64>() {
@@ -185,6 +180,16 @@ pub fn initial_slots_for(role: HeadRole) -> u64 {
         }
     }
     HeadScale::from_env().initial_slots(role)
+}
+
+/// Sorted/MPHF `scripthash.head/NN` + sharded body count (not a HashHead).
+pub const SH_MAIN_SHARDS_MAINNET: usize = 64;
+
+pub fn sh_main_shard_count() -> usize {
+    match HeadScale::from_env() {
+        HeadScale::Tiny => 1,
+        HeadScale::Mainnet => SH_MAIN_SHARDS_MAINNET,
+    }
 }
 
 /// Append-only multi-fk list for a single 16-byte head key (prefix / BIP30).
@@ -1062,9 +1067,9 @@ mod tests {
 
     #[test]
     fn mainnet_scale_slot_targets() {
-        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::ScriptHash), 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash) >= 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Header) >= 64);
+        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Header), 64);
+        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 22);
+        assert_eq!(sh_main_shard_count(), 1);
     }
 
     #[test]
@@ -1207,10 +1212,9 @@ mod tests {
             DEFAULT_SLOTS
         );
         assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 22);
-        assert_eq!(
-            HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash),
-            1 << 22
-        );
+        HeadScale::test_with(HeadScale::Mainnet, || {
+            assert_eq!(sh_main_shard_count(), SH_MAIN_SHARDS_MAINNET);
+        });
         assert_eq!(initial_slots_for(HeadRole::Header), DEFAULT_SLOTS);
         let full = [0xABu8; 32];
         let p = head_key_prefix(&full);

@@ -41,7 +41,6 @@ mod scripthash_pages;
 mod scripthash_slabs;
 mod scripthash_sorted_head;
 mod segmented_head;
-mod sharded_hashhead;
 mod sorted_run;
 mod sp_tweaks;
 mod sp_tweaks_uring;
@@ -71,7 +70,9 @@ pub use block_wire::block_wire_input_count;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use error::StoreError;
 pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
-pub use hashhead::{initial_slots_for, HeadRole, HeadScale};
+pub use hashhead::{
+    initial_slots_for, sh_main_shard_count, HeadRole, HeadScale, SH_MAIN_SHARDS_MAINNET,
+};
 pub use head_resolve_pick::{classify_leftover_miss, LeftoverMissOn};
 pub use head_resolve_stats::{leftover_probe_diag_ready, Sample as HeadResolveSample};
 pub use header_table::{block_header_hash, HeaderRecord, HeaderTable};
@@ -109,10 +110,6 @@ pub use segmented_head::{
     sample_lookup_stats as sample_head_lookup_stats,
     snapshot_lookup_stats as snapshot_head_lookup_stats, HeadLookupStats, SegmentedTxHead,
     SEGMENT_HEAD_BITS,
-};
-pub use sharded_hashhead::{
-    shard_count_for_role, shard_count_for_scale, SHARD_COUNT, SHARD_COUNT_SCRIPTHASH,
-    SHARD_COUNT_TX_SH,
 };
 pub use sorted_run::{
     claim_run_for_materialize, commit_run_to_catalog, crc32, detach_run, for_each_merged_rec,

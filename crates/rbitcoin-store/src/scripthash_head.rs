@@ -8,22 +8,18 @@
 //! Slot occupancy is process state for load-factor / `is_empty`, **not** needed for
 //! probe lookups. Mainnet shards are multi‑GiB — a full slot scan on every open is
 //! unacceptable. Durable sidecar `{shard}.occ` holds the count (written on create,
-//! reinit, cold install, rehash, and inserts). Large shards without a sidecar skip
+//! reinit, cold install, and inserts). Large shards without a sidecar skip
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::hashhead::HeadScale;
 #[cfg(test)]
-use crate::hashhead::{initial_slots_for, HeadRole};
+use crate::hashhead::sh_main_shard_count;
+use crate::hashhead::HeadScale;
 use crate::scripthash_layout::{
     head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
     SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
-#[cfg(test)]
-use crate::sharded_hashhead::initial_slots_per_shard;
-#[cfg(test)]
-use crate::sharded_hashhead::shard_count_for_role;
 use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1094,13 +1090,8 @@ pub struct ShardedScriptHashHead {
 #[cfg(test)]
 impl ShardedScriptHashHead {
     #[cfg(test)]
-    pub fn create_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
-        debug_assert_eq!(role, HeadRole::ScriptHash);
-        Self::create_sharded(
-            path,
-            shard_count_for_role(role),
-            initial_slots_per_shard(role),
-        )
+    pub fn create_for_role(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::create_sharded(path, sh_main_shard_count(), 64)
     }
 
     pub fn create_sharded(
@@ -1130,8 +1121,6 @@ impl ShardedScriptHashHead {
             let shard_path = path.join(format!("{i:02x}"));
             shards.push(ScriptHashHead::create_with_slots(shard_path, per)?);
         }
-        let _ = HeadScale::from_env();
-        let _ = initial_slots_for(HeadRole::ScriptHash);
         Ok(Self { shards })
     }
 
@@ -1143,7 +1132,7 @@ impl ShardedScriptHashHead {
         Ok(())
     }
 
-    pub fn open_for_role(path: impl Into<PathBuf>, role: HeadRole) -> Result<Self, StoreError> {
+    pub fn open_for_role(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
             // Shard files only (`00`..`3f`); ignore `00.occ` sidecars and temps.
@@ -1160,7 +1149,7 @@ impl ShardedScriptHashHead {
             }
             // Mainnet expects 64-way. Leftover live OA at `scripthash.head` is
             // refused by [`crate::scripthash::ScriptHashTable::open`].
-            let expected = shard_count_for_role(role);
+            let expected = sh_main_shard_count();
             if expected > 1 && names.len() != expected {
                 return Err(StoreError::Corrupt(SH_HEAD_SHARD_COUNT_MISMATCH));
             }
@@ -1713,7 +1702,7 @@ mod tests {
         h.flush().unwrap();
         drop(h);
         // open_for_role directory
-        let h2 = ShardedScriptHashHead::open_for_role(&multi, HeadRole::ScriptHash).unwrap();
+        let h2 = ShardedScriptHashHead::open_for_role(&multi).unwrap();
         assert_eq!(h2.shard_count(), 4);
         let key0 = [0u8; 32];
         assert!(h2.get(&key0).unwrap().is_some());
@@ -1728,15 +1717,13 @@ mod tests {
         let empty = base.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         assert!(matches!(
-            ShardedScriptHashHead::open_for_role(&empty, HeadRole::ScriptHash),
+            ShardedScriptHashHead::open_for_role(&empty),
             Err(StoreError::Corrupt(_))
         ));
         // open missing
-        assert!(
-            ShardedScriptHashHead::open_for_role(base.join("nope"), HeadRole::ScriptHash).is_err()
-        );
+        assert!(ShardedScriptHashHead::open_for_role(base.join("nope")).is_err());
         // open single file via open_for_role
-        let h3 = ShardedScriptHashHead::open_for_role(&single, HeadRole::ScriptHash).unwrap();
+        let h3 = ShardedScriptHashHead::open_for_role(&single).unwrap();
         assert_eq!(h3.shard_count(), 1);
 
         // unexpected shard name
@@ -1744,7 +1731,7 @@ mod tests {
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("zz"), b"x").unwrap();
         assert!(matches!(
-            ShardedScriptHashHead::open_for_role(&bad, HeadRole::ScriptHash),
+            ShardedScriptHashHead::open_for_role(&bad),
             Err(StoreError::Corrupt(_))
         ));
 

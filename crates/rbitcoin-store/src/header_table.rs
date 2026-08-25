@@ -1,7 +1,6 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::hashhead::{HashHead, HeadRole, HASH_HEAD_FULL};
-use crate::sharded_hashhead::initial_slots_per_shard;
+use crate::hashhead::{initial_slots_for, HashHead, HeadRole, HASH_HEAD_FULL};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
@@ -95,7 +94,7 @@ fn header_gen_path(base: &Path, i: usize) -> PathBuf {
 
 impl HeaderHead {
     fn create(base: PathBuf) -> Result<Self, StoreError> {
-        let target_slots = initial_slots_per_shard(HeadRole::Header);
+        let target_slots = initial_slots_for(HeadRole::Header);
         let h = HashHead::create_with_slots(&base, target_slots)?;
         Ok(Self {
             base,
@@ -114,7 +113,7 @@ impl HeaderHead {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "header.head missing"),
             ));
         }
-        let target_slots = initial_slots_per_shard(HeadRole::Header);
+        let target_slots = initial_slots_for(HeadRole::Header);
         let mut gens = vec![HashHead::open(&base)?];
         let mut i = 1usize;
         loop {

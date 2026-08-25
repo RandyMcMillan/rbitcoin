@@ -589,105 +589,8 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let _ = (utxos, tip);
+        let (conflict_set, fee_sat, weight) = self.plan_after_script(tx, prep, utxos, tip)?;
         let txid = tx.compute_txid();
-        if self.graph.contains(&txid) {
-            return Err(AcceptError::Duplicate(txid));
-        }
-        if self.orphanage.contains(&txid) {
-            return Err(AcceptError::Orphaned(txid));
-        }
-
-        // Re-resolve conflicts and parent availability (TOCTOU after off-lock script).
-        let mut direct_conflicts = BTreeSet::new();
-        let mut parent_txids = BTreeSet::new();
-        for inp in &tx.input {
-            let op = inp.previous_output;
-            if let Some(c) = self.graph.conflict_txid(&op) {
-                if c != txid {
-                    direct_conflicts.insert(c);
-                }
-            }
-            if let Some(creator) = self.graph.creator(&op) {
-                if !self.graph.mempool_utxo(&op) {
-                    if let Some(c) = self.graph.conflict_txid(&op) {
-                        direct_conflicts.insert(c);
-                    } else {
-                        return Err(AcceptError::Policy("mempool double-spend"));
-                    }
-                }
-                parent_txids.insert(creator);
-                if self.bodies.get(&creator).is_none() {
-                    return Err(AcceptError::Durable("parent body missing".into()));
-                }
-            } else if utxos.get_coin(&op).is_none() {
-                // Chain coin disappeared or was never present — fail closed.
-                return Err(AcceptError::MissingPrevout(op));
-            }
-        }
-        // Prefer re-resolved conflict set; prepared set is a hint only.
-        let _ = prep.direct_conflicts;
-        let _ = prep.parent_txids;
-        let _ = prep.chain_coins;
-
-        let fee_sat = prep.fee_sat;
-        let weight = prep.weight;
-        let admit_fee =
-            (i128::from(fee_sat).saturating_add(i128::from(prep.fee_delta))).max(0) as u64;
-
-        // Full RBF (Libre): BIP125-style absolute fee **or** pure replace-by-fee-rate.
-        // Incoming modified fee (base + prioritisetransaction) vs incumbent base.
-        let conflict_set = if !direct_conflicts.is_empty() {
-            let direct: Vec<Txid> = direct_conflicts.into_iter().collect();
-            let set = self.graph.conflict_set(&direct);
-            let (old_fee, old_weight) = self.graph.set_fee_weight(&set);
-            let (direct_fee, direct_weight) = self
-                .graph
-                .set_fee_weight(&direct.iter().copied().collect::<BTreeSet<_>>());
-            if !rbf_allows_replacement(
-                admit_fee,
-                weight,
-                old_fee,
-                old_weight,
-                direct_fee,
-                direct_weight,
-            ) {
-                return Err(AcceptError::RbfInsufficient);
-            }
-            set
-        } else {
-            BTreeSet::new()
-        };
-        let parent_txids: BTreeSet<Txid> = parent_txids
-            .into_iter()
-            .filter(|p| !conflict_set.contains(p))
-            .collect();
-
-        // Size the cluster *after* RBF: replaced txs do not count.
-        let mut members = BTreeSet::new();
-        for p in &parent_txids {
-            if let Some(c) = self.graph.cluster_of(p) {
-                members.extend(c.members);
-            }
-        }
-        members.retain(|m| !conflict_set.contains(m));
-        let base_w: u64 = members
-            .iter()
-            .filter_map(|t| self.graph.get(t).map(|e| e.weight))
-            .sum();
-        // Core `-limitclustersize` is kvB of (Σ weight + 3) / 4 — same as
-        // the functional test's `weight_to_vsize(clusterweight)`.
-        // Do not also sum per-tx vsizes: that over-rejects size-limit small_tx
-        // (each floor wastes up to 3 WU; 10 parents make remaining look too small).
-        let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
-        if members.len() + 1 > self.graph.cluster_count_limit()
-            || combined_vsize > self.graph.cluster_vsize_limit()
-        {
-            return Err(AcceptError::ClusterTooLarge {
-                count: members.len() + 1,
-                weight: base_w.saturating_add(weight),
-            });
-        }
 
         let mut replaced_scripthashes: Vec<[u8; 32]> = Vec::new();
         for c in &conflict_set {
@@ -751,6 +654,125 @@ impl ActiveMempool {
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes,
         })
+    }
+
+    /// Prepare + RBF/cluster checks with no graph or store mutation.
+    pub fn evaluate_after_script(
+        &self,
+        tx: &Transaction,
+        prep: PreparedAdmit,
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) -> Result<AcceptResult, AcceptError> {
+        let (conflict_set, fee_sat, weight) = self.plan_after_script(tx, prep, utxos, tip)?;
+        Ok(AcceptResult {
+            txid: tx.compute_txid(),
+            fee_sat,
+            weight,
+            slot: 0,
+            replaced: conflict_set.into_iter().collect(),
+            replaced_scripthashes: Vec::new(),
+        })
+    }
+
+    fn plan_after_script(
+        &self,
+        tx: &Transaction,
+        prep: PreparedAdmit,
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) -> Result<(BTreeSet<Txid>, u64, u64), AcceptError> {
+        let _ = tip;
+        let txid = tx.compute_txid();
+        if self.graph.contains(&txid) {
+            return Err(AcceptError::Duplicate(txid));
+        }
+        if self.orphanage.contains(&txid) {
+            return Err(AcceptError::Orphaned(txid));
+        }
+
+        let mut direct_conflicts = BTreeSet::new();
+        let mut parent_txids = BTreeSet::new();
+        for inp in &tx.input {
+            let op = inp.previous_output;
+            if let Some(c) = self.graph.conflict_txid(&op) {
+                if c != txid {
+                    direct_conflicts.insert(c);
+                }
+            }
+            if let Some(creator) = self.graph.creator(&op) {
+                if !self.graph.mempool_utxo(&op) {
+                    if let Some(c) = self.graph.conflict_txid(&op) {
+                        direct_conflicts.insert(c);
+                    } else {
+                        return Err(AcceptError::Policy("mempool double-spend"));
+                    }
+                }
+                parent_txids.insert(creator);
+                if self.bodies.get(&creator).is_none() {
+                    return Err(AcceptError::Durable("parent body missing".into()));
+                }
+            } else if utxos.get_coin(&op).is_none() {
+                return Err(AcceptError::MissingPrevout(op));
+            }
+        }
+        let _ = prep.direct_conflicts;
+        let _ = prep.parent_txids;
+        let _ = prep.chain_coins;
+
+        let fee_sat = prep.fee_sat;
+        let weight = prep.weight;
+        let admit_fee =
+            (i128::from(fee_sat).saturating_add(i128::from(prep.fee_delta))).max(0) as u64;
+
+        let conflict_set = if !direct_conflicts.is_empty() {
+            let direct: Vec<Txid> = direct_conflicts.into_iter().collect();
+            let set = self.graph.conflict_set(&direct);
+            let (old_fee, old_weight) = self.graph.set_fee_weight(&set);
+            let (direct_fee, direct_weight) = self
+                .graph
+                .set_fee_weight(&direct.iter().copied().collect::<BTreeSet<_>>());
+            if !rbf_allows_replacement(
+                admit_fee,
+                weight,
+                old_fee,
+                old_weight,
+                direct_fee,
+                direct_weight,
+            ) {
+                return Err(AcceptError::RbfInsufficient);
+            }
+            set
+        } else {
+            BTreeSet::new()
+        };
+        let parent_txids: BTreeSet<Txid> = parent_txids
+            .into_iter()
+            .filter(|p| !conflict_set.contains(p))
+            .collect();
+
+        let mut members = BTreeSet::new();
+        for p in &parent_txids {
+            if let Some(c) = self.graph.cluster_of(p) {
+                members.extend(c.members);
+            }
+        }
+        members.retain(|m| !conflict_set.contains(m));
+        let base_w: u64 = members
+            .iter()
+            .filter_map(|t| self.graph.get(t).map(|e| e.weight))
+            .sum();
+        let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
+        if members.len() + 1 > self.graph.cluster_count_limit()
+            || combined_vsize > self.graph.cluster_vsize_limit()
+        {
+            return Err(AcceptError::ClusterTooLarge {
+                count: members.len() + 1,
+                weight: base_w.saturating_add(weight),
+            });
+        }
+
+        Ok((conflict_set, fee_sat, weight))
     }
 
     /// Full prepare → script → commit without resetting stage timers (orphan promote).
@@ -1930,6 +1952,25 @@ mod tests {
         assert!(!mp.graph.contains(&low_id));
         assert!(mp.graph.contains(&high_id));
         assert_eq!(mp.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_after_script_rbf_leaves_conflict() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let low = spend_tx(op, 99_000);
+        let high = spend_tx(op, 50_000);
+        let low_id = low.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
+        let prep = mp.prepare_admit(&high, &utxos, TIP_OK, 0).unwrap();
+        let r = mp
+            .evaluate_after_script(&high, prep, &utxos, TIP_OK)
+            .expect("preview");
+        assert!(r.replaced.contains(&low_id));
+        assert!(mp.graph.contains(&low_id));
+        assert!(!mp.graph.contains(&high.compute_txid()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

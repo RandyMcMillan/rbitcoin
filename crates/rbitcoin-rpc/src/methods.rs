@@ -12,6 +12,7 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{hex_decode, hex_encode, Height, Network};
 use rbitcoin_query::Query;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -69,8 +70,42 @@ pub struct RpcContext {
     pub logpath: String,
     /// Core `-permitbaremultisig` (default true). `getmempoolinfo`.
     pub permit_bare_multisig: bool,
-    /// In-flight RPC methods (method, start) for `getrpcinfo.active_commands`.
-    pub active: Arc<std::sync::Mutex<Vec<(String, Instant)>>>,
+    /// In-flight RPC methods for `getrpcinfo.active_commands`.
+    pub active: Arc<std::sync::Mutex<RpcActive>>,
+}
+
+/// Concurrent `dispatch` entries keyed by id (not a Vec pop).
+#[derive(Default)]
+pub struct RpcActive {
+    next: u64,
+    cmds: HashMap<u64, (String, Instant)>,
+}
+
+impl RpcActive {
+    pub fn enter(&mut self, method: impl Into<String>) -> u64 {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.cmds.insert(id, (method.into(), Instant::now()));
+        id
+    }
+
+    pub fn leave(&mut self, id: u64) {
+        self.cmds.remove(&id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.cmds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cmds.is_empty()
+    }
+
+    pub fn snapshot(&self) -> Vec<(String, Instant)> {
+        let mut v: Vec<_> = self.cmds.values().cloned().collect();
+        v.sort_by_key(|(_, start)| *start);
+        v
+    }
 }
 
 /// Outcome of `submitblock` (Core: `null` or a reject-reason string).
@@ -300,12 +335,16 @@ pub fn dispatch(
     method: &str,
     params: impl Into<RpcParams>,
 ) -> Result<Value, Value> {
+    let id = ctx
+        .active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .enter(method);
+    let out = dispatch_inner(ctx, method, params.into());
     ctx.active
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((method.to_string(), Instant::now()));
-    let out = dispatch_inner(ctx, method, params.into());
-    ctx.active.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        .leave(id);
     out
 }
 
@@ -638,7 +677,8 @@ fn getrpcinfo(ctx: &RpcContext) -> Value {
         .active
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .iter()
+        .snapshot()
+        .into_iter()
         .map(|(method, start)| {
             json!({
                 "method": method,
@@ -1537,15 +1577,8 @@ fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     let mut out = Vec::new();
     for tx in decoded {
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        // Dry-run: accept then remove if we admitted (best-effort). Prefer not
-        // mutating — use accept and if ok, remove_for_block to roll back.
-        match mp.accept_tx(&tx) {
+        match mp.test_accept(&tx) {
             Ok(r) => {
-                // `remove_for_block` is a no-op while relay is off (IBD /
-                // `-blocksonly`). Dry-run must still roll back or sendraw
-                // becomes a duplicate and never notes unbroadcast
-                // (`p2p_blocksonly.py:48`).
-                let _ = mp.evict_live_txids(&[tx.compute_txid()]);
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 out.push(json!({
                     "txid": txid,

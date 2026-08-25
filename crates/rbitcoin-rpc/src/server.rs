@@ -48,7 +48,7 @@ pub struct RpcHandle {
     pub initial_block_download: Arc<AtomicBool>,
     /// Shared with [`RpcContext::active`] so tip-follow can drain in-flight
     /// handlers before tearing down the RPC server (`feature_shutdown.py`).
-    pub active: Arc<std::sync::Mutex<Vec<(String, std::time::Instant)>>>,
+    pub active: Arc<std::sync::Mutex<crate::methods::RpcActive>>,
     shutdown: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
@@ -91,7 +91,7 @@ pub async fn run_rpc(
     let stop = Arc::new(AtomicBool::new(false));
     let connections = Arc::new(AtomicU64::new(0));
     let ibd = Arc::new(AtomicBool::new(false));
-    let active = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let active = Arc::new(std::sync::Mutex::new(crate::methods::RpcActive::default()));
     let ctx = Arc::new(RpcContext {
         query,
         mempool,

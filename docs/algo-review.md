@@ -38,7 +38,7 @@ What the node actually runs. This is the map; findings follow.
 | `AddressHead` | 4 KiB pages of relative fks | torn 4-byte writes accepted; body-txid verifies |
 | Sealed `tx.head` | BDZ MPHF + fuse8 filter | FdOnly `g`; fingerprints in RAM |
 | `binary_fuse8` | 3-hash XOR fingerprint | `contains` indexes fingerprints unchecked |
-| `HeightFence` | sorted run vec | cloned per resolve batch |
+| `HeightFence` | sorted run vec behind `Arc` | leftover snapshot is O(1); extend/pop COW |
 | Spender overflow | linked list of `next` fks | no cycle bound |
 | SH pages | 4 KiB delta pages, `next` pointer | zero page = terminator |
 | `sorted_run` | LSM-style runs + manifest | `runs_io` mutex is a comment, not a type |
@@ -371,16 +371,12 @@ Grouped by cost at mainnet scale. Many overlap §2–3.
 | P4 | BDZ `index_batch_fd` fill | O(pages × keys) | pre-group by page |
 | P5 | `HashHead::bulk_fill_empty` | full table in RAM + dense write | dirty 4 KiB pages only |
 | P6 | SH `insert_many` `entries.iter().find` | O(N²) ingest | `HashMap` once |
-| P7 | Height-fence `.clone()` per resolve | ~15–20 MiB memcpy/wave | `Arc<HeightFence>` RCU |
-| P8 | v2 codec: SHA256d checksum + v1 reframe | 2 hashes + 3 copies / 4 MB block | `Decodable` on AEAD plaintext |
 | P9 | `queue_due_tx_invs` | O(peers × mempool), 1 Inv/tx | batch `Inv`; iterate `relay_seq` delta |
-| P10 | Densify walk from `path_lo` every tick | up to 65 536 heights × 2 probes | skip-below watermark |
 | P11 | Esplora `/blocks` | 10 full reconstructs / page | persist size/weight at connect |
 | P12 | Electrum status | 1 header read / history row / notify | cache confirmed-prefix hash |
 | P13 | `find_free_slot` | O(cap) per admit, O(cap²) fill | free-list `VecDeque` |
 | P14 | `persist_all` | rewrite entire mempool files | append body + patch slot |
 | P15 | `evict_nonfinal` | O(n²) per reorg | worklist of affected txs |
-| P16 | `median_time_past` | 11 store reads / header | rolling 11-slot ring |
 | P17 | `RecentCreates::snapshot` | clone pending map (pins) / wave | COW `Arc<LiveMap>` |
 | P18 | BQ `dequeue` height remap | O(queue) `index.iter().find` | `HashMap<u32, VecDeque<id>>` |
 | P19 | `BlockCache` prefix drop | O(chain) per connect | `VecDeque` + base height |
@@ -405,7 +401,7 @@ allocates; one-shot confirm `block.clone()`; seeds `Vec::contains`.
 | Mem2 | AddrMan | peer `addr` feed | **no** |
 | Mem3 | `announced_wtx` | 50k then **clear all** | yes, but bursty |
 | Mem4 | Mempool dead body bytes | RBF stall, compact not on admit | disk + rewrite |
-| Mem5 | `bulk_fill_empty` / fence clone | transient hundreds of MiB | per wave/shard |
+| Mem5 | `bulk_fill_empty` | transient hundreds of MiB | per grow |
 | Mem6 | IBD `disconnect_to` | whole losing branch cloned | skip if no mempool |
 | Mem7 | `--api-log` JSONL | unbounded | **no** |
 | Mem8 | Orphanage / Electrum subs / WS tracks | count/weight / `max_*` | yes |
@@ -531,8 +527,8 @@ then IBD CPU.
 5. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
 6. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-7. IBD: fence `Arc`, densify watermark, v2 decode without checksum reframe,
-   Esplora `/blocks` summaries.
+7. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
+   v2 decode, and MTP ring are closed.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
 pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
@@ -549,3 +545,7 @@ leaving a stale High row in §2–6.
 - **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).
 - **§6.20** — `has_spender_rels` deleted; `has_abs_layout` is the spent_range predicate. [#246](https://github.com/reardencode/rbitcoin/pull/246).
 - Lookup now stamps `spent.idx` ranges (stage table already required it); load copies onto pins; write ensure is holes-only. Not in the 2026-08-25 Open tables. [#246](https://github.com/reardencode/rbitcoin/pull/246).
+- **P7** — leftover TipOnly fence snapshot is `Arc<Vec<FenceRun>>` (O(1) clone; extend/pop COW). [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
+- **P8** — v2 `parse_v2_contents` does not sha256d; `FramedMessage::decode` is command+payload (checksum unused). [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
+- **P10** — densify `densify_scan_lo` skips BQ-ready / inflight / archived prefix; pending still walked. [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
+- **P16** — fence-tip MTP is an 11-slot ring on extend; pop rebuilds; historical heights still 11-read. [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).

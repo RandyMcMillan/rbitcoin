@@ -54,6 +54,13 @@ before 1.0).
 
 ### Changed
 
+- **Algo-review P7/P8/P10/P16:** leftover TipOnly fence snapshot is
+  `Arc` (COW on extend). Densify assign resumes after the BQ-ready
+  prefix. BIP324 v2 decode is command+payload (no sha256d checksum, no
+  v1 reframe). Fence-tip BIP113 MTP is an 11-slot ring. Closed
+  [`docs/algo-review.md`](docs/algo-review.md) P7, P8, P10, P16
+  ([#PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU)).
+
 - **Algo-review P1–P3:** BIP339 wtxid inv is a `TxGraph` map (no mempool
   scan under the lock). Best-chain cumulative work is a RAM prefix
   (~32 B × tip), not a genesis walk per unrequested body / `chainwork`.

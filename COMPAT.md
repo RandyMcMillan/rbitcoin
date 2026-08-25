@@ -256,7 +256,8 @@ Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
 **Not implemented as product features** (short slots 22–27 compact filters, 29–36
 placeholders, 37 `feature`): decode may reject unknown short IDs; peers that
 only need the live set above interoperate. Full Core filter/light-client APIs
-are deferred.
+are deferred. satd’s native BIP 157/158 index is noted (not scheduled) in
+[`docs/peer-clients.md`](./docs/peer-clients.md).
 
 ## Deferred surfaces
 

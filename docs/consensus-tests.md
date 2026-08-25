@@ -64,6 +64,11 @@ refreshing; do not check copies into `tests/fixtures/`.
 
 See `crates/rbitcoin-consensus/tests/fixtures/README.md`.
 
+Hornet’s published 34-rule table is a **gap checklist** against this
+matrix, not a second spec:
+[`peer-clients.md`](./peer-clients.md) (Hornet spec.html). Add missing
+named rows here.
+
 ## A. Block structure — `validate_block_structure_hashed`
 
 | ID | Rule | Error signal | Test |

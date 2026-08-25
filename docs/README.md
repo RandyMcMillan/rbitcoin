@@ -16,6 +16,7 @@ update that file — do not paste a parallel spec.
 | Confirm / store implementer | [`invariants.md`](./invariants.md) + [`concurrency.md`](./concurrency.md) | Stage IO, leftover union, roles, tip commit |
 | Tests | [`TESTING.md`](../TESTING.md) | How to run, budgets, coverage |
 | Algo / DS findings | [`algo-review.md`](./algo-review.md) | Whole-repo algorithm/data-structure review; work High first |
+| Peer full nodes | [`peer-clients.md`](./peer-clients.md) | Hornet / satd comparison; later-consideration tests and ideas |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
 1.0 product gates: [`road-to-1.0.md`](./road-to-1.0.md) (not the living
@@ -47,6 +48,7 @@ quality backlog).
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
 | [`algo-review.md`](./algo-review.md) | 2026-08-25 algorithm/DS findings. Close items here; do not copy into quality.md. |
+| [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
 
 ## Root (stay at root)

@@ -526,11 +526,6 @@ impl ShRunBuilder {
         Ok(())
     }
 
-    pub fn stop_and_drain_spills(&self) -> Result<(), StoreError> {
-        self.refresh_seal();
-        Ok(())
-    }
-
     /// Claim catalog runs and cold bulk-load durable SH (k-way over claimed files).
     pub fn finalize_and_bulk_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         self.finalize_and_bulk_materialize_cancellable(store, None)

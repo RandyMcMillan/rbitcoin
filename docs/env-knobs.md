@@ -9,7 +9,7 @@ below. Do not grow env surface without a damn-good reason.
 | Env | Why it stays |
 |-----|----------------|
 | **`RBITCOIN_LOG`** / **`RUST_LOG`** | Bootstrap logging before conf parse; CLI `--log-level` wins when set |
-| **`RBITCOIN_IO`** | Field escape hatch: `uring` \| `pool` \| `iocp` \| `pread`. **Single** bulk switch. `pread` disables the completion session (`mmap` demotes to pread) |
+| **`RBITCOIN_IO`** | Field escape hatch: `uring` \| `pool` \| `iocp` \| `pread`. **Single** bulk switch. `pread` disables the completion session. Unknown tokens (including deleted `mmap`) fall through to the default |
 
 `RBITCOIN_P2P_MAX_INBOUND` is an **input** when CLI/conf omit `--maxinbound`
 (`NodeConfig::absorb_inbound_env`). The node does not `set_var` it.
@@ -65,6 +65,7 @@ for signet/mainnet sync. **Not** CLI.
 | Confirm queue env overrides | Hardcoded depths |
 | `RBITCOIN_IO_URING` | Deleted; use `RBITCOIN_IO=pread` |
 | `RBITCOIN_TX_HEAD_ACCESS` | Deleted; tables are always fd pread/pwrite |
+| `RBITCOIN_IO=mmap` | Deleted; unknown token falls through to default |
 | `RBITCOIN_HEAD_SLOTS_TX` | Deleted; `tx.head` is segmented address head |
 | `RBITCOIN_SH_MAX_DIRECT_MERGE` | Deleted; catalog materialize is always k-way |
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | Deleted; recollect spill size is `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` |

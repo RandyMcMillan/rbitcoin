@@ -1,8 +1,8 @@
 //! Bulk-IO backend selection for Class A body (no mmap payload).
 //!
 //! ## Operator env (single switch)
-//! - `RBITCOIN_IO=uring|pread` — all bulk read/write paths (default: uring if available).
-//! - `RBITCOIN_IO=mmap` (legacy) → demoted to **pread** (one-time warn).
+//! - `RBITCOIN_IO=uring|pool|iocp|pread` — all bulk read/write paths
+//!   (default: uring if available). Unknown tokens fall through to the default.
 //!
 //! Per-path env overrides are **removed** — one global `RBITCOIN_IO` only.
 //!
@@ -33,11 +33,6 @@ fn parse_read_token(s: &str) -> Option<ReadIoBackend> {
     match s.trim().to_ascii_lowercase().as_str() {
         "uring" | "io_uring" | "pool" | "iocp" => Some(ReadIoBackend::Uring),
         "pread" | "fd" | "libc" | "pwrite" => Some(ReadIoBackend::Pread),
-        // Legacy body-mmap mode removed.
-        "mmap" => {
-            warn_mmap_demote();
-            Some(ReadIoBackend::Pread)
-        }
         _ => None,
     }
 }
@@ -46,21 +41,7 @@ fn parse_write_token(s: &str) -> Option<WriteIoBackend> {
     match s.trim().to_ascii_lowercase().as_str() {
         "uring" | "io_uring" | "pool" | "iocp" => Some(WriteIoBackend::Uring),
         "pwrite" | "pread" | "fd" | "libc" => Some(WriteIoBackend::Pwrite),
-        "mmap" => {
-            warn_mmap_demote();
-            Some(WriteIoBackend::Pwrite)
-        }
         _ => None,
-    }
-}
-
-fn warn_mmap_demote() {
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        rbitcoin_log::warn!(
-            "store: RBITCOIN_IO=mmap (and body mmap backends) removed; using pread/pwrite \
-             (set RBITCOIN_IO=uring|pread)"
-        );
     }
 }
 
@@ -174,14 +155,14 @@ mod tests {
         assert_eq!(parse_read_token("fd"), Some(ReadIoBackend::Pread));
         assert_eq!(parse_read_token("libc"), Some(ReadIoBackend::Pread));
         assert_eq!(parse_read_token("pwrite"), Some(ReadIoBackend::Pread));
-        assert_eq!(parse_read_token("mmap"), Some(ReadIoBackend::Pread));
+        assert!(parse_read_token("mmap").is_none());
         assert_eq!(parse_write_token("uring"), Some(WriteIoBackend::Uring));
         assert_eq!(parse_write_token("io_uring"), Some(WriteIoBackend::Uring));
         assert_eq!(parse_write_token("pwrite"), Some(WriteIoBackend::Pwrite));
         assert_eq!(parse_write_token("pread"), Some(WriteIoBackend::Pwrite));
         assert_eq!(parse_write_token("fd"), Some(WriteIoBackend::Pwrite));
         assert_eq!(parse_write_token("libc"), Some(WriteIoBackend::Pwrite));
-        assert_eq!(parse_write_token("mmap"), Some(WriteIoBackend::Pwrite));
+        assert!(parse_write_token("mmap").is_none());
         assert!(parse_read_token("alternate").is_none());
         assert!(parse_write_token("nope").is_none());
     }
@@ -203,8 +184,12 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO", "mmap");
-        assert_eq!(global_read_from_env(), Some(ReadIoBackend::Pread));
-        assert_eq!(global_write_from_env(), Some(WriteIoBackend::Pwrite));
+        assert_eq!(
+            global_read_from_env(),
+            None,
+            "mmap is not a token; unknown RBITCOIN_IO falls through"
+        );
+        assert_eq!(global_write_from_env(), None);
         clear_io_envs();
         std::env::set_var("RBITCOIN_IO_URING", "0");
         assert_eq!(

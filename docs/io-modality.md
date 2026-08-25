@@ -16,7 +16,7 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 | **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps |
 
 **`RBITCOIN_IO` selects the completion-session backend** (not per-path).
-Legacy token `mmap` demotes to **pread** with a one-time warning.
+Unknown tokens (including deleted `mmap`) fall through to the platform default.
 
 | Token | Backend |
 |-------|---------|

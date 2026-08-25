@@ -251,7 +251,7 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 
 | Env | Values | Note |
 |-----|--------|------|
-| **`RBITCOIN_IO`** | `uring` \| `pool` \| `iocp` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
+| **`RBITCOIN_IO`** | `uring` \| `pool` \| `iocp` \| `pread` | Only bulk switch |
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 

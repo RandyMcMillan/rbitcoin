@@ -113,7 +113,7 @@ fn parse_io_token() -> Option<IoToken> {
         "uring" | "io_uring" => Some(IoToken::Uring),
         "pool" => Some(IoToken::Pool),
         "iocp" => Some(IoToken::Iocp),
-        "pread" | "fd" | "libc" | "pwrite" | "mmap" => Some(IoToken::Pread),
+        "pread" | "fd" | "libc" | "pwrite" => Some(IoToken::Pread),
         _ => None,
     }
 }

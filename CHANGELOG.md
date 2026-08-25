@@ -139,6 +139,9 @@ before 1.0).
 
 ### Fixed
 
+- **Assemble checks future-time and BIP34/66/65 nVersion on every block,**
+  not only headers-first `validate_header` (pipelined / multi-block confirm).
+
 - **Witness sigops only after segwit:** `GetTransactionSigOpCost` witness
   component is gated on `segwit_active_at` (pre-segwit P2WPKH-shaped prevouts
   no longer add 1).

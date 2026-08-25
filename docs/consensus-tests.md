@@ -101,6 +101,7 @@ Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs`.
 | H6 | Target ≤ `pow_limit` | `target above pow limit` | `h6_target_above_pow_limit_is_detectable` |
 | H7 | PoW valid for claimed bits | `InvalidPow` | **rust-bitcoin** `validate_pow` — smoke via any successful `mine_regtest_block` accept |
 | H8 | Time not > now + 2h | `timestamp too far in future` | `h8_rejects_timestamp_too_far_in_future` |
+| H9 | `assemble_run` future-time + BIP34/66/65 nVersion on every block | `time-too-new` / `bad-version` | `check_header_version_and_future_time_regtest` + `assemble_second_block_rejects_stale_nversion` |
 | H10 | Testnet min-difficulty after 20 min | `expected_next_bits` = powLimit | `testnet_min_difficulty_after_20_minute_gap` |
 
 Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.

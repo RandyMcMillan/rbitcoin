@@ -229,9 +229,6 @@ will loop.
 
 ### Consensus
 
-- **C-M4.** Pipelined `assemble_run` skips future-time and BIP34/66/65
-  nVersion; relies on headers-first having run `validate_header`. Tip-ahead
-  / block-first is the gap.
 - **C-M5.** Script-pool `failed` is `Relaxed`; worker can enter a wave after
   the publisher observed `in_wave == 0` (ARM). Increment-then-check +
   Acquire/Release.
@@ -239,6 +236,7 @@ will loop.
   BIP141 prefix; `SigVersion::Base` for challenge; `null_dummy: false`;
   CLEANSTACK extra. Default 1-of-2 signet honest path OK; custom/adversarial
   diverges. Reuse `block/mod.rs` reverse commitment scan.
+
 ### Query
 
 - **Q-M1.** `retain_headers_needing_body` (`archive.rs` ~145): missing
@@ -471,6 +469,10 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-M4.** `assemble_run` runs future-time + BIP34/66/65 nVersion on every
+  block (`check_header_version_and_future_time`). Pins:
+  `check_header_version_and_future_time_regtest`,
+  `assemble_second_block_rejects_stale_nversion`. This PR.
 - **C-M7.** Witness sigops only after segwit (`prevout_spk_sigops` / `flag_segwit`).
   Pin: `witness_sigops_gated_on_segwit`. This PR.
 - **C-M3.** P2SH sigops abort on scriptSig opcode `> OP_16` (`p2sh_sigops_non_push_scriptsig_is_zero`). This PR.

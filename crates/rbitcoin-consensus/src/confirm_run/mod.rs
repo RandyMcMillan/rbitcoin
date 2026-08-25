@@ -28,7 +28,9 @@ use crate::block::{
 };
 use crate::confirm_phase_stats;
 use crate::error::ConsensusError;
-use crate::header::{median_time_past_times, validate_header};
+use crate::header::{
+    check_header_version_and_future_time, median_time_past_times, validate_header,
+};
 use crate::milestone::Milestone;
 use crate::params::{genesis_block, ChainParams};
 use bitcoin::hashes::Hash;

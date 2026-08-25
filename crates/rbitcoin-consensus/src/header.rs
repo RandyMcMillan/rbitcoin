@@ -32,23 +32,7 @@ pub fn validate_header(
         if header.time <= mtp {
             return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
         }
-        // Core: block time must not be more than 2 hours ahead of adjusted network time.
-        // We use wall-clock UTC (no peer-time adjustment).
-        const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
-        let now = crate::clock::current_now();
-        if u64::from(header.time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
-            return Err(ConsensusError::BadHeader("timestamp too far in future"));
-        }
-
-        // Core ContextualCheckBlockHeader: DeploymentActiveAfter(prev) = this
-        // height ≥ buried height. Reject outdated nVersion (BIP34/66/65).
-        let ver = header.version.to_consensus();
-        if (params.bip34_active_at(height.0) && ver < 2)
-            || (params.bip66_active_at(height.0) && ver < 3)
-            || (params.bip65_active_at(height.0) && ver < 4)
-        {
-            return Err(ConsensusError::BadVersion(ver));
-        }
+        check_header_version_and_future_time(params, height, header)?;
     }
 
     if let Some(cp) = params.checkpoint_at(height) {
@@ -70,6 +54,30 @@ pub fn validate_header(
         .validate_pow(target)
         .map_err(|_| ConsensusError::InvalidPow)?;
 
+    Ok(())
+}
+
+/// BIP34/66/65 `nVersion` floors and the 2-hour future-time cap (wall clock).
+///
+/// Core `ContextualCheckBlockHeader`. Assemble uses this instead of a second
+/// [`validate_header`] (MTP walk + header rehash).
+pub(crate) fn check_header_version_and_future_time(
+    params: &ChainParams,
+    height: Height,
+    header: &Header,
+) -> Result<(), ConsensusError> {
+    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+    let now = crate::clock::current_now();
+    if u64::from(header.time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
+        return Err(ConsensusError::BadHeader("timestamp too far in future"));
+    }
+    let ver = header.version.to_consensus();
+    if (params.bip34_active_at(height.0) && ver < 2)
+        || (params.bip66_active_at(height.0) && ver < 3)
+        || (params.bip65_active_at(height.0) && ver < 4)
+    {
+        return Err(ConsensusError::BadVersion(ver));
+    }
     Ok(())
 }
 
@@ -131,6 +139,7 @@ pub use rbitcoin_primitives::median_time_past_times;
 #[cfg(test)]
 mod median_time_past_tests {
     use super::*;
+    use bitcoin::block::Version;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::{Query, TxApply};
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
@@ -362,6 +371,27 @@ mod median_time_past_tests {
         assert_eq!(walked.to_consensus(), h0.bits);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_header_version_and_future_time_regtest() {
+        let params = ChainParams::regtest();
+        let mut h = crate::params::genesis_block(&params).header;
+        h.version = Version::from_consensus(1);
+        crate::clock::with_now(1_700_000_000, || {
+            h.time = 1_700_000_000;
+            let err = check_header_version_and_future_time(&params, Height(1), &h).unwrap_err();
+            assert!(matches!(err, ConsensusError::BadVersion(1)), "{err:?}");
+            h.version = Version::from_consensus(4);
+            h.time = 1_700_000_000 + 3 * 60 * 60;
+            let err = check_header_version_and_future_time(&params, Height(1), &h).unwrap_err();
+            assert!(
+                matches!(err, ConsensusError::BadHeader(s) if s.contains("future")),
+                "{err:?}"
+            );
+            h.time = 1_700_000_000 + 60 * 60;
+            check_header_version_and_future_time(&params, Height(1), &h).unwrap();
+        });
     }
 }
 

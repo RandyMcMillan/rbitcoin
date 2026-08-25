@@ -79,6 +79,7 @@ pub(super) fn assemble_run(
 
                 // MTP + prev hash already checked. Do not call validate_header
                 // (second MTP walk + header rehash).
+                check_header_version_and_future_time(params, height, &block.header)?;
                 let (Some(prev_bits_raw), Some(prev_time)) = (prev_bits_raw, prev_time) else {
                     return Err(ConsensusError::Store(StoreError::Corrupt(
                         "confirm: load incomplete (parent header plan missing above tip)",
@@ -123,6 +124,7 @@ pub(super) fn assemble_run(
                 return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
             }
             prev_mtp = mtp;
+            check_header_version_and_future_time(params, height, &block.header)?;
             if let Some(cp) = params.checkpoint_at(height) {
                 if cp.to_byte_array() != block_hash {
                     return Err(ConsensusError::BadHeader("checkpoint mismatch"));

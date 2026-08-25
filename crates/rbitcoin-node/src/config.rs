@@ -182,11 +182,6 @@ impl NodeConfig {
         self
     }
 
-    pub fn with_datadir_cold(mut self, datadir_cold: impl Into<PathBuf>) -> Self {
-        self.datadir_cold = Some(datadir_cold.into());
-        self
-    }
-
     pub fn with_network(mut self, network: Network) -> Self {
         self.network = network;
         self
@@ -709,9 +704,8 @@ mod tests {
         assert!(dir.join("mempool").is_dir());
         cfg.ensure_datadir().unwrap();
         let cold = dir.join("cold");
-        let split = NodeConfig::default()
-            .with_datadir(&dir)
-            .with_datadir_cold(&cold);
+        let mut split = NodeConfig::default().with_datadir(&dir);
+        split.datadir_cold = Some(cold.clone());
         assert_eq!(
             split.store_cold_path().as_deref(),
             Some(cold.join("store").as_path())

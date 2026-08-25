@@ -251,7 +251,7 @@ env overrides are **removed**. If `uring` is selected but setup fails, demote to
 
 | Env | Values | Note |
 |-----|--------|------|
-| **`RBITCOIN_IO`** | `uring` \| `pool` \| `iocp` \| `pread` | Only bulk switch (`mmap` demotes to pread) |
+| **`RBITCOIN_IO`** | `uring` \| `pool` \| `iocp` \| `pread` | Only bulk switch |
 
 Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
 
@@ -316,8 +316,8 @@ No temp `pack*.body`. Catalog records stay unique on `(scripthash, create_fk)`,
 `key_len=32` leftover `scripthash.runs` are refused (wipe that dir and
 rematerialize). Class A with creates in the pre-pack 16-byte meta /
 9-byte spent layout is refused (wipe datadir and redo IBD). New keys after seal go
-to one **global ingest OA** (mainnet 2²⁵ slots × 24 B ≈ 768 MiB). Fan-in reduce is
-**fallback only** when the catalog exceeds max direct. Materialize status logs
+to one **global ingest OA** (mainnet 2²⁵ slots × 24 B ≈ 768 MiB). Materialize
+k-ways catalog runs (recollect spills ~128 MiB). Materialize status logs
 ~**every 10s** from one observer (`keys`/`creates`/`pending` unpublished/
 `shards` published/`rate`). Path selection logs `path=FullCold|ColdResume|Skip`.
 **Full cold reinit only if the SH head is empty** (or force rebuild).
@@ -327,7 +327,7 @@ Incomplete catalog (high SEAL + tiny run mass) on an **empty** head triggers
 full Class A recollect (SEAL=0). Missing `include_hwm` on a durable head
 bootstraps from SEAL (never clamp SEAL→0). Clearing residual run files
 **preserves `SEAL`**. **SIGINT** mid cold keeps finished prefix shards
-(`scripthash.cold_progress`). Mid-reduce keeps CHECKPOINT.
+(`scripthash.cold_progress`).
 On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
 — prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` with

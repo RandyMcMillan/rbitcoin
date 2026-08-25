@@ -436,6 +436,7 @@ impl HashHead {
     }
 
     /// Number of occupied hash slots (open-address load observer).
+    #[cfg(test)]
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }

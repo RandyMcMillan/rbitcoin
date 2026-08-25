@@ -650,13 +650,7 @@ pub fn scan_packed_meta_and_prevouts(raw: &[u8]) -> Result<(TxRecord, Vec<(Fk, u
     Ok((meta, Vec::new()))
 }
 
-/// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
-pub fn decode_packed_tx_outs_only(raw: &[u8]) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
-    let (meta, outs, _rels) = decode_packed_tx_outs_with_spender_rels(raw)?;
-    Ok((meta, outs))
-}
-
-/// Like [`decode_packed_tx_outs_only`], plus dense relative offsets of each
+/// Decode packed `txout` body (meta + outputs) plus dense relative offsets of each
 /// output's start within the packed txout payload.
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],

@@ -60,15 +60,6 @@ pub use v2::WireBytes;
 /// leave enough live peers.
 pub const DEFAULT_IBD_TARGET_PEERS: u32 = 16;
 
-/// Suggested live outbound count: IBD target peers vs post-IBD tip-follow budget.
-pub fn outbound_for_ibd(ibd: bool) -> u32 {
-    if ibd {
-        DEFAULT_IBD_TARGET_PEERS
-    } else {
-        8
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,7 +67,5 @@ mod tests {
     #[test]
     fn outbound_defaults() {
         assert_eq!(DEFAULT_IBD_TARGET_PEERS, 16);
-        assert_eq!(outbound_for_ibd(true), 16);
-        assert_eq!(outbound_for_ibd(false), 8);
     }
 }

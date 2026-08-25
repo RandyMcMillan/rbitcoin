@@ -190,9 +190,9 @@ impl Query {
         Ok(())
     }
 
-    /// Drain SH spills and cold bulk-load durable scripthash tables (tip entry).
+    /// Cold bulk-load durable scripthash tables (tip entry).
     ///
-    /// Direct IBD: append-only target-sized runs + SEAL. Tip: fan-in reduce + bulk load.
+    /// Direct IBD: append-only ~128 MiB catalog runs + SEAL. Tip: k-way bulk load.
     ///
     /// **`RBITCOIN_SH_FORCE_REBUILD=1`:** wipe SH head/runs/SEAL/HWM, recollect **all**
     /// Class A creates into runs, then full cold materialize (not a catch-up tail).
@@ -200,7 +200,7 @@ impl Query {
         self.finalize_sh_runs_cancellable(None)
     }
 
-    /// Like [`Self::finalize_sh_runs`] with cooperative cancel (SIGINT → leave CHECKPOINT).
+    /// Like [`Self::finalize_sh_runs`] with cooperative cancel (SIGINT keeps sealed shards).
     pub fn finalize_sh_runs_cancellable(
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -376,10 +376,9 @@ impl Query {
                 let seal_now = self.sh_run.sealed_max_create_fk();
                 let hwm_now = self.store.scripthash.include_hwm();
                 rbitcoin_log::info!(
-                    "node: scripthash post-materialize drain round={round}/{MAX_POST_DRAIN_ROUNDS} \
+                    "node: scripthash post-materialize round={round}/{MAX_POST_DRAIN_ROUNDS} \
                      residual_runs={residual} seal={seal_now} include_hwm={hwm_now} tip_max={tip_now}"
                 );
-                self.sh_run.stop_and_drain_spills()?;
                 self.rebuild_sh_unsealed_from_class_a_cancellable(cancel)?;
                 let n2 = match cancel {
                     None => self.sh_run.finalize_and_bulk_materialize(&self.store)?,
@@ -395,7 +394,7 @@ impl Query {
                 let seal_now = self.sh_run.sealed_max_create_fk();
                 let hwm_now = self.store.scripthash.include_hwm();
                 rbitcoin_log::error!(
-                    "node: scripthash not tip-ready after post-materialize drain \
+                    "node: scripthash not tip-ready after post-materialize residual \
                      residual_runs={residual} seal={seal_now} include_hwm={hwm_now} tip_max={tip_now}"
                 );
                 return Err(StoreError::Corrupt(

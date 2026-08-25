@@ -507,65 +507,6 @@ impl StrongTxTable {
         Ok(ones == u64::from(count))
     }
 
-    /// Visit every fk whose strong bit is set (open repair / tests).
-    pub fn for_each_strong<F>(&self, mut visit: F) -> Result<(), StoreError>
-    where
-        F: FnMut(Fk) -> Result<(), StoreError>,
-    {
-        use std::sync::atomic::Ordering;
-        let n = self.n_bits.load(Ordering::Acquire);
-        if n == 0 {
-            return Ok(());
-        }
-        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref v) = *guard {
-            for (bi, &byte) in v.iter().enumerate() {
-                if byte == 0 {
-                    continue;
-                }
-                for bit in 0..8u32 {
-                    if byte & (1 << bit) == 0 {
-                        continue;
-                    }
-                    let idx = (bi as u64).saturating_mul(8).saturating_add(u64::from(bit));
-                    if idx < n {
-                        visit(Fk(idx + 1))?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-        drop(guard);
-        const CHUNK: usize = 8192;
-        let mut buf = vec![0u8; CHUNK];
-        let nbytes = n.div_ceil(8);
-        let mut off = 0u64;
-        while off < nbytes {
-            let take = ((nbytes - off) as usize).min(CHUNK);
-            self.bits
-                .read_at(crate::file::FILE_HEADER_LEN as u64 + off, &mut buf[..take])?;
-            for (bi, &byte) in buf[..take].iter().enumerate() {
-                if byte == 0 {
-                    continue;
-                }
-                for bit in 0..8u32 {
-                    if byte & (1 << bit) == 0 {
-                        continue;
-                    }
-                    let idx = off
-                        .saturating_add(bi as u64)
-                        .saturating_mul(8)
-                        .saturating_add(u64::from(bit));
-                    if idx < n {
-                        visit(Fk(idx + 1))?;
-                    }
-                }
-            }
-            off += take as u64;
-        }
-        Ok(())
-    }
-
     /// Bytes written by the last [`Self::flush_dirty`].
     #[cfg(test)]
     pub(crate) fn last_flush_write_bytes(&self) -> u64 {

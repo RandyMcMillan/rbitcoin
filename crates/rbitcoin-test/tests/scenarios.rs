@@ -7,7 +7,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, BlockHash};
 use rbitcoin_cli::cli_main as cli_cli_main;
 use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-use rbitcoin_net::outbound_for_ibd;
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
@@ -67,12 +66,7 @@ fn node_cli_and_surface_smoke() {
     // Net surface
     assert!(!Milestone::NONE.skips_scripts_at(0));
     assert!(Milestone { height: 10 }.skips_scripts_at(5));
-    assert_eq!(
-        outbound_for_ibd(true),
-        rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
-    );
-    assert_eq!(outbound_for_ibd(true), 16);
-    assert_eq!(outbound_for_ibd(false), 8);
+    assert_eq!(rbitcoin_net::DEFAULT_IBD_TARGET_PEERS, 16);
     assert_eq!(node_rpc_path(), "/");
     let _ = rbitcoin_net::local_service_flags();
     assert_eq!(rbitcoin_net::default_port(Network::Mainnet), 8333);

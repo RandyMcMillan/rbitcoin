@@ -35,9 +35,7 @@ use crate::scripthash_slabs::{
 };
 use crate::scripthash_sorted_head::{SortedHead, SortedHeadFilter};
 use crate::sharded_hashhead::shard_count_for_role;
-use crate::sorted_run::{
-    list_fanin_reduce_outputs, list_materialize_claims, list_runs, load_fanin_checkpoint,
-};
+use crate::sorted_run::{list_materialize_claims, list_runs};
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::HashMap;
@@ -975,7 +973,7 @@ pub fn sh_run_catalog_key_len_ok(store_dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// True when `scripthash.runs` (catalog, claims, merge CHECKPOINT/READY) can rebuild the head.
+/// True when `scripthash.runs` (catalog or claims) can rebuild the head.
 pub fn has_sh_run_rebuild_source(store_dir: &Path) -> bool {
     let runs = store_dir.join("scripthash.runs");
     if list_runs(&runs).map(|r| !r.is_empty()).unwrap_or(false) {
@@ -987,18 +985,7 @@ pub fn has_sh_run_rebuild_source(store_dir: &Path) -> bool {
     {
         return true;
     }
-    let merge = runs.join("merge");
-    if list_fanin_reduce_outputs(&merge)
-        .map(|o| o.map(|v| !v.is_empty()).unwrap_or(false))
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    if load_fanin_checkpoint(&merge).ok().flatten().is_some() {
-        return true;
-    }
-    // MANIFEST-less leftovers (crash mid-write).
-    dir_has_run_files(&runs) || dir_has_run_files(&merge)
+    dir_has_run_files(&runs)
 }
 
 fn dir_has_run_files(dir: &Path) -> bool {

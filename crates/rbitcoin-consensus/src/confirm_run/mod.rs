@@ -139,7 +139,7 @@ pub struct WireLoadPipeline {
     pub path_lo: u32,
     /// Parent of `path_lo` when ahead of store tip (last wire hash of prior loaded batch).
     pub parent_hash: Option<[u8; 32]>,
-    /// Inclusive create-fk start for [`Query::archive_plan_batch_from`].
+    /// Inclusive create-fk start for [`Query::archive_plan_batch_from_store`].
     pub next_tx_start: u64,
     /// Prior uncommitted packs: immutable layer snapshot (no shared mutable map).
     ///

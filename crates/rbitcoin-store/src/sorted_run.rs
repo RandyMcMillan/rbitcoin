@@ -284,72 +284,24 @@ fn rebuild_manifest_from_runs(dir: &Path, runs: &[SortedRunPath]) -> Result<(), 
     save_manifest(dir, &mf)
 }
 
-/// Sync / cache / pacing policy for sorted-run file writes.
-///
-/// | Policy | When |
-/// |--------|------|
-/// | [`RunWritePolicy::CATALOG`] | Tip fan-in / recollect / default durable — **no** artificial pace |
-/// | [`RunWritePolicy::IBD_BACKGROUND`] | Steady Direct IBD L0→catalog promote while confirm is hot |
-/// | [`RunWritePolicy::L0`] | Transient memtable spills (no fsync; keep cache for coalesce) |
-///
-/// **Do not** pace tip materialize: multi‑pass reduce rewrites tens of GiB; even
-/// 2 ms / 16 MiB would add multi‑second stalls on the critical path.
+/// Durable catalog write: fsync + `POSIX_FADV_DONTNEED` after rename.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunWritePolicy {
     /// `fsync` file + parent dir after rename.
     pub durable: bool,
     /// `POSIX_FADV_DONTNEED` after write (long-lived catalog only).
     pub drop_cache: bool,
-    /// Brief sleep every [`PACE_CHUNK_BYTES`] of body so confirm Class A can interleave.
-    /// **Only** for IBD background promotes — never tip reduce.
-    pub pace: bool,
 }
 
 impl RunWritePolicy {
     /// Durable catalog / SEAL-backed run; full-speed write + DONTNEED.
     ///
-    /// Used by tip fan-in reduce, recollect catalog spills, and generic
+    /// Recollect catalog spills, k-way materialize inputs, and
     /// [`write_sorted_run`] / [`merge_runs`].
     pub const CATALOG: Self = Self {
         durable: true,
         drop_cache: true,
-        pace: false,
     };
-    /// Steady IBD promote while confirm Class A is concurrent — paced durable.
-    pub const IBD_BACKGROUND: Self = Self {
-        durable: true,
-        drop_cache: true,
-        pace: true,
-    };
-    /// Transient L0: no fsync, keep cache for coalesce, no pace (small-ish spills).
-    pub const L0: Self = Self {
-        durable: false,
-        drop_cache: false,
-        pace: false,
-    };
-    /// Alias of [`Self::CATALOG`] (tests / explicit durable unpaced).
-    pub const DURABLE: Self = Self::CATALOG;
-}
-
-/// Body bytes between yields when [`RunWritePolicy::pace`] is set (~16 MiB).
-pub const PACE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-/// Sleep between paced chunks (idle SH worker cedes disk to confirm write).
-const PACE_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
-
-fn write_all_paced(f: &mut File, data: &[u8], pace: bool, path: &Path) -> Result<(), StoreError> {
-    if !pace || data.len() <= PACE_CHUNK_BYTES {
-        return f.write_all(data).map_err(|e| io_err(path, e));
-    }
-    let mut off = 0;
-    while off < data.len() {
-        let end = (off + PACE_CHUNK_BYTES).min(data.len());
-        f.write_all(&data[off..end]).map_err(|e| io_err(path, e))?;
-        off = end;
-        if off < data.len() {
-            std::thread::sleep(PACE_SLEEP);
-        }
-    }
-    Ok(())
 }
 
 /// Best-effort: lower this thread's **I/O** and CPU priority so SH run work yields
@@ -413,9 +365,6 @@ pub fn commit_run_to_catalog(run: &SortedRunPath) -> Result<(), StoreError> {
 }
 
 /// Write run file only (no MANIFEST) with an explicit policy.
-///
-/// L0 spills use [`RunWritePolicy::L0`]; catalog merge internals use
-/// [`RunWritePolicy::CATALOG`].
 pub fn write_sorted_run_file_with_policy(
     path: &Path,
     key_len: u32,
@@ -480,7 +429,7 @@ fn write_sorted_run_file(
         hdr[28..32].copy_from_slice(&body_crc32.to_le_bytes());
         f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
         if !records.is_empty() {
-            write_all_paced(&mut f, records, policy.pace, &tmp)?;
+            f.write_all(records).map_err(|e| io_err(&tmp, e))?;
         }
         if policy.durable {
             f.sync_all().map_err(|e| io_err(&tmp, e))?;
@@ -495,7 +444,7 @@ fn write_sorted_run_file(
         }
     }
     // Catalog: drop from page cache so multi‑hundred MiB runs do not crowd
-    // tx.body working set. L0 keeps cache for the imminent coalesce re-read.
+    // tx.body working set.
     if policy.drop_cache {
         advise_file_dont_need(path);
     }
@@ -1554,7 +1503,6 @@ pub fn merge_runs_to_file_with_policy(
     let mut count = 0u64;
     let mut body_crc = 0xFFFF_FFFFu32;
     let mut max_u64_at_32 = 0u64;
-    let mut pace_since = 0usize;
     let table = crc32_table();
     {
         let mut f = OpenOptions::new()
@@ -1578,13 +1526,6 @@ pub fn merge_runs_to_file_with_policy(
                 body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
             }
             count = count.saturating_add(1);
-            if policy.pace {
-                pace_since = pace_since.saturating_add(rec.len());
-                if pace_since >= PACE_CHUNK_BYTES {
-                    pace_since = 0;
-                    std::thread::sleep(PACE_SLEEP);
-                }
-            }
             Ok(())
         };
         let open_cursors = || -> Result<Vec<Option<RunCursor>>, StoreError> {
@@ -1637,191 +1578,6 @@ pub fn merge_runs_to_file_with_policy(
         },
         max_u64_at_32,
     })
-}
-
-/// Marker file: fan-in reduce finished; outputs under `work_dir` supersede inputs.
-///
-/// Written by the SH tip materialize path after a successful reduce so claimed
-/// `*.run.mat` inputs can be deleted immediately. Crash recovery resumes from
-/// `work_dir` when this marker is present (see [`list_fanin_reduce_outputs`]).
-pub const FANIN_READY_NAME: &str = "READY";
-
-/// Mid-reduce checkpoint (recoverable after SIGINT mid-chunk or mid-pass).
-///
-/// Format `RBFANCP2`: remaining input paths + completed output basenames under
-/// `work_dir`, plus `next_gen` / `next_seq` / `fanin`. Updated after **each**
-/// successful chunk merge; inputs for that chunk are deleted immediately.
-pub const FANIN_CHECKPOINT_NAME: &str = "CHECKPOINT";
-
-const CHECKPOINT_MAGIC_V2: &str = "RBFANCP2";
-/// Legacy full-pass-only checkpoints (ignored → fresh reduce).
-const CHECKPOINT_MAGIC_V1: &str = "RBFANCP1";
-
-/// Max runs for **direct** k-way materialize (and rare fan-in fallback target).
-///
-/// Catalog should stay O(10³) via IBD promote; hosts can open a few thousand FDs.
-pub const FANIN_TARGET_STREAM_RUNS: usize = 4096;
-/// Upper bound on k-way open cursors per chunk merge (fallback reduce only).
-pub const FANIN_MAX_CHUNK: usize = 512;
-
-/// Durable partial reduce state for resume.
-#[derive(Debug, Clone)]
-pub struct FaninCheckpoint {
-    pub next_gen: u32,
-    pub next_seq: u64,
-    pub fanin: usize,
-    /// Inputs still waiting to be merged (may be abs paths or under work_dir).
-    pub remaining: Vec<SortedRunPath>,
-    /// Outputs already produced this (single) pass under `work_dir`.
-    pub done_outputs: Vec<SortedRunPath>,
-}
-
-fn checkpoint_path(work_dir: &Path) -> PathBuf {
-    work_dir.join(FANIN_CHECKPOINT_NAME)
-}
-
-fn path_for_checkpoint(work_dir: &Path, run: &SortedRunPath) -> String {
-    if let Ok(rel) = run.path.strip_prefix(work_dir) {
-        return format!("w:{}", rel.display());
-    }
-    format!("a:{}", run.path.display())
-}
-
-fn open_checkpoint_path(work_dir: &Path, encoded: &str) -> Result<SortedRunPath, StoreError> {
-    let path = if let Some(rel) = encoded.strip_prefix("w:") {
-        work_dir.join(rel)
-    } else if let Some(abs) = encoded.strip_prefix("a:") {
-        PathBuf::from(abs)
-    } else if !encoded.contains('/') && !encoded.contains('\\') {
-        work_dir.join(encoded)
-    } else {
-        PathBuf::from(encoded)
-    };
-    open_run(&path)
-}
-
-/// Write partial/full reduce checkpoint atomically.
-pub fn write_fanin_checkpoint(
-    work_dir: &Path,
-    next_gen: u32,
-    next_seq: u64,
-    fanin: usize,
-    remaining: &[SortedRunPath],
-    done_outputs: &[SortedRunPath],
-) -> Result<(), StoreError> {
-    fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
-    let path = checkpoint_path(work_dir);
-    let tmp = work_dir.join(format!("{FANIN_CHECKPOINT_NAME}.tmp"));
-    let mut body = String::new();
-    body.push_str(CHECKPOINT_MAGIC_V2);
-    body.push('\n');
-    body.push_str(&format!("next_gen={next_gen}\n"));
-    body.push_str(&format!("next_seq={next_seq}\n"));
-    body.push_str(&format!("fanin={fanin}\n"));
-    body.push_str(&format!("n_rem={}\n", remaining.len()));
-    body.push_str(&format!("n_out={}\n", done_outputs.len()));
-    for r in remaining {
-        body.push_str("in=");
-        body.push_str(&path_for_checkpoint(work_dir, r));
-        body.push('\n');
-    }
-    for r in done_outputs {
-        body.push_str("out=");
-        body.push_str(&path_for_checkpoint(work_dir, r));
-        body.push('\n');
-    }
-    fs::write(&tmp, body.as_bytes()).map_err(|e| io_err(&tmp, e))?;
-    {
-        let f = OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| io_err(&tmp, e))?;
-        f.sync_all().map_err(|e| io_err(&tmp, e))?;
-    }
-    fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;
-    Ok(())
-}
-
-/// Load v2 checkpoint; v1 is ignored (returns None → fresh reduce).
-pub fn load_fanin_checkpoint(work_dir: &Path) -> Result<Option<FaninCheckpoint>, StoreError> {
-    let path = checkpoint_path(work_dir);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
-    let mut lines = text.lines();
-    let magic = lines.next().unwrap_or("");
-    if magic == CHECKPOINT_MAGIC_V1 {
-        rbitcoin_log::warn!("store: fanin CHECKPOINT v1 obsolete — starting fresh reduce");
-        return Ok(None);
-    }
-    if magic != CHECKPOINT_MAGIC_V2 {
-        rbitcoin_log::warn!("store: fanin CHECKPOINT bad magic — ignoring");
-        return Ok(None);
-    }
-    let mut next_gen = 0u32;
-    let mut next_seq = 1u64;
-    let mut fanin = 32usize;
-    let mut remaining = Vec::new();
-    let mut done_outputs = Vec::new();
-    for line in lines {
-        if let Some(v) = line.strip_prefix("next_gen=") {
-            next_gen = v.parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("next_seq=") {
-            next_seq = v.parse().unwrap_or(1);
-        } else if let Some(v) = line.strip_prefix("fanin=") {
-            fanin = v.parse().unwrap_or(32).max(1);
-        } else if let Some(enc) = line.strip_prefix("in=") {
-            match open_checkpoint_path(work_dir, enc) {
-                Ok(r) => remaining.push(r),
-                Err(e) => {
-                    rbitcoin_log::warn!(
-                        "store: fanin CHECKPOINT missing input {enc} ({e}) — ignoring checkpoint"
-                    );
-                    return Ok(None);
-                }
-            }
-        } else if let Some(enc) = line.strip_prefix("out=") {
-            match open_checkpoint_path(work_dir, enc) {
-                Ok(r) => done_outputs.push(r),
-                Err(e) => {
-                    rbitcoin_log::warn!(
-                        "store: fanin CHECKPOINT missing output {enc} ({e}) — ignoring checkpoint"
-                    );
-                    return Ok(None);
-                }
-            }
-        }
-    }
-    if remaining.is_empty() && done_outputs.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(FaninCheckpoint {
-        next_gen,
-        next_seq,
-        fanin,
-        remaining,
-        done_outputs,
-    }))
-}
-
-fn clear_tmp_in_work_dir(work_dir: &Path) {
-    let Ok(rd) = fs::read_dir(work_dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if name.ends_with(".tmp") || p.extension().and_then(|x| x.to_str()) == Some("tmp") {
-            let _ = fs::remove_file(&p);
-        }
-    }
-}
-
-fn cancel_requested(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
-    cancel
-        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(false)
 }
 
 /// Host RAM budget per SH recollect / k-way worker (Linux `MemAvailable`,
@@ -1981,7 +1737,7 @@ pub fn sh_workers_capped_by_free_ram() -> usize {
     sh_workers_for_free_ram(sh_logical_cpus(), host_mem_available_bytes().unwrap_or(0))
 }
 
-/// How many parallel chunk merges within the single fan-in pass.
+/// How many parallel k-way materialize workers.
 ///
 /// Default: [`sh_workers_capped_by_free_ram`]. Override `RBITCOIN_SH_MERGE_WORKERS`
 /// (`1` = serial).
@@ -1992,426 +1748,6 @@ pub fn sh_merge_workers() -> usize {
         }
     }
     sh_workers_capped_by_free_ram()
-}
-
-/// Choose chunk width so **one** pass yields ≤ `target_stream` outputs.
-///
-/// `outputs ≈ ceil(n / fanin) ≤ TARGET` ⇒ `fanin ≥ ceil(n / TARGET)`.
-/// Production uses [`FANIN_TARGET_STREAM_RUNS`]; tests may pass a tiny target.
-pub fn dynamic_merge_fanin_for(n_runs: usize, target_stream: usize) -> usize {
-    let target = target_stream.max(1);
-    if n_runs == 0 {
-        return target;
-    }
-    if n_runs <= target {
-        return n_runs.max(1);
-    }
-    n_runs.div_ceil(target).clamp(8, FANIN_MAX_CHUNK)
-}
-
-/// Choose chunk width so **one** pass yields ≤ [`FANIN_TARGET_STREAM_RUNS`] outputs.
-///
-/// `outputs ≈ ceil(n / fanin) ≤ TARGET` ⇒ `fanin ≥ ceil(n / TARGET)`.
-#[inline]
-pub fn dynamic_merge_fanin(n_runs: usize) -> usize {
-    dynamic_merge_fanin_for(n_runs, FANIN_TARGET_STREAM_RUNS)
-}
-
-/// Resolve `target_stream_runs` for reduce: `0` means production default.
-#[inline]
-fn resolve_target_stream(target_stream_runs: usize) -> usize {
-    if target_stream_runs == 0 {
-        FANIN_TARGET_STREAM_RUNS
-    } else {
-        target_stream_runs
-    }
-}
-
-/// Always 0 or 1 with dynamic single-pass reduce (kept for log compatibility).
-pub fn fanin_passes_total(n: usize, fanin: usize) -> u32 {
-    let fanin = fanin.max(1);
-    if n == 0 || n <= fanin {
-        0
-    } else {
-        1
-    }
-}
-
-fn run_body_bytes(run: &SortedRunPath) -> u64 {
-    run.count.saturating_mul(u64::from(run.rec_len))
-}
-
-/// Wall interval for tip fan-in reduce INFO heartbeats (time-based only).
-const REDUCE_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-struct ReduceStatus {
-    t0: std::time::Instant,
-    last_log: Option<std::time::Instant>,
-    chunks_done: usize,
-    chunks_total: usize,
-    bytes_done: u64,
-    fanin: usize,
-    workers: usize,
-}
-
-impl ReduceStatus {
-    fn new(fanin: usize, workers: usize, chunks_total: usize) -> Self {
-        Self {
-            t0: std::time::Instant::now(),
-            last_log: None,
-            chunks_done: 0,
-            chunks_total,
-            bytes_done: 0,
-            fanin,
-            workers,
-        }
-    }
-
-    fn pct(&self) -> f64 {
-        if self.chunks_total == 0 {
-            return 100.0;
-        }
-        (100.0 * self.chunks_done as f64 / self.chunks_total as f64).clamp(0.0, 99.9)
-    }
-
-    fn maybe_log(&mut self, force: bool) {
-        if !force {
-            if let Some(t) = self.last_log {
-                if t.elapsed() < REDUCE_STATUS_INTERVAL {
-                    return;
-                }
-            }
-        }
-        self.last_log = Some(std::time::Instant::now());
-        let elapsed = self.t0.elapsed();
-        let secs = elapsed.as_secs_f64().max(1e-3);
-        let mib = self.bytes_done as f64 / (1024.0 * 1024.0);
-        let rate = mib / secs;
-        rbitcoin_log::info!(
-            "store: scripthash fanin reduce status pass=1/1 chunks={}/{} pct≈{:.1}% \
-             elapsed={:?} rate≈{:.1}MiB/s fanin={} workers={}",
-            self.chunks_done,
-            self.chunks_total,
-            self.pct(),
-            elapsed,
-            rate,
-            self.fanin,
-            self.workers,
-        );
-    }
-
-    fn on_chunk_done(&mut self, chunk_bytes: u64) {
-        self.chunks_done = self.chunks_done.saturating_add(1);
-        self.bytes_done = self.bytes_done.saturating_add(chunk_bytes);
-        self.maybe_log(false);
-    }
-}
-
-/// Reduce `inputs` to ≤ target stream runs via **one** fan-in pass.
-///
-/// `target_stream_runs`: max stream runs after one pass. **`0` = production
-/// default** ([`FANIN_TARGET_STREAM_RUNS`]). Tests pass a small target so reduce
-/// behavior is covered without creating thousands of run files.
-///
-/// Dynamic fanin ([`dynamic_merge_fanin_for`]) so `ceil(n/fanin) ≤ target`.
-/// After each chunk: delete inputs, write CHECKPOINT (partial-pass resume).
-pub fn reduce_runs_to_fanin(
-    inputs: &[SortedRunPath],
-    work_dir: &Path,
-    target_stream_runs: usize,
-) -> Result<Vec<SortedRunPath>, StoreError> {
-    reduce_runs_to_fanin_cancellable(inputs, work_dir, target_stream_runs, None)
-}
-
-/// Like [`reduce_runs_to_fanin`] with cooperative cancel.
-pub fn reduce_runs_to_fanin_cancellable(
-    inputs: &[SortedRunPath],
-    work_dir: &Path,
-    target_stream_runs: usize,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<Vec<SortedRunPath>, StoreError> {
-    let target = resolve_target_stream(target_stream_runs);
-    fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
-    clear_tmp_in_work_dir(work_dir);
-
-    let workers = sh_merge_workers();
-    let remaining: Vec<SortedRunPath>;
-    let done_outputs: Vec<SortedRunPath>;
-    let gen: u32;
-    let mut seq: u64;
-    let fanin: usize;
-    let resumed: bool;
-
-    if let Some(cp) = load_fanin_checkpoint(work_dir)? {
-        remaining = cp.remaining;
-        done_outputs = cp.done_outputs;
-        gen = cp.next_gen;
-        seq = cp.next_seq;
-        fanin = cp.fanin.max(1);
-        resumed = true;
-        rbitcoin_log::info!(
-            "store: scripthash fanin reduce resume remaining={} done_out={} fanin={fanin} gen={gen}",
-            remaining.len(),
-            done_outputs.len()
-        );
-        if remaining.is_empty() {
-            rbitcoin_log::info!(
-                "store: scripthash fanin reduce resume complete stream_runs={}",
-                done_outputs.len()
-            );
-            return Ok(done_outputs);
-        }
-    } else {
-        // Fresh: wipe old merge work (not READY — caller owns READY path).
-        if let Ok(rd) = fs::read_dir(work_dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if name == FANIN_READY_NAME {
-                    continue;
-                }
-                let _ = fs::remove_file(&p);
-            }
-        }
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-        fanin = dynamic_merge_fanin_for(inputs.len(), target);
-        if inputs.len() <= target {
-            rbitcoin_log::info!(
-                "store: scripthash fanin reduce skipped runs={} already≤target={}",
-                inputs.len(),
-                target
-            );
-            return Ok(inputs.to_vec());
-        }
-        remaining = inputs.to_vec();
-        done_outputs = Vec::new();
-        gen = 0;
-        seq = 1;
-        resumed = false;
-    }
-
-    let total_recs: u64 = remaining
-        .iter()
-        .chain(done_outputs.iter())
-        .map(|r| r.count)
-        .sum();
-    let total_body: u64 = remaining
-        .iter()
-        .chain(done_outputs.iter())
-        .map(run_body_bytes)
-        .sum();
-    rbitcoin_log::info!(
-        "store: scripthash fanin reduce start remaining={} done_out={} fanin={fanin} workers={workers} \
-         records≈{total_recs} body≈{:.1}MiB passes=1 resumed={resumed}",
-        remaining.len(),
-        done_outputs.len(),
-        total_body as f64 / (1024.0 * 1024.0),
-    );
-
-    let n_chunks = remaining.len().div_ceil(fanin).max(1);
-    let mut status = ReduceStatus::new(fanin, workers, done_outputs.len() + n_chunks);
-    status.chunks_done = done_outputs.len();
-    status.maybe_log(true);
-
-    let mut jobs: Vec<(Vec<SortedRunPath>, PathBuf)> = Vec::with_capacity(n_chunks);
-    let mut rem = remaining;
-    while !rem.is_empty() {
-        let take = fanin.min(rem.len());
-        let chunk: Vec<SortedRunPath> = rem.drain(..take).collect();
-        let out_path = work_dir.join(format!("g{gen}_{seq:06}.run"));
-        seq += 1;
-        jobs.push((chunk, out_path));
-    }
-
-    use std::sync::Mutex;
-    let pending_inputs: Vec<SortedRunPath> =
-        jobs.iter().flat_map(|(c, _)| c.iter().cloned()).collect();
-    let state = Mutex::new(FaninChunkState {
-        done_outputs: done_outputs.clone(),
-        pending_inputs,
-        seq_note: seq,
-        cancelled: false,
-        last_err: None,
-        chunks_finished: 0u64,
-    });
-
-    let job_list = Mutex::new(jobs);
-    let n_workers = workers.max(1).min(n_chunks.max(1));
-    let status_mu = Mutex::new(status);
-
-    std::thread::scope(|scope| {
-        for _ in 0..n_workers {
-            let job_list = &job_list;
-            let state = &state;
-            let status_mu = &status_mu;
-            let work_dir = work_dir;
-            let fanin = fanin;
-            let gen = gen;
-            scope.spawn(move || loop {
-                if cancel_requested(cancel) {
-                    let mut st = state.lock().unwrap();
-                    st.cancelled = true;
-                    break;
-                }
-                let job = {
-                    let mut q = job_list.lock().unwrap();
-                    q.pop()
-                };
-                let Some((chunk, out_path)) = job else {
-                    break;
-                };
-                let chunk_bytes: u64 = chunk.iter().map(run_body_bytes).sum();
-                match merge_runs_to_file(&chunk, &out_path) {
-                    Ok(merged) => {
-                        for r in &chunk {
-                            let _ = fs::remove_file(&r.path);
-                        }
-                        {
-                            let mut st = state.lock().unwrap();
-                            st.pending_inputs
-                                .retain(|p| !chunk.iter().any(|c| c.path == p.path));
-                            st.done_outputs.push(merged);
-                            st.chunks_finished += 1;
-                            let _ = write_fanin_checkpoint(
-                                work_dir,
-                                gen,
-                                st.seq_note,
-                                fanin,
-                                &st.pending_inputs,
-                                &st.done_outputs,
-                            );
-                        }
-                        if let Ok(mut s) = status_mu.lock() {
-                            s.on_chunk_done(chunk_bytes);
-                        }
-                    }
-                    Err(e) => {
-                        let mut st = state.lock().unwrap();
-                        st.cancelled = true;
-                        st.last_err = Some(e);
-                        break;
-                    }
-                }
-            });
-        }
-    });
-
-    let st = state.into_inner().unwrap();
-    let mut status = status_mu.into_inner().unwrap();
-    if let Some(e) = st.last_err {
-        return Err(e);
-    }
-    if st.cancelled || cancel_requested(cancel) {
-        rbitcoin_log::warn!(
-            "store: scripthash fanin reduce cancelled pending_in={} done_out={} — checkpoint kept",
-            st.pending_inputs.len(),
-            st.done_outputs.len()
-        );
-        return Err(StoreError::Cancelled("scripthash fanin reduce"));
-    }
-    if !st.pending_inputs.is_empty() {
-        return Err(StoreError::Corrupt(
-            "scripthash fanin reduce: unfinished pending inputs",
-        ));
-    }
-
-    status.chunks_done = st.done_outputs.len();
-    status.chunks_total = st.done_outputs.len().max(1);
-    status.maybe_log(true);
-    rbitcoin_log::info!(
-        "store: scripthash fanin reduce done stream_runs={} fanin={fanin} workers={workers} \
-         elapsed={:?} pct=100",
-        st.done_outputs.len(),
-        status.t0.elapsed(),
-    );
-    write_fanin_checkpoint(work_dir, gen, seq, fanin, &[], &st.done_outputs)?;
-    Ok(st.done_outputs)
-}
-
-struct FaninChunkState {
-    done_outputs: Vec<SortedRunPath>,
-    pending_inputs: Vec<SortedRunPath>,
-    seq_note: u64,
-    cancelled: bool,
-    last_err: Option<StoreError>,
-    chunks_finished: u64,
-}
-
-/// List finished fan-in reduce outputs under `work_dir` when [`FANIN_READY_NAME`] is set.
-///
-/// Returns `Ok(None)` if not ready / empty. Used to resume tip materialize after
-/// claimed inputs were deleted post-reduce.
-pub fn list_fanin_reduce_outputs(
-    work_dir: &Path,
-) -> Result<Option<Vec<SortedRunPath>>, StoreError> {
-    let ready = work_dir.join(FANIN_READY_NAME);
-    if !ready.is_file() {
-        return Ok(None);
-    }
-    if !work_dir.is_dir() {
-        return Ok(None);
-    }
-    let mut paths: Vec<PathBuf> = fs::read_dir(work_dir)
-        .map_err(|e| io_err(work_dir, e))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("run"))
-        .collect();
-    paths.sort();
-    if paths.is_empty() {
-        return Ok(None);
-    }
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        out.push(open_run(&p)?);
-    }
-    Ok(Some(out))
-}
-
-/// Mark fan-in reduce complete and delete `inputs` that are fully superseded by
-/// `outputs` under `work_dir` (not the same path as an output).
-///
-/// Call only after [`reduce_runs_to_fanin`] returns outputs all under `work_dir`.
-/// Writes [`FANIN_READY_NAME`] first so crash recovery can resume from outputs
-/// even if some input deletes fail mid-loop.
-pub fn commit_fanin_reduce_and_drop_inputs(
-    work_dir: &Path,
-    inputs: &[SortedRunPath],
-    outputs: &[SortedRunPath],
-) -> Result<(), StoreError> {
-    if outputs.is_empty() {
-        return Ok(());
-    }
-    // Only free originals when outputs live in the work dir (true reduce happened).
-    let all_out_in_work = outputs.iter().all(|o| o.path.starts_with(work_dir));
-    if !all_out_in_work {
-        return Ok(());
-    }
-    fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
-    let ready = work_dir.join(FANIN_READY_NAME);
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&ready)
-            .map_err(|e| io_err(&ready, e))?;
-        f.write_all(b"1\n").map_err(|e| io_err(&ready, e))?;
-        f.sync_all().map_err(|e| io_err(&ready, e))?;
-    }
-    let out_paths: std::collections::HashSet<&Path> =
-        outputs.iter().map(|o| o.path.as_path()).collect();
-    for r in inputs {
-        if out_paths.contains(r.path.as_path()) {
-            continue;
-        }
-        if r.path.exists() {
-            let _ = fs::remove_file(&r.path);
-        }
-    }
-    Ok(())
 }
 
 /// K-way merge of sorted runs → new run at `out_path`. Deletes input files on success.
@@ -2439,7 +1775,7 @@ pub fn merge_runs_with_policy(
             max_u64_at_32: 0,
         });
     }
-    // CRC-verify inputs when promoting into the durable catalog; L0 rewrites skip
+    // CRC-verify inputs when promoting into the durable catalog; rewrites skip
     // (bodies just written by this process).
     let verify_crc = policy.durable;
     let merged = merge_runs_to_file_with_policy(inputs, out_path, policy, verify_crc)?;
@@ -2587,19 +1923,6 @@ mod tests {
         r[0] = key;
         r[32] = tag;
         r
-    }
-
-    /// Tiny stream target so reduce runs without thousands of run files.
-    const TEST_TARGET: usize = 16;
-
-    fn write_n_runs(dir: &Path, n: u64, seq_base: u64) -> Vec<SortedRunPath> {
-        let mut inputs = Vec::with_capacity(n as usize);
-        for i in 1..=n {
-            let p = next_run_path(dir, seq_base + i);
-            write_sorted_run(&p, 32, 44, &rec(((seq_base + i) % 200) as u8, i as u8)).unwrap();
-            inputs.push(open_run(&p).unwrap());
-        }
-        inputs
     }
 
     /// Scope `RBITCOIN_SH_MERGE_WORKERS` for one test (restore previous value).
@@ -2757,7 +2080,7 @@ mod tests {
         write_sorted_run(&d.join("000001.run"), 32, 44, &rec(1, 1)).unwrap();
         // Plant orphan without going through write_sorted_run catalog path.
         let orphan = d.join("000099.run");
-        write_sorted_run_file(&orphan, 32, 44, &rec(9, 9), RunWritePolicy::DURABLE).unwrap();
+        write_sorted_run_file(&orphan, 32, 44, &rec(9, 9), RunWritePolicy::CATALOG).unwrap();
         // MANIFEST still only has 000001.
         let runs = list_runs(&d).unwrap();
         assert_eq!(runs.len(), 1);
@@ -3074,135 +2397,6 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// One-pass dynamic fanin deletes inputs as soon as each chunk merge finishes.
-    #[test]
-    fn reduce_fanin_deletes_merged_inputs() {
-        let d = tmp_dir();
-        let work = d.join("merge");
-        // Exceed tiny TEST_TARGET so reduce actually runs (not skip).
-        let n = (TEST_TARGET + 8) as u64;
-        let inputs = write_n_runs(&d, n, 0);
-        let _w = MergeWorkersGuard::set("1");
-        let out = reduce_runs_to_fanin(&inputs, &work, TEST_TARGET).unwrap();
-        assert!(
-            out.len() <= TEST_TARGET,
-            "stream runs {} > target",
-            out.len()
-        );
-        // Originals deleted immediately after chunk merge.
-        for r in &inputs {
-            assert!(
-                !r.path.exists(),
-                "input {} should be deleted after merge",
-                r.path.display()
-            );
-        }
-        let total: u64 = out.iter().map(|r| r.count).sum();
-        assert_eq!(total, n);
-        commit_fanin_reduce_and_drop_inputs(&work, &inputs, &out).unwrap();
-        assert!(work.join(FANIN_READY_NAME).is_file());
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn dynamic_fanin_one_pass_geometry() {
-        assert_eq!(dynamic_merge_fanin(10), 10);
-        assert_eq!(dynamic_merge_fanin(32), 32);
-        // Under production target (4096): fanin == n (direct stream; no reduce).
-        assert_eq!(dynamic_merge_fanin(1000), 1000);
-        assert_eq!(fanin_passes_total(1000, 1000), 0);
-        assert_eq!(fanin_passes_total(10, 10), 0);
-        assert_eq!(dynamic_merge_fanin(64), 64);
-        // Above production target: ceil(n/TARGET) clamped (pure math; no IO).
-        let n = FANIN_TARGET_STREAM_RUNS * 2 + 100;
-        let f = dynamic_merge_fanin(n);
-        assert!(f >= 8 && f <= FANIN_MAX_CHUNK);
-        assert!(n.div_ceil(f) <= FANIN_TARGET_STREAM_RUNS);
-        // Tiny target geometry (same formula; used by IO tests).
-        let f_tiny = dynamic_merge_fanin_for(TEST_TARGET + 8, TEST_TARGET);
-        assert!(f_tiny >= 1);
-        assert!((TEST_TARGET + 8).div_ceil(f_tiny) <= TEST_TARGET);
-        assert_eq!(
-            dynamic_merge_fanin_for(TEST_TARGET, TEST_TARGET),
-            TEST_TARGET
-        );
-        assert_eq!(dynamic_merge_fanin_for(0, TEST_TARGET), TEST_TARGET);
-    }
-
-    /// Partial checkpoint: simulate mid-reduce then resume.
-    #[test]
-    fn reduce_fanin_resume_partial_checkpoint() {
-        let d = tmp_dir();
-        let _w = MergeWorkersGuard::set("1");
-        let work = d.join("merge");
-        fs::create_dir_all(&work).unwrap();
-        let n_runs = TEST_TARGET + 8;
-        let all = write_n_runs(&d, n_runs as u64, 0);
-        let fanin = dynamic_merge_fanin_for(n_runs, TEST_TARGET);
-        assert!(n_runs.div_ceil(fanin) <= TEST_TARGET);
-        // Complete first chunk only.
-        let chunk: Vec<_> = all[..fanin].to_vec();
-        let rest: Vec<_> = all[fanin..].to_vec();
-        let out0 = work.join("g0_000001.run");
-        let merged = merge_runs_to_file(&chunk, &out0).unwrap();
-        for r in &chunk {
-            let _ = fs::remove_file(&r.path);
-        }
-        write_fanin_checkpoint(&work, 0, 2, fanin, &rest, &[merged]).unwrap();
-
-        let cp = load_fanin_checkpoint(&work).unwrap().expect("cp");
-        assert_eq!(cp.remaining.len(), n_runs - fanin);
-        assert_eq!(cp.done_outputs.len(), 1);
-
-        // Resume finishes remaining (target unused when checkpoint present).
-        let out = reduce_runs_to_fanin(&[], &work, TEST_TARGET).unwrap();
-        assert!(out.len() <= TEST_TARGET);
-        let n: u64 = out.iter().map(|r| r.count).sum();
-        assert_eq!(n, n_runs as u64);
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn reduce_fanin_cancel_returns_cancelled() {
-        let d = tmp_dir();
-        let work = d.join("merge");
-        let n = (TEST_TARGET + 8) as u64;
-        let inputs = write_n_runs(&d, n, 0);
-        let _w = MergeWorkersGuard::set("1");
-        let cancel = std::sync::atomic::AtomicBool::new(true);
-        let err = reduce_runs_to_fanin_cancellable(&inputs, &work, TEST_TARGET, Some(&cancel))
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Cancelled(_)), "got {err}");
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    /// Parallel reduce preserves total record count.
-    #[test]
-    fn reduce_fanin_parallel_preserves_count() {
-        let d = tmp_dir();
-        let n = (TEST_TARGET + 8) as u64;
-        let inputs = write_n_runs(&d, n, 0);
-        let work1 = d.join("merge1");
-        {
-            let _w = MergeWorkersGuard::set("1");
-            let out1 = reduce_runs_to_fanin(&inputs, &work1, TEST_TARGET).unwrap();
-            let n1: u64 = out1.iter().map(|r| r.count).sum();
-            assert_eq!(n1, n);
-            assert!(out1.len() <= TEST_TARGET);
-        }
-
-        let inputs2 = write_n_runs(&d, n, 10_000);
-        let work2 = d.join("merge2");
-        {
-            let _w = MergeWorkersGuard::set("4");
-            let out2 = reduce_runs_to_fanin(&inputs2, &work2, TEST_TARGET).unwrap();
-            let n2: u64 = out2.iter().map(|r| r.count).sum();
-            assert_eq!(n2, n);
-            assert!(out2.len() <= TEST_TARGET);
-        }
-        let _ = fs::remove_dir_all(&d);
-    }
-
     #[test]
     fn lookup_key_finds_record() {
         let d = tmp_dir();
@@ -3466,7 +2660,7 @@ mod tests {
             32,
             44,
             &rec(7, 7),
-            RunWritePolicy::DURABLE,
+            RunWritePolicy::CATALOG,
         )
         .unwrap();
         assert!(!manifest_path(&d2).exists());
@@ -3476,17 +2670,17 @@ mod tests {
 
         // write errors: bad key/rec, body not multiple
         assert!(
-            write_sorted_run_file(&d.join("x.run"), 0, 44, &[], RunWritePolicy::DURABLE).is_err()
+            write_sorted_run_file(&d.join("x.run"), 0, 44, &[], RunWritePolicy::CATALOG).is_err()
         );
         assert!(
-            write_sorted_run_file(&d.join("y.run"), 32, 16, &[], RunWritePolicy::DURABLE).is_err()
+            write_sorted_run_file(&d.join("y.run"), 32, 16, &[], RunWritePolicy::CATALOG).is_err()
         );
         assert!(write_sorted_run_file(
             &d.join("z.run"),
             32,
             44,
             &[1, 2, 3],
-            RunWritePolicy::DURABLE
+            RunWritePolicy::CATALOG
         )
         .is_err());
 
@@ -3586,14 +2780,9 @@ mod tests {
     }
 
     #[test]
-    fn tip_catalog_unpaced_ibd_background_paced() {
-        // Tip fan-in / recollect must not inherit IBD artificial sleeps.
-        assert!(!RunWritePolicy::CATALOG.pace);
-        assert!(!RunWritePolicy::DURABLE.pace);
-        assert!(!RunWritePolicy::L0.pace);
-        assert!(RunWritePolicy::IBD_BACKGROUND.pace);
+    fn catalog_policy_is_durable() {
         assert!(RunWritePolicy::CATALOG.durable);
-        assert!(RunWritePolicy::IBD_BACKGROUND.durable);
+        assert!(RunWritePolicy::CATALOG.drop_cache);
     }
 
     #[test]
@@ -3612,14 +2801,12 @@ mod tests {
         assert_eq!(listed[0].count, 1);
     }
 
-    /// L0 spills must be readable without fsync; max create_fk tracked during merge
-    /// (no second full-body scan for SEAL).
+    /// Max create_fk tracked during merge (no second full-body scan for SEAL).
     #[test]
-    fn l0_write_policy_and_merge_tracks_max_fk() {
+    fn catalog_merge_tracks_max_fk() {
         let d = tmp_dir();
-        let p1 = d.join("l0").join("000001.run");
-        let p2 = d.join("l0").join("000002.run");
-        // 40-byte SH records: scripthash[32] | create_fk:u64
+        let p1 = d.join("cat").join("000001.run");
+        let p2 = d.join("cat").join("000002.run");
         fn sh_rec(key0: u8, fk: u64) -> [u8; 40] {
             let mut r = [0u8; 40];
             r[0] = key0;
@@ -3628,23 +2815,22 @@ mod tests {
         }
         let b1 = sh_rec(1, 10);
         let b2 = sh_rec(2, 99);
-        write_sorted_run_file_with_policy(&p1, 32, 40, &b1, RunWritePolicy::L0).unwrap();
-        write_sorted_run_file_with_policy(&p2, 32, 40, &b2, RunWritePolicy::L0).unwrap();
+        write_sorted_run_file_with_policy(&p1, 32, 40, &b1, RunWritePolicy::CATALOG).unwrap();
+        write_sorted_run_file_with_policy(&p2, 32, 40, &b2, RunWritePolicy::CATALOG).unwrap();
         let r1 = open_run(&p1).unwrap();
         let r2 = open_run(&p2).unwrap();
         assert_eq!(read_run_body(&r1).unwrap().len(), 40);
-        let out = d.join("l0").join("000003.run");
+        let out = d.join("cat").join("000003.run");
         let merged =
-            merge_runs_to_file_with_policy(&[r1, r2], &out, RunWritePolicy::L0, false).unwrap();
+            merge_runs_to_file_with_policy(&[r1, r2], &out, RunWritePolicy::CATALOG, false)
+                .unwrap();
         assert_eq!(merged.run.count, 2);
         assert_eq!(
             merged.max_u64_at_32, 99,
             "must track max create_fk while streaming"
         );
-        // L0 policy leaves file readable without catalog MANIFEST.
         assert!(out.exists());
-        assert!(!manifest_path(out.parent().unwrap()).exists() || true);
-        set_thread_idle_io_priority(); // best-effort no-op on failure
+        set_thread_idle_io_priority();
         let _ = fs::remove_dir_all(&d);
     }
 }

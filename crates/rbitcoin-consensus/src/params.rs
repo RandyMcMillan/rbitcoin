@@ -2,7 +2,7 @@ use bitcoin::blockdata::constants;
 use bitcoin::consensus::Params as BtcParams;
 use bitcoin::hashes::Hash;
 use bitcoin::script::ScriptBuf;
-use bitcoin::{BlockHash, CompactTarget, Network, Target};
+use bitcoin::{BlockHash, Network, Target};
 use rbitcoin_primitives::Height;
 
 /// Static chain parameters for validation.
@@ -119,10 +119,6 @@ impl ChainParams {
             .iter()
             .find(|c| c.height == height.0)
             .map(|c| c.hash)
-    }
-
-    pub fn min_difficulty_target(&self) -> CompactTarget {
-        self.pow_limit.to_compact_lossy()
     }
 
     pub fn difficulty_adjustment_interval(&self) -> u32 {
@@ -569,7 +565,6 @@ mod tests {
         assert_eq!(tn.taproot_height(), 2_011_968);
         assert_eq!(tn.coinbase_maturity(), 100);
         assert!(!tn.no_pow_retargeting());
-        let _ = tn.min_difficulty_target();
         assert!(tn.difficulty_adjustment_interval() > 0);
         assert!(tn.bip34_active_at(tn.btc.bip34_height));
         assert!(tn.bip65_active_at(tn.btc.bip65_height));

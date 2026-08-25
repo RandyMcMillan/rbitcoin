@@ -694,7 +694,7 @@ pub mod archive_phase_stats {
         });
     }
 
-    /// Lookup sub-phases for one plan batch (`archive_plan_batch_from`).
+    /// Lookup sub-phases for one plan batch (`archive_plan_batch_from_store`).
     ///
     /// `head_fk_ns`: leftover TipOnly `get_fk_by_txid_batch` after BQ / pins.
     #[inline]

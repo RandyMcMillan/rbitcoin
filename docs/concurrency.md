@@ -56,7 +56,7 @@ The 2-wave split is sealed age, not an IO flag.
 | **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | write-behind after tip commit (may lag live tip by 1+ blocks) |
 
 Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
-(runs → optional fan-in reduce → sliced k-way per prefix shard, workers
+(runs → sliced k-way per prefix shard, workers
 capped at one per 1.5 GiB host free RAM, writing `scripthash.body/NN`
 and sealing `scripthash.head/NN` themselves). Shared file `scripthash.body`
 is one writer. Overflow body
@@ -113,7 +113,7 @@ API tokens: [`COMPAT.md`](../COMPAT.md) (Esplora headers, Electrum JSON-RPC extr
 3. Scripts for batch N may run while load does N+1 and write does N−1. Scripts never touch disk.
 4. **Load ahead of store tip:** lookup may stamp batch N+1 while write has not advanced tip.
    Lookup holds a **reserved create-fk HWM** and **in-flight create/out maps** from
-   uncommitted plans (`WireLoadPipeline` / `archive_plan_batch_from`). First height
+   uncommitted plans (`WireLoadPipeline` / `archive_plan_batch_from_store`). First height
    of a batch is the **pipeline path_lo** (tip+1 or last-loaded+1), not only store tip.
    Write still applies batches in height order; on permanent reject, lookup clears
    reserved state and re-syncs from `txs.count()`.

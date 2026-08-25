@@ -218,18 +218,8 @@ impl InvalidHashSet {
         self.hashes.insert(hash);
     }
 
-    pub fn mark_path(&mut self, path: &[[u8; 32]]) {
-        for h in path {
-            self.hashes.insert(*h);
-        }
-    }
-
     pub fn contains(&self, hash: [u8; 32]) -> bool {
         self.hashes.contains(&hash)
-    }
-
-    pub fn is_invalid_fn(&self) -> impl Fn([u8; 32]) -> bool + '_ {
-        move |h| self.hashes.contains(&h)
     }
 
     pub fn len(&self) -> usize {
@@ -413,11 +403,9 @@ mod tests {
         set.mark(h);
         assert!(set.contains(h));
         assert_eq!(set.len(), 1);
-        set.mark_path(&[[0x01; 32], [0x02; 32]]);
+        set.mark([0x02; 32]);
         assert!(set.contains([0x02; 32]));
-        let f = set.is_invalid_fn();
-        assert!(f(h));
-        assert!(!f([0x00; 32]));
+        assert!(!set.contains([0x00; 32]));
     }
 
     #[test]

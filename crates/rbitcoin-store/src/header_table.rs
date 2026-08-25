@@ -198,11 +198,6 @@ impl HeaderTable {
         self.count.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Occupied open-address slots in the header hash head.
-    pub fn head_occupied(&self) -> u64 {
-        self.head.occupied()
-    }
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.head.flush()?;

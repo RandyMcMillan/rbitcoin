@@ -100,8 +100,8 @@ a pipeline-bounded create-outs cache, not a coins cache or process pin FIFO.
 
 Leftover union, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**
 (the only Allowed/Forbidden IO table). In-flight prune after pin + scripts
-handoff; no leftover pending / pin FIFO; recent identity ring is
-height-bounded. Union miss is permanent.
+handoff; no leftover pending / pin FIFO; RecentCreates identity + outs
+are height-bounded. Union miss is permanent.
 
 ### Confirm pipeline timers
 

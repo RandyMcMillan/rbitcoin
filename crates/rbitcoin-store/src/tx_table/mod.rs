@@ -691,36 +691,6 @@ impl TxTable {
         Ok((tx, prevs))
     }
 
-    /// Full decode from a known body range (skip idx). Txid left zero (no fk).
-    pub fn get_full_at(
-        &self,
-        offset: u64,
-        len: u64,
-    ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
-        self.body
-            .with_bytes_at(offset, len, |raw| decode_packed_tx(raw))
-    }
-
-    /// Meta + prevouts from a known body range (skip idx).
-    pub fn get_meta_and_prevouts_at(
-        &self,
-        offset: u64,
-        len: u64,
-    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-        self.body
-            .with_bytes_at(offset, len, |raw| scan_packed_meta_and_prevouts(raw))
-    }
-
-    /// Meta + outputs only from a known body range (skip allocating parent inputs).
-    pub fn get_meta_and_outputs_at(
-        &self,
-        offset: u64,
-        len: u64,
-    ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
-        self.body
-            .with_bytes_at(offset, len, |raw| decode_packed_tx_outs_only(raw))
-    }
-
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
         self.body.reserve_append(body_bytes, n_records)
     }
@@ -894,89 +864,6 @@ impl TxTable {
     /// `spent.body` ranges (same fk order as [`Self::body_range_batch`]).
     pub fn spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
         self.spent.record_range_batch(fks)
-    }
-
-    /// Bulk full packed decode from known ranges.
-    ///
-    /// Thin decode wrapper over [`crate::idx_body_pipeline`] (body-only jobs).
-    /// Fourth field: dense spender_rels relative to body_off.
-    pub fn get_full_batch_at(
-        &self,
-        ranges: &[(Fk, u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>, StoreError>
-    {
-        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
-        if ranges.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut jobs: Vec<IdxBodyJob> = ranges
-            .iter()
-            .map(|(fk, off, len)| {
-                let id = fk.get().unwrap_or(0);
-                IdxBodyJob::new(id, Some((*off, *len)))
-            })
-            .collect();
-        run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Full)?;
-        let mut in_jobs: Vec<IdxBodyJob> = ranges
-            .iter()
-            .map(|(fk, _, _)| IdxBodyJob::new(fk.get().unwrap_or(0), None))
-            .collect();
-        run_idx_body_pipeline(&self.inwit, &mut in_jobs, BodyMode::Full)?;
-        let mut out = Vec::with_capacity(jobs.len());
-        for ((j, ij), (fk, _, _)) in jobs.into_iter().zip(in_jobs.into_iter()).zip(ranges.iter()) {
-            if !j.ok {
-                out.push(None);
-                continue;
-            }
-            let mut decoded =
-                decode_packed_tx_with_spender_rels_secret(&j.body, Some(&self.secret)).ok();
-            if let Some(ref mut d) = decoded {
-                if ij.ok {
-                    if let Ok(ins) =
-                        decode_inwit_secret(&ij.body, d.0.input_count, Some(&self.secret))
-                    {
-                        d.1 = ins;
-                    }
-                }
-                if let Ok(tid) = self.txids.get(*fk) {
-                    d.0.txid = tid;
-                }
-            }
-            out.push(decoded);
-        }
-        Ok(out)
-    }
-
-    /// Bulk meta+outputs+spender_rels from known ranges.
-    ///
-    /// Thin decode wrapper over [`crate::idx_body_pipeline`] (body-only denserels).
-    pub fn get_meta_and_outputs_batch_at(
-        &self,
-        ranges: &[(u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
-        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
-        if ranges.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Synthetic sequential ids: pipeline only needs range when known; id is
-        // unused for body-only jobs (bounds skipped when range is Some).
-        let mut jobs: Vec<IdxBodyJob> = ranges
-            .iter()
-            .enumerate()
-            .map(|(i, &(off, len))| IdxBodyJob::new((i as u64).saturating_add(1), Some((off, len))))
-            .collect();
-        run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Outs)?;
-        let mut out = Vec::with_capacity(jobs.len());
-        for j in jobs {
-            if !j.ok {
-                out.push(None);
-                continue;
-            }
-            out.push(
-                decode_packed_tx_outs_with_spender_rels_secret(&j.body, Some(&self.secret)).ok(),
-            );
-        }
-        Ok(out)
     }
 
     /// Annotate spends at known absolute spender-meta offsets (confirm write).

@@ -470,6 +470,8 @@ pub mod archive_phase_stats {
     pub static LEFTOVER_AGE_N: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
+    /// `fill_missing_parent_ranges` entries (stamp + optional prestamp).
+    pub static FILL_MISSING_N: AtomicU64 = AtomicU64::new(0);
 
     /// Full load batch wall (struct → lookup → enqueue wait).
     pub static PREP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -663,6 +665,13 @@ pub mod archive_phase_stats {
                 LAST_HEAD_NEED.store(head_need, Ordering::Relaxed);
                 LAST_HEAD_HIT.store(head_hit, Ordering::Relaxed);
             }
+        });
+    }
+
+    #[inline]
+    pub fn note_fill_missing() {
+        exclusive::with(|| {
+            FILL_MISSING_N.fetch_add(1, Ordering::Relaxed);
         });
     }
 

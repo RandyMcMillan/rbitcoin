@@ -189,6 +189,7 @@ pub fn fill_missing_parent_ranges(
     spent_ranges: &mut U64Map<(u64, u64)>,
     txids: &U64Map<[u8; 32]>,
 ) -> Result<(), QueryError> {
+    crate::archive_phase_stats::note_fill_missing();
     let mut need_body: Vec<Fk> = Vec::new();
     let mut seen_body = U64Set::default();
     let mut need_spent: Vec<Fk> = Vec::new();

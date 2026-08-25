@@ -475,6 +475,14 @@ impl Query {
         let mut external_parent_vouts: crate::U64Map<Vec<u32>> = crate::U64Map::default();
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
+        let mut batch_create_ids: crate::U64Set =
+            crate::U64Set::with_capacity_and_hasher(batch_map.len(), Default::default());
+        for fk in batch_map.values() {
+            if let Some(id) = fk.get() {
+                batch_create_ids.insert(id);
+            }
+        }
+        let mut prestamp_parents = false;
         for (tx_fk, tx, mut inputs, outputs) in work {
             for (i, inp) in inputs.iter_mut().enumerate() {
                 if inp.is_coinbase() {
@@ -500,6 +508,13 @@ impl Query {
                         .entry(pid)
                         .or_default()
                         .push(inp.prev_index);
+                    if !batch_create_ids.contains(&pid)
+                        && !external_parent_txids.contains_key(&pid)
+                        && inp.prev_txid != [0u8; 32]
+                    {
+                        external_parent_txids.insert(pid, inp.prev_txid);
+                        prestamp_parents = true;
+                    }
                 }
                 if archive_spends {
                     spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
@@ -515,33 +530,7 @@ impl Query {
             vouts.sort_unstable();
             vouts.dedup();
         }
-
-        // Pre-stamped create_fk on the input (reconstruct) may not be in `need`.
-        // Same helper as the union: idx range-fill, skip same-batch / in-flight outs.
-        {
-            let mut batch_create_ids: crate::U64Set =
-                crate::U64Set::with_capacity_and_hasher(planned_fks.len(), Default::default());
-            for fk in &planned_fks {
-                if let Some(id) = fk.get() {
-                    batch_create_ids.insert(id);
-                }
-            }
-            for ((_pin, ins), _) in packed.iter().zip(planned_fks.iter()) {
-                for inp in ins {
-                    if inp.is_coinbase() || inp.prev_index == u32::MAX {
-                        continue;
-                    }
-                    let Some(id) = inp.create_fk.get() else {
-                        continue;
-                    };
-                    if batch_create_ids.contains(&id) {
-                        continue;
-                    }
-                    if !external_parent_txids.contains_key(&id) && inp.prev_txid != [0u8; 32] {
-                        external_parent_txids.insert(id, inp.prev_txid);
-                    }
-                }
-            }
+        if prestamp_parents {
             crate::fill_missing_parent_ranges(
                 &self.store,
                 in_flight,
@@ -1378,6 +1367,85 @@ mod tests {
         assert_eq!(batch_pin_len, 1);
         assert_eq!(q.tx_body_count(), 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S0 plan: stamp_external already idx-filled; do not fill_missing twice.
+    #[test]
+    fn plan_batch_one_fill_missing_when_parents_already_stamped() {
+        use std::sync::atomic::Ordering;
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::FILL_MISSING_N.swap(0, Ordering::Relaxed);
+            let (dir, q) = temp_query("plan-one-fill-missing");
+            use rbitcoin_primitives::Height;
+            use rbitcoin_store::HeaderRecord;
+            let parent = coinbase_apply(1);
+            let parent_txid = parent.tx.txid;
+            let ph = HeaderRecord {
+                prev_fk: Fk::NULL,
+                version: 1,
+                timestamp: 1,
+                bits: 1,
+                nonce: 1,
+                merkle_root: [1u8; 32],
+                hash: [1u8; 32],
+            };
+            q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
+            let spent = q.store.txs.spent_range(Fk(1)).expect("spent.idx");
+            let _ = crate::archive_phase_stats::FILL_MISSING_N.swap(0, Ordering::Relaxed);
+            let mut need = vec![(Fk(2), vec![child_spend(parent_txid, 0xcd)])];
+            let plan = q
+                .archive_plan_batch_from_store(&mut need, 2, &crate::InFlightView::empty(), None)
+                .expect("parent via head");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+            assert!(plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0));
+            assert_eq!(
+                plan.external_parent_spent_ranges.get(&1).copied(),
+                Some(spent)
+            );
+            assert_eq!(
+                crate::archive_phase_stats::FILL_MISSING_N.swap(0, Ordering::Relaxed),
+                1,
+                "stamp_external fill_missing is enough when packed adds no new fks"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// Packed reconstruct already has create_fk: still idx-fill (not in need).
+    #[test]
+    fn plan_batch_prestamp_create_fk_still_idx_fills() {
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::HeaderRecord;
+        let (dir, q) = temp_query("plan-prestamp-fk");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        let ph = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [1u8; 32],
+        };
+        q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
+        let spent = q.store.txs.spent_range(Fk(1)).expect("spent.idx");
+        let mut child = child_spend(parent_txid, 0xcf);
+        child.inputs[0].create_fk = Fk(1);
+        let mut need = vec![(Fk(2), vec![child])];
+        let plan = q
+            .archive_plan_batch_from_store(&mut need, 2, &crate::InFlightView::empty(), None)
+            .expect("prestamp parent");
+        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert!(
+            plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
+            "pre-stamped create_fk must still receive body_range"
+        );
+        assert_eq!(
+            plan.external_parent_spent_ranges.get(&1).copied(),
+            Some(spent)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

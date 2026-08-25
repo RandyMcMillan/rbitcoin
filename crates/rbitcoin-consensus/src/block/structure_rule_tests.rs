@@ -155,6 +155,37 @@ fn structure_with_pres_skips_from_tx() {
     });
 }
 
+/// Confirm assemble must Arc-share lookup/structure pres, not `Arc::new(p.clone())`.
+#[test]
+fn script_jobs_from_same_pres_slice_share_pre() {
+    use rbitcoin_query::TxPrecompute;
+    let spend = non_coinbase_spend(1);
+    let pres: std::sync::Arc<[TxPrecompute]> =
+        std::sync::Arc::from([TxPrecompute::from_tx(&spend)]);
+    let job_a = ScriptCheckJob::with_txid(
+        pres[0].txid,
+        vec![],
+        spend.clone(),
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .with_pre_slice(std::sync::Arc::clone(&pres), 0);
+    let job_b =
+        ScriptCheckJob::with_txid(pres[0].txid, vec![], spend, true, true, true, true, true)
+            .with_pre_slice(std::sync::Arc::clone(&pres), 0);
+    assert!(
+        std::ptr::eq(job_a.pre(), &pres[0]),
+        "job pre must be the slice element, not a cloned TxPrecompute"
+    );
+    assert!(
+        std::ptr::eq(job_a.pre(), job_b.pre()),
+        "two jobs from the same Arc<[TxPrecompute]> share the element"
+    );
+}
+
 fn assert_bad_block(err: ConsensusError, needle: &str) {
     match err {
         ConsensusError::BadBlock(s) => {

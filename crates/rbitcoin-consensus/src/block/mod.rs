@@ -818,7 +818,16 @@ pub struct ScriptCheckJob {
     /// SCRIPT_VERIFY_CONST_SCRIPTCODE: CODESEPARATOR + FindAndDelete hard-fail.
     pub(crate) const_scriptcode: bool,
     /// Lookup/structure `TxPrecompute`. Set on the confirm path; tests lazy-`from_tx`.
-    pub(crate) pre: std::sync::OnceLock<std::sync::Arc<rbitcoin_query::TxPrecompute>>,
+    pub(crate) pre: std::sync::OnceLock<JobPre>,
+}
+
+/// Confirm jobs borrow the lookup/structure slice; tests own an `Arc`.
+pub(crate) enum JobPre {
+    Owned(std::sync::Arc<rbitcoin_query::TxPrecompute>),
+    Slice {
+        slice: std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
+        idx: usize,
+    },
 }
 
 impl ScriptCheckJob {
@@ -935,22 +944,43 @@ impl ScriptCheckJob {
     /// Confirm path: reuse structure/lookup pres (no job `from_tx`).
     #[inline]
     pub(crate) fn with_pre(self, pre: std::sync::Arc<rbitcoin_query::TxPrecompute>) -> Self {
-        let _ = self.pre.set(pre);
+        let _ = self.pre.set(JobPre::Owned(pre));
         self
+    }
+
+    /// Confirm assemble: `slice[idx]` by refcount only (no `TxPrecompute` clone).
+    #[inline]
+    pub(crate) fn with_pre_slice(
+        self,
+        slice: std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
+        idx: usize,
+    ) -> Self {
+        let _ = self.pre.set(JobPre::Slice { slice, idx });
+        self
+    }
+
+    fn job_pre(&self) -> &JobPre {
+        self.pre.get_or_init(|| {
+            JobPre::Owned(std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(
+                &*self.tx,
+            )))
+        })
     }
 
     #[inline]
     pub(crate) fn pre_arc(&self) -> std::sync::Arc<rbitcoin_query::TxPrecompute> {
-        self.pre
-            .get_or_init(|| std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&*self.tx)))
-            .clone()
+        match self.job_pre() {
+            JobPre::Owned(a) => std::sync::Arc::clone(a),
+            JobPre::Slice { slice, idx } => std::sync::Arc::new(slice[*idx].clone()),
+        }
     }
 
     #[inline]
     pub(crate) fn pre(&self) -> &rbitcoin_query::TxPrecompute {
-        self.pre
-            .get_or_init(|| std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&*self.tx)))
-            .as_ref()
+        match self.job_pre() {
+            JobPre::Owned(a) => a.as_ref(),
+            JobPre::Slice { slice, idx } => &slice[*idx],
+        }
     }
 
     /// BIP141/147: NULLDUMMY + WITNESS rules follow `segwit` (not CSV).
@@ -1048,7 +1078,7 @@ pub(crate) fn assemble_block_prevouts(
     block_hash: &[u8; 32],
     bip16_active: bool,
     wire: Option<&Arc<Block>>,
-    pres: Option<&[rbitcoin_query::TxPrecompute]>,
+    pres: Option<&Arc<[rbitcoin_query::TxPrecompute]>>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -1096,7 +1126,7 @@ fn assemble_block_prevouts_mode(
     block_hash: &[u8; 32],
     bip16_active: bool,
     wire: Option<&Arc<Block>>,
-    pres: Option<&[rbitcoin_query::TxPrecompute]>,
+    pres: Option<&Arc<[rbitcoin_query::TxPrecompute]>>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -1400,8 +1430,10 @@ fn assemble_block_prevouts_mode(
                     )
                     .with_segwit(flag_segwit)
                 };
-                if let Some(p) = pres.and_then(|ps| ps.get(ti)) {
-                    job = job.with_pre(Arc::new(p.clone()));
+                if let Some(ps) = pres {
+                    if ti < ps.len() {
+                        job = job.with_pre_slice(Arc::clone(ps), ti);
+                    }
                 }
                 script_jobs.push(job);
                 clk_job = clk_job.saturating_add(t_job.elapsed().as_nanos() as u64);

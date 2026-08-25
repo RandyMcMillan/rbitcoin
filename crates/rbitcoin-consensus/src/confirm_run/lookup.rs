@@ -58,15 +58,11 @@ impl ParentPinStamp {
         pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
         parent_vouts: U64Map<Vec<u32>>,
     ) -> Self {
-        let mut create_by_txid = HashMap::with_capacity_and_hasher(txids.len(), Default::default());
-        for (id, tid) in &txids {
-            create_by_txid.insert(*tid, *id);
-        }
         Self {
             ranges,
             spent_ranges,
             txids,
-            create_by_txid,
+            create_by_txid: HashMap::with_hasher(Default::default()),
             pins,
             parent_vouts,
         }

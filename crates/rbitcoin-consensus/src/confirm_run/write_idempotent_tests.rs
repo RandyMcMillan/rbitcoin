@@ -1487,6 +1487,8 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
 
     let mut ranges = U64Map::default();
     ranges.insert(7, (8, 16));
+    let mut spent_ranges = U64Map::default();
+    spent_ranges.insert(7, (32, 8));
     let mut txids = U64Map::default();
     txids.insert(7, [0xABu8; 32]);
     let mut plan = ArchiveWritePlan {
@@ -1496,7 +1498,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         spends: vec![],
         batch_creates: vec![],
         external_parent_ranges: ranges,
-        external_parent_spent_ranges: Default::default(),
+        external_parent_spent_ranges: spent_ranges,
         external_parent_txids: txids,
         external_parent_pins: Default::default(),
         external_parent_vouts: Default::default(),
@@ -1507,8 +1509,14 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
     let stamp = ParentPinStamp::take_from_plan(&mut plan);
     assert!(plan.external_parent_ranges.is_empty());
     assert!(plan.external_parent_txids.is_empty());
+    assert!(plan.external_parent_spent_ranges.is_empty());
     assert_eq!(stamp.ranges.get(&7).copied(), Some((8, 16)));
+    assert_eq!(stamp.spent_ranges.get(&7).copied(), Some((32, 8)));
     assert_eq!(stamp.create_txid(7), Some([0xABu8; 32]));
+    assert!(
+        stamp.create_by_txid.is_empty(),
+        "plan path pins from packed create_fk; SipHash invert is plan=None only"
+    );
 }
 
 /// Need a high vout from a multi-out parent (need-vouts only, not full n_out).

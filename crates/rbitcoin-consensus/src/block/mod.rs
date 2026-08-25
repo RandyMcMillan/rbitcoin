@@ -165,6 +165,9 @@ pub fn validate_block_structure_with_pres(
 
     const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
+        if tx.output.is_empty() {
+            return Err(ConsensusError::BadTx("no outputs"));
+        }
         for o in &tx.output {
             if o.value.to_sat() > MAX_MONEY {
                 return Err(ConsensusError::BadBlock("bad-txns-vout-toolarge"));
@@ -1159,12 +1162,12 @@ fn assemble_block_prevouts_mode(
         if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
             return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
         }
+        if tx.output.is_empty() {
+            return Err(ConsensusError::BadTx("no outputs"));
+        }
         if ti > 0 {
             if tx.input.is_empty() {
                 return Err(ConsensusError::BadTx("no inputs"));
-            }
-            if tx.output.is_empty() {
-                return Err(ConsensusError::BadTx("no outputs"));
             }
 
             let mut value_in = 0i64;

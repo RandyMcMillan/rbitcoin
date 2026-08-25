@@ -85,6 +85,7 @@ named rows here.
 | S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `s10_rejects_vout_toolarge` |
 | S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `s11_rejects_excessive_legacy_sigops` |
 | S12 | Connect: P2SH + witness sigops (BIP16/BIP141) | `bad-blk-sigops` | `sigop_cost_tests::*` + connect path `tx_sigop_cost` |
+| S13 | Every tx including coinbase has ≥1 output | `no outputs` | `s13_rejects_coinbase_empty_vout` |
 
 Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs`.
 

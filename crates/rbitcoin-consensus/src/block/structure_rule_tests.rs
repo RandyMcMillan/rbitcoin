@@ -633,6 +633,19 @@ fn s10_rejects_vout_toolarge() {
 }
 
 #[test]
+fn s13_rejects_coinbase_empty_vout() {
+    let mut cb = coinbase(0);
+    cb.output.clear();
+    let b = block_with(vec![cb]);
+    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no outputs") || msg.contains("vout-empty"),
+        "expected empty vout reject, got {msg}"
+    );
+}
+
+#[test]
 fn s11_rejects_excessive_legacy_sigops() {
     let mut cb = coinbase(0);
     // 20_001 × OP_CHECKSIG × WITNESS_SCALE(4) = 80_004 > MAX 80_000.

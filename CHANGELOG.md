@@ -139,6 +139,9 @@ before 1.0).
 
 ### Fixed
 
+- **Coinbase (and every tx) with empty vout is rejected:** Core
+  `bad-txns-vout-empty`, including the coinbase.
+
 - **Testnet 20-minute min-difficulty:** off-interval headers with
   `time > prev + 2×spacing` use powLimit bits; otherwise walk back to the last
   non-min-diff block (Core `GetNextWorkRequired`).

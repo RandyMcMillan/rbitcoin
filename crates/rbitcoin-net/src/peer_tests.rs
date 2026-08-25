@@ -4115,12 +4115,7 @@ fn try_queue_served_block_false_at_cap() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let n = AtomicUsize::new(MAX_SERVE_BLOCKS);
     let gen = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let queued = try_queue_served_block(
-        &out_tx,
-        Some(&n),
-        NetworkMessage::Block(gen),
-    )
-    .unwrap();
+    let queued = try_queue_served_block(&out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
     assert!(!queued);
     assert!(out_rx.try_recv().is_err());
     assert_eq!(n.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
@@ -4129,7 +4124,11 @@ fn try_queue_served_block_false_at_cap() {
 #[test]
 fn announced_tip_is_hopeless_less_and_288_behind() {
     use std::cmp::Ordering;
-    assert!(announced_tip_is_hopeless(964_000, 961_638, Some(Ordering::Less)));
+    assert!(announced_tip_is_hopeless(
+        964_000,
+        961_638,
+        Some(Ordering::Less)
+    ));
     assert!(!announced_tip_is_hopeless(
         964_000,
         963_900,
@@ -4372,10 +4371,7 @@ fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
         let mut from_peer = HashMap::new();
         let mut requested = HashSet::new();
         let mut ban = 0u32;
-        let inv: Vec<Inventory> = hashes
-            .iter()
-            .map(|h| Inventory::WitnessBlock(*h))
-            .collect();
+        let inv: Vec<Inventory> = hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
         handle_peer_frame(
             frame_for(NetworkMessage::GetData(inv)),
             &hub,
@@ -4405,10 +4401,7 @@ fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
             "queued {n_block} blocks over cap {MAX_SERVE_BLOCKS}"
         );
         assert_eq!(n_block, MAX_SERVE_BLOCKS);
-        assert_eq!(
-            sess.serve_inflight.load(Ordering::SeqCst),
-            MAX_SERVE_BLOCKS
-        );
+        assert_eq!(sess.serve_inflight.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
         let _ = std::fs::remove_dir_all(dir);
     });
 }

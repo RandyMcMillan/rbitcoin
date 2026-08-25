@@ -97,6 +97,9 @@ Electrum is for **after** catch-up completes:
 ## Tip follow
 
 After tip: few outbound follow peers, getheaders / inv / block accept.
+Hopeless minority-fork tips (connecting path weaker than us and **>288**
+blocks behind) are disconnected; stale extras rotate inside `max_outbound`.
+Heap caps: [`docs/ibd-memory.md`](./ibd-memory.md) (tip-follow / P2P serve).
 
 **Compact blocks (BIP152 v2):** we advertise `sendcmpct` high-bandwidth version 2.
 Incoming `cmpctblock` is reconstructed from the mempool short-id map; missing txs

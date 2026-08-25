@@ -1225,8 +1225,7 @@ async fn handle_peer_frame(
             for item in inv.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS)
-                        {
+                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
                             continue;
                         }
                         if let Some(block) =
@@ -1240,8 +1239,7 @@ async fn handle_peer_frame(
                         }
                     }
                     Inventory::CompactBlock(h) => {
-                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS)
-                        {
+                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
                             continue;
                         }
                         if let Some(block) =

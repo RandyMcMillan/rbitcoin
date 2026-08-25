@@ -139,6 +139,10 @@ before 1.0).
 
 ### Fixed
 
+- **Truncated PUSHDATA2/4 no longer counts leftover opcodes as sigops:**
+  `script_sigop_count` stops when the length field or body overruns, matching
+  Core `GetOp` / `GetSigOpCount` (`[0x4d, 0xac]` is 0, not 1).
+
 - **SIGINT after `clean exit` no longer waits on peer header walks:** tip-follow
   sessions walked pending headers with a store lookup per step (`knows_header` /
   `header_height`), so a 2000-header stale-fork reply could peg the Tokio

@@ -1,7 +1,8 @@
 //! Index modes: Direct (IBD live heads/spends) and Tip (steady-state).
 //!
 //! Spentness truth for both: durable confirmed-strong spend annotations.
-//! SH uses append-only target-sized runs + SEAL during Direct; bulk-loads at tip.
+//! SH: Direct defers until post-IBD Class A collect; Tip write-behind if a
+//! durable head already exists.
 
 use super::*;
 use std::sync::atomic::Ordering;
@@ -300,21 +301,17 @@ impl Query {
             ShPreMaterializeAction::Noop => {}
         }
 
-        // Drain Direct IBD memtable/L0 into the catalog and advance SEAL **before**
-        // Class A recollect. Creates for the unsealed tip tail already sit in the
-        // enqueue pipeline; recollecting first re-spills the same create_fks
-        // (mainnet IBD exit: seal lag multi-million, then drain promoted overlapping L0).
-        self.sh_run.stop_and_drain_spills()?;
+        self.sh_run.refresh_seal();
         let seal_before_recollect = self.sh_run.sealed_max_create_fk();
         let tip_max = self.store.txs.count();
         if tip_max > 0 && seal_before_recollect.saturating_add(SH_SEAL_LAG_OK) < tip_max {
             rbitcoin_log::info!(
-                "node: scripthash post-drain gap seal={seal_before_recollect} \
+                "node: scripthash collect gap seal={seal_before_recollect} \
                  tip_max_create_fk={tip_max} — Class A recollect for residual"
             );
         } else if tip_max > 0 {
             rbitcoin_log::info!(
-                "node: scripthash post-drain seal={seal_before_recollect} covers \
+                "node: scripthash collect seal={seal_before_recollect} covers \
                  tip_max_create_fk={tip_max} (lag≤{SH_SEAL_LAG_OK}) — Class A recollect no-op if seal≥tip"
             );
         }
@@ -453,12 +450,6 @@ impl Query {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
-
-        // Parallel catalog writers: pause IBD crumb compact only for this scope —
-        // restore prior flag so mid-IBD enter_direct recollect does not leave
-        // compact permanently off for the rest of Direct IBD.
-        let _compact_gate = self.sh_run.pause_ibd_catalog_compact();
-        self.sh_run.ensure_enabled();
 
         // Recollect floor is max(SEAL, include_hwm): tip-mode durable writes raise
         // HWM without always matching SEAL; never re-scan creates already in head.
@@ -990,10 +981,9 @@ mod tests {
         assert!(q.sh_index_enabled());
         assert!(
             !q.sh_run_enabled(),
-            "Direct must not start the IBD SH run worker"
+            "Direct must not start an IBD SH run worker"
         );
         assert_eq!(q.scripthash_run_count(), 0);
-        assert_eq!(q.sh_run.memtable_len(), 0);
         assert!(
             !q.store.scripthash.has_durable_index(),
             "durable SH appears only after finalize recollect"
@@ -1004,77 +994,6 @@ mod tests {
         assert!(n_mat > 0 || q.store.scripthash.has_durable_index());
         assert!(!q.scripthash_history(&sh).unwrap().is_empty());
         assert_eq!(q.scripthash_run_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Tip entry must promote memtable/L0 (and advance SEAL) before Class A recollect.
-    ///
-    /// Mainnet regression: recollect ran with seal lag while the same create_fks
-    /// still sat in the Direct enqueue pipeline, then drain double-spilled them.
-    #[test]
-    fn tip_drain_before_recollect_covers_memtable_tail() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-drain-first-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        seed_direct_chain(&q, 10);
-        let tip_max = q.store.txs.count();
-        assert!(tip_max >= 10);
-
-        // Simulate seal lag: clamp SEAL low, re-enqueue creates for the tail into
-        // the memtable (same shape as Direct confirm while worker is behind).
-        let lag_seal = tip_max.saturating_sub(6).max(1);
-        q.sh_run.set_sealed_max_for_recollect(lag_seal).unwrap();
-        q.sh_run.ensure_enabled();
-        let mut tail: Vec<ScriptHashRecord> = Vec::new();
-        for id in (lag_seal + 1)..=tip_max {
-            let (_tx, outs) = q.store.get_tx_meta_and_outputs(Fk(id)).unwrap();
-            for o in &outs {
-                tail.push(ScriptHashRecord::from_fk(
-                    rbitcoin_store::script_hash(&o.script),
-                    Fk(id),
-                ));
-            }
-        }
-        assert!(
-            !tail.is_empty(),
-            "need creates above lag_seal={lag_seal} tip_max={tip_max}"
-        );
-        q.sh_run.enqueue(&tail);
-        assert!(
-            q.sh_run.memtable_len() > 0,
-            "tail must sit in memtable before drain"
-        );
-
-        // Order under test: stop + drain first → SEAL covers enqueued tail.
-        q.sh_run.stop_and_drain_spills().unwrap();
-        assert_eq!(q.sh_run.memtable_len(), 0, "drain must empty memtable");
-        let seal_after_drain = q.sh_run.sealed_max_create_fk();
-        assert!(
-            seal_after_drain >= tip_max,
-            "drain must advance SEAL over memtable tail: seal={seal_after_drain} tip_max={tip_max} lag_was={lag_seal}"
-        );
-
-        // Recollect must early-out (sealed0 >= tip_max) — no Class A gap work.
-        let runs_before = sh_catalog_total_records(&dir.join("scripthash.runs"));
-        q.rebuild_sh_unsealed_from_class_a().unwrap();
-        let runs_after = sh_catalog_total_records(&dir.join("scripthash.runs"));
-        assert_eq!(
-            runs_after, runs_before,
-            "recollect must not add runs when drain already covered tip"
-        );
-        assert_eq!(q.sh_run.sealed_max_create_fk(), seal_after_drain);
-
-        // Full tip finalize still settles a durable head.
-        let n_mat = q.finalize_sh_runs().unwrap();
-        assert!(
-            n_mat > 0 || q.store.scripthash.has_durable_index(),
-            "finalize after drain-first path must materialize SH"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1091,11 +1010,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(&dir).unwrap();
         q.enter_direct_index_mode().unwrap();
-        q.sh_run.ensure_enabled();
 
         let mut sh0 = [0u8; 32];
         sh0[0] = 0x44;
-        q.sh_run.enqueue(&[ScriptHashRecord::from_fk(sh0, Fk(3))]);
+        let mut recs = vec![ScriptHashRecord::from_fk(sh0, Fk(3))];
+        q.sh_run.spill_creates_catalog(&mut recs).unwrap();
         let n0 = q.sh_run.finalize_and_bulk_materialize(&q.store).unwrap();
         assert!(n0 >= 1);
         assert!(q.store.scripthash.has_durable_index());
@@ -1187,12 +1106,7 @@ mod tests {
         let tip_max = q.store.txs.count();
         assert!(tip_max >= 6);
 
-        // Ship path: prepare_force disables worker then must re-enable for recollect.
         q.sh_run.prepare_force_full_rebuild(&q.store).unwrap();
-        assert!(
-            q.sh_run.is_enabled(),
-            "FORCE prep must re-enable SH builder for Class A recollect"
-        );
         assert!(!q.store.scripthash.has_durable_index());
         assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
 
@@ -1241,7 +1155,6 @@ mod tests {
 
         // Plant SEAL mid (as after a partial spill), then cancel on entry.
         q.sh_run.reset_catalog_for_full_recollect().unwrap();
-        q.sh_run.ensure_enabled();
         q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
         let cancel = AtomicBool::new(true);
         let err = q
@@ -1314,43 +1227,6 @@ mod tests {
             "Direct enter must not Class A recollect (tip_max={tip_max})"
         );
         assert_eq!(q.scripthash_run_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Recollect pause/restore of `ibd_catalog_compact` still holds (finalize path).
-    #[test]
-    fn recollect_restores_ibd_catalog_compact() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-q-sh-compact-restore-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        seed_direct_chain(&q, 6);
-        q.sh_run.ensure_enabled();
-        assert!(
-            q.sh_run.ibd_catalog_compact(),
-            "enable must allow IBD crumb compact"
-        );
-        let tip_max = q.store.txs.count();
-        let mid = (tip_max / 2).max(1);
-        q.sh_run.set_sealed_max_for_recollect(mid).unwrap();
-        q.rebuild_sh_unsealed_from_class_a().unwrap();
-        assert!(
-            q.sh_run.ibd_catalog_compact(),
-            "rebuild_sh must restore prior compact flag"
-        );
-
-        q.sh_run
-            .set_sealed_max_for_recollect(q.store.txs.count())
-            .unwrap();
-        q.rebuild_sh_unsealed_from_class_a().unwrap();
-        assert!(
-            q.sh_run.ibd_catalog_compact(),
-            "no-op rebuild_sh must restore prior compact flag"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

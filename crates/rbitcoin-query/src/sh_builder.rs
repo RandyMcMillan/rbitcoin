@@ -1,35 +1,19 @@
-//! Direct-IBD scripthash builder: sorted runs + SEAL + tip materialize.
+//! Post-IBD scripthash collect: Class A recollect → catalog runs → FullCold / ColdResume.
 //!
-//! # Lifecycle (single pipeline)
+//! Direct confirm does **not** enqueue SH. A durable head never enters this
+//! path (write-behind / `recover_sh_writebehind` instead).
 //!
-//! 1. **Ingest**
-//!    - Confirm (Direct): `enqueue` → memtable → worker L0 → promote large catalog runs
-//!    - Class A recollect: parallel fk chunks → **direct** catalog spill (~128 MiB)
-//! 2. **Watermark:** `SEAL` = contiguous create_fk floor for resume (`create_fk > SEAL`).
-//!    Parallel recollect only advances SEAL over a completed chunk prefix.
-//! 3. **Tip:** [`plan_sh_pre_materialize`] → **stop worker + drain memtable/L0**
-//!    (advance SEAL) → Class A recollect only for remaining gap → claim runs →
-//!    `WarmOnly` | `ColdResume` | `FullCold` (never wipe a durable head for residuals).
-//!    Drain-before-recollect avoids re-spilling the Direct tip tail still in
-//!    memtable/L0 while SEAL lags (mainnet: multi-million create_fk recollect at
-//!    IBD exit while L0 held the same range).
-//!
-//! # Write amp
-//!
-//! Catalog compact only rewrites **crumbs** under [`catalog_compact_floor_bytes`].
-//! Intentional ~128 MiB recollect spills go straight to tip direct k-way.
+//! 1. Parallel fk chunks spill ~128 MiB catalog runs (`spill_creates_catalog`).
+//! 2. `SEAL` is the contiguous create_fk resume floor (`create_fk > SEAL`).
+//! 3. Tip finalize claims runs → `ColdResume` | `FullCold`.
 
-use super::run_builder_core::{
-    clear_runs_dir, finalize_wait_join, memtable_cap, on_disk_run_count, runs_dir_io, spawn_worker,
-    RunControl, RunMemtable, AFTER_WORK, FAMILY_SH, IDLE_POLL,
-};
-use rbitcoin_log::{debug, info, warn};
+use super::run_builder_core::{clear_runs_dir, on_disk_run_count, runs_dir_io, RunControl};
+use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, commit_run_to_catalog,
     for_each_merged_rec_opts, list_fanin_reduce_outputs, list_materialize_claims, list_runs,
-    load_fanin_checkpoint, materialize_sh_shards, merge_runs_with_policy, next_run_path,
-    reduce_runs_to_fanin_cancellable, set_thread_idle_io_priority,
+    load_fanin_checkpoint, materialize_sh_shards, next_run_path, reduce_runs_to_fanin_cancellable,
     write_sorted_run_file_with_policy, ColdProgress, RunWritePolicy, ScriptHashRecord,
     SortedRunPath, Store, StoreError, FANIN_TARGET_STREAM_RUNS, SH_RUN_SORT_KEY_LEN,
 };
@@ -257,24 +241,12 @@ pub fn sh_catalog_total_records(runs_dir: &Path) -> u64 {
 }
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
 pub const SH_RUN_REC_LEN: u32 = 40;
 pub const SH_RUN_KEY_LEN: u32 = SH_RUN_SORT_KEY_LEN;
-
-const DEFAULT_MEMTABLE_CAP: usize = 1_000_000;
-#[cfg(test)]
-const HARD_MEMTABLE_MUL: usize = 2;
-/// Coalesce L0 spills until a cataloged run is about this large.
-const DEFAULT_TARGET_RUN_BYTES: u64 = 512 * 1024 * 1024;
-/// Max open runs in any k-way pass (L0 coalesce).
-const DEFAULT_MERGE_FANIN: usize = 64;
-/// Promote L0→catalog only when merged body ≥ this fraction of target (except finalize).
-const PROMOTE_FRAC_NUM: u64 = 3;
-const PROMOTE_FRAC_DEN: u64 = 4;
 
 fn max_direct_merge() -> usize {
     std::env::var("RBITCOIN_SH_MAX_DIRECT_MERGE")
@@ -284,32 +256,9 @@ fn max_direct_merge() -> usize {
         .clamp(32, 8192)
 }
 
-fn promote_min_bytes(target: u64) -> u64 {
-    target
-        .saturating_mul(PROMOTE_FRAC_NUM)
-        .div_ceil(PROMOTE_FRAC_DEN)
-        .max(u64::from(SH_RUN_REC_LEN) * 1024)
-}
-
 #[inline]
 fn run_body_bytes(run: &SortedRunPath) -> u64 {
     run.count.saturating_mul(u64::from(run.rec_len))
-}
-
-fn target_run_bytes() -> u64 {
-    std::env::var("RBITCOIN_SH_TARGET_RUN_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_TARGET_RUN_BYTES)
-        .max(u64::from(SH_RUN_REC_LEN) * 1024)
-}
-
-fn merge_fanin() -> usize {
-    std::env::var("RBITCOIN_SH_MERGE_FANIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MERGE_FANIN)
-        .clamp(8, 128)
 }
 
 fn encode_rec(sh: &[u8; 32], tx_fk: Fk) -> [u8; SH_RUN_REC_LEN as usize] {
@@ -380,17 +329,6 @@ pub fn store_seal(runs_dir: &Path, max_fk: u64) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn bump_seal(runs_dir: &Path, max_fk: u64) -> Result<(), StoreError> {
-    if max_fk == 0 {
-        return Ok(());
-    }
-    let cur = load_seal(runs_dir);
-    if max_fk > cur {
-        store_seal(runs_dir, max_fk)?;
-    }
-    Ok(())
-}
-
 fn max_fk_in_body(body: &[u8]) -> u64 {
     let rec = SH_RUN_REC_LEN as usize;
     let mut max = 0u64;
@@ -406,64 +344,15 @@ fn max_fk_in_body(body: &[u8]) -> u64 {
 }
 
 struct Inner {
-    pending: Vec<([u8; 32], Fk)>,
     ctrl: RunControl,
-    /// Uncataloged L0 spill paths awaiting coalesce (under runs_dir/l0/).
-    l0: Vec<SortedRunPath>,
-    l0_bytes: u64,
 }
 
-impl RunMemtable for Inner {
-    fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-    fn control(&self) -> &RunControl {
-        &self.ctrl
-    }
-    fn control_mut(&mut self) -> &mut RunControl {
-        &mut self.ctrl
-    }
-    fn flush_pending(&mut self) -> Result<u64, StoreError> {
-        if self.pending.is_empty() {
-            return Ok(0);
-        }
-        let mut recs = std::mem::take(&mut self.pending);
-        let body = encode_sh_run_body_sorted_unique(&mut recs);
-        let l0_dir = self.ctrl.runs_dir.join("l0");
-        std::fs::create_dir_all(&l0_dir).map_err(|e| StoreError::io(&l0_dir, e))?;
-        let path = next_run_path(&l0_dir, self.ctrl.next_seq);
-        self.ctrl.next_seq += 1;
-        let _io = self.ctrl.runs_io.lock().unwrap();
-        // L0 is not SEAL-durable (resume recollects create_fk > SEAL). Skip fsync
-        // and DONTNEED so we do not thrash disk/cache before coalesce re-reads.
-        let run = write_sorted_run_file_with_policy(
-            &path,
-            SH_RUN_KEY_LEN,
-            SH_RUN_REC_LEN,
-            &body,
-            RunWritePolicy::L0,
-        )?;
-        self.l0_bytes = self.l0_bytes.saturating_add(run_body_bytes(&run));
-        self.l0.push(run);
-        Ok(recs.len() as u64)
-    }
-}
-
-/// Shared Direct-IBD SH builder + low-prio worker.
+/// Post-IBD SH catalog builder (Class A recollect spills; no memtable worker).
 pub struct ShRunBuilder {
     inner: Arc<Mutex<Inner>>,
-    cv: Arc<Condvar>,
     enabled: AtomicBool,
-    join: Mutex<Option<JoinHandle<()>>>,
-    #[cfg(test)]
-    pub enqueued: AtomicU64,
-    /// Process cache of SEAL (shared with worker).
     sealed_fk: Arc<AtomicU64>,
     runs_dir: PathBuf,
-    /// When true, the single IBD SH worker may crumb-compact the catalog.
-    /// Cleared for tip finalize and parallel Class A recollect (no multi-thread
-    /// rewrite against live catalog writers).
-    ibd_catalog_compact: Arc<AtomicBool>,
 }
 
 impl ShRunBuilder {
@@ -472,20 +361,10 @@ impl ShRunBuilder {
         let runs_dir = ctrl.runs_dir.clone();
         let sealed = load_seal(&runs_dir);
         Self {
-            inner: Arc::new(Mutex::new(Inner {
-                pending: Vec::new(),
-                ctrl,
-                l0: Vec::new(),
-                l0_bytes: 0,
-            })),
-            cv: Arc::new(Condvar::new()),
+            inner: Arc::new(Mutex::new(Inner { ctrl })),
             enabled: AtomicBool::new(false),
-            join: Mutex::new(None),
-            #[cfg(test)]
-            enqueued: AtomicU64::new(0),
             sealed_fk: Arc::new(AtomicU64::new(sealed)),
             runs_dir,
-            ibd_catalog_compact: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -498,114 +377,11 @@ impl ShRunBuilder {
         self.sealed_fk.load(Ordering::Acquire)
     }
 
-    /// Allow single-thread catalog crumb compact on the IBD worker only.
-    pub fn set_ibd_catalog_compact(&self, on: bool) {
-        self.ibd_catalog_compact.store(on, Ordering::Release);
-    }
-
-    /// Whether the IBD SH worker may crumb-compact the catalog.
-    pub fn ibd_catalog_compact(&self) -> bool {
-        self.ibd_catalog_compact.load(Ordering::Acquire)
-    }
-
-    /// Pause IBD crumb compact for parallel catalog writers; restore previous on drop.
-    ///
-    /// Parallel Class A recollect must not race the single-thread compact path.
-    /// Mid-IBD enter_direct recollect must **restore** compact=true so confirm
-    /// coalesces keep cleaning crumbs for the rest of Direct IBD.
-    pub fn pause_ibd_catalog_compact(&self) -> IbdCatalogCompactGuard<'_> {
-        let prev = self.ibd_catalog_compact();
-        self.set_ibd_catalog_compact(false);
-        IbdCatalogCompactGuard {
-            builder: self,
-            prev,
-        }
-    }
-
-    pub fn enable(&self) {
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.ctrl.reset_for_enable();
-        }
-        let sealed = load_seal(&self.runs_dir);
-        self.sealed_fk.store(sealed, Ordering::Release);
-        self.ibd_catalog_compact.store(true, Ordering::Release);
-        let inner_w = Arc::clone(&self.inner);
-        let cv_w = Arc::clone(&self.cv);
-        let runs_dir = self.runs_dir.clone();
-        let sealed_w = Arc::clone(&self.sealed_fk);
-        let compact_w = Arc::clone(&self.ibd_catalog_compact);
-
-        spawn_worker(
-            "ibd-sh-index",
-            || {
-                info!(
-                    "ibd: scripthash catch-up mode ON (memtable→target-sized runs+SEAL; bulk materialize at tip)"
-                );
-            },
-            &self.enabled,
-            &self.join,
-            move || {
-                debug!("ibd: SH run worker started (idle IO prio, spill+coalesce)");
-                sh_worker_loop(
-                    memtable_cap("RBITCOIN_SH_MEMTABLE_CAP", DEFAULT_MEMTABLE_CAP),
-                    inner_w,
-                    cv_w,
-                    runs_dir,
-                    sealed_w,
-                    compact_w,
-                );
-                debug!("ibd: SH run worker stopped");
-            },
-        );
-    }
-
     pub fn on_disk_run_count(&self) -> usize {
         let g = self.inner.lock().unwrap();
         let (dir, io) = runs_dir_io(&g.ctrl);
         drop(g);
         on_disk_run_count(&dir, &io)
-    }
-
-    pub fn memtable_len(&self) -> usize {
-        self.inner.lock().unwrap().pending.len()
-    }
-
-    #[cfg(test)]
-    pub fn enqueue(&self, creates: &[ScriptHashRecord]) {
-        if !self.is_enabled() || creates.is_empty() {
-            return;
-        }
-        let cap = memtable_cap("RBITCOIN_SH_MEMTABLE_CAP", DEFAULT_MEMTABLE_CAP);
-        let hard = cap.saturating_mul(HARD_MEMTABLE_MUL);
-        let sealed = self.sealed_max_create_fk();
-        let mut g = self.inner.lock().unwrap();
-        let mut crossed_soft = false;
-        let mut crossed_hard = false;
-        for rec in creates {
-            if rec.create_tx_fk.is_null() {
-                continue;
-            }
-            if rec.create_tx_fk.0 <= sealed {
-                continue;
-            }
-            // Never block confirm write on SH drain. Soft/hard caps only wake the
-            // idle-prio worker; if disk is busy, memtable may exceed hard until
-            // coalesce catches up (crash resume still recollects create_fk > SEAL).
-            let before = g.pending.len();
-            g.pending.push((rec.scripthash, rec.create_tx_fk));
-            self.enqueued.fetch_add(1, Ordering::Relaxed);
-            let after = g.pending.len();
-            if before < cap && after >= cap {
-                crossed_soft = true;
-            }
-            if before < hard && after >= hard {
-                crossed_hard = true;
-            }
-        }
-        if crossed_soft || crossed_hard || g.pending.len() >= cap {
-            self.cv.notify_all();
-        }
     }
 
     /// Reload SEAL from disk into process cache (after worker coalesce / resume).
@@ -614,13 +390,7 @@ impl ShRunBuilder {
         self.sealed_fk.store(s, Ordering::Release);
     }
 
-    /// Stop worker + clear RAM memtable/L0 (shared by FORCE prep paths).
     fn stop_and_clear_memtable(&self) -> Result<(), StoreError> {
-        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        let mut g = self.inner.lock().unwrap();
-        g.pending.clear();
-        g.l0.clear();
-        g.l0_bytes = 0;
         Ok(())
     }
 
@@ -646,16 +416,7 @@ impl ShRunBuilder {
         let _ = std::fs::remove_file(&hwm_path);
     }
 
-    /// Re-enable builder after finalize_wait_join.
-    ///
-    /// Leaving `enabled` false made Class A recollect a silent no-op and tip
-    /// finished FullCold with creates≈0 on a zeroed head.
-    ///
-    /// Does **not** force compact off — [`Self::pause_ibd_catalog_compact`] /
-    /// recollect restores prior compact state so mid-IBD Direct stays crumb-clean.
-    fn rearm_for_recollect(&self) {
-        self.ensure_enabled();
-    }
+    fn rearm_for_recollect(&self) {}
 
     /// Wipe SH runs/SEAL/cold progress/include_hwm and empty durable SH tables.
     ///
@@ -682,13 +443,6 @@ impl ShRunBuilder {
         store.scripthash.reinit_empty_for_cold_materialize()?;
         self.rearm_for_recollect();
         Ok(())
-    }
-
-    /// Ensure the SH run worker is enabled (idempotent). Used before Class A recollect.
-    pub fn ensure_enabled(&self) {
-        if !self.is_enabled() {
-            self.enable();
-        }
     }
 
     /// Thread-safe: sort `creates` and append one **catalog** run (direct write).
@@ -783,12 +537,6 @@ impl ShRunBuilder {
         info!(
             "node: scripthash catalog incomplete/stale — resetting SEAL=0 and clearing runs for full Class A recollect"
         );
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.pending.clear();
-            g.l0.clear();
-            g.l0_bytes = 0;
-        }
         self.wipe_catalog_and_seal()?;
         self.rearm_for_recollect();
         Ok(())
@@ -801,48 +549,7 @@ impl ShRunBuilder {
         Ok(())
     }
 
-    /// Stop the IBD SH worker and promote memtable/L0 into the catalog (tip entry).
-    ///
-    /// Call **before** Class A recollect so SEAL reflects creates already enqueued
-    /// during Direct IBD. Otherwise recollect re-reads Class A for the same
-    /// `create_fk > SEAL` tail still in memtable/L0 and double-spills it.
     pub fn stop_and_drain_spills(&self) -> Result<(), StoreError> {
-        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        self.drain_spills()?;
-        self.refresh_seal();
-        Ok(())
-    }
-
-    /// Force flush memtable + L0 coalesce (tests / resume / tip finalize).
-    ///
-    /// Promotes all L0 (including undersized tails). **Does not** compact the
-    /// catalog — crumb compact is IBD-worker-only (see [`sh_worker_loop`]) so tip
-    /// finalize / parallel recollect never rewrite runs multi-threaded against IBD.
-    pub fn drain_spills(&self) -> Result<(), StoreError> {
-        let mut g = self.inner.lock().unwrap();
-        if !g.pending.is_empty() {
-            g.flush_pending()?;
-        }
-        let runs_dir = g.ctrl.runs_dir.clone();
-        let runs_io = Arc::clone(&g.ctrl.runs_io);
-        let mut next_seq = g.ctrl.next_seq;
-        let l0 = std::mem::take(&mut g.l0);
-        g.l0_bytes = 0;
-        drop(g);
-        let leftover = {
-            let _io = runs_io.lock().unwrap();
-            // Planted catalog runs (tests / crash recovery) may outrun next_seq.
-            next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
-            coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &self.sealed_fk, true)?
-        };
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.ctrl.next_seq = next_seq;
-            for r in leftover {
-                g.l0_bytes = g.l0_bytes.saturating_add(run_body_bytes(&r));
-                g.l0.push(r);
-            }
-        }
         self.refresh_seal();
         Ok(())
     }
@@ -863,10 +570,6 @@ impl ShRunBuilder {
         store: &Store,
         cancel: Option<&AtomicBool>,
     ) -> Result<u64, StoreError> {
-        self.set_ibd_catalog_compact(false);
-        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        self.drain_spills()?;
-
         let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
             (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
@@ -1089,7 +792,6 @@ impl ShRunBuilder {
                 n_warm,
                 t0.elapsed()
             );
-            let _ = FAMILY_SH;
             let _ = (claim_ns, reduce_ns);
             return Ok(n_warm.saturating_add(n_deferred));
         }
@@ -1220,7 +922,6 @@ impl ShRunBuilder {
             Duration::from_nanos(head_fill_ns),
             Duration::from_nanos(finish_ns),
         );
-        let _ = FAMILY_SH;
         Ok(n_total.saturating_add(n_deferred))
     }
 }
@@ -1346,112 +1047,6 @@ fn next_seq_ceiling(runs_dir: &Path) -> u64 {
         .unwrap_or(1)
 }
 
-/// Coalesce L0 spills into cataloged runs under `runs_dir` MANIFEST.
-///
-/// Promotes only when merged body ≥ [`promote_min_bytes`] unless `force_all`
-/// (finalize / tip drain). Undersized remainder is rewritten back into L0 so
-/// the catalog does not accumulate tiny alternating runs.
-fn coalesce_l0_to_catalog(
-    runs_dir: &Path,
-    mut l0: Vec<SortedRunPath>,
-    next_seq: &mut u64,
-    sealed: &AtomicU64,
-    force_all: bool,
-) -> Result<Vec<SortedRunPath>, StoreError> {
-    if l0.is_empty() {
-        return Ok(Vec::new());
-    }
-    l0.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    let fanin = merge_fanin();
-    let target = target_run_bytes();
-    let promote_min = promote_min_bytes(target);
-    let mut leftover: Vec<SortedRunPath> = Vec::new();
-    let mut i = 0;
-    while i < l0.len() {
-        let mut chunk = Vec::new();
-        let mut bytes = 0u64;
-        while i < l0.len() && chunk.len() < fanin {
-            let b = run_body_bytes(&l0[i]);
-            if !chunk.is_empty() && bytes + b > target && bytes >= promote_min {
-                break;
-            }
-            bytes += b;
-            chunk.push(l0[i].clone());
-            i += 1;
-            if bytes >= target {
-                break;
-            }
-        }
-        if chunk.is_empty() {
-            break;
-        }
-        if !force_all && chunk.len() == 1 && bytes < promote_min {
-            leftover.push(chunk[0].clone());
-            continue;
-        }
-        let promote = force_all || bytes >= promote_min;
-        if promote {
-            let out = next_run_path(runs_dir, *next_seq);
-            *next_seq += 1;
-            // IBD background: paced durable merge so confirm Class A keeps disk;
-            // max create_fk tracked while streaming (no second full-body read).
-            // Tip fan-in uses unpaced CATALOG via merge_runs_to_file — do not pace
-            // that path (tens of GiB multi-pass reduce).
-            let merged = merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
-            let max_fk = merged.max_u64_at_32;
-            let merged = merged.run;
-            debug!(
-                "ibd: SH catalog promote runs_in={} body≈{:.1}MiB path={}",
-                chunk.len(),
-                run_body_bytes(&merged) as f64 / (1024.0 * 1024.0),
-                merged.path.display()
-            );
-            if max_fk > 0 {
-                bump_seal(runs_dir, max_fk)?;
-                let cur = sealed.load(Ordering::Relaxed);
-                if max_fk > cur {
-                    sealed.store(max_fk, Ordering::Release);
-                }
-            }
-        } else {
-            let l0_dir = runs_dir.join("l0");
-            std::fs::create_dir_all(&l0_dir).map_err(|e| StoreError::io(&l0_dir, e))?;
-            let out = next_run_path(&l0_dir, *next_seq);
-            *next_seq += 1;
-            let merged = merge_runs_to_l0(&chunk, &out)?;
-            leftover.push(merged);
-            debug!(
-                "ibd: SH L0 hold undersized body≈{:.1}MiB (promote_min≈{:.1}MiB)",
-                bytes as f64 / (1024.0 * 1024.0),
-                promote_min as f64 / (1024.0 * 1024.0)
-            );
-        }
-    }
-    Ok(leftover)
-}
-
-/// Merge into an L0 path without parent catalog MANIFEST / fsync / DONTNEED.
-fn merge_runs_to_l0(inputs: &[SortedRunPath], out: &Path) -> Result<SortedRunPath, StoreError> {
-    let merged =
-        rbitcoin_store::merge_runs_to_file_with_policy(inputs, out, RunWritePolicy::L0, false)?;
-    for r in inputs {
-        let _ = std::fs::remove_file(&r.path);
-    }
-    Ok(merged.run)
-}
-
-/// Restores prior [`ShRunBuilder::ibd_catalog_compact`] when dropped.
-pub struct IbdCatalogCompactGuard<'a> {
-    builder: &'a ShRunBuilder,
-    prev: bool,
-}
-
-impl Drop for IbdCatalogCompactGuard<'_> {
-    fn drop(&mut self) {
-        self.builder.set_ibd_catalog_compact(self.prev);
-    }
-}
-
 /// Parallel Class A recollect: spill local buffer at this size (~128 MiB of 40 B recs).
 pub const RECOLLECT_THREAD_SPILL_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -1483,13 +1078,13 @@ pub fn recollect_spill_bytes() -> u64 {
 }
 
 /// Compact floor: 3/4 of the effective recollect spill so intentional spills stay.
+#[cfg(test)]
 pub fn catalog_compact_floor_bytes(spill_bytes: u64) -> u64 {
     spill_bytes.saturating_mul(3) / 4
 }
 
 /// True if a catalog run body should be eligible for undersized compact.
-///
-/// Pure policy: crumbs only — never intentional recollect-scale spills.
+#[cfg(test)]
 pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) -> bool {
     if body_bytes == 0 {
         return false;
@@ -1497,160 +1092,6 @@ pub fn catalog_run_is_compact_candidate(body_bytes: u64, target_run_bytes: u64) 
     let half = target_run_bytes / 2;
     let small_max = half.min(catalog_compact_floor_bytes(recollect_spill_bytes()));
     body_bytes < small_max
-}
-
-/// Compact catalog runs that are well under target (except at most one small tail).
-///
-/// **Call site:** only the single IBD SH worker during steady Direct coalesce
-/// (`!force_all`). Never tip `drain_spills` or parallel recollect (multi-thread
-/// writers would race IBD and reintroduce write amp).
-///
-/// Runs ≥ [`catalog_compact_floor_bytes`] of the resolved spill are left
-/// alone so recollect spills stream straight into tip k-way merge.
-fn compact_catalog_undersized(
-    runs_dir: &Path,
-    next_seq: &mut u64,
-    sealed: &AtomicU64,
-) -> Result<(), StoreError> {
-    let target = target_run_bytes();
-    let mut runs = list_runs(runs_dir)?;
-    if runs.len() < 2 {
-        return Ok(());
-    }
-    runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    let small: Vec<_> = runs
-        .iter()
-        .filter(|r| catalog_run_is_compact_candidate(run_body_bytes(r), target))
-        .cloned()
-        .collect();
-    if small.len() <= 1 {
-        return Ok(());
-    }
-    let fanin = merge_fanin();
-    let mut i = 0;
-    while i < small.len() {
-        let mut chunk = Vec::new();
-        let mut bytes = 0u64;
-        while i < small.len() && chunk.len() < fanin {
-            bytes += run_body_bytes(&small[i]);
-            chunk.push(small[i].clone());
-            i += 1;
-            if bytes >= target {
-                break;
-            }
-        }
-        if chunk.len() < 2 {
-            break;
-        }
-        let out = next_run_path(runs_dir, *next_seq);
-        *next_seq += 1;
-        let merged = merge_runs_with_policy(&chunk, &out, RunWritePolicy::IBD_BACKGROUND)?;
-        let max_fk = merged.max_u64_at_32;
-        let merged = merged.run;
-        info!(
-            "ibd: SH catalog compact inputs={} body≈{:.1}MiB",
-            chunk.len(),
-            run_body_bytes(&merged) as f64 / (1024.0 * 1024.0)
-        );
-        if max_fk > 0 {
-            bump_seal(runs_dir, max_fk)?;
-            let cur = sealed.load(Ordering::Relaxed);
-            if max_fk > cur {
-                sealed.store(max_fk, Ordering::Release);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn sh_worker_loop(
-    soft_cap: usize,
-    inner: Arc<Mutex<Inner>>,
-    cv: Arc<Condvar>,
-    runs_dir: PathBuf,
-    sealed: Arc<AtomicU64>,
-    ibd_catalog_compact: Arc<AtomicBool>,
-) {
-    set_thread_idle_io_priority();
-    let target = target_run_bytes();
-    let fanin = merge_fanin();
-    loop {
-        let mut g = inner.lock().unwrap();
-        if g.ctrl.stop {
-            break;
-        }
-        let need_flush = g.pending.len() >= soft_cap || (g.ctrl.finalize && !g.pending.is_empty());
-        // Coalesce on **bytes** toward target (or finalize). Do not promote on
-        // L0 file count alone — that created alternating large/small catalog runs.
-        let need_coalesce = g.l0_bytes >= target
-            || (g.l0.len() >= fanin && g.l0_bytes >= promote_min_bytes(target))
-            || (g.ctrl.finalize && !g.l0.is_empty());
-
-        if need_flush {
-            if !g.pending.is_empty() {
-                if let Err(e) = g.flush_pending() {
-                    warn!("ibd: SH run flush failed: {e}");
-                }
-                cv.notify_all();
-            }
-            drop(g);
-            std::thread::sleep(AFTER_WORK);
-            continue;
-        }
-
-        if need_coalesce {
-            // force_all: tip/finalize drain — promote L0 only, no catalog compact.
-            // Steady IBD: single-thread crumb compact only when flag is on.
-            let force_all = g.ctrl.finalize;
-            let allow_compact = !force_all && ibd_catalog_compact.load(Ordering::Acquire);
-            let l0 = std::mem::take(&mut g.l0);
-            g.l0_bytes = 0;
-            let runs_io = Arc::clone(&g.ctrl.runs_io);
-            let mut next_seq = g.ctrl.next_seq;
-            drop(g);
-            let leftover = {
-                let _io = runs_io.lock().unwrap();
-                next_seq = next_seq.max(next_seq_ceiling(&runs_dir));
-                match coalesce_l0_to_catalog(&runs_dir, l0, &mut next_seq, &sealed, force_all) {
-                    Ok(left) => {
-                        if allow_compact {
-                            if let Err(e) =
-                                compact_catalog_undersized(&runs_dir, &mut next_seq, &sealed)
-                            {
-                                warn!("ibd: SH catalog compact failed: {e}");
-                            }
-                        }
-                        left
-                    }
-                    Err(e) => {
-                        warn!("ibd: SH L0 coalesce failed: {e}");
-                        Vec::new()
-                    }
-                }
-            };
-            let mut g = inner.lock().unwrap();
-            g.ctrl.next_seq = next_seq;
-            for r in leftover {
-                g.l0_bytes = g.l0_bytes.saturating_add(run_body_bytes(&r));
-                g.l0.push(r);
-            }
-            drop(g);
-            std::thread::sleep(AFTER_WORK);
-            continue;
-        }
-
-        if g.ctrl.finalize && g.pending.is_empty() && g.l0.is_empty() {
-            g.ctrl.stop = true;
-            cv.notify_all();
-            break;
-        }
-
-        let (gg, _) = cv.wait_timeout(g, IDLE_POLL).unwrap();
-        g = gg;
-        if g.ctrl.stop {
-            break;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1808,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_flush_materialize() {
+    fn catalog_spill_then_materialize() {
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1818,7 +1259,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open_or_create(&dir).unwrap();
         let b = ShRunBuilder::new(&dir);
-        b.enable();
         let mut creates = Vec::new();
         for i in 0..100u32 {
             let mut sh = [0u8; 32];
@@ -1826,16 +1266,17 @@ mod tests {
             sh[1] = (i / 17) as u8;
             creates.push(ScriptHashRecord::from_fk(sh, Fk(i as u64 + 1)));
         }
-        b.enqueue(&creates);
+        let (max_fk, n_spill) = b.spill_creates_catalog(&mut creates).unwrap();
+        assert_eq!(n_spill, 100);
+        assert_eq!(max_fk, 100);
         let n = b.finalize_and_bulk_materialize(&store).unwrap();
         assert!(n >= 100, "inserted={n}");
         assert!(store.scripthash.entry_count() >= 100);
-        assert!(b.sealed_max_create_fk() >= 100);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn seal_advances_on_spill() {
+    fn spill_creates_catalog_writes_run() {
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1844,29 +1285,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let b = ShRunBuilder::new(&dir);
-        b.enable();
         let mut creates = Vec::new();
         for i in 1..=50u64 {
             let mut sh = [0u8; 32];
             sh[0] = i as u8;
             creates.push(ScriptHashRecord::from_fk(sh, Fk(i)));
         }
-        b.enqueue(&creates);
-        b.drain_spills().unwrap();
-        assert!(
-            b.sealed_max_create_fk() >= 50,
-            "seal={}",
-            b.sealed_max_create_fk()
-        );
-        // Re-enqueue same fks: filtered by seal.
-        let before = b.enqueued.load(Ordering::Relaxed);
-        b.enqueue(&creates);
-        assert_eq!(b.enqueued.load(Ordering::Relaxed), before);
-        // Parallel recollect path: direct catalog spill.
+        let (mfk, n) = b.spill_creates_catalog(&mut creates).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(mfk, 50);
         let mut more = vec![ScriptHashRecord::from_fk([0xee; 32], Fk(99))];
-        let (mfk, n) = b.spill_creates_catalog(&mut more).unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(mfk, 99);
+        let (mfk2, n2) = b.spill_creates_catalog(&mut more).unwrap();
+        assert_eq!(n2, 1);
+        assert_eq!(mfk2, 99);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2174,39 +1605,6 @@ mod tests {
     }
 
     #[test]
-    fn pause_ibd_catalog_compact_restores_prior_on_drop() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-compact-gate-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let b = ShRunBuilder::new(&dir);
-        b.enable();
-        assert!(b.ibd_catalog_compact());
-        {
-            let _g = b.pause_ibd_catalog_compact();
-            assert!(!b.ibd_catalog_compact(), "paused during guard");
-        }
-        assert!(
-            b.ibd_catalog_compact(),
-            "drop must restore prior compact=true"
-        );
-        // Prior false stays false after pause.
-        b.set_ibd_catalog_compact(false);
-        {
-            let _g = b.pause_ibd_catalog_compact();
-            assert!(!b.ibd_catalog_compact());
-        }
-        assert!(
-            !b.ibd_catalog_compact(),
-            "drop must restore prior compact=false"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn compact_candidate_spares_recollect_scale_runs() {
         // Default tip target 512MiB → half=256MiB; floor=96MiB → small_max=96MiB.
         let target = 512 * 1024 * 1024u64;
@@ -2269,60 +1667,6 @@ mod tests {
             catalog_compact_floor_bytes(256 * 1024 * 1024),
             192 * 1024 * 1024
         );
-    }
-
-    #[test]
-    fn compact_undersized_does_not_merge_large_planted_runs() {
-        // Plant three "large" catalog runs via spill path with many recs; compact
-        // must leave them (body ≥ floor). Use record counts that exceed floor.
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-compact-floor-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let b = ShRunBuilder::new(&dir);
-        b.enable();
-        // 96MiB / 40B = 2_516_583 recs — too heavy for unit test. Instead plant
-        // runs whose reported count*rec_len is large by writing real bodies at a
-        // modest size and asserting the pure candidate filter (above), then plant
-        // tiny runs and prove compact still merges crumbs.
-        let runs_dir = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs_dir).unwrap();
-        for seq in 1..=3u64 {
-            let mut body = Vec::new();
-            for i in 0..1000u64 {
-                let mut sh = [0u8; 32];
-                sh[0] = seq as u8;
-                // BE so 32-byte sh memcmp matches increasing i (LE would invert 255/256).
-                sh[1..9].copy_from_slice(&i.to_be_bytes());
-                body.extend_from_slice(&encode_rec(&sh, Fk(seq * 10_000 + i)));
-            }
-            let path = next_run_path(&runs_dir, seq);
-            write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
-        }
-        let before = list_runs(&runs_dir).unwrap().len();
-        assert_eq!(before, 3);
-        // Drive production compact helper (same fn IBD worker calls) under runs_io.
-        let mut next_seq = 4u64;
-        compact_catalog_undersized(&runs_dir, &mut next_seq, &b.sealed_fk).unwrap();
-        let after = list_runs(&runs_dir).unwrap();
-        // Crumbs should coalesce to fewer catalog files (or one).
-        assert!(
-            after.len() < before || after.len() == 1,
-            "tiny planted runs should compact: before={before} after={}",
-            after.len()
-        );
-        // Tip drain_spills must NOT compact (IBD-only policy).
-        let n_before_drain = after.len();
-        b.drain_spills().unwrap();
-        assert_eq!(
-            list_runs(&runs_dir).unwrap().len(),
-            n_before_drain,
-            "drain_spills must not compact catalog (tip/recollect path)"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2427,7 +1771,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open_or_create(&dir).unwrap();
         let b = ShRunBuilder::new(&dir);
-        b.enable();
         let runs_dir = dir.join("scripthash.runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
         // Fake high SEAL + tiny run (incomplete catalog).
@@ -2449,58 +1792,6 @@ mod tests {
         assert!(store.scripthash.head_is_empty());
         assert_eq!(store.scripthash.entry_count(), 0);
         assert_eq!(store.scripthash.include_hwm(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Confirm write must not stall when SH memtable is past the hard soft-cap.
-    ///
-    /// Regression: enqueue used to `wait_timeout(50ms)` while `pending >= 2×cap`,
-    /// coupling confirm Class C SH collect to worker drain. Now it always accepts
-    /// and only notifies the idle-prio worker.
-    ///
-    /// Do **not** hold `runs_io` here: the worker takes `inner` then `runs_io` on
-    /// flush, so an outer `runs_io` hold + enqueue would deadlock (not a
-    /// production path — confirm never holds `runs_io`).
-    #[test]
-    fn enqueue_never_blocks_past_hard_cap() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-noblock-{n}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Serialize env mutation across parallel tests in this crate.
-        static CAP_LOCK: Mutex<()> = Mutex::new(());
-        let _cap_guard = CAP_LOCK.lock().unwrap();
-        // Tiny cap so a large batch exceeds hard (2× soft). Even with a live
-        // worker, the old wait loop paid multi-×50ms once pending crossed hard;
-        // non-blocking path is pure RAM push.
-        std::env::set_var("RBITCOIN_SH_MEMTABLE_CAP", "1000");
-        let b = ShRunBuilder::new(&dir);
-        b.enable();
-        let mut batch = Vec::with_capacity(20_000);
-        for i in 1..=20_000u64 {
-            let mut sh = [0u8; 32];
-            sh[0] = (i % 251) as u8;
-            sh[1] = ((i / 251) % 251) as u8;
-            sh[2] = ((i / 63001) % 251) as u8;
-            batch.push(ScriptHashRecord::from_fk(sh, Fk(i)));
-        }
-        let t0 = Instant::now();
-        b.enqueue(&batch);
-        let elapsed = t0.elapsed();
-        assert!(
-            elapsed.as_millis() < 500,
-            "enqueue blocked confirm-like path for {elapsed:?}"
-        );
-        assert_eq!(
-            b.enqueued.load(Ordering::Relaxed),
-            20_000,
-            "all creates must be accepted"
-        );
-        let _ = b.drain_spills();
-        std::env::remove_var("RBITCOIN_SH_MEMTABLE_CAP");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

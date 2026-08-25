@@ -40,8 +40,10 @@
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
 //! `scriptq` can stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
 //! `ready=` + `scriptq_hwm=` (OS-thread occupancy + queue high-water). High
-//! `load_thr stamp=` + `ready>0` + `scriptq=1` ⇒ leftover TipOnly on load,
-//! not “scripts hungry.” High load_recv_wait + ready=0 ⇒ lookup is the pole.
+//! `load_thr stamp=` nests `pack=` (plan HashMap) vs `head=` (leftover TipOnly
+//! `prep_head_fk_ns`). After a published wave `head=` is ~0. High `head=` +
+//! `ready>0` + `scriptq=1` ⇒ leftover TipOnly on load, not “scripts hungry.”
+//! High load_recv_wait + ready=0 ⇒ lookup is the pole.
 //!
 use super::confirm::ConfirmPipelineSizes;
 use super::state::WorkStructureSizes;
@@ -1255,10 +1257,12 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let thr_script_wait = s
         .thr_script_recv_wait_ms
         .saturating_add(s.thr_script_send_wait_ms);
+    let stamp_head_ms = s.stamp_batch_head_fk_ms;
+    let stamp_pack_ms = s.thr_load_stamp_ms.saturating_sub(stamp_head_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
          lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={})) keep={}ms other={}ms send_w={}ms) \
-         load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms pin={}ms asm={}ms prune={}ms send_w={}ms) \
+         load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms(pack={}ms head={}ms) pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
@@ -1286,6 +1290,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.thr_load_pack_ms,
         s.thr_load_clone_ms,
         s.thr_load_stamp_ms,
+        stamp_pack_ms,
+        stamp_head_ms,
         s.thr_load_pin_ms,
         s.thr_load_asm_ms,
         s.thr_load_prune_ms,
@@ -2145,7 +2151,16 @@ mod tests {
         let split = format_info(&s);
         assert!(split.contains("load_thr busy/wait=2550/200ms"), "{split}");
         assert!(split.contains("pack=100ms"), "{split}");
-        assert!(split.contains("stamp=1700ms"), "{split}");
+        assert!(
+            split.contains("stamp=1700ms(pack=1700ms head=0ms)"),
+            "{split}"
+        );
+        s.stamp_batch_head_fk_ms = 200;
+        let nested = format_info(&s);
+        assert!(
+            nested.contains("stamp=1700ms(pack=1500ms head=200ms)"),
+            "{nested}"
+        );
         assert!(split.contains("pin=700ms"), "{split}");
         assert!(split.contains("prune=50ms"), "{split}");
         assert!(split.contains("script=20ms(jobs=12 skip=3)"), "{split}");

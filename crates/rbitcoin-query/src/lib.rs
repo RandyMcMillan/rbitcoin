@@ -156,7 +156,9 @@ pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
 pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
-pub use published_ids::{IdLayer, IdMap, LiveUnion, PublishedIds, TxidHasher};
+pub use published_ids::{
+    IdLayer, IdMap, LiveUnion, OutPointHasher, OutPointSet, PublishedIds, TxidHasher,
+};
 pub use recent_creates::{
     recent_creates_ewma_step, recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_CAP,
     RECENT_CREATES_HORIZON_FLOOR,

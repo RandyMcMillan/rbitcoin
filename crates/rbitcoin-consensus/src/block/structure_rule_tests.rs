@@ -173,9 +173,8 @@ fn assert_bad_block(err: ConsensusError, needle: &str) {
 fn bip30_rejects_unspent_connected_sibling() {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, FkMap, Query, U32Map, U64Map};
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, Query, U32Map, U64Map};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::collections::HashSet;
     use std::sync::Once;
 
     static ONCE: Once = Once::new();
@@ -231,7 +230,7 @@ fn bip30_rejects_unspent_connected_sibling() {
         Some(&[Fk(2)]),
         &[],
         0,
-        &mut HashSet::new(),
+        &mut OutPointSet::default(),
         &BatchParents::new(),
         &mut U32Map::default(),
         &mut U64Map::default(),
@@ -787,8 +786,7 @@ fn bip34_height_script_small_and_op_n() {
 fn assemble_full_mode_spend_and_bip68() {
     use super::{assemble_block_prevouts_mode, AssembleMode};
     use crate::accept_and_connect_block;
-    use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::HashSet;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -879,7 +877,7 @@ fn assemble_full_mode_spend_and_bip68() {
     let ctx = ctx_h(4);
     let parents = BatchParents::new();
     let thin = BatchThin::default();
-    let mut spent = HashSet::new();
+    let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let create_txids: Vec<[u8; 32]> = block
         .txdata
@@ -912,8 +910,7 @@ fn assemble_full_mode_spend_and_bip68() {
 #[test]
 fn assemble_rejects_empty_and_fk_mismatch() {
     use super::assemble_block_prevouts;
-    use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::HashSet;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -935,7 +932,7 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let empty = block_with(vec![]);
     let parents = BatchParents::new();
     let thin = BatchThin::default();
-    let mut spent = HashSet::new();
+    let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let zero = [0u8; 32];
     let err = assemble_block_prevouts(
@@ -1024,8 +1021,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     use super::assemble_block_prevouts;
     use crate::confirm_phase_stats;
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, BatchThin, Query};
-    use std::collections::HashSet;
+    use rbitcoin_query::{BatchParents, BatchThin, OutPointSet, Query};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1046,7 +1042,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     let ctx = ctx_h(1);
     let parents = BatchParents::new();
     let thin = BatchThin::default();
-    let mut spent = HashSet::new();
+    let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let b = block_with(vec![coinbase(1)]);
     let tids: Vec<[u8; 32]> = b
@@ -1517,13 +1513,12 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     {
         use super::structural_validate_spends;
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{BatchParents, FkMap, U32Map, U64Map};
-        use std::collections::HashSet;
+        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map, U64Map};
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
         let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
         let parents = BatchParents::new();
         let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
-        let mut pending = HashSet::new();
+        let mut pending = OutPointSet::default();
         let mut mtp = U32Map::default();
         let mut meta = U64Map::default();
         let err = structural_validate_spends(

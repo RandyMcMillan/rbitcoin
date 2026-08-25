@@ -2092,9 +2092,8 @@ fn structural_pinned_without_abs_is_invariant_error() {
         Witness,
     };
     use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::{BatchParents, Query};
+    use rbitcoin_query::{BatchParents, OutPointSet, Query};
     use rbitcoin_store::{OutputRecord, TxRecord};
-    use std::collections::HashSet;
     use std::sync::Once;
 
     static ONCE: Once = Once::new();
@@ -2169,7 +2168,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
 
     let spends = vec![([7u8; 32], 0u32, Fk(100), parent_fk)];
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
-    let mut pending = HashSet::new();
+    let mut pending = OutPointSet::default();
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
     let mut meta_by_abs = rbitcoin_query::U64Map::default();
     let err = structural_validate_spends(

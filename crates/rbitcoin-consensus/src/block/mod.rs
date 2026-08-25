@@ -545,7 +545,7 @@ pub fn validate_block_connect(
     }
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    let mut pending = std::collections::HashSet::new();
+    let mut pending = rbitcoin_query::OutPointSet::default();
     let mut pending_creates = PendingCreates::default();
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::default();
@@ -581,7 +581,7 @@ pub fn validate_block_connect(
         verify_scripts_pool(&script_jobs)?;
     }
     // Empty BatchParents → missing abs → Err (cold forbidden).
-    let mut structural_pending = std::collections::HashSet::new();
+    let mut structural_pending = rbitcoin_query::OutPointSet::default();
     let mut mtp_cache = U32Map::default();
     let mut meta_by_abs = U64Map::default();
     let _ = structural_validate_spends(
@@ -985,7 +985,7 @@ pub(crate) fn assemble_block_prevouts(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_spent: &mut rbitcoin_query::OutPointSet,
     pending_creates: &mut PendingCreates,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
@@ -1032,7 +1032,7 @@ fn assemble_block_prevouts_mode(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_spent: &mut rbitcoin_query::OutPointSet,
     pending_creates: &mut PendingCreates,
     mode: AssembleMode,
     batch_parents: &rbitcoin_query::BatchParents,
@@ -1411,7 +1411,7 @@ pub(crate) fn structural_validate_spends(
         rbitcoin_primitives::Fk,
     )],
     fees: i64,
-    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_spent: &mut rbitcoin_query::OutPointSet,
     batch_parents: &rbitcoin_query::BatchParents,
     mtp_cache: &mut U32Map<u32>,
     meta_by_abs: &mut U64Map<(rbitcoin_primitives::Fk, u8)>,

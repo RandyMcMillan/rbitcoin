@@ -43,8 +43,8 @@ before 1.0).
   durable index only after tip announce (`release_sh_writebehind`). Wallet SH
   reads join that RAM head at live tip so mempool can drop confirmed txs
   without a hole. Reorg reaccepts into the mempool overlay before dropping
-  pending. Headers subscribe stays live tip. `tip: accept` now `sh_lag=`;
-  worker logs `sh: apply h= wall= lag=`.
+  pending. Headers subscribe stays live tip. `tip: accept` now `sh_lag=`
+  and `tweaks=`; worker logs `sh: apply h= wall= lag=`.
 
 - **SH workers follow free RAM:** recollect and k-way materialize default to
   at most **one worker per 1.5 GiB** host free RAM (Linux `MemAvailable`,
@@ -54,6 +54,13 @@ before 1.0).
   include `free_GiB=`.
 
 ### Fixed
+
+- **Tip `--sptweaks` write-through:** after backfill completes, every tip
+  block indexed tweaks on the confirm wall. A pin miss on a *non-P2TR* tx
+  failed the whole height into `tweaks_for_height` (Class A + secp). Ineligible
+  txs now skip the prevout walk; spend lookup is a map. `tip: accept` shows
+  `tweaks=`. Regression:
+  `ineligible_external_spend_does_not_fail_the_height`.
 
 - **Held io_uring leftover CQE vs BDZ g-pages:** lookup TipOnly resolve shares one TLS ring across OA probe, idx, sealed MPHF `g` pages, and rel preads. A swallowed `drain_all` left `KIND_BULK_PREAD` in `pending`; the next `stream_g_pages` harvested it as `bdz g page bad slot` and could park on unbounded `submit_and_wait`. `begin_batch` now drains leftover SQEs first; machines match `(kind, epoch, slot)`; undrained/unexpected/wait-timeout poison the session and drop the TLS ring. Caps `submit_and_wait_one` at 5 s.
 

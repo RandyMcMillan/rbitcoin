@@ -1135,7 +1135,7 @@ fn pin_and_ensure_journey() {
         )
         .unwrap()[0];
     let range = q.store().tx_body_range(pfk).unwrap();
-    let (spent_off, _spent_len) = q.store().tx_spent_range(pfk).unwrap();
+    let (spent_off, spent_len) = q.store().tx_spent_range(pfk).unwrap();
     let parent_id = pfk.get().unwrap();
 
     let spend_ins = vec![InputRecord {
@@ -1226,13 +1226,23 @@ fn pin_and_ensure_journey() {
     plan3.planned_fks = vec![Fk(2)];
     plan3.external_parent_ranges.insert(parent_id, range);
     plan3
+        .external_parent_spent_ranges
+        .insert(parent_id, (spent_off, spent_len));
+    plan3
         .external_parent_txids
         .insert(parent_id, parent_tx.txid);
     let stamp3 = ParentPinStamp::take_from_plan(&mut plan3);
     let (mut parents3, _, _) =
         pin_for_wire_batch(&q, Some(&plan3), &stamp3, &[], &[], None, None).unwrap();
-    assert!(!parents3.has_abs_layout(pfk));
-    ensure_spend_abs_layouts(&q, &mut parents3, &prepared).expect("ensure pin-hit");
+    assert!(
+        parents3.has_abs_layout(pfk),
+        "load pin copies lookup-stamped spent.idx range (no write idx)"
+    );
+    assert_eq!(
+        parents3.get_spender_abs(pfk, 0),
+        Some(rbitcoin_store::spent_abs(spent_off, 0))
+    );
+    ensure_spend_abs_layouts(&q, &mut parents3, &prepared).expect("ensure already-abs skip");
     assert!(parents3.has_abs_layout(pfk));
 
     let mut plan4 = ArchiveWritePlan::empty();
@@ -1423,8 +1433,10 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         spends: vec![],
         batch_creates: vec![],
         external_parent_ranges: Default::default(),
+        external_parent_spent_ranges: Default::default(),
         external_parent_txids: Default::default(),
         external_parent_pins: Default::default(),
+        external_parent_vouts: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -1477,8 +1489,10 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         spends: vec![],
         batch_creates: vec![],
         external_parent_ranges: ranges,
+        external_parent_spent_ranges: Default::default(),
         external_parent_txids: txids,
         external_parent_pins: Default::default(),
+        external_parent_vouts: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -1570,12 +1584,14 @@ fn pin_sparse_need_high_vout_only() {
             m.insert(parent_id, range);
             m
         },
+        external_parent_spent_ranges: Default::default(),
         external_parent_txids: {
             let mut m = rbitcoin_query::U64Map::default();
             m.insert(parent_id, parent_tx.txid);
             m
         },
         external_parent_pins: Default::default(),
+        external_parent_vouts: Default::default(),
         batch_pin: vec![Arc::clone(&spend_pin)],
         index_tx: false,
         body_est: 0,

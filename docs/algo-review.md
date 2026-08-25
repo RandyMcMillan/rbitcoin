@@ -442,7 +442,6 @@ Do not flatten io_uring machines. Do not add a process pin FIFO.
 17. **Seqlock:** fences, or stop rolling your own for a 16-byte pair.
 18. **CLI parsers:** table-driven `take_parsed` (node + bench).
 19. **Bench hex:** use `rbitcoin_primitives::hex_*`.
-20. **`has_abs_layout` / `has_spender_rels`:** identical — keep one name.
 21. **Bit count:** `u8::count_ones`.
 22. **SH `put_sorted_creates` `seen`:** `put_chain` already sorts+dedups.
 
@@ -548,3 +547,5 @@ leaving a stale High row in §2–6.
 - **P1 / N-H2** — `TxGraph` `HashMap<Wtxid, Txid>`; hub inv lookup is O(1). [#244](https://github.com/reardencode/rbitcoin/pull/244).
 - **P2 / N-H3** — `ChainHub` RAM prefix `work through h` (extend/truncate to tip; ~32 B × height). RPC `chainwork` uses `work_through_height`. [#244](https://github.com/reardencode/rbitcoin/pull/244). Durable `nChainWork` column not done.
 - **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).
+- **§6.20** — `has_spender_rels` deleted; `has_abs_layout` is the spent_range predicate. [#246](https://github.com/reardencode/rbitcoin/pull/246).
+- Lookup now stamps `spent.idx` ranges (stage table already required it); load copies onto pins; write ensure is holes-only. Not in the 2026-08-25 Open tables. [#246](https://github.com/reardencode/rbitcoin/pull/246).

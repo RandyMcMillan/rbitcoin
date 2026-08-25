@@ -26,6 +26,8 @@ pub struct DenserelsWarmStats {
 pub struct ParentPinStamp {
     /// create_fk_id → Class A body range.
     pub ranges: U64Map<(u64, u64)>,
+    /// create_fk_id → spent.body range (`spent.idx`; archived parents).
+    pub spent_ranges: U64Map<(u64, u64)>,
     /// create_fk_id → create txid (wire / sidefile at lookup).
     pub txids: U64Map<[u8; 32]>,
     /// prev_txid → create_fk_id (plan=None thin edges without head on load).
@@ -33,6 +35,8 @@ pub struct ParentPinStamp {
         HashMap<[u8; 32], u64, std::hash::BuildHasherDefault<rbitcoin_query::TxidHasher>>,
     /// RecentCreates outs stamped at lookup (pin-time; not a second ring walk).
     pub pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
+    /// create_fk_id → spent need-vouts (packed at lookup; load pin reuses).
+    pub parent_vouts: U64Map<Vec<u32>>,
 }
 
 impl ParentPinStamp {
@@ -40,15 +44,19 @@ impl ParentPinStamp {
     pub(crate) fn take_from_plan(plan: &mut rbitcoin_query::ArchiveWritePlan) -> Self {
         Self::from_maps(
             std::mem::take(&mut plan.external_parent_ranges),
+            std::mem::take(&mut plan.external_parent_spent_ranges),
             std::mem::take(&mut plan.external_parent_txids),
             std::mem::take(&mut plan.external_parent_pins),
+            std::mem::take(&mut plan.external_parent_vouts),
         )
     }
 
     fn from_maps(
         ranges: rbitcoin_query::U64Map<(u64, u64)>,
+        spent_ranges: rbitcoin_query::U64Map<(u64, u64)>,
         txids: rbitcoin_query::U64Map<[u8; 32]>,
         pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
+        parent_vouts: U64Map<Vec<u32>>,
     ) -> Self {
         let mut create_by_txid = HashMap::with_capacity_and_hasher(txids.len(), Default::default());
         for (id, tid) in &txids {
@@ -56,9 +64,11 @@ impl ParentPinStamp {
         }
         Self {
             ranges,
+            spent_ranges,
             txids,
             create_by_txid,
             pins,
+            parent_vouts,
         }
     }
 
@@ -180,12 +190,14 @@ pub(super) fn stamp_parent_pin_archived(
     .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
         ranges: ext.ranges,
+        spent_ranges: ext.spent_ranges,
         txids: ext.txids,
         create_by_txid: HashMap::with_capacity_and_hasher(
             ext.resolved.len().saturating_add(same_batch.len()),
             Default::default(),
         ),
         pins: ext.pins,
+        parent_vouts: U64Map::default(),
     };
     for (tid, fk) in ext.resolved {
         if let Some(id) = fk.get() {
@@ -197,8 +209,14 @@ pub(super) fn stamp_parent_pin_archived(
         stamp.txids.insert(id, tid);
     }
     // plan=None same-batch creates have no CreatePin offline — idx body_range.
-    rbitcoin_query::fill_missing_parent_ranges(query.store(), ifo, &mut stamp.ranges, &stamp.txids)
-        .map_err(ConsensusError::from)?;
+    rbitcoin_query::fill_missing_parent_ranges(
+        query.store(),
+        ifo,
+        &mut stamp.ranges,
+        &mut stamp.spent_ranges,
+        &stamp.txids,
+    )
+    .map_err(ConsensusError::from)?;
     // Identities are stamped from wire prev_txid at insert time — never soft-fill
     // from txid.body here (that would be a dual path after lookup promised identity).
     for (&id, tid) in &stamp.txids {

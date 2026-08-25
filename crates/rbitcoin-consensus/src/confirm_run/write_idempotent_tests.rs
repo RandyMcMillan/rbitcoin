@@ -1424,6 +1424,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         batch_creates: vec![],
         external_parent_ranges: Default::default(),
         external_parent_txids: Default::default(),
+        external_parent_pins: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -1477,6 +1478,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         batch_creates: vec![],
         external_parent_ranges: ranges,
         external_parent_txids: txids,
+        external_parent_pins: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -1573,6 +1575,7 @@ fn pin_sparse_need_high_vout_only() {
             m.insert(parent_id, parent_tx.txid);
             m
         },
+        external_parent_pins: Default::default(),
         batch_pin: vec![Arc::clone(&spend_pin)],
         index_tx: false,
         body_est: 0,
@@ -1778,11 +1781,17 @@ fn pin_recent_outs_is_cache_not_new() {
     plan.planned_fks = vec![Fk(100)];
     plan.external_parent_ranges.insert(7, (99, 1));
     plan.external_parent_txids.insert(7, tid);
+    plan.external_parent_pins.insert(7, Arc::clone(&pin));
 
     let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    assert!(
+        Arc::ptr_eq(parent_pin.pins.get(&7).expect("stamp pin"), &pin),
+        "pin must use stamp-carried CreatePin"
+    );
+    q.recent_creates().drop_from(0);
     let (_parents, _thin, warm) =
         pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
-            .expect("recent outs must cover without range-fill");
+            .expect("stamp-carried outs must cover without a live RecentCreates ring");
     assert_eq!(warm.parents, 1);
     assert_eq!(
         warm.already, 1,

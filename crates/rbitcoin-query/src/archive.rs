@@ -63,6 +63,8 @@ pub struct ArchiveWritePlan {
     /// Prep pin fills schema-13 zero body `TxRecord.txid` from this map — **never**
     /// re-pread `txid.body` on the pin path.
     pub external_parent_txids: crate::U64Map<[u8; 32]>,
+    /// RecentCreates CreatePin Arcs stamped for external parents (pin-time only).
+    pub external_parent_pins: crate::U64Map<crate::CreatePin>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
     /// only). Confirm `note_lookup_ok` only `Arc::clone`s into in-flight outs.
@@ -81,6 +83,7 @@ impl ArchiveWritePlan {
             batch_creates: Vec::new(),
             external_parent_ranges: crate::U64Map::default(),
             external_parent_txids: crate::U64Map::default(),
+            external_parent_pins: crate::U64Map::default(),
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
@@ -106,6 +109,8 @@ impl ArchiveWritePlan {
         self.external_parent_ranges.shrink_to_fit();
         self.external_parent_txids.clear();
         self.external_parent_txids.shrink_to_fit();
+        self.external_parent_pins.clear();
+        self.external_parent_pins.shrink_to_fit();
     }
 
     /// Freeze plan for write batch: drop all pin-staging maps.
@@ -203,8 +208,10 @@ impl ArchiveWritePlan {
         }
         other.external_parent_ranges.clear();
         other.external_parent_txids.clear();
+        other.external_parent_pins.clear();
         self.external_parent_ranges.clear();
         self.external_parent_txids.clear();
+        self.external_parent_pins.clear();
 
         self.packed.append(&mut other.packed);
         self.planned_fks.append(&mut other.planned_fks);
@@ -436,6 +443,7 @@ impl Query {
         let resolved = ext.resolved;
         let mut external_parent_ranges = ext.ranges;
         let mut external_parent_txids = ext.txids;
+        let external_parent_pins = ext.pins;
         crate::archive_phase_stats::note_resolve_counts(
             n_headers,
             need_vec.len() as u64,
@@ -557,6 +565,7 @@ impl Query {
             batch_creates,
             external_parent_ranges,
             external_parent_txids,
+            external_parent_pins,
             batch_pin,
             index_tx,
             body_est,
@@ -1629,6 +1638,10 @@ mod tests {
             assert_eq!(helper.ranges.get(&91), Some(&(5000, 16)));
             assert_eq!(helper.recent_n, 1);
             assert_eq!(helper.head_need_n, 0, "recent hit must skip leftover");
+            assert!(
+                helper.pins.get(&91).is_none(),
+                "identity-only recent note must not carry a CreatePin"
+            );
 
             let child = child_spend(parent_txid, 0x92);
             let mut need = vec![(Fk(1), vec![child])];
@@ -1643,6 +1656,44 @@ mod tests {
         });
         q.recent_creates().drop_from(10);
         assert!(q.recent_creates().get(&parent_txid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_recent_hit_carries_create_pin() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("recent-creates-pin");
+        let parent_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0x93;
+            t
+        };
+        let pin: crate::CreatePin = Arc::new((
+            rbitcoin_store::TxRecord {
+                txid: parent_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
+        ));
+        q.recent_creates().note_pins(
+            10,
+            [(parent_txid, Fk(93), (5000, 16), Some(Arc::clone(&pin)))],
+        );
+        let helper = crate::stamp_external_parents(
+            q.store(),
+            &[parent_txid],
+            &crate::InFlightView::empty(),
+            q.published_ids().as_ref(),
+            q.recent_creates().as_ref(),
+        )
+        .expect("recent stamp");
+        let got = helper.pins.get(&93).expect("stamp must carry CreatePin");
+        assert!(Arc::ptr_eq(got, &pin));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

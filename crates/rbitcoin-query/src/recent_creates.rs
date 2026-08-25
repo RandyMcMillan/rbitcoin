@@ -217,6 +217,7 @@ impl RecentCreates {
         }
     }
 
+    #[cfg(test)]
     fn head_hits_arc(&self) -> Option<Arc<LiveMap>> {
         self.head.load_full().map(|h| Arc::clone(&h.hits))
     }

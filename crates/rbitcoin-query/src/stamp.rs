@@ -4,7 +4,7 @@
 //! rehydrate. Pipeline parent store is outs only — not a create_fk source.
 
 use crate::published_ids::TxidHasher;
-use crate::{InFlightView, PublishedIds, QueryError, RecentCreates, U64Map, U64Set};
+use crate::{CreatePin, InFlightView, PublishedIds, QueryError, RecentCreates, U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::Store;
 use std::collections::HashMap;
@@ -22,6 +22,8 @@ pub struct ExternalParentStamp {
     pub ranges: U64Map<(u64, u64)>,
     /// create_fk_id → prev_txid
     pub txids: U64Map<[u8; 32]>,
+    /// create_fk_id → CreatePin when RecentCreates noted outs
+    pub pins: U64Map<CreatePin>,
     pub inflight_ns: u64,
     pub pin_txid_n: u64,
     pub pin_txid_ns: u64,
@@ -93,6 +95,9 @@ pub fn stamp_external_parents(
             if let Some(id) = fk.get() {
                 stamp.ranges.insert(id, range);
                 stamp.txids.insert(id, *t);
+                if let Some(pin) = recent_snap.create_pin(t) {
+                    stamp.pins.insert(id, pin);
+                }
             }
             stamp.recent_n = stamp.recent_n.saturating_add(1);
             continue;

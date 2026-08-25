@@ -229,9 +229,7 @@ will loop.
 
 ### Consensus
 
-- **C-M5.** Script-pool `failed` is `Relaxed`; worker can enter a wave after
-  the publisher observed `in_wave == 0` (ARM). Increment-then-check +
-  Acquire/Release.
+*(none remaining)*
 
 ### Query
 
@@ -464,6 +462,8 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-M5.** Script-pool `failed` uses Acquire loads / Release store (with
+  existing increment-then-check). This PR.
 - **C-M6.** Signet last exact 38-byte BIP141 commitment + Core
   `BLOCK_SCRIPT_VERIFY_FLAGS` (P2SH|WITNESS|DERSIG|NULLDUMMY, no CLEANSTACK).
   Pins: `witness_commitment_index_last_exact_38_byte`,

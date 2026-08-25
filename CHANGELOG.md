@@ -139,6 +139,9 @@ before 1.0).
 
 ### Fixed
 
+- **Script-pool wave `failed` is Acquire/Release:** a worker cannot enter
+  a wave after the publisher observed `in_wave == 0` (ARM).
+
 - **Signet matches Core BIP141 last-commitment + challenge flags:** last
   exact 38-byte `6a24aa21a9ed` output; verify with P2SH, WITNESS, DERSIG,
   NULLDUMMY (not CLEANSTACK / Base-only eval).

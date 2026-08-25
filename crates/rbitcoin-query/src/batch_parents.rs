@@ -17,7 +17,8 @@
 //! lock on the hot path.
 //!
 //! **Immutable publish:** outs and layout are **separate** immutable Arc
-//! snapshots published via [`arc_swap::ArcSwap`] (lock-free load; RCU store).
+//! snapshots. Vacant `insert_owned` stores Frozen halves (no `ArcSwap`). First
+//! real compose promotes that half to `ArcSwap` (lock-free load; RCU store).
 //! Widening need-vouts composes only the outs half; layout fill composes only
 //! denserels/range — never clones script bytes for a layout-only publish.
 //! No-op compose keeps Arc identity (no full-body clone on share hits). Never
@@ -38,7 +39,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64Map, U64Set};
 
@@ -145,10 +146,52 @@ impl ParentLayout {
     }
 }
 
+/// Frozen until the first real compose, then [`ArcSwap`] RCU.
+#[derive(Debug)]
+struct PinHalf<T> {
+    frozen: Arc<T>,
+    rcu: OnceLock<ArcSwap<T>>,
+}
+
+impl<T> PinHalf<T> {
+    fn new(val: T) -> Self {
+        Self {
+            frozen: Arc::new(val),
+            rcu: OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    fn load(&self) -> Arc<T> {
+        match self.rcu.get() {
+            Some(s) => s.load_full(),
+            None => Arc::clone(&self.frozen),
+        }
+    }
+
+    fn rcu(&self, f: impl Fn(&Arc<T>) -> Arc<T>) {
+        loop {
+            if let Some(s) = self.rcu.get() {
+                s.rcu(|cur| f(cur));
+                return;
+            }
+            let cur = Arc::clone(&self.frozen);
+            let next = f(&cur);
+            if Arc::ptr_eq(&next, &cur) {
+                return;
+            }
+            if self.rcu.set(ArcSwap::from(next)).is_ok() {
+                return;
+            }
+        }
+    }
+}
+
 /// One create's sparse pin payload, shared across concurrent pipeline batches.
 ///
 /// Outs and layout are independent immutable Arc halves (compose only the half
-/// that changes), published via ArcSwap (lock-free load).
+/// that changes). Vacant insert is Frozen; first real compose promotes to
+/// ArcSwap (lock-free load; RCU store).
 #[derive(Debug)]
 pub struct SharedParentPin {
     fk: Fk,
@@ -156,9 +199,9 @@ pub struct SharedParentPin {
     /// 0 unknown, 1 not coinbase, 2 coinbase.
     coinbase: AtomicU8,
     /// Sparse need outs + checked (prep widen).
-    outs: ArcSwap<PinOuts>,
+    outs: PinHalf<PinOuts>,
     /// Abs layout for spentness/annotate (write fill).
-    layout: ArcSwap<ParentLayout>,
+    layout: PinHalf<ParentLayout>,
 }
 
 impl SharedParentPin {
@@ -180,26 +223,26 @@ impl SharedParentPin {
             fk,
             tx,
             coinbase: AtomicU8::new(cb),
-            outs: ArcSwap::from_pointee(PinOuts::new(live, checked)),
-            layout: ArcSwap::from_pointee(ParentLayout::new(body_range, spender_rels)),
+            outs: PinHalf::new(PinOuts::new(live, checked)),
+            layout: PinHalf::new(ParentLayout::new(body_range, spender_rels)),
         }
     }
 
     #[inline]
     fn load_outs(&self) -> Arc<PinOuts> {
-        self.outs.load_full()
+        self.outs.load()
     }
 
     #[inline]
     fn load_layout(&self) -> Arc<ParentLayout> {
-        self.layout.load_full()
+        self.layout.load()
     }
 
     /// Compose outs half: `None` = no-op (keep existing Arc identity).
     ///
     /// Uses RCU so concurrent widens from peer batches merge correctly.
     fn publish_outs(&self, f: impl Fn(&PinOuts) -> Option<PinOuts>) {
-        let cur = self.outs.load_full();
+        let cur = self.outs.load();
         if f(cur.as_ref()).is_none() {
             return;
         }
@@ -211,7 +254,7 @@ impl SharedParentPin {
 
     /// Compose layout half: `None` = no-op (keep existing Arc identity).
     fn publish_layout(&self, f: impl Fn(&ParentLayout) -> Option<ParentLayout>) {
-        let cur = self.layout.load_full();
+        let cur = self.layout.load();
         if f(cur.as_ref()).is_none() {
             return;
         }
@@ -1518,6 +1561,58 @@ mod tests {
         assert_eq!(store.live_count(), 0, "insert must not touch store");
         bp.publish_to_store();
         assert_eq!(store.live_count(), 100);
+    }
+
+    #[test]
+    fn vacant_insert_does_not_arcswap_until_compose() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let pin = bp.pins.get(&1).expect("vacant pin");
+        assert!(
+            pin.outs.rcu.get().is_none(),
+            "vacant insert must not allocate ArcSwap on outs"
+        );
+        assert!(
+            pin.layout.rcu.get().is_none(),
+            "vacant insert must not allocate ArcSwap on layout"
+        );
+        assert!(pin.load_outs().covers_need(&[0]));
+        pin.merge_outs(vec![], &[0]);
+        assert!(pin.outs.rcu.get().is_none(), "no-op cover must stay Frozen");
+    }
+
+    #[test]
+    fn compose_adds_vout_without_mutating_old_snap() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let pin = Arc::clone(bp.pins.get(&1).unwrap());
+        let old = pin.load_outs();
+        pin.merge_outs(vec![(1, out(20))], &[1]);
+        assert!(
+            pin.outs.rcu.get().is_some(),
+            "real compose promotes Frozen to Rcu"
+        );
+        let new = pin.load_outs();
+        assert_eq!(old.outs.len(), 1, "old snap must not gain vouts");
+        assert_eq!(old.checked, vec![0]);
+        assert!(new.covers_need(&[0, 1]));
+        assert!(!Arc::ptr_eq(&old, &new));
     }
 
     /// Prep∥write on one SharedParentPin: write set_layout_for_need must not

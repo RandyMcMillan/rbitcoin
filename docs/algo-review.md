@@ -78,7 +78,7 @@ What the node actually runs. This is the map; findings follow.
 
 | Piece | Algorithm | Notes |
 |-------|-----------|--------|
-| Headers sync | one `sync_started` peer | timeout helper **only called from mock clock** |
+| Headers sync | one `sync_started` peer | 50 ms session tick polls `on_session_heartbeat` |
 | IBD assign | densify walk, `FAR_SCAN_BUDGET` 65 536 | request-limited soft budget |
 | Compact blocks | short-id + prefilled interleave | prefilled index validation weaker than Core |
 | AddrMan | unbounded `HashMap` | no tried/new bucket caps |
@@ -115,15 +115,6 @@ What the node actually runs. This is the map; findings follow.
 These are the ones worth a plan. ✔ = re-read against current source.
 
 ### High — P2P / DoS / indexes
-
-#### N-H1. ✔ Headers-sync timeout is dead in production
-
-`crates/rbitcoin-net/src/peers.rs:733` `check_headers_sync_timeouts`. Only
-caller is `set_mock_now` (~790), which is test-only. A stalling initial-sync
-peer that still answers pings is never replaced. Core runs this every message
-pass.
-
-**Fix:** call from the 50 ms session tick or a 1 s hub timer.
 
 #### N-H4. Inbound handshake holds a slot with no deadline
 
@@ -407,9 +398,9 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
 | store | 0 | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
-| consensus + primitives | 0 | pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
+| consensus + primitives | 0 | *(none remaining)* | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
-| net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
+| net | 1 (inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 2 (active pop, testmempoolaccept) | submitblock gate, gettxout, hashps, unbounded batch | GBT depends, longpoll |
 | electrum | 1 (status **order** vs get_history) | mempool_stats | status full-history, announce O(subs) |
@@ -423,7 +414,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
+1. **N-H4 inbound handshake timeout**.
 2. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
 3. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
@@ -477,4 +468,8 @@ leaving a stale High row in §2–6.
 - **P8** — v2 `parse_v2_contents` does not sha256d; `FramedMessage::decode` is command+payload (checksum unused). [#245](https://github.com/reardencode/rbitcoin/pull/245).
 - **P10** — densify `densify_scan_lo` skips BQ-ready / inflight / archived prefix; pending still walked. [#245](https://github.com/reardencode/rbitcoin/pull/245).
 - **P16** — fence-tip MTP is an 11-slot ring on extend; pop rebuilds; historical heights still 11-read. [#245](https://github.com/reardencode/rbitcoin/pull/245).
+- **N-H1.** 50 ms session tick calls `PeerHub::on_session_heartbeat` →
+  `check_headers_sync_timeouts`. Pins:
+  `session_heartbeat_disconnects_stalling_headers_sync`,
+  `session_heartbeat_keeps_sole_preferred_headers_sync_peer`.
 - **S-H1** — HashHead / ScriptHashHead no longer rewrite occupied tables while serving. Header overflow rolls `header.head.gN`; ingest SH seals at 0.80. Undersized single-gen `header.head` rewrites on open only. `rehash_to` / `rehash_gate` / `ShardedHashHead` deleted. [#248](https://github.com/reardencode/rbitcoin/pull/248).

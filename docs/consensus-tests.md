@@ -118,6 +118,7 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 | C19 | Core `bip341_wallet_vectors.json` | `verify_job_all_inputs` accept (taproot+witness) | `script::core_bip341::core_bip341_wallet_vectors_all_rows` |
 | C20 | Mainnet 866342 + Floresta prevouts | structure + scripts; overweight 4_000_001 WU rejects | `block::block_866342::*` |
 | C21 | Tapscript initial witness 1000 / 520 | `stack size` / `PUSH_SIZE`; OP_SUCCESS overrides | `script_path_rejects_initial_stack_over_max_size` ([023](./external_findings/023-tapscript-initial-stack-limits.md)) |
+| C24 | Signet last 38-byte BIP141 commitment; challenge P2SH|WITNESS|DERSIG|NULLDUMMY (no CLEANSTACK) | accept / `signet solution invalid` | `witness_commitment_index_last_exact_38_byte`, `signet_challenge_op_true_twice_is_not_cleanstack`, `signet_challenge_p2wpkh_empty_witness_rejected` |
 | C25 | BIP342 tapscript validation weight | `tapscript validation weight` | `script_path_rejects_tapscript_validation_weight` |
 | C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
 | C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings` |

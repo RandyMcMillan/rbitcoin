@@ -213,13 +213,25 @@ pub fn validate_block_structure_with_pres(
 }
 
 fn coinbase_has_witness_commitment(block: &Block) -> bool {
+    block
+        .txdata
+        .first()
+        .and_then(witness_commitment_vout_index)
+        .is_some()
+}
+
+/// Last BIP141 `OP_RETURN` witness commitment (exact 38-byte `6a24aa21a9ed` prefix).
+pub(crate) fn witness_commitment_vout_index(coinbase: &Transaction) -> Option<usize> {
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    block.txdata.first().is_some_and(|cb| {
-        cb.output.iter().any(|o| {
-            let b = o.script_pubkey.as_bytes();
-            b.len() >= 38 && b[0..6] == MAGIC
+    coinbase
+        .output
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, out)| {
+            let b = out.script_pubkey.as_bytes();
+            (b.len() >= 38 && b[..6] == MAGIC).then_some(i)
         })
-    })
 }
 
 /// True if any input carries witness data.
@@ -457,21 +469,13 @@ fn check_witness_commitment_with_wtxids(
     block: &Block,
     precomputed_non_cb: &[[u8; 32]],
 ) -> Result<(), ConsensusError> {
-    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     let coinbase = &block.txdata[0];
-    let mut commitment: Option<[u8; 32]> = None;
-    for out in coinbase.output.iter().rev() {
-        let b = out.script_pubkey.as_bytes();
-        if b.len() >= 38 && b[0..6] == MAGIC {
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&b[6..38]);
-            commitment = Some(h);
-            break;
-        }
-    }
-    let Some(committed) = commitment else {
+    let Some(cidx) = witness_commitment_vout_index(coinbase) else {
         return Err(ConsensusError::BadBlock("missing witness commitment"));
     };
+    let b = coinbase.output[cidx].script_pubkey.as_bytes();
+    let mut committed = [0u8; 32];
+    committed.copy_from_slice(&b[6..38]);
 
     if precomputed_non_cb.len() != block.txdata.len().saturating_sub(1) {
         return Err(ConsensusError::BadBlock("wtxid count mismatch"));

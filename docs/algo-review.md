@@ -232,10 +232,6 @@ will loop.
 - **C-M5.** Script-pool `failed` is `Relaxed`; worker can enter a wave after
   the publisher observed `in_wave == 0` (ARM). Increment-then-check +
   Acquire/Release.
-- **C-M6.** Signet: first output with 6-byte magic vs Core last 38-byte
-  BIP141 prefix; `SigVersion::Base` for challenge; `null_dummy: false`;
-  CLEANSTACK extra. Default 1-of-2 signet honest path OK; custom/adversarial
-  diverges. Reuse `block/mod.rs` reverse commitment scan.
 
 ### Query
 
@@ -351,7 +347,6 @@ a mainnet miss).
 
 Do not flatten io_uring machines. Do not add a process pin FIFO.
 
-1. **Signet commitment:** reuse BIP141 reverse scan (fixes C-M6).
 2. **Chain work:** one cumulative index (fixes N-H3 + RPC P2).
 4. **Wtxid:** secondary `HashMap` (fixes N-H2).
 5. **Mempool eviction:** `BinaryHeap` of cluster worst-rate (fixes P3).
@@ -469,6 +464,11 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-M6.** Signet last exact 38-byte BIP141 commitment + Core
+  `BLOCK_SCRIPT_VERIFY_FLAGS` (P2SH|WITNESS|DERSIG|NULLDUMMY, no CLEANSTACK).
+  Pins: `witness_commitment_index_last_exact_38_byte`,
+  `signet_challenge_op_true_twice_is_not_cleanstack`,
+  `signet_challenge_p2wpkh_empty_witness_rejected`. This PR.
 - **C-M4.** `assemble_run` runs future-time + BIP34/66/65 nVersion on every
   block (`check_header_version_and_future_time`). Pins:
   `check_header_version_and_future_time_regtest`,

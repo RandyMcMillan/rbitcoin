@@ -139,6 +139,10 @@ before 1.0).
 
 ### Fixed
 
+- **Signet matches Core BIP141 last-commitment + challenge flags:** last
+  exact 38-byte `6a24aa21a9ed` output; verify with P2SH, WITNESS, DERSIG,
+  NULLDUMMY (not CLEANSTACK / Base-only eval).
+
 - **Assemble checks future-time and BIP34/66/65 nVersion on every block,**
   not only headers-first `validate_header` (pipelined / multi-block confirm).
 

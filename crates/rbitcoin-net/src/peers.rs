@@ -7,7 +7,7 @@ use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Wtxid};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
@@ -68,6 +68,8 @@ pub struct LivePeer {
     /// Their `version.relay`. False or `block-relay-only` → `relaytxes=false`.
     pub relay: bool,
     pub stop: AtomicBool,
+    /// Full `Block`/`CmpctBlock` messages queued to this session's writer.
+    pub serve_inflight: AtomicUsize,
     /// We announce new tips as `cmpctblock` to this peer (`sendcmpct` they sent).
     pub hb_to: AtomicBool,
     /// They announce new tips as `cmpctblock` to us (`sendcmpct` they sent).
@@ -862,6 +864,7 @@ impl PeerHub {
             conn_type,
             relay: ver.relay,
             stop: AtomicBool::new(false),
+            serve_inflight: AtomicUsize::new(0),
             hb_to: AtomicBool::new(false),
             hb_from: AtomicBool::new(false),
             pending_sendcmpct: std::sync::atomic::AtomicU8::new(0),

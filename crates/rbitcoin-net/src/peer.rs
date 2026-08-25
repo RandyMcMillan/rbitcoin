@@ -100,6 +100,8 @@ const MAX_PENDING_HEADERS: usize = 8_000;
 /// competing branch; apply is `ChainHub::accept_received_block` (see
 /// `docs/architecture.md` most-work chain selection).
 const MAX_PENDING_BLOCKS: usize = 128;
+/// Max reconstructed full bodies queued on one session writer (IBD window).
+pub(crate) const MAX_SERVE_BLOCKS: usize = 16;
 
 /// Test/assert surface for the tip-follow pending-body cap (equals production).
 #[cfg(test)]
@@ -477,9 +479,20 @@ pub async fn peer_session_with(
         s.attach_out(out_tx.clone());
     }
 
+    let writer_session = meta.session.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            if write_v2_msg_offload(&mut writer, msg).await.is_err() {
+            let full = matches!(
+                msg,
+                NetworkMessage::Block(_) | NetworkMessage::CmpctBlock(_)
+            );
+            let err = write_v2_msg_offload(&mut writer, msg).await.is_err();
+            if full {
+                if let Some(s) = &writer_session {
+                    s.serve_inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            if err {
                 break;
             }
         }
@@ -1195,16 +1208,29 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::GetData(inv) => {
+            let inflight = session.map(|s| &s.serve_inflight);
             for item in inv.iter().take(MAX_INV_SIZE) {
                 match item {
                     Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS)
+                        {
+                            continue;
+                        }
                         if let Some(block) =
                             block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
                         {
-                            queue_out(out_tx, NetworkMessage::Block(block))?;
+                            let _ = try_queue_served_block(
+                                out_tx,
+                                inflight,
+                                NetworkMessage::Block(block),
+                            )?;
                         }
                     }
                     Inventory::CompactBlock(h) => {
+                        if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS)
+                        {
+                            continue;
+                        }
                         if let Some(block) =
                             block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
                         {
@@ -1220,14 +1246,19 @@ async fn handle_peer_frame(
                                 .map(|ht| ht.0)
                                 .unwrap_or(0);
                             if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
-                                queue_out(out_tx, NetworkMessage::Block(block))?;
+                                let _ = try_queue_served_block(
+                                    out_tx,
+                                    inflight,
+                                    NetworkMessage::Block(block),
+                                )?;
                             } else {
                                 let ver = (*peer_cmpct_version).max(1).min(2);
                                 if let Ok(hsi) =
                                     HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &[0])
                                 {
-                                    queue_out(
+                                    let _ = try_queue_served_block(
                                         out_tx,
+                                        inflight,
                                         NetworkMessage::CmpctBlock(CmpctBlock {
                                             compact_block: hsi,
                                         }),
@@ -2226,6 +2257,29 @@ fn queue_out(
 ) -> Result<(), NetError> {
     out.send(msg)
         .map_err(|_| NetError::Protocol("peer write half closed"))
+}
+
+/// Queue a reconstructed `Block`/`CmpctBlock` if this session is under the serve cap.
+///
+/// `None` inflight (tests without a session) always queues.
+pub(crate) fn try_queue_served_block(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    inflight: Option<&AtomicUsize>,
+    msg: NetworkMessage,
+) -> Result<bool, NetError> {
+    if let Some(n) = inflight {
+        if n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS {
+            return Ok(false);
+        }
+        n.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = queue_out(out, msg) {
+            n.fetch_sub(1, Ordering::SeqCst);
+            return Err(e);
+        }
+        return Ok(true);
+    }
+    queue_out(out, msg)?;
+    Ok(true)
 }
 
 /// Try to accept pending blocks that connect to tip or form a better branch.

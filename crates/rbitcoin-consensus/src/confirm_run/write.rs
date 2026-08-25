@@ -181,7 +181,7 @@ pub fn confirm_write_phase(
                     query.note_recent_creates_pins(height, rows);
                 }
                 if let Some(last) = batch.prepared.last() {
-                    query.expire_recent_creates_defer(last.height.0);
+                    query.set_class_a_hi(Some(last.height.0));
                 }
                 let t_clone = Instant::now();
                 query.flush_recent_creates();

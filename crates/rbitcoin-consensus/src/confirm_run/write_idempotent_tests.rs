@@ -2060,6 +2060,11 @@ fn store_start_states_lookup_load_confirm() {
         confirm_write_phase(&q, &params, ms, ok.batch).expect("S0 write");
     }
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s0));
+    assert_eq!(
+        q.class_a_hi(),
+        Some(h_s0),
+        "committed Class A must bump class_a_hi before Class C"
+    );
     tip = b_s0.block_hash();
     tip_time = b_s0.header.time;
 
@@ -2080,6 +2085,11 @@ fn store_start_states_lookup_load_confirm() {
         confirm_write_phase(&q, &params, ms, ok.batch).expect("S1 write");
     }
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s1));
+    assert_eq!(
+        q.class_a_hi(),
+        Some(h_s0),
+        "idempotent Class A skip must not bump class_a_hi"
+    );
 
     let _ = std::fs::remove_dir_all(&path);
 }

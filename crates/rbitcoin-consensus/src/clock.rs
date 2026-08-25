@@ -30,10 +30,6 @@ impl NodeClock {
     pub fn set_mock(&self, t: i64) {
         self.mock.store(t.max(0), Ordering::SeqCst);
     }
-
-    pub fn mock_value(&self) -> i64 {
-        self.mock.load(Ordering::Relaxed)
-    }
 }
 
 pub fn wall_now() -> u64 {

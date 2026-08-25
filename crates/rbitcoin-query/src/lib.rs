@@ -55,12 +55,11 @@ pub type QueryError = StoreError;
 ///
 /// `conf_plans` is header plan occupancy in ConfirmParentCache. Pipeline pins /
 /// prep-ahead CreatePins are metered via [`process_mem_stats`] (plan thread
-/// publishes snapshots) plus SH memtable / conf_plans on Query.
+/// publishes snapshots) plus conf_plans on Query.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
     pub conf_plans: usize,
     pub sh_runs: usize,
-    pub sh_memtable: usize,
     pub sh_heads: usize,
     /// Segmented `tx.head.*` occupancy (logical sizes; no shadow resize).
     pub head: rbitcoin_store::HeadResizeSizeSnapshot,
@@ -1118,7 +1117,7 @@ pub struct Query {
     lookup_taken_hi: AtomicU32,
     /// EWMA of `lookup_taken_hi − tip` for RecentCreates horizon.
     recent_lead_ewma: AtomicU32,
-    /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
+    /// Post-IBD SH catalog (Class A recollect spills; no IBD memtable).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
     /// SH collect/enqueue/durable write-through entirely (tip follow independent).
@@ -1882,7 +1881,6 @@ impl Query {
         ProcessOwnedSizes {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),
-            sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),
             head,
             inflight_layers: mem.inflight_layers,

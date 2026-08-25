@@ -190,7 +190,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Restart: shindex + tip-ready stays Tip (do not recollect). Else Direct IBD.
+    // Restart: durable SH head stays Tip (write-behind catch-up). Else Direct
+    // IBD with SH deferred until post-horizon Class A collect.
     handle.query.set_sh_index_enabled(config.shindex);
     if let Err(e) = handle.query.set_sptweaks_enabled(
         config.sptweaks,
@@ -200,12 +201,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     } else if config.sptweaks {
         info!("sp_tweaks: enabled origin={}", params.taproot_height());
     }
-    if config.shindex && handle.query.sh_is_tip_ready() {
+    if config.shindex && handle.query.sh_use_writebehind() {
         let _ = handle.query.sync_sh_seal_from_include_hwm();
         handle.query.enter_tip_index_mode();
         info!(
-            "node: durable scripthash covers tip (include_hwm/SEAL) — resume IndexMode::Tip \
-             (skip Direct Class A recollect; short catch-up uses durable SH write-through)"
+            "node: durable scripthash head — resume IndexMode::Tip \
+             (skip Class A recollect; catch-up uses write-behind)"
         );
     } else {
         handle
@@ -214,7 +215,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
         if config.shindex {
             info!(
-                "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
+                "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; \
+                 SH deferred until post-IBD Class A collect)"
             );
         } else {
             info!(
@@ -1057,32 +1059,32 @@ pub(crate) struct TipModeGates {
     pub sh_tip_ready: bool,
 }
 
-/// Enter steady-state tip mode after true catch-up.
+/// Enter steady-state after true catch-up.
 ///
 /// **Preconditions (enforced by IBD, not repaired here):** Direct catch-up already
 /// wrote durable **`tx.head`** (archive) and **spend annotations** (confirm).
 /// Incomplete IBD must not call this (`catch_up_complete` only after full horizon).
 ///
-/// **Always:** flip [`IndexMode::Tip`] so tip follow and mempool relay work without
-/// waiting on scripthash (`tip_follow_ready`).
+/// **SH methods (exactly two):**
+/// - Durable head: stay/flip [`IndexMode::Tip`], discard leftover runs, Electrum
+///   on (`sh_tip_ready`); catch-up / follow use write-behind.
+/// - No head: Class A collect + FullCold/ColdResume **while Direct** (write-behind
+///   no-ops), then Tip. Cancel leaves Direct; Electrum stays closed.
 ///
-/// **When `shindex`:** merge SH runs + cold bulk-load; `sh_tip_ready` only if
-/// materialize succeeds. Electrum/Esplora use that gate alone.
-///
-/// **When `!shindex`:** skip SH bulk; `sh_tip_ready = false`.
+/// **When `!shindex`:** skip SH; `sh_tip_ready = false`; Tip for follow/relay.
 pub(crate) fn enter_tip_mode(
     query: &Query,
     cancel: Option<Arc<AtomicBool>>,
     shindex: bool,
 ) -> TipModeGates {
     query.set_sh_index_enabled(shindex);
-    query.enter_tip_index_mode();
-    info!(
-        "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
-        query.index_mode()
-    );
 
     if !shindex {
+        query.enter_tip_index_mode();
+        info!(
+            "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
+            query.index_mode()
+        );
         info!("node: tip-follow ready without scripthash (shindex off); Electrum/Esplora disabled");
         return TipModeGates {
             tip_follow_ready: true,
@@ -1090,10 +1092,18 @@ pub(crate) fn enter_tip_mode(
         };
     }
 
-    if query.sh_is_tip_ready() {
-        let _ = query.sync_sh_seal_from_include_hwm();
+    if query.sh_use_writebehind() {
+        query.enter_tip_index_mode();
         info!(
-            "node: scripthash tip-ready — skip bulk materialize; rows={}",
+            "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
+            query.index_mode()
+        );
+        match query.finalize_sh_runs_cancellable(cancel.as_deref()) {
+            Ok(_) => {}
+            Err(e) => warn!("node: scripthash leftover-run discard: {e}"),
+        }
+        info!(
+            "node: scripthash write-behind — skip collect; rows={}",
             query.scripthash_entry_count()
         );
         info!("node: tip-mode complete — safe to start Electrum");
@@ -1103,7 +1113,12 @@ pub(crate) fn enter_tip_mode(
         };
     }
 
-    info!("node: scripthash bulk materialize from runs (merge + cold load)…");
+    info!("node: scripthash bulk materialize from Class A (Direct collect, then Tip)…");
+    if !query.index_mode().is_direct() {
+        if let Err(e) = query.enter_direct_index_mode_sh(true) {
+            warn!("node: enter Direct for SH collect: {e}");
+        }
+    }
     let cancel_ref = cancel.as_deref();
     let sh_ok = match query.finalize_sh_runs_cancellable(cancel_ref) {
         Ok(n) => {
@@ -1114,7 +1129,7 @@ pub(crate) fn enter_tip_mode(
             warn!("node: scripthash bulk materialize cancelled ({msg})");
             warn!(
                 "node: partial fan-in progress kept (merge/CHECKPOINT or READY) — \
-                 restart to resume; Electrum not ready yet (tip follow still on)"
+                 restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
             );
             false
         }
@@ -1123,7 +1138,7 @@ pub(crate) fn enter_tip_mode(
             warn!(
                 "node: Electrum history incomplete until materialize succeeds — \
                  keep store/scripthash.runs (incl. *.run.mat / merge/) and restart; \
-                 tip follow continues without Electrum"
+                 stay Direct (no write-behind onto an incomplete head)"
             );
             false
         }
@@ -1135,9 +1150,12 @@ pub(crate) fn enter_tip_mode(
         };
     }
 
-    // Fail closed for Electrum when Class A exists: residual runs mean creates
-    // not yet in durable SH. Tip follow already enabled above.
-    let tip_max = query.store().txs.count();
+    query.enter_tip_index_mode();
+    info!(
+        "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
+        query.index_mode()
+    );
+
     let leftover = query.scripthash_run_count();
     if leftover > 0 {
         warn!(
@@ -1149,16 +1167,9 @@ pub(crate) fn enter_tip_mode(
             sh_tip_ready: false,
         };
     }
-    if tip_max > 0 && !query.sh_is_tip_ready() {
-        warn!("node: scripthash materialize returned ok but not tip-ready — Electrum deferred");
-        return TipModeGates {
-            tip_follow_ready: true,
-            sh_tip_ready: false,
-        };
-    }
 
     info!(
-        "node: scripthash rows={} (thin creates from runs; spentness = confirmed-strong annotations)",
+        "node: scripthash rows={} (thin creates from Class A collect; spentness = confirmed-strong annotations)",
         query.scripthash_entry_count()
     );
     info!("node: tip-mode complete — safe to start Electrum");
@@ -1362,6 +1373,75 @@ mod tests {
         assert!(!should_resolve_default_seeds(&cfg));
     }
 
+    fn coinbase_block(
+        h: u32,
+        prev: rbitcoin_primitives::Fk,
+        parent_hash: Option<[u8; 32]>,
+    ) -> (rbitcoin_store::HeaderRecord, rbitcoin_query::TxApply) {
+        use rbitcoin_primitives::Fk;
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let version = 1;
+        let timestamp = h + 1;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[4] = 0xcd;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
+        let header = HeaderRecord {
+            prev_fk: prev,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![h as u8],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51, h as u8])],
+        };
+        (header, ta)
+    }
+
+    fn seed_direct_chain(q: &Query, n: u32) {
+        use rbitcoin_primitives::{Fk, Height};
+        q.enter_direct_index_mode().unwrap();
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        for h in 0..n {
+            let (header, ta) = coinbase_block(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+    }
+
     #[test]
     fn enter_tip_mode_reenables_indexes() {
         use rbitcoin_query::IndexMode;
@@ -1383,6 +1463,82 @@ mod tests {
         assert_eq!(q.index_mode(), IndexMode::Tip);
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Durable head + lagging HWM: enter_tip_mode must not collect; Electrum on.
+    #[test]
+    fn enter_tip_mode_durable_head_hwm_lag_writebehind() {
+        use rbitcoin_query::IndexMode;
+        use rbitcoin_store::{next_run_path, write_sorted_run};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-tip-wb-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("store");
+        let q = Query::open_or_create(&store).unwrap();
+        seed_direct_chain(&q, 5);
+        assert_eq!(q.index_mode(), IndexMode::Direct);
+        let _ = q.finalize_sh_runs().unwrap();
+        assert!(q.sh_use_writebehind());
+        let count_before = q.scripthash_entry_count();
+        let tip_max = q.store().txs.count();
+        let lag = tip_max.saturating_sub(2).max(1);
+        std::fs::write(
+            store.join(rbitcoin_store::INCLUDE_HWM_NAME),
+            lag.to_le_bytes(),
+        )
+        .unwrap();
+
+        let runs_dir = store.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut body = Vec::new();
+        let mut rec = [0u8; 40];
+        rec[..32].fill(0xee);
+        rec[32..40].copy_from_slice(&99u64.to_le_bytes());
+        body.extend_from_slice(&rec);
+        write_sorted_run(&next_run_path(&runs_dir, 50), 40, 40, &body).unwrap();
+
+        let g = enter_tip_mode(&q, None, true);
+        assert!(g.tip_follow_ready);
+        assert!(
+            g.sh_tip_ready,
+            "durable head chooses write-behind; Electrum must not wait on HWM==tip"
+        );
+        assert_eq!(q.index_mode(), IndexMode::Tip);
+        assert_eq!(q.scripthash_entry_count(), count_before);
+        assert_eq!(q.scripthash_run_count(), 0);
+        assert_eq!(q.store().scripthash.include_hwm(), lag);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// First-time SH: collect while Direct, then Tip.
+    #[test]
+    fn enter_tip_mode_collects_while_direct_then_tip() {
+        use rbitcoin_query::IndexMode;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-tip-collect-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        seed_direct_chain(&q, 4);
+        assert_eq!(q.index_mode(), IndexMode::Direct);
+        assert!(!q.store().scripthash.has_durable_index());
+        assert!(!q.sh_use_writebehind());
+
+        let g = enter_tip_mode(&q, None, true);
+        assert!(g.tip_follow_ready);
+        assert!(g.sh_tip_ready);
+        assert_eq!(q.index_mode(), IndexMode::Tip);
+        assert!(q.store().scripthash.has_durable_index());
+        assert_eq!(q.scripthash_run_count(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

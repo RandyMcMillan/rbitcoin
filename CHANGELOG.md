@@ -38,6 +38,12 @@ before 1.0).
 
 ### Changed
 
+- **Two SH methods only:** a durable scripthash head stays Tip (short
+  catch-up uses write-behind, leftover runs discarded). No head: Direct
+  defers SH; post-IBD Class A recollect + FullCold/ColdResume. Removed the
+  IBD memtable→runs worker and WarmOnly apply-onto-live-head (mainnet
+  2026-08-25 `fk stream zero delta` on a 12-block catch-up).
+
 - **Tip accept does not wait on scripthash:** Class C publishes `confirmed[]`
   then enqueues collected SH records onto a RAM head; `rbtc-sh-wb` seeds the
   durable index only after tip announce (`release_sh_writebehind`). Wallet SH

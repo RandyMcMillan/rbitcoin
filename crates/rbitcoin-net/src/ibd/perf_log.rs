@@ -1817,8 +1817,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let union_mib = union_bytes / (1024 * 1024);
     let h2h_mib = (o.h2h_keys as u64).saturating_mul(48) / (1024 * 1024);
     let fence_mib = (o.fence_runs as u64).saturating_mul(16) / (1024 * 1024);
-    // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
-    let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
     let conf_wire_mib = (load_wire_mib
         .saturating_add(script_wire_mib)
         .saturating_add(write_wire_mib)) as u64;
@@ -1833,7 +1831,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(union_mib)
         .saturating_add(h2h_mib)
         .saturating_add(fence_mib)
-        .saturating_add(sh_mt_mib)
         .saturating_add(conf_wire_mib)
         .saturating_add(fuse8_mib)
         .saturating_add(mphf_g_mib)
@@ -1851,11 +1848,11 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h live={}k/pub={}k/ov={} fifo={}k≈{}MiB \
            union={}L/{}k≈{}MiB h2h={}k≈{}MiB fence={}≈{}MiB \
-           pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
+           pstore weak={}/live={}≈{}MiB \
            wire={}MiB fuse8={}MiB mphf_g={}MiB open_keys={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
-         | sh runs={} memtable={} heads={}",
+         | sh runs={} heads={}",
         kb_mib(s.rss_kb),
         anon_mib,
         kb_mib(s.rss_file_kb),
@@ -1914,7 +1911,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.pstore_weak,
         o.pstore_live,
         ps_mib,
-        sh_mt_mib,
         conf_wire_mib,
         fuse8_mib,
         mphf_g_mib,
@@ -1931,7 +1927,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         h.sealed_segments,
         h.class_a_n,
         o.sh_runs,
-        o.sh_memtable,
         o.sh_heads,
     )
 }
@@ -2544,7 +2539,6 @@ mod tests {
         s.owned.pstore_weak = 20_000;
         s.owned.pstore_live = 8_000;
         s.owned.pstore_bytes = 16 * 1024 * 1024;
-        s.owned.sh_memtable = 500_000;
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_soft_stop = 256;

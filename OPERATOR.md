@@ -301,49 +301,34 @@ without clearing known flags.
 split Class A (`txout` / `inwit` / `spent`) + durable **`tx.head`**; confirm
 batch-writes **spend annotations** on **`spent.body`** after Class C. Those
 indexes are **complete before tip** — catch-up must finish; tip entry does not
-backfill them. Scripthash is **not** progressively materialized into heads:
-confirm only enqueues sorted runs (background flush + merge). At tip the node
-**merges remaining runs and cold bulk-loads** durable SH tables before Electrum
-(the only deferred index work). Tip SH materialize **slices the catalog
-k-way by prefix shard** (workers = min(CPUs, host free RAM / 1.5 GiB),
-256 KiB pages; no extra 64-file rewrite). Workers write `scripthash.body/NN` and seal `scripthash.head/NN`
-themselves (no publisher, no wait on a slow megakey shard). SIGINT
-keeps every sealed head; resume packs only unsealed shards (holes
-stay). Legacy shared `scripthash.body` stays one writer with prefix
-`scripthash.cold_progress`. No temp `pack*.body`. Catalog records stay unique
-on `(scripthash, create_fk)`, `key_len=40`. Sealed sorted+idx main
-shards (no main fuse; no 0.5–1 GiB in-RAM OA image per shard;
-megakey pages write as they fill — ≤510 FKs buffered). Schema-16
+backfill them. Scripthash has **two** methods: a **durable head** stays
+`IndexMode::Tip` (catch-up uses the same write-behind as tip follow;
+leftover `scripthash.runs` are discarded). **No head:** Direct IBD defers SH;
+after the horizon, Class A recollect spills catalog runs then **FullCold** /
+**ColdResume**. Confirm does **not** enqueue SH during Direct. Tip SH
+materialize **slices the catalog k-way by prefix shard** (workers = min(CPUs,
+host free RAM / 1.5 GiB), 256 KiB pages). Workers write `scripthash.body/NN`
+and seal `scripthash.head/NN` themselves. SIGINT keeps every sealed head;
+resume packs only unsealed shards (holes stay). Legacy shared
+`scripthash.body` stays one writer with prefix `scripthash.cold_progress`.
+No temp `pack*.body`. Catalog records stay unique on `(scripthash, create_fk)`,
+`key_len=40`. Sealed sorted+idx main shards (no main fuse). Schema-16
 `key_len=32` leftover `scripthash.runs` are refused (wipe that dir and
 rematerialize). Class A with creates in the pre-pack 16-byte meta /
 9-byte spent layout is refused (wipe datadir and redo IBD). New keys after seal go
 to one **global ingest OA** (mainnet 2²⁵ slots × 24 B ≈ 768 MiB). Fan-in reduce is
-**fallback only** when the catalog exceeds max direct. IBD promotes L0 spills
-only at ≥75% of target run size (default target **512 MiB**) and compacts tiny
-catalog runs so tip stays **O(10³) runs**, not O(10⁴). Materialize status logs
+**fallback only** when the catalog exceeds max direct. Materialize status logs
 ~**every 10s** from one observer (`keys`/`creates`/`pending` unpublished/
-`shards` published/`rate`) — not per-worker session counters. Path selection logs `path=FullCold|ColdResume|WarmOnly` plus
-`catalog_complete` / `seal` / `tip_max_fk`. **Full cold reinit only if the SH
-head is empty** (or force rebuild); a nearly complete index with residual runs
-uses **warm batch apply** only. **SH runs pipeline:** confirm enqueues → large
-catalog spills; tip Class A recollect is parallel. Direct enter only recollects
-a small SEAL gap (crash window); full recollect is tip finalize. Tip
-materialize: WarmOnly / ColdResume / FullCold. Catalog compact is **IBD worker
-only** (crumbs &lt;~96 MiB). Force-rebuild sticky env (`RBITCOIN_SH_FORCE_REBUILD`)
-must never redo multi-hour Class A work casually — see [`docs/env-knobs.md`](docs/env-knobs.md).
-Empty head + **usable** catalog → **reinit head only** + FullCold. Empty head +
-**unusable** catalog → nuclear wipe + full recollect. **Durable
-head** + FORCE → never wipe (bootstrap/clamp/Noop + warm residual only; materialize
-mode is WarmOnly). Unset the env after a successful rebuild. Incomplete catalog
-(high SEAL + tiny run mass, or consumed runs with no head) on an **empty** head
-triggers full Class A recollect (SEAL=0). **Durable head** never uses run-mass
-incompleteness (empty runs after successful materialize are normal): missing
-`include_hwm` bootstraps from SEAL (never clamp SEAL→0); only when
-`0 < include_hwm < SEAL` is SEAL clamped for gap recollect + warm residual.
-Clearing residual run files **preserves `SEAL`** (watermark is not a run).
-**SIGINT** mid cold keeps finished prefix shards (`scripthash.cold_progress`).
-Mid-reduce keeps CHECKPOINT.
-Deferred/residual runs batch warm-apply (10s status). On enter Direct, leftover
+`shards` published/`rate`). Path selection logs `path=FullCold|ColdResume|Skip`.
+**Full cold reinit only if the SH head is empty** (or force rebuild).
+`RBITCOIN_SH_FORCE_REBUILD=1` wipes the head and does a full Class A collect +
+FullCold — unset after success; see [`docs/env-knobs.md`](docs/env-knobs.md).
+Incomplete catalog (high SEAL + tiny run mass) on an **empty** head triggers
+full Class A recollect (SEAL=0). Missing `include_hwm` on a durable head
+bootstraps from SEAL (never clamp SEAL→0). Clearing residual run files
+**preserves `SEAL`**. **SIGINT** mid cold keeps finished prefix shards
+(`scripthash.cold_progress`). Mid-reduce keeps CHECKPOINT.
+On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed
 — prefer a **fresh datadir**. Legacy **16-way** `scripthash.head/` with
 **`scripthash.runs` still present** auto-migrates on open (old head renamed

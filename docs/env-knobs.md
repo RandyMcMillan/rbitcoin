@@ -37,7 +37,6 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_MAX_DIRECT_MERGE` | default | SH direct-merge cap |
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | default | SH run target size |
 | `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |
-| `RBITCOIN_SH_MEMTABLE_CAP` | default | SH memtable cap |
 | `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, free-RAM/1.5 GiB) | Fan-in reduce + shard-kway (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--maxinbound` / conf omitted |
 

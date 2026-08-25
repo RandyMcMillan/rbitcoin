@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Structural lint / CRAP / Miri:** required `ast-grep` scan for discarded
+  `tokio::spawn`, `mem::forget`/`Box::leak`, and dropped `thread::spawn`;
+  `coverage.sh` prints a cargo-crap summary after the ≥90% LCOV gate (no
+  CRAP-30 fail); nightly Miri on `rbitcoin-primitives` only. Further work
+  is **Q-54–Q-56** in [`docs/quality.md`](docs/quality.md);
+  how to run is [`TESTING.md`](TESTING.md).
+
 - **Confirmed-tx chain view:** Electrum/Esplora responses for confirmed
   txs are built at one published tip and stamp that tip for the client
   (`X-Bitcoin-Chain-Tip` on Esplora; JSON-RPC `chain_tip` on Electrum).

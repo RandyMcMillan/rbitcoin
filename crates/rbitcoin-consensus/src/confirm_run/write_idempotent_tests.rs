@@ -1436,6 +1436,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         external_parent_spent_ranges: Default::default(),
         external_parent_txids: Default::default(),
         external_parent_pins: Default::default(),
+        external_parent_vouts: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -1491,6 +1492,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         external_parent_spent_ranges: Default::default(),
         external_parent_txids: txids,
         external_parent_pins: Default::default(),
+        external_parent_vouts: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
@@ -1589,6 +1591,7 @@ fn pin_sparse_need_high_vout_only() {
             m
         },
         external_parent_pins: Default::default(),
+        external_parent_vouts: Default::default(),
         batch_pin: vec![Arc::clone(&spend_pin)],
         index_tx: false,
         body_est: 0,

@@ -67,6 +67,8 @@ pub struct ArchiveWritePlan {
     pub external_parent_txids: crate::U64Map<[u8; 32]>,
     /// RecentCreates CreatePin Arcs stamped for external parents (pin-time only).
     pub external_parent_pins: crate::U64Map<crate::CreatePin>,
+    /// create_fk_id → spent need-vouts, filled while packing (load pin reuses).
+    pub external_parent_vouts: crate::U64Map<Vec<u32>>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
     /// only). Confirm `note_lookup_ok` only `Arc::clone`s into in-flight outs.
@@ -87,6 +89,7 @@ impl ArchiveWritePlan {
             external_parent_spent_ranges: crate::U64Map::default(),
             external_parent_txids: crate::U64Map::default(),
             external_parent_pins: crate::U64Map::default(),
+            external_parent_vouts: crate::U64Map::default(),
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
@@ -116,6 +119,8 @@ impl ArchiveWritePlan {
         self.external_parent_txids.shrink_to_fit();
         self.external_parent_pins.clear();
         self.external_parent_pins.shrink_to_fit();
+        self.external_parent_vouts.clear();
+        self.external_parent_vouts.shrink_to_fit();
     }
 
     /// Freeze plan for write batch: drop all pin-staging maps.
@@ -215,10 +220,12 @@ impl ArchiveWritePlan {
         other.external_parent_spent_ranges.clear();
         other.external_parent_txids.clear();
         other.external_parent_pins.clear();
+        other.external_parent_vouts.clear();
         self.external_parent_ranges.clear();
         self.external_parent_spent_ranges.clear();
         self.external_parent_txids.clear();
         self.external_parent_pins.clear();
+        self.external_parent_vouts.clear();
 
         self.packed.append(&mut other.packed);
         self.planned_fks.append(&mut other.planned_fks);
@@ -465,6 +472,7 @@ impl Query {
         let mut packed: Vec<(CreatePin, Vec<InputRecord>)> = Vec::with_capacity(work.len());
         let mut batch_pin: Vec<CreatePin> = Vec::with_capacity(work.len());
         let mut planned_fks: Vec<Fk> = Vec::with_capacity(work.len());
+        let mut external_parent_vouts: crate::U64Map<Vec<u32>> = crate::U64Map::default();
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
         for (tx_fk, tx, mut inputs, outputs) in work {
@@ -487,6 +495,12 @@ impl Query {
                         ));
                     }
                 }
+                if let Some(pid) = inp.create_fk.get() {
+                    external_parent_vouts
+                        .entry(pid)
+                        .or_default()
+                        .push(inp.prev_index);
+                }
                 if archive_spends {
                     spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                 }
@@ -497,6 +511,10 @@ impl Query {
             packed.push((pin, inputs));
         }
         let stamp_ns = t_stamp.elapsed().as_nanos() as u64;
+        for vouts in external_parent_vouts.values_mut() {
+            vouts.sort_unstable();
+            vouts.dedup();
+        }
 
         // Pre-stamped create_fk on the input (reconstruct) may not be in `need`.
         // Same helper as the union: idx range-fill, skip same-batch / in-flight outs.
@@ -576,6 +594,7 @@ impl Query {
             external_parent_spent_ranges,
             external_parent_txids,
             external_parent_pins,
+            external_parent_vouts,
             batch_pin,
             index_tx,
             body_est,
@@ -1414,6 +1433,11 @@ mod tests {
             "creates-only in_flight must still stamp body_range for load denserels"
         );
         assert_eq!(plan.external_parent_txid(1), Some(parent_txid));
+        assert_eq!(
+            plan.external_parent_vouts.get(&1).map(|v| v.as_slice()),
+            Some(&[0u32][..]),
+            "lookup packing must publish parent need-vouts for load pin"
+        );
         let spent = q.store.txs.spent_range(Fk(1)).expect("archived spent.idx");
         assert_eq!(
             plan.external_parent_spent_ranges.get(&1).copied(),

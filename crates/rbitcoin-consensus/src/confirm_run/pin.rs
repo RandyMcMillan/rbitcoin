@@ -56,6 +56,7 @@ pub(super) fn pin_for_wire_batch(
                 }
             }
         }
+        let fill_vouts = parent_pin.parent_vouts.is_empty();
         for ((_pin, ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
             let Some(sid) = fk.get() else { continue };
             let mut edges = Vec::with_capacity(ins.len());
@@ -72,7 +73,9 @@ pub(super) fn pin_for_wire_batch(
                         create_fk: Some(pid),
                         prev_index: inp.prev_index,
                     });
-                    parent_vouts.entry(pid).or_default().push(inp.prev_index);
+                    if fill_vouts {
+                        parent_vouts.entry(pid).or_default().push(inp.prev_index);
+                    }
                 } else {
                     edges.push(ThinInput {
                         create_fk: None,
@@ -81,6 +84,9 @@ pub(super) fn pin_for_wire_batch(
                 }
             }
             batch_thin.insert(sid, edges);
+        }
+        if !fill_vouts {
+            parent_vouts = parent_pin.parent_vouts.clone();
         }
     } else {
         // plan=None: create_fk from ParentPinStamp (lookup head/idx), never load head.

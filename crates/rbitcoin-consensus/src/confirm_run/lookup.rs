@@ -35,6 +35,8 @@ pub struct ParentPinStamp {
         HashMap<[u8; 32], u64, std::hash::BuildHasherDefault<rbitcoin_query::TxidHasher>>,
     /// RecentCreates outs stamped at lookup (pin-time; not a second ring walk).
     pub pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
+    /// create_fk_id → spent need-vouts (packed at lookup; load pin reuses).
+    pub parent_vouts: U64Map<Vec<u32>>,
 }
 
 impl ParentPinStamp {
@@ -45,6 +47,7 @@ impl ParentPinStamp {
             std::mem::take(&mut plan.external_parent_spent_ranges),
             std::mem::take(&mut plan.external_parent_txids),
             std::mem::take(&mut plan.external_parent_pins),
+            std::mem::take(&mut plan.external_parent_vouts),
         )
     }
 
@@ -53,6 +56,7 @@ impl ParentPinStamp {
         spent_ranges: rbitcoin_query::U64Map<(u64, u64)>,
         txids: rbitcoin_query::U64Map<[u8; 32]>,
         pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
+        parent_vouts: U64Map<Vec<u32>>,
     ) -> Self {
         let mut create_by_txid = HashMap::with_capacity_and_hasher(txids.len(), Default::default());
         for (id, tid) in &txids {
@@ -64,6 +68,7 @@ impl ParentPinStamp {
             txids,
             create_by_txid,
             pins,
+            parent_vouts,
         }
     }
 
@@ -192,6 +197,7 @@ pub(super) fn stamp_parent_pin_archived(
             Default::default(),
         ),
         pins: ext.pins,
+        parent_vouts: U64Map::default(),
     };
     for (tid, fk) in ext.resolved {
         if let Some(id) = fk.get() {

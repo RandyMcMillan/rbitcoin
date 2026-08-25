@@ -317,7 +317,13 @@ pub(super) fn pin_for_wire_batch(
         }
     }
 
-    // Never `tx.idx` / head cold denserels on load. `spent.idx` is write ensure.
+    for (id, _) in &parent_vouts {
+        if let Some(sr) = parent_pin.spent_ranges.get(id).copied() {
+            batch_parents.set_spent_range_only(rbitcoin_primitives::Fk(*id), sr);
+        }
+    }
+
+    // Never `tx.idx` / head cold denserels on load. `spent.idx` IO is lookup.
     let n_cold = 0u64;
     let cold_io_ns = 0u64;
     let cold_decode_ns = 0u64;
@@ -416,14 +422,9 @@ pub(super) fn pin_for_wire_batch(
 
 /// Ensure spend abs for every spend edge on the write batch.
 ///
-/// Sole owner of `spent.idx` range stamp for write. Covers:
-/// 1. Archived parents (load pin no longer idx-batches the full set)
-/// 2. Same-batch creates (range only after `archive_commit_plan` + fill)
-/// 3. Load-ahead parents not yet in `spent.idx` when pinned
-/// 4. Retry after partial write
-///
-/// Missing abs after those fills is `Corrupt`. Write still annotates every
-/// eligible edge; this function never calls `put_spend*`.
+/// Lookup stamps archived-parent `spent.idx` ranges; load copies them onto
+/// the pin. This idx-stamps remaining holes (same-batch creates after Class A,
+/// missing stamp). Missing abs after that is `Corrupt`. Never `put_spend*`.
 pub(super) fn ensure_spend_abs_layouts(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
@@ -481,7 +482,6 @@ pub(super) fn ensure_spend_abs_layouts(
 
     let mut ensure_res = 0u64;
     let mut still: U64Map<Vec<u32>> = U64Map::default();
-    let mut need_idx_body_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (id, need_v) in &need {
         let fk = rbitcoin_primitives::Fk(*id);
         if batch_parents.has_abs_layout(fk)
@@ -493,60 +493,7 @@ pub(super) fn ensure_spend_abs_layouts(
             ensure_res = ensure_res.saturating_add(1);
             continue;
         }
-        if batch_parents.has_spender_rels(fk) {
-            if batch_parents.has_abs_layout(fk)
-                && (need_v.is_empty()
-                    || need_v
-                        .iter()
-                        .all(|&v| batch_parents.get_spender_abs(fk, v).is_some()))
-            {
-                ensure_res = ensure_res.saturating_add(1);
-                continue;
-            }
-            need_idx_body_range.push(fk);
-            continue;
-        }
         still.insert(*id, need_v.clone());
-    }
-
-    if !need_idx_body_range.is_empty() {
-        need_idx_body_range.sort_unstable_by_key(|f| f.0);
-        need_idx_body_range.dedup();
-        let ranges = query
-            .store()
-            .tx_body_range_batch(&need_idx_body_range)
-            .map_err(ConsensusError::from)?;
-        let spent = query
-            .store()
-            .tx_spent_range_batch(&need_idx_body_range)
-            .map_err(ConsensusError::from)?;
-        for (fk, sr) in need_idx_body_range.iter().zip(spent.into_iter()) {
-            if let Some(range) = sr {
-                batch_parents.set_spent_range_only(*fk, range);
-            }
-        }
-        for (fk, opt) in need_idx_body_range.iter().zip(ranges.into_iter()) {
-            let Some(range) = opt else {
-                // No idx range yet (e.g. parent not committed) — hard fail at post-condition
-                // if spend still needs abs; leave for invariant.
-                continue;
-            };
-            batch_parents.set_body_range_only(*fk, range);
-            let id = fk.get().unwrap_or(0);
-            let need_v = need.get(&id).cloned().unwrap_or_default();
-            if batch_parents.has_abs_layout(*fk)
-                && (need_v.is_empty()
-                    || need_v
-                        .iter()
-                        .all(|&v| batch_parents.get_spender_abs(*fk, v).is_some()))
-            {
-                ensure_res = ensure_res.saturating_add(1);
-            } else {
-                // denserels present but need_v not covered — should not happen if pin sparse
-                // was built for need; fall through to cold denserels as last resort.
-                still.entry(id).or_insert(need_v);
-            }
-        }
     }
     confirm_phase_stats::ENSURE_RES_HIT.fetch_add(ensure_res, Ordering::Relaxed);
 

@@ -54,6 +54,12 @@ before 1.0).
 
 ### Changed
 
+- **Held tx.head `.rel` pread:** after fail-closed `begin_batch` (`f07415b5`),
+  a poisoned leftover ring made `pread_batch_on_ctx` return false and
+  `read_rels_batch` opened a second TLS uring — nested panic on
+  `ibd-confirm-lookup`. Held failure is now `Corrupt`; `pread_batch` only
+  when `IoCtx` has no session.
+
 - **Algo-review S-H1:** HashHead / ScriptHashHead no longer rewrite occupied
   tables while serving. Mainnet `header.head` creates at 2²² slots (~96 MiB
   sparse). Overflow rolls `header.head.gN`. Undersized single-gen files

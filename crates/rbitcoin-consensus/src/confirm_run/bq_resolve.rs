@@ -157,8 +157,7 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 ///
 /// When `ids` is `Some`, skip TipOnly for keys already in the live union and
 /// publish **one** layer for the whole wave (`lo..=hi`). The layer stays while
-/// any height in the span is still on the BQ, overlaps `(tip, taken_hi]`,
-/// **or** `hi` is inside the RecentCreates horizon.
+/// any height in the span is still on the BQ or overlaps `(tip, taken_hi]`.
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,

@@ -13,27 +13,6 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 
-/// Floor so a cold / empty lead still covers one pipeline of 1-high batches.
-pub const RECENT_CREATES_HORIZON_FLOOR: u32 = 32;
-/// Cap: 32 load-sized batches × 144-block hard pack.
-pub const RECENT_CREATES_HORIZON_CAP: u32 = 32 * 144;
-
-/// One EWMA step: `(3·ewma + span) / 4`. Cold `ewma == 0` starts at `span`.
-#[inline]
-pub fn recent_creates_ewma_step(ewma: u32, span: u32) -> u32 {
-    if ewma == 0 {
-        span
-    } else {
-        ewma.saturating_mul(3).saturating_add(span) / 4
-    }
-}
-
-/// Heights to retain: EWMA lead, clamped to floor/cap.
-#[inline]
-pub fn recent_creates_horizon(ewma_lead: u32) -> u32 {
-    ewma_lead.clamp(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_CAP)
-}
-
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
 type RecentLayer = ChainLayer<u32, LiveMap>;
 
@@ -173,13 +152,6 @@ impl RecentCreates {
     pub fn expire_through(&self, through: u32) {
         self.filter_pending(|e| e.height > through);
         self.filter_layers(|l| l.hi > through, |e| e.height > through);
-    }
-
-    pub fn expire_to_horizon(&self, tip: u32, horizon: u32) {
-        if tip < horizon {
-            return;
-        }
-        self.expire_through(tip - horizon);
     }
 
     /// Disconnect: drop heights `≥ height`.
@@ -338,21 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn horizon_is_ewma_clamped_not_plus_quarter() {
-        assert_eq!(recent_creates_ewma_step(0, 40), 40);
-        assert_eq!(recent_creates_ewma_step(40, 40), 40);
-        assert_eq!(recent_creates_horizon(0), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(40), 40);
-        assert_eq!(recent_creates_horizon(10_000), RECENT_CREATES_HORIZON_CAP);
-        let mut e = 0u32;
-        for _ in 0..8 {
-            e = recent_creates_ewma_step(e, 40);
-        }
-        let h = recent_creates_horizon(e);
-        assert_eq!(h, 40, "settled horizon={h}");
-    }
-
-    #[test]
     fn recent_layer_publish_prepends_without_cloning_older_hits() {
         let r = RecentCreates::new();
         r.note(10, [(tid(1), Fk(1), (1, 2))]);
@@ -460,22 +417,6 @@ mod tests {
         assert_eq!(r.get(&tid(3)), Some((Fk(3), (5, 6))));
         let (_layers, keys) = r.size_snapshot();
         assert_eq!(keys, 2);
-    }
-
-    #[test]
-    fn expire_to_horizon_keeps_until_tip_covers_window() {
-        let r = RecentCreates::new();
-        r.note(0, [(tid(1), Fk(1), (1, 2))]);
-        r.publish_if_dirty();
-        r.expire_to_horizon(16, RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(
-            r.get(&tid(1)),
-            Some((Fk(1), (1, 2))),
-            "tip below horizon must not drop genesis-height notes"
-        );
-        r.expire_to_horizon(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_FLOOR);
-        r.publish_if_dirty();
-        assert!(r.get(&tid(1)).is_none());
     }
 
     #[test]

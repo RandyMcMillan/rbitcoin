@@ -72,13 +72,13 @@ pub struct ProcessOwnedSizes {
     pub pstore_weak: usize,
     pub pstore_live: usize,
     pub pstore_bytes: u64,
-    /// Write-published recent-create identity ring (heights / live keys).
+    /// Write-published recent-create layer chain (layers / live keys).
     pub recent_heights: usize,
     pub recent_keys: usize,
-    /// Published Arc keys (may equal live, or lag until flush).
+    /// Published layer keys (pending not included).
     pub recent_pub_keys: usize,
     pub recent_overlay_keys: usize,
-    /// Fifo txid copies (one vec per height).
+    /// Same as live keys (pending + published).
     pub recent_fifo_keys: usize,
     /// Live CreatePin payload bytes (not 96 B/key).
     pub recent_pin_bytes: u64,
@@ -160,10 +160,7 @@ pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{
     IdLayer, IdMap, LiveUnion, OutPointHasher, OutPointSet, PublishedIds, TxidHasher,
 };
-pub use recent_creates::{
-    recent_creates_ewma_step, recent_creates_horizon, RecentCreates, RECENT_CREATES_HORIZON_CAP,
-    RECENT_CREATES_HORIZON_FLOOR,
-};
+pub use recent_creates::RecentCreates;
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
@@ -1652,9 +1649,9 @@ impl Query {
         &self.recent_creates
     }
 
-    /// After Class A + idx: publish `txid → (fk, range)` and expire past
-    /// [`recent_creates_horizon`]. Missing idx range is skipped (leftover
-    /// TipOnly stays the home).
+    /// After Class A + idx: note identity rows and flush (layer until =
+    /// `lookup_started_hi`, drop when `class_a_hi` covers it). Missing idx
+    /// range is skipped (leftover TipOnly stays the home).
     pub fn publish_recent_creates(
         &self,
         height: u32,
@@ -1722,8 +1719,9 @@ impl Query {
     pub fn flush_recent_creates(&self) {
         let started = self.lookup_started_hi().unwrap_or(0);
         self.recent_creates.publish_layer(started);
-        self.recent_creates
-            .drop_ready(self.class_a_hi().unwrap_or(0));
+        if let Some(h) = self.class_a_hi() {
+            self.recent_creates.drop_ready(h);
+        }
     }
 
     pub fn expire_recent_creates(&self, tip_hint: u32) {
@@ -1732,8 +1730,9 @@ impl Query {
     }
 
     pub fn expire_recent_creates_defer(&self, _tip_hint: u32) {
-        self.recent_creates
-            .drop_ready(self.class_a_hi().unwrap_or(0));
+        if let Some(h) = self.class_a_hi() {
+            self.recent_creates.drop_ready(h);
+        }
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.

@@ -1179,11 +1179,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("rbitcoin-mempool-accept-{n}"));
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-mempool-accept-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            n
+        ));
         let _ = std::fs::remove_dir_all(&p);
         p
     }

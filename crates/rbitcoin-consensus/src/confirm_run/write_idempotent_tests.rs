@@ -1709,6 +1709,179 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Write-published RecentCreates outs cover a later spend after in-flight is gone.
+/// That is `PIN_CACHE_BODY` / `warm.already`, not `PIN_NEW` / range-fill.
+#[test]
+fn pin_recent_outs_is_cache_not_new() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-recent-outs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+
+    let mut tid = [0u8; 32];
+    tid[0] = 0x41;
+    let parent_tx = TxRecord {
+        txid: tid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let parent_out = OutputRecord::unspent(50, vec![0x51, 0xaa]);
+    let pin: CreatePin = Arc::new((parent_tx.clone(), vec![parent_out.clone()]));
+    let pfk = Fk(7);
+    q.note_recent_creates_pins(10, [(tid, pfk, (1, 8), Some(Arc::clone(&pin)))]);
+    q.flush_recent_creates();
+
+    let spend_tx = TxRecord {
+        txid: [0x5cu8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let spend_ins = vec![InputRecord {
+        prev_txid: tid,
+        create_fk: pfk,
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+        spend_ins,
+    )];
+    plan.planned_fks = vec![Fk(100)];
+    plan.external_parent_ranges.insert(7, (99, 1));
+    plan.external_parent_txids.insert(7, tid);
+
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (_parents, _thin, warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+            .expect("recent outs must cover without range-fill");
+    assert_eq!(warm.parents, 1);
+    assert_eq!(
+        warm.already, 1,
+        "RecentCreates outs must count as PIN_CACHE, not PIN_NEW"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Identity-only RecentCreates (no outs) still cold-fills by stamped range.
+#[test]
+fn pin_recent_identity_without_outs_still_range_fills() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, Query};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::{Arc, Once};
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-recent-id-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let mut tid = [0u8; 32];
+    tid[0] = 0x42;
+    let parent = (
+        TxRecord {
+            txid: tid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![InputRecord::coinbase(u32::MAX, vec![0x42], vec![])],
+        vec![OutputRecord::unspent(50, vec![0x51, 0x42])],
+    );
+    let fks = q
+        .store()
+        .txs
+        .put_full_batch_indexed(&[parent.clone()], true)
+        .unwrap();
+    let range = q.store().tx_body_range(fks[0]).unwrap();
+    q.note_recent_creates_rows(10, [(tid, fks[0], range)]);
+    q.flush_recent_creates();
+
+    let spend_tx = TxRecord {
+        txid: [0x5du8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let spend_ins = vec![InputRecord {
+        prev_txid: tid,
+        create_fk: fks[0],
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+        spend_ins,
+    )];
+    plan.planned_fks = vec![Fk(100)];
+    if let Some(id) = fks[0].get() {
+        plan.external_parent_ranges.insert(id, range);
+        plan.external_parent_txids.insert(id, tid);
+    }
+
+    let parent_pin = ParentPinStamp::take_from_plan(&mut plan);
+    let (_parents, _thin, warm) =
+        pin_for_wire_batch(&q, Some(&plan), &parent_pin, &[], &[], None, None)
+            .expect("identity-only recent still range-fills");
+    assert_eq!(warm.parents, 1);
+    assert_eq!(
+        warm.already, 0,
+        "identity without outs must not count as PIN_CACHE"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Store start states: S0 new Class A and S1 already-archived both confirm
 /// via shipped lookup→load (body denserels by range; no load head/idx).
 #[test]

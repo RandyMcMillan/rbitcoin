@@ -275,9 +275,10 @@ pub(crate) struct IbdPerfSample {
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
     pub load_plan_pin_ms: u64,
-    /// Pin residual sub-walls (adopt / range-fill insert / contract / publish).
+    /// Pin residual sub-walls (adopt / recent-outs / range-fill insert / contract / publish).
     pub load_pin_adopt_ms: u64,
     pub load_pin_range_fill_ms: u64,
+    pub load_pin_recent_outs_ms: u64,
     pub load_pin_contract_ms: u64,
     pub load_pin_publish_ms: u64,
     pub load_cold_io_ms: u64,
@@ -549,6 +550,7 @@ impl Default for IbdPerfSample {
             load_plan_pin_ms: 0,
             load_pin_adopt_ms: 0,
             load_pin_range_fill_ms: 0,
+            load_pin_recent_outs_ms: 0,
             load_pin_contract_ms: 0,
             load_pin_publish_ms: 0,
             load_cold_io_ms: 0,
@@ -1002,6 +1004,7 @@ pub(crate) fn sample(
         load_plan_pin_ms: ns_ms(pw.plan_pin_ns),
         load_pin_adopt_ms: ns_ms(pw.pin_adopt_ns),
         load_pin_range_fill_ms: ns_ms(pw.pin_range_fill_ns),
+        load_pin_recent_outs_ms: ns_ms(pw.pin_recent_outs_ns),
         load_pin_contract_ms: ns_ms(pw.pin_contract_ns),
         load_pin_publish_ms: ns_ms(pw.pin_publish_ns),
         load_cold_io_ms: ns_ms(pw.cold_io_ns),
@@ -1396,7 +1399,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
          pin(thin={}ms plan={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={} \
-         adopt={}ms range_fill={}ms contract={}ms publish={}ms) \
+         adopt={}ms recent_outs={}ms range_fill={}ms contract={}ms publish={}ms) \
          pin_hit%={} pin_plan={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         load_wall_ms,
@@ -1438,6 +1441,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         cold_dec_ms,
         pin_cold_us_per,
         s.load_pin_adopt_ms,
+        s.load_pin_recent_outs_ms,
         s.load_pin_range_fill_ms,
         s.load_pin_contract_ms,
         s.load_pin_publish_ms,
@@ -2228,6 +2232,7 @@ mod tests {
         s.load_plan_pin_ms = 100;
         s.load_pin_plan = 20_000;
         s.load_pin_adopt_ms = 15;
+        s.load_pin_recent_outs_ms = 8;
         s.load_pin_range_fill_ms = 40;
         s.load_pin_contract_ms = 25;
         s.load_pin_publish_ms = 12;
@@ -2243,6 +2248,7 @@ mod tests {
         // Residual pin sub-timers named in pin(...) block.
         assert!(line.contains("thin=7ms"), "{line}");
         assert!(line.contains("adopt=15ms"), "{line}");
+        assert!(line.contains("recent_outs=8ms"), "{line}");
         assert!(line.contains("range_fill=40ms"), "{line}");
         assert!(line.contains("contract=25ms"), "{line}");
         assert!(line.contains("publish=12ms"), "{line}");

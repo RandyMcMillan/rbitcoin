@@ -171,8 +171,12 @@ pub fn confirm_write_phase(
                     .tx_body_range_batch(&fks)
                     .map_err(ConsensusError::from)?;
                 let idx_ns = t_idx.elapsed().as_nanos() as u64;
+                let pin_opts: Vec<Option<rbitcoin_query::CreatePin>> = pins
+                    .iter()
+                    .map(|p| Some(std::sync::Arc::clone(p)))
+                    .collect();
                 for (height, rows) in
-                    recent_create_rows_for_slices(&slices, &txid_fks, &ranges, &[])
+                    recent_create_rows_for_slices(&slices, &txid_fks, &ranges, &pin_opts)
                 {
                     query.note_recent_creates_pins(height, rows);
                 }

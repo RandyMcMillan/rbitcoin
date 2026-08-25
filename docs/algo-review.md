@@ -117,25 +117,6 @@ These are the ones worth a plan. ✔ = re-read against current source.
 
 ### High — mempool / RPC / Electrum (product-visible)
 
-#### M-H1. ✔ `testmempoolaccept` really accepts, then only evicts the trial tx
-
-`crates/rbitcoin-rpc/src/methods.rs:1540-1550`. Comment admits
-best-effort rollback. `accept_tx` runs the live path: RBF **actually evicts**
-conflicts inside `commit_after_script`. Rollback is
-`evict_live_txids(&[trial])` — replaced txs stay gone, and an announce may
-already have fired.
-
-**Fix:** dry-run in `MempoolAccept` (prepare + scripts + RBF checks, no
-commit), or snapshot/restore the conflict set.
-
-#### M-H2. ✔ RPC `dispatch` `active` stack pops the wrong entry
-
-`crates/rbitcoin-rpc/src/methods.rs:298-309`. Shared `Vec` push/pop across
-concurrent `spawn_blocking` threads. Thread A finishes and `pop()`s B's
-entry. `getrpcinfo` lies; durations pair with the wrong start.
-
-**Fix:** id-keyed map / slab; remove by id.
-
 #### M-H3. Electrum status preimage vs protocol — **documented, not a silent bug**
 
 `crates/rbitcoin-electrum/src/server.rs:1692-1744` concatenates
@@ -313,7 +294,7 @@ Do not flatten io_uring machines. Do not add a process pin FIFO.
 8. **Held/pending eviction:** FIFO via existing `held_seq` / `VecDeque`.
 9. **Announced-tx sets:** rolling bloom (Core `CRollingBloomFilter`).
 10. **BlockCache:** `VecDeque` + height offset.
-11. **RPC `active`:** slab keyed by id (fixes M-H2).
+11. **RPC `active`:** id-keyed map (M-H2 closed).
 12. **Esplora `sh_join`:** small LRU, not one global slot.
 13. **Esplora `/blocks`:** stored summary, not reconstruct.
 14. **Electrum status:** one history-row builder for wire + preimage.
@@ -390,8 +371,8 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | consensus + primitives | 0 | *(none remaining)* | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 0 | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
-| mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
-| rpc | 2 (active pop, testmempoolaccept) | submitblock gate, gettxout, hashps, unbounded batch | GBT depends, longpoll |
+| mempool | 0 | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
+| rpc | 0 | submitblock gate, gettxout, hashps, unbounded batch | GBT depends, longpoll |
 | electrum | 1 (status **order** vs get_history) | mempool_stats | status full-history, announce O(subs) |
 | esplora | 0 | stub mempool JSON, WS on runtime, sh_join slot | `/blocks` reconstruct |
 | node/cli/log/bench | 0 | milestone=0 conf, minrelay silent, frozen AddrMan | log gating, api_log mutex |
@@ -403,11 +384,10 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
-2. Electrum status **ordering**; decide COMPAT vs spec for the extra
+1. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
-3. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-4. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
+2. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+3. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
    v2 decode, MTP ring, and HashHead online rehash (S-H1) are closed.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
@@ -465,4 +445,10 @@ leaving a stale High row in §2–6.
   VERSION/VERACK bound); timeout is `NetError::Timeout` and drops the
   `max_inbound` permit. Pins: `inbound_handshake_timeout_after_silence`,
   `inbound_handshake_timeout_is_core_60s`.
+- **M-H1.** `testmempoolaccept` uses `MempoolHub::test_accept` (prepare +
+  scripts + RBF/cluster checks, no commit). Pins:
+  `testmempoolaccept_rbf_does_not_evict_conflict`,
+  `evaluate_after_script_rbf_leaves_conflict`.
+- **M-H2.** `RpcActive` is an id-keyed map; `dispatch` removes by id.
+  Pin: `rpc_active_leave_removes_by_id_not_last`.
 - **S-H1** — HashHead / ScriptHashHead no longer rewrite occupied tables while serving. Header overflow rolls `header.head.gN`; ingest SH seals at 0.80. Undersized single-gen `header.head` rewrites on open only. `rehash_to` / `rehash_gate` / `ShardedHashHead` deleted. [#248](https://github.com/reardencode/rbitcoin/pull/248).

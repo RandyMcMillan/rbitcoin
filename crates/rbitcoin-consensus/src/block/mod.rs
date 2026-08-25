@@ -1820,9 +1820,10 @@ pub(crate) fn verify_one_script_job(job: &ScriptCheckJob) -> Result<(), Consensu
     }
 }
 
-/// Halving subsidy (mainnet schedule; regtest uses same formula with params).
-pub fn block_subsidy(height: u32, _params: &ChainParams) -> i64 {
-    let halvings = height / 210_000;
+/// Halving subsidy. Regtest interval is 150; other networks 210_000 (Core).
+pub fn block_subsidy(height: u32, params: &ChainParams) -> i64 {
+    let interval = params.subsidy_halving_interval();
+    let halvings = height / interval;
     if halvings >= 64 {
         return 0;
     }

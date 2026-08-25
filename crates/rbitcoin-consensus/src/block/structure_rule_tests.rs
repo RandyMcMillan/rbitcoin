@@ -531,13 +531,17 @@ fn witness_commitment_script_honors_reserved() {
 
 #[test]
 fn p1_block_subsidy_halvings() {
-    let p = params();
-    assert_eq!(block_subsidy(0, &p), 50_0000_0000);
-    assert_eq!(block_subsidy(209_999, &p), 50_0000_0000);
-    assert_eq!(block_subsidy(210_000, &p), 25_0000_0000);
-    assert_eq!(block_subsidy(419_999, &p), 25_0000_0000);
-    assert_eq!(block_subsidy(420_000, &p), 12_5000_0000);
-    assert_eq!(block_subsidy(210_000 * 64, &p), 0);
+    let main = ChainParams::mainnet();
+    assert_eq!(block_subsidy(0, &main), 50_0000_0000);
+    assert_eq!(block_subsidy(209_999, &main), 50_0000_0000);
+    assert_eq!(block_subsidy(210_000, &main), 25_0000_0000);
+    assert_eq!(block_subsidy(419_999, &main), 25_0000_0000);
+    assert_eq!(block_subsidy(420_000, &main), 12_5000_0000);
+    assert_eq!(block_subsidy(210_000 * 64, &main), 0);
+
+    let rt = ChainParams::regtest();
+    assert_eq!(block_subsidy(149, &rt), 50_0000_0000);
+    assert_eq!(block_subsidy(150, &rt), 25_0000_0000);
 }
 
 #[test]

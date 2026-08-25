@@ -133,6 +133,14 @@ impl ChainParams {
         self.btc.allow_min_difficulty_blocks
     }
 
+    pub fn subsidy_halving_interval(&self) -> u32 {
+        if self.network == Network::Regtest {
+            150
+        } else {
+            210_000
+        }
+    }
+
     /// Coinbase maturity in blocks (Core default).
     pub fn coinbase_maturity(&self) -> u32 {
         100

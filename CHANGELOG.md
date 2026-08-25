@@ -139,6 +139,8 @@ before 1.0).
 
 ### Fixed
 
+- **Regtest subsidy halves every 150 blocks** (Core `nSubsidyHalvingInterval`).
+
 - **Coinbase (and every tx) with empty vout is rejected:** Core
   `bad-txns-vout-empty`, including the coinbase.
 

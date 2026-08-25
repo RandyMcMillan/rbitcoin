@@ -229,8 +229,6 @@ will loop.
 
 ### Consensus
 
-- **C-M2.** `block_subsidy` ignores `ChainParams` (`block/mod.rs` ~1848):
-  hardcoded 210 000. Regtest halves every 150 in Core.
 - **C-M3.** P2SH sigop `last_script_push` skips non-push opcodes instead of
   returning 0. Observable under milestone (scripts skipped).
 - **C-M4.** Pipelined `assemble_run` skips future-time and BIP34/66/65
@@ -443,7 +441,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
 | store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
-| consensus + primitives | 0 | subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
+| consensus + primitives | 0 | pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
@@ -478,6 +476,7 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-M2.** Regtest subsidy halves every 150 (`p1_block_subsidy_halvings`). This PR.
 - **C-M1.** Coinbase empty `vout` rejected (`s13_rejects_coinbase_empty_vout`). This PR.
 - **C-H4.** Testnet 20-minute min-difficulty (`allow_min_difficulty_blocks`)
   and walk-back to last non-powLimit bits. Pin: `testnet_min_difficulty_after_20_minute_gap`.

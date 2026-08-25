@@ -59,7 +59,7 @@ before 1.0).
   prefix. BIP324 v2 decode is command+payload (no sha256d checksum, no
   v1 reframe). Fence-tip BIP113 MTP is an 11-slot ring. Closed
   [`docs/algo-review.md`](docs/algo-review.md) P7, P8, P10, P16
-  ([#PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU)).
+  ([#245](https://github.com/reardencode/rbitcoin/pull/245)).
 
 - **Algo-review P1–P3:** BIP339 wtxid inv is a `TxGraph` map (no mempool
   scan under the lock). Best-chain cumulative work is a RAM prefix

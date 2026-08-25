@@ -545,7 +545,7 @@ leaving a stale High row in §2–6.
 - **P3** — `worst_chunk` is the first `(rate, rep)` map entry; insert/remove repair the cluster. [#244](https://github.com/reardencode/rbitcoin/pull/244).
 - **§6.20** — `has_spender_rels` deleted; `has_abs_layout` is the spent_range predicate. [#246](https://github.com/reardencode/rbitcoin/pull/246).
 - Lookup now stamps `spent.idx` ranges (stage table already required it); load copies onto pins; write ensure is holes-only. Not in the 2026-08-25 Open tables. [#246](https://github.com/reardencode/rbitcoin/pull/246).
-- **P7** — leftover TipOnly fence snapshot is `Arc<Vec<FenceRun>>` (O(1) clone; extend/pop COW). [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
-- **P8** — v2 `parse_v2_contents` does not sha256d; `FramedMessage::decode` is command+payload (checksum unused). [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
-- **P10** — densify `densify_scan_lo` skips BQ-ready / inflight / archived prefix; pending still walked. [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
-- **P16** — fence-tip MTP is an 11-slot ring on extend; pop rebuilds; historical heights still 11-read. [PR_IBD_CPU](https://github.com/reardencode/rbitcoin/pull/PR_IBD_CPU).
+- **P7** — leftover TipOnly fence snapshot is `Arc<Vec<FenceRun>>` (O(1) clone; extend/pop COW). [#245](https://github.com/reardencode/rbitcoin/pull/245).
+- **P8** — v2 `parse_v2_contents` does not sha256d; `FramedMessage::decode` is command+payload (checksum unused). [#245](https://github.com/reardencode/rbitcoin/pull/245).
+- **P10** — densify `densify_scan_lo` skips BQ-ready / inflight / archived prefix; pending still walked. [#245](https://github.com/reardencode/rbitcoin/pull/245).
+- **P16** — fence-tip MTP is an 11-slot ring on extend; pop rebuilds; historical heights still 11-read. [#245](https://github.com/reardencode/rbitcoin/pull/245).

@@ -56,7 +56,9 @@ IBD thread split (same IO table): lookup **thread** is decode + TipOnly +
 `take_raw` onto loadq. Structure + plan_batch (`confirm_wire_lookup_stamp`)
 run on the **load** thread and consume `LoadBatch.pres` — they do not read
 `block_queue_resolved`. Leftover TipOnly on that stamp is still **lookup-stage
-IO** (head / idx), not load pin.
+IO** (head / idx), not load pin. After a lookup wave publishes parent P into
+live_union, load stamp of a child spending P has **zero** leftover TipOnly for
+P (`head_need_n=0`). Pack stays on load; do not move `plan_batch` onto lookup.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|

@@ -288,44 +288,64 @@ pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
 
 pub(crate) use rbitcoin_primitives::script_sigop_count;
 
-/// Last data push in a script (P2SH redeem / witness script).
+/// Last push in a script for P2SH/BIP141 sigops (Core `CScript::GetSigOpCount(scriptSig)`).
+///
+/// Opcode `> OP_16` or a truncated push → no redeem (0 sigops). OP_N / OP_1NEGATE
+/// count as an empty push.
 fn last_script_push(script: &[u8]) -> Option<&[u8]> {
     let mut i = 0usize;
-    let mut last: Option<(usize, usize)> = None;
+    let mut last: &[u8] = &[];
     while i < script.len() {
         let opcode = script[i];
         i += 1;
-        let (start, len) = if opcode <= 0x4b {
+        if opcode > 0x60 {
+            return None;
+        }
+        if opcode <= 0x4b {
             let push = opcode as usize;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
-        } else if opcode == 0x4c && i < script.len() {
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
+        } else if opcode == 0x4c {
+            if i >= script.len() {
+                return None;
+            }
             let push = script[i] as usize;
             i += 1;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
-        } else if opcode == 0x4d && i + 1 < script.len() {
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
+        } else if opcode == 0x4d {
+            if i + 1 >= script.len() {
+                return None;
+            }
             let push = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
             i += 2;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
-        } else if opcode == 0x4e && i + 3 < script.len() {
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
+        } else if opcode == 0x4e {
+            if i + 3 >= script.len() {
+                return None;
+            }
             let push = u32::from_le_bytes(script[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
             i += 4;
-            let s = i;
-            i = i.saturating_add(push);
-            (s, push)
+            if i.saturating_add(push) > script.len() {
+                return None;
+            }
+            last = &script[i..i + push];
+            i += push;
         } else {
-            continue;
-        };
-        if start + len <= script.len() {
-            last = Some((start, len));
+            last = &[];
         }
     }
-    last.map(|(s, l)| &script[s..s + l])
+    Some(last)
 }
 
 fn is_p2sh_script(spk: &[u8]) -> bool {

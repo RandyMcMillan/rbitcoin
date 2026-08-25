@@ -139,6 +139,8 @@ before 1.0).
 
 ### Fixed
 
+- **P2SH sigops match Core GetSigOpCount(scriptSig):** opcode `> OP_16` yields 0.
+
 - **Regtest subsidy halves every 150 blocks** (Core `nSubsidyHalvingInterval`).
 
 - **Coinbase (and every tx) with empty vout is rejected:** Core

@@ -229,8 +229,6 @@ will loop.
 
 ### Consensus
 
-- **C-M3.** P2SH sigop `last_script_push` skips non-push opcodes instead of
-  returning 0. Observable under milestone (scripts skipped).
 - **C-M4.** Pipelined `assemble_run` skips future-time and BIP34/66/65
   nVersion; relies on headers-first having run `validate_header`. Tip-ahead
   / block-first is the gap.
@@ -476,6 +474,7 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-M3.** P2SH sigops abort on scriptSig opcode `> OP_16` (`p2sh_sigops_non_push_scriptsig_is_zero`). This PR.
 - **C-M2.** Regtest subsidy halves every 150 (`p1_block_subsidy_halvings`). This PR.
 - **C-M1.** Coinbase empty `vout` rejected (`s13_rejects_coinbase_empty_vout`). This PR.
 - **C-H4.** Testnet 20-minute min-difficulty (`allow_min_difficulty_blocks`)

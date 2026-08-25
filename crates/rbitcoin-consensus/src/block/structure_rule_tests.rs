@@ -583,7 +583,7 @@ fn script_sigop_count_and_last_push_helpers() {
         last_script_push(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0x77]),
         Some(&[0x77][..])
     );
-    assert!(last_script_push(&[]).is_none());
+    assert_eq!(last_script_push(&[]), Some(&[][..]));
     // Program shape helpers
     let mut p2sh = vec![0xa9, 0x14];
     p2sh.extend_from_slice(&[0u8; 20]);

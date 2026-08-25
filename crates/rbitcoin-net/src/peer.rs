@@ -1477,6 +1477,17 @@ async fn handle_peer_frame(
                     // (`p2p_headers_sync_with_minchainwork` height=14).
                     let announced_h = announced_headers_height(hub, pending_headers, last);
                     let noban = session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_noban()));
+                    let branch = header_branch_vs_tip(hub, pending_headers, last);
+                    let our_tip = hub.tip_height().unwrap_or(0);
+                    if announced_tip_is_hopeless(our_tip, announced_h, branch) && !noban {
+                        rbitcoin_log::info!(
+                            "p2p: disconnect stale fork tip announced={announced_h} our={our_tip}"
+                        );
+                        if let Some(s) = session {
+                            s.request_disconnect();
+                        }
+                        return Ok(());
+                    }
                     if !header_path_meets_minwork(hub, pending_headers, last) {
                         if noban {
                             persist_pending_header_path(hub, pending_headers, last);
@@ -1498,7 +1509,7 @@ async fn handle_peer_frame(
                                 pending_blocks,
                                 requested_blocks,
                             );
-                            match header_branch_vs_tip(hub, pending_headers, last) {
+                            match branch {
                                 Some(std::cmp::Ordering::Less) => want.clear(),
                                 // BIP130 cap is for unsolicited announcements only.
                                 // A getheaders reply (rejoin / catch-up) must fetch
@@ -2041,6 +2052,21 @@ fn header_path_join(
         }
     }
     None
+}
+
+/// Headers more than this many blocks behind our tip are not useful for
+/// tip-follow (Core `NODE_NETWORK_LIMITED` window, ~2 days).
+pub(crate) const ANCIENT_TIP_BLOCKS: u32 = 288;
+
+/// Connecting header path that cannot beat our tip and whose announced height
+/// is more than [`ANCIENT_TIP_BLOCKS`] behind — BIP-110-class minority fork.
+pub(crate) fn announced_tip_is_hopeless(
+    our_tip: u32,
+    announced_h: u32,
+    branch: Option<std::cmp::Ordering>,
+) -> bool {
+    matches!(branch, Some(std::cmp::Ordering::Less))
+        && announced_h.saturating_add(ANCIENT_TIP_BLOCKS) < our_tip
 }
 
 /// Compare announced header-chain length (equal-bits ≈ work) to our path

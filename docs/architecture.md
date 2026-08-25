@@ -192,9 +192,10 @@ Roles and locks: [`docs/concurrency.md`](./concurrency.md). IO modality:
    (CPU only) → write** so disk work, script verify, and Class A/C publish
    overlap without pausing queries under a map lock. Confirm write is the
    **sole Class A appender** on the unified IBD path.
-4. **Request-bounded wire memory.** Durable **body-queue soft time-depth**
-   (and optional absolute byte ceiling) limit new densify `getdata` — **not**
-   peer TCP accept of already-requested blocks (see ibd-memory).
+4. **Request-bounded wire memory.** Body-queue **soft time-depth** and the
+   1 GiB densify assign-stop limit new `getdata` (holes in the fetched range
+   still fill) — **not** peer TCP accept of already-requested blocks (see
+   ibd-memory).
 5. **Bulk IO vs table transport.** `RBITCOIN_IO=uring|pread` selects **bulk
    batch** backends for `txout` pin, `txid.body` identity, `spent` annotate, spend paths
    (thread-local ring depth 128). **Table files** are always **fd** (page-/chunk-

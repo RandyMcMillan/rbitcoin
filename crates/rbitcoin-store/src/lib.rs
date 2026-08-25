@@ -66,9 +66,7 @@ pub use address_head::{
 };
 #[cfg(any(test, debug_assertions))]
 pub use block_queue::take_raw_clone_n;
-pub use block_queue::{
-    BlockQueue, QueuedBlock, QueuedBlockMeta, TakenRaw, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
-};
+pub use block_queue::{BlockQueue, QueuedBlock, QueuedBlockMeta, TakenRaw};
 pub use block_wire::block_wire_input_count;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use error::StoreError;

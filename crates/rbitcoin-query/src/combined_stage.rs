@@ -309,25 +309,34 @@ mod tests {
         let free = BQ_SOFT_FREE_BYTES;
         let over = free + 1;
         // Under free: full densify_hi regardless of rate.
-        assert_eq!(soft_densify_band_hi(100, 1000, free, Some(0.1)), 1000);
+        assert_eq!(
+            soft_densify_band_hi(100, 1000, free, Some(0.1), u64::MAX, None),
+            1000
+        );
         assert!(!soft_assign_restricted(free));
         // densify_hi < path_lo edge (empty band).
-        assert_eq!(soft_densify_band_hi(50, 40, free, Some(1.0)), 40);
-        assert_eq!(soft_densify_band_hi(50, 40, over, Some(1.0)), 40);
+        assert_eq!(
+            soft_densify_band_hi(50, 40, free, Some(1.0), u64::MAX, None),
+            40
+        );
+        assert_eq!(
+            soft_densify_band_hi(50, 40, over, Some(1.0), u64::MAX, None),
+            40
+        );
         // Over free: confirm window only.
         assert_eq!(
-            soft_densify_band_hi(100, 1000, over, Some(0.1)),
+            soft_densify_band_hi(100, 1000, over, Some(0.1), u64::MAX, None),
             105,
             "0.1 blk/s × 60s = 6 heights → path_lo..path_lo+5"
         );
         assert_eq!(
-            soft_densify_band_hi(100, 1000, over, None),
+            soft_densify_band_hi(100, 1000, over, None, u64::MAX, None),
             100,
             "rate cold → tip-adjacent only"
         );
         // Window clamp to densify_hi when rate is high.
         assert_eq!(
-            soft_densify_band_hi(100, 110, over, Some(5.0)),
+            soft_densify_band_hi(100, 110, over, Some(5.0), u64::MAX, None),
             110,
             "window 300 clamped to densify_hi=110"
         );

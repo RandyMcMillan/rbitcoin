@@ -6,7 +6,7 @@
 //!
 //! Expire is `pop_front` of whole heights. Horizon is
 //! [`recent_creates_horizon`] on an EWMA of `lookup_taken_hi − tip`
-//! plus 25% (floor 32, cap `32*144`).
+//! (floor 32, cap `32*144`).
 //!
 //! Overlay + tombstones hold unflushed notes. [`RecentCreates::publish_if_dirty`]
 //! builds **one** published [`Arc`] (confirm write: once per batch). There is no
@@ -35,12 +35,10 @@ pub fn recent_creates_ewma_step(ewma: u32, span: u32) -> u32 {
     }
 }
 
-/// Heights to retain: EWMA lead + 25%, clamped to floor/cap.
+/// Heights to retain: EWMA lead, clamped to floor/cap.
 #[inline]
 pub fn recent_creates_horizon(ewma_lead: u32) -> u32 {
-    ewma_lead
-        .saturating_add(ewma_lead / 4)
-        .clamp(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_CAP)
+    ewma_lead.clamp(RECENT_CREATES_HORIZON_FLOOR, RECENT_CREATES_HORIZON_CAP)
 }
 
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
@@ -271,18 +269,18 @@ mod tests {
     }
 
     #[test]
-    fn horizon_is_ewma_lead_plus_quarter() {
+    fn horizon_is_ewma_clamped_not_plus_quarter() {
         assert_eq!(recent_creates_ewma_step(0, 40), 40);
         assert_eq!(recent_creates_ewma_step(40, 40), 40);
         assert_eq!(recent_creates_horizon(0), RECENT_CREATES_HORIZON_FLOOR);
-        assert_eq!(recent_creates_horizon(40), 50);
+        assert_eq!(recent_creates_horizon(40), 40);
         assert_eq!(recent_creates_horizon(10_000), RECENT_CREATES_HORIZON_CAP);
         let mut e = 0u32;
         for _ in 0..8 {
             e = recent_creates_ewma_step(e, 40);
         }
         let h = recent_creates_horizon(e);
-        assert!((40..=50).contains(&h), "settled horizon={h}");
+        assert_eq!(h, 40, "settled horizon={h}");
     }
 
     #[test]

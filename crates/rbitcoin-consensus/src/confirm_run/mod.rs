@@ -50,8 +50,9 @@ mod scripts;
 mod write;
 
 pub use bq_resolve::{
-    confirm_bq_resolve_wave, confirm_bq_resolve_wave_with_ids, BqResolveWave, BqResolveWaveStats,
-    BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS, BQ_RESOLVE_WAVE_MIN_INPUTS,
+    confirm_bq_resolve_wave, confirm_bq_resolve_wave_capped, confirm_bq_resolve_wave_with_ids,
+    take_wave_items_for_load, BqResolveWave, BqResolveWaveStats, BQ_RESOLVE_WAVE_MAX_BLOCKS,
+    BQ_RESOLVE_WAVE_MAX_INPUTS, BQ_RESOLVE_WAVE_MIN_INPUTS,
 };
 #[cfg(test)]
 use head_drain::{submit_head_drain, HEAD_DRAIN_THREAD_NAME};

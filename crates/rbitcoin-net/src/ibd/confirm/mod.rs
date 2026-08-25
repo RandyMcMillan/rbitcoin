@@ -624,6 +624,10 @@ impl ConfirmQueueDepths {
         )
     }
 
+    pub(crate) fn load_depth(&self) -> usize {
+        self.lookup_to_load.load(Ordering::Relaxed)
+    }
+
     /// Max queue depths since last call; resets HWMs to 0.
     pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
         (
@@ -1630,21 +1634,39 @@ pub(crate) fn spawn_confirm_engine(
                 } else {
                     tip.unwrap_or(0).saturating_add(1)
                 };
-                let wave_h = hub.query.block_queue_unresolved_heights(
-                    path_lo,
-                    &skip,
-                    rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS,
-                );
+                let remaining = load_queue_cap().saturating_sub(queues_lookup.load_depth());
+                if remaining == 0 {
+                    let t_wait = Instant::now();
+                    let g = feed.inner.lock().unwrap();
+                    if feed.stopped() {
+                        break;
+                    }
+                    let (_gg, _) = feed.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+                    confirm_thr_stats::add_lookup_send_wait(t_wait.elapsed());
+                    confirm_thr_stats::add_lookup_claim(t_wait.elapsed());
+                    continue;
+                }
+                let max_blocks = remaining
+                    .saturating_mul(CONFIRM_RUN_MAX_BLOCKS)
+                    .min(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_BLOCKS);
+                let max_inputs = (remaining as u32)
+                    .saturating_mul(confirm_batch_max_inputs())
+                    .min(rbitcoin_consensus::BQ_RESOLVE_WAVE_MAX_INPUTS);
+                let wave_h = hub
+                    .query
+                    .block_queue_unresolved_heights(path_lo, &skip, max_blocks);
                 confirm_thr_stats::add_lookup_other(t_sel.elapsed());
                 let mut did = false;
                 if !wave_h.is_empty() {
                     let t_wave = Instant::now();
-                    match rbitcoin_consensus::confirm_bq_resolve_wave_with_ids(
+                    match rbitcoin_consensus::confirm_bq_resolve_wave_capped(
                         &hub.query,
                         &hub.params,
                         hub.milestone,
                         &wave_h,
                         Some((&mut live_union, hub.query.published_ids().as_ref())),
+                        max_blocks,
+                        max_inputs,
                     ) {
                         Ok(wave) if !wave.items.is_empty() => {
                             did = true;
@@ -1659,7 +1681,11 @@ pub(crate) fn spawn_confirm_engine(
                                 CONFIRM_RUN_MAX_BLOCKS,
                             );
                             let mut i = 0usize;
+                            let mut sent = 0usize;
                             for n in parts {
+                                if sent >= remaining {
+                                    break;
+                                }
                                 let end = i.saturating_add(n).min(wave.items.len());
                                 if i >= end {
                                     break;
@@ -1670,10 +1696,21 @@ pub(crate) fn spawn_confirm_engine(
                                 let n = chunk.len();
                                 let wire: usize =
                                     chunk.iter().map(|(_, _, w)| w.block.total_size()).sum();
-                                if load_tx.send(LoadBatch { items: chunk }).is_err() {
+                                if load_tx
+                                    .send(LoadBatch {
+                                        items: chunk.clone(),
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if rbitcoin_consensus::take_wave_items_for_load(&hub.query, &chunk)
+                                    .is_err()
+                                {
                                     break;
                                 }
                                 queues_lookup.note_load_send(n, wire);
+                                sent = sent.saturating_add(1);
                                 confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
                             }
                             feed.notify();

@@ -69,16 +69,13 @@ pub fn bq_resolve_wave_hold_partial(
     path_lo: u32,
     first_unresolved: u32,
     more_remain: bool,
+    max_inputs: u32,
+    max_blocks: usize,
 ) -> bool {
     if n_blocks == 0 {
         return false;
     }
-    let at_max = bq_resolve_wave_stop_after(
-        sum_inputs,
-        n_blocks,
-        BQ_RESOLVE_WAVE_MAX_INPUTS,
-        BQ_RESOLVE_WAVE_MAX_BLOCKS,
-    );
+    let at_max = bq_resolve_wave_stop_after(sum_inputs, n_blocks, max_inputs, max_blocks);
     if at_max {
         return false;
     }
@@ -94,7 +91,7 @@ pub fn bq_resolve_wave_hold_partial(
     ready > soft_win / 2
 }
 
-/// Decoded heights from one lookup wave (BQ rows already taken).
+/// Decoded heights from one lookup wave (BQ rows parked as resolved until take).
 pub struct BqResolveWave {
     pub stats: BqResolveWaveStats,
     pub items: Vec<(u32, [u8; 32], ResolvedWire)>,
@@ -160,8 +157,8 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 ///
 /// When `ids` is `Some`, skip TipOnly for keys already in the live union and
 /// publish **one** layer for the whole wave (`lo..=hi`). The layer stays while
-/// any height in the span is still on the BQ **or** `hi` is inside the
-/// RecentCreates horizon (`2×soft_win`).
+/// any height in the span is still on the BQ, overlaps `(tip, taken_hi]`,
+/// **or** `hi` is inside the RecentCreates horizon.
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
@@ -177,10 +174,34 @@ pub fn confirm_bq_resolve_wave_with_ids(
     params: &ChainParams,
     milestone: Milestone,
     heights: &[u32],
+    ids: Option<(
+        &mut rbitcoin_query::LiveUnion,
+        &rbitcoin_query::PublishedIds,
+    )>,
+) -> Result<BqResolveWave, ConsensusError> {
+    confirm_bq_resolve_wave_capped(
+        query,
+        params,
+        milestone,
+        heights,
+        ids,
+        BQ_RESOLVE_WAVE_MAX_BLOCKS,
+        BQ_RESOLVE_WAVE_MAX_INPUTS,
+    )
+}
+
+/// Same as [`confirm_bq_resolve_wave_with_ids`] with emit caps (remaining loadq).
+pub fn confirm_bq_resolve_wave_capped(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    heights: &[u32],
     mut ids: Option<(
         &mut rbitcoin_query::LiveUnion,
         &rbitcoin_query::PublishedIds,
     )>,
+    max_blocks: usize,
+    max_inputs: u32,
 ) -> Result<BqResolveWave, ConsensusError> {
     let t0 = Instant::now();
     let mut stats = BqResolveWaveStats::default();
@@ -220,12 +241,7 @@ pub fn confirm_bq_resolve_wave_with_ids(
         let n = n_inputs_at.get(&h).copied().unwrap_or(0);
         selected.push(h);
         sum_inputs = sum_inputs.saturating_add(n);
-        if bq_resolve_wave_stop_after(
-            sum_inputs,
-            selected.len(),
-            BQ_RESOLVE_WAVE_MAX_INPUTS,
-            BQ_RESOLVE_WAVE_MAX_BLOCKS,
-        ) {
+        if bq_resolve_wave_stop_after(sum_inputs, selected.len(), max_inputs, max_blocks) {
             break;
         }
     }
@@ -246,6 +262,8 @@ pub fn confirm_bq_resolve_wave_with_ids(
             path_lo,
             first,
             more_remain,
+            max_inputs,
+            max_blocks,
         ) {
             stats.work_ns = t0.elapsed().as_nanos() as u64;
             lookup_stage_stats::note_wave_decode(
@@ -351,17 +369,23 @@ pub fn confirm_bq_resolve_wave_with_ids(
         let taken = query.lookup_taken_hi().unwrap_or(tip);
         let span = taken.saturating_sub(tip);
         let horizon = rbitcoin_query::recent_creates_horizon(span);
-        live.keep_queued_or_horizon(&queued, tip, horizon);
+        live.keep_queued_or_horizon(&queued, tip, horizon, query.lookup_taken_hi());
         live.publish(published);
         crate::confirm_phase_stats::LOOKUP_KEEP_NS
             .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    let mut items = Vec::with_capacity(done.len());
+    let mut items = Vec::with_capacity(wires.len());
+    let mut promote = Vec::with_capacity(wires.len());
     for (h, hash, wire) in wires {
-        let _ = query.block_queue_take_raw(h);
-        query.set_lookup_taken_hi(Some(h));
+        let charge = wire.block.total_size() as u64;
+        promote.push((h, wire.clone(), charge));
         items.push((h, hash, wire));
+    }
+    if !promote.is_empty() {
+        query
+            .block_queue_promote_wave(promote)
+            .map_err(ConsensusError::from)?;
     }
     stats.heights = items.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
@@ -372,6 +396,20 @@ pub fn confirm_bq_resolve_wave_with_ids(
         stats.head_ns,
     );
     Ok(BqResolveWave { stats, items })
+}
+
+/// Dequeue BQ rows and bump `lookup_taken_hi` after a successful loadq send.
+pub fn take_wave_items_for_load(
+    query: &Query,
+    items: &[(u32, [u8; 32], ResolvedWire)],
+) -> Result<(), ConsensusError> {
+    for (h, _, _) in items {
+        query
+            .block_queue_dequeue_height(*h)
+            .map_err(ConsensusError::from)?;
+        query.set_lookup_taken_hi(Some(*h));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,6 +450,17 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         let q = Query::open_or_create(&path).unwrap();
         (path, q)
+    }
+
+    fn take_emitted(q: &Query, wave: &BqResolveWave) {
+        take_wave_items_for_load(q, &wave.items).unwrap();
+    }
+
+    fn resolve_and_take(q: &Query, params: &ChainParams, heights: &[u32]) -> BqResolveWaveStats {
+        let wave =
+            confirm_bq_resolve_wave_with_ids(q, params, Milestone::NONE, heights, None).unwrap();
+        take_emitted(q, &wave);
+        wave.stats
     }
 
     fn spend_op_true(prev: Txid, vout: u32, value: Amount) -> Transaction {
@@ -616,6 +665,7 @@ mod tests {
             "one lookup wave is one published layer, not one layer per height"
         );
         assert_eq!((head.lo, head.hi), (1, 2));
+        take_emitted(&q, &wave);
         assert!(!q.block_queue_has_height(1));
         assert!(!q.block_queue_has_height(2));
         let spend_pre = &wave.items[0].2.pres[1];
@@ -678,14 +728,16 @@ mod tests {
             prev = b.block_hash();
             heights.push(h);
         }
-        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &heights).unwrap();
+        let wave =
+            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &heights, None).unwrap();
         assert_eq!(
-            st.heights, 9,
+            wave.stats.heights, 9,
             "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
         );
+        take_emitted(&q, &wave);
         assert!(
             !q.block_queue_has_height(1),
-            "lookup must dequeue the BQ row after decode"
+            "take after send dequeues the BQ row"
         );
         assert!(q.block_queue_resolved(1).is_none());
         let _ = std::fs::remove_dir_all(&path);
@@ -708,57 +760,63 @@ mod tests {
 
     #[test]
     fn hold_partial_table() {
+        const MAX_IN: u32 = BQ_RESOLVE_WAVE_MAX_INPUTS;
+        const MAX_BL: usize = BQ_RESOLVE_WAVE_MAX_BLOCKS;
         // far unresolved (beyond first half of win) + fat + short → hold
         assert!(bq_resolve_wave_hold_partial(
-            330, 180, 4_000, 1, 100, 191, false
+            330, 180, 4_000, 1, 100, 191, false, MAX_IN, MAX_BL
         ));
         // above min, gap in the first half of the window → emit (load needs it)
         assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 9_000, 2, 100, 190, true
+            330, 180, 9_000, 2, 100, 190, true, MAX_IN, MAX_BL
         ));
         assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 9_000, 2, 100, 100, true
+            330, 180, 9_000, 2, 100, 100, true, MAX_IN, MAX_BL
         ));
         // fat BQ + full input wave → emit
         assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 64_100, 16, 100, 250, true
+            330, 180, 64_100, 16, 100, 250, true, MAX_IN, MAX_BL
         ));
         // fat BQ + full block cap → emit
         assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 1, 1080, 100, 250, true
+            330, 180, 1, 1080, 100, 250, true, MAX_IN, MAX_BL
         ));
         // thin BQ + short wave, nothing more to join → emit
         assert!(!bq_resolve_wave_hold_partial(
-            50, 180, 4_000, 1, 100, 250, false
+            50, 180, 4_000, 1, 100, 250, false, MAX_IN, MAX_BL
         ));
         // rate unknown (win=0), nothing more to join → emit
         assert!(!bq_resolve_wave_hold_partial(
-            330, 0, 4_000, 1, 100, 250, false
+            330, 0, 4_000, 1, 100, 250, false, MAX_IN, MAX_BL
         ));
         // nothing collected
         assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 0, 0, 100, 100, true
+            330, 180, 0, 0, 100, 100, true, MAX_IN, MAX_BL
         ));
         // Hard min 8000: hold a thin *far* layer when more BQ heights can
         // still join. A single block at the load frontier (tip+1) must emit.
         assert!(
-            bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 150, true),
+            bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 150, true, MAX_IN, MAX_BL),
             "ready=0 must still hold a far <8000-input layer when more remain"
         );
         assert!(
-            !bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100, true),
+            !bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 100, true, MAX_IN, MAX_BL),
             "one tip+1 block must emit even under the 8000-input floor"
         );
         assert!(
-            bq_resolve_wave_hold_partial(0, 0, 4_000, 1, 100, 150, true),
+            bq_resolve_wave_hold_partial(0, 0, 4_000, 1, 100, 150, true, MAX_IN, MAX_BL),
             "unknown window must still hold a far <8000 layer when more remain"
         );
         assert!(
-            !bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, false),
+            !bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, false, MAX_IN, MAX_BL),
             "last available thin wave must emit (tip / empty BQ)"
         );
         assert!(!bq_resolve_wave_hold_partial(
-            0, 180, 8_000, 2, 100, 100, true
+            0, 180, 8_000, 2, 100, 100, true, MAX_IN, MAX_BL
+        ));
+        // remaining-loadq cap counts as at_max so a packed remaining=1 wave emits
+        assert!(!bq_resolve_wave_hold_partial(
+            330, 180, 8_001, 2, 100, 250, true, 8_000, 144
         ));
     }
 
@@ -804,7 +862,7 @@ mod tests {
         assert!(q.block_queue_resolved(8).is_none());
 
         let _ = q.block_queue_update_soft_pressure(None);
-        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[8]).unwrap();
+        let st = resolve_and_take(&q, &params, &[8]);
         assert_eq!(st.heights, 1, "unknown window must allow a short wave");
         assert!(!q.block_queue_has_height(8));
         let _ = std::fs::remove_dir_all(&path);
@@ -830,7 +888,7 @@ mod tests {
         }
         // win=12; ready=20 > 6 (fat) but height 1 is path_lo — load is waiting on it.
         let _ = q.block_queue_update_soft_pressure(Some(0.2));
-        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[1]).unwrap();
+        let st = resolve_and_take(&q, &params, &[1]);
         assert_eq!(
             st.heights, 1,
             "unresolved height in the first half of the soft window must emit"
@@ -857,7 +915,7 @@ mod tests {
         // IBD-sized window, BQ still filling (10 < 180). Height 1 is tip+1.
         let _ = q.block_queue_update_soft_pressure(Some(3.0));
         let all: Vec<u32> = (1..=10).collect();
-        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &all).unwrap();
+        let st = resolve_and_take(&q, &params, &all);
         assert_eq!(
             st.heights, 10,
             "tip+1 must emit even under 8000 inputs while the BQ is filling"
@@ -984,7 +1042,7 @@ mod tests {
         q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
             .unwrap();
         // Caller skipped height 2 (claimed / inflight) — only resolve 1.
-        let st = confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[1]).unwrap();
+        let st = resolve_and_take(&q, &params, &[1]);
         assert_eq!(st.heights, 1);
         assert!(!q.block_queue_has_height(1), "emitted height is dequeued");
         assert!(q.block_queue_has_height(2));
@@ -1013,16 +1071,16 @@ mod tests {
         assert_eq!(q.tip_height().map(|h| h.0), Some(0));
 
         let mut live = rbitcoin_query::LiveUnion::new();
-        let st = confirm_bq_resolve_wave_with_ids(
+        let wave = confirm_bq_resolve_wave_with_ids(
             &q,
             &params,
             Milestone::NONE,
             &[2],
             Some((&mut live, q.published_ids().as_ref())),
         )
-        .unwrap()
-        .stats;
-        assert_eq!(st.heights, 1);
+        .unwrap();
+        assert_eq!(wave.stats.heights, 1);
+        take_emitted(&q, &wave);
         assert!(
             q.published_ids().get(&cb1.to_byte_array()).is_none(),
             "abandoned-fork coinbase must not be a TipOnly hit (TipThenAny would attach it)"
@@ -1293,7 +1351,7 @@ mod tests {
         let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
             .unwrap();
-        confirm_bq_resolve_wave(&q, &params, Milestone::NONE, &[1]).unwrap();
+        resolve_and_take(&q, &params, &[1]);
         assert!(!q.block_queue_has_height(1));
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
@@ -1310,6 +1368,54 @@ mod tests {
         let ok = crate::confirm_scripts_phase(mat.batch).expect("scripts");
         crate::confirm_write_phase(&q, &params, Milestone::NONE, ok.batch).expect("write");
         assert_eq!(q.tip_height().map(|h| h.0), Some(1));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn taken_hi_tracks_sent_load_batches_not_unsent_wave() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let mut prev = genesis.block_hash();
+        let mut time = genesis.header.time;
+        let mut heights = Vec::new();
+        for h in 1..=4u32 {
+            time += 600;
+            let b = mine_empty_regtest(prev, time, h);
+            prev = b.block_hash();
+            q.block_queue_enqueue(h, prev.to_byte_array(), 1, &serialize(&b))
+                .unwrap();
+            heights.push(h);
+        }
+        let mut live = rbitcoin_query::LiveUnion::new();
+        let wave = confirm_bq_resolve_wave_with_ids(
+            &q,
+            &params,
+            Milestone::NONE,
+            &heights,
+            Some((&mut live, q.published_ids().as_ref())),
+        )
+        .unwrap();
+        assert_eq!(wave.items.len(), 4);
+        assert!(
+            q.lookup_taken_hi().is_none(),
+            "resolve must not bump taken_hi before load-batch send; got {:?}",
+            q.lookup_taken_hi()
+        );
+        assert!(
+            q.block_queue_has_height(4),
+            "unsent wave tail must stay on the BQ"
+        );
+        assert!(
+            q.block_queue_resolved(4).is_some(),
+            "unsent tail is parked decoded (no re-decode)"
+        );
+        q.block_queue_dequeue_height(1).unwrap();
+        q.set_lookup_taken_hi(Some(1));
+        assert_eq!(q.lookup_taken_hi(), Some(1));
+        assert!(!q.block_queue_has_height(1));
+        assert!(q.block_queue_has_height(4));
         let _ = std::fs::remove_dir_all(&path);
     }
 }

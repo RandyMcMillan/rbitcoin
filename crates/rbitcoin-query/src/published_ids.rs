@@ -189,15 +189,17 @@ impl LiveUnion {
         self.head = splice_queued(self.head.take(), queued);
     }
 
-    /// Keep layers that still overlap the BQ **or** whose `hi` is inside
+    /// Keep layers that still overlap the BQ, overlap `(tip, taken_hi]`
+    /// (taken onto loadq, already off BQ), **or** whose `hi` is inside
     /// `tip − horizon` (RecentCreates window). Identity only.
     pub fn keep_queued_or_horizon(
         &mut self,
         queued: &std::collections::BTreeSet<u32>,
         tip: u32,
         horizon: u32,
+        taken_hi: Option<u32>,
     ) {
-        self.head = splice_queued_or_horizon(self.head.take(), queued, tip, horizon);
+        self.head = splice_queued_or_horizon(self.head.take(), queued, tip, horizon, taken_hi);
     }
 
     /// Prepend one layer covering `lo..=hi` (inclusive).
@@ -292,10 +294,24 @@ fn splice_queued_or_horizon(
     queued: &std::collections::BTreeSet<u32>,
     tip: u32,
     horizon: u32,
+    taken_hi: Option<u32>,
 ) -> Option<Arc<IdLayer>> {
     splice_queued_pred(head, |lo, hi| {
-        span_overlaps_queued(lo, hi, queued) || layer_in_horizon(hi, tip, horizon)
+        span_overlaps_queued(lo, hi, queued)
+            || layer_in_horizon(hi, tip, horizon)
+            || span_overlaps_taken(lo, hi, tip, taken_hi)
     })
+}
+
+/// Overlap of `lo..=hi` with `(tip, taken_hi]` (in-pipeline, already off BQ).
+fn span_overlaps_taken(lo: u32, hi: u32, tip: u32, taken_hi: Option<u32>) -> bool {
+    let Some(taken) = taken_hi else {
+        return false;
+    };
+    if taken <= tip {
+        return false;
+    }
+    lo <= taken && hi > tip
 }
 
 fn splice_queued(
@@ -549,18 +565,40 @@ mod tests {
         live.note_span(10, 12, hits(&[(tid(1), Fk(10), (1, 2))]));
         live.publish(&published);
         let empty = std::collections::BTreeSet::new();
-        live.keep_queued_or_horizon(&empty, 20, 16);
+        live.keep_queued_or_horizon(&empty, 20, 16, None);
         live.publish(&published);
         assert_eq!(
             published.get(&tid(1)),
             Some((Fk(10), (1, 2))),
             "layer hi=12 must stay while tip-hi < horizon"
         );
-        live.keep_queued_or_horizon(&empty, 40, 16);
+        live.keep_queued_or_horizon(&empty, 40, 16, None);
         live.publish(&published);
         assert!(
             published.get(&tid(1)).is_none(),
             "layer must drop once tip-hi >= horizon and BQ empty"
+        );
+    }
+
+    #[test]
+    fn keep_queued_or_horizon_holds_taken_off_bq_span() {
+        let published = PublishedIds::new();
+        let mut live = LiveUnion::new();
+        live.note_span(10, 12, hits(&[(tid(1), Fk(10), (1, 2))]));
+        live.publish(&published);
+        let empty = std::collections::BTreeSet::new();
+        live.keep_queued_or_horizon(&empty, 5, 0, Some(12));
+        live.publish(&published);
+        assert_eq!(
+            published.get(&tid(1)),
+            Some((Fk(10), (1, 2))),
+            "taken (off-BQ) span overlapping (tip, taken_hi] must stay even at horizon=0"
+        );
+        live.keep_queued_or_horizon(&empty, 12, 0, Some(12));
+        live.publish(&published);
+        assert!(
+            published.get(&tid(1)).is_none(),
+            "layer must drop once tip has caught taken_hi and horizon is 0"
         );
     }
 

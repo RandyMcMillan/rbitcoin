@@ -866,6 +866,63 @@ impl MempoolHub {
         }
     }
 
+    /// Prepare + scripts + RBF/cluster checks with no mempool mutation.
+    pub fn test_accept(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
+        let t0 = Instant::now();
+        let utxo = QueryUtxoProvider {
+            query: self.query.as_ref(),
+        };
+        let tip = self.chain_tip_ctx();
+
+        let mut stages = rbitcoin_mempool::AcceptStageUs::default();
+        let mut lock_us = 0u64;
+
+        let prep = {
+            let t_lock = Instant::now();
+            let mut g = self.inner.write().unwrap();
+            g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
+            let delta = self.fee_delta(&tx.compute_txid());
+            let r = g.prepare_admit(tx, &utxo, tip, delta);
+            stages.utxo_us = g.last_accept_stages.utxo_us;
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            r
+        };
+        let prep = match prep {
+            Ok(p) => p,
+            Err(e) => {
+                let us = t0.elapsed().as_micros() as u64;
+                self.meter_accept_stages(lock_us, stages);
+                return self.finish_accept_err(us, e);
+            }
+        };
+
+        let t_script = Instant::now();
+        if let Err(e) =
+            rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
+        {
+            let us = t0.elapsed().as_micros() as u64;
+            stages.script_us = t_script.elapsed().as_micros() as u64;
+            self.meter_accept_stages(lock_us, stages);
+            return self.finish_accept_err(us, AcceptError::Script(e.to_string()));
+        }
+        stages.script_us = t_script.elapsed().as_micros() as u64;
+
+        let result = {
+            let t_lock = Instant::now();
+            let g = self.inner.read().unwrap();
+            let r = g.evaluate_after_script(tx, prep, &utxo, tip);
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            r
+        };
+
+        let us = t0.elapsed().as_micros() as u64;
+        self.meter_accept_stages(lock_us, stages);
+        match result {
+            Ok(r) => Ok(r),
+            Err(e) => self.finish_accept_err(us, e),
+        }
+    }
+
     fn note_fee_flow_admit(&self, weight: u64, fee_sat: u64) {
         let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight);
         if let Ok(mut m) = self.fee_flow.lock() {

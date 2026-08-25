@@ -31,7 +31,7 @@ fn ctx_empty() -> (RpcContext, PathBuf) {
         peers: None,
         chain: None,
         logpath: String::new(),
-        active: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        active: std::sync::Arc::new(std::sync::Mutex::new(RpcActive::default())),
         permit_bare_multisig: true,
     };
     (ctx, dir)
@@ -732,7 +732,7 @@ fn all_methods_callable_empty_or_error() {
         peers: None,
         chain: None,
         logpath: String::new(),
-        active: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        active: std::sync::Arc::new(std::sync::Mutex::new(RpcActive::default())),
         permit_bare_multisig: true,
     };
     let mem2 = dispatch(&ctx2, "getmempoolinfo", vec![]).unwrap();
@@ -780,7 +780,7 @@ fn chain_methods_against_mined_regtest() {
         peers: None,
         chain: None,
         logpath: String::new(),
-        active: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        active: std::sync::Arc::new(std::sync::Mutex::new(RpcActive::default())),
         permit_bare_multisig: true,
     };
 
@@ -1254,7 +1254,7 @@ fn ctx_regtest_hub() -> (RpcContext, PathBuf, Arc<rbitcoin_net::ChainHub>) {
         peers: None,
         chain: Some(Arc::clone(&hub)),
         logpath: String::new(),
-        active: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        active: std::sync::Arc::new(std::sync::Mutex::new(RpcActive::default())),
         permit_bare_multisig: true,
     };
     (ctx, dir, hub)
@@ -2675,7 +2675,7 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
         peers: None,
         chain: None,
         logpath: String::new(),
-        active: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        active: std::sync::Arc::new(std::sync::Mutex::new(RpcActive::default())),
         permit_bare_multisig: true,
     };
     let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
@@ -2726,6 +2726,101 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
     assert!(
         !names.contains(&"NETWORK_LIMITED"),
         "we do not advertise NETWORK_LIMITED: {names:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rpc_active_leave_removes_by_id_not_last() {
+    let mut active = RpcActive::default();
+    let slow = active.enter("slow");
+    let _fast = active.enter("fast");
+    active.leave(slow);
+    let names: Vec<String> = active.snapshot().into_iter().map(|(m, _)| m).collect();
+    assert_eq!(names, vec!["fast".to_string()]);
+}
+
+#[test]
+fn testmempoolaccept_rbf_does_not_evict_conflict() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let (ctx, dir) = ctx_empty();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(
+        &ctx.query,
+        &params,
+        Height::GENESIS,
+        &genesis,
+        Milestone::NONE,
+    )
+    .unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &ctx.query,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        101,
+        1,
+    );
+    let mp = ctx.mempool.as_ref().expect("mempool");
+    mp.set_relay_enabled(true);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let low = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    mp.accept_tx(&low).expect("low");
+    let high = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 50_000),
+            script_pubkey: spk,
+        }],
+    };
+    let high_hex = hex_encode(serialize(&high));
+    let row = dispatch(&ctx, "testmempoolaccept", vec![json!([high_hex])]).unwrap();
+    assert_eq!(row[0]["allowed"], json!(true), "{row}");
+    assert!(
+        mp.contains(&low.compute_txid()),
+        "testmempoolaccept must not RBF-evict the live conflict"
+    );
+    assert!(
+        !mp.contains(&high.compute_txid()),
+        "trial replacement must not remain in the mempool"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

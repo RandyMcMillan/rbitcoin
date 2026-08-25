@@ -251,7 +251,7 @@ pub fn confirm_wire_load_from_plan(
 
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_store = pipeline.and_then(|p| p.parent_store.as_ref());
-    let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
+    let (batch_parents, spend_edges, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &mut parent_pin,
@@ -273,9 +273,9 @@ pub fn confirm_wire_load_from_plan(
         metas,
         &wire_blocks,
         &batch_parents,
-        &batch_thin,
+        &spend_edges,
     )?;
-    drop(batch_thin);
+    drop(spend_edges);
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {

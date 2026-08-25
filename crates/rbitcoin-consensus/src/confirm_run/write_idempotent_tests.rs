@@ -1713,8 +1713,12 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
     plan.per_header_ranges = vec![(Fk(10), Fk(1), 1), (Fk(11), Fk(2), 1)];
     plan.external_parent_vouts.insert(1, vec![0]);
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
-    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let (parents, edges, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
         .expect("cross-height CreatePin pin");
+    let child_edges = edges.get(&2).expect("child spend edges");
+    assert_eq!(child_edges.len(), 1);
+    assert_eq!(child_edges[0].create_fk, Fk(1));
+    assert_eq!(child_edges[0].vout, 0);
     let got = parents
         .get_parent_txout_parts(Fk(1), 0, |v, sc, _| {
             assert_eq!(v, 50);

@@ -1,12 +1,10 @@
-//! Thin create-fk edges for confirm load / assemble.
-//!
-//! Batch-local: load builds [`crate::confirm_load::BatchThin`], assemble
-//! consumes it. Not stored on the process parent cache.
+//! Pin-time spend edges for confirm assemble / write.
 
-/// Thin input edge: create-tx Class A fk when known at load (UTXO / same-batch).
-/// Coinbase / unknown → `create_fk = None`. Not stored on Class A disk.
+/// One spend at pin time: wire prevout + spend/create fks (no second thin rebuild).
 #[derive(Clone, Copy, Debug)]
-pub struct ThinInput {
-    pub create_fk: Option<u64>,
-    pub prev_index: u32,
+pub struct SpendEdge {
+    pub prev_txid: [u8; 32],
+    pub vout: u32,
+    pub spend_fk: rbitcoin_primitives::Fk,
+    pub create_fk: rbitcoin_primitives::Fk,
 }

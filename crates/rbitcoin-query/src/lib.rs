@@ -154,8 +154,8 @@ pub use batch_parents::{
 };
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
-pub use confirm_load::BatchThin;
 pub use confirm_load::ConfirmLoadStats;
+pub use confirm_load::SpendEdges;
 pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{
@@ -167,7 +167,7 @@ pub use scripthash::{
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
 };
 pub use stamp::{fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp};
-pub use wave_prevout::ThinInput;
+pub use wave_prevout::SpendEdge;
 
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).
 ///

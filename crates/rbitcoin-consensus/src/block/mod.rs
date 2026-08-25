@@ -602,7 +602,7 @@ pub fn validate_block_connect(
     let mut pending = rbitcoin_query::OutPointSet::default();
     let mut pending_creates = PendingCreates::default();
     let batch_parents = rbitcoin_query::BatchParents::new();
-    let batch_thin = rbitcoin_query::BatchThin::default();
+    let spend_edges = rbitcoin_query::SpendEdges::default();
     let create_txids: Vec<[u8; 32]> = block
         .txdata
         .iter()
@@ -623,7 +623,7 @@ pub fn validate_block_connect(
         &mut pending,
         &mut pending_creates,
         &batch_parents,
-        &batch_thin,
+        &spend_edges,
         &create_txids,
         prev_mtp,
         &block_hash,
@@ -1048,7 +1048,7 @@ impl AsmPrevoutAcc {
 /// once per block (no per-input Instant / atomics).
 ///
 /// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] +
-/// [`rbitcoin_query::BatchThin`]. Optimistic miss is `invariant:` (no head recover).
+/// [`rbitcoin_query::SpendEdges`]. Optimistic miss is `invariant:` (no head recover).
 ///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
 ///
@@ -1065,7 +1065,7 @@ pub(crate) fn assemble_block_prevouts(
     pending_spent: &mut rbitcoin_query::OutPointSet,
     pending_creates: &mut PendingCreates,
     batch_parents: &rbitcoin_query::BatchParents,
-    batch_thin: &rbitcoin_query::BatchThin,
+    spend_edges: &rbitcoin_query::SpendEdges,
     create_txids: &[[u8; 32]],
     prev_mtp: u32,
     block_hash: &[u8; 32],
@@ -1094,7 +1094,7 @@ pub(crate) fn assemble_block_prevouts(
         pending_creates,
         AssembleMode::Optimistic,
         batch_parents,
-        batch_thin,
+        spend_edges,
         create_txids,
         prev_mtp,
         block_hash,
@@ -1113,7 +1113,7 @@ fn assemble_block_prevouts_mode(
     pending_creates: &mut PendingCreates,
     mode: AssembleMode,
     batch_parents: &rbitcoin_query::BatchParents,
-    batch_thin: &rbitcoin_query::BatchThin,
+    spend_edges: &rbitcoin_query::SpendEdges,
     create_txids: &[[u8; 32]],
     prev_mtp: u32,
     block_hash: &[u8; 32],
@@ -1233,7 +1233,7 @@ fn assemble_block_prevouts_mode(
             } else {
                 Vec::new()
             };
-            let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
+            let edges = spend_fk.and_then(|fk| fk.get().and_then(|id| spend_edges.get(&id)));
             let mut tx_in_sigops = 0u64;
 
             let t_prev = Instant::now();
@@ -1243,8 +1243,8 @@ fn assemble_block_prevouts_mode(
                 if !pending_spent.insert(key) {
                     return Err(ConsensusError::BadTx("double spend in block"));
                 }
-                // Same-block parent must appear *before* this tx. batch_thin
-                // stamps the whole block; using that edge accepts child-before-parent
+                // Same-block parent must appear *before* this tx. spend edges
+                // stamp the whole block; using that edge accepts child-before-parent
                 // (docs/external_findings/005-non-topological-block-accepted.md).
                 if let Some(&pj) = txid_index.get(&key.0) {
                     if pj >= ti {
@@ -1254,10 +1254,10 @@ fn assemble_block_prevouts_mode(
                 // Thin create_fk is a promise (identity matches wire prev_txid).
                 // Do not treat thin as a soft spentness hint. Same-block (pj < ti)
                 // resolves via same_block only.
-                let prev_fk = thin
+                let prev_fk = edges
                     .as_ref()
                     .and_then(|t| t.get(ii))
-                    .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
+                    .and_then(|e| e.create_fk.get().map(|_| e.create_fk))
                     .or_else(|| pending_creates.get(&key.0).copied())
                     .or_else(|| {
                         if mode == AssembleMode::Full {

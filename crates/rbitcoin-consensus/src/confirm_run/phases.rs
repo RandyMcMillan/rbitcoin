@@ -10,7 +10,7 @@ pub(super) fn assemble_run(
     metas: Vec<BodyMeta>,
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
-    batch_thin: &rbitcoin_query::BatchThin,
+    spend_edges: &rbitcoin_query::SpendEdges,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
@@ -177,7 +177,7 @@ pub(super) fn assemble_run(
             &mut pending_spent,
             &mut pending_creates,
             batch_parents,
-            batch_thin,
+            spend_edges,
             &meta.txids,
             prev_mtp,
             &block_hash,

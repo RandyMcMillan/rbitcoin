@@ -15,6 +15,7 @@ update that file — do not paste a parallel spec.
 | On-disk | [`SCHEMA.md`](../SCHEMA.md) | Current bytes; history in [`SCHEMA_HISTORY.md`](../SCHEMA_HISTORY.md) |
 | Confirm / store implementer | [`invariants.md`](./invariants.md) + [`concurrency.md`](./concurrency.md) | Stage IO, leftover union, roles, tip commit |
 | Tests | [`TESTING.md`](../TESTING.md) | How to run, budgets, coverage |
+| Algo / DS findings | [`algo-review.md`](./algo-review.md) | Whole-repo algorithm/data-structure review; work High first |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
 1.0 product gates: [`road-to-1.0.md`](./road-to-1.0.md) (not the living
@@ -45,6 +46,7 @@ quality backlog).
 | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | Workarounds where rust-bitcoin is not Core-faithful. |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
+| [`algo-review.md`](./algo-review.md) | 2026-08-25 algorithm/DS findings. Close items here; do not copy into quality.md. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
 
 ## Root (stay at root)

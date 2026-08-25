@@ -56,6 +56,8 @@ Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
 | **GetData serve inflight** | **16** full `Block`/`CmpctBlock` per session writer | Writer decrements after send; extra inv hashes not reconstructed. |
 | **`pending_blocks`** | **128** decoded bodies / session | Insert evicts one existing hash at cap. Unsolicited BIP130 window still 16. |
 | **Hub `held_bodies`** | **320** | Existing; side-branch hold for most-work apply. |
+| **getheaders continuation** | full 2000-header reply locates from last hash | Next batch after that hash, not a replay from our tip. |
+| **headers poll** | skip if `best_known` cannot beat our tip | 120s `getheaders` only for peers that can still add work. |
 
 ## Soft budgets: request-limited only (invariant)
 

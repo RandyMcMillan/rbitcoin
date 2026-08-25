@@ -1,0 +1,23 @@
+id: thread-spawn-dropped
+language: rust
+severity: error
+message: Discarded thread::spawn leaks a thread; bind and join, or use Builder with a stored handle.
+note: Allowed drop — tx.head spawn_seal publishes via mpsc (segmented_head.rs).
+rule:
+  all:
+    - any:
+        - pattern: std::thread::spawn($B);
+        - pattern: thread::spawn($B);
+    - not:
+        inside:
+          stopBy: end
+          kind: mod_item
+          has:
+            field: name
+            regex: "tests$"
+ignores:
+  - "**/*tests*.rs"
+  - "**/tests/**"
+  - "**/benches/**"
+  - "crates/rbitcoin-bench/**"
+  - "crates/rbitcoin-store/src/segmented_head.rs"

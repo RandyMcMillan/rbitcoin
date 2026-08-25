@@ -90,6 +90,7 @@
               llvmPackages.bintools
               llvmPackages.llvm
               cargo-llvm-cov
+              ast-grep
               pkg-config
             ];
             RUST_BACKTRACE = "1";

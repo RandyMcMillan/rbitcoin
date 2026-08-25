@@ -4,9 +4,17 @@ severity: error
 message: Discarded tokio::spawn leaks a task; bind, JoinSet, or abort the JoinHandle.
 note: Allowed drops — msg_decode spawn_decode_then_with_err (Q-54), node SIGINT handler, rbitcoin-bench.
 rule:
-  any:
-    - pattern: tokio::spawn($BODY);
-    - pattern: let _ = tokio::spawn($BODY);
+  all:
+    - any:
+        - pattern: tokio::spawn($BODY);
+        - pattern: let _ = tokio::spawn($BODY);
+    - not:
+        inside:
+          stopBy: end
+          kind: mod_item
+          has:
+            field: name
+            regex: "tests$"
 ignores:
   - "**/*tests*.rs"
   - "**/tests/**"

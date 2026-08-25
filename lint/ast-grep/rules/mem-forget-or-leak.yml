@@ -1,0 +1,24 @@
+id: mem-forget-or-leak
+language: rust
+severity: error
+message: mem::forget / Box::leak hide process-owned bytes; drop or bound the value.
+note: block_866342.rs is a #![cfg(test)] file; ignored until Q-54 if it grows production code.
+rule:
+  all:
+    - any:
+        - pattern: std::mem::forget($X)
+        - pattern: mem::forget($X)
+        - pattern: Box::leak($X)
+    - not:
+        inside:
+          stopBy: end
+          kind: mod_item
+          has:
+            field: name
+            regex: "tests$"
+ignores:
+  - "**/*tests*.rs"
+  - "**/tests/**"
+  - "**/benches/**"
+  - "crates/rbitcoin-bench/**"
+  - "crates/rbitcoin-consensus/src/block/block_866342.rs"

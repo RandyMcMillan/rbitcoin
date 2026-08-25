@@ -818,7 +818,16 @@ pub struct ScriptCheckJob {
     /// SCRIPT_VERIFY_CONST_SCRIPTCODE: CODESEPARATOR + FindAndDelete hard-fail.
     pub(crate) const_scriptcode: bool,
     /// Lookup/structure `TxPrecompute`. Set on the confirm path; tests lazy-`from_tx`.
-    pub(crate) pre: std::sync::OnceLock<std::sync::Arc<rbitcoin_query::TxPrecompute>>,
+    pub(crate) pre: std::sync::OnceLock<JobPre>,
+}
+
+/// Confirm jobs borrow the lookup/structure slice; tests own an `Arc`.
+pub(crate) enum JobPre {
+    Owned(std::sync::Arc<rbitcoin_query::TxPrecompute>),
+    Slice {
+        slice: std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
+        idx: usize,
+    },
 }
 
 impl ScriptCheckJob {
@@ -932,25 +941,39 @@ impl ScriptCheckJob {
         }
     }
 
-    /// Confirm path: reuse structure/lookup pres (no job `from_tx`).
+    /// Confirm assemble: `slice[idx]` by refcount only (no `TxPrecompute` clone).
     #[inline]
-    pub(crate) fn with_pre(self, pre: std::sync::Arc<rbitcoin_query::TxPrecompute>) -> Self {
-        let _ = self.pre.set(pre);
+    pub(crate) fn with_pre_slice(
+        self,
+        slice: std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
+        idx: usize,
+    ) -> Self {
+        let _ = self.pre.set(JobPre::Slice { slice, idx });
         self
+    }
+
+    fn job_pre(&self) -> &JobPre {
+        self.pre.get_or_init(|| {
+            JobPre::Owned(std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(
+                &*self.tx,
+            )))
+        })
     }
 
     #[inline]
     pub(crate) fn pre_arc(&self) -> std::sync::Arc<rbitcoin_query::TxPrecompute> {
-        self.pre
-            .get_or_init(|| std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&*self.tx)))
-            .clone()
+        match self.job_pre() {
+            JobPre::Owned(a) => std::sync::Arc::clone(a),
+            JobPre::Slice { slice, idx } => std::sync::Arc::new(slice[*idx].clone()),
+        }
     }
 
     #[inline]
     pub(crate) fn pre(&self) -> &rbitcoin_query::TxPrecompute {
-        self.pre
-            .get_or_init(|| std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&*self.tx)))
-            .as_ref()
+        match self.job_pre() {
+            JobPre::Owned(a) => a.as_ref(),
+            JobPre::Slice { slice, idx } => &slice[*idx],
+        }
     }
 
     /// BIP141/147: NULLDUMMY + WITNESS rules follow `segwit` (not CSV).
@@ -1025,7 +1048,7 @@ impl AsmPrevoutAcc {
 /// once per block (no per-input Instant / atomics).
 ///
 /// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] +
-/// [`rbitcoin_query::BatchThin`], then shared outs FIFO / durable store.
+/// [`rbitcoin_query::BatchThin`]. Optimistic miss is `invariant:` (no head recover).
 ///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
 ///
@@ -1048,7 +1071,7 @@ pub(crate) fn assemble_block_prevouts(
     block_hash: &[u8; 32],
     bip16_active: bool,
     wire: Option<&Arc<Block>>,
-    pres: Option<&[rbitcoin_query::TxPrecompute]>,
+    pres: Option<&Arc<[rbitcoin_query::TxPrecompute]>>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -1096,7 +1119,7 @@ fn assemble_block_prevouts_mode(
     block_hash: &[u8; 32],
     bip16_active: bool,
     wire: Option<&Arc<Block>>,
-    pres: Option<&[rbitcoin_query::TxPrecompute]>,
+    pres: Option<&Arc<[rbitcoin_query::TxPrecompute]>>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -1205,7 +1228,11 @@ fn assemble_block_prevouts_mode(
             } else {
                 Vec::new()
             };
-            let mut input_create_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
+            let mut input_create_heights: Vec<u32> = if mode == AssembleMode::Full {
+                Vec::with_capacity(tx.input.len())
+            } else {
+                Vec::new()
+            };
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
             let mut tx_in_sigops = 0u64;
 
@@ -1233,14 +1260,20 @@ fn assemble_block_prevouts_mode(
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key.0).copied())
                     .or_else(|| {
-                        query
-                            .tx_fk_by_txid_tip(op.txid.as_byte_array())
-                            .ok()
-                            .flatten()
+                        if mode == AssembleMode::Full {
+                            query
+                                .tx_fk_by_txid_tip(op.txid.as_byte_array())
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        }
                     });
                 let pin_live = match prev_fk {
-                    Some(fk) => batch_parents.has_parent_out(fk, op.vout),
-                    None => false,
+                    Some(fk) if mode == AssembleMode::Full => {
+                        batch_parents.has_parent_out(fk, op.vout)
+                    }
+                    _ => false,
                 };
                 // Durable spentness: Full mode only. Optimistic defers to structural
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
@@ -1390,8 +1423,10 @@ fn assemble_block_prevouts_mode(
                     )
                     .with_segwit(flag_segwit)
                 };
-                if let Some(p) = pres.and_then(|ps| ps.get(ti)) {
-                    job = job.with_pre(Arc::new(p.clone()));
+                if let Some(ps) = pres {
+                    if ti < ps.len() {
+                        job = job.with_pre_slice(Arc::clone(ps), ti);
+                    }
                 }
                 script_jobs.push(job);
                 clk_job = clk_job.saturating_add(t_job.elapsed().as_nanos() as u64);
@@ -2092,6 +2127,11 @@ fn resolve_prevout(
         }
     }
 
+    if !resolve_create_heights {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: lookup stage miss (assemble parent create_fk)",
+        )));
+    }
     let head_fk = query
         .tx_fk_by_txid_tip(&prev_txid)
         .map_err(ConsensusError::from)?;

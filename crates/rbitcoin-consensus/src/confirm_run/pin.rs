@@ -6,13 +6,12 @@ use super::*;
 ///
 /// Sources: plan/in-flight offline denserels → RecentCreates create_pin →
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
-/// reads head / `tx.idx` / `txid.body`. Write [`ensure_spend_abs_layouts`] stamps
-/// `spent.idx` ranges for archived parents — load does not idx-batch the full
-/// parent set.
+/// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
+/// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is holes-only.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-    parent_pin: &ParentPinStamp,
+    parent_pin: &mut ParentPinStamp,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight: Option<&rbitcoin_query::InFlightView>,
@@ -34,6 +33,7 @@ pub(super) fn pin_for_wire_batch(
     let mut batch_thin: rbitcoin_query::BatchThin = rbitcoin_query::BatchThin::default();
     let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     let mut n_same_batch = 0u32;
+    let mut vouts_from_stamp = false;
 
     let mut plan_by_id: U64Map<
         std::sync::Arc<(rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
@@ -73,7 +73,7 @@ pub(super) fn pin_for_wire_batch(
                         create_fk: Some(pid),
                         prev_index: inp.prev_index,
                     });
-                    if fill_vouts {
+                    if fill_vouts && !plan.create_in_spend_header(*fk, pid) {
                         parent_vouts.entry(pid).or_default().push(inp.prev_index);
                     }
                 } else {
@@ -86,7 +86,8 @@ pub(super) fn pin_for_wire_batch(
             batch_thin.insert(sid, edges);
         }
         if !fill_vouts {
-            parent_vouts = parent_pin.parent_vouts.clone();
+            parent_vouts = std::mem::take(&mut parent_pin.parent_vouts);
+            vouts_from_stamp = true;
         }
     } else {
         // plan=None: create_fk from ParentPinStamp (lookup head/idx), never load head.
@@ -124,9 +125,11 @@ pub(super) fn pin_for_wire_batch(
         }
     }
 
-    for vouts in parent_vouts.values_mut() {
-        vouts.sort_unstable();
-        vouts.dedup();
+    if !vouts_from_stamp {
+        for vouts in parent_vouts.values_mut() {
+            vouts.sort_unstable();
+            vouts.dedup();
+        }
     }
 
     if let Some(ifo) = in_flight {
@@ -341,17 +344,18 @@ pub(super) fn pin_for_wire_batch(
 
     // Same-batch / load-ahead creates may still lack spent_range until write.
     let t_contract = Instant::now();
-    for (id, need) in &parent_vouts {
-        let fk = rbitcoin_primitives::Fk(*id);
-        if !batch_parents.contains(fk) {
-            return Err(ConsensusError::Store(StoreError::Corrupt(
-                "invariant: wire pin missing spent parent",
-            )));
-        }
-        if !need.is_empty() && !batch_parents.pin_covered(fk, need) {
-            return Err(ConsensusError::Store(StoreError::Corrupt(
-                "invariant: wire pin incomplete outs for spent parent",
-            )));
+    #[cfg(debug_assertions)]
+    {
+        for (id, need) in &parent_vouts {
+            let fk = rbitcoin_primitives::Fk(*id);
+            debug_assert!(
+                batch_parents.contains(fk),
+                "invariant: wire pin missing spent parent"
+            );
+            debug_assert!(
+                need.is_empty() || batch_parents.pin_covered(fk, need),
+                "invariant: wire pin incomplete outs for spent parent"
+            );
         }
     }
     let contract_ns = t_contract.elapsed().as_nanos() as u64;

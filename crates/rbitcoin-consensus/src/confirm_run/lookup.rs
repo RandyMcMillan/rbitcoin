@@ -58,15 +58,11 @@ impl ParentPinStamp {
         pins: rbitcoin_query::U64Map<rbitcoin_query::CreatePin>,
         parent_vouts: U64Map<Vec<u32>>,
     ) -> Self {
-        let mut create_by_txid = HashMap::with_capacity_and_hasher(txids.len(), Default::default());
-        for (id, tid) in &txids {
-            create_by_txid.insert(*tid, *id);
-        }
         Self {
             ranges,
             spent_ranges,
             txids,
-            create_by_txid,
+            create_by_txid: HashMap::with_hasher(Default::default()),
             pins,
             parent_vouts,
         }
@@ -247,7 +243,7 @@ pub fn confirm_wire_load_from_plan(
     let t_load = Instant::now();
     let PlanStampOutcome {
         mut plan,
-        parent_pin,
+        mut parent_pin,
         metas,
         wire_blocks,
         ..
@@ -258,7 +254,7 @@ pub fn confirm_wire_load_from_plan(
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
-        &parent_pin,
+        &mut parent_pin,
         &metas,
         &wire_blocks,
         ifo,

@@ -57,7 +57,7 @@ pub fn validate_header(
         }
     }
 
-    let expected_bits = expected_next_bits(query, params, height)?;
+    let expected_bits = expected_next_bits(query, params, height, header.time)?;
     if header.bits != expected_bits {
         return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
     }
@@ -242,14 +242,14 @@ mod median_time_past_tests {
 
         // expected_next_bits: height 0 + regtest no-retarget.
         let params = ChainParams::regtest();
-        let gbits = expected_next_bits(&q, &params, Height(0)).unwrap();
+        let gbits = expected_next_bits(&q, &params, Height(0), 0).unwrap();
         assert_eq!(gbits, crate::params::genesis_block(&params).header.bits);
-        let b1 = expected_next_bits(&q, &params, Height(1)).unwrap();
+        let b1 = expected_next_bits(&q, &params, Height(1), 0).unwrap();
         let (_fk, rec0) = q.header_at_height(Height(0)).unwrap().unwrap();
         assert_eq!(b1.to_consensus(), rec0.bits);
 
         // Bad prev header height.
-        assert!(expected_next_bits(&q, &params, Height(99)).is_err());
+        assert!(expected_next_bits(&q, &params, Height(99), 0).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -327,13 +327,52 @@ mod median_time_past_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn testnet_min_difficulty_after_20_minute_gap() {
+        let (dir, q) = temp_q();
+        let params = ChainParams::testnet();
+        assert!(params.allow_min_difficulty_blocks());
+        let (h0, ta0) = coinbase(0, Fk::NULL, None);
+        let prev_fk = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let limit = params.pow_limit.to_compact_lossy();
+        assert_ne!(CompactTarget::from_consensus(h0.bits), limit);
+
+        let spacing = params.btc.pow_target_spacing as u32;
+        let gap =
+            expected_next_bits(&q, &params, Height(1), h0.timestamp + 2 * spacing + 1).unwrap();
+        assert_eq!(gap, limit);
+        let eq_boundary =
+            expected_next_bits(&q, &params, Height(1), h0.timestamp + 2 * spacing).unwrap();
+        assert_eq!(eq_boundary.to_consensus(), h0.bits);
+
+        let (mut h1, ta1) = coinbase(1, prev_fk, Some(h0.hash));
+        h1.timestamp = h0.timestamp + 2 * spacing + 1;
+        h1.bits = limit.to_consensus();
+        h1.hash = rbitcoin_store::block_header_hash(
+            h1.version,
+            &h0.hash,
+            &h1.merkle_root,
+            h1.timestamp,
+            h1.bits,
+            h1.nonce,
+        );
+        q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+        let walked = expected_next_bits(&q, &params, Height(2), h1.timestamp + 100).unwrap();
+        assert_eq!(walked.to_consensus(), h0.bits);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Expected `nBits` for a new header at `height`.
+///
+/// `header_time` is the candidate block's timestamp (Core `pblock->GetBlockTime()`).
 pub fn expected_next_bits(
     query: &Query,
     params: &ChainParams,
     height: Height,
+    header_time: u32,
 ) -> Result<CompactTarget, ConsensusError> {
     if height.0 == 0 {
         let g = crate::params::genesis_block(params);
@@ -347,11 +386,20 @@ pub fn expected_next_bits(
         .ok_or(ConsensusError::BadPrev)?;
     let prev_bits = CompactTarget::from_consensus(prev_rec.bits);
 
-    if params.no_pow_retargeting() || !height.0.is_multiple_of(interval) {
+    if !height.0.is_multiple_of(interval) {
+        return min_difficulty_or_walk(
+            query,
+            params,
+            height,
+            prev_bits,
+            prev_rec.timestamp,
+            header_time,
+        );
+    }
+    if params.no_pow_retargeting() {
         return Ok(prev_bits);
     }
 
-    // Retarget: timespan from first of period to last (height-1).
     let first_height = Height(height.0 - interval);
     let (_fk, first_rec) = query
         .header_at_height(first_height)?
@@ -363,4 +411,43 @@ pub fn expected_next_bits(
         timespan,
         &params.btc,
     ))
+}
+
+pub(crate) fn min_difficulty_or_walk(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    prev_bits: CompactTarget,
+    prev_time: u32,
+    header_time: u32,
+) -> Result<CompactTarget, ConsensusError> {
+    if !params.allow_min_difficulty_blocks() {
+        return Ok(prev_bits);
+    }
+    let limit = params.pow_limit.to_compact_lossy();
+    let spacing = params.btc.pow_target_spacing;
+    if u64::from(header_time) > u64::from(prev_time).saturating_add(spacing.saturating_mul(2)) {
+        return Ok(limit);
+    }
+    let interval = params.difficulty_adjustment_interval();
+    let mut h = height.0 - 1;
+    let mut bits = prev_bits;
+    while h % interval != 0 && bits == limit {
+        if h == 0 {
+            break;
+        }
+        h -= 1;
+        bits = CompactTarget::from_consensus(header_bits_at(query, Height(h))?);
+    }
+    Ok(bits)
+}
+
+fn header_bits_at(query: &Query, height: Height) -> Result<u32, ConsensusError> {
+    if let Some((_fk, rec)) = query.header_at_height(height)? {
+        return Ok(rec.bits);
+    }
+    if let Some(plan) = query.confirm_parent_cache().get_header_plan(height.0) {
+        return Ok(plan.header_rec.bits);
+    }
+    Err(ConsensusError::BadPrev)
 }

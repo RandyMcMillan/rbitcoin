@@ -90,8 +90,14 @@ pub(super) fn assemble_run(
                     }
                 }
                 let prev_bits = bitcoin::CompactTarget::from_consensus(prev_bits_raw);
-                let expected =
-                    expected_bits_extending(query, params, height, prev_bits, prev_time)?;
+                let expected = expected_bits_extending(
+                    query,
+                    params,
+                    height,
+                    prev_bits,
+                    prev_time,
+                    block.header.time,
+                )?;
                 if block.header.bits != expected {
                     return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
                 }
@@ -122,7 +128,14 @@ pub(super) fn assemble_run(
                     return Err(ConsensusError::BadHeader("checkpoint mismatch"));
                 }
             }
-            let expected = expected_bits_extending(query, params, height, prev.bits, prev.time)?;
+            let expected = expected_bits_extending(
+                query,
+                params,
+                height,
+                prev.bits,
+                prev.time,
+                block.header.time,
+            )?;
             if block.header.bits != expected {
                 return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
             }
@@ -372,13 +385,24 @@ pub(super) fn expected_bits_extending(
     height: Height,
     prev_bits: bitcoin::CompactTarget,
     prev_time: u32,
+    header_time: u32,
 ) -> Result<bitcoin::CompactTarget, ConsensusError> {
     use bitcoin::CompactTarget;
     if height.0 == 0 {
         return Ok(genesis_block(params).header.bits);
     }
     let interval = params.difficulty_adjustment_interval();
-    if params.no_pow_retargeting() || !height.0.is_multiple_of(interval) {
+    if !height.0.is_multiple_of(interval) {
+        return crate::header::min_difficulty_or_walk(
+            query,
+            params,
+            height,
+            prev_bits,
+            prev_time,
+            header_time,
+        );
+    }
+    if params.no_pow_retargeting() {
         return Ok(prev_bits);
     }
     // Period-start may still be above confirmed tip during tip-ahead multi-block

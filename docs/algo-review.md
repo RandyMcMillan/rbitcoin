@@ -61,7 +61,7 @@ What the node actually runs. This is the map; findings follow.
 | Confirm queues | loadq=14, scriptq=4, writeq=14 | bounded sync channels |
 | Script pool | lock-free steal waves | `in_wave` + `failed` atomics |
 | Merkle | Bitcoin duplicate-last | CVE-2012-2459 covered by whole-block txid set |
-| Difficulty | Core retarget + 4× clamps | testnet 20-min min-diff **absent** |
+| Difficulty | Core retarget + 4× clamps | testnet 20-min min-diff |
 | MTP | 11-header median | store walk per header |
 
 ### Script engine
@@ -113,18 +113,6 @@ What the node actually runs. This is the map; findings follow.
 ## 2. Highest-priority findings
 
 These are the ones worth a plan. ✔ = re-read against current source.
-
-### High — consensus
-
-#### C-H4. Testnet 20-minute min-difficulty rule absent
-
-`crates/rbitcoin-consensus/src/header.rs:281-315` `expected_next_bits`.
-`no_pow_retargeting()` is honored (regtest). Off-interval blocks **always**
-reuse prev bits. Testnet3: if `block.time > prev.time + 20 min` → `powLimit`
-bits, else walk back to last non-min-diff block. Nearly every testnet3 header
-off a retarget boundary would fail. Mainnet unaffected.
-
-**Fix:** `params.allow_min_difficulty_blocks` like Core `GetNextWorkRequired`.
 
 ### High — store / concurrency
 
@@ -457,7 +445,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | Crate | High | Medium | Perf/Mem notable |
 |-------|------|--------|------------------|
 | store | 1 (rehash vs readers) | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
-| consensus + primitives | 1 (testnet min-diff) | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
+| consensus + primitives | 0 | coinbase vout, subsidy, pipelined header gates, script pool, signet, witness sigops | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
 | net | 2 (headers timeout, inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
@@ -473,14 +461,13 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **C-H4 testnet min-difficulty** — remaining consensus High.
-2. **S-H1 HashHead seqlock/epoch** — false misses during grow.
-3. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
-4. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
-5. Electrum status **ordering**; decide COMPAT vs spec for the extra
+1. **S-H1 HashHead seqlock/epoch** — false misses during grow.
+2. **N-H1 headers-sync timeout** + **N-H4 inbound handshake timeout**.
+3. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
+4. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
-6. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-7. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
+5. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+6. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
    v2 decode, and MTP ring are closed.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
@@ -493,6 +480,9 @@ pin FIFO, leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
 When a finding is fixed, move its ID here with the PR number instead of
 leaving a stale High row in §2–6.
 
+- **C-H4.** Testnet 20-minute min-difficulty (`allow_min_difficulty_blocks`)
+  and walk-back to last non-powLimit bits. Pin: `testnet_min_difficulty_after_20_minute_gap`.
+  This PR.
 - **C-H3.** P2SH scriptSig is `eval_script` + IsPushOnly (`OP_1NEGATE` accepted;
   >10 000-byte scriptSig rejected). Pins: `p2sh_legacy_op_1negate_scriptsig_accepted`,
   `p2sh_legacy_scriptsig_over_10k_rejected`. This PR.

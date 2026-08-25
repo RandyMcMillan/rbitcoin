@@ -139,6 +139,10 @@ before 1.0).
 
 ### Fixed
 
+- **Testnet 20-minute min-difficulty:** off-interval headers with
+  `time > prev + 2×spacing` use powLimit bits; otherwise walk back to the last
+  non-min-diff block (Core `GetNextWorkRequired`).
+
 - **P2SH scriptSig matches Core EvalScript + IsPushOnly:** `OP_1NEGATE` is a
   valid push; scriptSig >10 000 bytes is rejected. Finding 006 520-byte pin kept.
 

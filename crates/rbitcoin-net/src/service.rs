@@ -16,7 +16,7 @@ use rbitcoin_primitives::Network as RNetwork;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -55,6 +55,9 @@ pub struct P2PNode {
     /// Live outbound tip-follow sessions (inc/dec inside session task).
     follow_live: Arc<AtomicUsize>,
     tasks: Vec<JoinHandle<()>>,
+    /// Nested inbound / dial session tasks (not in `tasks` so accept/dial
+    /// abort does not leave them running through process exit).
+    session_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Live sessions for RPC getpeerinfo / addnode / disconnectnode.
     pub peers: Arc<PeerHub>,
     user_agent: String,
@@ -117,6 +120,8 @@ impl P2PNode {
         let ua_in = user_agent.clone();
         let max_inbound = max_inbound.max(1);
         let inbound_sem = inbound_semaphore(max_inbound);
+        let session_tasks = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
+        let sessions_in = session_tasks.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 if shutdown_c.load(Ordering::SeqCst) {
@@ -143,7 +148,8 @@ impl P2PNode {
                             Ok(a) => a,
                             Err(_) => our,
                         };
-                        tokio::spawn(async move {
+                        let sessions = sessions_in.clone();
+                        let h = tokio::spawn(async move {
                             let _session_slot = permit;
                             let (ver, reader, writer, wire) = match connect_and_handshake(
                                 stream,
@@ -183,6 +189,7 @@ impl P2PNode {
                                 peer_session_with(reader, writer, magic_c, hub, tip_rx, meta).await;
                             peers.unregister(id);
                         });
+                        push_session_task(&sessions, h);
                     }
                     Ok(Err(_)) => break,
                     Err(_) => continue,
@@ -196,6 +203,7 @@ impl P2PNode {
         let dial_ua = user_agent.clone();
         let dial_live = follow_live.clone();
         let dial_shutdown = shutdown.clone();
+        let sessions_dial = session_tasks.clone();
         let dial_task = tokio::spawn(async move {
             while let Some(req) = dial_rx.recv().await {
                 if dial_shutdown.load(Ordering::SeqCst) {
@@ -205,12 +213,13 @@ impl P2PNode {
                 let peers = dial_peers.clone();
                 let ua = dial_ua.clone();
                 let live = dial_live.clone();
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     let _ = run_outbound_session(
                         req.addr, magic, local_addr, hub, peers, ua, live, req.typ,
                     )
                     .await;
                 });
+                push_session_task(&sessions_dial, h);
             }
         });
 
@@ -223,6 +232,7 @@ impl P2PNode {
             shutdown,
             follow_live,
             tasks: vec![accept_task, dial_task],
+            session_tasks,
             peers,
             user_agent,
             max_inbound,
@@ -350,12 +360,33 @@ impl P2PNode {
 
     pub async fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        for p in self.peers.live_peers() {
+            p.request_disconnect();
+        }
+        let mut join = Vec::new();
         for t in self.tasks.drain(..) {
             t.abort();
+            join.push(t);
         }
-        // Do **not** full-flush here: `run.rs` already calls `flush_for_shutdown`
-        // (or callers that need durability flush explicitly). Double multi‑GiB
-        // msync/fdatasync was a multi-minute host freeze on exit.
+        if let Ok(mut g) = self.session_tasks.lock() {
+            for t in g.drain(..) {
+                t.abort();
+                join.push(t);
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+            for t in join {
+                let _ = t.await;
+            }
+        })
+        .await;
+    }
+}
+
+fn push_session_task(bag: &Mutex<Vec<JoinHandle<()>>>, h: JoinHandle<()>) {
+    if let Ok(mut g) = bag.lock() {
+        g.retain(|t| !t.is_finished());
+        g.push(h);
     }
 }
 
@@ -531,5 +562,39 @@ mod tests {
             magic_for_params(&params),
             Magic::from_bytes([0x54, 0xd2, 0x6f, 0xbd])
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_lingering_session_task() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-p2p-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = rbitcoin_query::Query::open_or_create(&dir).unwrap();
+        let mut node = P2PNode::start(
+            "127.0.0.1:0".parse().unwrap(),
+            q,
+            ChainParams::regtest(),
+            Milestone::NONE,
+        )
+        .await
+        .unwrap();
+        let sleeper = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        node.tasks.push(sleeper);
+        let t0 = std::time::Instant::now();
+        node.shutdown().await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "shutdown must not wait out a 30s session task"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

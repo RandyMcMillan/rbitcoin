@@ -1012,7 +1012,7 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 return ExitCode::FAILURE;
             }
         };
-        match rt.block_on(run_p2p(config)) {
+        let code = match rt.block_on(run_p2p(config)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 if matches!(e, crate::error::NodeError::FutureTip) {
@@ -1022,7 +1022,11 @@ IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
                 }
                 ExitCode::FAILURE
             }
-        }
+        };
+        // Peer sessions can still be in spawn_blocking / CPU header walks
+        // after `clean exit`. Dropping the runtime would wait on them.
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+        code
     }
 }
 

@@ -100,6 +100,14 @@ before 1.0).
 
 ### Fixed
 
+- **SIGINT after `clean exit` no longer waits on peer header walks:** tip-follow
+  sessions walked pending headers with a store lookup per step (`knows_header` /
+  `header_height`), so a 2000-header stale-fork reply could peg the Tokio
+  runtime for ~90s after shutdown logged (mainnet 2026-08-25, `disconnect stale
+  fork tip announced=961638`). Walks are RAM-first (one store lookup at the
+  join). Shutdown `request_disconnect`s live peers, aborts nested inbound/dial
+  sessions, timeout-joins, and the process runtime uses `shutdown_timeout(2s)`.
+
 - **io_uring drain fail-closed:** `drain_all` treats unmatched CQEs and CQ
   overflow as `Corrupt` (no longer ignored). `begin_batch` returns `Err` on a
   poisoned session or leftover that cannot drain. Held idx fill (`fill_idx_pages`)

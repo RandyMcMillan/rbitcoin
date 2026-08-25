@@ -758,7 +758,8 @@ impl Store {
     ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
         // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
         // `height_fence_extend`. Confirm extends before `set_many`, so tip
-        // cannot publish while this clone is in flight. Clone is O(blocks).
+        // cannot publish while this clone is in flight. Clone is Arc (COW on
+        // the next extend if this snapshot is still live).
         let t_fence = std::time::Instant::now();
         let fence = self.fence().clone();
         crate::head_resolve_stats::add_probe(t_fence.elapsed().as_nanos() as u64);

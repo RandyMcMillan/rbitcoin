@@ -11,6 +11,7 @@
 use crate::chain::{ConfirmedTable, HeaderTxsTable};
 use crate::error::StoreError;
 use rbitcoin_primitives::{Fk, Height};
+use std::sync::Arc;
 
 /// One confirmed height’s contiguous Class A run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,22 +30,34 @@ impl FenceRun {
 }
 
 /// Height-indexed, first_fk-sorted confirmed runs.
+///
+/// `runs` is `Arc` so leftover TipOnly snapshots are O(1). `extend` / `pop`
+/// COW via [`Arc::make_mut`].
 #[derive(Clone, Debug, Default)]
 pub struct HeightFence {
     /// Sorted by `first_fk` (Class A assign is increasing; reorgs append higher).
-    runs: Vec<FenceRun>,
+    runs: Arc<Vec<FenceRun>>,
 }
 
 impl HeightFence {
     pub fn empty() -> Self {
-        Self { runs: Vec::new() }
+        Self {
+            runs: Arc::new(Vec::new()),
+        }
     }
 
     /// Sort by `first_fk` and drop empty counts.
     pub fn from_runs(mut runs: Vec<FenceRun>) -> Self {
         runs.retain(|r| r.count > 0 && r.first_fk > 0);
         runs.sort_unstable_by_key(|r| r.first_fk);
-        Self { runs }
+        Self {
+            runs: Arc::new(runs),
+        }
+    }
+
+    /// True when `other` shares this fence's run allocation (cheap snapshot).
+    pub fn shares_runs(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.runs, &other.runs)
     }
 
     /// Rebuild from confirmed tip + per-header Class A ranges.
@@ -94,16 +107,16 @@ impl HeightFence {
         if count == 0 {
             return;
         }
-        self.runs.push(FenceRun {
+        let runs = Arc::make_mut(&mut self.runs);
+        runs.push(FenceRun {
             first_fk: id,
             count,
             height,
         });
-        // Cheap: IBD/reorg assigns higher fks. Only sort if the new run is out of order.
-        if self.runs.len() >= 2 {
-            let n = self.runs.len();
-            if self.runs[n - 1].first_fk < self.runs[n - 2].first_fk {
-                self.runs.sort_unstable_by_key(|r| r.first_fk);
+        if runs.len() >= 2 {
+            let n = runs.len();
+            if runs[n - 1].first_fk < runs[n - 2].first_fk {
+                runs.sort_unstable_by_key(|r| r.first_fk);
             }
         }
     }
@@ -111,7 +124,7 @@ impl HeightFence {
     /// Disconnect tip: drop the run for `height` (must be the tip height).
     pub fn pop_height(&mut self, height: u32) {
         if let Some(i) = self.runs.iter().position(|r| r.height == height) {
-            self.runs.remove(i);
+            Arc::make_mut(&mut self.runs).remove(i);
         }
     }
 
@@ -149,7 +162,7 @@ impl HeightFence {
         let mut out = Vec::new();
         let mut prev_end = 1u64;
         let cap = last_fk.saturating_add(1);
-        for r in &self.runs {
+        for r in self.runs.iter() {
             if r.first_fk >= cap {
                 break;
             }
@@ -270,6 +283,23 @@ mod tests {
         assert_eq!(f.height_of(Fk(1)), Some(0));
         f.pop_height(0);
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn height_fence_clone_shares_runs_until_extend() {
+        let mut f = HeightFence::from_runs(vec![run(1, 2, 0)]);
+        let snap = f.clone();
+        assert!(f.shares_runs(&snap), "snapshot must be Arc, not a vec copy");
+        assert_eq!(snap.height_of(Fk(1)), Some(0));
+        f.extend(1, Fk(3), 1);
+        assert!(
+            !f.shares_runs(&snap),
+            "extend COWs away from live snapshots"
+        );
+        assert_eq!(snap.height_of(Fk(3)), None);
+        assert_eq!(f.height_of(Fk(3)), Some(1));
+        assert_eq!(snap.len(), 1);
+        assert_eq!(f.len(), 2);
     }
 
     #[test]

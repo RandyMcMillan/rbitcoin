@@ -326,7 +326,7 @@ impl TxidBody {
                     result: i32::MIN,
                 });
             }
-            used_session = crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops);
+            used_session = crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops).unwrap_or(false);
             if used_session {
                 for (op, (first, blob, _)) in ops.iter().zip(jobs.iter_mut()) {
                     if op.result < 0 || (op.result as usize) != blob.len() {

@@ -28,6 +28,7 @@
 //! Machines stay staged; they do not flatten to one-shot `pread`. See
 //! `docs/io-modality.md` and `docs/concurrency.md`.
 
+use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -338,11 +339,17 @@ fn test_force_session_false() -> bool {
     TEST_FORCE_SESSION_FALSE.with(|c| c.get())
 }
 
-/// Bulk pread on a shared [`crate::IoCtx`]. Held session submits SQEs;
-/// `none` returns false so the caller uses libc (never nested TLS).
-pub(crate) fn pread_batch_on_ctx(ctx: &mut crate::IoCtx<'_>, ops: &mut [ReadOp<'_>]) -> bool {
+/// Bulk pread on a shared [`crate::IoCtx`].
+///
+/// - `Ok(true)`: filled on the **held** session.
+/// - `Ok(false)`: no session — caller may `pread_batch` (standalone TLS, `DEPTH=0`).
+/// - `Err`: held session failed (poison / leftover). Do **not** open another ring.
+pub(crate) fn pread_batch_on_ctx(
+    ctx: &mut crate::IoCtx<'_>,
+    ops: &mut [ReadOp<'_>],
+) -> Result<bool, StoreError> {
     let Some(session) = ctx.session() else {
-        return false;
+        return Ok(false);
     };
     let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
     if total_nonempty == 0 {
@@ -351,12 +358,18 @@ pub(crate) fn pread_batch_on_ctx(ctx: &mut crate::IoCtx<'_>, ops: &mut [ReadOp<'
                 op.result = 0;
             }
         }
-        return true;
+        return Ok(true);
     }
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
     }
-    pread_batch_on_session_inner(session, ops, total_nonempty)
+    if pread_batch_on_session_inner(session, ops, total_nonempty) {
+        return Ok(true);
+    }
+    if session.is_poisoned() {
+        return Err(StoreError::Corrupt("invariant: io_uring session poisoned"));
+    }
+    Err(StoreError::Corrupt("invariant: held pread failed"))
 }
 
 fn pread_batch_on_session_inner(
@@ -1153,7 +1166,8 @@ mod tests {
                 result: i32::MIN,
             }];
             assert!(
-                pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops2),
+                pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops2)
+                    .expect("held pool pread"),
                 "pread_batch_on_ctx(held) must succeed on pool (not a linux-only stub)"
             );
             assert_eq!(ops2[0].result, 4);

@@ -151,8 +151,9 @@ impl TxHeadMphf {
                 })
                 .collect();
             if !ops.is_empty() {
-                if !pread_batch_on_ctx(ctx, &mut ops) {
-                    pread_batch(&mut ops);
+                match pread_batch_on_ctx(ctx, &mut ops)? {
+                    true => {}
+                    false => pread_batch(&mut ops),
                 }
                 for op in &ops {
                     if op.result < 4 {
@@ -386,5 +387,41 @@ mod tests {
             .unwrap();
         assert_eq!(rels[0][0], pairs[0].1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Held `.rel` pread must fail closed on a poisoned TLS ring (f07415b5).
+    /// Falling through to `pread_batch` nests `with_thread_local` and panics
+    /// lookup (`ibd-confirm-lookup` nested thread-local io_uring).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn held_rel_pread_poisoned_session_does_not_nest_tls() {
+        if !crate::bulk_io::io_uring_enabled() {
+            return;
+        }
+        let dir = tmp("held-rel-poison");
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("000000");
+        let pairs = vec![(0x1111_u64, 1u32), (0x2222, 2)];
+        let h = TxHeadMphf::write(&base, &pairs).unwrap();
+        let slots = h.slots_for(&[pairs[0].0]).unwrap();
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::uring_session::with_thread_local(
+                crate::uring_session::DEFAULT_ENTRIES,
+                |session| {
+                    session.poison();
+                    h.read_rels_batch(&slots, &mut IoCtx::held(session))
+                },
+            )
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        match caught {
+            Ok(Ok(Err(StoreError::Corrupt(msg))))
+                if msg.contains("poisoned") || msg.contains("held") => {}
+            Ok(Ok(Ok(_))) => panic!("poisoned held rel must fail closed, not succeed"),
+            Ok(Err(e)) => panic!("with_thread_local setup failed: {e}"),
+            Err(_) => panic!("nested thread-local io_uring: held rel must not open a second ring"),
+            Ok(Ok(Err(e))) => panic!("unexpected held rel error: {e}"),
+        }
     }
 }

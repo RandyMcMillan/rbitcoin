@@ -60,7 +60,8 @@ before 1.0).
   rewrite on open. Ingest SH seals at 0.80. `ShardedHashHead`,
   `HeadRole::ScriptHash`, and `rehash_gate` are deleted. Leftover 256-way
   `header.head/` is Layout refuse. Closed
-  [`docs/algo-review.md`](docs/algo-review.md) S-H1.
+  [`docs/algo-review.md`](docs/algo-review.md) S-H1
+  ([#248](https://github.com/reardencode/rbitcoin/pull/248)).
 
 - **Algo-review P7/P8/P10/P16:** leftover TipOnly fence snapshot is
   `Arc` (COW on extend). Densify assign resumes after the BQ-ready

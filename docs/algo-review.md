@@ -528,4 +528,4 @@ leaving a stale High row in §2–6.
 - **P8** — v2 `parse_v2_contents` does not sha256d; `FramedMessage::decode` is command+payload (checksum unused). [#245](https://github.com/reardencode/rbitcoin/pull/245).
 - **P10** — densify `densify_scan_lo` skips BQ-ready / inflight / archived prefix; pending still walked. [#245](https://github.com/reardencode/rbitcoin/pull/245).
 - **P16** — fence-tip MTP is an 11-slot ring on extend; pop rebuilds; historical heights still 11-read. [#245](https://github.com/reardencode/rbitcoin/pull/245).
-- **S-H1** — HashHead / ScriptHashHead no longer rewrite occupied tables while serving. Header overflow rolls `header.head.gN`; ingest SH seals at 0.80. Undersized single-gen `header.head` rewrites on open only. `rehash_to` / `rehash_gate` / `ShardedHashHead` deleted.
+- **S-H1** — HashHead / ScriptHashHead no longer rewrite occupied tables while serving. Header overflow rolls `header.head.gN`; ingest SH seals at 0.80. Undersized single-gen `header.head` rewrites on open only. `rehash_to` / `rehash_gate` / `ShardedHashHead` deleted. [#248](https://github.com/reardencode/rbitcoin/pull/248).

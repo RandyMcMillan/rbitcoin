@@ -384,14 +384,6 @@ pub(super) fn wire_lookup_phase(
                 .put_header(&header_rec)
                 .map_err(ConsensusError::from)?
         };
-        let prev_bytes = block.header.prev_blockhash.to_byte_array();
-        query.confirm_parent_cache().put_header_plan(
-            height.0,
-            header_fk,
-            header_rec.clone(),
-            Vec::new(),
-            prev_bytes,
-        );
         prepare_ns = prepare_ns.saturating_add(t_prep.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);

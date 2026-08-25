@@ -136,14 +136,16 @@ impl ArchiveWritePlan {
         self.external_parent_vouts.shrink_to_fit();
     }
 
-    /// Freeze plan for write batch: drop all pin-staging maps.
+    /// Freeze plan for write batch: drop pin-staging maps and `batch_creates`.
     ///
     /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
-    /// / headers / spends / `batch_pin`). Prep must call this (or
-    /// [`Self::clear_external_parent_outs`]) before enqueue to scripts/write so
-    /// batch-merge never mutates growing stamp maps.
+    /// / headers / spends / `batch_pin`). In-flight still binds from `batch_pin`.
+    /// Prep must call this (or [`Self::clear_external_parent_outs`]) before
+    /// enqueue to scripts/write so batch-merge never mutates growing stamp maps.
     pub fn freeze_after_pin(&mut self) {
         self.clear_external_parent_outs();
+        self.batch_creates.clear();
+        self.batch_creates.shrink_to_fit();
     }
 
     /// Drop headers that already have Class A body (partial-commit / retry).
@@ -1964,8 +1966,27 @@ mod tests {
         plan_a
             .external_parents
             .insert(99, crate::ParentIdent::with_body([9u8; 32], (0, 1)));
+        let txid = plan_a.batch_pin[0].0.txid;
+        let fk = plan_a.planned_fks[0];
         plan_a.freeze_after_pin();
         assert!(plan_a.external_parents.is_empty());
+        assert!(
+            plan_a.batch_creates.is_empty(),
+            "freeze drops batch_creates; in-flight binds from batch_pin"
+        );
+        let mut log = crate::InFlightLog::new();
+        log.note_layer(crate::InFlightLayer::from_plan_pins(
+            plan_a
+                .planned_fks
+                .iter()
+                .zip(plan_a.batch_pin.iter())
+                .map(|(fk, pin)| (*fk, pin)),
+        ));
+        assert_eq!(
+            log.snapshot().get_create_fk(&txid),
+            Some(fk),
+            "in-flight still has txid→fk after freeze"
+        );
 
         let mut need_b = vec![(Fk(2), vec![coinbase_apply(2), coinbase_apply(3)])];
         let mut plan_b = q

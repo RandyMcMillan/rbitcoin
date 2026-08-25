@@ -944,21 +944,26 @@ impl BatchParents {
     ) -> Option<R> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let outs = if use_sticky {
-            let mut st = self.sticky_outs.borrow_mut();
-            match st.as_ref() {
-                Some((sid, snap)) if *sid == id => Arc::clone(snap),
-                _ => {
-                    let snap = e.load_outs();
-                    *st = Some((id, Arc::clone(&snap)));
-                    snap
+        let txid = e.tx.txid;
+        if use_sticky {
+            {
+                let st = self.sticky_outs.borrow();
+                if let Some((sid, snap)) = st.as_ref() {
+                    if *sid == id {
+                        let o = snap.get(vout)?;
+                        return Some(f(o.value, o.script.as_slice(), txid));
+                    }
                 }
             }
-        } else {
-            e.load_outs()
-        };
+            let snap = e.load_outs();
+            let o = snap.get(vout)?;
+            let r = f(o.value, o.script.as_slice(), txid);
+            *self.sticky_outs.borrow_mut() = Some((id, Arc::clone(&snap)));
+            return Some(r);
+        }
+        let outs = e.load_outs();
         let o = outs.get(vout)?;
-        Some(f(o.value, o.script.as_slice(), e.tx.txid))
+        Some(f(o.value, o.script.as_slice(), txid))
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
@@ -2074,6 +2079,17 @@ mod tests {
         let (v1, s1, t1) = bp
             .get_parent_txout_parts(Fk(7), 1, |v, s, t| (v, s.to_vec(), t))
             .unwrap();
+        let pin = std::sync::Arc::clone(bp.pins.get(&7).unwrap());
+        let outs = pin.load_outs();
+        let before = std::sync::Arc::strong_count(&outs);
+        bp.get_parent_txout_parts(Fk(7), 1, |_, _, _| {
+            assert_eq!(
+                std::sync::Arc::strong_count(&outs),
+                before,
+                "sticky hit must borrow, not Arc::clone"
+            );
+        })
+        .unwrap();
         let (v2, s2, t2) = bp
             .get_parent_txout_parts(Fk(7), 2, |v, s, t| (v, s.to_vec(), t))
             .unwrap();

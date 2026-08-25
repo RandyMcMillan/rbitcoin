@@ -87,6 +87,12 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 3 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work. **After this:** Electrum 1.6 then 1.7 (`protocol_max` bump in the same work) — [`COMPAT.md`](../COMPAT.md) § Protocol versions |
 | 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
 | 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam |
+| 6 | **Q-51** | ast-grep structural lints | code | `sgconfig.yml` + `lint/ast-grep/` first rules + `scripts/ast-grep.sh` + required CI job (fmt-class). First rules: discarded `tokio::spawn`, `mem::forget`/`Box::leak`, dropped `thread::spawn`. Not a clippy clone. |
+| 7 | **Q-52** | CRAP report on coverage LCOV | test | After the ≥90% LCOV gate, `coverage.sh` runs `cargo crap --workspace --summary` and writes `coverage/crap.json` when `cargo-crap` is on `PATH`. No `--fail-above 30` (clippy still allows `cognitive_complexity`; at ≥90% line coverage CRAP equals CC). |
+| 8 | **Q-53** | Miri on primitives | reliability | Nightly/`workflow_dispatch` `miri.yml` like `fuzz.yml`; `./scripts/miri.sh` → `cargo miri test -p rbitcoin-primitives`. Not a required PR check. Never `--workspace`. |
+| 9 | **Q-54** | Grow ast-grep rules from `ibd-memory.md` | code | One rule per named cap that is easy to delete: `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each rule has `lint/ast-grep/fixtures/{good,bad}/`. Peel god-files (**R-10**) only if a rule needs a seam. |
+| 10 | **Q-55** | CRAP `--fail-regression` | test | Commit `crap_baseline.json` (`--format json --sort file`) from a green coverage artifact. PRs fail if a function’s CRAP rises. Still no `--fail-above 30` while clippy allows `cognitive_complexity`. |
+| 11 | **Q-56** | Miri islands beyond primitives | reliability | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack_ud-style integers) that do not pull secp/store. Never workspace miri. |
 
 ### Still valid? (this reaudit)
 
@@ -116,7 +122,7 @@ and bench-in-CI (shipped shape, not a backlog).
 
 R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed/Won't-fix
 id is in **bold**. Do not start **R-11+** — new work is the next unused
-**Q-id (Q-51+)**.
+**Q-id (Q-57+)**.
 
 | R-id | Canonical | Where |
 |------|-----------|-------|
@@ -126,7 +132,7 @@ id is in **bold**. Do not start **R-11+** — new work is the next unused
 | R-09 | **Q-16** | Completed |
 | R-10 | **R-10** | Open rank 5 |
 
-New work after this reaudit starts at **Q-51**.
+Next unused Q-id is **Q-57**.
 
 ---
 
@@ -150,6 +156,9 @@ Retired on purpose. Not a backlog. Not a failure.
 | **—** | Flatten purpose-built io_uring machines | AGENTS.md: fix the machine; do not replace it with batched `pread`/`pwrite` without an explicit ask |
 | **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD confirm is body-queue wire → lookup → load. See AGENTS.md |
 | **—** | `rbitcoin-bench` default-member / musl / required CI | Optional crate, host A/B against a live store. Not a packaging or coverage gate |
+| **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Same class as Q-38 (too heavy / cannot go green). Primitives only (**Q-53**); extra islands are **Q-56**. |
+| **—** | `cargo crap --fail-above --threshold 30` | At ≥90% line coverage CRAP **equals CC**. `handle_peer_frame` / confirm write / SH k-way would force **R-10** peels. Use **Q-55** regression instead. |
+| **—** | ast-grep as a second clippy for style | `cognitive_complexity` and friends are allowed on purpose. Structural rules catch RSS/task-leak *shapes*; they do not re-litigate clippy. |
 
 ---
 
@@ -185,7 +194,7 @@ findings 001–022, CI split, map-free README, …) live in
 | Do | Do not |
 |----|--------|
 | Close work by **moving the Open row into Completed** in the same edit as the landing change | Leave `Status: fixed` in Open, or start a second table |
-| New item: next unused **Q-id (Q-51+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
+| New item: next unused **Q-id (Q-57+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
 | Retire a row to **Won't fix** when the product will not do it | Leave dead Open rows “for completeness” |
 | God-file peels only when a higher Open row needs a seam (**R-10**) | Split `query/lib` / `interpreter.rs` / `scripthash.rs` as a standalone “modularity” project |
 | Suite: no new remine-100 / default test **&gt;2 s** without justification ([TESTING.md](../TESTING.md)) | Time the full workspace as a planning spike |

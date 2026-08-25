@@ -750,19 +750,13 @@ impl MempoolHub {
     /// Look up a live mempool tx by wtxid (BIP339 / compact v2).
     pub fn get_tx_by_wtxid(&self, wtxid: &Wtxid) -> Option<Transaction> {
         let g = self.inner.read().unwrap();
-        for (txid, e) in g.graph.iter() {
-            if e.wtxid == *wtxid {
-                return g.get_tx(txid).cloned();
-            }
-        }
-        None
+        let txid = g.graph.txid_for_wtxid(wtxid)?;
+        g.get_tx(&txid).cloned()
     }
 
     /// True if a live mempool entry has this wtxid (BIP339 inv filter).
     pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
-        let g = self.inner.read().unwrap();
-        let found = g.graph.iter().any(|(_, e)| e.wtxid == *wtxid);
-        found
+        self.inner.read().unwrap().graph.contains_wtxid(wtxid)
     }
 
     /// Confirmed tip snapshot for mempool structural checks (height + BIP113 MTP).
@@ -1826,6 +1820,11 @@ mod tests {
             let delta = hub.scripthash_unconfirmed_delta(&sh);
             assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
             assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
+            assert!(
+                !hub.contains_wtxid(&wtxid),
+                "wtxid index must drop with the live entry"
+            );
+            assert!(hub.get_tx_by_wtxid(&wtxid).is_none());
             assert!(hub.list_live().len() < 3);
             let _ = std::fs::remove_dir_all(&mp);
         }

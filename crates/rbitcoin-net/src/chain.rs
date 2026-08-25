@@ -107,6 +107,9 @@ pub struct ChainHub {
     max_tip_age_secs: AtomicU64,
     /// Block hashes we already issued getdata for (any peer).
     asked_blocks: RwLock<HashSet<BlockHash>>,
+    /// `prefix[h] = work through height h` on the best chain. Process cache;
+    /// rebuilt from wire headers when short, truncated on disconnect.
+    chain_work_prefix: RwLock<Vec<Work>>,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -154,6 +157,7 @@ impl ChainHub {
             block_min_tx_fee_sat_kvb: AtomicU64::new(1),
             max_tip_age_secs: AtomicU64::new(DEFAULT_MAX_TIP_AGE_SECS),
             asked_blocks: RwLock::new(HashSet::new()),
+            chain_work_prefix: RwLock::new(Vec::new()),
         }
     }
 
@@ -303,16 +307,12 @@ impl ChainHub {
         let Some(tip) = self.tip_height() else {
             return Ok(Work::from_be_bytes([0u8; 32]));
         };
-        let end = height.min(tip);
-        let mut works = Vec::new();
-        for h in 0..=end {
-            let hdr = self
-                .query
-                .wire_header_at_height(Height(h))
-                .map_err(|e| NetError::Consensus(e.to_string()))?;
-            works.push(hdr.work());
-        }
-        Ok(sum_work(works.into_iter()))
+        self.ensure_chain_work_prefix()?;
+        let p = self.chain_work_prefix.read().unwrap();
+        let i = height.min(tip) as usize;
+        Ok(p.get(i)
+            .copied()
+            .unwrap_or_else(|| Work::from_be_bytes([0u8; 32])))
     }
 
     /// Core `nMaxTipAge` (`-maxtipage`): tip time vs [`Self::clock`].
@@ -1843,15 +1843,47 @@ impl ChainHub {
         if start > tip {
             return Ok(Work::from_be_bytes([0u8; 32]));
         }
-        let mut works = Vec::new();
-        for h in start..=tip {
+        self.ensure_chain_work_prefix()?;
+        let p = self.chain_work_prefix.read().unwrap();
+        let end = p
+            .get(tip as usize)
+            .copied()
+            .unwrap_or_else(|| Work::from_be_bytes([0u8; 32]));
+        if start == 0 {
+            return Ok(end);
+        }
+        let base = p
+            .get((start - 1) as usize)
+            .copied()
+            .unwrap_or_else(|| Work::from_be_bytes([0u8; 32]));
+        Ok(end - base)
+    }
+
+    fn ensure_chain_work_prefix(&self) -> Result<(), NetError> {
+        let Some(tip) = self.tip_height() else {
+            self.chain_work_prefix.write().unwrap().clear();
+            return Ok(());
+        };
+        let want = tip as usize + 1;
+        let mut p = self.chain_work_prefix.write().unwrap();
+        if p.len() > want {
+            p.truncate(want);
+            return Ok(());
+        }
+        while p.len() < want {
+            let h = p.len() as u32;
             let hdr = self
                 .query
                 .wire_header_at_height(Height(h))
                 .map_err(|e| NetError::Consensus(e.to_string()))?;
-            works.push(hdr.work());
+            let w = hdr.work();
+            let acc = match p.last() {
+                None => w,
+                Some(&prev) => prev + w,
+            };
+            p.push(acc);
         }
-        Ok(sum_work(works.into_iter()))
+        Ok(())
     }
 }
 
@@ -2417,12 +2449,28 @@ mod tests {
 
         // Non-genesis without tip rejected on empty hub.
         let (dir2, empty) = tmp_hub();
-        let err = empty.accept_block(b1).unwrap_err();
+        let err = empty.accept_block(b1.clone()).unwrap_err();
         assert!(matches!(err, NetError::Protocol(_)));
 
         // Chain work is non-zero after tip.
         assert!(hub.chain_work().unwrap().to_be_bytes() != [0u8; 32]);
         assert!(hub.tip_header().is_some());
+        let gwork = hub.work_through_height(0).unwrap();
+        assert_eq!(gwork, hub.tip_header().unwrap().work());
+        let b2 = mine(hub.tip_hash().unwrap(), 1_300_000_100, 2);
+        assert!(matches!(
+            hub.accept_block(b2.clone()).unwrap(),
+            AcceptOutcome::Accepted { height: 2 }
+        ));
+        let tip_w = hub.chain_work().unwrap();
+        assert_eq!(tip_w, hub.work_through_height(2).unwrap());
+        assert_eq!(hub.work_through_height(0).unwrap(), gwork);
+        assert_eq!(tip_w - gwork, b1.header.work() + b2.header.work());
+        let extra = mine(b2.block_hash(), 1_300_000_200, 3);
+        assert_eq!(
+            hub.work_with_header(&extra.header),
+            tip_w + extra.header.work()
+        );
         assert!(hub.mempool().is_none());
         let _ = hub.subscribe_tips();
 

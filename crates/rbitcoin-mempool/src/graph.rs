@@ -109,6 +109,8 @@ pub struct MempoolGraphStats {
 #[derive(Debug)]
 pub struct TxGraph {
     entries: HashMap<Txid, TxEntry>,
+    /// Live wtxid → txid (last insert wins). BIP339 inv must not scan `entries`.
+    by_wtxid: HashMap<Wtxid, Txid>,
     /// Mempool-created outpoints spent by another mempool tx.
     spends: HashMap<OutPoint, Txid>,
     /// **All** outpoints spent by live mempool txs (chain UTXOs + mempool), for RBF conflicts.
@@ -122,6 +124,10 @@ pub struct TxGraph {
     chunks_rebuilds: AtomicU64,
     /// Best-first chunks; `None` after mutate until next build.
     chunk_cache: Mutex<Option<Vec<Chunk>>>,
+    /// Lowest-rate chunk per cluster, ordered by (rate, representative txid).
+    worst_chunks: BTreeMap<(u64, Txid), Chunk>,
+    /// Representative → rate key into [`Self::worst_chunks`].
+    worst_rep_rate: HashMap<Txid, u64>,
     /// Core `-limitclustercount` (default [`MAX_CLUSTER_COUNT`]).
     cluster_count_limit: usize,
     /// Core `-limitclustersize` as vbytes (default [`MAX_CLUSTER_VSIZE`]).
@@ -134,12 +140,15 @@ impl Default for TxGraph {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            by_wtxid: HashMap::new(),
             spends: HashMap::new(),
             conflicts: HashMap::new(),
             created: HashSet::new(),
             total_weight: 0,
             chunks_rebuilds: AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
+            worst_chunks: BTreeMap::new(),
+            worst_rep_rate: HashMap::new(),
             cluster_count_limit: MAX_CLUSTER_COUNT,
             cluster_vsize_limit: MAX_CLUSTER_VSIZE,
             cluster_weight_limit: MAX_CLUSTER_WEIGHT,
@@ -179,6 +188,14 @@ impl TxGraph {
         self.entries.len()
     }
 
+    pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
+        self.by_wtxid.contains_key(wtxid)
+    }
+
+    pub fn txid_for_wtxid(&self, wtxid: &Wtxid) -> Option<Txid> {
+        self.by_wtxid.get(wtxid).copied()
+    }
+
     /// Sample-and-reset cluster-linearize count (fee-refresh tests).
     pub fn take_chunks_rebuilds(&self) -> u64 {
         self.chunks_rebuilds.swap(0, Ordering::Relaxed)
@@ -186,6 +203,41 @@ impl TxGraph {
 
     fn invalidate_chunk_cache(&mut self) {
         *self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    fn cluster_rep(&self, txid: &Txid) -> Option<Txid> {
+        self.cluster_of(txid)?.members.iter().next().copied()
+    }
+
+    fn drop_cluster_index(&mut self, rep: Txid) {
+        if let Some(rate) = self.worst_rep_rate.remove(&rep) {
+            self.worst_chunks.remove(&(rate, rep));
+        }
+    }
+
+    fn index_cluster_of(&mut self, txid: &Txid) {
+        let Some(c) = self.cluster_of(txid) else {
+            return;
+        };
+        let Some(&rep) = c.members.iter().next() else {
+            return;
+        };
+        self.drop_cluster_index(rep);
+        let mut best: Option<(u64, Chunk)> = None;
+        for ch in c.chunks {
+            let rate = ch.fee_rate_sat_per_kvb();
+            let take = match &best {
+                None => true,
+                Some((br, _)) => rate < *br,
+            };
+            if take {
+                best = Some((rate, ch));
+            }
+        }
+        if let Some((rate, ch)) = best {
+            self.worst_rep_rate.insert(rep, rate);
+            self.worst_chunks.insert((rate, rep), ch);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -380,6 +432,28 @@ impl TxGraph {
     pub fn insert(&mut self, entry: TxEntry, tx: &Transaction) {
         self.invalidate_chunk_cache();
         let txid = entry.txid;
+        let mut old_reps = BTreeSet::new();
+        for inp in &tx.input {
+            if self.created.contains(&inp.previous_output) {
+                if let Some(r) = self.cluster_rep(&inp.previous_output.txid) {
+                    old_reps.insert(r);
+                }
+            }
+        }
+        for (vout, _) in tx.output.iter().enumerate() {
+            let op = OutPoint {
+                txid,
+                vout: vout as u32,
+            };
+            if let Some(child) = self.conflicts.get(&op).copied() {
+                if let Some(r) = self.cluster_rep(&child) {
+                    old_reps.insert(r);
+                }
+            }
+        }
+        for r in old_reps {
+            self.drop_cluster_index(r);
+        }
         let weight = entry.weight;
         let parents: BTreeSet<Txid> = tx
             .input
@@ -415,6 +489,7 @@ impl TxGraph {
             });
         }
         self.total_weight = self.total_weight.saturating_add(weight);
+        self.by_wtxid.insert(e.wtxid, txid);
         self.entries.insert(txid, e);
         // Children accepted while we were confirmed (reorg re-accept).
         for (vout, _) in tx.output.iter().enumerate() {
@@ -436,13 +511,26 @@ impl TxGraph {
             }
             self.spends.insert(op, child_id);
         }
+        self.index_cluster_of(&txid);
     }
 
     /// Remove a tx and unlink edges. Returns the removed entry if present.
     pub fn remove(&mut self, txid: &Txid, tx: &Transaction) -> Option<TxEntry> {
         self.invalidate_chunk_cache();
+        let old_rep = self.cluster_rep(txid);
+        let neighbors: Vec<Txid> = self
+            .entries
+            .get(txid)
+            .map(|e| e.parents.iter().chain(e.children.iter()).copied().collect())
+            .unwrap_or_default();
+        if let Some(r) = old_rep {
+            self.drop_cluster_index(r);
+        }
         let e = self.entries.remove(txid)?;
         self.total_weight = self.total_weight.saturating_sub(e.weight);
+        if self.by_wtxid.get(&e.wtxid) == Some(txid) {
+            self.by_wtxid.remove(&e.wtxid);
+        }
         for p in &e.parents {
             if let Some(pe) = self.entries.get_mut(p) {
                 pe.children.remove(txid);
@@ -466,6 +554,14 @@ impl TxGraph {
                 txid: *txid,
                 vout: vout as u32,
             });
+        }
+        for n in neighbors {
+            if self.entries.contains_key(&n) {
+                if let Some(r) = self.cluster_rep(&n) {
+                    self.drop_cluster_index(r);
+                }
+                self.index_cluster_of(&n);
+            }
         }
         Some(e)
     }
@@ -789,36 +885,19 @@ impl TxGraph {
 
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
     pub fn worst_chunk(&self) -> Option<(Txid, Chunk)> {
-        // Representative = min member txid of cluster.
-        let mut seen = HashSet::new();
-        let mut worst_rate_rep_chunk: Option<(u64, Txid, Chunk)> = None;
-        for txid in self.entries.keys() {
-            if seen.contains(txid) {
-                continue;
-            }
-            let c = self.cluster_of(txid)?;
-            for m in &c.members {
-                seen.insert(*m);
-            }
-            let rep = *c.members.iter().next()?;
-            for ch in c.chunks {
-                let rate = ch.fee_rate_sat_per_kvb();
-                let better = match &worst_rate_rep_chunk {
-                    None => true,
-                    Some((wr, _, _)) => rate < *wr,
-                };
-                if better {
-                    worst_rate_rep_chunk = Some((rate, rep, ch));
-                }
-            }
-        }
-        worst_rate_rep_chunk.map(|(_, rep, ch)| (rep, ch))
+        self.worst_chunks
+            .iter()
+            .next()
+            .map(|((_, rep), ch)| (*rep, ch.clone()))
     }
 
     /// Rebuild helper: clear and re-insert from an ordered list (parents first best-effort).
     pub fn rebuild_from(&mut self, items: Vec<(TxEntry, Transaction)>) {
         self.invalidate_chunk_cache();
         self.entries.clear();
+        self.by_wtxid.clear();
+        self.worst_chunks.clear();
+        self.worst_rep_rate.clear();
         self.spends.clear();
         self.conflicts.clear();
         self.created.clear();
@@ -910,6 +989,56 @@ mod tests {
         assert_eq!(c.members.len(), 1);
         assert_eq!(c.linearization, vec![id]);
         assert_eq!(c.chunks.len(), 1);
+    }
+
+    #[test]
+    fn wtxid_index_insert_remove_and_loser_collision() {
+        let mut g = TxGraph::new();
+        let a = make_tx(None, 1, 1);
+        let b = make_tx(None, 1, 2);
+        let ea = entry_for(&a, 100, 0);
+        let eb = entry_for(&b, 100, 1);
+        let wa = ea.wtxid;
+        let wb = eb.wtxid;
+        let ida = ea.txid;
+        let idb = eb.txid;
+        assert_ne!(wa, wb);
+        g.insert(ea, &a);
+        g.insert(eb, &b);
+        assert!(g.contains_wtxid(&wa));
+        assert!(g.contains_wtxid(&wb));
+        assert_eq!(g.txid_for_wtxid(&wa), Some(ida));
+        assert_eq!(g.txid_for_wtxid(&wb), Some(idb));
+        assert!(g.remove(&ida, &a).is_some());
+        assert!(!g.contains_wtxid(&wa));
+        assert_eq!(g.txid_for_wtxid(&wb), Some(idb));
+
+        let c = make_tx(None, 1, 3);
+        let d = make_tx(None, 1, 4);
+        let ec = entry_for(&c, 10, 2);
+        let mut ed = entry_for(&d, 10, 3);
+        let collide = ec.wtxid;
+        ed.wtxid = collide;
+        let idc = ec.txid;
+        let idd = ed.txid;
+        g.insert(ec, &c);
+        g.insert(ed, &d);
+        assert_eq!(g.txid_for_wtxid(&collide), Some(idd), "last insert wins");
+        assert!(g.remove(&idc, &c).is_some());
+        assert_eq!(
+            g.txid_for_wtxid(&collide),
+            Some(idd),
+            "removing the loser must not drop the winner"
+        );
+        assert!(g.remove(&idd, &d).is_some());
+        assert!(!g.contains_wtxid(&collide));
+
+        let e = make_tx(None, 1, 5);
+        let ee = entry_for(&e, 1, 4);
+        let we = ee.wtxid;
+        g.rebuild_from(vec![(ee, e.clone())]);
+        assert_eq!(g.txid_for_wtxid(&we), Some(e.compute_txid()));
+        assert!(!g.contains_wtxid(&wb));
     }
 
     #[test]
@@ -1287,6 +1416,32 @@ mod tests {
         assert!(g.remove(&pid, &parent).is_some());
         assert!(g.worst_chunk().is_none());
         assert!(g.remove(&pid, &parent).is_none());
+    }
+
+    #[test]
+    fn worst_chunk_index_picks_lowest_rate_then_repairs() {
+        let mut g = TxGraph::new();
+        let cheap = spend_op([1u8; 32], 50_000, 49_000);
+        let dear = spend_op([2u8; 32], 50_000, 40_000);
+        g.insert(entry_for(&cheap, 1_000, 0), &cheap);
+        g.insert(entry_for(&dear, 10_000, 1), &dear);
+        let (rep, ch) = g.worst_chunk().expect("non-empty");
+        let cheap_id = cheap.compute_txid();
+        let dear_id = dear.compute_txid();
+        assert_eq!(rep, cheap_id);
+        assert_eq!(ch.txids, vec![cheap_id]);
+        assert!(g.remove(&cheap_id, &cheap).is_some());
+        let (rep2, ch2) = g.worst_chunk().expect("dear remains");
+        assert_eq!(rep2, dear_id);
+        assert_eq!(ch2.txids, vec![dear_id]);
+        let child = make_tx(Some((dear_id, 0)), 1, 9);
+        g.insert(entry_for(&child, 1, 2), &child);
+        let (rep3, ch3) = g.worst_chunk().expect("merged cluster");
+        let members: BTreeSet<Txid> = ch3.txids.iter().copied().collect();
+        assert!(members.contains(&dear_id) || rep3 == dear_id.min(child.compute_txid()));
+        assert!(g.remove(&child.compute_txid(), &child).is_some());
+        let (rep4, _) = g.worst_chunk().expect("split back to dear");
+        assert_eq!(rep4, dear_id);
     }
 
     #[test]

@@ -846,10 +846,8 @@ fn chainwork_hex(ctx: &RpcContext, through: Option<Height>) -> String {
         return "00".repeat(32);
     };
     if let Some(hub) = ctx.chain.as_ref() {
-        if ctx.query.tip_height() == Some(tip) {
-            if let Ok(w) = hub.chain_work() {
-                return hex_encode(w.to_be_bytes());
-            }
+        if let Ok(w) = hub.work_through_height(tip.0) {
+            return hex_encode(w.to_be_bytes());
         }
     }
     let mut works = Vec::new();

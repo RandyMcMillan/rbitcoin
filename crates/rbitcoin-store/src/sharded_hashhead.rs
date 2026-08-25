@@ -250,7 +250,7 @@ mod tests {
     fn sharded_roundtrip_and_partition() {
         let dir = tmp_dir();
         let path = dir.join("head");
-        let h = ShardedHashHead::create_sharded(&path, 16, 64).unwrap();
+        let h = ShardedHashHead::create_sharded(&path, 16, 256).unwrap();
         assert_eq!(h.shards.len(), 16);
         assert!(path.is_dir());
 
@@ -288,7 +288,7 @@ mod tests {
     fn open_for_role_roundtrip_sharded() {
         let dir = tmp_dir();
         let path = dir.join("head");
-        let h = ShardedHashHead::create_sharded(&path, 16, 64).unwrap();
+        let h = ShardedHashHead::create_sharded(&path, 16, 256).unwrap();
         let mut batch = Vec::new();
         for i in 0u64..200 {
             let mut key = [0u8; 32];

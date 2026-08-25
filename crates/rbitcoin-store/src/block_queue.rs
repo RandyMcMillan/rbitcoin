@@ -12,20 +12,15 @@
 //!
 //! **Primary capacity** is soft densify assign in the net layer (no hysteresis):
 //! under ~100 MiB free densify ahead; over ~100 MiB only the next ~1 min of
-//! confirm work at tip rate. This type accepts payloads until an optional
-//! absolute byte ceiling (env) is hit.
-//!
-//! Absolute safety ceiling (optional): `RBITCOIN_BLOCK_QUEUE_GB` (integer GiB)
-//! or `RBITCOIN_BLOCK_QUEUE_BYTES`. When unset, enqueue is unlimited
-//! (`u64::MAX`) aside from OOM.
+//! confirm work at tip rate; over the 1 GiB assign-stop (`RBITCOIN_BLOCK_QUEUE_GB`
+//! / `_BYTES`) densify fills holes inside the already-fetched height range
+//! and does not grow past that horizon. This type **always** accepts
+//! already-requested payloads (OOM aside).
 
 use crate::error::StoreError;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Default absolute byte ceiling: unlimited (soft time-depth gates densify).
-pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;
 
 /// Payload clones from [`BlockQueue::raw_payloads`] / [`BlockQueue::raw_payload`].
 /// Debug/test only — wave intake must not bump this for the whole asked set.
@@ -106,7 +101,6 @@ pub struct QueuedBlockMeta {
 /// payload) but **never** writes rec files. `store_dir` is accepted for API
 /// compatibility and to optionally ignore/remove a legacy `block_queue/` dir.
 pub struct BlockQueue {
-    budget: u64,
     next_id: AtomicU64,
     /// id → entry (payload owned)
     index: BTreeMap<u64, IndexEntry>,
@@ -126,50 +120,19 @@ struct IndexEntry {
 }
 
 impl BlockQueue {
-    /// Absolute byte ceiling from env, or [`DEFAULT_BLOCK_QUEUE_BUDGET_BYTES`]
-    /// (unlimited) when unset. Env values clamp to at least 64 MiB.
-    pub fn budget_from_env() -> u64 {
-        if let Ok(s) = std::env::var("RBITCOIN_BLOCK_QUEUE_BYTES") {
-            if let Ok(n) = s.parse::<u64>() {
-                return n.max(64 * 1024 * 1024);
-            }
-        }
-        if let Ok(s) = std::env::var("RBITCOIN_BLOCK_QUEUE_GB") {
-            if let Ok(n) = s.parse::<u64>() {
-                return n.saturating_mul(1024 * 1024 * 1024).max(64 * 1024 * 1024);
-            }
-        }
-        DEFAULT_BLOCK_QUEUE_BUDGET_BYTES
-    }
-
     /// Create an empty in-RAM queue. Legacy on-disk `store_dir/block_queue/` is
     /// not loaded (redownload after restart); best-effort remove stale files.
     pub fn open_or_create(store_dir: &Path) -> Result<Self, StoreError> {
-        Self::open_or_create_with_budget(store_dir, Self::budget_from_env())
-    }
-
-    pub fn open_or_create_with_budget(store_dir: &Path, budget: u64) -> Result<Self, StoreError> {
-        // Drop legacy durable layout if present (no longer used).
         let legacy = store_dir.join("block_queue");
         if legacy.exists() {
             let _ = std::fs::remove_dir_all(&legacy);
         }
-        let budget = if budget == u64::MAX {
-            u64::MAX
-        } else {
-            budget.max(64 * 1024 * 1024)
-        };
         Ok(Self {
-            budget,
             next_id: AtomicU64::new(1),
             index: BTreeMap::new(),
             height_to_id: HashMap::new(),
             bytes: 0,
         })
-    }
-
-    pub fn budget(&self) -> u64 {
-        self.budget
     }
 
     pub fn bytes(&self) -> u64 {
@@ -180,30 +143,10 @@ impl BlockQueue {
         self.index.len()
     }
 
-    /// True when an optional absolute byte ceiling still has room.
-    ///
-    /// Default budget is unlimited; densify is gated by time-depth soft stop
-    /// in the IBD assign path, not this check.
-    pub fn can_enqueue(&self, payload_len: usize) -> bool {
-        if self.budget == u64::MAX {
-            return true;
-        }
-        self.bytes.saturating_add(payload_len as u64) <= self.budget
-    }
-
-    /// `bytes / budget` for finite caps; `0.0` when unlimited.
-    pub fn fill_ratio(&self) -> f64 {
-        if self.budget == 0 || self.budget == u64::MAX {
-            return 0.0;
-        }
-        self.bytes as f64 / self.budget as f64
-    }
-
     /// Append a block payload in RAM. Returns queue id.
     ///
-    /// Refuses only when an optional absolute [`Self::budget`] would be
-    /// exceeded ([`StoreError::BudgetFull`]). Default budget is unlimited —
-    /// IBD soft time-depth stops **new densify getdata**, not in-flight offers.
+    /// Always accepts (IBD densify assign-stop is request-limited; never refuse
+    /// already-requested bodies here).
     pub fn enqueue(
         &mut self,
         height: u32,
@@ -211,11 +154,6 @@ impl BlockQueue {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<u64, StoreError> {
-        if !self.can_enqueue(payload.len()) {
-            return Err(StoreError::BudgetFull(
-                "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
-            ));
-        }
         let n_inputs = crate::block_wire_input_count(payload);
         self.enqueue_vec(height, hash, header_fk, payload.to_vec(), n_inputs)
     }
@@ -232,11 +170,6 @@ impl BlockQueue {
         payload: Vec<u8>,
         n_inputs: u32,
     ) -> Result<u64, StoreError> {
-        if !self.can_enqueue(payload.len()) {
-            return Err(StoreError::BudgetFull(
-                "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
-            ));
-        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
         self.index.insert(
@@ -548,7 +481,7 @@ mod tests {
     #[test]
     fn get_by_height_peek_without_dequeue() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let payload = b"wire-bytes-height-42".to_vec();
         q.enqueue(42, [0x11u8; 32], 3, &payload).unwrap();
         let got = q.get_by_height(42).unwrap().expect("by height");
@@ -563,7 +496,7 @@ mod tests {
     #[test]
     fn enqueue_dequeue_no_disk_rehydrate() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let payload = b"fake-block-bytes-for-queue".to_vec();
         let id = q.enqueue(100, [0xABu8; 32], 7, &payload).unwrap();
         assert_eq!(q.count(), 1);
@@ -575,62 +508,19 @@ mod tests {
         assert_eq!(q.count(), 0);
         // Restart: RAM queue is empty (by design — no durable rehydrate).
         drop(q);
-        let q2 = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let q2 = BlockQueue::open_or_create(&dir).unwrap();
         assert_eq!(q2.count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Serialize env mutators — parallel suite races `budget_from_env` readers.
-    static BQ_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    fn default_budget_unlimited_unless_env() {
-        let _g = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let b = BlockQueue::budget_from_env();
-        if std::env::var("RBITCOIN_BLOCK_QUEUE_BYTES").is_ok()
-            || std::env::var("RBITCOIN_BLOCK_QUEUE_GB").is_ok()
-        {
-            assert!(b >= 64 * 1024 * 1024);
-        } else {
-            assert_eq!(b, u64::MAX, "default absolute ceiling is unlimited");
-        }
-    }
-
-    #[test]
-    fn budget_from_env_bytes_and_gb_clamps() {
-        let _g = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_b = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
-        let prev_g = std::env::var_os("RBITCOIN_BLOCK_QUEUE_GB");
-        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");
-        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", "1"); // below 64MiB floor
-        assert_eq!(BlockQueue::budget_from_env(), 64 * 1024 * 1024);
-        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES");
-        std::env::set_var("RBITCOIN_BLOCK_QUEUE_GB", "2");
-        assert_eq!(BlockQueue::budget_from_env(), 2u64 * 1024 * 1024 * 1024);
-        match prev_b {
-            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
-        }
-        match prev_g {
-            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_GB", v),
-            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB"),
-        }
-    }
-
-    #[test]
-    fn can_enqueue_and_fill_ratio_budgeted() {
+    fn enqueue_accepts_large_payload_and_drops_legacy_dir() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
-        assert!(q.can_enqueue(1024));
-        assert!(q.fill_ratio() >= 0.0);
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let big = vec![0u8; 65 * 1024 * 1024];
-        assert!(!q.can_enqueue(big.len()));
-        assert!(q.enqueue(1, [9u8; 32], 1, &big).is_err());
-        // Unlimited budget: fill_ratio 0.
-        let q2 = BlockQueue::open_or_create_with_budget(&dir, u64::MAX).unwrap();
-        assert_eq!(q2.fill_ratio(), 0.0);
-        assert!(q2.can_enqueue(big.len()));
-        // Legacy dir cleanup path.
+        q.enqueue(1, [9u8; 32], 1, &big)
+            .expect("enqueue has no byte ceiling");
+        assert_eq!(q.count(), 1);
         let legacy = dir.join("block_queue");
         std::fs::create_dir_all(&legacy).unwrap();
         let _ = BlockQueue::open_or_create(&dir).unwrap();
@@ -640,7 +530,7 @@ mod tests {
     #[test]
     fn max_height_span() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         assert_eq!(q.max_height(), None);
         q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
         q.enqueue(15, [2u8; 32], 2, b"b").unwrap();
@@ -653,7 +543,7 @@ mod tests {
     #[test]
     fn fifo_oldest_and_heights() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let id1 = q.enqueue(1, [1u8; 32], 1, b"a").unwrap();
         let id2 = q.enqueue(2, [2u8; 32], 2, b"bb").unwrap();
         assert_eq!(q.peek_oldest_id(), Some(id1));
@@ -669,7 +559,7 @@ mod tests {
     #[test]
     fn list_meta_matches_payload_len() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(5, [9u8; 32], 1, b"hello").unwrap();
         let m = q.list_meta();
         assert_eq!(m.len(), 1);
@@ -683,7 +573,7 @@ mod tests {
     #[test]
     fn enqueue_stamps_wire_input_count() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let mut payload = vec![0u8; 80];
         crate::compact::write_compact_size(&mut payload, 1);
         payload.extend_from_slice(&1u32.to_le_bytes());
@@ -705,7 +595,7 @@ mod tests {
     #[test]
     fn list_meta_reports_resolve_complete() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(3, [3u8; 32], 1, b"a").unwrap();
         q.enqueue(4, [4u8; 32], 2, b"b").unwrap();
         q.mark_resolve_complete(4).unwrap();
@@ -731,7 +621,7 @@ mod tests {
     fn unresolved_heights_skips_complete_and_respects_cap() {
         use std::collections::HashSet;
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         for h in 0..24u32 {
             q.enqueue(h, [h as u8; 32], 1, b"x").unwrap();
         }
@@ -750,7 +640,7 @@ mod tests {
     fn unresolved_heights_stops_at_first_gap() {
         use std::collections::HashSet;
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(12, [12u8; 32], 1, b"a").unwrap();
         q.enqueue(13, [13u8; 32], 1, b"b").unwrap();
         let none = HashSet::new();
@@ -769,27 +659,25 @@ mod tests {
     }
 
     #[test]
-    fn absolute_budget_refuses_enqueue() {
+    fn enqueue_never_refuses_on_bytes() {
         let dir = temp();
-        // 64 MiB floor still applies — use small payload vs tiny budget override
-        // after open: construct with large floor then fill.
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let big = vec![0u8; 32 * 1024 * 1024];
         q.enqueue(1, [1u8; 32], 1, &big).unwrap();
         q.enqueue(2, [2u8; 32], 2, &big).unwrap();
-        // Third 32 MiB would exceed 64 MiB budget.
-        assert!(q.enqueue(3, [3u8; 32], 3, &big).is_err());
+        q.enqueue(3, [3u8; 32], 3, &big)
+            .expect("BQ must accept already-requested bodies; densify assign-stop is the cap");
+        assert_eq!(q.count(), 3);
+        assert!(q.bytes() > 64 * 1024 * 1024);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn ids_and_get_by_height_and_fill_ratio() {
+    fn ids_and_get_by_height() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         assert!(q.ids().is_empty());
         assert!(!q.contains_height(1));
-        assert!((q.fill_ratio() - 0.0).abs() < 1e-9);
-        assert!(q.can_enqueue(1));
         let id = q.enqueue(7, [7u8; 32], 1, b"xyz").unwrap();
         let mut ids = q.ids();
         ids.sort_unstable();
@@ -805,14 +693,13 @@ mod tests {
         assert_eq!(q.max_height(), Some(7));
         assert!(q.dequeue(id).unwrap());
         assert!(!q.contains_height(7));
-        let _ = BlockQueue::budget_from_env();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn resolve_complete_clears_with_dequeue() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let id = q.enqueue(5, [5u8; 32], 1, b"blk").unwrap();
         q.mark_resolve_complete(5).unwrap();
         assert!(q.is_resolve_complete(5));
@@ -824,7 +711,7 @@ mod tests {
     #[test]
     fn resolve_complete_clears_with_dequeue_height() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(9, [9u8; 32], 1, b"a").unwrap();
         q.enqueue(10, [10u8; 32], 2, b"b").unwrap();
         q.mark_resolve_complete(10).unwrap();
@@ -839,7 +726,7 @@ mod tests {
     #[test]
     fn lookup_take_removes_bq_row() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(10, [10u8; 32], 7, b"aaaa").unwrap();
         q.enqueue(11, [11u8; 32], 8, b"bb").unwrap();
         assert_eq!(q.bytes(), 6);
@@ -858,7 +745,7 @@ mod tests {
     #[test]
     fn promote_wave_drops_raw_and_charges_decoded() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(10, [1u8; 32], 1, b"aaaa").unwrap();
         q.enqueue(11, [2u8; 32], 2, b"bb").unwrap();
         q.enqueue(12, [3u8; 32], 3, b"c").unwrap();
@@ -888,7 +775,7 @@ mod tests {
     #[test]
     fn raw_payload_clones_one_has_raw_does_not() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         for h in 0..8u32 {
             q.enqueue(h, [h as u8; 32], 1, &[h as u8; 8]).unwrap();
         }
@@ -907,7 +794,7 @@ mod tests {
     #[test]
     fn height_index_survives_promote_and_dequeue() {
         let dir = temp();
-        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let mut q = BlockQueue::open_or_create(&dir).unwrap();
         q.enqueue(10, [10u8; 32], 1, b"a").unwrap();
         q.enqueue(11, [11u8; 32], 2, b"b").unwrap();
         q.enqueue(12, [12u8; 32], 3, b"c").unwrap();

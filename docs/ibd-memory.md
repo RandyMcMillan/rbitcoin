@@ -8,7 +8,7 @@ IBD path. It is **not** about kernel page cache under FdOnly store files
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). `bytes()` is **raw only** | Peer **BlockFramed** enqueues **raw** frame payload and stamps Σ `tx.input` via a CompactSize walk (no `Block` decode). Lookup packs/holds on that count; **dequeues** after load-batch send. Decoded `Arc<Block>` + `TxPrecompute` live on **loadq** (cap 14), then scriptq/writeq. **Have-body** (hole / densify / receive) is confirmed ∨ BQ hash ∨ `H ≤ lookup_taken_hi`. **Never both** raw and decoded. **RAM-only by design**. Restart empties BQ+loadq. Logs: `bq soft=n/win RAM=` `loadq=n/14`. |
+| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate; at/over 1 GiB assign-stop (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, `0` = unlimited) fill holes through the already-fetched height horizon only (BQ max / lookup_taken) — do not grow past it. **Never** refuse enqueue. `bytes()` is **raw only** | Peer **BlockFramed** enqueues **raw** frame payload and stamps Σ `tx.input` via a CompactSize walk (no `Block` decode). Lookup packs/holds on that count; **dequeues** after load-batch send. Decoded `Arc<Block>` + `TxPrecompute` live on **loadq** (cap 14), then scriptq/writeq. **Have-body** (hole / densify / receive) is confirmed ∨ BQ hash ∨ `H ≤ lookup_taken_hi`. **Never both** raw and decoded. **RAM-only by design**. Restart empties BQ+loadq. Logs: `bq soft=n/win RAM=` `loadq=n/14`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary gate is soft assign (100 MiB free / 1 min confirm window). |
 | **Confirm feed** | readiness (height/hash), no wire retain | **Load** packs tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (hardcoded **8000**, overshoot block included) or hard **144** blocks. At dense mainnet heights **8000 inputs ≈ a few blocks** (often 1–3; early chain can pack many tiny blocks up to 144). Do not treat ~32 as pack size. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave. Hard **min 8000** inputs when more unresolved heights remain (`ready=0` included). Also holds a short wave while `ready` is over half the 1-min BQ window, unless the first unresolved height is in the load-facing half of that window **and** the collect is already ≥8000. Requeue / finish on outcome |
 
@@ -68,9 +68,9 @@ is over target.
 | Allowed | Forbidden |
 |---------|-----------|
 | Limit **densify getdata assign** when BQ payload is over ~100 MiB to heights confirm will consume in the next ~1 min at tip rate | Await a soft gate **before** the next TCP read on a peer |
-| Free densify ahead while BQ payload is under ~100 MiB | Drop a body we already received solely for soft budget |
-| Overshoot soft limits while in-flight requests complete | Make healthy peers look stalled by parking the reader on soft backpressure |
-| Accept all in-flight bodies into the RAM queue via `block_queue_offer` (soft assign limits are ignored on offer) | Bound process RAM by refusing peer bytes already on the wire |
+| At/over 1 GiB assign-stop, densify **holes in the already-fetched height range only** (do not grow past BQ max / lookup_taken) | Drop a body we already received solely for soft budget |
+| Free densify ahead while BQ payload is under ~100 MiB | Make healthy peers look stalled by parking the reader on soft backpressure |
+| Overshoot soft limits while in-flight requests complete; accept all in-flight bodies via `block_queue_offer` (assign-stop is ignored on offer) | Bound process RAM by refusing peer bytes already on the wire |
 
 **Why this is safe:** when soft assign restricts densify to the confirm-time
 window, outstanding requests remain finite (per-peer in-flight window).

@@ -10,6 +10,8 @@
 //!   - BQ payload **≤ ~100 MiB** → usual densify ahead to the height horizon
 //!   - BQ payload **> ~100 MiB** → only heights confirm will consume in the
 //!     next **~1 min** at current tip rate ([`rbitcoin_query::soft_densify_band_hi`])
+//!   - BQ payload **≥ assign-stop** (default 1 GiB) → holes through the
+//!     already-fetched height horizon only (BQ max / lookup_taken); do not grow
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -189,11 +191,19 @@ pub(crate) fn assign_work_ordered(
 
     let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
     let depth_bytes = hub.query.block_queue_stats().1;
+    let fetched_hi = hub
+        .query
+        .block_queue_max_height()
+        .into_iter()
+        .chain(hub.query.lookup_taken_hi())
+        .max();
     let band_hi = rbitcoin_query::soft_densify_band_hi(
         path_lo,
         densify_hi,
         depth_bytes,
         tip_rate_blocks_per_s,
+        rbitcoin_query::bq_assign_stop_bytes(),
+        fetched_hi,
     );
 
     let densify = collect_height_band(st, hub, path_lo, band_hi, room.max(1));
@@ -1471,6 +1481,87 @@ mod tests {
         assert!(
             issued_hts.iter().any(|&ht| ht > 16),
             "under free bytes: densify past 1-min window; issued={issued_hts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Serialize env mutators — parallel suite races `bq_assign_stop_bytes`.
+    static BQ_ASSIGN_STOP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Over assign-stop: fill holes in the already-fetched range, do not grow past it.
+    #[test]
+    fn densify_over_assign_stop_fills_fetched_range_only() {
+        let _g = BQ_ASSIGN_STOP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_b = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
+        let prev_g = std::env::var_os("RBITCOIN_BLOCK_QUEUE_GB");
+        struct Restore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
+                    None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
+                }
+                match self.1.take() {
+                    Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_GB", v),
+                    None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB"),
+                }
+            }
+        }
+        let _restore = Restore(prev_b, prev_g);
+        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", "2048");
+
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 128;
+        cfg.per_peer = 64;
+
+        for ht in 1u32..=200 {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.height_to_hash.insert(ht, hash);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+            st.body.mark_missing(hash);
+        }
+        // Tip batch already fetched so densify is not starved by tip-hole slots.
+        for ht in 1u32..=TIP_HOLE_MAX as u32 {
+            hub.query
+                .block_queue_enqueue(ht, h(ht).to_byte_array(), ht as u64, b"x")
+                .unwrap();
+            st.body.mark_pending(h(ht));
+        }
+        let chunk = vec![0u8; 4096];
+        hub.query
+            .block_queue_enqueue(80, h(80).to_byte_array(), 80, &chunk)
+            .unwrap();
+        st.body.mark_pending(h(80));
+        assert!(hub.query.block_queue_stats().1 >= 2048);
+        assert_eq!(hub.query.block_queue_max_height(), Some(80));
+
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, Some(5.0));
+
+        let issued_hts: Vec<u32> = st
+            .inflight
+            .keys()
+            .filter_map(|hash| st.hash_height.get(hash).copied())
+            .collect();
+        assert!(
+            issued_hts
+                .iter()
+                .any(|&ht| ht > TIP_HOLE_MAX as u32 && ht < 80),
+            "assign-stop must still densify holes inside fetched range; issued={issued_hts:?}"
+        );
+        assert!(
+            issued_hts.iter().all(|&ht| ht <= 80),
+            "assign-stop must not grow past fetched horizon 80; issued={issued_hts:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);

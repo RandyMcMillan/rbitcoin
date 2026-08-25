@@ -393,9 +393,18 @@ mod tests {
 
         let free = BQ_SOFT_FREE_BYTES;
         let over = free + 1;
-        assert_eq!(soft_densify_band_hi(10, 5000, free, Some(5.0)), 5000);
-        assert_eq!(soft_densify_band_hi(10, 5000, over, Some(5.0)), 309);
-        assert_eq!(soft_densify_band_hi(10, 5000, over, None), 10);
+        assert_eq!(
+            soft_densify_band_hi(10, 5000, free, Some(5.0), u64::MAX, None),
+            5000
+        );
+        assert_eq!(
+            soft_densify_band_hi(10, 5000, over, Some(5.0), u64::MAX, None),
+            309
+        );
+        assert_eq!(
+            soft_densify_band_hi(10, 5000, over, None, u64::MAX, None),
+            10
+        );
         assert!(!soft_assign_restricted(free));
         assert!(soft_assign_restricted(over));
     }

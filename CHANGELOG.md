@@ -45,6 +45,11 @@ before 1.0).
 
 ### Changed
 
+- **BQ assign-stop 1 GiB:** `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` no longer
+  refuse enqueue. Default 1 GiB densify assign-stop (`0` = unlimited): fill
+  holes through the already-fetched height horizon; do not grow past it.
+  [`docs/ibd-memory.md`](docs/ibd-memory.md).
+
 - **Idx fill windows io_uring SQ:** unique `tx.idx` page preads harvest when
   the session is at in-flight cap (same shape as BDZ / bulk_io). SQ full is
   `BudgetFull`, not `corrupt record`. Lookup retries it at debug, not WARN.

@@ -128,6 +128,7 @@ PY
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
   echo "Tooling: use llvmPackages matching rustc (rustc 1.95 → LLVM 21; see shell.nix)."
+  ./scripts/coverage-crap.sh "$ROOT/coverage/lcov.info" "$ROOT/coverage/crap.json"
   exit 0
 fi
 

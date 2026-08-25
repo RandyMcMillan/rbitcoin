@@ -359,6 +359,10 @@ pub fn confirm_bq_resolve_wave_capped(
     }
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
+    if let Some(&hi) = done.last() {
+        let started = query.lookup_started_hi().unwrap_or(0).max(hi);
+        query.set_lookup_started_hi(Some(started));
+    }
     if let Some((live, published)) = ids.as_mut() {
         if let (Some(&lo), Some(&hi)) = (done.first(), done.last()) {
             live.note_span(lo, hi, layer);
@@ -1403,6 +1407,11 @@ mod tests {
             "resolve must not bump taken_hi before load-batch send; got {:?}",
             q.lookup_taken_hi()
         );
+        assert_eq!(
+            q.lookup_started_hi(),
+            Some(4),
+            "resolve wave must bump started_hi to processed hi"
+        );
         assert!(
             q.block_queue_has_height(4),
             "unsent wave tail must stay on the BQ"
@@ -1414,6 +1423,11 @@ mod tests {
         q.block_queue_dequeue_height(1).unwrap();
         q.set_lookup_taken_hi(Some(1));
         assert_eq!(q.lookup_taken_hi(), Some(1));
+        assert_eq!(
+            q.lookup_started_hi(),
+            Some(4),
+            "take must not rewind started_hi"
+        );
         assert!(!q.block_queue_has_height(1));
         assert!(q.block_queue_has_height(4));
         let _ = std::fs::remove_dir_all(&path);

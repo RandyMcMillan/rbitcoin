@@ -1423,6 +1423,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         spends: vec![],
         batch_creates: vec![],
         external_parent_ranges: Default::default(),
+        external_parent_spent_ranges: Default::default(),
         external_parent_txids: Default::default(),
         external_parent_pins: Default::default(),
         batch_pin: vec![],
@@ -1477,6 +1478,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         spends: vec![],
         batch_creates: vec![],
         external_parent_ranges: ranges,
+        external_parent_spent_ranges: Default::default(),
         external_parent_txids: txids,
         external_parent_pins: Default::default(),
         batch_pin: vec![],
@@ -1570,6 +1572,7 @@ fn pin_sparse_need_high_vout_only() {
             m.insert(parent_id, range);
             m
         },
+        external_parent_spent_ranges: Default::default(),
         external_parent_txids: {
             let mut m = rbitcoin_query::U64Map::default();
             m.insert(parent_id, parent_tx.txid);

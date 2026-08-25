@@ -20,6 +20,8 @@ pub struct ExternalParentStamp {
     pub resolved: TxidFkMap,
     /// create_fk_id → Class A body range
     pub ranges: U64Map<(u64, u64)>,
+    /// create_fk_id → spent.body range (`spent.idx`). Archived parents only.
+    pub spent_ranges: U64Map<(u64, u64)>,
     /// create_fk_id → prev_txid
     pub txids: U64Map<[u8; 32]>,
     /// create_fk_id → CreatePin when RecentCreates noted outs
@@ -165,45 +167,80 @@ pub fn stamp_external_parents(
     crate::archive_phase_stats::note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
     crate::archive_phase_stats::note_recent(stamp.recent_n, stamp.recent_ns);
 
-    fill_missing_parent_ranges(store, in_flight, &mut stamp.ranges, &stamp.txids)?;
+    fill_missing_parent_ranges(
+        store,
+        in_flight,
+        &mut stamp.ranges,
+        &mut stamp.spent_ranges,
+        &stamp.txids,
+    )?;
     Ok(stamp)
 }
 
-/// Idx body_range for stamped create_fks that have no range and no in-flight outs.
+/// Idx body_range and spent_range for stamped create_fks with no in-flight outs.
+///
+/// Body miss after identity is `Corrupt`. Spent miss after a **store** body fill
+/// is `Corrupt`. RAM-only identity (published/recent fake range, no `spent.idx`
+/// row) leaves spent unset — write ensure still stamps those holes.
 pub fn fill_missing_parent_ranges(
     store: &Store,
     in_flight: &InFlightView,
     ranges: &mut U64Map<(u64, u64)>,
+    spent_ranges: &mut U64Map<(u64, u64)>,
     txids: &U64Map<[u8; 32]>,
 ) -> Result<(), QueryError> {
-    let mut need_range: Vec<Fk> = Vec::new();
-    let mut seen = U64Set::default();
+    let mut need_body: Vec<Fk> = Vec::new();
+    let mut seen_body = U64Set::default();
+    let mut need_spent: Vec<Fk> = Vec::new();
+    let mut seen_spent = U64Set::default();
     for (&id, _) in txids {
-        if ranges.contains_key(&id) {
-            continue;
-        }
         if in_flight.get_out(id).is_some() {
             continue;
         }
-        if seen.insert(id) {
-            need_range.push(Fk(id));
+        let fk = Fk(id);
+        if !ranges.contains_key(&id) && seen_body.insert(id) {
+            need_body.push(fk);
+        }
+        if !spent_ranges.contains_key(&id) && seen_spent.insert(id) {
+            need_spent.push(fk);
         }
     }
-    if need_range.is_empty() {
-        return Ok(());
+    let mut body_filled = U64Set::default();
+    if !need_body.is_empty() {
+        let filled = store.tx_body_range_batch(&need_body)?;
+        for (fk, row) in need_body.into_iter().zip(filled.into_iter()) {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            let Some(range) = row else {
+                return Err(rbitcoin_store::StoreError::Corrupt(
+                    "archive: external parent body_range missing after create_fk stamp",
+                )
+                .into());
+            };
+            ranges.insert(id, range);
+            body_filled.insert(id);
+        }
     }
-    let filled = store.tx_body_range_batch(&need_range)?;
-    for (fk, row) in need_range.into_iter().zip(filled.into_iter()) {
-        let Some(id) = fk.get() else {
-            continue;
-        };
-        let Some(range) = row else {
-            return Err(rbitcoin_store::StoreError::Corrupt(
-                "archive: external parent body_range missing after create_fk stamp",
-            )
-            .into());
-        };
-        ranges.insert(id, range);
+    if !need_spent.is_empty() {
+        let filled = store.tx_spent_range_batch(&need_spent)?;
+        for (fk, row) in need_spent.into_iter().zip(filled.into_iter()) {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            match row {
+                Some(sr) => {
+                    spent_ranges.insert(id, sr);
+                }
+                None if body_filled.contains(&id) => {
+                    return Err(rbitcoin_store::StoreError::Corrupt(
+                        "archive: external parent spent_range missing after create_fk stamp",
+                    )
+                    .into());
+                }
+                None => {}
+            }
+        }
     }
     Ok(())
 }

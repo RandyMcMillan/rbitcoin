@@ -57,6 +57,8 @@ pub struct ArchiveWritePlan {
     /// `txid.body` (identity is separate from range). Pack-scale identity hasher
     /// ([`crate::U64Map`]): dense create_fks load evenly.
     pub external_parent_ranges: crate::U64Map<(u64, u64)>,
+    /// create_fk → spent.body `(off, len)` from `spent.idx` (archived parents).
+    pub external_parent_spent_ranges: crate::U64Map<(u64, u64)>,
     /// **RAM-only** reverse of stamp resolve: create_fk id → parent `prev_txid`.
     ///
     /// Built when in-flight / head resolve binds `prev_txid → fk`.
@@ -82,6 +84,7 @@ impl ArchiveWritePlan {
             spends: Vec::new(),
             batch_creates: Vec::new(),
             external_parent_ranges: crate::U64Map::default(),
+            external_parent_spent_ranges: crate::U64Map::default(),
             external_parent_txids: crate::U64Map::default(),
             external_parent_pins: crate::U64Map::default(),
             batch_pin: Vec::new(),
@@ -107,6 +110,8 @@ impl ArchiveWritePlan {
     pub fn clear_external_parent_outs(&mut self) {
         self.external_parent_ranges.clear();
         self.external_parent_ranges.shrink_to_fit();
+        self.external_parent_spent_ranges.clear();
+        self.external_parent_spent_ranges.shrink_to_fit();
         self.external_parent_txids.clear();
         self.external_parent_txids.shrink_to_fit();
         self.external_parent_pins.clear();
@@ -207,9 +212,11 @@ impl ArchiveWritePlan {
             return;
         }
         other.external_parent_ranges.clear();
+        other.external_parent_spent_ranges.clear();
         other.external_parent_txids.clear();
         other.external_parent_pins.clear();
         self.external_parent_ranges.clear();
+        self.external_parent_spent_ranges.clear();
         self.external_parent_txids.clear();
         self.external_parent_pins.clear();
 
@@ -442,6 +449,7 @@ impl Query {
         let head_fk_ns = ext.head_fk_ns;
         let resolved = ext.resolved;
         let mut external_parent_ranges = ext.ranges;
+        let mut external_parent_spent_ranges = ext.spent_ranges;
         let mut external_parent_txids = ext.txids;
         let external_parent_pins = ext.pins;
         crate::archive_phase_stats::note_resolve_counts(
@@ -520,6 +528,7 @@ impl Query {
                 &self.store,
                 in_flight,
                 &mut external_parent_ranges,
+                &mut external_parent_spent_ranges,
                 &external_parent_txids,
             )?;
         }
@@ -564,6 +573,7 @@ impl Query {
             spends,
             batch_creates,
             external_parent_ranges,
+            external_parent_spent_ranges,
             external_parent_txids,
             external_parent_pins,
             batch_pin,
@@ -1404,6 +1414,49 @@ mod tests {
             "creates-only in_flight must still stamp body_range for load denserels"
         );
         assert_eq!(plan.external_parent_txid(1), Some(parent_txid));
+        let spent = q.store.txs.spent_range(Fk(1)).expect("archived spent.idx");
+        assert_eq!(
+            plan.external_parent_spent_ranges.get(&1).copied(),
+            Some(spent),
+            "creates-only in_flight must stamp spent.idx range (write ensure skip)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TipOnly leftover parent: body range from head, spent.idx range on the stamp.
+    #[test]
+    fn fill_missing_parent_ranges_stamps_spent_idx_for_archived() {
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::HeaderRecord;
+        let (dir, q) = temp_query("stamp-spent-idx");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        let ph = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [1u8; 32],
+        };
+        q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
+        let spent = q.store.txs.spent_range(Fk(1)).expect("spent.idx");
+        let helper = crate::stamp_external_parents(
+            q.store(),
+            &[parent_txid],
+            &crate::InFlightView::empty(),
+            q.published_ids().as_ref(),
+            q.recent_creates().as_ref(),
+        )
+        .expect("stamp archived parent");
+        assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(1)));
+        assert!(helper.ranges.get(&1).is_some_and(|r| r.1 > 0));
+        assert_eq!(
+            helper.spent_ranges.get(&1).copied(),
+            Some(spent),
+            "archived parent must carry spent.idx range on the lookup stamp"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

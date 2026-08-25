@@ -79,6 +79,7 @@ What the node actually runs. This is the map; findings follow.
 | Piece | Algorithm | Notes |
 |-------|-----------|--------|
 | Headers sync | one `sync_started` peer | 50 ms session tick polls `on_session_heartbeat` |
+| Inbound handshake | 60 s VERSION/VERACK bound | `inbound_connect_and_handshake`; drops the `max_inbound` permit |
 | IBD assign | densify walk, `FAR_SCAN_BUDGET` 65 536 | request-limited soft budget |
 | Compact blocks | short-id + prefilled interleave | prefilled index validation weaker than Core |
 | AddrMan | unbounded `HashMap` | no tried/new bucket caps |
@@ -113,18 +114,6 @@ What the node actually runs. This is the map; findings follow.
 ## 2. Highest-priority findings
 
 These are the ones worth a plan. ✔ = re-read against current source.
-
-### High — P2P / DoS / indexes
-
-#### N-H4. Inbound handshake holds a slot with no deadline
-
-`crates/rbitcoin-net/src/service.rs` inbound spawn keeps the semaphore
-permit across `connect_and_handshake` → `application_handshake`
-(`peer.rs` ~349) looping `read_v2_frame` with no timeout. Silent TCP/BIP324
-completes then stalls → `max_inbound` exhausted at zero bandwidth. Core: 60 s
-VERSION/VERACK.
-
-**Fix:** `tokio::time::timeout(60s, connect_and_handshake)` on inbound.
 
 ### High — mempool / RPC / Electrum (product-visible)
 
@@ -400,7 +389,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | store | 0 | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N², fence clone |
 | consensus + primitives | 0 | *(none remaining)* | MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
-| net | 1 (inbound handshake) | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
+| net | 0 | compact indexes, random eviction, unbounded maps, v2 copies | densify, INV flush, BlockCache |
 | mempool | 1 (testmempoolaccept, shared with RPC) | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 2 (active pop, testmempoolaccept) | submitblock gate, gettxout, hashps, unbounded batch | GBT depends, longpoll |
 | electrum | 1 (status **order** vs get_history) | mempool_stats | status full-history, announce O(subs) |
@@ -414,12 +403,11 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Order is split-risk then operator-visible
 then IBD CPU.
 
-1. **N-H4 inbound handshake timeout**.
-2. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
-3. Electrum status **ordering**; decide COMPAT vs spec for the extra
+1. **M-H1 dry-run testmempoolaccept** + **M-H2 RPC active map**.
+2. Electrum status **ordering**; decide COMPAT vs spec for the extra
    blockhash.
-4. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-5. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
+3. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+4. Esplora `/blocks` summaries (P11). IBD fence Arc, densify watermark,
    v2 decode, MTP ring, and HashHead online rehash (S-H1) are closed.
 
 Out of scope for that list (Won't-fix / policy): flattening uring, process
@@ -472,4 +460,9 @@ leaving a stale High row in §2–6.
   `check_headers_sync_timeouts`. Pins:
   `session_heartbeat_disconnects_stalling_headers_sync`,
   `session_heartbeat_keeps_sole_preferred_headers_sync_peer`.
+  [#252](https://github.com/reardencode/rbitcoin/pull/252).
+- **N-H4.** Inbound accept uses `inbound_connect_and_handshake` (60 s Core
+  VERSION/VERACK bound); timeout is `NetError::Timeout` and drops the
+  `max_inbound` permit. Pins: `inbound_handshake_timeout_after_silence`,
+  `inbound_handshake_timeout_is_core_60s`.
 - **S-H1** — HashHead / ScriptHashHead no longer rewrite occupied tables while serving. Header overflow rolls `header.head.gN`; ingest SH seals at 0.80. Undersized single-gen `header.head` rewrites on open only. `rehash_to` / `rehash_gate` / `ShardedHashHead` deleted. [#248](https://github.com/reardencode/rbitcoin/pull/248).

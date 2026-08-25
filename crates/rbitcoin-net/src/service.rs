@@ -4,7 +4,10 @@ use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
-use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta, HandshakePolicy};
+use crate::peer::{
+    connect_and_handshake, inbound_connect_and_handshake, peer_session_with, FollowSessionMeta,
+    HandshakePolicy,
+};
 use crate::peer_dos::{inbound_semaphore, DEFAULT_MAX_INBOUND};
 use crate::peers::{DialRequest, LivePeer, PeerConnType, PeerHub};
 use crate::v2::{V2Reader, V2Writer};
@@ -151,13 +154,12 @@ impl P2PNode {
                         let sessions = sessions_in.clone();
                         let h = tokio::spawn(async move {
                             let _session_slot = permit;
-                            let (ver, reader, writer, wire) = match connect_and_handshake(
+                            let (ver, reader, writer, wire) = match inbound_connect_and_handshake(
                                 stream,
                                 magic_c,
                                 our,
                                 peer_addr,
                                 height,
-                                true,
                                 &ua,
                                 HandshakePolicy {
                                     hub: Some(hub.as_ref()),

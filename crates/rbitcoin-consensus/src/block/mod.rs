@@ -1508,37 +1508,12 @@ pub(crate) fn structural_validate_spends(
     // On-disk spender meta is authority; pin only supplies abs. No cold body walk.
     let t_spent = Instant::now();
 
-    let mut vouts_by_create: U64Map<Vec<u32>> = U64Map::default();
-    let mut null_create_keys: Vec<([u8; 32], u32)> = Vec::new();
-    for &(prev_txid, vout, _sfk, create_fk) in spends {
-        if create_fk.is_null() {
-            null_create_keys.push((prev_txid, vout));
-            continue;
-        }
-        if let Some(id) = create_fk.get() {
-            vouts_by_create.entry(id).or_default().push(vout);
-        }
-    }
-    for vouts in vouts_by_create.values_mut() {
-        vouts.sort_unstable();
-        vouts.dedup();
-    }
-
     // Every non-null create must have pin abs. Missing abs is a load bug —
     // not a soft cold spentness path.
     let t_abs = Instant::now();
-    let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
-    for (id, vouts) in &vouts_by_create {
-        let fk = rbitcoin_primitives::Fk(*id);
-        for &v in vouts {
-            let Some(abs) = batch_parents.get_spender_abs(fk, v) else {
-                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-                    "invariant: structural spentness missing pin denserels/abs (cold forbidden)",
-                )));
-            };
-            abs_jobs.push((*id, v, abs));
-        }
-    }
+    let abs_jobs = batch_parents
+        .spend_abs_jobs(spends.iter().map(|&(_, vout, _, cfk)| (cfk, vout)))
+        .map_err(ConsensusError::from)?;
     // Sparse durable **spent** set (honest IBD: almost all outs unspent).
     // Present ⇒ confirmed-strong spent; missing ⇒ unspent.
     let mut durable_spent: HashSet<(u64, u32)> = HashSet::new();
@@ -1626,11 +1601,8 @@ pub(crate) fn structural_validate_spends(
     }
     let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
 
-    // Null create_fk = same-block. Double-spend is only `pending_spent` — do
-    // not probe durable store by wire txid (plan=None rehydrate false-hits
-    // Class A / BIP30 siblings; mainnet 961461 tip stall).
-    let _ = null_create_keys; // same-block: pending only (no durable probe)
-                              // Multi-list walks are the only "cold" spentness (protocol, not body).
+    // Null create_fk = same-block. Double-spend is only `pending_spent`.
+    // Multi-list walks are the only "cold" spentness (protocol, not body).
     let spent_cold_ns = multi_list_ns;
 
     let t_pending = Instant::now();
@@ -1657,11 +1629,12 @@ pub(crate) fn structural_validate_spends(
     // Coinbase = create_fk == first_tx_fk at that height — never `tx.body`.
     let t_create = Instant::now();
     let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
-        let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
+        let mut v: Vec<rbitcoin_primitives::Fk> = abs_jobs
+            .iter()
+            .map(|(id, _, _)| rbitcoin_primitives::Fk(*id))
             .collect();
         v.sort_unstable_by_key(|f| f.0);
+        v.dedup();
         v
     };
     let durable_heights = query
@@ -1689,7 +1662,7 @@ pub(crate) fn structural_validate_spends(
         .map_err(ConsensusError::from)?;
 
     let mut seen_create: rbitcoin_query::U64Set =
-        rbitcoin_query::U64Set::with_capacity_and_hasher(vouts_by_create.len(), Default::default());
+        rbitcoin_query::U64Set::with_capacity_and_hasher(abs_jobs.len(), Default::default());
     for &(_ptid, _vout, _sfk, create_fk) in spends {
         if create_fk.is_null() {
             continue;

@@ -34,7 +34,7 @@
 
 use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;
-use rbitcoin_store::{OutputRecord, TxRecord};
+use rbitcoin_store::{OutputRecord, StoreError, TxRecord};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -964,6 +964,32 @@ impl BatchParents {
             return None;
         }
         Some(abs)
+    }
+
+    /// Unique `(create_id, vout, abs)` for spend edges. Missing abs is Corrupt.
+    pub fn spend_abs_jobs(
+        &self,
+        edges: impl IntoIterator<Item = (Fk, u32)>,
+    ) -> Result<Vec<(u64, u32, u64)>, StoreError> {
+        let mut out = Vec::new();
+        let mut seen = U64Set::default();
+        for (fk, vout) in edges {
+            if fk.is_null() {
+                continue;
+            }
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            let Some(abs) = self.get_spender_abs(fk, vout) else {
+                return Err(StoreError::Corrupt(
+                    "invariant: structural spentness missing pin denserels/abs (cold forbidden)",
+                ));
+            };
+            if seen.insert(abs) {
+                out.push((id, vout, abs));
+            }
+        }
+        Ok(out)
     }
 
     pub fn set_spent_range_only(&mut self, fk: Fk, spent_range: (u64, u64)) {
@@ -2085,6 +2111,22 @@ mod tests {
         assert_eq!(weak_after, 0);
         assert_eq!(live_after, 0);
         assert_eq!(bytes_after, 0);
+    }
+
+    #[test]
+    fn spend_abs_jobs_unique_and_missing_is_corrupt() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
+        bp.set_spent_range_only(Fk(1), (1000, 24));
+        let jobs = bp
+            .spend_abs_jobs([(Fk(1), 0), (Fk::NULL, 0), (Fk(1), 0)])
+            .expect("abs");
+        assert_eq!(jobs, vec![(1, 0, rbitcoin_store::spent_abs(1000, 0))]);
+        let err = bp.spend_abs_jobs([(Fk(2), 0)]).unwrap_err();
+        assert!(
+            err.to_string().contains("missing pin denserels/abs"),
+            "got {err}"
+        );
     }
 
     /// has_abs_layout null and missing pins.

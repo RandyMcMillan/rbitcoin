@@ -20,6 +20,7 @@ use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, Se
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
 use bitcoin::{Block, BlockHash, Transaction};
+use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -514,7 +515,7 @@ pub async fn peer_session_with(
     if let Some(s) = meta.session.as_ref() {
         let _ = maybe_queue_addrfetch_getaddr(&out_tx, s);
         let _ = maybe_queue_initial_getheaders(&out_tx, hub.as_ref(), s);
-    } else if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), None, true) {
+    } else if let Err(e) = queue_getheaders(&out_tx, hub.as_ref(), None, true, None) {
         rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
     }
 
@@ -662,10 +663,18 @@ pub async fn peer_session_with(
                     }
                 }
                 _ = headers_poll.tick() => {
-                    if !session.as_ref().is_some_and(|s| {
+                    let skip = session.as_ref().is_some_and(|s| {
                         s.conn_type == crate::peers::PeerConnType::AddrFetch
-                    }) {
-                        let _ = queue_getheaders(&out_tx, hub.as_ref(), session.as_deref(), false);
+                            || !should_poll_peer_headers(hub.as_ref(), s.best_known())
+                    });
+                    if !skip {
+                        let _ = queue_getheaders(
+                            &out_tx,
+                            hub.as_ref(),
+                            session.as_deref(),
+                            false,
+                            None,
+                        );
                     }
                 }
                 ann = async {
@@ -866,6 +875,76 @@ pub(crate) fn tip_follow_locator(hub: &ChainHub) -> Vec<BlockHash> {
     }
 }
 
+/// Locator for `getheaders`. `from` is the last header of a full 2000-header
+/// reply so the next batch starts after it (Core continues from that hash).
+pub(crate) fn headers_sync_locator(hub: &ChainHub, from: Option<BlockHash>) -> Vec<BlockHash> {
+    match from {
+        None => tip_follow_locator(hub),
+        Some(start) => locator_from_start(hub, start),
+    }
+}
+
+fn locator_from_start(hub: &ChainHub, start: BlockHash) -> Vec<BlockHash> {
+    if let Ok(Some(h)) = hub.query.height_of_hash(&start.to_byte_array()) {
+        return locator_from_height(hub, h.0);
+    }
+    let mut out = vec![start];
+    push_genesis_locator(hub, &mut out);
+    out
+}
+
+fn locator_from_height(hub: &ChainHub, start: u32) -> Vec<BlockHash> {
+    let mut out = Vec::new();
+    let mut h = start as i64;
+    let mut step = 1i64;
+    while h >= 0 {
+        match hub.query.header_at_height(Height(h as u32)) {
+            Ok(Some((_, rec))) => out.push(BlockHash::from_byte_array(rec.hash)),
+            _ => break,
+        }
+        if out.len() >= 10 {
+            step *= 2;
+        }
+        h -= step;
+        if out.len() >= MAX_LOCATOR_SZ {
+            break;
+        }
+    }
+    push_genesis_locator(hub, &mut out);
+    out
+}
+
+fn push_genesis_locator(hub: &ChainHub, out: &mut Vec<BlockHash>) {
+    let g = hub
+        .query
+        .header_at_height(Height::GENESIS)
+        .ok()
+        .flatten()
+        .map(|(_, rec)| BlockHash::from_byte_array(rec.hash))
+        .unwrap_or_else(|| BlockHash::from_byte_array([0u8; 32]));
+    if out.last() != Some(&g) {
+        out.push(g);
+    }
+}
+
+/// Periodic getheaders is for discovering more work. Skip peers whose best
+/// known header is already on our chain behind tip, or a connecting fork that
+/// cannot beat us.
+pub(crate) fn should_poll_peer_headers(hub: &ChainHub, best_known: Option<BlockHash>) -> bool {
+    let Some(best) = best_known else {
+        return true;
+    };
+    let our_tip = hub.tip_height().unwrap_or(0);
+    if let Ok(Some(h)) = hub.query.height_of_hash(&best.to_byte_array()) {
+        return h.0 >= our_tip;
+    }
+    let empty = HashMap::new();
+    !matches!(
+        header_branch_vs_tip(hub, &empty, best),
+        Some(std::cmp::Ordering::Less)
+    )
+}
+
 /// Start Core initial headers-sync on this session if we are allowed to.
 fn maybe_queue_initial_getheaders(
     out: &mpsc::UnboundedSender<NetworkMessage>,
@@ -886,7 +965,7 @@ fn maybe_queue_initial_getheaders(
     if started {
         let h = hub.tip_height().unwrap_or(0);
         rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, session.id));
-        let _ = queue_getheaders(out, hub, Some(session), true);
+        let _ = queue_getheaders(out, hub, Some(session), true, None);
     }
     started
 }
@@ -912,6 +991,7 @@ fn queue_getheaders(
     hub: &ChainHub,
     session: Option<&crate::peers::LivePeer>,
     mark_awaiting: bool,
+    from: Option<BlockHash>,
 ) -> Result<(), NetError> {
     if mark_awaiting {
         if let Some(s) = session {
@@ -923,7 +1003,7 @@ fn queue_getheaders(
             s.note_awaiting_headers();
         }
     }
-    let locator = tip_follow_locator(hub);
+    let locator = headers_sync_locator(hub, from);
     let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
     queue_out(out, NetworkMessage::GetHeaders(gh))
 }
@@ -1472,7 +1552,7 @@ async fn handle_peer_frame(
                 }
             }
             if need_headers {
-                let _ = queue_getheaders(out_tx, hub, session, true);
+                let _ = queue_getheaders(out_tx, hub, session, true, None);
             }
             if !want.is_empty() {
                 queue_out(out_tx, NetworkMessage::GetData(want))?;
@@ -1511,7 +1591,9 @@ async fn handle_peer_frame(
                     pending_headers.insert(hash, *hdr);
                 }
                 if !connecting {
-                    let _ = queue_getheaders(out_tx, hub, session, true);
+                    if n < MAX_HEADERS_RESULTS {
+                        let _ = queue_getheaders(out_tx, hub, session, true, None);
+                    }
                 } else {
                     let last = headers[n - 1].block_hash();
                     // Core `chain_start.nHeight + headers.size()`. One-header
@@ -1582,7 +1664,8 @@ async fn handle_peer_frame(
                 }
             }
             if n >= MAX_HEADERS_RESULTS {
-                let _ = queue_getheaders(out_tx, hub, session, true);
+                let from = headers.get(n - 1).map(|h| h.block_hash());
+                let _ = queue_getheaders(out_tx, hub, session, true, from);
             }
         }
         NetworkMessage::Block(block) => {
@@ -1678,7 +1761,7 @@ async fn handle_peer_frame(
                 // Better-work compact of a long fork announces only the
                 // tip (`mempool_reorg` 20-block submitblock). Ask for the
                 // header path before reconstruct.
-                let _ = queue_getheaders(out_tx, hub, session, true);
+                let _ = queue_getheaders(out_tx, hub, session, true, None);
             }
             pending_headers.entry(hash).or_insert(hsi.header);
             if !any_header_path_meets_minwork(hub, pending_headers, hash) {
@@ -1716,7 +1799,7 @@ async fn handle_peer_frame(
                     if hub.knows_header(&prev) || pending_headers.contains_key(&prev) {
                         let _ = hub.ensure_header(&hsi.header);
                     } else {
-                        let _ = queue_getheaders(out_tx, hub, session, false);
+                        let _ = queue_getheaders(out_tx, hub, session, false, None);
                     }
                 } else if hub.has_block(&hash) {
                 } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
@@ -1729,7 +1812,7 @@ async fn handle_peer_frame(
                     } else if !hub.knows_header(&hsi.header.prev_blockhash) {
                         // Filled a better-work compact whose parent bodies
                         // we lack (`mempool_reorg` 20-block submitblock).
-                        let _ = queue_getheaders(out_tx, hub, session, true);
+                        let _ = queue_getheaders(out_tx, hub, session, true, None);
                     }
                     drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
                 } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
@@ -2131,9 +2214,12 @@ fn header_branch_vs_tip(
             let tip = hub.tip_height()?;
             return Some(n_new.cmp(&tip.saturating_sub(ancestor)));
         }
-        let hdr = pending.get(&h)?;
+        let prev = pending
+            .get(&h)
+            .map(|hdr| hdr.prev_blockhash)
+            .or_else(|| hub.prev_of(&h))?;
         n_new = n_new.saturating_add(1);
-        h = hdr.prev_blockhash;
+        h = prev;
         if h.to_byte_array() == [0u8; 32] {
             return Some(std::cmp::Ordering::Greater);
         }

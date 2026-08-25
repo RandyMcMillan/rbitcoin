@@ -67,6 +67,76 @@ fn tip_follow_locator_includes_tip_after_genesis() {
 }
 
 #[test]
+fn headers_sync_locator_from_unknown_starts_at_that_hash() {
+    let (dir, q) = tmp_store("loc-unk");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let start = BlockHash::from_byte_array([0xab; 32]);
+    let loc = headers_sync_locator(&hub, Some(start));
+    assert_eq!(loc[0], start);
+    assert_eq!(loc.last().copied(), hub.tip_hash());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn headers_sync_locator_from_mid_height_starts_there() {
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let (dir, q) = tmp_store("loc-mid");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let hashes = hub
+        .generate_to_script(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let mid = hashes[0];
+    let loc = headers_sync_locator(&hub, Some(mid));
+    assert_eq!(loc[0], mid);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn should_poll_peer_headers_skips_behind_and_weaker_fork() {
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let (dir, q) = tmp_store("poll-skip");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    assert!(should_poll_peer_headers(&hub, None));
+    hub.generate_to_script(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub.tip_hash().unwrap();
+    assert!(
+        should_poll_peer_headers(&hub, Some(tip)),
+        "at our tip: still poll in case they have a new block"
+    );
+    assert!(
+        !should_poll_peer_headers(&hub, Some(gen)),
+        "best-known on our chain behind tip cannot supply headers after our locator"
+    );
+    assert!(
+        should_poll_peer_headers(&hub, Some(BlockHash::from_byte_array([0xee; 32]))),
+        "unknown best-known still poll until we can classify the branch"
+    );
+    let fork = bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(4),
+        prev_blockhash: gen,
+        merkle_root: bitcoin::TxMerkleNode::from_byte_array([0x22; 32]),
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce: 99,
+    };
+    hub.ensure_header(&fork).unwrap();
+    assert!(
+        !should_poll_peer_headers(&hub, Some(fork.block_hash())),
+        "persisted weaker fork cannot beat our tip"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn live_follow_dec_on_drop() {
     let c = Arc::new(AtomicUsize::new(2));
     {
@@ -1589,7 +1659,7 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     let (tx, rx) = mpsc::unbounded_channel();
     drop(rx);
     assert!(queue_out(&tx, NetworkMessage::Verack).is_err());
-    assert!(queue_getheaders(&tx, &hub, None, false).is_err());
+    assert!(queue_getheaders(&tx, &hub, None, false, None).is_err());
 
     // headers_for_peer empty store after genesis still returns (tip exists).
     use bitcoin::p2p::message_blockdata::GetHeadersMessage;
@@ -4402,6 +4472,141 @@ fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
         );
         assert_eq!(n_block, MAX_SERVE_BLOCKS);
         assert_eq!(sess.serve_inflight.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn queue_getheaders_from_hash_puts_it_first() {
+    let (dir, q) = tmp_store("gh-from");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let start = BlockHash::from_byte_array([0xcd; 32]);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    queue_getheaders(&tx, &hub, None, false, Some(start)).unwrap();
+    match rx.try_recv().unwrap() {
+        NetworkMessage::GetHeaders(gh) => {
+            assert_eq!(gh.locator_hashes[0], start);
+        }
+        other => panic!("expected GetHeaders, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn full_headers_batch_continues_from_last_header() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::{CompactTarget, Network, TxMerkleNode};
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            checksum,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, q) = tmp_store("hdr-continue");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let unknown_prev = BlockHash::from_byte_array([0x11; 32]);
+        let mut headers = Vec::with_capacity(MAX_HEADERS_RESULTS);
+        let mut prev = unknown_prev;
+        for i in 0..MAX_HEADERS_RESULTS {
+            let mut merkle = [0u8; 32];
+            merkle[0] = (i >> 8) as u8;
+            merkle[1] = i as u8;
+            let hdr = Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array(merkle),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: i as u32,
+            };
+            prev = hdr.block_hash();
+            headers.push(hdr);
+        }
+        let last = headers.last().unwrap().block_hash();
+        let our_tip = hub.tip_hash().unwrap();
+        let peers = crate::peers::PeerHub::new();
+        let addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 18446);
+        let ver = bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let sess = peers.register(
+            addr,
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::OutboundFullRelay,
+        );
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = false;
+        let mut cmpct_ver = 2u32;
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut ban = 0u32;
+        handle_peer_frame(
+            frame_for(NetworkMessage::Headers(headers)),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        let mut getheaders = Vec::new();
+        while let Ok(msg) = out_rx.try_recv() {
+            if let NetworkMessage::GetHeaders(gh) = msg {
+                getheaders.push(gh.locator_hashes);
+            }
+        }
+        assert_eq!(
+            getheaders.len(),
+            1,
+            "full unconnected batch must not also re-ask from our tip"
+        );
+        assert_eq!(
+            getheaders[0].first().copied(),
+            Some(last),
+            "full headers batch must getheaders from the last header, not our tip"
+        );
+        assert_ne!(getheaders[0].first().copied(), Some(our_tip));
         let _ = std::fs::remove_dir_all(dir);
     });
 }

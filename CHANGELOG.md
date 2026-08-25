@@ -38,6 +38,13 @@ before 1.0).
 
 ### Changed
 
+- **Cargo.lock compatible bumps:** `bitcoin-consensus-encoding` 1.2.0,
+  `cc` 1.4.4, `find-msvc-tools` 0.1.11, `futures-channel` 0.3.34,
+  `http-body-util` 0.1.5, `log` 0.4.34, `rand` 0.8.8, `syn` 3.0.4,
+  `zerocopy`/`zerocopy-derive` 0.8.56. Direct crates already at latest
+  compatible; skipped `bitcoin_hashes` 1.x and `tokio-tungstenite` 0.30
+  (axum 0.8 still on 0.29).
+
 - **Two SH methods only:** a durable scripthash head stays Tip (short
   catch-up uses write-behind, leftover runs discarded). No head: Direct
   defers SH; post-IBD Class A recollect + FullCold/ColdResume. Removed the

@@ -248,11 +248,9 @@ fn header_getdata_is_compact_after_sendcmpct() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -332,11 +330,9 @@ fn submitheader_parent_p2p_child_header_getdatas_body() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -618,11 +614,9 @@ fn minchainwork_does_not_getdata_below_floor() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -755,11 +749,9 @@ fn minchainwork_one_header_announces_ignore_height_14() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -856,11 +848,9 @@ fn blocksonly_tx_and_inv_raise_ban() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -980,11 +970,9 @@ fn blocksonly_sendraw_invs_unbroadcast_to_inbound() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -1353,11 +1341,9 @@ fn mocktime_jump_does_not_inv_or_serve_new_sendraw() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -1530,11 +1516,9 @@ fn blocksonly_relay_perm_tx_invs_other_inbound() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -1765,12 +1749,10 @@ fn compact_child_of_invalid_disconnects_cached_same_stays() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         let payload = full[24..].to_vec();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload,
         }
     }
@@ -1907,12 +1889,10 @@ fn handle_peer_frame_control_and_inv_paths() {
         let full = serialize(&raw);
         // 4 magic + 12 command + 4 len + 4 checksum + payload
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         let payload = full[24..].to_vec();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload,
         }
     }
@@ -2505,12 +2485,10 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         let payload = full[24..].to_vec();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload,
         }
     }
@@ -2715,11 +2693,9 @@ fn getdata_tx_notfound_unless_announced_or_reorg() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -2968,11 +2944,9 @@ fn invalid_getdata_type0_still_serves_tip_block() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -3483,11 +3457,9 @@ fn inv_of_already_asked_block_does_not_getdata() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -3603,11 +3575,9 @@ fn bloom_disabled_messages_request_disconnect() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -3683,11 +3653,9 @@ fn oversize_locator_request_disconnect() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -3846,12 +3814,10 @@ fn redundant_verack_is_ignored_and_logged() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         let payload = full[24..].to_vec();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload,
         }
     }
@@ -3984,7 +3950,6 @@ fn addrfetch_multi_addr_disconnects() {
         FramedMessage {
             magic,
             command: full[4..16].try_into().unwrap(),
-            checksum: full[20..24].try_into().unwrap(),
             payload: full[24..].to_vec(),
         }
     }
@@ -4237,11 +4202,9 @@ fn connecting_ancient_weaker_headers_request_disconnect() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -4391,11 +4354,9 @@ fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }
@@ -4506,11 +4467,9 @@ fn full_headers_batch_continues_from_last_header() {
         let raw = RawNetworkMessage::new(magic, msg);
         let full = serialize(&raw);
         let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let checksum: [u8; 4] = full[20..24].try_into().unwrap();
         FramedMessage {
             magic,
             command,
-            checksum,
             payload: full[24..].to_vec(),
         }
     }

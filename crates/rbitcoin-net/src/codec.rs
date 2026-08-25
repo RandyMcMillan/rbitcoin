@@ -49,7 +49,6 @@ pub struct FramedMessage {
     pub magic: Magic,
     /// 12-byte null-padded command (wire form).
     pub command: [u8; 12],
-    pub checksum: [u8; 4],
     pub payload: Vec<u8>,
 }
 
@@ -109,8 +108,7 @@ impl FramedMessage {
 
     /// Deserialize the application payload (no v1 header, no checksum).
     ///
-    /// BIP324 v2 has no checksum; [`crate::v2::parse_v2_contents`] leaves this
-    /// field zero. Extra bytes / unknown command → [`NetworkMessage::Unknown`].
+    /// Extra bytes / unknown command → [`NetworkMessage::Unknown`].
     pub fn decode(self) -> RawNetworkMessage {
         let cmd = command_from_header(&self.command);
         let mut sl = self.payload.as_slice();
@@ -259,7 +257,6 @@ mod tests {
         let frame = FramedMessage {
             magic: signet_magic(),
             command: *b"verack\0\0\0\0\0\0",
-            checksum: [0; 4],
             payload: Vec::new(),
         };
         assert!(!frame.decode_is_cpu_heavy());
@@ -275,7 +272,6 @@ mod tests {
         let frame = FramedMessage {
             magic,
             command: *b"block\0\0\0\0\0\0\0",
-            checksum: [0xff; 4],
             payload,
         };
         assert!(frame.is_block());
@@ -316,7 +312,6 @@ mod tests {
         let ping = FramedMessage {
             magic,
             command: *b"ping\0\0\0\0\0\0\0\0",
-            checksum: [0; 4],
             payload: payload.clone(),
         };
         assert!(ping.is_ping());
@@ -326,7 +321,6 @@ mod tests {
         let short = FramedMessage {
             magic,
             command: *b"ping\0\0\0\0\0\0\0\0",
-            checksum: [0; 4],
             payload: vec![1, 2, 3],
         };
         assert!(short.ping_nonce().is_none());
@@ -334,7 +328,6 @@ mod tests {
         let headers = FramedMessage {
             magic,
             command: *b"headers\0\0\0\0\0",
-            checksum: [0; 4],
             payload: vec![],
         };
         assert!(headers.is_headers());
@@ -344,7 +337,6 @@ mod tests {
         let nf = FramedMessage {
             magic,
             command: *b"notfound\0\0\0\0",
-            checksum: [0; 4],
             payload: vec![],
         };
         assert!(nf.is_notfound());
@@ -354,7 +346,6 @@ mod tests {
         let bad = FramedMessage {
             magic,
             command: *b"block\0\0\0\0\0\0\0",
-            checksum: [0; 4],
             payload: vec![0u8; 10],
         };
         match bad.decode().payload() {

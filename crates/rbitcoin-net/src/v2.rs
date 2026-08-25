@@ -383,7 +383,7 @@ pub fn encode_v2_contents(payload: NetworkMessage) -> Result<Vec<u8>, NetError> 
 
 /// Parse BIP324 packet contents into a [`FramedMessage`].
 ///
-/// v2 plaintext is command + payload only — checksum is unused (zeros).
+/// v2 plaintext is command + payload only (no checksum).
 pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage, NetError> {
     if contents.is_empty() {
         return Err(NetError::Protocol("empty v2 message contents"));
@@ -421,7 +421,6 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
     Ok(FramedMessage {
         magic,
         command,
-        checksum: [0; 4],
         payload,
     })
 }
@@ -691,7 +690,6 @@ mod tests {
         let want = genesis.block_hash();
         let contents = encode_v2_contents(NetworkMessage::Block(genesis)).unwrap();
         let frame = parse_v2_contents(magic, &contents).unwrap();
-        assert_eq!(frame.checksum, [0; 4]);
         match frame.decode().payload() {
             NetworkMessage::Block(b) => assert_eq!(b.block_hash(), want),
             other => panic!("expected block, got {other:?}"),

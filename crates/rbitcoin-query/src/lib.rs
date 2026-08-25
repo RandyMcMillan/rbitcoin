@@ -1661,6 +1661,15 @@ impl Query {
         self.recent_creates.note(height, rows);
     }
 
+    /// Same as [`Self::note_recent_creates_rows`] with optional [`CreatePin`] Arcs.
+    pub fn note_recent_creates_pins(
+        &self,
+        height: u32,
+        rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64), Option<CreatePin>)>,
+    ) {
+        self.recent_creates.note_pins(height, rows);
+    }
+
     /// Rebuild the RecentCreates snapshot if note/expire/drop dirtied it.
     pub fn flush_recent_creates(&self) {
         self.recent_creates.publish_if_dirty();

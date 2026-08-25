@@ -1,8 +1,10 @@
-//! Height-FIFO identity ring: just-confirmed `txid → (create_fk, body_range)`.
+//! Height-FIFO identity ring: just-confirmed `txid → (create_fk, body_range)`
+//! plus optional [`CreatePin`] outs (Arc-shared with in-flight / `batch_pin`).
 //!
 //! Write publishes after Class A + idx. Load stamp probes this **after**
-//! published live-union and **before** leftover TipOnly. Outs are not stored
-//! (not a process pin FIFO).
+//! published live-union and **before** leftover TipOnly. [`RecentSnap::get`]
+//! stays `(fk, range)` and does **not** clone the pin Arc. Load pin uses
+//! [`RecentSnap::create_pin`].
 //!
 //! Expire is `pop_front` of whole heights. Horizon is
 //! [`recent_creates_horizon`] on an EWMA of `lookup_taken_hi − tip`
@@ -14,6 +16,7 @@
 //! see overlay first so stamp hits unflushed notes without cloning.
 
 use crate::published_ids::TxidHasher;
+use crate::CreatePin;
 use arc_swap::ArcSwap;
 use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -44,11 +47,12 @@ pub fn recent_creates_horizon(ewma_lead: u32) -> u32 {
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
 type DeadSet = HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LiveEnt {
     fk: Fk,
     range: (u64, u64),
     height: u32,
+    outs: Option<CreatePin>,
 }
 
 struct Inner {
@@ -78,6 +82,21 @@ impl RecentSnap {
             return Some((e.fk, e.range));
         }
         self.published.get(txid).map(|e| (e.fk, e.range))
+    }
+
+    /// Arc-clone the create pin when the note carried one. Identity-only notes
+    /// return `None` (load pin then cold-fills). Does not run on [`Self::get`].
+    pub fn create_pin(&self, txid: &[u8; 32]) -> Option<CreatePin> {
+        if *txid == [0u8; 32] {
+            return None;
+        }
+        if self.dead.contains(txid) {
+            return None;
+        }
+        if let Some(e) = self.overlay.get(txid) {
+            return e.outs.clone();
+        }
+        self.published.get(txid).and_then(|e| e.outs.clone())
     }
 }
 
@@ -117,7 +136,7 @@ impl RecentCreates {
         let published = self.live.load_full();
         let mut next = (*published).clone();
         for (k, e) in g.overlay.iter() {
-            next.insert(*k, *e);
+            next.insert(*k, e.clone());
         }
         for k in g.dead.iter() {
             next.remove(k);
@@ -131,14 +150,29 @@ impl RecentCreates {
     /// Insert creates at `height`. Last write wins if the txid is already live.
     ///
     /// Does not rebuild the snapshot — call [`Self::publish_if_dirty`].
+    /// Identity-only (no outs). [`Self::note_pins`] carries a [`CreatePin`].
     pub fn note(&self, height: u32, rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>) {
+        self.note_pins(height, rows.into_iter().map(|(t, f, r)| (t, f, r, None)));
+    }
+
+    /// Same as [`Self::note`] with optional [`CreatePin`] (Arc clone, not script bytes).
+    pub fn note_pins(
+        &self,
+        height: u32,
+        rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64), Option<CreatePin>)>,
+    ) {
         let mut keys: Vec<[u8; 32]> = Vec::new();
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        for (txid, fk, range) in rows {
+        for (txid, fk, range, outs) in rows {
             if txid == [0u8; 32] {
                 continue;
             }
-            let ent = LiveEnt { fk, range, height };
+            let ent = LiveEnt {
+                fk,
+                range,
+                height,
+                outs,
+            };
             g.overlay.insert(txid, ent);
             g.dead.remove(&txid);
             keys.push(txid);
@@ -225,6 +259,11 @@ impl RecentCreates {
     /// Point get. Zero txid is never a hit. Lock-free snapshot load.
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
         self.snapshot().get(txid)
+    }
+
+    /// Snapshot then [`RecentSnap::create_pin`].
+    pub fn create_pin(&self, txid: &[u8; 32]) -> Option<CreatePin> {
+        self.snapshot().create_pin(txid)
     }
 
     /// Published Arc plus a small overlay (do not `load` per parent).
@@ -408,5 +447,55 @@ mod tests {
         r.drop_from(12);
         assert_eq!(r.get(&tid(1)), Some((Fk(1), (1, 2))));
         assert!(r.get(&tid(2)).is_none());
+    }
+
+    fn dummy_pin(script: Vec<u8>) -> CreatePin {
+        Arc::new((
+            rbitcoin_store::TxRecord {
+                txid: tid(1),
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![rbitcoin_store::OutputRecord::unspent(1, script)],
+        ))
+    }
+
+    #[test]
+    fn recent_snap_get_does_not_need_outs() {
+        let r = RecentCreates::new();
+        r.note(10, [(tid(1), Fk(7), (100, 8))]);
+        let snap = r.snapshot();
+        assert_eq!(snap.get(&tid(1)), Some((Fk(7), (100, 8))));
+        assert!(
+            snap.create_pin(&tid(1)).is_none(),
+            "identity note must not clone a pin Arc on get; create_pin is None"
+        );
+        assert!(r.create_pin(&tid(1)).is_none());
+    }
+
+    #[test]
+    fn recent_create_pin_survives_flush_and_expires() {
+        let r = RecentCreates::new();
+        let pin = dummy_pin(vec![0x51, 0xaa, 0xbb]);
+        r.note_pins(10, [(tid(1), Fk(7), (100, 8), Some(Arc::clone(&pin)))]);
+        assert!(
+            Arc::ptr_eq(&r.create_pin(&tid(1)).expect("overlay pin"), &pin),
+            "two notes without flush: overlay create_pin hits the same Arc"
+        );
+        r.publish_if_dirty();
+        let flushed = r.create_pin(&tid(1)).expect("published pin");
+        assert!(
+            Arc::ptr_eq(&flushed, &pin),
+            "flush clones the HashMap of Arcs, not script bytes"
+        );
+        assert_eq!(r.get(&tid(1)), Some((Fk(7), (100, 8))));
+        r.expire_through(10);
+        r.publish_if_dirty();
+        assert!(r.get(&tid(1)).is_none());
+        assert!(r.create_pin(&tid(1)).is_none());
     }
 }

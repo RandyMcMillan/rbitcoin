@@ -44,7 +44,16 @@ pub(super) fn recent_create_rows_for_slices(
     slices: &[(u32, std::ops::Range<usize>)],
     txid_fks: &[([u8; 32], rbitcoin_primitives::Fk)],
     ranges: &[Option<(u64, u64)>],
-) -> Vec<(u32, Vec<([u8; 32], rbitcoin_primitives::Fk, (u64, u64))>)> {
+    pins: &[Option<rbitcoin_query::CreatePin>],
+) -> Vec<(
+    u32,
+    Vec<(
+        [u8; 32],
+        rbitcoin_primitives::Fk,
+        (u64, u64),
+        Option<rbitcoin_query::CreatePin>,
+    )>,
+)> {
     let mut out = Vec::new();
     for (height, range) in slices {
         let mut rows = Vec::new();
@@ -55,7 +64,8 @@ pub(super) fn recent_create_rows_for_slices(
             let Some(body) = ranges.get(i).copied().flatten() else {
                 continue;
             };
-            rows.push((*txid, *fk, body));
+            let pin = pins.get(i).cloned().flatten();
+            rows.push((*txid, *fk, body, pin));
         }
         if !rows.is_empty() {
             out.push((*height, rows));
@@ -161,8 +171,10 @@ pub fn confirm_write_phase(
                     .tx_body_range_batch(&fks)
                     .map_err(ConsensusError::from)?;
                 let idx_ns = t_idx.elapsed().as_nanos() as u64;
-                for (height, rows) in recent_create_rows_for_slices(&slices, &txid_fks, &ranges) {
-                    query.note_recent_creates_rows(height, rows);
+                for (height, rows) in
+                    recent_create_rows_for_slices(&slices, &txid_fks, &ranges, &[])
+                {
+                    query.note_recent_creates_pins(height, rows);
                 }
                 if let Some(last) = batch.prepared.last() {
                     query.expire_recent_creates_defer(last.height.0);

@@ -47,7 +47,7 @@ fn recent_create_rows_skip_missing_idx_keep_heights() {
         (tid(4), rbitcoin_primitives::Fk(4)),
     ];
     let ranges = [Some((1, 8)), None, Some((9, 8)), Some((17, 8))];
-    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges);
+    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges, &[]);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, 10);
     assert_eq!(rows[0].1.len(), 1, "missing idx at height 10 dropped");

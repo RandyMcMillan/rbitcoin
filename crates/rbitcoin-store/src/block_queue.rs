@@ -364,17 +364,6 @@ impl BlockQueue {
             .collect()
     }
 
-    /// Load every queued block with full payload (tests / tools only).
-    pub fn load_all(&self) -> Result<Vec<QueuedBlock>, StoreError> {
-        let mut out = Vec::with_capacity(self.index.len());
-        for &id in self.index.keys() {
-            if let Some(b) = self.get(id)? {
-                out.push(b);
-            }
-        }
-        Ok(out)
-    }
-
     /// Load payload for a height (confirm load intake). First match by height.
     ///
     /// Does **not** dequeue — confirm-write / permanent reject removes the rec.
@@ -814,7 +803,6 @@ mod tests {
         assert!(q.get(999).unwrap().is_none());
         assert_eq!(q.min_height(), Some(7));
         assert_eq!(q.max_height(), Some(7));
-        let _ = q.load_all().unwrap();
         assert!(q.dequeue(id).unwrap());
         assert!(!q.contains_height(7));
         let _ = BlockQueue::budget_from_env();

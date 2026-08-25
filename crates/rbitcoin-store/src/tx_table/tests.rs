@@ -662,9 +662,9 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Bulk body_range (sorted mmap) + get_full_batch_at agree with sequential paths.
+/// Bulk body_range agrees with sequential record_range.
 #[test]
-fn bulk_body_range_and_full_match_sequential() {
+fn bulk_body_range_matches_sequential() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-bulk-body-{}",
         std::time::SystemTime::now()
@@ -716,34 +716,13 @@ fn bulk_body_range_and_full_match_sequential() {
         let seq = t.body_range(*fk).unwrap();
         assert_eq!(*br, Some(seq));
     }
-    let range_args: Vec<(Fk, u64, u64)> = fks
-        .iter()
-        .zip(batch_ranges.iter())
-        .filter_map(|(fk, r)| r.map(|(o, l)| (*fk, o, l)))
-        .collect();
-    let bulk = t.get_full_batch_at(&range_args).unwrap();
-    for ((fk, off, len), got) in range_args.iter().zip(bulk.iter()) {
-        let seq = t.get_full(*fk).unwrap();
-        let b = got.as_ref().expect("bulk decode");
-        assert_eq!(b.0.txid, seq.0.txid);
-        assert_eq!(b.0.txid, t.body_txid(*fk).unwrap());
-        // Offset-only decode has no sidefile fill.
-        assert_eq!(t.get_full_at(*off, *len).unwrap().0.txid, [0u8; 32]);
-        assert_eq!(b.3.len(), b.2.len()); // denserels
-        for o in &b.2 {
-            assert!(o.spender_field.is_null());
-        }
-    }
-    let meta_ranges: Vec<(u64, u64)> = range_args.iter().map(|(_, o, l)| (*o, *l)).collect();
-    let meta = t.get_meta_and_outputs_batch_at(&meta_ranges).unwrap();
-    for ((_, off, len), got) in range_args.iter().zip(meta.iter()) {
-        let seq = t.get_meta_and_outputs_at(*off, *len).unwrap();
-        let b = got.as_ref().expect("meta bulk");
-        assert_eq!(b.0, seq.0);
-        assert_eq!(b.1.len(), seq.1.len());
-        assert_eq!(b.2.len(), b.1.len()); // dense spender_rels
-                                          // Content-only outs (spender fields cleared for pin/FIFO).
-        for o in &b.1 {
+    for fk in &fks {
+        let (meta, outs) = t.get_meta_and_outputs(*fk).unwrap();
+        let full = t.get_full(*fk).unwrap();
+        assert_eq!(meta.txid, full.0.txid);
+        assert_eq!(meta.txid, t.body_txid(*fk).unwrap());
+        assert_eq!(outs.len(), full.2.len());
+        for o in &outs {
             assert!(o.spender_field.is_null());
             assert!(!o.multi_spender);
         }
@@ -1325,12 +1304,9 @@ fn get_output_spender_metas_at_one_walk() {
     assert!(!metas[2].1 && metas[2].2 == Fk(20));
 
     // Bulk 8-byte abs preads match spent_abs (pin → write spentness path).
-    let (toff, tlen) = t.body_range(fks[0]).unwrap();
-    let decoded = t.get_meta_and_outputs_batch_at(&[(toff, tlen)]).unwrap();
-    let (_meta, outs, rels) = decoded[0].as_ref().expect("decode with rels");
+    let (_meta, outs) = t.get_meta_and_outputs(fks[0]).unwrap();
     assert_eq!(outs.len(), 3);
-    assert_eq!(rels.len(), 3);
-    for o in outs {
+    for o in &outs {
         assert!(o.spender_field.is_null());
     }
     let abs: Vec<u64> = (0..3).map(|v| spent_abs(off, v)).collect();

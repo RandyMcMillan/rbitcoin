@@ -472,11 +472,6 @@ impl Store {
         self.headers.count()
     }
 
-    /// Occupied slots in the header hash head (load / sizes observer).
-    pub fn header_head_occupied(&self) -> u64 {
-        self.headers.head_occupied()
-    }
-
     /// Headers that currently have a Class A body association.
     pub fn archived_block_count(&self) -> Result<u64, StoreError> {
         self.header_txs.count_bodies()
@@ -560,33 +555,6 @@ impl Store {
     /// Absolute `inwit.body` `(offset, len)` for `fk`.
     pub fn tx_inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.txs.inwit.record_range(fk)
-    }
-
-    /// Full tx decode from a cached body range (no idx read).
-    pub fn get_tx_full_at(
-        &self,
-        offset: u64,
-        len: u64,
-    ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
-        self.txs.get_full_at(offset, len)
-    }
-
-    /// Meta + prevouts from a cached body range (no idx read).
-    pub fn get_tx_meta_and_prevouts_at(
-        &self,
-        offset: u64,
-        len: u64,
-    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-        self.txs.get_meta_and_prevouts_at(offset, len)
-    }
-
-    /// Meta + outputs only from a cached body range (no parent input materialization).
-    pub fn get_tx_meta_and_outputs_at(
-        &self,
-        offset: u64,
-        len: u64,
-    ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
-        self.txs.get_meta_and_outputs_at(offset, len)
     }
 
     /// Append packed full-tx Class A rows (preferred archive path).
@@ -857,28 +825,6 @@ impl Store {
         crate::run_idx_body_pipeline(&self.txs.inwit, jobs, mode)
     }
 
-    /// Bulk full packed decode from known ranges (confirm load).
-    ///
-    /// Fourth field: dense spender_rels (rel to body_off) for pin/residency layout.
-    pub fn get_tx_full_batch_at(
-        &self,
-        ranges: &[(Fk, u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>, StoreError>
-    {
-        self.txs.get_full_batch_at(ranges)
-    }
-
-    /// Bulk meta+outputs+spender_rels from known ranges (confirm pin_new).
-    ///
-    /// Outs are content-only (spender fields cleared). `spender_rels[v]` is the
-    /// relative offset of the 8-byte annotation within the spent record.
-    pub fn get_tx_meta_and_outputs_batch_at(
-        &self,
-        ranges: &[(u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
-        self.txs.get_meta_and_outputs_batch_at(ranges)
-    }
-
     /// Bulk 8-byte spender meta at absolute `spent.body` offsets.
     ///
     /// Backend from global `RBITCOIN_IO` (see [`crate::spend_meta_backend`]).
@@ -1042,12 +988,6 @@ impl Store {
             Some(t) if h <= t => Ok(true),
             _ => Ok(false),
         }
-    }
-
-    /// True if `tx_fk` is in the Class A body association for `header_fk`.
-    #[inline]
-    pub fn header_body_contains(&self, header_fk: Fk, tx_fk: Fk) -> Result<bool, StoreError> {
-        self.header_txs.contains_tx(header_fk, tx_fk)
     }
 
     /// True if any annotated spender for this outpoint is confirmed-strong.
@@ -1310,14 +1250,6 @@ impl Store {
         self.spenders.flush()?;
         self.scripthash.flush()?;
         self.flush_class_c_tip()?;
-        Ok(())
-    }
-
-    /// Flush durable index tables (spenders / tx head / scripthash).
-    pub fn flush_index_tables(&self) -> Result<(), StoreError> {
-        self.spenders.flush()?;
-        self.txs.flush()?;
-        self.scripthash.flush()?;
         Ok(())
     }
 
@@ -1652,12 +1584,9 @@ mod tests {
         let (m2, prevs) = s.get_tx_meta_and_prevouts(create_fk).unwrap();
         assert_eq!(m2.txid, [10u8; 32]);
         assert_eq!(prevs.len(), 1);
-        let (off, len) = s.tx_body_range(create_fk).unwrap();
-        // Body alone has zero txid; identity is sidefile / get_tx_full.
-        assert_eq!(s.get_tx_full_at(off, len).unwrap().0.txid, [0u8; 32]);
         assert_eq!(s.get_tx_full(create_fk).unwrap().0.txid, [10u8; 32]);
         assert_eq!(s.get_tx_meta_and_prevouts(create_fk).unwrap().1.len(), 1);
-        assert_eq!(s.get_tx_meta_and_outputs_at(off, len).unwrap().1.len(), 2);
+        assert_eq!(s.get_tx_meta_and_outputs(create_fk).unwrap().1.len(), 2);
         let mut span_hashes = Vec::new();
         s.for_each_create_script_hashes_in_fk_span(create_fk.0, create_fk.0, |_fk, sh| {
             span_hashes.push(sh);
@@ -1788,16 +1717,15 @@ mod tests {
         // Batch helpers
         let ranges = s.tx_body_range_batch(&[create_fk, spend_fk]).unwrap();
         assert_eq!(ranges.len(), 2);
-        let full_b = s.get_tx_full_batch_at(&[(create_fk, off, len)]).unwrap();
-        assert!(full_b[0].is_some());
-        let outs_b = s.get_tx_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
-        assert!(outs_b[0].is_some());
+        let full_b = s.get_tx_full(create_fk).unwrap();
+        assert_eq!(full_b.0.txid, [10u8; 32]);
+        let outs_b = s.get_tx_meta_and_outputs(create_fk).unwrap();
+        assert_eq!(outs_b.1.len(), 2);
         let heights = s.tx_height_get_batch(&[spend_fk, create_fk]).unwrap();
         assert_eq!(heights[0], Some(0));
 
         assert_eq!(s.archived_block_count().unwrap(), 1);
         s.flush_header_archive().unwrap();
-        s.flush_index_tables().unwrap();
         s.flush_for_shutdown().unwrap();
 
         // repair: strong not on the fence
@@ -1924,10 +1852,9 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         );
         let fk = s.put_tx_full_batch_indexed(&[item], true).unwrap()[0];
-        let (off, len) = s.tx_body_range(fk).unwrap();
-        let (m, prevs) = s.get_tx_meta_and_prevouts_at(off, len).unwrap();
+        let (m, prevs) = s.get_tx_meta_and_prevouts(fk).unwrap();
         assert_eq!(m.input_count, 1);
-        assert!(prevs.is_empty());
+        assert_eq!(prevs.len(), 1);
         assert!(s.tx_inwit_range(fk).unwrap().1 > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

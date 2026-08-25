@@ -9,7 +9,7 @@
 //! blocking worker. Never deserialize multi‑MB `block` payloads on the async
 //! I/O worker.
 
-use bitcoin::consensus::deserialize;
+use bitcoin::consensus::encode::Decodable;
 use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::Magic;
 
@@ -107,30 +107,22 @@ impl FramedMessage {
         Some(bitcoin::BlockHash::from_byte_array(dig.to_byte_array()))
     }
 
-    /// CPU-heavy: checksum + payload deserialize into [`RawNetworkMessage`].
+    /// Deserialize the application payload (no v1 header, no checksum).
+    ///
+    /// BIP324 v2 has no checksum; [`crate::v2::parse_v2_contents`] leaves this
+    /// field zero. Extra bytes / unknown command → [`NetworkMessage::Unknown`].
     pub fn decode(self) -> RawNetworkMessage {
-        let mut full = Vec::with_capacity(24 + self.payload.len());
-        full.extend_from_slice(self.magic.to_bytes().as_ref());
-        full.extend_from_slice(&self.command);
-        full.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
-        full.extend_from_slice(&self.checksum);
-        full.extend_from_slice(&self.payload);
-
-        match deserialize::<RawNetworkMessage>(&full) {
-            Ok(msg) => msg,
-            Err(_e) => {
-                // Real peers send extensions/padding that can trip strict payload
-                // checks (e.g. "extra bytes after network message payload").
-                // Bytes are already framed correctly — surface as Unknown.
-                let cmd = command_from_header(&self.command);
-                RawNetworkMessage::new(
-                    self.magic,
-                    NetworkMessage::Unknown {
-                        command: cmd,
-                        payload: self.payload,
-                    },
-                )
-            }
+        let cmd = command_from_header(&self.command);
+        let mut sl = self.payload.as_slice();
+        match decode_cmd_payload(cmd.as_ref(), &mut sl) {
+            Ok(Some(msg)) if sl.is_empty() => RawNetworkMessage::new(self.magic, msg),
+            _ => RawNetworkMessage::new(
+                self.magic,
+                NetworkMessage::Unknown {
+                    command: cmd,
+                    payload: self.payload,
+                },
+            ),
         }
     }
 
@@ -168,6 +160,82 @@ pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
     any
 }
 
+fn decode_cmd_payload(
+    cmd: &str,
+    d: &mut &[u8],
+) -> Result<Option<NetworkMessage>, bitcoin::consensus::encode::Error> {
+    fn one<T: Decodable>(
+        d: &mut &[u8],
+        f: fn(T) -> NetworkMessage,
+    ) -> Result<NetworkMessage, bitcoin::consensus::encode::Error> {
+        Ok(f(Decodable::consensus_decode(d)?))
+    }
+    Ok(Some(match cmd {
+        "verack" => NetworkMessage::Verack,
+        "sendheaders" => NetworkMessage::SendHeaders,
+        "getaddr" => NetworkMessage::GetAddr,
+        "mempool" => NetworkMessage::MemPool,
+        "filterclear" => NetworkMessage::FilterClear,
+        "wtxidrelay" => NetworkMessage::WtxidRelay,
+        "sendaddrv2" => NetworkMessage::SendAddrV2,
+        "version" => one(d, NetworkMessage::Version)?,
+        "addr" => one(d, NetworkMessage::Addr)?,
+        "inv" => one(d, NetworkMessage::Inv)?,
+        "getdata" => one(d, NetworkMessage::GetData)?,
+        "notfound" => one(d, NetworkMessage::NotFound)?,
+        "getblocks" => one(d, NetworkMessage::GetBlocks)?,
+        "getheaders" => one(d, NetworkMessage::GetHeaders)?,
+        "block" => one(d, NetworkMessage::Block)?,
+        "tx" => one(d, NetworkMessage::Tx)?,
+        "ping" => one(d, NetworkMessage::Ping)?,
+        "pong" => one(d, NetworkMessage::Pong)?,
+        "merkleblock" => one(d, NetworkMessage::MerkleBlock)?,
+        "filterload" => one(d, NetworkMessage::FilterLoad)?,
+        "filteradd" => one(d, NetworkMessage::FilterAdd)?,
+        "getcfilters" => one(d, NetworkMessage::GetCFilters)?,
+        "cfilter" => one(d, NetworkMessage::CFilter)?,
+        "getcfheaders" => one(d, NetworkMessage::GetCFHeaders)?,
+        "cfheaders" => one(d, NetworkMessage::CFHeaders)?,
+        "getcfcheckpt" => one(d, NetworkMessage::GetCFCheckpt)?,
+        "cfcheckpt" => one(d, NetworkMessage::CFCheckpt)?,
+        "reject" => one(d, NetworkMessage::Reject)?,
+        "alert" => one(d, NetworkMessage::Alert)?,
+        "sendcmpct" => one(d, NetworkMessage::SendCmpct)?,
+        "cmpctblock" => one(d, NetworkMessage::CmpctBlock)?,
+        "getblocktxn" => one(d, NetworkMessage::GetBlockTxn)?,
+        "blocktxn" => one(d, NetworkMessage::BlockTxn)?,
+        "addrv2" => one(d, NetworkMessage::AddrV2)?,
+        "feefilter" => {
+            let fee: i64 = Decodable::consensus_decode(d)?;
+            let upper: i64 = bitcoin::Amount::MAX_MONEY
+                .to_sat()
+                .try_into()
+                .expect("Amount::MAX_MONEY < i64::MAX");
+            if fee < 0 || fee > upper {
+                return Err(bitcoin::consensus::encode::Error::ParseFailed(
+                    "feefilter value out of range",
+                ));
+            }
+            NetworkMessage::FeeFilter(fee)
+        }
+        "headers" => {
+            let n = bitcoin::consensus::encode::VarInt::consensus_decode(d)?.0 as usize;
+            let mut hs = Vec::with_capacity(n.min(16 * 1024));
+            for _ in 0..n {
+                hs.push(bitcoin::block::Header::consensus_decode(d)?);
+                let txn: u8 = Decodable::consensus_decode(d)?;
+                if txn != 0 {
+                    return Err(bitcoin::consensus::encode::Error::ParseFailed(
+                        "Headers message should not contain transactions",
+                    ));
+                }
+            }
+            NetworkMessage::Headers(hs)
+        }
+        _ => return Ok(None),
+    }))
+}
+
 fn command_from_header(cmd12: &[u8]) -> CommandString {
     let end = cmd12.iter().position(|&b| b == 0).unwrap_or(12);
     let s = std::str::from_utf8(&cmd12[..end]).unwrap_or("unknown");
@@ -187,17 +255,12 @@ mod tests {
     }
 
     #[test]
-    fn frame_decode_verack_via_synthetic() {
-        use bitcoin::hashes::Hash as _;
-        let magic = signet_magic();
-        let payload = Vec::<u8>::new();
-        let dig = bitcoin::hashes::sha256d::Hash::hash(&payload);
-        let ba = dig.to_byte_array();
+    fn frame_decode_verack_ignores_checksum() {
         let frame = FramedMessage {
-            magic,
+            magic: signet_magic(),
             command: *b"verack\0\0\0\0\0\0",
-            checksum: [ba[0], ba[1], ba[2], ba[3]],
-            payload,
+            checksum: [0; 4],
+            payload: Vec::new(),
         };
         assert!(!frame.decode_is_cpu_heavy());
         assert!(matches!(frame.decode().payload(), NetworkMessage::Verack));
@@ -205,17 +268,14 @@ mod tests {
 
     #[test]
     fn block_hash_from_header_matches_full_block() {
-        use bitcoin::hashes::Hash as _;
         let magic = Magic::from(Network::Bitcoin);
         let genesis = genesis_block(Network::Bitcoin);
         let want = genesis.block_hash();
         let payload = serialize(&genesis);
-        let dig = bitcoin::hashes::sha256d::Hash::hash(&payload);
-        let ba = dig.to_byte_array();
         let frame = FramedMessage {
             magic,
             command: *b"block\0\0\0\0\0\0\0",
-            checksum: [ba[0], ba[1], ba[2], ba[3]],
+            checksum: [0xff; 4],
             payload,
         };
         assert!(frame.is_block());
@@ -250,16 +310,13 @@ mod tests {
 
     #[test]
     fn frame_helpers_ping_headers_notfound_and_encode_cost() {
-        use bitcoin::hashes::Hash as _;
         let magic = signet_magic();
         let nonce: u64 = 0x1122_3344_5566_7788;
         let payload = nonce.to_le_bytes().to_vec();
-        let dig = bitcoin::hashes::sha256d::Hash::hash(&payload);
-        let ba = dig.to_byte_array();
         let ping = FramedMessage {
             magic,
             command: *b"ping\0\0\0\0\0\0\0\0",
-            checksum: [ba[0], ba[1], ba[2], ba[3]],
+            checksum: [0; 4],
             payload: payload.clone(),
         };
         assert!(ping.is_ping());
@@ -310,6 +367,7 @@ mod tests {
         assert!(!encode_is_cpu_heavy(&NetworkMessage::Verack));
         assert!(encode_is_cpu_heavy(&NetworkMessage::Headers(vec![])));
         // Small inv is cheap; large is heavy.
+        use bitcoin::hashes::Hash as _;
         use bitcoin::p2p::message_blockdata::Inventory;
         let small = NetworkMessage::Inv(vec![Inventory::Block(
             bitcoin::BlockHash::from_byte_array([0; 32]),

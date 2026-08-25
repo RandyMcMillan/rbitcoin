@@ -16,8 +16,6 @@ use bip324::futures::{Protocol, ProtocolReader, ProtocolSessionReader, ProtocolW
 use bip324::io::{Payload, ProtocolError, ProtocolFailureSuggestion};
 use bip324::{Error as Bip324Error, InboundCipher, PacketType, Role};
 use bitcoin::consensus::serialize;
-use bitcoin::hashes::sha256d;
-use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::Magic;
 use std::pin::Pin;
@@ -383,7 +381,9 @@ pub fn encode_v2_contents(payload: NetworkMessage) -> Result<Vec<u8>, NetError> 
     }
 }
 
-/// Parse BIP324 packet contents into a [`FramedMessage`] (synthetic checksum for decode path).
+/// Parse BIP324 packet contents into a [`FramedMessage`].
+///
+/// v2 plaintext is command + payload only — checksum is unused (zeros).
 pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage, NetError> {
     if contents.is_empty() {
         return Err(NetError::Protocol("empty v2 message contents"));
@@ -418,15 +418,10 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
         return Err(NetError::MessageTooLarge(payload.len()));
     }
 
-    // Synthetic checksum so existing FramedMessage::decode (v1-shaped) still works.
-    let dig = sha256d::Hash::hash(&payload);
-    let ba = dig.to_byte_array();
-    let checksum = [ba[0], ba[1], ba[2], ba[3]];
-
     Ok(FramedMessage {
         magic,
         command,
-        checksum,
+        checksum: [0; 4],
         payload,
     })
 }
@@ -685,6 +680,22 @@ mod tests {
         let frame = parse_v2_contents(magic, &contents).unwrap();
         assert!(frame.is_ping());
         assert_eq!(frame.ping_nonce(), Some(0xdead_beef));
+    }
+
+    /// v2 has no checksum; decode must not require sha256d of the payload.
+    #[test]
+    fn parse_v2_block_zero_checksum_decodes() {
+        use bitcoin::blockdata::constants::genesis_block;
+        let magic = Magic::from(Network::Bitcoin);
+        let genesis = genesis_block(Network::Bitcoin);
+        let want = genesis.block_hash();
+        let contents = encode_v2_contents(NetworkMessage::Block(genesis)).unwrap();
+        let frame = parse_v2_contents(magic, &contents).unwrap();
+        assert_eq!(frame.checksum, [0; 4]);
+        match frame.decode().payload() {
+            NetworkMessage::Block(b) => assert_eq!(b.block_hash(), want),
+            other => panic!("expected block, got {other:?}"),
+        }
     }
 
     /// Two ends of a tokio duplex complete BIP324 + application ping/pong.

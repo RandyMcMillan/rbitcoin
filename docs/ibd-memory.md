@@ -37,7 +37,7 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 | **RecentCreates identity ring** | `txid → fk+range` only; expire EWMA(`lookup_taken_hi − tip`)+25% (floor 32, cap 32×144) | Write notes per height then **one** `flush_recent_creates` (and expire) after Class A+idx; disconnect `drop_from` + flush. Sizes: `recent=… live=/pub=/ov= fifo=`. Not a pin/outs FIFO |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
-| **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
+| **SH catalog runs** | on disk after post-IBD Class A recollect | bulk FullCold / ColdResume at tip; not during Direct confirm |
 | **SH recollect / k-way workers** | min(CPUs, host free RAM / 1.5 GiB); floor 1. Linux `/proc/meminfo` `MemAvailable`; Darwin `host_statistics64` free+inactive pages; Windows `GlobalMemoryStatusEx` `ullAvailPhys`. Unknown OS → 1 worker. Env `RBITCOIN_SH_RECOLLECT_WORKERS` / `RBITCOIN_SH_MERGE_WORKERS` override | Start of recollect / tip materialize. Logs `workers=` `free_GiB=` |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
 
@@ -95,8 +95,8 @@ known retain structures:
 | `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
 | `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap **14**) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
-| `sh` | SH runs / memtable / tip heads |
-| `heap … iflight= pstore= recent= union= h2h= fence= sh_mt= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB`; one published Arc + overlay + fifo) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence + SH memtable + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `sh` | SH catalog runs / tip heads |
+| `heap … iflight= pstore= recent= union= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + parent-store live pins + **recent-create identity ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB`; one published Arc + overlay + fifo) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 

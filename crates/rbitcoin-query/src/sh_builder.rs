@@ -63,10 +63,10 @@ pub fn sh_force_rebuild() -> bool {
     )
 }
 
-/// Allowed SEAL lag behind tip create count (memtable / crash window).
+/// Allowed SEAL lag behind tip create count (recollect cancel window).
 pub const SH_SEAL_LAG_OK: u64 = 50_000;
 
-/// True when SEAL is near tip create HWM (small lag for unsealed memtable).
+/// True when SEAL is near tip create HWM.
 pub fn sh_catalog_seal_covers_tip(seal_max_fk: u64, tip_max_create_fk: u64) -> bool {
     if tip_max_create_fk == 0 {
         return true;
@@ -168,7 +168,7 @@ pub fn plan_sh_pre_materialize(
         if head_durable {
             // Sticky FORCE must never nuclear-wipe a live durable head. Fall through
             // to durable maintenance (bootstrap HWM / clamp SEAL / Noop). Gap recollect
-            // after this plan fills any floor↔tip lag via WarmOnly residual.
+            // after this plan a durable head uses write-behind, not recollect.
         } else if empty_head_needs_full_class_a_recollect(seal, tip_max_create_fk, run_records) {
             return ShPreMaterializeAction::ForceFullRebuild;
         } else {
@@ -187,10 +187,8 @@ pub fn plan_sh_pre_materialize(
     if include_hwm > 0 && include_hwm < seal {
         // SEAL ahead of HWM is normal after enter_direct recollect or IBD spills:
         // residual runs already hold create_fk in (hwm, seal]. Clamping SEAL back
-        // to HWM and re-recollecting re-spills the same creates, then WarmOnly
-        // walks a multi-GiB head per key — mainnet tip logs showed ~295k recs
-        // pegging one core for many minutes. Warm residual only; HWM advances
-        // after apply.
+        // to HWM and re-recollecting re-spills the same creates onto a live
+        // head (mainnet 2026-08-25 zero delta). Durable head: skip collect.
         if run_records > 0 {
             return ShPreMaterializeAction::Noop;
         }
@@ -384,10 +382,6 @@ impl ShRunBuilder {
         self.sealed_fk.store(s, Ordering::Release);
     }
 
-    fn stop_and_clear_memtable(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
-
     /// Drop leftover catalog / `.mat` / merge files. **Keeps `SEAL`** (resume
     /// watermark). Used when a durable head exists: residual runs are not merged.
     pub fn discard_residual_runs(&self) {
@@ -418,7 +412,6 @@ impl ShRunBuilder {
     /// recollects **all** Class A creates (SEAL=0).
     pub fn prepare_force_full_rebuild(&self, store: &Store) -> Result<(), StoreError> {
         info!("node: scripthash FORCE_REBUILD — clearing runs/SEAL/progress/HWM and reinit head");
-        self.stop_and_clear_memtable()?;
         self.wipe_catalog_and_seal()?;
         Self::clear_cold_progress_and_hwm(store);
         store.scripthash.reinit_empty_for_cold_materialize()?;
@@ -432,7 +425,6 @@ impl ShRunBuilder {
             "node: scripthash FORCE_REBUILD — catalog usable; reinit head only \
              (not wiping runs/SEAL)"
         );
-        self.stop_and_clear_memtable()?;
         Self::clear_cold_progress_and_hwm(store);
         store.scripthash.reinit_empty_for_cold_materialize()?;
         self.rearm_for_recollect();
@@ -442,7 +434,7 @@ impl ShRunBuilder {
     /// Thread-safe: sort `creates` and append one **catalog** run (direct write).
     ///
     /// Used by parallel Class A recollect so each worker can spill ~128 MiB without
-    /// going through the single-threaded memtable. Does **not** advance SEAL —
+    /// going through a process-wide queue. Does **not** advance SEAL —
     /// the recollect coordinator bumps a **contiguous** watermark so resume never
     /// skips unfinished lower fk ranges.
     ///
@@ -548,7 +540,7 @@ impl ShRunBuilder {
         Ok(())
     }
 
-    /// Flush memtable, coalesce, claim runs, fan-in reduce, cold bulk-load durable SH.
+    /// Claim catalog runs, fan-in reduce, cold bulk-load durable SH.
     pub fn finalize_and_bulk_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         self.finalize_and_bulk_materialize_cancellable(store, None)
     }

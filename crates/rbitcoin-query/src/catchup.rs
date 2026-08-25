@@ -359,8 +359,8 @@ impl Query {
         // landed as small runs after recollect but before claim, must be folded
         // into the durable head **before** tip-ready / Electrum. Mainnet saw
         // leftover catalog after ENOSPC rematerialize + short Direct catch-up.
-        // Bounded loop: each pass drains memtable/L0, recollects create_fk > SEAL,
-        // then warm/cold materializes residual runs.
+        // Bounded loop: each pass recollects create_fk > SEAL then FullCold /
+        // ColdResume residual catalog.
         //
         // Empty store (tip_max==0): nothing to cover — skip tip-ready fail-closed.
         let tip_final = self.store.txs.count();

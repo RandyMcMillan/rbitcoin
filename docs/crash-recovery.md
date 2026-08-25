@@ -89,7 +89,7 @@ Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_sea
   - **Cold resume** via `scripthash.cold_progress`. Dir-variant: sealed
     `scripthash.head/NN` is the commit (holes stay); `next_shard` is the
     lowest unsealed shard. File-variant: prefix HWM + `body_bump`.
-  Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: leftover runs are wiped, `SEAL` kept; missing `include_hwm` bootstraps from SEAL. Inclusion HWM: `scripthash.include_hwm`. Mid-reduce: `merge/CHECKPOINT`. **Leftover live OA** at `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`): refuse — wipe `store/scripthash*` and restart with `--shindex`.
+  Catalog sanity: high SEAL + tiny run mass ⇒ incomplete **only for empty head** (full Class A recollect). Durable head: leftover runs are wiped, `SEAL` kept; missing `include_hwm` bootstraps from SEAL. Inclusion HWM: `scripthash.include_hwm`. **Leftover live OA** at `scripthash.head` (or non-`SHSR` `ovf/NNNNNN`): refuse — wipe `store/scripthash*` and restart with `--shindex`.
   **SH head open:** sealed **main** shards load `.idx` only (one entry per 128
   records; no fuse). Sealed **ovf** loads `.idx` + BF8R. Occupancy scan is not
   used on those files. A schema-14 page-era durable index is **refused** (wipe

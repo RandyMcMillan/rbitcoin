@@ -87,7 +87,7 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 | Package / binary (warm, order-of-magnitude) | Budget | Notes |
 |---------------------------------------------|-------:|-------|
-| `rbitcoin-store --lib` | **&lt;45 s** | Fan-in reduce tests must use a **tiny** stream target, not production 4096 |
+| `rbitcoin-store --lib` | **&lt;45 s** | Catalog-run fixtures stay tens of tiny files, not thousands |
 | `rbitcoin-consensus --lib` | **&lt;30 s** | Prefer pure unit over full-store loops. Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
 | `rbitcoin-query --lib` | **&lt;20 s** | |
 | `rbitcoin-test --test scenarios` | **&lt;15 s** | Prefer `pad_empty_from` / shared mature helpers |
@@ -99,7 +99,7 @@ Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 | Anti-pattern | Prefer |
 |--------------|--------|
-| `n = FANIN_TARGET_STREAM_RUNS + ε` (~4k run files) | Pass a tiny `target_stream_runs` into reduce; keep 4096 geometry in pure math tests only |
+| Thousands of SH catalog run files | Recollect spills ~128 MiB runs; tests use tens of tiny runs and k-way |
 | Multi‑GiB / mainnet head scale under `cargo test` | `RBITCOIN_HEAD_SCALE=tiny` / `cfg(test)` default; force mainnet only for explicit scale tests |
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |

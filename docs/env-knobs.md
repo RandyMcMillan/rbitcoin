@@ -34,10 +34,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
 | `RBITCOIN_SH_RECOLLECT_WORKERS` | min(n-cpu, free-RAM/1.5 GiB) | SH recollect parallelism (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
 | `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` | 128 MiB | Recollect per-worker spill (clamp 16–512 MiB); compact floor is 3/4 of this |
-| `RBITCOIN_SH_MAX_DIRECT_MERGE` | default | SH direct-merge cap |
-| `RBITCOIN_SH_TARGET_RUN_BYTES` | default | SH run target size |
-| `RBITCOIN_SH_MERGE_FANIN` | default | SH merge fan-in |
-| `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, free-RAM/1.5 GiB) | Fan-in reduce + shard-kway (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
+| `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, free-RAM/1.5 GiB) | Recollect + shard k-way (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--maxinbound` / conf omitted |
 
 ## Hardcoded (no env)
@@ -69,6 +66,9 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_IO_URING` | Deleted; use `RBITCOIN_IO=pread` |
 | `RBITCOIN_TX_HEAD_ACCESS` | Deleted; tables are always fd pread/pwrite |
 | `RBITCOIN_HEAD_SLOTS_TX` | Deleted; `tx.head` is segmented address head |
+| `RBITCOIN_SH_MAX_DIRECT_MERGE` | Deleted; catalog materialize is always k-way |
+| `RBITCOIN_SH_TARGET_RUN_BYTES` | Deleted; recollect spill size is `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` |
+| `RBITCOIN_SH_MERGE_FANIN` | Deleted; no fan-in reduce |
 
 ## Related
 

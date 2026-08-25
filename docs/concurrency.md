@@ -56,7 +56,7 @@ The 2-wave split is sealed age, not an IO flag.
 | **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | write-behind after tip commit (may lag live tip by 1+ blocks) |
 
 Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
-(runs → optional fan-in reduce → sliced k-way per prefix shard, workers
+(runs → sliced k-way per prefix shard, workers
 capped at one per 1.5 GiB host free RAM, writing `scripthash.body/NN`
 and sealing `scripthash.head/NN` themselves). Shared file `scripthash.body`
 is one writer. Overflow body

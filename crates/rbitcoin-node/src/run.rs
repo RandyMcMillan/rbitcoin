@@ -1145,7 +1145,7 @@ pub(crate) fn enter_tip_mode(
         Err(StoreError::Cancelled(msg)) => {
             warn!("node: scripthash bulk materialize cancelled ({msg})");
             warn!(
-                "node: partial fan-in progress kept (merge/CHECKPOINT or READY) — \
+                "node: partial cold shards kept (scripthash.cold_progress) — \
                  restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
             );
             false

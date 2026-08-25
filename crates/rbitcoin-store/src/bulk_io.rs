@@ -364,7 +364,9 @@ fn pread_batch_on_session_inner(
     ops: &mut [ReadOp<'_>],
     total_nonempty: usize,
 ) -> bool {
-    session.begin_batch();
+    if session.begin_batch().is_err() {
+        return false;
+    }
     let epoch = session.epoch();
     let n = ops.len();
     let mut next = 0usize;
@@ -482,7 +484,9 @@ fn pwrite_batch_on_session(
     ops: &mut [WriteOp<'_>],
     total_nonempty: usize,
 ) -> bool {
-    session.begin_batch();
+    if session.begin_batch().is_err() {
+        return false;
+    }
     let epoch = session.epoch();
     let n = ops.len();
     let mut next = 0usize;
@@ -600,7 +604,9 @@ fn page_rmw_on_session(
     pages: &mut [PageRmw<'_>],
     apply: &mut dyn FnMut(usize, &mut [u8]) -> bool,
 ) -> bool {
-    session.begin_batch();
+    if session.begin_batch().is_err() {
+        return false;
+    }
     let epoch = session.epoch();
     let n = pages.len();
     // 0 = need read, 1 = read in flight, 2 = need write, 3 = write in flight, 4 = done

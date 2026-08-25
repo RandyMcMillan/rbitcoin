@@ -95,6 +95,14 @@ before 1.0).
 
 ### Fixed
 
+- **io_uring drain fail-closed:** `drain_all` treats unmatched CQEs and CQ
+  overflow as `Corrupt` (no longer ignored). `begin_batch` returns `Err` on a
+  poisoned session or leftover that cannot drain. Held idx fill (`fill_idx_pages`)
+  propagates that error instead of libc-falling back on a dirty TLS ring (that
+  mixed `KIND_BULK_PREAD`/`KIND_IDX` into BDZ g-page harvest as
+  `bdz g page bad slot` / leftover CQE). Invariant WARNs fire on every hit with
+  `pending=` / `epoch=` / `thread=`. [`docs/concurrency.md`](docs/concurrency.md).
+
 - **Tip `--sptweaks` write-through:** after backfill completes, every tip
   block indexed tweaks on the confirm wall. A pin miss on a *non-P2TR* tx
   failed the whole height into `tweaks_for_height` (Class A + secp). Ineligible

@@ -1097,7 +1097,7 @@ impl AddressHead {
         let mut free_slots: Vec<usize> = (0..pool_n).collect();
         let mut next_page = 0usize;
         let mut in_flight = 0usize;
-        session.begin_batch();
+        session.begin_batch()?;
         let epoch = session.epoch();
 
         // On error, drain while bufs still live (SQE destinations).

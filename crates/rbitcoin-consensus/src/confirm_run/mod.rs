@@ -36,7 +36,7 @@ use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{FkMap, Query, U32Map, U64Map, U64Set};
 use rbitcoin_store::{SpendAnnBackend, StoreError};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;

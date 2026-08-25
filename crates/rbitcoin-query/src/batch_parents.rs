@@ -691,34 +691,40 @@ impl BatchParents {
         Some((e.tx.clone(), outs.outs[i].1.clone()))
     }
 
-    /// Assemble hot path: value + script bytes + parent txid (script owned from
-    /// immutable outs snapshot).
+    /// Assemble hot path: value + borrowed script bytes + parent txid.
     ///
     /// Sticky: multi-input spends of the same create reuse one outs Arc without
-    /// re-entering the pin slot.
+    /// re-entering the pin slot. The callback runs while that Arc is held.
     #[inline]
-    pub fn get_parent_txout_parts(&self, fk: Fk, vout: u32) -> Option<(i64, Vec<u8>, [u8; 32])> {
-        self.parent_txout_parts_inner(fk, vout, true)
+    pub fn get_parent_txout_parts<R>(
+        &self,
+        fk: Fk,
+        vout: u32,
+        f: impl FnOnce(i64, &[u8], [u8; 32]) -> R,
+    ) -> Option<R> {
+        self.parent_txout_parts_inner(fk, vout, true, f)
     }
 
     /// Same as [`get_parent_txout_parts`] but **always** `load_outs` (no sticky).
     /// Used as the fair cold control for sticky benches / tests.
     #[inline]
-    pub fn get_parent_txout_parts_no_sticky(
+    pub fn get_parent_txout_parts_no_sticky<R>(
         &self,
         fk: Fk,
         vout: u32,
-    ) -> Option<(i64, Vec<u8>, [u8; 32])> {
-        self.parent_txout_parts_inner(fk, vout, false)
+        f: impl FnOnce(i64, &[u8], [u8; 32]) -> R,
+    ) -> Option<R> {
+        self.parent_txout_parts_inner(fk, vout, false, f)
     }
 
     #[inline]
-    fn parent_txout_parts_inner(
+    fn parent_txout_parts_inner<R>(
         &self,
         fk: Fk,
         vout: u32,
         use_sticky: bool,
-    ) -> Option<(i64, Vec<u8>, [u8; 32])> {
+        f: impl FnOnce(i64, &[u8], [u8; 32]) -> R,
+    ) -> Option<R> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
         let outs = if use_sticky {
@@ -736,7 +742,7 @@ impl BatchParents {
         };
         let i = outs.outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
         let o = &outs.outs[i].1;
-        Some((o.value, o.script.clone(), e.tx.txid))
+        Some(f(o.value, o.script.as_slice(), e.tx.txid))
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
@@ -1209,11 +1215,47 @@ mod tests {
         assert!(bp.has_abs_layout(Fk(9)));
         let (_, o) = bp.get_parent_out(Fk(9), 0).unwrap();
         assert_eq!(o.value, 42);
-        let (v, script, parent_txid) = bp.get_parent_txout_parts(Fk(9), 0).unwrap();
+        let (v, script, parent_txid) = bp
+            .get_parent_txout_parts(Fk(9), 0, |v, s, t| (v, s.to_vec(), t))
+            .unwrap();
         assert_eq!(v, 42);
         assert_eq!(script, &[0x51]);
         assert_eq!(parent_txid[0], 9);
-        assert!(bp.get_parent_txout_parts(Fk(9), 1).is_none());
+        assert!(bp.get_parent_txout_parts(Fk(9), 1, |_, _, _| ()).is_none());
+    }
+
+    #[test]
+    fn parent_txout_borrows_pin_script() {
+        let mut bp = BatchParents::new();
+        let script = vec![0x51, 0x52, 0x53];
+        bp.insert_owned(
+            Fk(9),
+            tx(9),
+            vec![(0, OutputRecord::unspent(42, script))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let pin_ptr = {
+            let e = bp.pins.get(&9).expect("pin");
+            let outs = e.load_outs();
+            outs.outs[0].1.script.as_ptr()
+        };
+        let hit = bp
+            .get_parent_txout_parts(Fk(9), 0, |value, spk, txid| {
+                assert_eq!(value, 42);
+                assert_eq!(spk, &[0x51, 0x52, 0x53]);
+                assert_eq!(txid[0], 9);
+                assert_eq!(
+                    spk.as_ptr(),
+                    pin_ptr,
+                    "must borrow pin script bytes, not clone"
+                );
+                true
+            })
+            .expect("hit");
+        assert!(hit);
     }
 
     #[test]
@@ -1621,7 +1663,7 @@ mod tests {
         for p in 1..=n_parents as u64 {
             for _ in 0..reps {
                 for vout in 0u32..2 {
-                    if let Some((v, _, _)) = a.get_parent_txout_parts_no_sticky(Fk(p), vout) {
+                    if let Some(v) = a.get_parent_txout_parts_no_sticky(Fk(p), vout, |v, _, _| v) {
                         sum_c = sum_c.wrapping_add(v);
                     }
                 }
@@ -1633,7 +1675,7 @@ mod tests {
         for p in 1..=n_parents as u64 {
             for _ in 0..reps {
                 for vout in 0u32..2 {
-                    if let Some((v, _, _)) = a.get_parent_txout_parts(Fk(p), vout) {
+                    if let Some(v) = a.get_parent_txout_parts(Fk(p), vout, |v, _, _| v) {
                         sum = sum.wrapping_add(v);
                     }
                 }
@@ -1706,8 +1748,12 @@ mod tests {
             Vec::new(),
         );
         for vout in [0u32, 1] {
-            let s = bp.get_parent_txout_parts(Fk(3), vout).unwrap();
-            let c = bp.get_parent_txout_parts_no_sticky(Fk(3), vout).unwrap();
+            let s = bp
+                .get_parent_txout_parts(Fk(3), vout, |v, sc, t| (v, sc.to_vec(), t))
+                .unwrap();
+            let c = bp
+                .get_parent_txout_parts_no_sticky(Fk(3), vout, |v, sc, t| (v, sc.to_vec(), t))
+                .unwrap();
             assert_eq!(s.0, c.0);
             assert_eq!(s.1, c.1);
             assert_eq!(s.2, c.2);
@@ -1727,9 +1773,15 @@ mod tests {
             None,
             Vec::new(),
         );
-        let (v0, s0, t0) = bp.get_parent_txout_parts(Fk(7), 0).unwrap();
-        let (v1, s1, t1) = bp.get_parent_txout_parts(Fk(7), 1).unwrap();
-        let (v2, s2, t2) = bp.get_parent_txout_parts(Fk(7), 2).unwrap();
+        let (v0, s0, t0) = bp
+            .get_parent_txout_parts(Fk(7), 0, |v, s, t| (v, s.to_vec(), t))
+            .unwrap();
+        let (v1, s1, t1) = bp
+            .get_parent_txout_parts(Fk(7), 1, |v, s, t| (v, s.to_vec(), t))
+            .unwrap();
+        let (v2, s2, t2) = bp
+            .get_parent_txout_parts(Fk(7), 2, |v, s, t| (v, s.to_vec(), t))
+            .unwrap();
         assert_eq!(v0, 10);
         assert_eq!(v1, 20);
         assert_eq!(v2, 30);
@@ -1751,7 +1803,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        let _ = bp.get_parent_txout_parts(Fk(8), 0).unwrap();
+        let _ = bp.get_parent_txout_parts(Fk(8), 0, |_, _, _| ()).unwrap();
         assert_eq!(bp.sticky_outs.borrow().as_ref().map(|(id, _)| *id), Some(8));
     }
 

@@ -338,47 +338,68 @@ fn is_p2wsh_program(prog: &[u8]) -> bool {
 }
 
 /// BIP16 P2SH sigops from redeem scripts (accurate CHECKMULTISIG count).
-fn p2sh_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
+fn p2sh_sigops_one(inp: &bitcoin::TxIn, spk: &[u8]) -> u64 {
+    if !is_p2sh_script(spk) {
+        return 0;
+    }
+    last_script_push(inp.script_sig.as_bytes())
+        .map(|redeem| script_sigop_count(redeem, true))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn p2sh_sigop_count(tx: &Transaction, prev_spks: &[&[u8]]) -> u64 {
     let mut n = 0u64;
     for (i, inp) in tx.input.iter().enumerate() {
-        let Some(prev) = prevouts.get(i) else {
+        let Some(spk) = prev_spks.get(i) else {
             continue;
         };
-        if !is_p2sh_script(prev.script_pubkey.as_bytes()) {
-            continue;
-        }
-        if let Some(redeem) = last_script_push(inp.script_sig.as_bytes()) {
-            n = n.saturating_add(script_sigop_count(redeem, true));
-        }
+        n = n.saturating_add(p2sh_sigops_one(inp, spk));
     }
     n
 }
 
 /// BIP141 witness sigop count (not witness-scaled).
-fn witness_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
-    let mut n = 0u64;
-    for (i, inp) in tx.input.iter().enumerate() {
-        let Some(prev) = prevouts.get(i) else {
-            continue;
-        };
-        let mut program = prev.script_pubkey.as_bytes();
-        if is_p2sh_script(program) {
-            if let Some(redeem) = last_script_push(inp.script_sig.as_bytes()) {
-                program = redeem;
-            } else {
-                continue;
-            }
-        }
-        if is_p2wpkh_program(program) {
-            n = n.saturating_add(1);
-        } else if is_p2wsh_program(program) {
-            let wit = &inp.witness;
-            if let Some(ws) = wit.last() {
-                n = n.saturating_add(script_sigop_count(ws, true));
-            }
+fn witness_sigops_one(inp: &bitcoin::TxIn, spk: &[u8]) -> u64 {
+    let mut program = spk;
+    if is_p2sh_script(program) {
+        if let Some(redeem) = last_script_push(inp.script_sig.as_bytes()) {
+            program = redeem;
+        } else {
+            return 0;
         }
     }
+    if is_p2wpkh_program(program) {
+        1
+    } else if is_p2wsh_program(program) {
+        inp.witness
+            .last()
+            .map(|ws| script_sigop_count(ws, true))
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+fn witness_sigop_count(tx: &Transaction, prev_spks: &[&[u8]]) -> u64 {
+    let mut n = 0u64;
+    for (i, inp) in tx.input.iter().enumerate() {
+        let Some(spk) = prev_spks.get(i) else {
+            continue;
+        };
+        n = n.saturating_add(witness_sigops_one(inp, spk));
+    }
     n
+}
+
+fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool) -> u64 {
+    const WITNESS_SCALE: u64 = 4;
+    let mut n = 0u64;
+    if bip16 {
+        n = n.saturating_add(p2sh_sigops_one(inp, spk).saturating_mul(WITNESS_SCALE));
+    }
+    n.saturating_add(witness_sigops_one(inp, spk))
 }
 
 /// GBT `sigops`: Core `GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR`.
@@ -389,14 +410,15 @@ pub fn tx_gbt_sigops(tx: &Transaction) -> u64 {
     legacy_sigop_count(tx).saturating_mul(4)
 }
 
-/// Full Core-style sigop cost for one tx given prevouts (BIP16 + BIP141).
-fn tx_sigop_cost(tx: &Transaction, prevouts: &[TxOut], bip16: bool) -> u64 {
+/// Full Core-style sigop cost for one tx given prevout scripts (BIP16 + BIP141).
+#[cfg(test)]
+fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool) -> u64 {
     const WITNESS_SCALE: u64 = 4;
     let mut cost = legacy_sigop_count(tx).saturating_mul(WITNESS_SCALE);
     if bip16 {
-        cost = cost.saturating_add(p2sh_sigop_count(tx, prevouts).saturating_mul(WITNESS_SCALE));
+        cost = cost.saturating_add(p2sh_sigop_count(tx, prev_spks).saturating_mul(WITNESS_SCALE));
     }
-    cost = cost.saturating_add(witness_sigop_count(tx, prevouts));
+    cost = cost.saturating_add(witness_sigop_count(tx, prev_spks));
     cost
 }
 
@@ -545,7 +567,7 @@ pub fn validate_block_connect(
     }
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    let mut pending = std::collections::HashSet::new();
+    let mut pending = rbitcoin_query::OutPointSet::default();
     let mut pending_creates = PendingCreates::default();
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::default();
@@ -581,7 +603,7 @@ pub fn validate_block_connect(
         verify_scripts_pool(&script_jobs)?;
     }
     // Empty BatchParents → missing abs → Err (cold forbidden).
-    let mut structural_pending = std::collections::HashSet::new();
+    let mut structural_pending = rbitcoin_query::OutPointSet::default();
     let mut mtp_cache = U32Map::default();
     let mut meta_by_abs = U64Map::default();
     let _ = structural_validate_spends(
@@ -985,7 +1007,7 @@ pub(crate) fn assemble_block_prevouts(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_spent: &mut rbitcoin_query::OutPointSet,
     pending_creates: &mut PendingCreates,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
@@ -1032,7 +1054,7 @@ fn assemble_block_prevouts_mode(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_spent: &mut rbitcoin_query::OutPointSet,
     pending_creates: &mut PendingCreates,
     mode: AssembleMode,
     batch_parents: &rbitcoin_query::BatchParents,
@@ -1146,9 +1168,14 @@ fn assemble_block_prevouts_mode(
             }
 
             let mut value_in = 0i64;
-            let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
+            let mut prevouts: Vec<TxOut> = if build_script_jobs {
+                Vec::with_capacity(tx.input.len())
+            } else {
+                Vec::new()
+            };
             let mut input_create_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
+            let mut tx_in_sigops = 0u64;
 
             let t_prev = Instant::now();
             for (ii, input) in tx.input.iter().enumerate() {
@@ -1206,6 +1233,7 @@ fn assemble_block_prevouts_mode(
                     query,
                     block,
                     op,
+                    input,
                     prev_fk,
                     &txid_index,
                     ti,
@@ -1213,9 +1241,12 @@ fn assemble_block_prevouts_mode(
                     batch_parents,
                     ctx.height.0,
                     mode == AssembleMode::Full,
+                    bip16_for_jobs,
+                    build_script_jobs,
                     &mut acc,
                 )?;
                 let create_fk = prev_out.create_fk;
+                tx_in_sigops = tx_in_sigops.saturating_add(prev_out.input_sigops);
                 if mode == AssembleMode::Full {
                     if let Some(created) = prev_out.coinbase_height {
                         let maturity = ctx.params.coinbase_maturity();
@@ -1236,13 +1267,16 @@ fn assemble_block_prevouts_mode(
                 if mode == AssembleMode::Full {
                     input_create_heights.push(prev_out.create_height);
                 }
-                prevouts.push(prev_out.txout);
+                if build_script_jobs {
+                    prevouts.push(prev_out.txout);
+                }
             }
             clk_prev = clk_prev.saturating_add(t_prev.elapsed().as_nanos() as u64);
 
             let t_sig = Instant::now();
-            block_sigops_cost =
-                block_sigops_cost.saturating_add(tx_sigop_cost(tx, &prevouts, bip16_for_jobs));
+            block_sigops_cost = block_sigops_cost
+                .saturating_add(legacy_sigop_count(tx).saturating_mul(4))
+                .saturating_add(tx_in_sigops);
             if block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConsensusError::BadBlock("bad-blk-sigops"));
             }
@@ -1411,7 +1445,7 @@ pub(crate) fn structural_validate_spends(
         rbitcoin_primitives::Fk,
     )],
     fees: i64,
-    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_spent: &mut rbitcoin_query::OutPointSet,
     batch_parents: &rbitcoin_query::BatchParents,
     mtp_cache: &mut U32Map<u32>,
     meta_by_abs: &mut U64Map<(rbitcoin_primitives::Fk, u8)>,
@@ -1821,6 +1855,8 @@ pub fn block_subsidy(height: u32, _params: &ChainParams) -> i64 {
 
 struct ResolvedPrevout {
     txout: TxOut,
+    /// P2SH+witness sigop cost for this input's prevout script (not legacy).
+    input_sigops: u64,
     /// `Some(create_height)` when prev is a confirmed coinbase (maturity check).
     coinbase_height: Option<u32>,
     /// Block height that created this UTXO (BIP68). Same-block → spending height.
@@ -1924,6 +1960,7 @@ fn resolve_prevout(
     query: &Query,
     block: &Block,
     op: OutPoint,
+    inp: &bitcoin::TxIn,
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     txid_index: &TxidMap<usize>,
     spend_ti: usize,
@@ -1932,6 +1969,8 @@ fn resolve_prevout(
     spend_height: u32,
     // Optimistic: prevout value/script only. BIP68 + maturity run in structural.
     resolve_create_heights: bool,
+    bip16: bool,
+    need_script_buf: bool,
     acc: &mut AsmPrevoutAcc,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     let prev_txid = op.txid.to_byte_array();
@@ -1945,6 +1984,7 @@ fn resolve_prevout(
             acc.same_n = acc.same_n.saturating_add(1);
             return Ok(ResolvedPrevout {
                 txout: o.clone(),
+                input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16),
                 coinbase_height: None,
                 create_height: if resolve_create_heights {
                     spend_height
@@ -1965,12 +2005,38 @@ fn resolve_prevout(
         NullFk,
         NotPin,
     }
+    enum PinLook {
+        Mismatch,
+        Hit { txout: TxOut, input_sigops: u64 },
+    }
     let mut cold_why = ColdWhy::NullFk;
 
     if let Some(prev_fk) = prev_fk_hint {
         cold_why = ColdWhy::NotPin;
-        match batch_parents.get_parent_txout_parts(prev_fk, op.vout) {
-            Some((value, script, parent_txid)) if parent_txid == prev_txid => {
+        match batch_parents.get_parent_txout_parts(
+            prev_fk,
+            op.vout,
+            |value, script, parent_txid| {
+                if parent_txid != prev_txid {
+                    return PinLook::Mismatch;
+                }
+                PinLook::Hit {
+                    txout: TxOut {
+                        value: Amount::from_sat(value as u64),
+                        script_pubkey: if need_script_buf {
+                            ScriptBuf::from_bytes(script.to_vec())
+                        } else {
+                            ScriptBuf::new()
+                        },
+                    },
+                    input_sigops: prevout_spk_sigops(inp, script, bip16),
+                }
+            },
+        ) {
+            Some(PinLook::Hit {
+                txout,
+                input_sigops,
+            }) => {
                 let (cb_h, create_height) = if resolve_create_heights {
                     let prev_rec = batch_parents
                         .get_parent_tx(prev_fk)
@@ -1991,20 +2057,14 @@ fn resolve_prevout(
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_batch_hit();
                 return Ok(ResolvedPrevout {
-                    txout: TxOut {
-                        value: Amount::from_sat(value as u64),
-                        script_pubkey: ScriptBuf::from_bytes(script),
-                    },
+                    txout,
+                    input_sigops,
                     coinbase_height: cb_h,
                     create_height,
                     create_fk: prev_fk,
                 });
             }
-            Some((_value, _script, parent_txid)) => {
-                // Pin promised this create_fk + vout but identity ≠ wire. Load bug
-                // (schema-13 zero identity, wrong denserels stamp) — hard fail.
-                // Do **not** soft-cold recover; fill pin identity at load instead.
-                let _ = parent_txid;
+            Some(PinLook::Mismatch) => {
                 acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_txid_mismatch();
@@ -2013,7 +2073,6 @@ fn resolve_prevout(
                 )));
             }
             None if batch_parents.contains(prev_fk) => {
-                // Parent create pinned, but needed vout not in sparse outs — load bug.
                 acc.cold_vout_miss_n = acc.cold_vout_miss_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_vout_miss();
@@ -2081,11 +2140,13 @@ fn resolve_prevout(
                 confirm_phase_stats::tl_note_cold_why_not_pin();
             }
         }
+        let input_sigops = prevout_spk_sigops(inp, &out.script, bip16);
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),
                 script_pubkey: ScriptBuf::from_bytes(out.script),
             },
+            input_sigops,
             coinbase_height: cb_h,
             create_height,
             create_fk: prev_fk,

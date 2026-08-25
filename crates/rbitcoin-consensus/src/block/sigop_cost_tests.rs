@@ -10,6 +10,13 @@ use bitcoin::script::ScriptBuf;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 
+fn spks(prevouts: &[TxOut]) -> Vec<&[u8]> {
+    prevouts
+        .iter()
+        .map(|o| o.script_pubkey.as_bytes())
+        .collect()
+}
+
 #[test]
 fn gbt_sigops_scales_legacy_checksig() {
     let tx = Transaction {
@@ -96,7 +103,7 @@ fn p2sh_and_witness_sigop_paths() {
         value: Amount::from_sat(1),
         script_pubkey: ScriptBuf::from_bytes(p2sh_spk),
     }];
-    assert!(witness_sigop_count(&tx, &prevouts) >= 1);
+    assert!(witness_sigop_count(&tx, &spks(&prevouts)) >= 1);
     // P2SH bare redeem with CHECKSIG
     let redeem2 = vec![0xac];
     let mut ss2 = vec![0x01];
@@ -129,8 +136,8 @@ fn p2sh_and_witness_sigop_paths() {
         value: Amount::from_sat(1),
         script_pubkey: ScriptBuf::from_bytes(spk2),
     }];
-    assert!(p2sh_sigop_count(&tx2, &prev2) >= 1);
-    assert!(tx_sigop_cost(&tx2, &prev2, true) >= 4);
+    assert!(p2sh_sigop_count(&tx2, &spks(&prev2)) >= 1);
+    assert!(tx_sigop_cost(&tx2, &spks(&prev2), true) >= 4);
     // Nested P2SH without redeem push → continue (0 witness sigops).
     let tx3 = Transaction {
         version: TxVersion::TWO,
@@ -155,7 +162,7 @@ fn p2sh_and_witness_sigop_paths() {
             0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x87,
         ]),
     }];
-    assert_eq!(witness_sigop_count(&tx3, &prev3), 0);
+    assert_eq!(witness_sigop_count(&tx3, &spks(&prev3)), 0);
 }
 
 #[test]
@@ -222,9 +229,9 @@ fn p2sh_sigops_from_redeem() {
         value: Amount::from_sat(10),
         script_pubkey: ScriptBuf::from_bytes(p2sh_spk),
     }];
-    assert_eq!(p2sh_sigop_count(&tx, &prevouts), 1);
+    assert_eq!(p2sh_sigop_count(&tx, &spks(&prevouts)), 1);
     // legacy×4 + p2sh×4 = 0 + 4 (no legacy CHECKSIG in ss/spk for bare count of redeem)
-    let cost = tx_sigop_cost(&tx, &prevouts, true);
+    let cost = tx_sigop_cost(&tx, &spks(&prevouts), true);
     // scriptSig has push only (0 legacy), output OP_1 (0), p2sh redeem 1×4 = 4
     assert_eq!(cost, 4);
 }
@@ -254,7 +261,7 @@ fn witness_p2wpkh_counts_one() {
         value: Amount::from_sat(10),
         script_pubkey: ScriptBuf::from_bytes(spk),
     }];
-    assert_eq!(witness_sigop_count(&tx, &prevouts), 1);
+    assert_eq!(witness_sigop_count(&tx, &spks(&prevouts)), 1);
 }
 
 #[test]
@@ -313,7 +320,7 @@ fn witness_p2wsh_and_nested_p2sh() {
         value: Amount::from_sat(10),
         script_pubkey: ScriptBuf::from_bytes(spk),
     }];
-    assert_eq!(witness_sigop_count(&tx, &prevouts), 1);
+    assert_eq!(witness_sigop_count(&tx, &spks(&prevouts)), 1);
 
     // Nested P2SH-P2WPKH: redeem in scriptSig.
     let mut redeem = vec![0x00, 0x14];
@@ -344,20 +351,11 @@ fn witness_p2wsh_and_nested_p2sh() {
         value: Amount::from_sat(10),
         script_pubkey: ScriptBuf::from_bytes(p2sh),
     }];
-    assert_eq!(witness_sigop_count(&tx2, &prevouts2), 1);
+    assert_eq!(witness_sigop_count(&tx2, &spks(&prevouts2)), 1);
 
     // p2sh_sigop prevouts short / non-p2sh skip
     assert_eq!(p2sh_sigop_count(&tx2, &[]), 0);
-    assert_eq!(
-        p2sh_sigop_count(
-            &tx2,
-            &[TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }]
-        ),
-        0
-    );
+    assert_eq!(p2sh_sigop_count(&tx2, &[(&[0x51u8][..])]), 0);
     // witness_sigop missing prevout
     assert_eq!(witness_sigop_count(&tx, &[]), 0);
 }

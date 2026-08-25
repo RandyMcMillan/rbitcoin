@@ -941,13 +941,6 @@ impl ScriptCheckJob {
         }
     }
 
-    /// Confirm path: reuse structure/lookup pres (no job `from_tx`).
-    #[inline]
-    pub(crate) fn with_pre(self, pre: std::sync::Arc<rbitcoin_query::TxPrecompute>) -> Self {
-        let _ = self.pre.set(JobPre::Owned(pre));
-        self
-    }
-
     /// Confirm assemble: `slice[idx]` by refcount only (no `TxPrecompute` clone).
     #[inline]
     pub(crate) fn with_pre_slice(

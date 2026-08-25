@@ -753,6 +753,7 @@ mod verify_routing_tests {
             .unwrap()
             .to_byte_array();
         assert_eq!(ours, theirs);
+        let pres: std::sync::Arc<[crate::TxPrecompute]> = std::sync::Arc::from([(*pre).clone()]);
         let job = ScriptCheckJob::with_txid(
             pre.txid,
             vec![TxOut {
@@ -768,7 +769,7 @@ mod verify_routing_tests {
             true,
             true,
         )
-        .with_pre(pre);
+        .with_pre_slice(pres, 0);
         assert_eq!(job.pre().txid, job.txid);
     }
 

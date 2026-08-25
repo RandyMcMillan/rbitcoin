@@ -55,6 +55,36 @@ fn recent_create_rows_skip_missing_idx_keep_heights() {
     assert_eq!(rows[1].1.len(), 2);
 }
 
+#[test]
+fn recent_create_rows_share_create_pin_slice() {
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    use std::sync::Arc;
+    let tid = [0x11u8; 32];
+    let pin = Arc::new((
+        TxRecord {
+            txid: tid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: rbitcoin_primitives::Fk::NULL,
+            input_count: 0,
+            output_start_fk: rbitcoin_primitives::Fk::NULL,
+            output_count: 1,
+        },
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    ));
+    let slices = recent_create_height_slices(&[(10, 1)], 1);
+    let pairs = [(tid, rbitcoin_primitives::Fk(1))];
+    let ranges = [Some((8, 16))];
+    let pins = [Arc::clone(&pin)];
+    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges, &pins);
+    let got = rows[0].1[0].3.as_ref().expect("pin");
+    assert!(
+        Arc::ptr_eq(got, &pin),
+        "rows must Arc-clone the pin slice, not rebuild outs"
+    );
+    assert_eq!(rows[0].1[0].2, (8, 16));
+}
+
 /// Batch append: contiguous heights merge; gap returns Err(other).
 #[test]
 fn script_ok_append_contiguous_and_gap() {
@@ -2240,5 +2270,52 @@ fn structural_pinned_without_abs_is_invariant_error() {
         msg.contains("invariant") && msg.contains("denserels"),
         "unexpected err: {msg}"
     );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Direct write skips SH FkMap; RecentCreates body ranges match idx.
+#[test]
+fn direct_write_skips_create_pin_map_recent_matches_idx() {
+    use crate::confirm_phase_stats;
+    use crate::regtest_pad::mine_empty_regtest;
+    use crate::{accept_and_connect_block, ChainParams, Milestone};
+    use bitcoin::hashes::Hash;
+    use rbitcoin_primitives::Height;
+    use rbitcoin_query::Query;
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-direct-write-pins-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    q.set_lookup_started_hi(Some(32));
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    let tid = b1.txdata[0].compute_txid().to_byte_array();
+    let _ = confirm_phase_stats::sample_write_pins_and_reset();
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let (_take, map_ns, _head) = confirm_phase_stats::sample_write_pins_and_reset();
+    assert_eq!(map_ns, 0, "Direct must not insert write_create_pins");
+    let (fk, range) = q
+        .recent_creates()
+        .get(&tid)
+        .expect("height-1 create stays in RecentCreates while lookup_started_hi is ahead");
+    let idx = q.store().tx_body_range(fk).expect("idx after Class A");
+    assert_eq!(range, idx, "RecentCreates body range must be the idx row");
     let _ = std::fs::remove_dir_all(&path);
 }

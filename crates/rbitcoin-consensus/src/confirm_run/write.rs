@@ -44,7 +44,7 @@ pub(super) fn recent_create_rows_for_slices(
     slices: &[(u32, std::ops::Range<usize>)],
     txid_fks: &[([u8; 32], rbitcoin_primitives::Fk)],
     ranges: &[Option<(u64, u64)>],
-    pins: &[Option<rbitcoin_query::CreatePin>],
+    pins: &[rbitcoin_query::CreatePin],
 ) -> Vec<(
     u32,
     Vec<(
@@ -64,7 +64,7 @@ pub(super) fn recent_create_rows_for_slices(
             let Some(body) = ranges.get(i).copied().flatten() else {
                 continue;
             };
-            let pin = pins.get(i).cloned().flatten();
+            let pin = pins.get(i).map(std::sync::Arc::clone);
             rows.push((*txid, *fk, body, pin));
         }
         if !rows.is_empty() {
@@ -119,13 +119,13 @@ pub fn confirm_write_phase(
     let mut ensure_ns = 0u64;
     let mut plan_take_ns = 0u64;
     let mut create_map_ns = 0u64;
-    if let Some(plan) = batch.archive_plan.take() {
+    if let Some(mut plan) = batch.archive_plan.take() {
         if !plan.is_empty() {
             let t_take = Instant::now();
             let planned_fks = plan.planned_fks.clone();
             let pins: Vec<rbitcoin_query::CreatePin> =
                 if plan.batch_pin.len() == plan.planned_fks.len() {
-                    plan.batch_pin.iter().map(std::sync::Arc::clone).collect()
+                    std::mem::take(&mut plan.batch_pin)
                 } else {
                     plan.packed
                         .iter()
@@ -140,19 +140,28 @@ pub fn confirm_write_phase(
             class_a_ns = t_ca.elapsed().as_nanos() as u64;
             // Layout + SH pins only after a real append. Idempotent skip (Class A
             // already present) uses store denserels via ensure / class_c cold pins.
+            // Direct SH collect is a no-op — skip the FkMap.
             if committed {
-                let t_map = Instant::now();
-                write_create_pins.reserve(planned_fks.len());
-                for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
-                    write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
+                if query.index_mode().is_tip() {
+                    let t_map = Instant::now();
+                    write_create_pins.reserve(planned_fks.len());
+                    for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
+                        write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
+                    }
+                    create_map_ns = t_map.elapsed().as_nanos() as u64;
                 }
-                create_map_ns = t_map.elapsed().as_nanos() as u64;
+                let t_idx = Instant::now();
+                let body_ranges = query
+                    .store()
+                    .tx_body_range_batch(&planned_fks)
+                    .map_err(ConsensusError::from)?;
+                let idx_ns = t_idx.elapsed().as_nanos() as u64;
                 let t_ens = Instant::now();
                 fill_planned_create_layout_after_commit(
                     query,
                     &mut batch.batch_parents,
                     &planned_fks,
-                    &pins,
+                    &body_ranges,
                 )?;
                 ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
                 let slices = recent_create_height_slices(
@@ -169,20 +178,8 @@ pub fn confirm_write_phase(
                     .zip(pins.iter())
                     .map(|(fk, pin)| (pin.0.txid, *fk))
                     .collect();
-                let fks: Vec<rbitcoin_primitives::Fk> =
-                    txid_fks.iter().map(|(_, fk)| *fk).collect();
-                let t_idx = Instant::now();
-                let ranges = query
-                    .store()
-                    .tx_body_range_batch(&fks)
-                    .map_err(ConsensusError::from)?;
-                let idx_ns = t_idx.elapsed().as_nanos() as u64;
-                let pin_opts: Vec<Option<rbitcoin_query::CreatePin>> = pins
-                    .iter()
-                    .map(|p| Some(std::sync::Arc::clone(p)))
-                    .collect();
                 for (height, rows) in
-                    recent_create_rows_for_slices(&slices, &txid_fks, &ranges, &pin_opts)
+                    recent_create_rows_for_slices(&slices, &txid_fks, &body_ranges, &pins)
                 {
                     query.note_recent_creates_pins(height, rows);
                 }
@@ -326,19 +323,16 @@ pub fn confirm_write_phase(
     Ok(out)
 }
 
-/// After Class A commit, set body_range (+ denserels if missing) for **pinned**
-/// planned creates only.
-///
-/// Uses `tx_body_range_batch` — **no** Class A body pread. Skips creates not in
-/// `batch_parents` (most of the batch). Prefer denserels already set at load pin;
-/// missing denserels come from shared [`rbitcoin_query::CreatePin`] (no packed reclone).
+/// After Class A commit, set body_range (+ spent.idx) for **pinned** creates
+/// still missing layout. Body ranges come from the write's one `tx_body_range_batch`
+/// (shared with RecentCreates). Spent holes use one `tx_spent_range_batch`.
 pub(super) fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
     planned_fks: &[rbitcoin_primitives::Fk],
-    pins: &[rbitcoin_query::CreatePin],
+    body_ranges: &[Option<(u64, u64)>],
 ) -> Result<(), ConsensusError> {
-    if planned_fks.is_empty() || pins.is_empty() {
+    if planned_fks.is_empty() {
         return Ok(());
     }
     let missing: U64Set = batch_parents
@@ -349,38 +343,27 @@ pub(super) fn fill_planned_create_layout_after_commit(
     if missing.is_empty() {
         return Ok(());
     }
-    let mut need_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    let mut need_pin_i: Vec<usize> = Vec::new();
+    let mut need_spent: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (i, fk) in planned_fks.iter().enumerate() {
         let Some(id) = fk.get() else { continue };
         if !missing.contains(&id) {
             continue;
         }
-        need_fks.push(*fk);
-        need_pin_i.push(i);
+        if let Some((off, len)) = body_ranges.get(i).copied().flatten() {
+            batch_parents.set_body_range_only(*fk, (off, len));
+        }
+        need_spent.push(*fk);
     }
-    if need_fks.is_empty() {
+    if need_spent.is_empty() {
         return Ok(());
     }
-    let ranges = query
-        .store()
-        .tx_body_range_batch(&need_fks)
-        .map_err(ConsensusError::from)?;
     let spent = query
         .store()
-        .tx_spent_range_batch(&need_fks)
+        .tx_spent_range_batch(&need_spent)
         .map_err(ConsensusError::from)?;
-    for (((&fk, range), spent_r), &_pi) in need_fks
-        .iter()
-        .zip(ranges.into_iter())
-        .zip(spent.into_iter())
-        .zip(need_pin_i.iter())
-    {
-        if let Some((off, len)) = range {
-            batch_parents.set_body_range_only(fk, (off, len));
-        }
+    for (fk, spent_r) in need_spent.iter().zip(spent.into_iter()) {
         if let Some(sr) = spent_r {
-            batch_parents.set_spent_range_only(fk, sr);
+            batch_parents.set_spent_range_only(*fk, sr);
         }
     }
     Ok(())

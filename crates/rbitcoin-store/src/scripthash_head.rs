@@ -24,6 +24,7 @@ use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(test)]
 use std::time::Instant;
 
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};

@@ -84,7 +84,7 @@ pub enum HeadRole {
 pub enum HeadScale {
     /// Minimal (64 slots) — unit/integration tests.
     Tiny,
-    /// Full-mainnet IBD: `header.head` starts at 2²² slots (~24 MiB).
+    /// Full-mainnet IBD: `header.head` starts at 2²² slots (~96 MiB sparse).
     Mainnet,
 }
 
@@ -415,6 +415,7 @@ impl HashHead {
     }
 
     /// Number of occupied hash slots (open-address load observer).
+    #[cfg(test)]
     pub(crate) fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }
@@ -434,6 +435,7 @@ impl HashHead {
     }
 
     /// Minimum power-of-two slot count so `keys` stay under load factor 7/8.
+    #[cfg(test)]
     fn slots_for_keys(keys: u64) -> u64 {
         if keys == 0 {
             return DEFAULT_SLOTS;
@@ -449,6 +451,7 @@ impl HashHead {
     /// Ensure an **empty** table can hold `additional` keys (load 7/8).
     ///
     /// Occupied tables do not grow; overflow is [`HASH_HEAD_FULL`].
+    #[cfg(test)]
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -485,6 +488,7 @@ impl HashHead {
         Ok(prev)
     }
 
+    #[cfg(test)]
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         self.insert_many_with(entries, |_| {})
     }
@@ -624,6 +628,7 @@ impl HashHead {
 
     /// Expand an **empty** table to `new_slots` (power of two). Occupied tables
     /// must not call this (that is the old in-place rehash).
+    #[cfg(test)]
     fn grow_empty_to(&self, new_slots: u64) -> Result<(), StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
         let (old_slots, occupied) = {

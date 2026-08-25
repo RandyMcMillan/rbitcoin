@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **Algo-review open list:** [`docs/algo-review.md`](docs/algo-review.md)
+  is remaining work only. Landed items from that pass live here and in
+  owner docs. Close a finding by deleting its row; do not append a Closed
+  graveyard.
+
 - **Held tx.head `.rel` pread:** after fail-closed `begin_batch` (`f07415b5`),
   a poisoned leftover ring made `pread_batch_on_ctx` return false and
   `read_rels_batch` opened a second TLS uring — nested panic on
@@ -65,22 +70,19 @@ before 1.0).
   sparse). Overflow rolls `header.head.gN`. Undersized single-gen files
   rewrite on open. Ingest SH seals at 0.80. `ShardedHashHead`,
   `HeadRole::ScriptHash`, and `rehash_gate` are deleted. Leftover 256-way
-  `header.head/` is Layout refuse. Closed
-  [`docs/algo-review.md`](docs/algo-review.md) S-H1
+  `header.head/` is Layout refuse.
   ([#248](https://github.com/reardencode/rbitcoin/pull/248)).
 
 - **Algo-review P7/P8/P10/P16:** leftover TipOnly fence snapshot is
   `Arc` (COW on extend). Densify assign resumes after the BQ-ready
   prefix. BIP324 v2 decode is command+payload (no sha256d checksum, no
-  v1 reframe). Fence-tip BIP113 MTP is an 11-slot ring. Closed
-  [`docs/algo-review.md`](docs/algo-review.md) P7, P8, P10, P16
+  v1 reframe). Fence-tip BIP113 MTP is an 11-slot ring.
   ([#245](https://github.com/reardencode/rbitcoin/pull/245)).
 
 - **Algo-review P1–P3:** BIP339 wtxid inv is a `TxGraph` map (no mempool
   scan under the lock). Best-chain cumulative work is a RAM prefix
   (~32 B × tip), not a genesis walk per unrequested body / `chainwork`.
-  Mempool `worst_chunk` is an ordered cluster-rate index. Closed
-  [`docs/algo-review.md`](docs/algo-review.md) P1/P2/P3 and N-H2/N-H3
+  Mempool `worst_chunk` is an ordered cluster-rate index.
   ([#244](https://github.com/reardencode/rbitcoin/pull/244)).
 
 - **BQ assign-stop 1 GiB:** `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` no longer
@@ -153,6 +155,20 @@ before 1.0).
   `NodeConfig::with_datadir_cold`. RecentCreates identity **and** outs stay.
 
 ### Fixed
+
+- **`testmempoolaccept` is dry-run:** `MempoolHub::test_accept` runs
+  prepare + scripts + RBF/cluster checks without commit, announce, or
+  conflict eviction.
+
+- **RPC `getrpcinfo` active list is id-keyed:** concurrent `dispatch`
+  no longer `pop()`s the wrong in-flight command.
+
+- **Headers-sync stall timeout runs in production:** the 50 ms session
+  tick calls `PeerHub::on_session_heartbeat` →
+  `check_headers_sync_timeouts`.
+
+- **Inbound VERSION/VERACK handshake has a 60 s bound:** timeout is
+  `NetError::Timeout` and drops the `max_inbound` permit.
 
 - **Script-pool wave `failed` is Acquire/Release:** a worker cannot enter
   a wave after the publisher observed `in_wave == 0` (ARM).

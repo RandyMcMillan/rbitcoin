@@ -80,7 +80,7 @@ still wait for durable SH when shindex is on.
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
 | `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`). `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. Verbose `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight` include `prioritisetransaction` deltas; top-level `ancestorfees` / `descendantfees` stay base satoshis. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. |
 | `getrawtransaction` | Class A + mempool. Optional Core `blockhash` arg is accepted and ignored. |
-| `sendrawtransaction` / `testmempoolaccept` | Accept path (relay must be enabled) |
+| `sendrawtransaction` / `testmempoolaccept` | Relay must be enabled. `sendrawtransaction` is live accept. `testmempoolaccept` is dry-run (`MempoolHub::test_accept`: prepare + scripts + RBF/cluster checks, no commit / announce / RBF eviction). |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
 | `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` | **Regtest only.** Mine through `ChainHub::accept_block` (same confirm as P2P). First generated block includes `select_block_txs`, then `remove_for_block`. `generatetodescriptor` accepts `raw(HEX)`, `addr(ADDRESS)`, or a bare address. |
 | `getblocktemplate` / `getmininginfo` | All networks. Template from `select_block_txs`. `rules` must include `segwit`. Proposal validates without connecting and returns Core reject needles (`bad-cb-missing`, `bad-diffbits`, `time-too-old`, …). Version is `VERSIONBITS_TOP_BITS` only (no testdummy). `longpollid` waits until the tip or mempool update counter changes. |
@@ -88,7 +88,7 @@ still wait for durable SH when shindex is on.
 | `getmempoolcluster` | All networks. Cluster weight / chunks from the live graph (modified fees). Same prefix-maximal chunks as mining selection. |
 | `getmempoolancestors` / `getmempooldescendants` | All networks. Exclusive walks of the live cluster graph. `verbose` reuses `getmempoolentry` fields. |
 | `getmempoolfeeratediagram` | All networks. Mining chunks as `{weight, fee}` points (decreasing feerate). |
-| `submitpackage` | All networks. Sequential `accept_tx` (parent can stay if the child fails). `package_msg` / `tx-results` / `replaced-transactions`. |
+| `submitpackage` | All networks. Sequential `accept_tx` (parent can stay if the child fails). No package-level feerate (a 0-fee CPFP parent is rejected on its own min-relay). `package_msg` / `tx-results` / `replaced-transactions`. |
 | `gettxspendingprevout` | All networks. Live mempool spender of each `{txid,vout}`. |
 | `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |

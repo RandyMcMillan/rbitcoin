@@ -24,9 +24,9 @@ This is not a security audit. Numbers are order-of-magnitude.
 **1.0 product gates** (what an operator can count on) live in
 [`road-to-1.0.md`](./road-to-1.0.md). Do not copy that list here.
 
-Algorithm/data-structure findings (2026-08-25 snapshot) live in
-[`algo-review.md`](./algo-review.md). Close items there; do not paste those
-tables into Open.
+Open algorithm/data-structure findings live in
+[`algo-review.md`](./algo-review.md). Close an item by deleting it there in
+the same PR; do not paste those tables into Open.
 
 Peer full-node notes (Hornet, satd) live in
 [`peer-clients.md`](./peer-clients.md). Ranked later-consideration items

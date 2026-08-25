@@ -15,7 +15,7 @@ update that file — do not paste a parallel spec.
 | On-disk | [`SCHEMA.md`](../SCHEMA.md) | Current bytes; history in [`SCHEMA_HISTORY.md`](../SCHEMA_HISTORY.md) |
 | Confirm / store implementer | [`invariants.md`](./invariants.md) + [`concurrency.md`](./concurrency.md) | Stage IO, leftover union, roles, tip commit |
 | Tests | [`TESTING.md`](../TESTING.md) | How to run, budgets, coverage |
-| Algo / DS findings | [`algo-review.md`](./algo-review.md) | Whole-repo algorithm/data-structure review; work High first |
+| Algo / DS findings | [`algo-review.md`](./algo-review.md) | Open algorithm/DS findings; work High first |
 | Peer full nodes | [`peer-clients.md`](./peer-clients.md) | Hornet / satd comparison; later-consideration tests and ideas |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
@@ -47,7 +47,7 @@ quality backlog).
 | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | Workarounds where rust-bitcoin is not Core-faithful. |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
-| [`algo-review.md`](./algo-review.md) | 2026-08-25 algorithm/DS findings. Close items here; do not copy into quality.md. |
+| [`algo-review.md`](./algo-review.md) | Open algorithm/DS findings. Close by deleting the row in the same PR; do not copy into quality.md. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
 

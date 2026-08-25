@@ -273,7 +273,7 @@ pages after annotate does not protect `txout`. See
 | IBD concurrent getdata | **1024** | code `IbdConfig::window` |
 | Blocks in transit / peer | **16** | `IbdConfig::per_peer` |
 | Live IBD peers | **16** | `--max-outbound` |
-| Inbound P2P sessions | **125** | `--maxinbound` / `--maxconnections` |
+| Inbound P2P sessions | **125** | `--maxinbound` / `--maxconnections`. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` / `--assumevalid-height` (`0` = full scripts) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only; ring depth **128**. Segmented `tx.head` FdOnly; Class C L2 write-behind (`docs/io-modality.md`) |

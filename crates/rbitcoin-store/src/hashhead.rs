@@ -419,8 +419,13 @@ impl HashHead {
     }
 
     #[inline]
-    fn max_occupied(slots: u64) -> u64 {
+    pub(crate) fn max_occupied(slots: u64) -> u64 {
         slots.saturating_mul(MAX_LOAD_NUM) / MAX_LOAD_DEN
+    }
+
+    pub(crate) fn at_load_cap(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.occupied >= Self::max_occupied(s.slots)
     }
 
     /// Minimum power-of-two slot count so `keys` stay under load factor 7/8.

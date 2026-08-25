@@ -1,9 +1,14 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::sharded_hashhead::ShardedHashHead;
+use crate::hashhead::{HashHead, HeadRole, HASH_HEAD_FULL};
+use crate::sharded_hashhead::initial_slots_per_shard;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{Fk, TableKind};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
+
+pub const HEADER_HEAD_DIR_REFUSE: &str =
+    "header.head is a shard directory; wipe header.head and header.body and reindex";
 
 /// Fixed-size header body record (88 bytes). See SCHEMA.md.
 pub const HEADER_RECORD_LEN: usize = 88;
@@ -72,9 +77,122 @@ pub fn block_header_hash(
     sha256::Hash::from_engine(eng2).to_byte_array()
 }
 
+/// `header.head` plus overflow gens `header.head.g1`, `header.head.g2`, …
+struct HeaderHead {
+    base: PathBuf,
+    target_slots: u64,
+    gens: RwLock<Vec<HashHead>>,
+}
+
+fn header_gen_path(base: &Path, i: usize) -> PathBuf {
+    if i == 0 {
+        return base.to_path_buf();
+    }
+    let mut p = base.as_os_str().to_os_string();
+    p.push(format!(".g{i}"));
+    PathBuf::from(p)
+}
+
+impl HeaderHead {
+    fn create(base: PathBuf) -> Result<Self, StoreError> {
+        let target_slots = initial_slots_per_shard(HeadRole::Header);
+        let h = HashHead::create_with_slots(&base, target_slots)?;
+        Ok(Self {
+            base,
+            target_slots,
+            gens: RwLock::new(vec![h]),
+        })
+    }
+
+    fn open(base: PathBuf) -> Result<Self, StoreError> {
+        if base.is_dir() {
+            return Err(StoreError::Layout(HEADER_HEAD_DIR_REFUSE.to_string()));
+        }
+        if !base.is_file() {
+            return Err(StoreError::io(
+                &base,
+                std::io::Error::new(std::io::ErrorKind::NotFound, "header.head missing"),
+            ));
+        }
+        let target_slots = initial_slots_per_shard(HeadRole::Header);
+        let mut gens = vec![HashHead::open(&base)?];
+        let mut i = 1usize;
+        loop {
+            let p = header_gen_path(&base, i);
+            if !p.is_file() {
+                break;
+            }
+            gens.push(HashHead::open(p)?);
+            i += 1;
+        }
+        Ok(Self {
+            base,
+            target_slots,
+            gens: RwLock::new(gens),
+        })
+    }
+
+    fn get_all(&self, key: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let gens = self.gens.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for h in gens.iter().rev() {
+            out.extend(h.get_all(key)?);
+        }
+        Ok(out)
+    }
+
+    fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
+        loop {
+            let last = {
+                let gens = self.gens.read().unwrap_or_else(|e| e.into_inner());
+                gens.len().saturating_sub(1)
+            };
+            let err = {
+                let gens = self.gens.read().unwrap_or_else(|e| e.into_inner());
+                match gens[last].insert(key, fk) {
+                    Ok(prev) => return Ok(prev),
+                    Err(e) => e,
+                }
+            };
+            match err {
+                StoreError::Corrupt(HASH_HEAD_FULL) => self.roll()?,
+                e => return Err(e),
+            }
+        }
+    }
+
+    fn roll(&self) -> Result<(), StoreError> {
+        let mut gens = self.gens.write().unwrap_or_else(|e| e.into_inner());
+        // Another ensure may have rolled while we dropped the read lock.
+        if gens.last().is_some_and(|h| !h.at_load_cap()) {
+            return Ok(());
+        }
+        let i = gens.len();
+        let p = header_gen_path(&self.base, i);
+        gens.push(HashHead::create_with_slots(p, self.target_slots)?);
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), StoreError> {
+        let gens = self.gens.read().unwrap_or_else(|e| e.into_inner());
+        for h in gens.iter() {
+            h.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_async(&self) -> Result<(), StoreError> {
+        let gens = self.gens.read().unwrap_or_else(|e| e.into_inner());
+        for h in gens.iter() {
+            h.flush_async()?;
+        }
+        Ok(())
+    }
+}
+
 pub struct HeaderTable {
     body: TableFile,
-    head: ShardedHashHead,
+    head: HeaderHead,
     count: std::sync::atomic::AtomicU64,
     /// Serializes check-then-put so two threads cannot both miss and both append
     /// the same full hash (I1 + I4).
@@ -84,10 +202,7 @@ pub struct HeaderTable {
 impl HeaderTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::create(dir.join("header.body"), TableKind::Header)?;
-        let head = ShardedHashHead::create_for_role(
-            dir.join("header.head"),
-            crate::hashhead::HeadRole::Header,
-        )?;
+        let head = HeaderHead::create(dir.join("header.head"))?;
         Ok(Self {
             body,
             head,
@@ -98,10 +213,7 @@ impl HeaderTable {
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
-        let head = ShardedHashHead::open_for_role(
-            dir.join("header.head"),
-            crate::hashhead::HeadRole::Header,
-        )?;
+        let head = HeaderHead::open(dir.join("header.head"))?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body_len % HEADER_RECORD_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("header body size"));
@@ -363,6 +475,54 @@ mod tests {
             "C must not gain false children from poison puts"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_head_rolls_generation_when_gen0_is_full() {
+        let dir = tmp();
+        let t = HeaderTable::create(&dir).unwrap();
+        let mut hashes = Vec::new();
+        for i in 0u32..80 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&i.to_le_bytes());
+            hash[4] = 0xa5;
+            hashes.push(hash);
+            t.ensure(&sample(hash)).unwrap();
+        }
+        assert!(
+            dir.join("header.head.g1").is_file(),
+            "tiny 64-slot gen0 must roll header.head.g1"
+        );
+        assert!(dir.join("header.head").is_file());
+        let first = t.get_by_hash(&hashes[0]).unwrap().unwrap();
+        let last = t.get_by_hash(&hashes[79]).unwrap().unwrap();
+        assert_eq!(first.1.hash, hashes[0]);
+        assert_eq!(last.1.hash, hashes[79]);
+        assert_eq!(t.ensure(&sample(hashes[0])).unwrap(), first.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_head_directory_is_layout_refuse() {
+        let dir = tmp();
+        let t = HeaderTable::create(&dir).unwrap();
+        drop(t);
+        let head = dir.join("header.head");
+        std::fs::remove_file(&head).unwrap();
+        std::fs::create_dir(&head).unwrap();
+        std::fs::write(head.join("00"), b"x").unwrap();
+        std::fs::write(head.join("01"), b"y").unwrap();
+        let err = match HeaderTable::open(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Layout refuse for sharded header.head dir"),
+        };
+        match err {
+            StoreError::Layout(m) => {
+                assert!(m.contains("header.head"), "{m}");
+            }
+            other => panic!("expected Layout, got {other}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

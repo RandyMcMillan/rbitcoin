@@ -163,7 +163,7 @@ impl HeadScale {
             HeadScale::Tiny => DEFAULT_SLOTS,
             // Unsharded fallback only (legacy single-file). Prefer sharded layout.
             HeadScale::Mainnet => match role {
-                HeadRole::Header => 1 << 20,
+                HeadRole::Header => 1 << 22,
                 HeadRole::ScriptHash => 1 << 22,
             },
         }
@@ -1206,7 +1206,7 @@ mod tests {
             HeadScale::Tiny.initial_slots(HeadRole::Header),
             DEFAULT_SLOTS
         );
-        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 20);
+        assert_eq!(HeadScale::Mainnet.initial_slots(HeadRole::Header), 1 << 22);
         assert_eq!(
             HeadScale::Mainnet.initial_slots(HeadRole::ScriptHash),
             1 << 22

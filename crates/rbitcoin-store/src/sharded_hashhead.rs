@@ -41,8 +41,7 @@ pub fn shard_count_for_role(role: HeadRole) -> usize {
     }
 }
 
-/// Initial slots **per shard** (not global). For header, shard count is 1 so this
-/// is the full table size (~1 M slots × 24 B ≈ 24 MiB).
+/// Initial slots **per shard** (not global). Header is one file (2²² × 24 B ≈ 96 MiB).
 ///
 /// Override with `RBITCOIN_HEAD_SLOTS_*` as **per-shard** slot count when set.
 pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
@@ -52,8 +51,7 @@ pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
     match HeadScale::from_env() {
         HeadScale::Tiny => 64,
         HeadScale::Mainnet => match role {
-            // Single-file: enough for full mainnet headers at 7/8 load.
-            HeadRole::Header => 1 << 20,
+            HeadRole::Header => 1 << 22,
             HeadRole::ScriptHash => 1 << 16,
         },
     }
@@ -394,7 +392,7 @@ mod tests {
                 shard_count_for_role(HeadRole::ScriptHash),
                 SHARD_COUNT_TX_SH
             );
-            assert_eq!(initial_slots_per_shard(HeadRole::Header), 1 << 20);
+            assert_eq!(initial_slots_per_shard(HeadRole::Header), 1 << 22);
             assert_eq!(initial_slots_per_shard(HeadRole::ScriptHash), 1 << 16);
         });
         let _ = std::fs::remove_dir_all(&dir);

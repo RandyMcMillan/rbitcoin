@@ -254,6 +254,10 @@ New features: add a high-level scenario; remove obsolete lower-level tests in th
 
 ## Core differential
 
+In-tree fuzz is still `block_wire` (nightly `fuzz.yml`). A satd-style
+**verdict-only** dual-submit vs live `bitcoind` is later-consideration
+for **Q-30**: [`docs/peer-clients.md`](./docs/peer-clients.md).
+
 Inventory for Bitcoin Core **v31.1** functional tests lives in
 [`scripts/core-functional/`](scripts/core-functional/)
 ([`docs/core-functional.md`](docs/core-functional.md)).

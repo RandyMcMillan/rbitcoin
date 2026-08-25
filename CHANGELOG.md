@@ -11,6 +11,10 @@ before 1.0).
 
 ### Added
 
+- **Peer full-node notes:** [`docs/peer-clients.md`](docs/peer-clients.md)
+  compares Hornet Node and satd (tests and ideas to consider later, and
+  explicit non-copies). Not a quality.md Open list.
+
 - **Write `other=` classification:** `ibd: perf` names `pins=take+map`
   (plan Arc copies + create-pin FkMap) and `head_sub=` (tx.head drain
   submit). They join the write inventory so `other=` is the leftover

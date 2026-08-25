@@ -82,6 +82,12 @@ Product / wire intentional differences: [`COMPAT.md`](../COMPAT.md).
 | Unconfirmed | Mempool attached in-process | Depends on Core mempool RPC |
 | Consensus | This binary validates blocks/scripts | Trusts the node it indexes |
 
+### vs other full nodes (Hornet, satd)
+
+Core / Fulcrum stay in the tables above. Snapshot of **Hornet Node** and
+**satd** (tests, designs, explicit non-copies):
+[`peer-clients.md`](./peer-clients.md). Do not paste that comparison here.
+
 ---
 
 ## Novel on-disk model

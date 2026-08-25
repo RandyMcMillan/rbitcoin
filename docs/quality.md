@@ -28,6 +28,11 @@ Algorithm/data-structure findings (2026-08-25 snapshot) live in
 [`algo-review.md`](./algo-review.md). Close items there; do not paste those
 tables into Open.
 
+Peer full-node notes (Hornet, satd) live in
+[`peer-clients.md`](./peer-clients.md). Ranked later-consideration items
+stay there; promote into Open only when scheduling a slice. **Q-30** already
+covers the highest-leverage steal (in-tree differential fuzz).
+
 ---
 
 ## North star: industry-leading full node in Rust
@@ -283,6 +288,7 @@ included; tree at #177):
 |----------|------|
 | Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active program: **Q-41** (Core functional `run` set) |
 | Algo / DS findings | [`algo-review.md`](./algo-review.md) — not a fourth backlog in this file |
+| Peer full nodes | [`peer-clients.md`](./peer-clients.md) — Hornet / satd notes; not a fourth backlog |
 | Release engineering | **Q-20**, **Q-21**, **Q-23** (completed) |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** |
 | Docs / README | Map is done; first hour is OPERATOR.md (**Q-34** closed) |

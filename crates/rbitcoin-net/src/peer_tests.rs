@@ -4610,3 +4610,49 @@ fn full_headers_batch_continues_from_last_header() {
         let _ = std::fs::remove_dir_all(dir);
     });
 }
+
+#[test]
+fn pending_header_walk_is_ram_then_one_store_lookup() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::{CompactTarget, TxMerkleNode};
+    use std::time::Instant;
+
+    let (dir, q) = tmp_store("pending-walk");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+
+    let n = 2_500u32;
+    let mut pending = HashMap::new();
+    let mut prev = genesis;
+    let mut tip = genesis;
+    for i in 0..n {
+        let mut merkle = [0u8; 32];
+        merkle[..4].copy_from_slice(&(i + 1).to_le_bytes());
+        let hdr = Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::from_byte_array(merkle),
+            time: 1 + i,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: i,
+        };
+        tip = hdr.block_hash();
+        pending.insert(tip, hdr);
+        prev = tip;
+    }
+
+    let t0 = Instant::now();
+    let height = announced_headers_height(&hub, &pending, tip);
+    let branch = header_branch_vs_tip(&hub, &pending, tip);
+    let connects = header_announcement_connects(&hub, &pending, genesis);
+    let dt = t0.elapsed();
+    assert_eq!(height, n, "pending chain from genesis is height={n}");
+    assert_eq!(branch, Some(std::cmp::Ordering::Greater));
+    assert!(connects);
+    assert!(
+        dt < std::time::Duration::from_millis(200),
+        "RAM pending walk must not per-step store lookup, took {dt:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -2065,6 +2065,31 @@ fn tip_announce_decision(
     TipAnnounce::Inv(ev.hash)
 }
 
+fn is_genesis_hash(h: &BlockHash) -> bool {
+    h.to_byte_array() == [0u8; 32]
+}
+
+/// Walk `pending` toward genesis. Returns the first hash **not** in `pending`
+/// and how many pending headers were consumed. Store is not consulted.
+fn pending_walk(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    start: BlockHash,
+) -> (BlockHash, u32) {
+    let mut h = start;
+    let mut steps = 0u32;
+    while steps < 10_000 {
+        if is_genesis_hash(&h) {
+            return (h, steps);
+        }
+        let Some(hdr) = pending.get(&h) else {
+            return (h, steps);
+        };
+        steps = steps.saturating_add(1);
+        h = hdr.prev_blockhash;
+    }
+    (h, steps)
+}
+
 /// Height of `tip` from stored headers or a walk of this peer's pending path.
 ///
 /// Core logs `chain_start.nHeight + headers.size()` on the *batch*. Node-to-node
@@ -2075,28 +2100,17 @@ fn announced_headers_height(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> u32 {
-    if tip.to_byte_array() == [0u8; 32] {
+    if is_genesis_hash(&tip) {
         return 0;
     }
     if let Some(h) = hub.header_height(&tip) {
         return h;
     }
-    let mut steps = 0u32;
-    let mut h = tip;
-    for _ in 0..10_000 {
-        if h.to_byte_array() == [0u8; 32] {
-            return steps;
-        }
-        if let Some(known) = hub.header_height(&h) {
-            return known.saturating_add(steps);
-        }
-        let Some(hdr) = pending.get(&h) else {
-            return steps;
-        };
-        steps = steps.saturating_add(1);
-        h = hdr.prev_blockhash;
+    let (join, steps) = pending_walk(pending, tip);
+    if is_genesis_hash(&join) {
+        return steps;
     }
-    steps
+    hub.header_height(&join).unwrap_or(0).saturating_add(steps)
 }
 
 /// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
@@ -2108,21 +2122,12 @@ fn persist_pending_header_path(
     let mut path = Vec::new();
     let mut h = tip;
     for _ in 0..10_000 {
-        if hub
-            .query
-            .get_header_by_hash(h.as_byte_array())
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            break;
-        }
         let Some(hdr) = pending.get(&h) else {
             break;
         };
         path.push(*hdr);
         h = hdr.prev_blockhash;
-        if h.to_byte_array() == [0u8; 32] {
+        if is_genesis_hash(&h) {
             break;
         }
     }
@@ -2137,27 +2142,11 @@ fn header_announcement_connects(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     prev: BlockHash,
 ) -> bool {
-    if prev.to_byte_array() == [0u8; 32] || hub.knows_header(&prev) {
+    if is_genesis_hash(&prev) || hub.knows_header(&prev) {
         return true;
     }
-    let mut h = prev;
-    for _ in 0..10_000 {
-        if hub.knows_header(&h) {
-            return true;
-        }
-        let next = pending
-            .get(&h)
-            .map(|hdr| hdr.prev_blockhash)
-            .or_else(|| hub.prev_of(&h));
-        let Some(next) = next else {
-            return false;
-        };
-        h = next;
-        if h.to_byte_array() == [0u8; 32] {
-            return true;
-        }
-    }
-    false
+    let (join, _) = pending_walk(pending, prev);
+    is_genesis_hash(&join) || hub.knows_header(&join)
 }
 
 fn header_path_join(
@@ -2165,18 +2154,17 @@ fn header_path_join(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     start: BlockHash,
 ) -> Option<BlockHash> {
-    let mut h = start;
-    for _ in 0..10_000 {
-        if hub.is_connected(&h) {
-            return Some(h);
-        }
-        let hdr = pending.get(&h)?;
-        h = hdr.prev_blockhash;
-        if h.to_byte_array() == [0u8; 32] {
-            return None;
-        }
+    if hub.is_connected(&start) {
+        return Some(start);
     }
-    None
+    let (join, _) = pending_walk(pending, start);
+    if join == start {
+        return None;
+    }
+    if is_genesis_hash(&join) {
+        return None;
+    }
+    hub.is_connected(&join).then_some(join)
 }
 
 /// Headers more than this many blocks behind our tip are not useful for
@@ -2201,8 +2189,20 @@ fn header_branch_vs_tip(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     start: BlockHash,
 ) -> Option<std::cmp::Ordering> {
-    let mut n_new = 0u32;
-    let mut h = start;
+    if hub.is_connected(&start) {
+        let ancestor = hub
+            .query
+            .height_of_hash(&start.to_byte_array())
+            .ok()
+            .flatten()?
+            .0;
+        let tip = hub.tip_height()?;
+        return Some(0u32.cmp(&tip.saturating_sub(ancestor)));
+    }
+    let (mut h, mut n_new) = pending_walk(pending, start);
+    if is_genesis_hash(&h) {
+        return Some(std::cmp::Ordering::Greater);
+    }
     for _ in 0..10_000 {
         if hub.is_connected(&h) {
             let ancestor = hub
@@ -2214,13 +2214,10 @@ fn header_branch_vs_tip(
             let tip = hub.tip_height()?;
             return Some(n_new.cmp(&tip.saturating_sub(ancestor)));
         }
-        let prev = pending
-            .get(&h)
-            .map(|hdr| hdr.prev_blockhash)
-            .or_else(|| hub.prev_of(&h))?;
+        let prev = hub.prev_of(&h)?;
         n_new = n_new.saturating_add(1);
         h = prev;
-        if h.to_byte_array() == [0u8; 32] {
+        if is_genesis_hash(&h) {
             return Some(std::cmp::Ordering::Greater);
         }
     }

@@ -13,19 +13,46 @@ use std::time::Instant;
 
 type TxidFkMap = HashMap<[u8; 32], Fk, BuildHasherDefault<TxidHasher>>;
 
+/// One create's lookup-stamped identity (body / spent / pin optional).
+#[derive(Debug, Clone, Default)]
+pub struct ParentIdent {
+    pub txid: [u8; 32],
+    pub body: Option<(u64, u64)>,
+    pub spent: Option<(u64, u64)>,
+    pub pin: Option<CreatePin>,
+}
+
+impl ParentIdent {
+    #[inline]
+    pub fn new(txid: [u8; 32]) -> Self {
+        Self {
+            txid,
+            body: None,
+            spent: None,
+            pin: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_body(txid: [u8; 32], body: (u64, u64)) -> Self {
+        Self {
+            txid,
+            body: Some(body),
+            spent: None,
+            pin: None,
+        }
+    }
+}
+
 /// Lookup-stamped external parent identity (same-batch stays offline at pin).
+///
+/// `txid → create_fk` plus `create_fk → ParentIdent`. No parallel range/txid/pin maps.
 #[derive(Debug, Default, Clone)]
 pub struct ExternalParentStamp {
     /// prev_txid → create_fk
     pub resolved: TxidFkMap,
-    /// create_fk_id → Class A body range
-    pub ranges: U64Map<(u64, u64)>,
-    /// create_fk_id → spent.body range (`spent.idx`). Archived parents only.
-    pub spent_ranges: U64Map<(u64, u64)>,
-    /// create_fk_id → prev_txid
-    pub txids: U64Map<[u8; 32]>,
-    /// create_fk_id → CreatePin when RecentCreates noted outs
-    pub pins: U64Map<CreatePin>,
+    /// create_fk_id → identity
+    pub idents: U64Map<ParentIdent>,
     pub inflight_ns: u64,
     pub pin_txid_n: u64,
     pub pin_txid_ns: u64,
@@ -34,6 +61,14 @@ pub struct ExternalParentStamp {
     pub head_fk_ns: u64,
     pub head_need_n: u64,
     pub head_hit_n: u64,
+}
+
+impl ExternalParentStamp {
+    fn bind(&mut self, id: u64, txid: [u8; 32]) -> &mut ParentIdent {
+        self.idents
+            .entry(id)
+            .or_insert_with(|| ParentIdent::new(txid))
+    }
 }
 
 /// Bind `need` txids: in-flight → published `live_union` → recent creates → leftover.
@@ -52,7 +87,7 @@ pub fn stamp_external_parents(
     let recent_snap = recent.snapshot();
     let mut stamp = ExternalParentStamp {
         resolved: TxidFkMap::with_capacity_and_hasher(need.len() / 2, Default::default()),
-        txids: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
+        idents: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
         ..ExternalParentStamp::default()
     };
 
@@ -65,7 +100,7 @@ pub fn stamp_external_parents(
         if let Some(fk) = in_flight.get_create_fk(t) {
             stamp.resolved.insert(*t, fk);
             if let Some(id) = fk.get() {
-                stamp.txids.insert(id, *t);
+                stamp.bind(id, *t);
             }
         } else {
             still_need.push(t);
@@ -79,8 +114,7 @@ pub fn stamp_external_parents(
         if let Some((fk, range)) = pub_head.as_ref().and_then(|h| h.get(t)) {
             stamp.resolved.insert(*t, fk);
             if let Some(id) = fk.get() {
-                stamp.ranges.insert(id, range);
-                stamp.txids.insert(id, *t);
+                stamp.bind(id, *t).body = Some(range);
             }
             stamp.pin_txid_n = stamp.pin_txid_n.saturating_add(1);
             continue;
@@ -95,10 +129,10 @@ pub fn stamp_external_parents(
         if let Some((fk, range)) = recent_snap.get(t) {
             stamp.resolved.insert(*t, fk);
             if let Some(id) = fk.get() {
-                stamp.ranges.insert(id, range);
-                stamp.txids.insert(id, *t);
+                let e = stamp.bind(id, *t);
+                e.body = Some(range);
                 if let Some(pin) = recent_snap.create_pin(t) {
-                    stamp.pins.insert(id, pin);
+                    e.pin = Some(pin);
                 }
             }
             stamp.recent_n = stamp.recent_n.saturating_add(1);
@@ -122,8 +156,7 @@ pub fn stamp_external_parents(
                 stamp.resolved.insert(txid, fk);
                 stamp.head_hit_n = stamp.head_hit_n.saturating_add(1);
                 if let Some(id) = fk.get() {
-                    stamp.ranges.insert(id, range);
-                    stamp.txids.insert(id, txid);
+                    stamp.bind(id, txid).body = Some(range);
                     if let Some(age) =
                         rbitcoin_store::head_resolve_stats::sealed_age_for_fk(&first_fks, id)
                     {
@@ -167,13 +200,7 @@ pub fn stamp_external_parents(
     crate::archive_phase_stats::note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
     crate::archive_phase_stats::note_recent(stamp.recent_n, stamp.recent_ns);
 
-    fill_missing_parent_ranges(
-        store,
-        in_flight,
-        &mut stamp.ranges,
-        &mut stamp.spent_ranges,
-        &stamp.txids,
-    )?;
+    fill_missing_parent_ranges(store, in_flight, &mut stamp.idents)?;
     Ok(stamp)
 }
 
@@ -185,24 +212,20 @@ pub fn stamp_external_parents(
 pub fn fill_missing_parent_ranges(
     store: &Store,
     in_flight: &InFlightView,
-    ranges: &mut U64Map<(u64, u64)>,
-    spent_ranges: &mut U64Map<(u64, u64)>,
-    txids: &U64Map<[u8; 32]>,
+    idents: &mut U64Map<ParentIdent>,
 ) -> Result<(), QueryError> {
     crate::archive_phase_stats::note_fill_missing();
     let mut need_body: Vec<Fk> = Vec::new();
-    let mut seen_body = U64Set::default();
     let mut need_spent: Vec<Fk> = Vec::new();
-    let mut seen_spent = U64Set::default();
-    for (&id, _) in txids {
+    for (&id, ident) in idents.iter() {
         if in_flight.get_out(id).is_some() {
             continue;
         }
         let fk = Fk(id);
-        if !ranges.contains_key(&id) && seen_body.insert(id) {
+        if ident.body.is_none() {
             need_body.push(fk);
         }
-        if !spent_ranges.contains_key(&id) && seen_spent.insert(id) {
+        if ident.spent.is_none() {
             need_spent.push(fk);
         }
     }
@@ -219,7 +242,9 @@ pub fn fill_missing_parent_ranges(
                 )
                 .into());
             };
-            ranges.insert(id, range);
+            if let Some(e) = idents.get_mut(&id) {
+                e.body = Some(range);
+            }
             body_filled.insert(id);
         }
     }
@@ -231,7 +256,9 @@ pub fn fill_missing_parent_ranges(
             };
             match row {
                 Some(sr) => {
-                    spent_ranges.insert(id, sr);
+                    if let Some(e) = idents.get_mut(&id) {
+                        e.spent = Some(sr);
+                    }
                 }
                 None if body_filled.contains(&id) => {
                     return Err(rbitcoin_store::StoreError::Corrupt(

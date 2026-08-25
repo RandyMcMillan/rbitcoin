@@ -166,7 +166,9 @@ pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
 };
-pub use stamp::{fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp};
+pub use stamp::{
+    fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp, ParentIdent,
+};
 pub use wave_prevout::SpendEdge;
 
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).

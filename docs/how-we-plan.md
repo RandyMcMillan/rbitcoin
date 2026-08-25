@@ -243,7 +243,7 @@ Feature: “lookup stamps body_range for load denserels.”
 
 | Step | Contract |
 |------|----------|
-| 1 | Plan/archive stamp fills `external_parent_ranges` for creates-only in_flight parent |
+| 1 | Plan/archive stamp fills `external_parents` body for creates-only in_flight parent |
 | 2 | Load pin hard-fails if range missing (no cold idx denserels) |
 | 3 | plan=None path stamps parent pin from archived Class A |
 | 4 | Soft-requeue policy: store invariants permanent (tests only on reject map) |

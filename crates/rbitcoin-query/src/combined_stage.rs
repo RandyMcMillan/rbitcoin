@@ -127,7 +127,7 @@ pub fn load_creates_once(
                     decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
                 {
                     // Leave txid zero; caller fills from plan
-                    // `external_parent_txids` / batch maps only.
+                    // `external_parents` / batch maps only.
                     decoded_outs = Some((tx, outs, rels));
                 } else {
                     return Err(StoreError::Corrupt(

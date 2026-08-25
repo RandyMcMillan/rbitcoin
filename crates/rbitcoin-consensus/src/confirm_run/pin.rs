@@ -114,7 +114,7 @@ pub(super) fn pin_for_wire_batch(
                     }
                     let prev_txid = inp.previous_output.txid.to_byte_array();
                     let vout = inp.previous_output.vout;
-                    if let Some(&pid) = parent_pin.create_by_txid.get(&prev_txid) {
+                    if let Some(&pid) = parent_pin.resolved.get(&prev_txid) {
                         edges.push(rbitcoin_query::SpendEdge {
                             prev_txid,
                             vout,
@@ -169,7 +169,7 @@ pub(super) fn pin_for_wire_batch(
         if plan_by_id.contains_key(id) {
             continue;
         }
-        let Some(pin) = parent_pin.pins.get(id).cloned() else {
+        let Some(pin) = parent_pin.create_pin(*id).cloned() else {
             continue;
         };
         let (_tx, outs) = pin.as_ref();
@@ -215,7 +215,7 @@ pub(super) fn pin_for_wire_batch(
                 } else {
                     None
                 };
-                let plan_range = parent_pin.ranges.get(id).copied();
+                let plan_range = parent_pin.body_range(*id);
                 if cb.is_some() || plan_range.is_some() {
                     batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
                 }
@@ -234,7 +234,7 @@ pub(super) fn pin_for_wire_batch(
             } else {
                 None
             };
-            let plan_range = parent_pin.ranges.get(id).copied();
+            let plan_range = parent_pin.body_range(*id);
             batch_parents.insert_create_pin(
                 fk,
                 std::sync::Arc::clone(pin),
@@ -258,7 +258,7 @@ pub(super) fn pin_for_wire_batch(
             Vec::new();
         let pending = std::mem::take(&mut still_need);
         for (id, need) in pending {
-            let Some(range) = parent_pin.ranges.get(&id).copied() else {
+            let Some(range) = parent_pin.body_range(id) else {
                 still_need.insert(id, need);
                 continue;
             };
@@ -333,7 +333,7 @@ pub(super) fn pin_for_wire_batch(
     }
 
     for (id, _) in &parent_vouts {
-        if let Some(sr) = parent_pin.spent_ranges.get(id).copied() {
+        if let Some(sr) = parent_pin.spent_range(*id) {
             batch_parents.set_spent_range_only(rbitcoin_primitives::Fk(*id), sr);
         }
     }

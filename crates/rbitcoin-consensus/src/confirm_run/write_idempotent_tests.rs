@@ -1165,8 +1165,10 @@ fn pin_and_ensure_journey() {
         spend_ins.clone(),
     )];
     plan.planned_fks = vec![Fk(2)];
-    plan.external_parent_ranges.insert(parent_id, range);
-    plan.external_parent_txids.insert(parent_id, parent_tx.txid);
+    plan.external_parents.insert(
+        parent_id,
+        rbitcoin_query::ParentIdent::with_body(parent_tx.txid, range),
+    );
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
     let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
         .expect("pin via stamped range");
@@ -1174,7 +1176,7 @@ fn pin_and_ensure_journey() {
     assert!(parents.get_parent_out(pfk, 0).is_some());
     plan.freeze_after_pin();
     assert!(
-        plan.external_parent_ranges.is_empty() && plan.external_parent_txids.is_empty(),
+        plan.external_parents.is_empty(),
         "post-pin plan must not carry stamp staging"
     );
 
@@ -1184,10 +1186,10 @@ fn pin_and_ensure_journey() {
         spend_ins.clone(),
     )];
     plan2.planned_fks = vec![Fk(2)];
-    plan2.external_parent_ranges.insert(parent_id, range);
-    plan2
-        .external_parent_txids
-        .insert(parent_id, parent_tx.txid);
+    plan2.external_parents.insert(
+        parent_id,
+        rbitcoin_query::ParentIdent::with_body(parent_tx.txid, range),
+    );
     let mut empty_stamp = ParentPinStamp::default();
     let err = pin_for_wire_batch(&q, Some(&plan2), &mut empty_stamp, &[], &[], None, None)
         .expect_err("plan maps must not backfill an empty stamp");
@@ -1230,13 +1232,15 @@ fn pin_and_ensure_journey() {
         spend_ins,
     )];
     plan3.planned_fks = vec![Fk(2)];
-    plan3.external_parent_ranges.insert(parent_id, range);
-    plan3
-        .external_parent_spent_ranges
-        .insert(parent_id, (spent_off, spent_len));
-    plan3
-        .external_parent_txids
-        .insert(parent_id, parent_tx.txid);
+    plan3.external_parents.insert(
+        parent_id,
+        rbitcoin_query::ParentIdent {
+            txid: parent_tx.txid,
+            body: Some(range),
+            spent: Some((spent_off, spent_len)),
+            pin: None,
+        },
+    );
     let mut stamp3 = ParentPinStamp::take_from_plan(&mut plan3);
     let (mut parents3, _, _) =
         pin_for_wire_batch(&q, Some(&plan3), &mut stamp3, &[], &[], None, None).unwrap();
@@ -1351,8 +1355,10 @@ fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
         )];
         plan.planned_fks = vec![Fk(2)];
         if let Some(id) = pfk.get() {
-            plan.external_parent_ranges.insert(id, range);
-            plan.external_parent_txids.insert(id, parent_tx.txid);
+            plan.external_parents.insert(
+                id,
+                rbitcoin_query::ParentIdent::with_body(parent_tx.txid, range),
+            );
         }
         plan
     };
@@ -1453,10 +1459,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         per_header_ranges: vec![],
         spends: vec![],
         batch_creates: vec![],
-        external_parent_ranges: Default::default(),
-        external_parent_spent_ranges: Default::default(),
-        external_parent_txids: Default::default(),
-        external_parent_pins: Default::default(),
+        external_parents: Default::default(),
         external_parent_vouts: Default::default(),
         batch_pin: vec![],
         index_tx: false,
@@ -1497,38 +1500,37 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
 #[test]
 fn parent_pin_stamp_take_from_plan_moves_maps() {
     use super::ParentPinStamp;
-    use rbitcoin_query::{ArchiveWritePlan, U64Map};
+    use rbitcoin_query::{ArchiveWritePlan, ParentIdent, U64Map};
 
-    let mut ranges = U64Map::default();
-    ranges.insert(7, (8, 16));
-    let mut spent_ranges = U64Map::default();
-    spent_ranges.insert(7, (32, 8));
-    let mut txids = U64Map::default();
-    txids.insert(7, [0xABu8; 32]);
+    let mut idents = U64Map::default();
+    idents.insert(
+        7,
+        ParentIdent {
+            txid: [0xABu8; 32],
+            body: Some((8, 16)),
+            spent: Some((32, 8)),
+            pin: None,
+        },
+    );
     let mut plan = ArchiveWritePlan {
         packed: vec![],
         planned_fks: vec![],
         per_header_ranges: vec![],
         spends: vec![],
         batch_creates: vec![],
-        external_parent_ranges: ranges,
-        external_parent_spent_ranges: spent_ranges,
-        external_parent_txids: txids,
-        external_parent_pins: Default::default(),
+        external_parents: idents,
         external_parent_vouts: Default::default(),
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
     };
     let stamp = ParentPinStamp::take_from_plan(&mut plan);
-    assert!(plan.external_parent_ranges.is_empty());
-    assert!(plan.external_parent_txids.is_empty());
-    assert!(plan.external_parent_spent_ranges.is_empty());
-    assert_eq!(stamp.ranges.get(&7).copied(), Some((8, 16)));
-    assert_eq!(stamp.spent_ranges.get(&7).copied(), Some((32, 8)));
+    assert!(plan.external_parents.is_empty());
+    assert_eq!(stamp.body_range(7), Some((8, 16)));
+    assert_eq!(stamp.spent_range(7), Some((32, 8)));
     assert_eq!(stamp.create_txid(7), Some([0xABu8; 32]));
     assert!(
-        stamp.create_by_txid.is_empty(),
+        stamp.resolved.is_empty(),
         "plan path pins from packed create_fk; SipHash invert is plan=None only"
     );
 }
@@ -1604,8 +1606,10 @@ fn pin_takes_stamp_parent_vouts() {
         }],
     )];
     plan.planned_fks = vec![Fk(2)];
-    plan.external_parent_ranges.insert(parent_id, range);
-    plan.external_parent_txids.insert(parent_id, parent_tx.txid);
+    plan.external_parents.insert(
+        parent_id,
+        rbitcoin_query::ParentIdent::with_body(parent_tx.txid, range),
+    );
     plan.external_parent_vouts.insert(parent_id, vec![0]);
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
     assert_eq!(
@@ -1783,18 +1787,14 @@ fn pin_sparse_need_high_vout_only() {
         per_header_ranges: vec![],
         spends: vec![],
         batch_creates: vec![],
-        external_parent_ranges: {
+        external_parents: {
             let mut m = rbitcoin_query::U64Map::default();
-            m.insert(parent_id, range);
+            m.insert(
+                parent_id,
+                rbitcoin_query::ParentIdent::with_body(parent_tx.txid, range),
+            );
             m
         },
-        external_parent_spent_ranges: Default::default(),
-        external_parent_txids: {
-            let mut m = rbitcoin_query::U64Map::default();
-            m.insert(parent_id, parent_tx.txid);
-            m
-        },
-        external_parent_pins: Default::default(),
         external_parent_vouts: Default::default(),
         batch_pin: vec![Arc::clone(&spend_pin)],
         index_tx: false,
@@ -1914,8 +1914,10 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
     plan.planned_fks = vec![Fk(100)];
     for i in 0..3 {
         if let Some(id) = fks[i].get() {
-            plan.external_parent_ranges.insert(id, ranges[i]);
-            plan.external_parent_txids.insert(id, items[i].0.txid);
+            plan.external_parents.insert(
+                id,
+                rbitcoin_query::ParentIdent::with_body(items[i].0.txid, ranges[i]),
+            );
         }
     }
 
@@ -2006,13 +2008,19 @@ fn pin_recent_outs_is_cache_not_new() {
         spend_ins,
     )];
     plan.planned_fks = vec![Fk(100)];
-    plan.external_parent_ranges.insert(7, (99, 1));
-    plan.external_parent_txids.insert(7, tid);
-    plan.external_parent_pins.insert(7, Arc::clone(&pin));
+    plan.external_parents.insert(
+        7,
+        rbitcoin_query::ParentIdent {
+            txid: tid,
+            body: Some((99, 1)),
+            spent: None,
+            pin: Some(Arc::clone(&pin)),
+        },
+    );
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     assert!(
-        Arc::ptr_eq(parent_pin.pins.get(&7).expect("stamp pin"), &pin),
+        Arc::ptr_eq(parent_pin.create_pin(7).expect("stamp pin"), &pin),
         "pin must use stamp-carried CreatePin"
     );
     q.recent_creates().drop_from(0);
@@ -2102,8 +2110,8 @@ fn pin_recent_identity_without_outs_still_range_fills() {
     )];
     plan.planned_fks = vec![Fk(100)];
     if let Some(id) = fks[0].get() {
-        plan.external_parent_ranges.insert(id, range);
-        plan.external_parent_txids.insert(id, tid);
+        plan.external_parents
+            .insert(id, rbitcoin_query::ParentIdent::with_body(tid, range));
     }
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
@@ -2277,7 +2285,7 @@ fn store_start_states_lookup_load_confirm() {
         let stamped = confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S0 lookup");
         assert!(stamped.plan.is_some(), "S0 must plan Class A");
         assert!(
-            !stamped.parent_pin.ranges.is_empty(),
+            stamped.parent_pin.idents.values().any(|p| p.body.is_some()),
             "S0 lookup must stamp external parent body ranges"
         );
         let mat =

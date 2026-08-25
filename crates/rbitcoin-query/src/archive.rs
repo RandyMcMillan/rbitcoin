@@ -50,23 +50,12 @@ pub struct ArchiveWritePlan {
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
-    /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
+    /// External parent identity stamped at lookup (`txid` + optional body/spent/pin).
     ///
-    /// Filled at plan stamp (fk+range short-circuit). Load pin denserels-loads by
-    /// this range (skip `tx.idx`). Still live — not obsolete after schema-13
-    /// `txid.body` (identity is separate from range). Pack-scale identity hasher
-    /// ([`crate::U64Map`]): dense create_fks load evenly.
-    pub external_parent_ranges: crate::U64Map<(u64, u64)>,
-    /// create_fk → spent.body `(off, len)` from `spent.idx` (archived parents).
-    pub external_parent_spent_ranges: crate::U64Map<(u64, u64)>,
-    /// **RAM-only** reverse of stamp resolve: create_fk id → parent `prev_txid`.
-    ///
-    /// Built when in-flight / head resolve binds `prev_txid → fk`.
-    /// Prep pin fills schema-13 zero body `TxRecord.txid` from this map — **never**
+    /// Load pin denserels by `ParentIdent.body` (skip `tx.idx`). Prep pin fills
+    /// schema-13 zero body `TxRecord.txid` from `ParentIdent.txid` — **never**
     /// re-pread `txid.body` on the pin path.
-    pub external_parent_txids: crate::U64Map<[u8; 32]>,
-    /// RecentCreates CreatePin Arcs stamped for external parents (pin-time only).
-    pub external_parent_pins: crate::U64Map<crate::CreatePin>,
+    pub external_parents: crate::U64Map<crate::ParentIdent>,
     /// create_fk_id → spent need-vouts, filled while packing (load pin reuses).
     pub external_parent_vouts: crate::U64Map<Vec<u32>>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
@@ -85,10 +74,7 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             spends: Vec::new(),
             batch_creates: Vec::new(),
-            external_parent_ranges: crate::U64Map::default(),
-            external_parent_spent_ranges: crate::U64Map::default(),
-            external_parent_txids: crate::U64Map::default(),
-            external_parent_pins: crate::U64Map::default(),
+            external_parents: crate::U64Map::default(),
             external_parent_vouts: crate::U64Map::default(),
             batch_pin: Vec::new(),
             index_tx: false,
@@ -103,7 +89,10 @@ impl ArchiveWritePlan {
     /// Wire `prev_txid` known for this create_fk at plan stamp (RAM only).
     #[inline]
     pub fn external_parent_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
-        self.external_parent_txids.get(&create_fk_id).copied()
+        self.external_parents
+            .get(&create_fk_id)
+            .map(|p| p.txid)
+            .filter(|t| *t != [0u8; 32])
     }
 
     /// Same-header create: assemble uses the wire `TxOut` (do not pin).
@@ -141,14 +130,8 @@ impl ArchiveWritePlan {
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
     /// reads these maps.
     pub fn clear_external_parent_outs(&mut self) {
-        self.external_parent_ranges.clear();
-        self.external_parent_ranges.shrink_to_fit();
-        self.external_parent_spent_ranges.clear();
-        self.external_parent_spent_ranges.shrink_to_fit();
-        self.external_parent_txids.clear();
-        self.external_parent_txids.shrink_to_fit();
-        self.external_parent_pins.clear();
-        self.external_parent_pins.shrink_to_fit();
+        self.external_parents.clear();
+        self.external_parents.shrink_to_fit();
         self.external_parent_vouts.clear();
         self.external_parent_vouts.shrink_to_fit();
     }
@@ -246,15 +229,9 @@ impl ArchiveWritePlan {
         if other.is_empty() && other.per_header_ranges.is_empty() {
             return;
         }
-        other.external_parent_ranges.clear();
-        other.external_parent_spent_ranges.clear();
-        other.external_parent_txids.clear();
-        other.external_parent_pins.clear();
+        other.external_parents.clear();
         other.external_parent_vouts.clear();
-        self.external_parent_ranges.clear();
-        self.external_parent_spent_ranges.clear();
-        self.external_parent_txids.clear();
-        self.external_parent_pins.clear();
+        self.external_parents.clear();
         self.external_parent_vouts.clear();
 
         self.packed.append(&mut other.packed);
@@ -485,10 +462,7 @@ impl Query {
         let inflight_ns = ext.inflight_ns;
         let head_fk_ns = ext.head_fk_ns;
         let resolved = ext.resolved;
-        let mut external_parent_ranges = ext.ranges;
-        let mut external_parent_spent_ranges = ext.spent_ranges;
-        let mut external_parent_txids = ext.txids;
-        let external_parent_pins = ext.pins;
+        let mut external_parents = ext.idents;
         crate::archive_phase_stats::note_resolve_counts(
             n_headers,
             need_vec.len() as u64,
@@ -541,10 +515,10 @@ impl Query {
                             .push(inp.prev_index);
                     }
                     if !batch_create_ids.contains(&pid)
-                        && !external_parent_txids.contains_key(&pid)
+                        && !external_parents.contains_key(&pid)
                         && inp.prev_txid != [0u8; 32]
                     {
-                        external_parent_txids.insert(pid, inp.prev_txid);
+                        external_parents.insert(pid, crate::ParentIdent::new(inp.prev_txid));
                         prestamp_parents = true;
                     }
                 }
@@ -563,13 +537,7 @@ impl Query {
             vouts.dedup();
         }
         if prestamp_parents {
-            crate::fill_missing_parent_ranges(
-                &self.store,
-                in_flight,
-                &mut external_parent_ranges,
-                &mut external_parent_spent_ranges,
-                &external_parent_txids,
-            )?;
+            crate::fill_missing_parent_ranges(&self.store, in_flight, &mut external_parents)?;
         }
 
         let t_finish = Instant::now();
@@ -611,10 +579,7 @@ impl Query {
             per_header_ranges,
             spends,
             batch_creates,
-            external_parent_ranges,
-            external_parent_spent_ranges,
-            external_parent_txids,
-            external_parent_pins,
+            external_parents,
             external_parent_vouts,
             batch_pin,
             index_tx,
@@ -1312,8 +1277,8 @@ mod tests {
 
         // Simulate plan stamp reverse map (txid→fk invert).
         let mut plan = super::ArchiveWritePlan::empty();
-        plan.external_parent_ranges.insert(pid, range);
-        plan.external_parent_txids.insert(pid, parent_txid);
+        plan.external_parents
+            .insert(pid, crate::ParentIdent::with_body(parent_txid, range));
 
         let known = plan.external_parent_txid(pid).expect("reverse map");
         let (rows, _body_ns, _dec_ns) = q
@@ -1384,7 +1349,10 @@ mod tests {
         assert_eq!(plan.batch_creates[0].0, child_txid);
         // Plan stamp is fk+range only — denserels load at pin by offset.
         assert!(
-            plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
+            plan.external_parents
+                .get(&1)
+                .and_then(|p| p.body)
+                .is_some_and(|r| r.1 > 0),
             "plan must record Class A body range for head-resolved parent"
         );
         assert_eq!(
@@ -1465,9 +1433,13 @@ mod tests {
                 .archive_plan_batch_from_store(&mut need, 2, &crate::InFlightView::empty(), None)
                 .expect("parent via head");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
-            assert!(plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0));
+            assert!(plan
+                .external_parents
+                .get(&1)
+                .and_then(|p| p.body)
+                .is_some_and(|r| r.1 > 0));
             assert_eq!(
-                plan.external_parent_spent_ranges.get(&1).copied(),
+                plan.external_parents.get(&1).and_then(|p| p.spent),
                 Some(spent)
             );
             assert_eq!(
@@ -1506,11 +1478,14 @@ mod tests {
             .expect("prestamp parent");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
-            plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
+            plan.external_parents
+                .get(&1)
+                .and_then(|p| p.body)
+                .is_some_and(|r| r.1 > 0),
             "pre-stamped create_fk must still receive body_range"
         );
         assert_eq!(
-            plan.external_parent_spent_ranges.get(&1).copied(),
+            plan.external_parents.get(&1).and_then(|p| p.spent),
             Some(spent)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1564,7 +1539,10 @@ mod tests {
             .expect("parent via creates-only in_flight");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
-            plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
+            plan.external_parents
+                .get(&1)
+                .and_then(|p| p.body)
+                .is_some_and(|r| r.1 > 0),
             "creates-only in_flight must still stamp body_range for load denserels"
         );
         assert_eq!(plan.external_parent_txid(1), Some(parent_txid));
@@ -1575,7 +1553,7 @@ mod tests {
         );
         let spent = q.store.txs.spent_range(Fk(1)).expect("archived spent.idx");
         assert_eq!(
-            plan.external_parent_spent_ranges.get(&1).copied(),
+            plan.external_parents.get(&1).and_then(|p| p.spent),
             Some(spent),
             "creates-only in_flight must stamp spent.idx range (write ensure skip)"
         );
@@ -1610,9 +1588,13 @@ mod tests {
         )
         .expect("stamp archived parent");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(1)));
-        assert!(helper.ranges.get(&1).is_some_and(|r| r.1 > 0));
+        assert!(helper
+            .idents
+            .get(&1)
+            .and_then(|p| p.body)
+            .is_some_and(|r| r.1 > 0));
         assert_eq!(
-            helper.spent_ranges.get(&1).copied(),
+            helper.idents.get(&1).and_then(|p| p.spent),
             Some(spent),
             "archived parent must carry spent.idx range on the lookup stamp"
         );
@@ -1768,7 +1750,10 @@ mod tests {
                 .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
                 .expect("published union stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));
-            assert_eq!(plan.external_parent_ranges.get(&66), Some(&(3000, 24)));
+            assert_eq!(
+                plan.external_parents.get(&66).and_then(|p| p.body),
+                Some((3000, 24))
+            );
             assert_eq!(plan.external_parent_txid(66), Some(parent_txid));
             let mix = crate::archive_phase_stats::sample_and_reset();
             assert_eq!(
@@ -1808,8 +1793,11 @@ mod tests {
         )
         .expect("shared helper");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(88)));
-        assert_eq!(helper.ranges.get(&88), Some(&(4000, 32)));
-        assert_eq!(helper.txids.get(&88), Some(&parent_txid));
+        assert_eq!(
+            helper.idents.get(&88).and_then(|p| p.body),
+            Some((4000, 32))
+        );
+        assert_eq!(helper.idents.get(&88).map(|p| p.txid), Some(parent_txid));
 
         let child = child_spend(parent_txid, 0x72);
         let mut need = vec![(Fk(1), vec![child])];
@@ -1817,10 +1805,13 @@ mod tests {
             .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
             .expect("S0 plan");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(88));
-        assert_eq!(plan.external_parent_ranges.get(&88), helper.ranges.get(&88));
+        assert_eq!(
+            plan.external_parents.get(&88).and_then(|p| p.body),
+            helper.idents.get(&88).and_then(|p| p.body)
+        );
         assert_eq!(
             plan.external_parent_txid(88),
-            helper.txids.get(&88).copied()
+            helper.idents.get(&88).map(|p| p.txid)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1847,11 +1838,18 @@ mod tests {
             )
             .expect("recent stamp");
             assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(91)));
-            assert_eq!(helper.ranges.get(&91), Some(&(5000, 16)));
+            assert_eq!(
+                helper.idents.get(&91).and_then(|p| p.body),
+                Some((5000, 16))
+            );
             assert_eq!(helper.recent_n, 1);
             assert_eq!(helper.head_need_n, 0, "recent hit must skip leftover");
             assert!(
-                helper.pins.get(&91).is_none(),
+                helper
+                    .idents
+                    .get(&91)
+                    .and_then(|p| p.pin.as_ref())
+                    .is_none(),
                 "identity-only recent note must not carry a CreatePin"
             );
 
@@ -1861,7 +1859,10 @@ mod tests {
                 .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
                 .expect("S0 recent");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(91));
-            assert_eq!(plan.external_parent_ranges.get(&91), Some(&(5000, 16)));
+            assert_eq!(
+                plan.external_parents.get(&91).and_then(|p| p.body),
+                Some((5000, 16))
+            );
             let mix = crate::archive_phase_stats::sample_and_reset();
             assert_eq!(mix.head_need, 0, "plan path must skip leftover too");
             assert!(mix.recent_n >= 1, "recent hits must be metered: {mix:?}");
@@ -1904,7 +1905,11 @@ mod tests {
             q.recent_creates().as_ref(),
         )
         .expect("recent stamp");
-        let got = helper.pins.get(&93).expect("stamp must carry CreatePin");
+        let got = helper
+            .idents
+            .get(&93)
+            .and_then(|p| p.pin.as_ref())
+            .expect("stamp must carry CreatePin");
         assert!(Arc::ptr_eq(got, &pin));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1956,17 +1961,19 @@ mod tests {
             .archive_plan_batch_from_store(&mut need_a, 1, &crate::InFlightView::empty(), None)
             .unwrap();
         // Simulate residual stamp staging (must not survive freeze/append).
-        plan_a.external_parent_ranges.insert(99, (0, 1));
-        plan_a.external_parent_txids.insert(99, [9u8; 32]);
+        plan_a
+            .external_parents
+            .insert(99, crate::ParentIdent::with_body([9u8; 32], (0, 1)));
         plan_a.freeze_after_pin();
-        assert!(plan_a.external_parent_ranges.is_empty());
-        assert!(plan_a.external_parent_txids.is_empty());
+        assert!(plan_a.external_parents.is_empty());
 
         let mut need_b = vec![(Fk(2), vec![coinbase_apply(2), coinbase_apply(3)])];
         let mut plan_b = q
             .archive_plan_batch_from_store(&mut need_b, 2, &crate::InFlightView::empty(), None)
             .unwrap();
-        plan_b.external_parent_ranges.insert(88, (0, 1));
+        plan_b
+            .external_parents
+            .insert(88, crate::ParentIdent::with_body([0u8; 32], (0, 1)));
         plan_b.freeze_after_pin();
 
         let fks_a = plan_a.planned_fks.clone();
@@ -1976,7 +1983,7 @@ mod tests {
 
         plan_a.append(plan_b);
         assert!(
-            plan_a.external_parent_ranges.is_empty() && plan_a.external_parent_txids.is_empty(),
+            plan_a.external_parents.is_empty(),
             "append must not keep stamp staging maps"
         );
         assert_eq!(plan_a.planned_fks.len(), 3);
@@ -2154,11 +2161,12 @@ mod tests {
 
         // external_parent_txid / clear_external / append empty other.
         let mut plan = super::ArchiveWritePlan::empty();
-        plan.external_parent_txids.insert(7, [0xab; 32]);
+        plan.external_parents
+            .insert(7, crate::ParentIdent::new([0xab; 32]));
         assert_eq!(plan.external_parent_txid(7), Some([0xab; 32]));
         assert!(plan.external_parent_txid(8).is_none());
         plan.clear_external_parent_outs();
-        assert!(plan.external_parent_txids.is_empty());
+        assert!(plan.external_parents.is_empty());
         plan.append(super::ArchiveWritePlan::empty());
         assert!(plan.is_empty());
     }

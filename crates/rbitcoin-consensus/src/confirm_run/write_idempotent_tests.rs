@@ -1376,10 +1376,10 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
     };
     let pin = std::sync::Arc::new((parent_tx, Vec::new()));
     let mut log = rbitcoin_query::InFlightLog::new();
-    log.note_layer(rbitcoin_query::InFlightLayer::from_plan_pins([(
-        Fk(parent_id),
-        &pin,
-    )]));
+    log.note_layer(
+        rbitcoin_query::InFlightLayer::from_plan_pins([(Fk(parent_id), &pin)]),
+        None,
+    );
     let ifo = log.snapshot();
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);

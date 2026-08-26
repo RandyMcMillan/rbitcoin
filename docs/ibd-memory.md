@@ -33,8 +33,8 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
 | **Published identity union** | Per-wave map of **this wave's** parent identities (re-home union hits + TipOnly misses; `ArcSwap` of the layer-chain head; get walks, no union rebuild) | Lookup keeps a layer while its span is on the BQ or overlaps `(tip, taken_hi]`. Disconnect stores `None`. Not a process FIFO. |
-| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range). Recent-window first spend uses stamp-carried in-flight CreatePin until write keep-until |
-| **In-flight CreatePin layers** | identity + full create outs; pin layers drop when drain+fence **and** `class_a_hi >= until` (`until = lookup_started_hi.max(hi)` frozen at write) | Lookup/load note; write stamps keep-until; disconnect `drop_from`. Sizes: `iflight=`. Not a coins cache / spend FIFO |
+| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range). Recent-window first spend uses stamp-carried in-flight CreatePin until Class C covers stamped `until` |
+| **In-flight CreatePin layers** | identity + full create outs; drop when Class C tip ≥ `until` stamped at `note_layer` (`until = lookup_started_hi`, or pack `max_height` if `None`) | Load notes at stamp; disconnect `drop_from` on pack height. Sizes: `iflight=`. Not a coins cache / spend FIFO |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH catalog runs** | on disk after post-IBD Class A recollect | bulk FullCold / ColdResume at tip; not during Direct confirm |

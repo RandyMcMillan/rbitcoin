@@ -50,22 +50,15 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop packs TipOnly can see: drain inserted **and** fence covers.
+    /// Drop packs whose stamped `until` is in Class C (`Query::tip_height`).
     ///
     /// Call **after** pin + scripts handoff so n−1 still has CreatePin outs
-    /// for load (stamp skips body_range when `get_out`). Either signal alone
-    /// keeps the layer.
+    /// for load (stamp skips body_range when `get_out`).
     ///
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        self.in_flight
-            .apply_keep_untils(hub.query.take_create_keep_until());
-        self.in_flight.prune_if_head_ready(
-            &hub.query.store().height_fence_snapshot(),
-            hub.query.head_drain_fk(),
-            hub.query.class_a_hi(),
-        );
+        self.in_flight.prune_if_class_c(hub.tip_height());
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);
@@ -101,7 +94,7 @@ impl LoadAheadState {
 
     fn note_lookup_ok(
         &mut self,
-        _hub: &ChainHub,
+        hub: &ChainHub,
         plan: &rbitcoin_query::ArchiveWritePlan,
         last_height: u32,
         last_hash: [u8; 32],
@@ -121,8 +114,10 @@ impl LoadAheadState {
                     .map(|((pin, _), fk)| (*fk, pin)),
             )
         };
-        self.in_flight
-            .note_layer(layer.with_max_height(last_height));
+        self.in_flight.note_layer(
+            layer.with_max_height(last_height),
+            hub.query.lookup_started_hi(),
+        );
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
@@ -173,7 +168,8 @@ impl LoadAheadState {
         if let Some(h) = max_height {
             layer = layer.with_max_height(h);
         }
-        self.in_flight.note_layer(layer);
+        self.in_flight
+            .note_layer(layer, hub.query.lookup_started_hi());
         if let Some(&(h, hash)) = heights_hashes.last() {
             self.last_loaded = Some((h, hash.to_byte_array()));
         }

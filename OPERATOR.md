@@ -228,7 +228,7 @@ onto loadq). Tip-batch getdata races up to 4 peers
 half-median outlier only after ~60s warm-up and only when the peer pack is not
 tight (max/min bps &gt; 2×); good-but-slightly-slower peers are kept.
 
-**Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** stay on in-flight until write keep-until (`class_a_hi >= lookup_started_hi.max(hi)`). Not a coins cache.
+**Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** stay on in-flight until Class C tip covers the lookup wave that was started when the pack was noted (`until = lookup_started_hi`). Not a coins cache.
 
 **Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).

@@ -28,19 +28,24 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
     ))
 }
 
-/// Unconfirmed pack stays after head drain; drop only once the fence covers it.
-///
-/// Occupied/confirmed-HWM prune dropped tip-ahead parents (931147 / 945952).
+/// Unconfirmed pack stays until Class C covers stamped until (not pack height).
 #[test]
-fn prune_inflight_keeps_until_tip_covers_height() {
+fn prune_inflight_keeps_until_class_c_covers_until() {
     let mut log = InFlightLog::new();
     let pins: Vec<_> = (85u64..=100).map(|id| (Fk(id), test_pin(id))).collect();
     log.note_layer(
         InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))).with_max_height(10),
+        Some(40),
     );
-    log.prune_through_tip(Some(9));
-    assert_eq!(log.entry_count(), 16, "tip < max_height keeps the pack");
-    log.prune_through_tip(Some(10));
+    log.prune_if_class_c(Some(9));
+    assert_eq!(log.entry_count(), 16, "Class C < until keeps the pack");
+    log.prune_if_class_c(Some(10));
+    assert_eq!(
+        log.entry_count(),
+        16,
+        "Class C of pack height is not enough while until is 40"
+    );
+    log.prune_if_class_c(Some(40));
     assert_eq!(log.layer_count(), 0);
 }
 
@@ -193,7 +198,10 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
 fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
     let mut log = InFlightLog::new();
     let p = test_pin(42);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1));
+    log.note_layer(
+        InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1),
+        None,
+    );
     log.prune_through_tip(Some(0));
     assert!(
         log.snapshot().get_create_fk(&p.0.txid).is_some(),
@@ -207,11 +215,11 @@ fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
 fn note_while_prep_holds_snapshot_does_not_clone_prior_layers() {
     let mut log = InFlightLog::new();
     let p1 = test_pin(1);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]), None);
     let held = log.snapshot();
     for i in 2u64..=30 {
         let p = test_pin(i);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]), None);
     }
     assert_eq!(held.layer_count(), 1);
     assert!(held.get_out(1).is_some());

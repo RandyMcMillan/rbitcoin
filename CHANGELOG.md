@@ -64,9 +64,11 @@ before 1.0).
   a higher tip (`lag > 2`), `headers_done` unlatches and `getheaders`
   resumes. Near-tip (`lag ≤ 2`) still does not re-fan.
 
-- **In-flight keep-until:** pin layers stay until drain+fence **and**
-  `class_a_hi >= until` (`until = lookup_started_hi.max(hi)` frozen at
-  write). Stamp walks `InFlightView` only (then live_union, then TipOnly).
+- **In-flight until at layer create:** pin layers stay until Class C tip
+  ≥ `until` stamped at `note_layer` (`until = lookup_started_hi`, or pack
+  `max_height` if started_hi is `None`). Write does not freeze keep-until;
+  drain+fence and `class_a_hi` are not drop gates. Stamp walks
+  `InFlightView` only (then live_union, then TipOnly).
   [`docs/invariants.md`](docs/invariants.md),
   [`docs/concurrency.md`](docs/concurrency.md).
 

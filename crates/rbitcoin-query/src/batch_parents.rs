@@ -148,15 +148,15 @@ impl PinOuts {
     }
 
     /// Compose wider need coverage (new half; does not mutate `self`).
-    fn compose(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) -> Self {
+    fn compose(&self, live: &[(u32, OutputRecord)], checked: &[u32]) -> Self {
         match self {
             Self::Full { pin, checked: ch } => {
                 let extra = live.iter().any(|(v, _)| pin.1.get(*v as usize).is_none());
                 if extra {
                     let mut outs = self.sparse_live();
                     for (v, o) in live {
-                        if outs.binary_search_by_key(&v, |(dv, _)| *dv).is_err() {
-                            outs.push((v, o));
+                        if outs.binary_search_by_key(v, |(dv, _)| *dv).is_err() {
+                            outs.push((*v, o.clone()));
                         }
                     }
                     outs.sort_unstable_by_key(|(v, _)| *v);
@@ -182,8 +182,8 @@ impl PinOuts {
             Self::Sparse { outs, checked: ch } => {
                 let mut next_outs = outs.clone();
                 for (v, o) in live {
-                    if next_outs.binary_search_by_key(&v, |(dv, _)| *dv).is_err() {
-                        next_outs.push((v, o));
+                    if next_outs.binary_search_by_key(v, |(dv, _)| *dv).is_err() {
+                        next_outs.push((*v, o.clone()));
                     }
                 }
                 next_outs.sort_unstable_by_key(|(v, _)| *v);
@@ -406,7 +406,7 @@ impl SharedParentPin {
             if cur.already_covers(&live, checked) {
                 Arc::clone(cur)
             } else {
-                Arc::new(cur.compose(live.clone(), checked))
+                Arc::new(cur.compose(&live, checked))
             }
         });
     }
@@ -1841,6 +1841,29 @@ mod tests {
             "Occupied empty-checked new live must still widen"
         );
         assert!(!Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn merge_outs_large_script_widens_once() {
+        let script = vec![0x51u8; 4096];
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let pin = Arc::clone(bp.pins.get(&1).unwrap());
+        let rec = OutputRecord::unspent(20, script.clone());
+        pin.merge_outs(vec![(1, rec.clone())], &[1]);
+        pin.merge_outs(vec![(1, rec)], &[1]);
+        let snap = pin.load_outs();
+        assert_eq!(snap.live_len(), 2);
+        assert_eq!(snap.get(1).expect("vout 1").script.len(), 4096);
+        assert_eq!(snap.get(1).unwrap().script, script);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Esplora HTTP listener (axum + tower limits) and wallet WebSocket live path.
 
 use crate::handlers;
-use crate::tx_json::{build_tx_json, tx_status_json_in};
+use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_status_json_in};
 use crate::ws;
 use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
 use axum::http::request::Parts;
@@ -527,7 +527,19 @@ async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Re
                 Ok(v) => Json(v).into_response(),
                 Err(e) => store_err(e),
             },
-            Ok(None) => not_found(),
+            Ok(None) => match mempool_wire(&st, &txid) {
+                Some(tx) => match build_tx_json_from_tx(
+                    &st.query,
+                    &tx,
+                    st.network,
+                    None,
+                    st.mempool.as_deref(),
+                ) {
+                    Ok(v) => Json(v).into_response(),
+                    Err(e) => store_err(e),
+                },
+                None => not_found(),
+            },
             Err(e) => store_err(e),
         }
     })
@@ -545,7 +557,13 @@ async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Res
                 Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(raw)),
                 Err(e) => store_err(e),
             },
-            Ok(None) => not_found(),
+            Ok(None) => match mempool_wire(&st, &txid) {
+                Some(tx) => {
+                    let raw = bitcoin::consensus::serialize(&tx);
+                    plain_ok(rbitcoin_primitives::hex_encode(raw))
+                }
+                None => not_found(),
+            },
             Err(e) => store_err(e),
         }
     })
@@ -626,6 +644,12 @@ pub(crate) fn parse_hash32(s: &str) -> Result<[u8; 32], ()> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+pub(crate) fn mempool_wire(st: &AppState, txid: &[u8; 32]) -> Option<bitcoin::Transaction> {
+    use bitcoin::hashes::Hash;
+    let tid = bitcoin::Txid::from_byte_array(*txid);
+    st.mempool.as_ref().and_then(|m| m.get_tx(&tid))
 }
 
 fn encode_header_hex(hdr: &bitcoin::block::Header) -> Result<String, String> {
@@ -2237,6 +2261,106 @@ mod tests {
         );
 
         let _ = ws.close(None).await;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mempool-only txs (not in Class A) must be full Esplora JSON, not a stub.
+    #[tokio::test]
+    async fn mempool_only_tx_json_has_vin_vout_size_weight() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_net::MempoolHub;
+        use rbitcoin_store::script_hash;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = temp_query("mp-tx-json");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut coinbase_txids = Vec::new();
+        for h in 0..101u32 {
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            coinbase_txids.push(ta.tx.txid);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        let q = Arc::new(q);
+        let mp_dir = dir.join("mp");
+        std::fs::create_dir_all(&mp_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        hub.accept_tx(&spend).expect("accept mempool spend");
+        let txid_hex = display_txid(spend.compute_txid());
+        let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
+        assert_eq!(st, 200, "{body}");
+        let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let row = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["txid"] == txid_hex);
+        let row = row.expect("mempool list contains spend");
+        assert!(row.get("vin").is_some(), "stub omitted vin: {row}");
+        assert!(row.get("vout").is_some(), "stub omitted vout: {row}");
+        assert!(row.get("size").is_some(), "stub omitted size: {row}");
+        assert!(row.get("weight").is_some(), "stub omitted weight: {row}");
+        assert_eq!(row["status"]["confirmed"], false);
+        assert_eq!(row["fee"], 1_000);
+
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs")).await;
+        assert_eq!(st, 200, "{body}");
+        let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let row = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["txid"] == txid_hex)
+            .expect("combined /txs contains spend");
+        assert!(row.get("vin").is_some(), "combined stub omitted vin: {row}");
+
+        let (st, body) = http_get(addr, &format!("/tx/{txid_hex}")).await;
+        assert_eq!(st, 200, "GET /tx mempool-only: {body}");
+        let full: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(full.get("vin").is_some());
+        assert!(full.get("vout").is_some());
+        assert!(full.get("size").is_some());
+        assert!(full.get("weight").is_some());
+        assert_eq!(full["status"]["confirmed"], false);
+
+        let (st, hex_body) = http_get(addr, &format!("/tx/{txid_hex}/hex")).await;
+        assert_eq!(st, 200, "{hex_body}");
+        let (st, _) = http_get(addr, &format!("/tx/{txid_hex}/raw")).await;
+        assert_eq!(st, 200);
+
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

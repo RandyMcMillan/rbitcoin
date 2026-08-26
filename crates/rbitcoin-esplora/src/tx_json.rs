@@ -2,7 +2,8 @@
 
 use crate::script_fields::esplora_script_fields;
 use bitcoin::hashes::Hash;
-use bitcoin::Network;
+use bitcoin::{Network, Transaction};
+use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::hex_encode;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::{Query, QueryError, ScriptHashHistoryItem, ScriptHashUtxo};
@@ -147,7 +148,53 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
     let wire = query.reconstruct_tx(tx_fk)?;
     let status = tx_status_json(query, tx_fk)?;
     let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
+    let stored_txid = query
+        .store()
+        .txs
+        .body_txid(tx_fk)
+        .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
+    tx_json_from_wire(
+        query,
+        &wire,
+        network,
+        status,
+        &stored_inputs,
+        stored_txid,
+        None,
+        None,
+    )
+}
 
+/// Esplora tx JSON from a mempool wire body (not in Class A).
+pub fn build_tx_json_from_tx(
+    query: &Query,
+    tx: &Transaction,
+    network: Network,
+    fee: Option<i64>,
+    mempool: Option<&MempoolHub>,
+) -> Result<Value, QueryError> {
+    tx_json_from_wire(
+        query,
+        tx,
+        network,
+        json!({ "confirmed": false }),
+        &[],
+        tx.compute_txid().to_byte_array(),
+        fee,
+        mempool,
+    )
+}
+
+fn tx_json_from_wire(
+    query: &Query,
+    wire: &Transaction,
+    network: Network,
+    status: Value,
+    stored_inputs: &[InputRecord],
+    txid_bytes: [u8; 32],
+    fee_override: Option<i64>,
+    mempool: Option<&MempoolHub>,
+) -> Result<Value, QueryError> {
     let mut vin = Vec::with_capacity(wire.input.len());
     let mut fee_in: Option<i64> = Some(0);
     for (i, tin) in wire.input.iter().enumerate() {
@@ -179,7 +226,7 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
         }
 
         if !is_coinbase {
-            if let Some(prev) = prevout_json(query, &stored_inputs, i, tin, network)? {
+            if let Some(prev) = prevout_json(query, stored_inputs, i, tin, network, mempool)? {
                 if let Some(v) = prev.get("value").and_then(|x| x.as_i64()) {
                     if let Some(acc) = fee_in.as_mut() {
                         *acc = acc.saturating_add(v);
@@ -214,27 +261,20 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
         vout.push(o);
     }
 
-    let weight = wire.weight().to_wu();
-    let size = wire.total_size();
-    // Prefer Class A stored txid so history cursors and /tx routes share identity
-    // (reconstructed wire hash matches in production; fixtures may differ).
-    let stored_txid = query
-        .store()
-        .txs
-        .body_txid(tx_fk)
-        .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
     let mut obj = json!({
-        "txid": block_hash_hex(&stored_txid),
+        "txid": block_hash_hex(&txid_bytes),
         "version": wire.version.0,
         "locktime": wire.lock_time.to_consensus_u32(),
-        "size": size,
-        "weight": weight,
+        "size": wire.total_size(),
+        "weight": wire.weight().to_wu(),
         "vin": vin,
         "vout": vout,
         "status": status,
     });
 
-    if let Some(ins) = fee_in {
+    if let Some(fee) = fee_override {
+        obj["fee"] = json!(fee);
+    } else if let Some(ins) = fee_in {
         if wire.is_coinbase() {
             obj["fee"] = json!(0);
         } else {
@@ -251,6 +291,7 @@ fn prevout_json(
     idx: usize,
     tin: &bitcoin::TxIn,
     network: Network,
+    mempool: Option<&MempoolHub>,
 ) -> Result<Option<Value>, QueryError> {
     if let Some(inp) = stored_inputs.get(idx) {
         if !inp.create_fk.is_null() {
@@ -263,6 +304,15 @@ fn prevout_json(
     if let Some(pfk) = query.tx_fk_by_txid(&prev_txid)? {
         if let Ok(out) = query.tx_output_at_fk(pfk, tin.previous_output.vout) {
             return Ok(Some(vout_fields(&out.script, out.value, network)));
+        }
+    }
+    if let Some(prev) = mempool.and_then(|m| m.get_tx(&tin.previous_output.txid)) {
+        if let Some(o) = prev.output.get(tin.previous_output.vout as usize) {
+            return Ok(Some(vout_fields(
+                o.script_pubkey.as_bytes(),
+                o.value.to_sat() as i64,
+                network,
+            )));
         }
     }
     Ok(None)

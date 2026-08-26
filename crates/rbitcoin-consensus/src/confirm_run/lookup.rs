@@ -450,7 +450,7 @@ pub(super) fn wire_lookup_phase(
                 .archive_plan_batch_from_wire(
                     &need,
                     p.next_tx_start.max(1),
-                    &p.in_flight,
+                    p.in_flight,
                     p.skeleton.as_ref(),
                 )
                 .map_err(ConsensusError::from)?,

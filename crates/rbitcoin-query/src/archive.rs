@@ -1787,7 +1787,7 @@ mod tests {
         };
         let mut need = vec![(Fk(2), vec![child])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 2, &ifo, None)
+            .archive_plan_batch_from_store(&mut need, 2, ifo, None)
             .expect("parent via creates-only in_flight");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
@@ -2164,7 +2164,7 @@ mod tests {
         let ifo = &log;
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
-            let helper = crate::stamp_external_parents(q.store(), &[parent_txid], &ifo, None)
+            let helper = crate::stamp_external_parents(q.store(), &[parent_txid], ifo, None)
                 .expect("inflight stamp");
             assert_eq!(helper.head_need_n, 0, "inflight hit must skip leftover");
             let got = helper
@@ -2177,7 +2177,7 @@ mod tests {
             let child = child_spend(parent_txid, 0x94);
             let mut need = vec![(Fk(1), vec![child])];
             let plan = q
-                .archive_plan_batch_from_store(&mut need, 1, &ifo, None)
+                .archive_plan_batch_from_store(&mut need, 1, ifo, None)
                 .expect("S0 inflight");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(93));
             let mix = crate::archive_phase_stats::sample_and_reset();

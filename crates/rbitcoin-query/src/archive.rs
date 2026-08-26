@@ -47,6 +47,8 @@ pub struct ArchiveWritePlan {
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
+    /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins do not.
+    pub edges: crate::SpendEdges,
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
@@ -72,6 +74,7 @@ impl ArchiveWritePlan {
             packed: Vec::new(),
             planned_fks: Vec::new(),
             per_header_ranges: Vec::new(),
+            edges: crate::SpendEdges::default(),
             spends: Vec::new(),
             batch_creates: Vec::new(),
             external_parents: crate::U64Map::default(),
@@ -211,6 +214,7 @@ impl ArchiveWritePlan {
         self.planned_fks = new_fks;
         self.batch_pin = new_pin;
         self.per_header_ranges = new_ranges;
+        self.edges.retain(|id, _| keep_fks.contains(id));
         self.spends
             .retain(|(_, _, spend_fk, _)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
         self.batch_creates
@@ -239,6 +243,7 @@ impl ArchiveWritePlan {
         self.packed.append(&mut other.packed);
         self.planned_fks.append(&mut other.planned_fks);
         self.per_header_ranges.append(&mut other.per_header_ranges);
+        self.edges.extend(other.edges);
         self.spends.append(&mut other.spends);
         self.batch_creates.append(&mut other.batch_creates);
         self.batch_pin.append(&mut other.batch_pin);
@@ -478,6 +483,7 @@ impl Query {
         let mut packed: Vec<(CreatePin, Vec<InputRecord>)> = Vec::with_capacity(work.len());
         let mut batch_pin: Vec<CreatePin> = Vec::with_capacity(work.len());
         let mut planned_fks: Vec<Fk> = Vec::with_capacity(work.len());
+        let mut edges: crate::SpendEdges = crate::SpendEdges::default();
         let mut external_parent_vouts: crate::U64Map<Vec<u32>> = crate::U64Map::default();
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
@@ -490,10 +496,17 @@ impl Query {
         }
         let mut prestamp_parents = false;
         for (tx_fk, tx, mut inputs, outputs) in work {
+            let mut tx_edges: Vec<crate::SpendEdge> = Vec::with_capacity(inputs.len());
             for (i, inp) in inputs.iter_mut().enumerate() {
                 if inp.is_coinbase() {
                     inp.create_fk = Fk::NULL;
                     inp.prev_index = u32::MAX;
+                    tx_edges.push(crate::SpendEdge {
+                        prev_txid: [0u8; 32],
+                        vout: u32::MAX,
+                        spend_fk: tx_fk,
+                        create_fk: Fk::NULL,
+                    });
                     continue;
                 }
                 if inp.create_fk.is_null() {
@@ -527,6 +540,24 @@ impl Query {
                 if archive_spends {
                     spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                 }
+                if inp.is_coinbase() || inp.prev_index == u32::MAX {
+                    tx_edges.push(crate::SpendEdge {
+                        prev_txid: [0u8; 32],
+                        vout: u32::MAX,
+                        spend_fk: tx_fk,
+                        create_fk: Fk::NULL,
+                    });
+                } else {
+                    tx_edges.push(crate::SpendEdge {
+                        prev_txid: inp.prev_txid,
+                        vout: inp.prev_index,
+                        spend_fk: tx_fk,
+                        create_fk: inp.create_fk,
+                    });
+                }
+            }
+            if let Some(sid) = tx_fk.get() {
+                edges.insert(sid, tx_edges);
             }
             planned_fks.push(tx_fk);
             let pin = std::sync::Arc::new((tx, outputs));
@@ -579,6 +610,7 @@ impl Query {
             packed,
             planned_fks,
             per_header_ranges,
+            edges,
             spends,
             batch_creates,
             external_parents,
@@ -1600,6 +1632,32 @@ mod tests {
             Some(spent),
             "archived parent must carry spent.idx range on the lookup stamp"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stamp emits SpendEdges (create_fk) so pin/write need not walk packed ins.
+    #[test]
+    fn plan_batch_emits_spend_edges() {
+        let (dir, q) = temp_query("plan-spend-edges");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        let mut need = vec![(Fk(1), vec![parent, child_spend(parent_txid, 0xee)])];
+        let plan = q
+            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+            .expect("plan");
+        assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2)]);
+        let cb = plan.edges.get(&1).expect("coinbase edges");
+        assert_eq!(cb.len(), 1);
+        assert!(cb[0].create_fk.is_null());
+        let edges = plan
+            .edges
+            .get(&2)
+            .expect("plan stamp must emit spend edges");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].prev_txid, parent_txid);
+        assert_eq!(edges[0].vout, 0);
+        assert_eq!(edges[0].spend_fk, Fk(2));
+        assert_eq!(edges[0].create_fk, Fk(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

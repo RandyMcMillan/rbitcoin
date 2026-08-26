@@ -1457,6 +1457,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         )],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
+        edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
         external_parents: Default::default(),
@@ -1516,6 +1517,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         packed: vec![],
         planned_fks: vec![],
         per_header_ranges: vec![],
+        edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
         external_parents: idents,
@@ -1785,6 +1787,7 @@ fn pin_sparse_need_high_vout_only() {
         packed: vec![(Arc::clone(&spend_pin), spend_ins)],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
+        edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
         external_parents: {

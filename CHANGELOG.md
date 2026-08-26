@@ -54,6 +54,10 @@ before 1.0).
 
 ### Changed
 
+- **Pin `merge_outs` no-op Arc:** empty / already-covered `checked`+`live`
+  keep the outs Arc (assemble sticky `ptr_eq`). RCU compose borrows `live`
+  instead of cloning script bytes on every retry.
+
 - **IBD Class A ins at write:** `confirm_wire_lookup_stamp` plans from
   wire (`archive_plan_batch_from_wire`) without `TxApply`. Packed ins stay
   empty; SpendEdges + CreatePin remain. Write encodes ins from `Arc<Block>`

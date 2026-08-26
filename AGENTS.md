@@ -90,8 +90,9 @@ Pin material is **plan / batch only** (`batch_pin`, `BatchParents`). No process
 create pin FIFO. IBD confirm intake
 is **body queue wire only** → lookup → load.
 
-In-flight CreatePin layers drop at drain+fence **and**, for pin layers, write
-`until = lookup_started_hi.max(hi)` then `class_a_hi >= until`. Stamp attaches
+In-flight CreatePin layers drop when Class C tip ≥ `until` stamped at
+layer create (`until = lookup_started_hi`, or pack `max_height` if
+started_hi is `None`). Stamp attaches
 the CreatePin from `InFlightView`. Not a coins cache or process pin FIFO.
 
 Leftover union, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**

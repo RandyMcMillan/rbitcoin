@@ -74,6 +74,10 @@ pub(crate) fn should_reseed_work_path_on_empty_lag(streak: u32) -> bool {
 }
 
 /// Work path idle: no ordered hashes, no inflight getdata.
+///
+/// Off-path leftover getdata is dropped by
+/// [`super::assign::prune_off_path_inflight`] before this is consulted — not a
+/// second meaning of drained.
 #[inline]
 pub fn path_drained(st: &IbdWorkState) -> bool {
     st.ordered.is_empty() && st.inflight.is_empty()
@@ -210,6 +214,38 @@ mod tests {
         near.max_ready_height = 105;
         assert!(!peer_caught_up(&near, 100));
         assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
+
+        // Mainnet 08:16:23: ordered empty, headers_done, tip=horizon, 7 off-path
+        // inflight. Prune then drain — do not treat leftover getdata as work.
+        use super::super::assign::prune_off_path_inflight;
+        use super::super::state::InflightReq;
+        let mut at_horizon = IbdWorkState::new(Vec::new(), None, Some(964_108));
+        at_horizon.max_peer_height = 964_108;
+        at_horizon.max_ready_height = 964_108;
+        at_horizon.headers_done = true;
+        for i in 1u8..=7 {
+            at_horizon
+                .inflight
+                .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
+        }
+        assert!(!path_drained(&at_horizon));
+        assert!(!catchup_complete_after_drain(&at_horizon, 964_108));
+        prune_off_path_inflight(&mut at_horizon);
+        assert!(path_drained(&at_horizon));
+        assert!(catchup_complete_after_drain(&at_horizon, 964_108));
+
+        // Mid-chain on-path inflight (tip+1 in h2h) must not complete after prune.
+        let mut mid_inf = IbdWorkState::new(Vec::new(), None, Some(161_249));
+        mid_inf.max_peer_height = 958_820;
+        mid_inf.max_ready_height = 161_000;
+        mid_inf.headers_done = true;
+        let on_path = BlockHash::from_byte_array([0x2a; 32]);
+        mid_inf.record_height(on_path, 161_250);
+        mid_inf.inflight.insert(on_path, InflightReq::new(0));
+        prune_off_path_inflight(&mut mid_inf);
+        assert!(mid_inf.inflight.contains_key(&on_path));
+        assert!(!path_drained(&mid_inf));
+        assert!(!catchup_complete_after_drain(&mid_inf, 161_249));
     }
 
     /// Empty-headers lag WARN/reget cadence (mainnet log flood regression).

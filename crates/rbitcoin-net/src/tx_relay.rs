@@ -313,6 +313,9 @@ pub struct MempoolHub {
     reorg_servable: Mutex<HashSet<Wtxid>>,
     /// Core mempool entry_sequence. Regular accept starts at 1; reorg is 0.
     relay_seq: Mutex<HashMap<Wtxid, u64>>,
+    /// Reverse of `relay_seq` / `accept_at` so `unindex_txid` can drop them
+    /// after the graph entry is already gone.
+    wtxid_by_txid: Mutex<HashMap<Txid, Wtxid>>,
     next_relay_seq: AtomicU64,
     /// `prioritisetransaction` fee deltas (sat), keyed by txid even if not live.
     fee_deltas: Mutex<HashMap<Txid, i64>>,
@@ -391,6 +394,7 @@ impl MempoolHub {
             unbroadcast: Mutex::new(unbroadcast),
             reorg_servable: Mutex::new(HashSet::new()),
             relay_seq: Mutex::new(HashMap::new()),
+            wtxid_by_txid: Mutex::new(HashMap::new()),
             next_relay_seq: AtomicU64::new(1),
             immediate_relay: AtomicBool::new(false),
             mock_now: AtomicU64::new(0),
@@ -458,10 +462,31 @@ impl MempoolHub {
 
     fn unindex_txid(&self, txid: &Txid) {
         self.sh_index.lock().unwrap().remove(txid);
+        self.remove_relay_maps(txid);
         let mut u = self.unbroadcast.lock().unwrap();
         if u.remove(txid) {
             persist_unbroadcast_file(&self.dir, &u);
             rbitcoin_log::info!("{}", Self::unbroadcast_removed_log(txid));
+        }
+    }
+
+    fn insert_relay_maps(&self, txid: Txid, wtxid: Wtxid, seq: u64) {
+        let at = self.mock_now.load(Ordering::Relaxed);
+        let mut by_tx = self.wtxid_by_txid.lock().unwrap();
+        let mut seqs = self.relay_seq.lock().unwrap();
+        let mut ats = self.accept_at.lock().unwrap();
+        by_tx.insert(txid, wtxid);
+        seqs.insert(wtxid, seq);
+        ats.insert(wtxid, at);
+    }
+
+    fn remove_relay_maps(&self, txid: &Txid) {
+        let mut by_tx = self.wtxid_by_txid.lock().unwrap();
+        let mut seqs = self.relay_seq.lock().unwrap();
+        let mut ats = self.accept_at.lock().unwrap();
+        if let Some(w) = by_tx.remove(txid) {
+            seqs.remove(&w);
+            ats.remove(&w);
         }
     }
 
@@ -856,10 +881,8 @@ impl MempoolHub {
                 self.note_template_update();
                 let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
                 let w = tx.compute_wtxid();
-                self.relay_seq.lock().unwrap().insert(w, seq);
+                self.insert_relay_maps(r.txid, w, seq);
                 self.reorg_servable.lock().unwrap().remove(&w);
-                let at = self.mock_now.load(Ordering::Relaxed);
-                self.accept_at.lock().unwrap().insert(w, at);
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -1214,9 +1237,7 @@ impl MempoolHub {
                 if r.is_ok() {
                     let w = tx.compute_wtxid();
                     s.insert(w);
-                    self.relay_seq.lock().unwrap().insert(w, 0);
-                    let at = self.mock_now.load(Ordering::Relaxed);
-                    self.accept_at.lock().unwrap().insert(w, at);
+                    self.insert_relay_maps(tx.compute_txid(), w, 0);
                     self.index_txid(tx.compute_txid(), tx);
                     n += 1;
                 }
@@ -1928,6 +1949,54 @@ mod tests {
             let _ = std::fs::remove_dir_all(&mp);
         }
 
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Confirm/RBF unindex must drop `relay_seq` / `accept_at` for the gone
+    /// wtxid and leave a still-live sibling indexed.
+    #[test]
+    fn unindex_drops_relay_seq_and_accept_at() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        let q = Arc::new(q);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let mp = tmp();
+        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let gone = spend_true(cbs[0], 1_000, spk.clone());
+        let stay = spend_true(cbs[1], 2_000, spk);
+        hub.accept_tx(&gone).expect("accept gone");
+        hub.accept_tx(&stay).expect("accept stay");
+        let gone_w = gone.compute_wtxid();
+        let stay_w = stay.compute_wtxid();
+        assert!(hub.relay_seq_of(&gone_w).is_some());
+        assert!(hub.relay_seq_of(&stay_w).is_some());
+        assert!(hub.remove_for_block(&[gone.compute_txid()]) >= 1);
+        assert!(hub.contains(&stay.compute_txid()));
+        assert!(hub.relay_seq_of(&gone_w).is_none());
+        assert!(hub.relay_seq_of(&stay_w).is_some());
+        hub.note_mock_now(40);
+        assert!(!hub.tx_inv_due(&gone_w));
+        assert!(hub.tx_inv_due(&stay_w));
+        let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 

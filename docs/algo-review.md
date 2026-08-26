@@ -79,7 +79,7 @@ What the node runs. Findings follow.
 | IBD assign | densify walk, `FAR_SCAN_BUDGET` 65 536 | `densify_scan_lo` skips BQ-ready prefix; request-limited soft budget |
 | Compact blocks | short-id + prefilled interleave | prefilled index validation weaker than Core |
 | AddrMan | unbounded `HashMap` | no tried/new bucket caps |
-| Tx relay | graph + per-peer announced set | `HashMap<Wtxid, Txid>` on `TxGraph`; `relay_seq`/`accept_at` not unindexed |
+| Tx relay | graph + per-peer announced set | `HashMap<Wtxid, Txid>` on `TxGraph`; `relay_seq`/`accept_at` dropped in `unindex_txid` |
 | Chain work | RAM prefix `work through h` | rebuilt from wire headers; no durable `nChainWork` |
 | `BlockCache` | `Vec` of hashes | prefix eviction O(chain) |
 | Peer rate limit | **fixed** 1 s window | documented as sliding |
@@ -169,8 +169,6 @@ What the node runs. Findings follow.
   unused for eviction.
 - **N-M3.** `cmpct_fills` and `requested_blocks` grow until success/arrival;
   no prune on abandon/timeout.
-- **N-M4.** `relay_seq` / `accept_at` inserted on accept (`tx_relay.rs`) and
-  **not** removed in `unindex_txid`. ~20 MiB/day unbounded.
 - **N-M5.** AddrMan unbounded; Core caps tried/new.
 - **N-M6.** `announced_wtx` cap = clear entire set → INV burst.
 - **N-M7.** `disconnect_to` clones all disconnected txs even with no mempool
@@ -249,7 +247,6 @@ GBT longpoll parks a blocking thread with no timeout.
 
 | ID | Where | Shape | Cap today? |
 |----|--------|--------|------------|
-| Mem1 | `relay_seq` / `accept_at` | process lifetime | **no** |
 | Mem2 | AddrMan | peer `addr` feed | **no** |
 | Mem3 | `announced_wtx` | 50k then **clear all** | yes, but bursty |
 | Mem4 | Mempool dead body bytes | RBF stall, compact not on admit | disk + rewrite |
@@ -338,8 +335,8 @@ Do not flatten io_uring machines. Do not add a process pin FIFO.
 - `TxPrecompute` vs rust-bitcoin oracles (incl. zero-input BIP144).
 - Body-queue budget accounting matches `docs/ibd-memory.md`.
 - Orphanage count/weight caps; Electrum/WS per-conn caps.
-- `unindex_txid` **does** drop scripthash index + unbroadcast; it does
-  **not** drop `relay_seq`/`accept_at` (Mem1).
+- `unindex_txid` drops scripthash index, unbroadcast, `relay_seq`, and
+  `accept_at`.
 
 ---
 
@@ -353,7 +350,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | store | 0 | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N² |
 | consensus + primitives | 0 | *(none remaining)* | historical MTP walks, rehash txids |
 | query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
-| net | 0 | compact indexes, random eviction, unbounded maps, v2 copies | INV flush, BlockCache |
+| net | 0 | compact indexes, random eviction, AddrMan/cmpct unbounded, v2 copies | INV flush, BlockCache |
 | mempool | 0 | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 0 | submitblock gate, gettxout, hashps, unbounded batch, blockmintxfee, maxfeerate | GBT depends, longpoll |
 | electrum | 0 | mempool_stats | status full-history, announce O(subs) |
@@ -367,7 +364,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Split-risk, then operator-visible, then
 IBD CPU.
 
-1. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+1. Mempool persist order, AddrMan cap.
 2. Esplora `/blocks` summaries (P11) and mempool JSON stubs (X-M1).
 
 Out of scope (Won't-fix / policy): flattening uring, process pin FIFO,

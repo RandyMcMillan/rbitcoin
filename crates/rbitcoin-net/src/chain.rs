@@ -2580,7 +2580,7 @@ mod tests {
                         .map(|((pin, _), fk)| (*fk, pin)),
                 )
             };
-            log.note_layer(layer, None);
+            log.note_layer(layer);
             pipe.in_flight = log.snapshot();
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {

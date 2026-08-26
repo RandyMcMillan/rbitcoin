@@ -2085,7 +2085,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
                     .map(|((pin, _), fk)| (*fk, pin)),
             )
         };
-        log.note_layer(layer, None);
+        log.note_layer(layer);
         pipe.in_flight = log.snapshot();
     }
     if let Some(last) = plan_a.planned_fks.last().and_then(|f| f.get()) {

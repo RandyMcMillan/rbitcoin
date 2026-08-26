@@ -50,7 +50,7 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop packs whose stamped `until` is in Class C (`Query::tip_height`).
+    /// Drop packs whose stamped `until` is behind drain+fence.
     ///
     /// Call **after** pin + scripts handoff so n−1 still has CreatePin outs
     /// for load (stamp skips body_range when `get_out`).
@@ -58,7 +58,8 @@ impl LoadAheadState {
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        self.in_flight.prune_if_class_c(hub.tip_height());
+        self.in_flight
+            .prune_if_drain_fence(hub.query.drain_and_fence_hi());
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);

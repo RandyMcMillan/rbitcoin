@@ -1277,6 +1277,16 @@ impl Query {
         self.head_drain_fk.load(AtomicOrdering::Acquire)
     }
 
+    /// Height both `tx.head` drain and the RAM fence have passed.
+    ///
+    /// In-flight prune HWM. `None` when drain is 0 or the drain fk is not on
+    /// the fence (Class C/fence can lead unpublished head).
+    pub fn drain_and_fence_hi(&self) -> Option<u32> {
+        self.store
+            .height_fence_snapshot()
+            .drain_and_fence_hi(self.head_drain_fk())
+    }
+
     /// Record a tip shrink so load can drop in-flight layers for that height.
     pub(crate) fn note_disconnect_height(&self, height: u32) {
         self.disconnect_height
@@ -1984,7 +1994,8 @@ impl Query {
         self.store.tip_height()
     }
 
-    /// Highest height on the RAM fence. In-flight prune HWM — not [`Self::tip_height`].
+    /// Highest height on the RAM fence. Not the in-flight prune HWM
+    /// ([`Self::drain_and_fence_hi`] — drain can lag this).
     pub fn fence_tip_height(&self) -> Option<u32> {
         self.store.fence_tip_height()
     }

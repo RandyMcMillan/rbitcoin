@@ -1416,7 +1416,12 @@ mod tests {
         );
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
-        log.prune_if_class_c(q.tip_height().map(|h| h.0));
+        log.prune_if_drain_fence(q.drain_and_fence_hi());
+        assert_eq!(
+            q.drain_and_fence_hi(),
+            None,
+            "drain fk not on fence: keep inflight"
+        );
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
             "fence missing: prune must keep"
@@ -1501,7 +1506,8 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        log.prune_if_class_c(q.tip_height().map(|h| h.0));
+        log.prune_if_drain_fence(q.drain_and_fence_hi());
+        assert_eq!(q.drain_and_fence_hi(), None, "drain_fk 0: HWM is None");
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
             "drain_fk 0: prune must keep"

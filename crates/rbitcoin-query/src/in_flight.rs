@@ -6,11 +6,13 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop a tagged layer iff Class C tip ≥ `until` stamped at
+//! **Prune:** drop a tagged layer iff drain+fence height > `until` stamped at
 //! [`InFlightLog::note_layer`] (`until = lookup_started_hi`, or pack
-//! `max_height` when started_hi is `None`). Drain+fence and `class_a_hi` are
-//! not drop gates. Disconnect still [`InFlightLog::drop_from_height`] on pack
-//! height. Call after pin so n−1 still has CreatePin outs.
+//! `max_height` when started_hi is `None`). Horizon is
+//! [`rbitcoin_store::HeightFence::drain_and_fence_hi`] (min of drain height and
+//! fence tip). Class C tip and `class_a_hi` are not drop gates. Disconnect
+//! still [`InFlightLog::drop_from_height`] on pack height. Call after pin so
+//! n−1 still has CreatePin outs.
 //!
 //! Lookup is newest→oldest scan over layers (O(L)).
 
@@ -27,7 +29,7 @@ pub struct InFlightLayer {
     outs: U64Map<CreatePin>,
     /// Highest block height in this pack. [`None`] = untagged (disconnect keeps it).
     max_height: Option<u32>,
-    /// Class C drop horizon stamped at [`InFlightLog::note_layer`].
+    /// Drain+fence drop horizon stamped at [`InFlightLog::note_layer`].
     until: Option<u32>,
     /// Occupancy bytes computed at build (no per-pack script walk).
     approx_bytes: u64,
@@ -135,18 +137,19 @@ impl InFlightLog {
         self.layers.shrink_to_fit();
     }
 
-    /// Drop layers whose stamped `until` is already in Class C.
+    /// Drop layers whose stamped `until` is already behind drain+fence.
     ///
-    /// `None` tip keeps every layer. Untagged (`until == None`) stay.
-    pub fn prune_if_class_c(&mut self, class_c_tip: Option<u32>) {
-        let Some(tip) = class_c_tip else {
+    /// `None` hi keeps every layer. Untagged (`until == None`) stay.
+    /// Drop when `drain_fence_hi > until` (equality keeps).
+    pub fn prune_if_drain_fence(&mut self, drain_fence_hi: Option<u32>) {
+        let Some(hi) = drain_fence_hi else {
             return;
         };
         if self.layers.is_empty() {
             return;
         }
         self.layers.retain(|layer| match layer.until {
-            Some(u) => tip < u,
+            Some(u) => hi <= u,
             None => true,
         });
         self.layers.shrink_to_fit();
@@ -154,7 +157,7 @@ impl InFlightLog {
 
     /// Drop packs whose heights are already on the fence. `None` keeps all.
     ///
-    /// Not the IBD pin-layer path (that is [`Self::prune_if_class_c`] vs
+    /// Not the IBD pin-layer path (that is [`Self::prune_if_drain_fence`] vs
     /// stamped `until`). Untagged layers (`max_height == None`) stay.
     pub fn prune_through_tip(&mut self, tip: Option<u32>) {
         let Some(t) = tip else {
@@ -388,32 +391,32 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_until_class_c_covers_stamped_until() {
+    fn prune_keeps_until_drain_fence_exceeds_stamped_until() {
         let mut log = InFlightLog::new();
         let p = pin(10);
         log.note_layer(
             InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(2),
             Some(40),
         );
-        log.prune_if_class_c(None);
+        log.prune_if_drain_fence(None);
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "no Class C tip: keep"
+            "no drain+fence height: keep"
         );
-        log.prune_if_class_c(Some(2));
+        log.prune_if_drain_fence(Some(2));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "Class C tip 2 < until 40: keep (drain+fence/class_a are not gates)"
+            "drain lag (2) while until is 40: keep — Class C/fence tip is not the gate"
         );
-        log.prune_if_class_c(Some(39));
+        log.prune_if_drain_fence(Some(40));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "Class C tip still below until"
+            "drain+fence == until keeps (drop is strictly >)"
         );
-        log.prune_if_class_c(Some(40));
+        log.prune_if_drain_fence(Some(41));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_none(),
-            "Class C tip >= until drops"
+            "drain+fence > until drops"
         );
     }
 
@@ -425,12 +428,17 @@ mod tests {
             InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(10),
             Some(40),
         );
-        log.prune_if_class_c(Some(10));
+        log.prune_if_drain_fence(Some(10));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
             "until is started_hi 40, not pack height 10"
         );
-        log.prune_if_class_c(Some(40));
+        log.prune_if_drain_fence(Some(40));
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "equality keeps"
+        );
+        log.prune_if_drain_fence(Some(41));
         assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
     }
 
@@ -442,13 +450,15 @@ mod tests {
             InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(10),
             None,
         );
-        log.prune_if_class_c(Some(9));
+        log.prune_if_drain_fence(Some(9));
         assert!(log.snapshot().get_create_fk(&p.0.txid).is_some());
-        log.prune_if_class_c(Some(10));
+        log.prune_if_drain_fence(Some(10));
         assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_none(),
-            "None started_hi: until = pack max_height"
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "None started_hi: until = pack max_height; equality keeps"
         );
+        log.prune_if_drain_fence(Some(11));
+        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
     }
 
     #[test]
@@ -474,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_if_class_c_keeps_higher_until() {
+    fn prune_if_drain_fence_keeps_higher_until() {
         let mut log = InFlightLog::new();
         let a = pin(10);
         let b = pin(50);
@@ -486,13 +496,20 @@ mod tests {
             InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(8),
             Some(8),
         );
-        log.prune_if_class_c(Some(2));
+        log.prune_if_drain_fence(Some(2));
         let v = log.snapshot();
-        assert!(v.get_create_fk(&a.0.txid).is_none());
+        assert!(
+            v.get_create_fk(&a.0.txid).is_some(),
+            "drain+fence == until 2 keeps"
+        );
         assert!(
             v.get_create_fk(&b.0.txid).is_some(),
-            "until 8 still ahead of Class C tip 2"
+            "until 8 still ahead of drain+fence 2"
         );
+        log.prune_if_drain_fence(Some(3));
+        let v = log.snapshot();
+        assert!(v.get_create_fk(&a.0.txid).is_none());
+        assert!(v.get_create_fk(&b.0.txid).is_some());
     }
 
     #[test]

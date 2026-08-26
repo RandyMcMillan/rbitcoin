@@ -28,24 +28,30 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
     ))
 }
 
-/// Unconfirmed pack stays until Class C covers stamped until (not pack height).
+/// Unconfirmed pack stays until drain+fence exceeds stamped until (not pack height, not Class C).
 #[test]
-fn prune_inflight_keeps_until_class_c_covers_until() {
+fn prune_inflight_keeps_until_drain_fence_exceeds_until() {
     let mut log = InFlightLog::new();
     let pins: Vec<_> = (85u64..=100).map(|id| (Fk(id), test_pin(id))).collect();
     log.note_layer(
         InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))).with_max_height(10),
         Some(40),
     );
-    log.prune_if_class_c(Some(9));
-    assert_eq!(log.entry_count(), 16, "Class C < until keeps the pack");
-    log.prune_if_class_c(Some(10));
+    log.prune_if_drain_fence(Some(9));
+    assert_eq!(log.entry_count(), 16, "drain+fence < until keeps the pack");
+    log.prune_if_drain_fence(Some(10));
     assert_eq!(
         log.entry_count(),
         16,
-        "Class C of pack height is not enough while until is 40"
+        "drain+fence of pack height is not enough while until is 40"
     );
-    log.prune_if_class_c(Some(40));
+    log.prune_if_drain_fence(Some(40));
+    assert_eq!(
+        log.entry_count(),
+        16,
+        "drain+fence == until keeps (mainnet 258870 Class C/fence lead)"
+    );
+    log.prune_if_drain_fence(Some(41));
     assert_eq!(log.layer_count(), 0);
 }
 

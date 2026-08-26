@@ -1192,16 +1192,7 @@ fn dispatch_pinned(
             // appended as a tail — Electrum Cash: only when to_height is -1/omitted.
             if include_mempool {
                 if let Some(mp) = mempool {
-                    for item in mp.scripthash_mempool(&sh) {
-                        if hist.iter().any(|h| h.txid == item.txid) {
-                            continue;
-                        }
-                        hist.push(rbitcoin_query::ScriptHashHistoryItem {
-                            height: item.height,
-                            txid: item.txid,
-                            tx_fk: Fk::NULL,
-                        });
-                    }
+                    append_mempool_history(&mut hist, mp, &sh);
                 }
             }
             let arr: Vec<Value> = hist
@@ -1689,6 +1680,23 @@ fn hash_hex_rev(h: &[u8; 32]) -> String {
     rbitcoin_primitives::hex_encode(r)
 }
 
+fn append_mempool_history(
+    hist: &mut Vec<rbitcoin_query::ScriptHashHistoryItem>,
+    mp: &MempoolHub,
+    sh: &[u8; 32],
+) {
+    for item in mp.scripthash_mempool(sh) {
+        if hist.iter().any(|h| h.txid == item.txid) {
+            continue;
+        }
+        hist.push(rbitcoin_query::ScriptHashHistoryItem {
+            height: item.height,
+            txid: item.txid,
+            tx_fk: Fk::NULL,
+        });
+    }
+}
+
 fn scripthash_status(
     query: Option<&Query>,
     hist: &[rbitcoin_query::ScriptHashHistoryItem],
@@ -1733,14 +1741,7 @@ fn scripthash_status_full_slot(
     let mut hist = query
         .scripthash_history_slot(sh, slot)
         .map_err(|e| e.to_string())?;
-    for item in mp.scripthash_mempool(sh) {
-        hist.push(rbitcoin_query::ScriptHashHistoryItem {
-            height: item.height,
-            txid: item.txid,
-            tx_fk: Fk::NULL,
-        });
-    }
-    hist.sort_by_key(|i| i.height);
+    append_mempool_history(&mut hist, mp, sh);
     Ok(scripthash_status(Some(query), &hist)?)
 }
 
@@ -4579,6 +4580,109 @@ mod tests {
         let sh_bytes = param_scripthash(&json!([sh]), 0).unwrap();
         let st = scripthash_status_full(&q_arc, &mp, &sh_bytes).unwrap();
         assert!(!st.is_empty() || st.is_empty()); // always returns string
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripthash_status_matches_get_history_row_order() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_consensus::{accept_and_connect_block, Milestone};
+        use rbitcoin_net::MempoolHub;
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::ScriptHashHistoryItem;
+        use rbitcoin_store::script_hash;
+        use std::sync::Arc;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            103,
+            2,
+        );
+
+        let q_arc = Arc::new(q);
+        let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&q_arc)).unwrap();
+        mp.set_relay_enabled(true);
+
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx(&parent).expect("accept parent");
+
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let sh = electrum_scripthash_hex(spk.as_bytes());
+        let hist = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let arr = hist.as_array().unwrap();
+        assert!(
+            arr.iter().any(|r| r["height"].as_i64().unwrap() >= 1),
+            "need a confirmed history row"
+        );
+        assert!(
+            arr.last().unwrap()["height"].as_i64().unwrap() <= 0,
+            "get_history must append mempool last"
+        );
+
+        let rows: Vec<ScriptHashHistoryItem> = arr
+            .iter()
+            .map(|r| ScriptHashHistoryItem {
+                height: r["height"].as_i64().unwrap(),
+                txid: param_txid(&json!([r["tx_hash"].as_str().unwrap()]), 0).unwrap(),
+                tx_fk: Fk::NULL,
+            })
+            .collect();
+        let expected = scripthash_status(Some(q_arc.as_ref()), &rows).unwrap();
+        let mut height_sorted = rows.clone();
+        height_sorted.sort_by_key(|i| i.height);
+        let sorted_hash = scripthash_status(Some(q_arc.as_ref()), &height_sorted).unwrap();
+        assert_ne!(
+            sorted_hash, expected,
+            "height-sort must not match get_history order"
+        );
+
+        let sh_bytes = script_hash(spk.as_bytes());
+        let got = scripthash_status_full(q_arc.as_ref(), &mp, &sh_bytes).unwrap();
+        assert_eq!(got, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

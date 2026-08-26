@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **IBD exits to tip follow at the peer horizon:** leftover off-path
+  `getdata` is dropped so catch-up can complete; if peers then advertise
+  a higher tip (`lag > 2`), `headers_done` unlatches and `getheaders`
+  resumes. Near-tip (`lag ≤ 2`) still does not re-fan.
+
 - **In-flight keep-until:** pin layers stay until drain+fence **and**
   `class_a_hi >= until` (`until = lookup_started_hi.max(hi)` frozen at
   write). Stamp walks `InFlightView` only (then live_union, then TipOnly).

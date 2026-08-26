@@ -42,7 +42,8 @@ use events::{
 };
 use exit::{
     all_peers_dead_action, catchup_complete_after_drain, empty_path_header_fan,
-    header_lag_behind_peers, path_drained, peer_caught_up, AllPeersDead,
+    header_lag_behind_peers, path_drained, peer_caught_up, should_unlatch_headers_done,
+    AllPeersDead,
 };
 use path::{seed_work_path_from_store, work_path_tips};
 use peer_io::{PeerCmd, PeerEvent, PeerEventSinks};
@@ -595,6 +596,9 @@ pub async fn ibd_cancellable(
             );
             let under_hard = live < MAX_ORDERED_HEADERS;
             let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
+            if should_unlatch_headers_done(&st, hub.tip_height().unwrap_or(0)) {
+                st.headers_done = false;
+            }
             if !st.headers_done && under_hard && (under_soft || need_ready_headroom) {
                 let tip_h = hub.tip_height().unwrap_or(0);
                 let lag = header_lag_behind_peers(&st, tip_h);
@@ -944,11 +948,6 @@ pub async fn ibd_cancellable(
                     st.max_peer_height, st.max_ready_height, st.headers_done
                 );
                 break;
-            }
-            if header_lag_behind_peers(&st, tip_h) > 2 {
-                st.headers_done = false;
-                let tips = work_path_tips(&st);
-                let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
             }
         }
         // All peers dead — never treat mid-chain peer death as catch-up complete.

@@ -64,6 +64,16 @@ pub(crate) fn empty_path_header_fan(lag: u32, inflight: usize, alive: usize) -> 
     alive.min(4).max(1)
 }
 
+/// Clear `headers_done` so empty-path `getheaders` can resume.
+///
+/// Latch is only for lag ≤ 2 (stop the tip storm). When peers advertise a
+/// higher tip, unlatch even if leftover getdata is still inflight — that
+/// used to sit behind [`path_drained`] and stall until SIGINT.
+#[inline]
+pub(crate) fn should_unlatch_headers_done(st: &IbdWorkState, tip_h: u32) -> bool {
+    st.headers_done && st.ordered.is_empty() && header_lag_behind_peers(st, tip_h) > 2
+}
+
 /// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.
 ///
 /// Must stay rare: mainnet ~1M headers ≈ 200–300ms per call. Same cadence as
@@ -74,6 +84,10 @@ pub(crate) fn should_reseed_work_path_on_empty_lag(streak: u32) -> bool {
 }
 
 /// Work path idle: no ordered hashes, no inflight getdata.
+///
+/// Off-path leftover getdata is dropped by
+/// [`super::assign::prune_off_path_inflight`] before this is consulted — not a
+/// second meaning of drained.
 #[inline]
 pub fn path_drained(st: &IbdWorkState) -> bool {
     st.ordered.is_empty() && st.inflight.is_empty()
@@ -210,6 +224,38 @@ mod tests {
         near.max_ready_height = 105;
         assert!(!peer_caught_up(&near, 100));
         assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
+
+        // Mainnet 08:16:23: ordered empty, headers_done, tip=horizon, 7 off-path
+        // inflight. Prune then drain — do not treat leftover getdata as work.
+        use super::super::assign::prune_off_path_inflight;
+        use super::super::state::InflightReq;
+        let mut at_horizon = IbdWorkState::new(Vec::new(), None, Some(964_108));
+        at_horizon.max_peer_height = 964_108;
+        at_horizon.max_ready_height = 964_108;
+        at_horizon.headers_done = true;
+        for i in 1u8..=7 {
+            at_horizon
+                .inflight
+                .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
+        }
+        assert!(!path_drained(&at_horizon));
+        assert!(!catchup_complete_after_drain(&at_horizon, 964_108));
+        prune_off_path_inflight(&mut at_horizon);
+        assert!(path_drained(&at_horizon));
+        assert!(catchup_complete_after_drain(&at_horizon, 964_108));
+
+        // Mid-chain on-path inflight (tip+1 in h2h) must not complete after prune.
+        let mut mid_inf = IbdWorkState::new(Vec::new(), None, Some(161_249));
+        mid_inf.max_peer_height = 958_820;
+        mid_inf.max_ready_height = 161_000;
+        mid_inf.headers_done = true;
+        let on_path = BlockHash::from_byte_array([0x2a; 32]);
+        mid_inf.record_height(on_path, 161_250);
+        mid_inf.inflight.insert(on_path, InflightReq::new(0));
+        prune_off_path_inflight(&mut mid_inf);
+        assert!(mid_inf.inflight.contains_key(&on_path));
+        assert!(!path_drained(&mid_inf));
+        assert!(!catchup_complete_after_drain(&mid_inf, 161_249));
     }
 
     /// Empty-headers lag WARN/reget cadence (mainnet log flood regression).
@@ -268,5 +314,32 @@ mod tests {
         assert_eq!(empty_path_header_fan(100, 0, 29), 4);
         assert_eq!(empty_path_header_fan(100, 5, 29), 1);
         assert_eq!(empty_path_header_fan(100, 0, 2), 2);
+    }
+
+    /// Unlatch `headers_done` on lag>2 even with leftover inflight; never at lag≤2.
+    #[test]
+    fn should_unlatch_headers_done() {
+        use super::super::state::InflightReq;
+        use bitcoin::hashes::Hash;
+        use bitcoin::BlockHash;
+
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(100));
+        st.max_peer_height = 105;
+        st.max_ready_height = 100;
+        st.headers_done = true;
+        for i in 1u8..=7 {
+            st.inflight
+                .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
+        }
+        assert_eq!(header_lag_behind_peers(&st, 100), 5);
+        assert!(super::should_unlatch_headers_done(&st, 100));
+
+        st.max_peer_height = 100;
+        assert_eq!(header_lag_behind_peers(&st, 100), 0);
+        assert!(!super::should_unlatch_headers_done(&st, 100));
+
+        st.max_peer_height = 105;
+        st.ordered.push_back(BlockHash::from_byte_array([0xab; 32]));
+        assert!(!super::should_unlatch_headers_done(&st, 100));
     }
 }

@@ -109,12 +109,6 @@ pub fn confirm_wire_lookup_stamp(
         Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, ifo)?,
     };
-    if let Some(ref mut p) = plan {
-        for (_, ins) in &mut p.packed {
-            ins.clear();
-            ins.shrink_to_fit();
-        }
-    }
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
     let work_ns = t0.elapsed().as_nanos() as u64;
@@ -310,11 +304,6 @@ pub(super) fn wire_lookup_phase(
         }
     }
 
-    let mut with_fk: Vec<(
-        rbitcoin_primitives::Fk,
-        rbitcoin_store::HeaderRecord,
-        Vec<rbitcoin_query::TxApply>,
-    )> = Vec::with_capacity(blocks.len());
     let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
     let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
 
@@ -377,8 +366,20 @@ pub(super) fn wire_lookup_phase(
         struct_ns = struct_ns.saturating_add(t_struct.elapsed().as_nanos() as u64);
 
         let t_prep = Instant::now();
-        let (header_rec, txs) =
-            crate::prepare_block_for_archive_with_txids(query, block.as_ref(), &txids)?;
+        let prev_fk = if i == 0 {
+            if block.header.prev_blockhash.to_byte_array() == [0u8; 32] {
+                rbitcoin_primitives::Fk::NULL
+            } else {
+                query
+                    .get_header_by_hash(block.header.prev_blockhash.as_byte_array())
+                    .map_err(ConsensusError::from)?
+                    .map(|(fk, _)| fk)
+                    .ok_or(ConsensusError::BadPrev)?
+            }
+        } else {
+            metas[i - 1].header_fk
+        };
+        let header_rec = crate::header_to_record(prev_fk, &block.header);
         let header_fk = if let Some((fk, _)) = query
             .get_header_by_hash(&header_rec.hash)
             .map_err(ConsensusError::from)?
@@ -391,7 +392,6 @@ pub(super) fn wire_lookup_phase(
                 .map_err(ConsensusError::from)?
         };
         prepare_ns = prepare_ns.saturating_add(t_prep.elapsed().as_nanos() as u64);
-        with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);
         metas.push(BodyMeta {
             height: *height,
@@ -405,12 +405,13 @@ pub(super) fn wire_lookup_phase(
     }
 
     let t_filter = Instant::now();
-    let (_header_fks, mut need) = query
-        .archive_filter_need_bodies(&mut with_fk)
+    let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
+    let need_fks = query
+        .archive_filter_need_header_fks(&header_fks)
         .map_err(ConsensusError::from)?;
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
     let t_batch = Instant::now();
-    let plan = if need.is_empty() {
+    let plan = if need_fks.is_empty() {
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
                 .store()
@@ -432,18 +433,28 @@ pub(super) fn wire_lookup_phase(
         }
         None
     } else {
+        let mut need = Vec::with_capacity(need_fks.len());
+        for fk in &need_fks {
+            let i = metas
+                .iter()
+                .position(|m| m.header_fk == *fk)
+                .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: need-body header_fk not in batch",
+                )))?;
+            need.push((*fk, wire_blocks[i].as_ref(), metas[i].txids.as_slice()));
+        }
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_batch_from_store(
-                    &mut need,
+                .archive_plan_batch_from_wire(
+                    &need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
-                .archive_plan_batch_from_store(
-                    &mut need,
+                .archive_plan_batch_from_wire(
+                    &need,
                     query.tx_body_count().saturating_add(1).max(1),
                     &rbitcoin_query::InFlightView::empty(),
                     None,
@@ -891,6 +902,16 @@ mod tests {
             .expect("coinbase-only stamp");
         assert_eq!(stamped.metas[0].pres.len(), pres.len());
         assert_eq!(stamped.metas[0].pres[0].txid, pres[0].txid);
+        let plan = stamped.plan.as_ref().expect("new body plans");
+        assert!(
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "wire planner packed ins stay empty"
+        );
+        let want = items[0].1.txdata[0].output[0].script_pubkey.to_bytes();
+        assert_eq!(
+            plan.batch_pin[0].1[0].script, want,
+            "CreatePin outs from wire script_pubkey"
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 }

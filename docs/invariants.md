@@ -60,9 +60,10 @@ IO** (head / idx), not load pin. After a lookup wave publishes parent P into
 live_union, load stamp of a child spending P has **zero** leftover TipOnly for
 P (`head_need_n=0`). Pack stays on load; do not move `plan_batch` onto lookup.
 
-IBD stamp drops packed `InputRecord`s after plan (SpendEdges + CreatePin
-survive freeze). Write encodes ins from `Arc<Block>` + those edges. CreatePin
-outs stay stamp-time for in-flight. Load still does not head/idx.
+IBD stamp does not build `TxApply` / packed ins (`archive_plan_batch_from_wire`).
+SpendEdges + CreatePin survive freeze. Write encodes ins from `Arc<Block>` +
+those edges. CreatePin outs stay stamp-time for in-flight. Load still does
+not head/idx.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|

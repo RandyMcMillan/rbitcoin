@@ -1,7 +1,8 @@
 //! Class A archive write path.
 //!
 //! Split for IBD dual-thread (prep/write may overlap with a small plan queue):
-//! - **Plan** ([`Query::archive_plan_batch_from_store`]):
+//! - **Plan** ([`Query::archive_plan_batch_from_wire`] IBD;
+//!   [`Query::archive_plan_batch_from_store`] TxApply tests):
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
 //!   in-flight planned creates + `tx.head` resolve, stamp inputs.
 //!   Head-miss parents use **fk-only** head resolve (no denserels on plan stamp);
@@ -43,7 +44,7 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
 #[derive(Debug)]
 pub struct ArchiveWritePlan {
     /// Body-append rows: shared [`CreatePin`] (tx + outs) + inputs.
-    /// IBD stamp clears ins after plan; write fills from wire + [`Self::edges`].
+    /// IBD wire planner leaves ins empty; write fills from wire + [`Self::edges`].
     /// Outs live once in the pin Arc (not duplicated alongside inputs).
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
@@ -430,6 +431,22 @@ impl Query {
             }
         }
         Ok((header_fks, need))
+    }
+
+    /// Header-only need-body filter (IBD wire planner). No [`TxApply`].
+    pub fn archive_filter_need_header_fks(&self, header_fks: &[Fk]) -> Result<Vec<Fk>, QueryError> {
+        let mut need = Vec::with_capacity(header_fks.len());
+        let mut seen_headers = crate::FkSet::default();
+        for &fk in header_fks {
+            if !seen_headers.insert(fk) {
+                continue;
+            }
+            if self.store.header_txs.has_body(fk)? {
+                continue;
+            }
+            need.push(fk);
+        }
+        Ok(need)
     }
 
     /// **Prep / read path:** assign create fks, identity resolve, stamp
@@ -1832,6 +1849,29 @@ mod tests {
             Some(spent),
             "archived parent must carry spent.idx range on the lookup stamp"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_filter_need_header_fks_drops_archived() {
+        use rbitcoin_store::HeaderRecord;
+        let (dir, q) = temp_query("filter-header-fks");
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 1,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [2u8; 32],
+        };
+        let hfk = q
+            .commit_class_a_only(&header, &[coinbase_apply(1)])
+            .unwrap();
+        let need = q
+            .archive_filter_need_header_fks(&[hfk, hfk, Fk(99)])
+            .unwrap();
+        assert_eq!(need, vec![Fk(99)], "archived + dup dropped; missing kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

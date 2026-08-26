@@ -54,6 +54,15 @@ before 1.0).
 
 ### Changed
 
+- **Confirm Class A kind per batch:** a load/write batch is all need-body
+  (`plan=Some`) or all already-bodied (`plan=None`). Lookup splits loadq
+  at `header_txs.has_body`; write drain stops on plan polarity. Mixed
+  stamp is `Corrupt("invariant: confirm batch mixed archived")`. Write
+  vs tip is all-old (`Ok([])`), all-new (fill zip), or
+  `Corrupt("invariant: write batch spans tip")` — no prefix strip.
+  [`docs/invariants.md`](docs/invariants.md),
+  [`docs/concurrency.md`](docs/concurrency.md).
+
 - **Pin `merge_outs` no-op Arc:** empty / already-covered `checked`+`live`
   keep the outs Arc (assemble sticky `ptr_eq`). RCU compose borrows `live`
   instead of cloning script bytes on every retry.

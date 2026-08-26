@@ -95,7 +95,6 @@ impl LoadAheadState {
             parent_hash,
             next_tx_start: self.next_tx_start,
             in_flight: self.in_flight.snapshot(),
-            parent_store: None,
             published: std::sync::Arc::clone(&self.published),
         }
     }

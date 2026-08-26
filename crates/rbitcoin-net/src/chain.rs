@@ -2547,9 +2547,6 @@ mod tests {
             parent_hash: None,
             next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
             in_flight: rbitcoin_query::InFlightView::empty(),
-            parent_store: Some(std::sync::Arc::new(
-                rbitcoin_query::PipelineParentStore::new(),
-            )),
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let mat1 = hub

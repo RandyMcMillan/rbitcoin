@@ -68,7 +68,7 @@ pub struct ProcessOwnedSizes {
     pub inflight_layers: usize,
     pub inflight_pins: usize,
     pub inflight_bytes: u64,
-    /// PipelineParentStore Weak map + live strong pins.
+    /// Unused process pstore meters (always 0; BatchParents is batch-local).
     pub pstore_weak: usize,
     pub pstore_live: usize,
     pub pstore_bytes: u64,
@@ -148,8 +148,8 @@ pub mod process_mem_stats {
 
 pub use archive::{ArchiveWritePlan, CreatePin};
 pub use batch_parents::{
-    layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, PipelineParentStore,
-    SharedParentPin, U32Map, U64Map, U64Set, SPENDER_REL_UNKNOWN,
+    layout_covers_need, sparse_spender_rels, BatchParents, FkMap, FkSet, SharedParentPin, U32Map,
+    U64Map, U64Set, SPENDER_REL_UNKNOWN,
 };
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
@@ -455,7 +455,7 @@ pub mod archive_phase_stats {
     pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
-    /// Unique prev_txids resolved from live [`crate::PipelineParentStore`].
+    /// Unique prev_txids resolved from published live_union.
     pub static PIN_TXID_N: AtomicU64 = AtomicU64::new(0);
     /// Wall of that consult (RAM).
     pub static PIN_TXID_NS: AtomicU64 = AtomicU64::new(0);

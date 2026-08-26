@@ -24,9 +24,9 @@ This is not a security audit. Numbers are order-of-magnitude.
 **1.0 product gates** (what an operator can count on) live in
 [`road-to-1.0.md`](./road-to-1.0.md). Do not copy that list here.
 
-Open algorithm/data-structure findings live in
-[`algo-review.md`](./algo-review.md). Close an item by deleting it there in
-the same PR; do not paste those tables into Open.
+Former `algo-review.md` items that are still worth doing are **Q-57–Q-60**.
+Inventory tables, gotchas, and micro-opts were not a second backlog — they
+died with that file. Close a Q-id by moving it to Completed in the same PR.
 
 Peer full-node notes (Hornet, satd) live in
 [`peer-clients.md`](./peer-clients.md). Ranked later-consideration items
@@ -93,12 +93,16 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 |-----:|----|------|-----|-----------------|
 | 1 | **Q-30** | Continuous differential fuzz | reliability | A nightly/weekly job that feeds BIP324 + header/block (and script) wire. Crashes → `docs/external_findings/` + named regression. **Today: `fuzz/` `block_wire` + nightly `fuzz.yml` (not a required PR check).** Grow corpus / more targets. Findings 001–021 came from an external fuzzamoto campaign — that is not a substitute for the in-tree job. |
 | 2 | **Q-41** | Grow Core functional `run` set | test | Inventory `run` covers the wallet-client / P2P / mempool / buried-activation scripts we **claim**. **Today: 53 run / 214 skip (30 rpc-missing, 26 core-log).** COMPAT-done leftovers are `rpc-dialect` (not `rpc-missing`). Next `run` candidates: `mempool_accept` type-check, `mining_basic` weight, `rpc_getblockfrompeer`. Product-never skips stay skip. Unlabeled PRs stay cargo-only; nightly green |
-| 3 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work. **After this:** Electrum 1.6 then 1.7 (`protocol_max` bump in the same work) — [`COMPAT.md`](../COMPAT.md) § Protocol versions |
-| 4 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
-| 5 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam. **Q-54** may need a seam if a cap rule cannot match a god-file. |
-| 6 | **Q-54** | Grow ast-grep rules from `ibd-memory.md` | code | One rule per named cap that is easy to delete: `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each rule has `lint/ast-grep/fixtures/{good,bad}/`. Peel god-files (**R-10**) only if a rule needs a seam. |
-| 7 | **Q-55** | CRAP `--fail-regression` | test | Commit `crap_baseline.json` (`--format json --sort file`) from a green coverage artifact. PRs fail if a function’s CRAP rises. Still no `--fail-above 30` while clippy allows `cognitive_complexity`. |
-| 8 | **Q-56** | Miri islands beyond primitives | reliability | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack_ud-style integers) that do not pull secp/store. Never workspace miri. |
+| 3 | **Q-57** | Store publish / Class C flush / sidecar | store | `VarTable::published_meta` loads count/end `Acquire` (ARM cannot tear the pair). `ArrayTable` / `StrongTxTable` `flush_dirty` cannot lose a `set` in the write window (clear dirty then snapshot, or equivalent). fuse8 `decode_body` fails closed (`NeedsRewrite`) instead of indexing fingerprints OOB. Spender overflow walk bounded by `spenders.count()`. Sidecar meta / `.mphf` / SH `.idx` do not rename an unsynced empty file into place. `sorted_run` orphan GC cannot delete a live run (lock is a type, not a comment). |
+| 4 | **Q-58** | Mempool persist order + eviction | mempool | `persist_all` writes body before claiming LIVE slots. Known-parent out-of-range vout hard-rejects (not orphan-forever). `worst_chunk` rate-tie does not strand descendants. `evict_to_budget` no-op iterations break (no spin). |
+| 5 | **Q-59** | RPC / CLI honesty | ops | `submitblock` matches [`rpc.md`](./rpc.md) / COMPAT (all networks) or those docs say regtest-only. `gettxout include_mempool` hides mempool-spent confirmed outs. `sendrawtransaction` / `submitpackage` enforce or reject `maxfeerate` / `maxburnamount`. Conf `milestone=0` is not overwritten by the network default. `--minrelaytxfee` parse failure is an error (negatives rejected). `getmininginfo` `blockmintxfee` uses a feerate formatter. `getnetworkhashps` is not a dummy ~2 hashes/block (or is labeled). JSON-RPC batch is bounded under the work permit. |
+| 6 | **Q-60** | P2P caps + compact reconstruction | p2p | Compact-block prefilled indexes are strictly increasing and in-bounds. AddrMan has tried/new caps. `cmpct_fills` / `requested_blocks` prune on abandon/timeout. `announced_wtx` rolls instead of clear-all INV burst. Pending/held eviction is FIFO (`held_seq`), not `HashMap::keys().next()`. Esplora WS store IO uses `spawn_blocking` like REST. IBD `disconnect_to` skips cloning the losing branch when there is no mempool. |
+| 7 | **Q-48** | BIP331 rust-bitcoin package types | interop | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only — no private P2P command. Blocked upstream — ranked below unblocked ops work. **After this:** Electrum 1.6 then 1.7 (`protocol_max` bump in the same work) — [`COMPAT.md`](../COMPAT.md) § Protocol versions |
+| 8 | **Q-31** | Hermetic tip fixtures | ops | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Unblocks Q-30 corpora |
+| 9 | **R-10** | Residual god-files | code | Peel **only** when a higher row needs a seam. After extracting `peer_tests` / `methods_tests` / `scripthash_tests`: production `query/lib` **4.2k**, `electrum/server` **3.7k**, `scripthash` **3.4k**, `sorted_run` **3.4k**, `methods` **3.3k**, `chain` **3.3k**, `store` **3.2k**. Further production peels wait for a real seam. **Q-54** may need a seam if a cap rule cannot match a god-file. |
+| 10 | **Q-54** | Grow ast-grep rules from `ibd-memory.md` | code | One rule per named cap that is easy to delete: `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each rule has `lint/ast-grep/fixtures/{good,bad}/`. Peel god-files (**R-10**) only if a rule needs a seam. |
+| 11 | **Q-55** | CRAP `--fail-regression` | test | Commit `crap_baseline.json` (`--format json --sort file`) from a green coverage artifact. PRs fail if a function’s CRAP rises. Still no `--fail-above 30` while clippy allows `cognitive_complexity`. |
+| 12 | **Q-56** | Miri islands beyond primitives | reliability | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack_ud-style integers) that do not pull secp/store. Never workspace miri. |
 
 ### Still valid? (this reaudit)
 
@@ -114,10 +118,11 @@ in store IO sessions + `script_pool` + confirm `head_drain`.
 | **Q-41** | Keep rank 2. 44 → **53** `run`. 214 skips; `rpc-missing` 30 + `core-log` 26 are the only growth matching claimed surface. |
 | **Q-50** | **Closed.** Write/lookup/load inventory includes `drain_join` / `dequeue` / wave nested tokens; `other=` is the explicit residual (`format_info` pins). A fat `other=` on a later IBD is confirm-perf, not a missing-meter program. 2026-08-18 dark-time numbers retired. |
 | **Q-36** | **Closed.** Default INFO is `ibd: progress`; `ibd: perf` / `ibd: sizes` / `perf_dbg` are DEBUG (`log_sample`). |
-| **Q-48** | Keep, rank 3. Waits on rust-bitcoin (**RB-007**). |
+| **Q-48** | Keep, rank 7. Waits on rust-bitcoin (**RB-007**). |
 | **Q-31** | Keep. Useful for Q-30; not blocking operators. |
 | **Q-34** | **Closed.** `OPERATOR.md` § First hour (regtest); README points at that section. |
-| **R-10** | Keep last. Inline tests left `peer.rs` / `methods.rs` / `scripthash.rs`. Remaining giants are production-sized (`query/lib` **4.2k**). |
+| **R-10** | Keep last among peels. Inline tests left `peer.rs` / `methods.rs` / `scripthash.rs`. Remaining giants are production-sized (`query/lib` **4.2k**). |
+| **Q-57–Q-60** | **Added 2026-08-25** from retired `algo-review.md`. Not a reaudit of the rest of this table. |
 
 Prior-reaudit closures (Q-37, Q-47, Q-49) and Won't-fix calls
 (Q-24/25/32/33/35/38) stand — evidence unchanged. This pass adds
@@ -128,7 +133,7 @@ and bench-in-CI (shipped shape, not a backlog).
 
 R-ids were the 2026-08-12 ranked slice. Canonical Open/Completed/Won't-fix
 id is in **bold**. Do not start **R-11+** — new work is the next unused
-**Q-id (Q-57+)**.
+**Q-id (Q-61+)**.
 
 | R-id | Canonical | Where |
 |------|-----------|-------|
@@ -136,9 +141,9 @@ id is in **bold**. Do not start **R-11+** — new work is the next unused
 | R-07 | **Q-30** | Open rank 1 |
 | R-08 | **Q-20** | Completed |
 | R-09 | **Q-16** | Completed |
-| R-10 | **R-10** | Open rank 5 |
+| R-10 | **R-10** | Open rank 9 |
 
-Next unused Q-id is **Q-57**.
+Next unused Q-id is **Q-61**.
 
 ---
 
@@ -157,6 +162,9 @@ Retired on purpose. Not a backlog. Not a failure.
 | **—** | Darwin notarization / Developer ID | Ad-hoc `codesign -s -` on the macos snapshot. Notarization is still not a product |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **X-M3** | Esplora process-wide `sh_join` LRU / per-IP / large cache | HTTP is not a session. A tiny LRU still evicts wallets; per-IP is NAT/DoS; a large cache is RSS (join payload × addresses × clients). Sticky joins stay on Electrum TCP (one slot per connection). Esplora keeps one last SH for sequential REST. |
+| **—** | Package-level feerate on `accept_package` / `submitpackage` | COMPAT: sequential `accept_tx`; a 0-fee CPFP parent is rejected on its own min-relay. Core `submitpackage` parity is not 1.0. |
+| **—** | Esplora `/blocks` reconstruct + chained `scripthash_mempool_stats` | Explorer page cost / dialect. Persist size/weight is a schema ask; graphical explorer APIs are already Won't-fix. |
+| **—** | Retired algo-review micro-opts | BDZ page fill, `HashHead::bulk_fill_empty` RAM, SH `insert_many` N², INV O(peers×mempool), Electrum per-row header read, mempool `find_free_slot` O(cap), `evict_nonfinal` O(n²), BQ `index.iter().find`, `BlockCache` prefix O(chain), GBT `depends` scan, log-macro eval when disabled, `api_log` mutex, bit-by-bit `count_ones`, `U64IdentityHasher` clustering, `last_push_data` PUSHDATA4, `--api-log` unbounded JSONL. Not a second backlog. Reopen a named Q-id only with a mainnet profile that names the cost. |
 | **—** | Headerless SH extent interior pages | Extent is a span-read of the existing 4 KiB delta-page record. Interiors keep `ver`/`n_fks`/`next` so one decoder serves leftovers, tails, and last-page append. Full-page payload is ~0.2% and a schema bump |
 | **—** | Restore `rbtc-script-coord-*` | `ibd-confirm` publishes waves, polls lock-free completion, feeds `scriptq` when steal is empty. Steal workers unpark the publisher. Do not add coordinator threads to keep the pool fed |
 | **—** | Flatten purpose-built io_uring machines | AGENTS.md: fix the machine; do not replace it with batched `pread`/`pwrite` without an explicit ask |
@@ -203,7 +211,7 @@ findings 001–022, CI split, map-free README, …) live in
 | Do | Do not |
 |----|--------|
 | Close work by **moving the Open row into Completed** in the same edit as the landing change | Leave `Status: fixed` in Open, or start a second table |
-| New item: next unused **Q-id (Q-57+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
+| New item: next unused **Q-id (Q-61+)** inserted at an explicit rank | Fill historical gaps (Q-06–Q-09, Q-17–Q-19, Q-26–Q-29) or start **R-11+** |
 | Retire a row to **Won't fix** when the product will not do it | Leave dead Open rows “for completeness” |
 | God-file peels only when a higher Open row needs a seam (**R-10**) | Split `query/lib` / `interpreter.rs` / `scripthash.rs` as a standalone “modularity” project |
 | Suite: no new remine-100 / default test **&gt;2 s** without justification ([TESTING.md](../TESTING.md)) | Time the full workspace as a planning spike |
@@ -286,8 +294,7 @@ included; tree at #177):
 
 | Audience | Read |
 |----------|------|
-| Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active program: **Q-41** (Core functional `run` set) |
-| Algo / DS findings | [`algo-review.md`](./algo-review.md) — not a fourth backlog in this file |
+| Next quality slice | **Open**, rank 1 (**Q-30** fuzz). Active program: **Q-41** (Core functional `run` set). Folded store/mempool/RPC/P2P leftovers: **Q-57–Q-60** |
 | Peer full nodes | [`peer-clients.md`](./peer-clients.md) — Hornet / satd notes; not a fourth backlog |
 | Release engineering | **Q-20**, **Q-21**, **Q-23** (completed) |
 | Security / adversarial | Protect Q-01–Q-02; next **Q-30** |

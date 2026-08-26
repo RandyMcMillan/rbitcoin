@@ -11,10 +11,15 @@ use arc_swap::ArcSwapOption;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type LiveMap = HashMap<[u8; 32], LiveEnt, BuildHasherDefault<TxidHasher>>;
 type RecentLayer = ChainLayer<u32, LiveMap>;
+
+fn empty_pending() -> Arc<LiveMap> {
+    static EMPTY: OnceLock<Arc<LiveMap>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(LiveMap::default())))
+}
 
 #[derive(Clone)]
 struct LiveEnt {
@@ -25,7 +30,7 @@ struct LiveEnt {
 }
 
 struct Inner {
-    pending: LiveMap,
+    pending: Arc<LiveMap>,
 }
 
 /// Pending notes plus the published layer head.
@@ -73,7 +78,7 @@ impl Default for RecentCreates {
         Self {
             head: ArcSwapOption::empty(),
             inner: Mutex::new(Inner {
-                pending: LiveMap::default(),
+                pending: empty_pending(),
             }),
         }
     }
@@ -91,23 +96,18 @@ impl RecentCreates {
         if g.pending.is_empty() {
             return;
         }
-        let hits = std::mem::take(&mut g.pending);
+        let hits = std::mem::replace(&mut g.pending, empty_pending());
+        drop(g);
         let mut lo = u32::MAX;
         let mut hi = 0u32;
         for e in hits.values() {
             lo = lo.min(e.height);
             hi = hi.max(e.height);
         }
-        drop(g);
         let until = until.max(hi);
         let older = self.head.load_full();
-        self.head.store(Some(ChainLayer::prepend(
-            older,
-            lo,
-            hi,
-            until,
-            Arc::new(hits),
-        )));
+        self.head
+            .store(Some(ChainLayer::prepend(older, lo, hi, until, hits)));
     }
 
     /// Merge pending into a layer that is never drop_ready until Class A HWMs exist.
@@ -132,11 +132,12 @@ impl RecentCreates {
         rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64), Option<CreatePin>)>,
     ) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let pending = Arc::make_mut(&mut g.pending);
         for (txid, fk, range, outs) in rows {
             if txid == [0u8; 32] {
                 continue;
             }
-            g.pending.insert(
+            pending.insert(
                 txid,
                 LiveEnt {
                     fk,
@@ -162,7 +163,13 @@ impl RecentCreates {
 
     fn filter_pending(&self, keep: impl Fn(&LiveEnt) -> bool) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.pending.retain(|_, e| keep(e));
+        if g.pending.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut g.pending).retain(|_, e| keep(e));
+        if g.pending.is_empty() {
+            g.pending = empty_pending();
+        }
     }
 
     fn filter_layers(
@@ -186,7 +193,7 @@ impl RecentCreates {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         RecentSnap {
             head: self.head.load_full(),
-            pending: Arc::new(g.pending.clone()),
+            pending: Arc::clone(&g.pending),
         }
     }
 
@@ -491,5 +498,53 @@ mod tests {
             "size must count pin script bytes, not 96 B/key; got {n}"
         );
         assert!(n > 96, "96 B/key identity estimate must not be the payload");
+    }
+
+    #[test]
+    fn snapshot_pending_is_cow_ptr_eq_until_note() {
+        let r = RecentCreates::new();
+        let a = r.snapshot();
+        let b = r.snapshot();
+        assert!(
+            Arc::ptr_eq(&a.pending, &b.pending),
+            "two snapshots with no note/publish/drop share pending Arc"
+        );
+        let pin = dummy_pin(vec![0x51, 0xaa]);
+        r.note_pins(10, [(tid(1), Fk(1), (1, 2), Some(Arc::clone(&pin)))]);
+        let c = r.snapshot();
+        assert!(
+            !Arc::ptr_eq(&a.pending, &c.pending),
+            "note must COW a new pending map"
+        );
+        assert_eq!(c.get(&tid(1)), Some((Fk(1), (1, 2))));
+        assert!(
+            Arc::ptr_eq(&c.create_pin(&tid(1)).expect("pin"), &pin),
+            "create_pin Arc-clones the pin, not script bytes"
+        );
+        assert!(
+            a.get(&tid(1)).is_none(),
+            "snapshot taken before note still sees the old map"
+        );
+        assert!(a.create_pin(&tid(1)).is_none());
+    }
+
+    #[test]
+    fn empty_pending_reuses_one_empty_arc() {
+        let r = RecentCreates::new();
+        let a = r.snapshot();
+        assert!(a.pending.is_empty());
+        r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        r.publish_layer(10);
+        let b = r.snapshot();
+        assert!(
+            Arc::ptr_eq(&a.pending, &b.pending),
+            "empty pending after publish reuses the construction empty Arc"
+        );
+        r.drop_from(10);
+        let c = r.snapshot();
+        assert!(
+            Arc::ptr_eq(&a.pending, &c.pending),
+            "empty pending after drop_from reuses the same empty Arc"
+        );
     }
 }

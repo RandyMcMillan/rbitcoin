@@ -225,7 +225,6 @@ Grouped by cost at mainnet scale. Many overlap §3.
 | P13 | `find_free_slot` | O(cap) per admit, O(cap²) fill | free-list `VecDeque` |
 | P14 | `persist_all` | rewrite entire mempool files | append body + patch slot |
 | P15 | `evict_nonfinal` | O(n²) per reorg | worklist of affected txs |
-| P17 | `RecentCreates::snapshot` | clone pending map (pins) / wave | COW `Arc<LiveMap>` |
 | P18 | BQ `dequeue` height remap | O(queue) `index.iter().find` | `HashMap<u32, VecDeque<id>>` |
 | P19 | `BlockCache` prefix drop | O(chain) per connect | `VecDeque` + base height |
 | P20 | GBT `depends` | O(txs × inputs) linear scan | `HashMap<Txid, idx>` |
@@ -349,7 +348,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 |-------|------|--------|------------------|
 | store | 0 | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N² |
 | consensus + primitives | 0 | *(none remaining)* | historical MTP walks, rehash txids |
-| query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | snapshot clone, BQ scan, SipHash in-flight |
+| query | 0 | retain fallback, RecentCreates CAS, merge_outs clone | BQ scan, SipHash in-flight |
 | net | 0 | compact indexes, random eviction, AddrMan/cmpct unbounded, v2 copies | INV flush, BlockCache |
 | mempool | 0 | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 0 | submitblock gate, gettxout, hashps, unbounded batch, blockmintxfee, maxfeerate | GBT depends, longpoll |

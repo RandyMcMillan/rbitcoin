@@ -125,7 +125,8 @@ impl HeaderHead {
             i += 1;
         }
         if gens.len() == 1 && gens[0].slots() < target_slots {
-            gens[0].rewrite_to_slots(target_slots)?;
+            let g = gens.remove(0);
+            gens.push(g.rewrite_to_slots(target_slots)?);
         }
         Ok(Self {
             base,
@@ -533,7 +534,24 @@ mod tests {
             h.flush().unwrap();
             assert_eq!(h.slots(), 32);
         }
+        #[cfg(unix)]
+        let old = std::fs::File::open(dir.join("header.head")).unwrap();
+        #[cfg(unix)]
+        let old_ino = {
+            use std::os::unix::fs::MetadataExt;
+            old.metadata().unwrap().ino()
+        };
         let t = HeaderTable::open(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                std::fs::metadata(dir.join("header.head")).unwrap().ino(),
+                old_ino,
+                "HeaderTable::open must replace undersized header.head, not punch it"
+            );
+            drop(old);
+        }
         for hash in &hashes {
             assert_eq!(t.get_by_hash(hash).unwrap().unwrap().1.hash, *hash);
         }

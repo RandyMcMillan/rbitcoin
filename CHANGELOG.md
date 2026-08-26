@@ -63,10 +63,10 @@ before 1.0).
   empty; SpendEdges + CreatePin remain. Write encodes ins from `Arc<Block>`
   + those edges. CreatePin outs stay stamp-time for in-flight.
 
-- **Algo-review open list:** [`docs/algo-review.md`](docs/algo-review.md)
-  is remaining work only. Landed items from that pass live here and in
-  owner docs. Close a finding by deleting its row; do not append a Closed
-  graveyard.
+- **Retire `docs/algo-review.md`:** remaining worth-fixing items are
+  **Q-57–Q-60** in [`docs/quality.md`](docs/quality.md) (store publish/flush,
+  mempool persist/eviction, RPC/CLI honesty, P2P caps). Inventory, gotchas,
+  and micro-opts are not a second backlog.
 
 - **`load_thr stamp=` nest:** `ibd: perf` prints
   `stamp=Nms(pack=Xms head=Yms)`. `head=` is leftover TipOnly

@@ -15,7 +15,6 @@ update that file — do not paste a parallel spec.
 | On-disk | [`SCHEMA.md`](../SCHEMA.md) | Current bytes; history in [`SCHEMA_HISTORY.md`](../SCHEMA_HISTORY.md) |
 | Confirm / store implementer | [`invariants.md`](./invariants.md) + [`concurrency.md`](./concurrency.md) | Stage IO, leftover union, roles, tip commit |
 | Tests | [`TESTING.md`](../TESTING.md) | How to run, budgets, coverage |
-| Algo / DS findings | [`algo-review.md`](./algo-review.md) | Open algorithm/DS findings; work High first |
 | Peer full nodes | [`peer-clients.md`](./peer-clients.md) | Hornet / satd comparison; later-consideration tests and ideas |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
@@ -47,7 +46,6 @@ quality backlog).
 | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | Workarounds where rust-bitcoin is not Core-faithful. |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
-| [`algo-review.md`](./algo-review.md) | Open algorithm/DS findings. Close by deleting the row in the same PR; do not copy into quality.md. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
 
@@ -81,6 +79,6 @@ table. Do not paste a second Allowed/Forbidden IO copy.
 1. Find the owner in the tables above. Edit that file.
 2. If the fact has no owner, add a row here in the same commit as the new file.
 3. Do not resurrect `docs/future-features/`, `docs/store-format.md`,
-   `docs/startup-states.md`, `docs/design-ibd-most-work-reorg.md`, or
-   `COVERAGE.md`. Their content lives in SCHEMA / invariants / architecture /
-   TESTING.
+   `docs/startup-states.md`, `docs/design-ibd-most-work-reorg.md`,
+   `docs/algo-review.md`, or `COVERAGE.md`. Their content lives in SCHEMA /
+   invariants / architecture / TESTING / quality.md.

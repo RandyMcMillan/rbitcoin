@@ -197,7 +197,7 @@ No `-u` on push (that would retarget the branch remote away from `origin`).
 | **One PR per plan** | Push more commits to the same branch. |
 | **Poll until green** | Do not walk away and call the plan done. |
 | **Done** | Required checks green **and** the PR is up for review. Do not merge unless asked. |
-| **No post-green PR-cite** | After required checks are green, do **not** push a docs-only follow-up whose only change is inserting this PR's number into CHANGELOG / algo-review / similar. That wastes a full CI run. Cite in the **PR body**. Owner docs can omit the GitHub number, or pick it up later in a docs change that was already needed. |
+| **No post-green PR-cite** | After required checks are green, do **not** push a docs-only follow-up whose only change is inserting this PR's number into CHANGELOG / quality.md / similar. That wastes a full CI run. Cite in the **PR body**. Owner docs can omit the GitHub number, or pick it up later in a docs change that was already needed. |
 | **Do not** | Force-push `master`, merge a red PR, collapse `origin` to a single URL, skip polling because “tests passed locally,” or invent **empty commits** to poke Actions. |
 | **Workflow YAML** | App cannot push `.github/workflows/*`. Ask the operator to `git push`. |
 

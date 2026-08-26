@@ -880,7 +880,7 @@ nice -n 10 ionice -c 3 ./target/release/rbitcoin-node \
 ```
 
 Hash-head in-place rehash is gone. An undersized leftover `header.head` may
-rewrite once at open (`store: header.head open-grow`).
+be deleted and recreated once at open (`store: header.head open-grow`).
 
 ## Consensus notes (historical mainnet)
 

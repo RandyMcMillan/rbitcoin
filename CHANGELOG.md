@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **`header.head` open-grow replaces the file:** an undersized single-gen
+  OA is deleted and recreated at the create target (`.mlt` kept). Crash
+  after unlink is a missing `header.head`, not a zeroed live table.
+  [`SCHEMA.md`](SCHEMA.md), [`docs/concurrency.md`](docs/concurrency.md).
+
 - **Confirm Class A kind per batch:** a load/write batch is all need-body
   (`plan=Some`) or all already-bodied (`plan=None`). Lookup splits loadq
   at `header_txs.has_body`; write drain stops on plan polarity. Mixed

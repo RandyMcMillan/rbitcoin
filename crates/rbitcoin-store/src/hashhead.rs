@@ -650,18 +650,33 @@ impl HashHead {
         Ok(())
     }
 
-    /// Occupied rewrite to a larger power-of-two. **Only** from
-    /// `HeaderHead::open` (no concurrent probes).
-    pub(crate) fn rewrite_to_slots(&self, new_slots: u64) -> Result<(), StoreError> {
+    /// Create a new OA file at `path`, reopening an existing `.mlt` if present.
+    fn create_replaced_oa(path: &Path, slots: u64) -> Result<Self, StoreError> {
+        let slots = slots.max(2).next_power_of_two();
+        let file = TableFile::create(path, TableKind::HashHead)?;
+        let multi = MultiList::open(path)?;
+        let body_bytes = SLOT_SIZE as u64 * slots;
+        let need = FILE_HEADER_LEN as u64 + body_bytes;
+        file.ensure_capacity(need)?;
+        file.set_logical_len(need)?;
+        file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
+        Ok(Self {
+            file,
+            multi,
+            state: Mutex::new(HashState { slots, occupied: 0 }),
+        })
+    }
+
+    /// Replace the OA file with a larger power-of-two. Open-only (no concurrent probes).
+    pub(crate) fn rewrite_to_slots(self, new_slots: u64) -> Result<Self, StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
         let (old_slots, occupied) = {
             let state = self.state.lock().unwrap();
             (state.slots, state.occupied)
         };
         if new_slots <= old_slots {
-            return Ok(());
+            return Ok(self);
         }
-        let new_bytes = SLOT_SIZE as u64 * new_slots;
         let mut entries: Vec<(HeadKey, u64)> = Vec::new();
         entries
             .try_reserve_exact(occupied as usize)
@@ -688,19 +703,14 @@ impl HashHead {
             slot += n as u64;
         }
 
-        let need = FILE_HEADER_LEN as u64 + new_bytes;
-        self.file.ensure_capacity(need)?;
-        self.file.set_logical_len(need)?;
-        self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
-        {
-            let mut state = self.state.lock().unwrap();
-            state.slots = new_slots;
-            state.occupied = 0;
-        }
+        let path = self.file.path().to_path_buf();
+        drop(self);
+        std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+        let fresh = Self::create_replaced_oa(&path, new_slots)?;
 
         entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
         let n_entries = entries.len() as u64;
-        let mut cache = SlotPageCache::new(self, new_slots);
+        let mut cache = SlotPageCache::new(&fresh, new_slots);
         for (k, packed) in entries {
             match cache.try_place_raw(&k, packed)? {
                 InsertResult::Done { .. } => {}
@@ -711,15 +721,16 @@ impl HashHead {
             }
         }
         cache.flush()?;
-        self.state.lock().unwrap().occupied = n_entries;
+        drop(cache);
+        fresh.state.lock().unwrap().occupied = n_entries;
         rbitcoin_log::warn!(
             "store: header.head open-grow path={} {}→{} slots occupied={}",
-            self.file.path().display(),
+            fresh.file.path().display(),
             old_slots,
             new_slots,
             n_entries
         );
-        Ok(())
+        Ok(fresh)
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
@@ -1234,6 +1245,42 @@ mod tests {
         assert!(!multi);
         assert_eq!(fk, Fk(42));
         assert!(running_as_cargo_test_binary() || cfg!(test));
+    }
+
+    #[test]
+    fn rewrite_to_slots_replaces_file_keeps_keys() {
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, 32).unwrap();
+        let mut k_multi = [0u8; 32];
+        k_multi[0] = 0x11;
+        h.insert(&k_multi, Fk(1)).unwrap();
+        h.insert(&k_multi, Fk(2)).unwrap();
+        let mut k_sole = [0u8; 32];
+        k_sole[0] = 0x22;
+        h.insert(&k_sole, Fk(3)).unwrap();
+        h.flush().unwrap();
+        #[cfg(unix)]
+        let old = std::fs::File::open(&path).unwrap();
+        #[cfg(unix)]
+        let old_ino = {
+            use std::os::unix::fs::MetadataExt;
+            old.metadata().unwrap().ino()
+        };
+        let h = h.rewrite_to_slots(64).unwrap();
+        assert_eq!(h.slots(), 64);
+        assert_eq!(h.get_all(&k_multi).unwrap(), vec![Fk(2), Fk(1)]);
+        assert_eq!(h.get(&k_sole).unwrap(), Some(Fk(3)));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().ino(),
+                old_ino,
+                "open-grow must replace the OA file, not zero the live inode"
+            );
+            drop(old);
+        }
+        cleanup_hh(&path);
     }
 
     #[test]

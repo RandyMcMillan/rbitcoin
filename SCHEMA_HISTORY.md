@@ -263,7 +263,8 @@ log a one-line warn, migrate or refuse with a clear message — do not silently
 - Rehash at load **7/8** (earlier eras rehashed more aggressively, e.g. ~1/2).
   Current writer: insert past 7/8 is full; `header.head` rolls `header.head.gN`
   instead of rewriting occupied slots. Open-grow of an undersized single gen
-  is the only occupied rewrite (exclusive, no concurrent probes).
+  deletes the OA file and recreates it at the create target (exclusive, no
+  concurrent probes; `.mlt` kept).
 
 ### Why
 

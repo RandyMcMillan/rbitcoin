@@ -141,7 +141,7 @@ pub struct WireLoadPipeline {
     pub path_lo: u32,
     /// Parent of `path_lo` when ahead of store tip (last wire hash of prior loaded batch).
     pub parent_hash: Option<[u8; 32]>,
-    /// Inclusive create-fk start for [`Query::archive_plan_batch_from_store`].
+    /// Inclusive create-fk start for [`Query::archive_plan_batch_from_wire`].
     pub next_tx_start: u64,
     /// Prior uncommitted packs: immutable layer snapshot (no shared mutable map).
     ///
@@ -248,11 +248,6 @@ pub fn confirm_wire_load_phase_pipelined(
     let mut ns_header = 0u64;
     let mut ns_prepare = 0u64;
 
-    let mut with_fk: Vec<(
-        rbitcoin_primitives::Fk,
-        rbitcoin_store::HeaderRecord,
-        Vec<rbitcoin_query::TxApply>,
-    )> = Vec::with_capacity(blocks.len());
     let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
     let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
 
@@ -319,8 +314,20 @@ pub fn confirm_wire_load_phase_pipelined(
         ns_header = ns_header.saturating_add(t.elapsed().as_nanos() as u64);
 
         let t = Instant::now();
-        let (header_rec, txs) =
-            crate::prepare_block_for_archive_with_txids(query, block.as_ref(), &txids)?;
+        let prev_fk = if i == 0 {
+            if block.header.prev_blockhash.to_byte_array() == [0u8; 32] {
+                rbitcoin_primitives::Fk::NULL
+            } else {
+                query
+                    .get_header_by_hash(block.header.prev_blockhash.as_byte_array())
+                    .map_err(ConsensusError::from)?
+                    .map(|(fk, _)| fk)
+                    .ok_or(ConsensusError::BadPrev)?
+            }
+        } else {
+            metas[i - 1].header_fk
+        };
+        let header_rec = crate::header_to_record(prev_fk, &block.header);
         ns_prepare = ns_prepare.saturating_add(t.elapsed().as_nanos() as u64);
         let t = Instant::now();
         let header_fk = if let Some((fk, _)) = query
@@ -335,7 +342,6 @@ pub fn confirm_wire_load_phase_pipelined(
                 .map_err(ConsensusError::from)?
         };
         ns_header = ns_header.saturating_add(t.elapsed().as_nanos() as u64);
-        with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);
         metas.push(BodyMeta {
             height: *height,
@@ -349,10 +355,11 @@ pub fn confirm_wire_load_phase_pipelined(
     }
 
     let t_fp = Instant::now();
-    let (_header_fks, mut need) = query
-        .archive_filter_need_bodies(&mut with_fk)
+    let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
+    let need_fks = query
+        .archive_filter_need_header_fks(&header_fks)
         .map_err(ConsensusError::from)?;
-    let mut plan = if need.is_empty() {
+    let mut plan = if need_fks.is_empty() {
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
                 .store()
@@ -374,18 +381,28 @@ pub fn confirm_wire_load_phase_pipelined(
         }
         None
     } else {
+        let mut need = Vec::with_capacity(need_fks.len());
+        for fk in &need_fks {
+            let i = metas
+                .iter()
+                .position(|m| m.header_fk == *fk)
+                .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: need-body header_fk not in batch",
+                )))?;
+            need.push((*fk, wire_blocks[i].as_ref(), metas[i].txids.as_slice()));
+        }
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_batch_from_store(
-                    &mut need,
+                .archive_plan_batch_from_wire(
+                    &need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
                     Some(p.published.as_ref()),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
-                .archive_plan_batch_from_store(
-                    &mut need,
+                .archive_plan_batch_from_wire(
+                    &need,
                     query.tx_body_count().saturating_add(1).max(1),
                     &rbitcoin_query::InFlightView::empty(),
                     None,

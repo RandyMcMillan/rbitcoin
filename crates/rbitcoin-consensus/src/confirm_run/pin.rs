@@ -56,55 +56,23 @@ pub(super) fn pin_for_wire_batch(
             }
         }
         let fill_vouts = parent_pin.parent_vouts.is_empty();
-        if !plan.edges.is_empty() {
-            spend_edges = plan.edges.clone();
-            if fill_vouts {
-                for eds in plan.edges.values() {
-                    for e in eds {
-                        let Some(pid) = e.create_fk.get() else {
-                            continue;
-                        };
-                        if plan.create_in_spend_header(e.spend_fk, pid) {
-                            continue;
-                        }
-                        parent_vouts.entry(pid).or_default().push(e.vout);
-                    }
-                }
-            }
-        } else {
-            for ((_pin, ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-                let Some(sid) = fk.get() else { continue };
-                let mut edges = Vec::with_capacity(ins.len());
-                for inp in ins {
-                    if inp.is_coinbase() || inp.prev_index == u32::MAX {
-                        edges.push(rbitcoin_query::SpendEdge {
-                            prev_txid: [0u8; 32],
-                            vout: u32::MAX,
-                            spend_fk: rbitcoin_primitives::Fk(sid),
-                            create_fk: rbitcoin_primitives::Fk::NULL,
-                        });
+        if plan.edges.is_empty() && !plan.planned_fks.is_empty() {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: plan spend edges empty",
+            )));
+        }
+        spend_edges = plan.edges.clone();
+        if fill_vouts {
+            for eds in plan.edges.values() {
+                for e in eds {
+                    let Some(pid) = e.create_fk.get() else {
+                        continue;
+                    };
+                    if plan.create_in_spend_header(e.spend_fk, pid) {
                         continue;
                     }
-                    if let Some(pid) = inp.create_fk.get() {
-                        edges.push(rbitcoin_query::SpendEdge {
-                            prev_txid: inp.prev_txid,
-                            vout: inp.prev_index,
-                            spend_fk: rbitcoin_primitives::Fk(sid),
-                            create_fk: inp.create_fk,
-                        });
-                        if fill_vouts && !plan.create_in_spend_header(*fk, pid) {
-                            parent_vouts.entry(pid).or_default().push(inp.prev_index);
-                        }
-                    } else {
-                        edges.push(rbitcoin_query::SpendEdge {
-                            prev_txid: inp.prev_txid,
-                            vout: inp.prev_index,
-                            spend_fk: rbitcoin_primitives::Fk(sid),
-                            create_fk: rbitcoin_primitives::Fk::NULL,
-                        });
-                    }
+                    parent_vouts.entry(pid).or_default().push(e.vout);
                 }
-                spend_edges.insert(sid, edges);
             }
         }
         if !fill_vouts {

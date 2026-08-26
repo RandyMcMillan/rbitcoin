@@ -166,6 +166,10 @@ before 1.0).
 
 ### Fixed
 
+- **Esplora mempool-only tx JSON includes vin/vout/size/weight:** Class A
+  miss uses the mempool wire body (`GET /tx`, `/txs`, `/txs/mempool`, WS
+  address-transactions). No more txid+fee stub.
+
 - **Mempool `relay_seq` / `accept_at` drop on unindex:** confirm, RBF, and
   eviction no longer leak per-admit INV maps for the process lifetime.
 

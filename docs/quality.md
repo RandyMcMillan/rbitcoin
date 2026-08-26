@@ -156,7 +156,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
 | **—** | Darwin notarization / Developer ID | Ad-hoc `codesign -s -` on the macos snapshot. Notarization is still not a product |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
-| **—** | Explorer APIs, full Core RPC, prune, ZMQ, IPC, v1 P2P, GUI, wallet keys | Product never. Inventory skips already say so |
+| **X-M3** | Esplora process-wide `sh_join` LRU / per-IP / large cache | HTTP is not a session. A tiny LRU still evicts wallets; per-IP is NAT/DoS; a large cache is RSS (join payload × addresses × clients). Sticky joins stay on Electrum TCP (one slot per connection). Esplora keeps one last SH for sequential REST. |
 | **—** | Headerless SH extent interior pages | Extent is a span-read of the existing 4 KiB delta-page record. Interiors keep `ver`/`n_fks`/`next` so one decoder serves leftovers, tails, and last-page append. Full-page payload is ~0.2% and a schema bump |
 | **—** | Restore `rbtc-script-coord-*` | `ibd-confirm` publishes waves, polls lock-free completion, feeds `scriptq` when steal is empty. Steal workers unpark the publisher. Do not add coordinator threads to keep the pool fed |
 | **—** | Flatten purpose-built io_uring machines | AGENTS.md: fix the machine; do not replace it with batched `pread`/`pwrite` without an explicit ask |

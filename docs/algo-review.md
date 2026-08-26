@@ -98,7 +98,7 @@ What the node runs. Findings follow.
 | RPC `active` | id-keyed map | `dispatch` removes by id |
 | Electrum status | `sha256(concat rows)` | confirmed rows include **blockhash** (COMPAT A-B-A); mempool appended last (same as `get_history`) |
 | Esplora `/blocks` | reconstruct 10 full blocks | for size/weight only |
-| SH join cache | process-wide single slot | serializes clients |
+| SH join cache | process-wide single slot | sequential REST reuse; concurrent different SHs re-join |
 
 ### Node / primitives
 
@@ -190,13 +190,8 @@ What the node runs. Findings follow.
   `maxburnamount` and ignore them. Enforce or reject the params.
 - **E-M1.** `scripthash_mempool_stats` undercounts chained unconfirmed vs
   Esplora.
-- **X-M1.** Esplora mempool tx JSON stubs omit vin/vout/size/weight when the
-  tx is not in Class A (`handlers.rs`). BDK-class clients fail to parse.
-  Wire tx is in `mp.get_tx`.
 - **X-M2.** Esplora WS does store IO on the tokio thread (`ws.rs` `on_tip` /
   `on_mempool_announce`). REST uses `spawn_blocking`.
-- **X-M3.** Process-wide single `sh_join` slot: concurrent clients serialize
-  and evict each other.
 - **O-M1.** Conf `milestone=0` overwritten by network default (`cli.rs`).
   CLI `--milestone 0` works; conf cannot disable skip.
 - **O-M2.** `--minrelaytxfee` parse failure silently ignored; negatives → 0.
@@ -264,16 +259,15 @@ Do not flatten io_uring machines. Do not add a process pin FIFO.
 3. **Held/pending eviction:** FIFO via existing `held_seq` / `VecDeque`.
 4. **Announced-tx sets:** rolling bloom (Core `CRollingBloomFilter`).
 5. **BlockCache:** `VecDeque` + height offset.
-6. **Esplora `sh_join`:** small LRU, not one global slot.
-7. **Esplora `/blocks`:** stored summary, not reconstruct.
-8. **`last_push_data`:** `Script::instructions()` (gets PUSHDATA4).
-9. **`U64IdentityHasher`:** multiply by odd golden-ratio constant if
+6. **Esplora `/blocks`:** stored summary, not reconstruct.
+7. **`last_push_data`:** `Script::instructions()` (gets PUSHDATA4).
+8. **`U64IdentityHasher`:** multiply by odd golden-ratio constant if
     hashbrown clustering shows.
-10. **Seqlock:** fences, or stop rolling your own for a 16-byte pair.
-11. **CLI parsers:** table-driven `take_parsed` (node + bench).
-12. **Bench hex:** use `rbitcoin_primitives::hex_*`.
-13. **Bit count:** `u8::count_ones`.
-14. **SH `put_sorted_creates` `seen`:** `put_chain` already sorts+dedups.
+9. **Seqlock:** fences, or stop rolling your own for a 16-byte pair.
+10. **CLI parsers:** table-driven `take_parsed` (node + bench).
+11. **Bench hex:** use `rbitcoin_primitives::hex_*`.
+12. **Bit count:** `u8::count_ones`.
+13. **SH `put_sorted_creates` `seen`:** `put_chain` already sorts+dedups.
 
 ---
 
@@ -347,7 +341,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | mempool | 0 | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 0 | submitblock gate, gettxout, hashps, unbounded batch, blockmintxfee, maxfeerate | GBT depends, longpoll |
 | electrum | 0 | mempool_stats | status full-history, announce O(subs) |
-| esplora | 0 | stub mempool JSON, WS on runtime, sh_join slot | `/blocks` reconstruct, WS announce IO |
+| esplora | 0 | WS on runtime | `/blocks` reconstruct, WS announce IO |
 | node/cli/log/bench | 0 | milestone=0 conf, minrelay silent, frozen AddrMan | log gating, api_log mutex |
 
 ---
@@ -358,10 +352,11 @@ Not a plan (no red/green steps). Split-risk, then operator-visible, then
 IBD CPU.
 
 1. Mempool persist order, AddrMan cap.
-2. Esplora `/blocks` summaries (P11) and mempool JSON stubs (X-M1).
+2. Esplora `/blocks` summaries (P11).
 
 Out of scope (Won't-fix / policy): flattening uring, process pin FIFO,
-leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.
+leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI,
+Esplora SH join LRU / per-IP / large cache (**X-M3**).
 Dropped from this list as too small or already owner-doc: ping RTT in
 whole seconds, bench Electrum response pairing, CLI `--` for negative
 RPC args, chunked HTTP in `rbitcoin-cli`.

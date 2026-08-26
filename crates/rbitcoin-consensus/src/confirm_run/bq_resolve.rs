@@ -345,6 +345,10 @@ pub fn confirm_bq_resolve_wave_capped(
     let t_head = Instant::now();
     need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
 
+    if let Some(&hi) = selected.last() {
+        query.note_lookup_tiponly_start(hi);
+    }
+
     if !need.is_empty() {
         let rows = query
             .store()
@@ -358,10 +362,6 @@ pub fn confirm_bq_resolve_wave_capped(
     }
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
-    if let Some(&hi) = done.last() {
-        let started = query.lookup_started_hi().unwrap_or(0).max(hi);
-        query.set_lookup_started_hi(Some(started));
-    }
     if let Some((live, published)) = ids.as_mut() {
         if let (Some(&lo), Some(&hi)) = (done.first(), done.last()) {
             live.note_span(lo, hi, layer);
@@ -954,6 +954,11 @@ mod tests {
         assert_eq!(st.precompute_ns, 0);
         assert_eq!(rbitcoin_store::take_raw_clone_n(), 0);
         assert!(q.block_queue_has_height(15));
+        assert!(
+            q.lookup_started_hi().is_none(),
+            "hold_partial must not bump started_hi; got {:?}",
+            q.lookup_started_hi()
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -1460,7 +1465,7 @@ mod tests {
         assert_eq!(
             q.lookup_started_hi(),
             Some(4),
-            "resolve wave must bump started_hi to processed hi"
+            "resolve wave must bump started_hi at start of TipOnly"
         );
         assert!(
             q.block_queue_has_height(4),

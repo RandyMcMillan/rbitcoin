@@ -1131,7 +1131,7 @@ pub struct Query {
     soft_confirm_window: AtomicU32,
     /// Last contiguous height lookup dequeued into loadq (`u32::MAX` = none).
     lookup_taken_hi: AtomicU32,
-    /// Max height included in a lookup resolve wave (`u32::MAX` = none).
+    /// Highest height whose TipOnly **started** (`u32::MAX` = none).
     lookup_started_hi: AtomicU32,
     /// Max height whose Class A append committed (`u32::MAX` = none).
     class_a_hi: AtomicU32,
@@ -1561,6 +1561,12 @@ impl Query {
     pub fn set_lookup_started_hi(&self, hi: Option<u32>) {
         self.lookup_started_hi
             .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+    }
+
+    /// Advance [`Self::lookup_started_hi`] to `hi` if higher (never rewind).
+    pub fn note_lookup_tiponly_start(&self, hi: u32) {
+        let next = self.lookup_started_hi().unwrap_or(0).max(hi);
+        self.set_lookup_started_hi(Some(next));
     }
 
     pub fn class_a_hi(&self) -> Option<u32> {
@@ -2513,6 +2519,16 @@ mod tests {
         assert_eq!(q.class_a_hi(), Some(2));
         q.set_lookup_started_hi(None);
         assert!(q.lookup_started_hi().is_none());
+        q.note_lookup_tiponly_start(12);
+        assert_eq!(q.lookup_started_hi(), Some(12));
+        q.note_lookup_tiponly_start(7);
+        assert_eq!(
+            q.lookup_started_hi(),
+            Some(12),
+            "TipOnly start must never rewind"
+        );
+        q.note_lookup_tiponly_start(40);
+        assert_eq!(q.lookup_started_hi(), Some(40));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

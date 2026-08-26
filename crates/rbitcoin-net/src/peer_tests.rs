@@ -722,14 +722,16 @@ fn minchainwork_does_not_getdata_below_floor() {
         .unwrap();
         let got = drain_getdata(&mut out_rx);
         let h1 = hdrs[0].block_hash();
-        let h50 = hdrs[49].block_hash();
         assert_eq!(
             got.len(),
-            50,
-            "50th header (work 102) must getdata the whole path, got {got:?}"
+            MAX_SERVE_BLOCKS,
+            "50th header (work 102) getdata must match serve window, got {got:?}"
         );
         assert_eq!(got[0], h1, "getdata should start at height 1");
-        assert_eq!(got[49], h50, "getdata should end at height 50");
+        assert_eq!(
+            got[MAX_SERVE_BLOCKS - 1],
+            hdrs[MAX_SERVE_BLOCKS - 1].block_hash()
+        );
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
     });
@@ -1659,7 +1661,7 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     let mut pb = HashMap::new();
     let mut ph = HashMap::new();
     let (tx, _rx) = mpsc::unbounded_channel();
-    drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
+    drain_pending(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false).unwrap();
 
     // Invalid tip-extending body must not kill the session (001).
     use bitcoin::absolute::LockTime;
@@ -1727,7 +1729,8 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     let bh = bad.block_hash();
     pb.insert(bh, bad.clone());
     let (tx, _rx) = mpsc::unbounded_channel();
-    drain_pending(&hub, &tx, &mut pb, &mut ph).expect("invalid block must not end session");
+    drain_pending(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false)
+        .expect("invalid block must not end session");
     assert!(
         hub.is_block_invalid(&bh),
         "consensus-invalid body must be cached as failed"
@@ -3349,7 +3352,7 @@ fn drain_requests_missing_parent_of_pending_branch() {
     let mut pb = HashMap::new();
     pb.insert(orphan.block_hash(), orphan);
     let mut ph = HashMap::new();
-    drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
+    drain_pending(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false).unwrap();
     let msg = rx.try_recv().expect("getdata for missing parent");
     match msg {
         NetworkMessage::GetData(inv) => {
@@ -3433,7 +3436,7 @@ fn drain_connects_pending_child_of_new_tip_after_reorg() {
     pb.insert(b2.block_hash(), b2.clone());
     let mut ph = HashMap::new();
     let (tx, _rx) = mpsc::unbounded_channel();
-    drain_pending(&hub, &tx, &mut pb, &mut ph).unwrap();
+    drain_pending(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false).unwrap();
     assert_eq!(hub.tip_height(), Some(2), "reorg plus child must connect");
     assert_eq!(hub.tip_hash().unwrap(), b2.block_hash());
     assert!(hub.is_connected(&b1.block_hash()));

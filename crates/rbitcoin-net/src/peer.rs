@@ -96,12 +96,13 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
 const MAX_PENDING_CMPCT: usize = 8;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
-/// Cap on the per-peer download window and missing-parent getdata burst
-/// (DoS / process RAM). Must be ≥99 so tip-follow can *request* a 99-block
-/// competing branch; apply is `ChainHub::accept_received_block` (see
-/// `docs/architecture.md` most-work chain selection).
+/// Cap on decoded bodies stashed per session (DoS / process RAM). Must be
+/// ≥99 so tip-follow can assemble a 99-block competing branch; apply is
+/// `ChainHub::accept_received_block` (see `docs/architecture.md`).
+/// Inflight `getdata` is [`MAX_SERVE_BLOCKS`] (peer reconstruct cap).
 const MAX_PENDING_BLOCKS: usize = 128;
-/// Max reconstructed full bodies queued on one session writer (IBD window).
+/// Max reconstructed full bodies queued on one session writer, and the
+/// matching catch-up `getdata` window (extra hashes stick in `requested`).
 pub(crate) const MAX_SERVE_BLOCKS: usize = 16;
 
 /// Test/assert surface for the tip-follow pending-body cap (equals production).
@@ -1617,7 +1618,7 @@ async fn handle_peer_frame(
         }
         NetworkMessage::Headers(headers) => {
             let n = headers.len().min(MAX_HEADERS_RESULTS);
-            let headers_reply = session.is_some_and(|s| s.take_awaiting_headers());
+            let _ = session.is_some_and(|s| s.take_awaiting_headers());
             if n == 0 {
                 // Empty headers is a failed getheaders response, not an announcement.
             } else if let Some(first) = headers.first() {
@@ -1681,35 +1682,14 @@ async fn handle_peer_frame(
                     } else {
                         persist_pending_header_path(hub, pending_headers, last);
                         rbitcoin_log::info!("{}", synchronizing_blockheaders_log(announced_h));
-                        let mut want = Vec::new();
-                        if header_path_meets_minwork(hub, pending_headers, last) {
-                            want = missing_blocks_on_header_path(
-                                hub,
-                                pending_headers,
-                                last,
-                                pending_blocks,
-                                requested_blocks,
-                            );
-                            match branch {
-                                Some(std::cmp::Ordering::Less) => want.clear(),
-                                // BIP130 cap is for unsolicited announcements only.
-                                // A getheaders reply (rejoin / catch-up) must fetch
-                                // the whole offered path.
-                                Some(std::cmp::Ordering::Equal) if !headers_reply => {
-                                    let room = 16usize.saturating_sub(requested_blocks.len());
-                                    want.truncate(room);
-                                }
-                                Some(std::cmp::Ordering::Greater) if !headers_reply => {
-                                    let side = header_path_join(hub, pending_headers, last)
-                                        .is_some_and(|h| hub.tip_hash() != Some(h));
-                                    if side {
-                                        let room = 16usize.saturating_sub(requested_blocks.len());
-                                        want.truncate(room);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                        let mut want = fetchable_header_path_bodies(
+                            hub,
+                            pending_headers,
+                            last,
+                            pending_blocks,
+                            requested_blocks,
+                        );
+                        want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested_blocks.len()));
                         queue_block_getdata(
                             hub,
                             out_tx,
@@ -1768,17 +1748,38 @@ async fn handle_peer_frame(
                     pending_blocks.remove(&hash);
                     pending_headers.remove(&hash);
                     maybe_select_hb_if_relay(hub, session);
-                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                    drain_pending(
+                        hub,
+                        out_tx,
+                        pending_blocks,
+                        pending_headers,
+                        requested_blocks,
+                        getdata_use_compact(hub, *peer_cmpct_version),
+                    )?;
                 }
                 Ok(AcceptOutcome::AlreadyHave) => {
                     pending_blocks.remove(&hash);
                     pending_headers.remove(&hash);
-                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                    drain_pending(
+                        hub,
+                        out_tx,
+                        pending_blocks,
+                        pending_headers,
+                        requested_blocks,
+                        getdata_use_compact(hub, *peer_cmpct_version),
+                    )?;
                 }
                 Ok(AcceptOutcome::IgnoredWeaker) => {
                     pending_blocks.remove(&hash);
                     pending_headers.remove(&hash);
-                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                    drain_pending(
+                        hub,
+                        out_tx,
+                        pending_blocks,
+                        pending_headers,
+                        requested_blocks,
+                        getdata_use_compact(hub, *peer_cmpct_version),
+                    )?;
                 }
                 Err(e) if net_error_is_store_not_found(&e) => {
                     rbitcoin_log::warn!(
@@ -1871,7 +1872,14 @@ async fn handle_peer_frame(
                         // we lack (`mempool_reorg` 20-block submitblock).
                         let _ = queue_getheaders(out_tx, hub, session, true, None);
                     }
-                    drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                    drain_pending(
+                        hub,
+                        out_tx,
+                        pending_blocks,
+                        pending_headers,
+                        requested_blocks,
+                        getdata_use_compact(hub, *peer_cmpct_version),
+                    )?;
                 } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
                     if missing.is_empty() {
                         queue_out(
@@ -1936,10 +1944,24 @@ async fn handle_peer_frame(
                                     ph.clear_cmpct_fill(hash);
                                 }
                             }
-                            drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                            drain_pending(
+                                hub,
+                                out_tx,
+                                pending_blocks,
+                                pending_headers,
+                                requested_blocks,
+                                getdata_use_compact(hub, *peer_cmpct_version),
+                            )?;
                         }
                         Ok(_) => {
-                            drain_pending(hub, out_tx, pending_blocks, pending_headers)?;
+                            drain_pending(
+                                hub,
+                                out_tx,
+                                pending_blocks,
+                                pending_headers,
+                                requested_blocks,
+                                getdata_use_compact(hub, *peer_cmpct_version),
+                            )?;
                         }
                         Err(_) => {
                             // Reconstructed but unconnectable (swapped txs):
@@ -2206,24 +2228,6 @@ fn header_announcement_connects(
     is_genesis_hash(&join) || hub.knows_header(&join)
 }
 
-fn header_path_join(
-    hub: &ChainHub,
-    pending: &HashMap<BlockHash, bitcoin::block::Header>,
-    start: BlockHash,
-) -> Option<BlockHash> {
-    if hub.is_connected(&start) {
-        return Some(start);
-    }
-    let (join, _) = pending_walk(pending, start);
-    if join == start {
-        return None;
-    }
-    if is_genesis_hash(&join) {
-        return None;
-    }
-    hub.is_connected(&join).then_some(join)
-}
-
 /// Headers more than this many blocks behind our tip are not useful for
 /// tip-follow (Core `NODE_NETWORK_LIMITED` window, ~2 days).
 pub(crate) const ANCIENT_TIP_BLOCKS: u32 = 288;
@@ -2345,6 +2349,27 @@ fn work_of_header_path(
     None
 }
 
+/// Bodies on `tip`'s connecting header path that we may `getdata`.
+/// Weaker-than-tip and below `-minimumchainwork` stay header-only.
+fn fetchable_header_path_bodies(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+    pending_blocks: &HashMap<BlockHash, bitcoin::Block>,
+    requested: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
+    if !header_path_meets_minwork(hub, pending, tip) {
+        return Vec::new();
+    }
+    if matches!(
+        header_branch_vs_tip(hub, pending, tip),
+        Some(std::cmp::Ordering::Less)
+    ) {
+        return Vec::new();
+    }
+    missing_blocks_on_header_path(hub, pending, tip, pending_blocks, requested)
+}
+
 /// Bodies on `tip`'s header path that we have not connected, stashed, or asked for.
 fn missing_blocks_on_header_path(
     hub: &ChainHub,
@@ -2433,12 +2458,23 @@ pub(crate) fn try_queue_served_block(
     Ok(true)
 }
 
+fn pending_header_leaves(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {
+    let prevs: HashSet<BlockHash> = pending.values().map(|h| h.prev_blockhash).collect();
+    pending
+        .keys()
+        .copied()
+        .filter(|h| !prevs.contains(h))
+        .collect()
+}
+
 /// Try to accept pending blocks that connect to tip or form a better branch.
 fn drain_pending(
     hub: &ChainHub,
     out: &mpsc::UnboundedSender<NetworkMessage>,
     pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    requested_blocks: &mut HashSet<BlockHash>,
+    compact: bool,
 ) -> Result<(), NetError> {
     // A reorg can make a held block the child of the *new* tip after the
     // greedy pass already ran. Repeat until the tip is stable.
@@ -2462,11 +2498,22 @@ fn drain_pending(
             missing.push(prev);
         }
     }
-    if !missing.is_empty() {
-        missing.truncate(MAX_PENDING_BLOCKS);
-        let want: Vec<Inventory> = missing.into_iter().map(Inventory::WitnessBlock).collect();
-        queue_out(out, NetworkMessage::GetData(want))?;
+    for last in pending_header_leaves(pending_headers) {
+        for h in fetchable_header_path_bodies(
+            hub,
+            pending_headers,
+            last,
+            pending_blocks,
+            requested_blocks,
+        ) {
+            if !missing.contains(&h) {
+                missing.push(h);
+            }
+        }
     }
+    missing.retain(|h| !requested_blocks.contains(h));
+    missing.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested_blocks.len()));
+    queue_block_getdata(hub, out, requested_blocks, &missing, compact)?;
     Ok(())
 }
 

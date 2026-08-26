@@ -59,9 +59,12 @@ impl LoadAheadState {
     /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
+        self.in_flight
+            .apply_keep_untils(hub.query.take_create_keep_until());
         self.in_flight.prune_if_head_ready(
             &hub.query.store().height_fence_snapshot(),
             hub.query.head_drain_fk(),
+            hub.query.class_a_hi(),
         );
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {

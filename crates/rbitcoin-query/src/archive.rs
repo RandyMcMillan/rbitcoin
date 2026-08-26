@@ -1409,7 +1409,11 @@ mod tests {
         ));
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
-        log.prune_if_head_ready(&q.store().height_fence_snapshot(), q.head_drain_fk());
+        log.prune_if_head_ready(
+            &q.store().height_fence_snapshot(),
+            q.head_drain_fk(),
+            q.class_a_hi(),
+        );
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
             "fence missing: prune must keep"
@@ -1491,7 +1495,11 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        log.prune_if_head_ready(&q.store().height_fence_snapshot(), q.head_drain_fk());
+        log.prune_if_head_ready(
+            &q.store().height_fence_snapshot(),
+            q.head_drain_fk(),
+            q.class_a_hi(),
+        );
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
             "drain_fk 0: prune must keep"

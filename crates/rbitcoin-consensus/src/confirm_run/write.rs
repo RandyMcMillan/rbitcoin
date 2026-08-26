@@ -258,6 +258,9 @@ pub fn confirm_write_phase(
                 if let Some(last) = batch.prepared.last() {
                     query.set_class_a_hi(Some(last.height.0));
                 }
+                for p in &batch.prepared {
+                    query.stamp_create_keep_until(p.height.0);
+                }
                 let t_clone = Instant::now();
                 query.flush_recent_creates();
                 let clone_ns = t_clone.elapsed().as_nanos() as u64;

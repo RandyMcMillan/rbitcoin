@@ -1,6 +1,9 @@
 //! Confirm_run unit tests (peeled from confirm_run.rs).
 
-use super::{recent_create_height_slices, recent_create_rows_for_slices, write_height_needed};
+use super::{
+    confirm_archive_kind, recent_create_height_slices, recent_create_rows_for_slices,
+    write_batch_vs_tip, write_height_needed, ConfirmArchiveKind, WriteBatchVsTip,
+};
 
 #[test]
 fn tx_head_drain_thread_is_named_and_reused() {
@@ -163,7 +166,7 @@ fn script_ok_append_contiguous_and_gap() {
     let err = good.append_contiguous(bad).err().expect("len mismatch");
     assert_eq!(err.len(), 1);
 
-    // archive_plan merge: None + Some, Some + Some, Some + None.
+    // archive_plan merge: Some+Some concatenates; mixed polarity is leftover.
     let mut with_plan = batch_one(70);
     with_plan.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
     let mut next = batch_one(71);
@@ -171,35 +174,54 @@ fn script_ok_append_contiguous_and_gap() {
     assert!(with_plan.append_contiguous(next).is_ok());
     assert!(with_plan.archive_plan.is_some());
     let mut only_other = batch_one(72);
-    // Self plan remains Some; other None keeps it.
     only_other.archive_plan = None;
-    assert!(with_plan.append_contiguous(only_other).is_ok());
+    let err = with_plan
+        .append_contiguous(only_other)
+        .err()
+        .expect("Some+None polarity");
+    assert_eq!(err.len(), 1);
+    assert_eq!(with_plan.len(), 2);
     assert!(with_plan.archive_plan.is_some());
-    // Self None absorbs other's plan.
     let mut no_plan = batch_one(80);
     let mut has = batch_one(81);
     has.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
-    assert!(no_plan.append_contiguous(has).is_ok());
-    assert!(no_plan.archive_plan.is_some());
+    let err = no_plan
+        .append_contiguous(has)
+        .err()
+        .expect("None+Some polarity");
+    assert_eq!(err.len(), 1);
+    assert_eq!(no_plan.len(), 1);
+    assert!(no_plan.archive_plan.is_none());
+    let n2 = batch_one(81);
+    assert!(no_plan.append_contiguous(n2).is_ok());
+    assert_eq!(no_plan.len(), 2);
+    assert!(no_plan.archive_plan.is_none());
 }
 
-/// Heights at or below tip must be stripped before structural write
-/// (dup pipeline race after scripts claim the same tip+1 twice).
-/// Write filter + stage entry points + empty scripts purity (one surface).
+/// Write vs tip is all-old (no-op), all-new (proceed), or spans tip (Corrupt).
 /// External three-stage path: rbitcoin-test three_stage_confirm_and_parent_pin_surface.
 #[test]
 fn three_stage_write_filter_and_scripts_surface() {
     let tip = Some(100u32);
-    let heights = [98u32, 99, 100, 101, 102];
-    let kept: Vec<u32> = heights
-        .into_iter()
-        .filter(|&h| write_height_needed(tip, h))
-        .collect();
-    assert_eq!(kept, vec![101, 102]);
+    assert_eq!(
+        write_batch_vs_tip(tip, [98u32, 99, 100, 101, 102]),
+        WriteBatchVsTip::SpansTip
+    );
+    assert_eq!(
+        write_batch_vs_tip(tip, [98u32, 99, 100]),
+        WriteBatchVsTip::AllOld
+    );
+    assert_eq!(
+        write_batch_vs_tip(tip, [101u32, 102]),
+        WriteBatchVsTip::AllNew
+    );
+    assert_eq!(
+        write_batch_vs_tip(tip, std::iter::empty()),
+        WriteBatchVsTip::AllOld
+    );
     assert!(!write_height_needed(tip, 100));
     assert!(!write_height_needed(Some(0), 0));
     assert!(write_height_needed(Some(0), 1));
-    // Empty chain: genesis (and all heights) still need write.
     assert!(write_height_needed(None, 0));
     assert!(write_height_needed(None, 1));
 
@@ -223,6 +245,35 @@ fn three_stage_write_filter_and_scripts_surface() {
     let ok = confirm_scripts_phase(batch).expect("empty scripts ok");
     assert!(ok.batch.prepared.is_empty());
     assert!(ok.batch.wire_blocks.is_empty());
+}
+
+#[test]
+fn confirm_archive_kind_refuses_mixed() {
+    assert_eq!(
+        confirm_archive_kind(3, 0).unwrap(),
+        ConfirmArchiveKind::AllHaveBody
+    );
+    assert_eq!(
+        confirm_archive_kind(3, 3).unwrap(),
+        ConfirmArchiveKind::AllNeedBody
+    );
+    assert_eq!(
+        confirm_archive_kind(1, 0).unwrap(),
+        ConfirmArchiveKind::AllHaveBody
+    );
+    assert_eq!(
+        confirm_archive_kind(1, 1).unwrap(),
+        ConfirmArchiveKind::AllNeedBody
+    );
+    let err = confirm_archive_kind(3, 2).unwrap_err();
+    match err {
+        crate::error::ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(m)) => {
+            assert_eq!(m, "invariant: confirm batch mixed archived");
+        }
+        other => panic!("expected mixed archived, got {other:?}"),
+    }
+    assert!(confirm_archive_kind(2, 1).is_err());
+    assert!(confirm_archive_kind(2, 3).is_err());
 }
 
 fn empty_loaded_batch() -> super::LoadedBatch {
@@ -2518,6 +2569,33 @@ fn store_start_states_lookup_load_confirm() {
         Some(h_s0),
         "idempotent Class A skip must not bump class_a_hi"
     );
+
+    // One-shot mixed need-body + already-bodied must fail closed (split into two calls).
+    let h_have = h_s1 + 1;
+    let b_have = mine_cb(b_s1.block_hash(), b_s1.header.time + 600, h_have);
+    let (header_have, txs_have) = prepare_block_for_archive(&q, &params, &b_have).unwrap();
+    q.commit_class_a_only(&header_have, &txs_have).unwrap();
+    let h_need = h_have + 1;
+    let b_need = mine_cb(b_have.block_hash(), b_have.header.time + 600, h_need);
+    let mixed_arcs = [
+        (Height(h_have), Arc::new(b_have.clone()), None),
+        (Height(h_need), Arc::new(b_need.clone()), None),
+    ];
+    match confirm_wire_lookup_stamp(&q, &params, ms, &mixed_arcs, None) {
+        Err(crate::error::ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(m))) => {
+            assert_eq!(m, "invariant: confirm batch mixed archived");
+        }
+        Ok(_) => panic!("mixed lookup stamp must fail closed"),
+        Err(other) => panic!("expected mixed archived lookup, got {other:?}"),
+    }
+    let mixed_run = [(Height(h_have), b_have), (Height(h_need), b_need)];
+    match super::confirm_wire_load_phase(&q, &params, ms, &mixed_run, &ScriptPreverified::new()) {
+        Err(crate::error::ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(m))) => {
+            assert_eq!(m, "invariant: confirm batch mixed archived");
+        }
+        Ok(_) => panic!("mixed one-shot load must fail closed"),
+        Err(other) => panic!("expected mixed archived load, got {other:?}"),
+    }
 
     let _ = std::fs::remove_dir_all(&path);
 }

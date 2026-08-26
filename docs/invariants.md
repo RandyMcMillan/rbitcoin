@@ -114,12 +114,13 @@ published idx window.
 | **S0 fresh tip+1** | absent | present | parents on head | plan=Some: plan_batch stamps fk+txout/spent range+txid + parent vouts; load `txout` by range, copies spent_range |
 | **S1 already-archived** | body present (plan=None) | present | parents on head | lookup still stamps parent fk+ranges+txid (idx/head); load `txout` only |
 | **S2 tip-ahead pack** | prior pack uncommitted | — | parents in in_flight | plan uses in_flight create_fk; **must** also stamp ranges (idx) when body exists, or use offline CreatePin |
-| **S3 short catch-up** | mixed S0/S1 over gap | present | mostly cold | ordered claim tip+1 only for write; lookup may plan ahead with reserved HWM |
+| **S3 short catch-up** | mixed need-body / already-bodied over a height-ordered prefix | present | mostly cold | two (or more) homogeneous batches: lookup splits loadq at `header_txs.has_body`; write drain stops on `archive_plan` polarity. Load/scripts are not splitters. Mixed stamp is `Corrupt("invariant: confirm batch mixed archived")`. Write vs tip is all-old no-op, all-new fill, or `Corrupt("invariant: write batch spans tip")` — no prefix strip |
 | **S4 cascade fail** | tip+1 blacklisted or write failed | — | — | tip-ahead write may hit `fk mismatch` / `connect height not tip+1` → **soft requeue**, not permanent blacklist |
 
 | Error | State | Root | Fix |
 |-------|-------|------|-----|
 | `lookup stage miss (load cold denserels forbidden)` | S0/S3 | Load Forbid + parents without plan range | Lookup always fills `external_parents` body; load outs by `txout` range only |
+| `invariant: confirm batch mixed archived` | S3 | One stamp/load list spans need-body and already-bodied | Split at the `has_body` change (IBD lookup) or call one-shot twice. Do not hitchhike `get_list` on `plan=Some` |
 | `put_full_batch fk mismatch` | S4 cascade | Tip-ahead plan after tip+1 reject | Soft requeue for fk mismatch / connect height not tip+1 |
 | `parent create_fk unresolved` | S2 | Leftover union miss | **Permanent.** Fix publish order. Do not soft-requeue. |
 | false PrevoutSpent | identity | schema-13 zero pin id | plan reverse map / lookup `txid.body` only |

@@ -60,11 +60,16 @@ pub use bq_resolve::{
 use head_drain::{submit_head_drain, HEAD_DRAIN_THREAD_NAME};
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
+#[cfg(test)]
+use lookup::ConfirmArchiveKind;
+use lookup::{
+    confirm_archive_kind, create_fks_from_header_ranges, known_create_txid_lookup,
+    stamp_parent_pin_archived,
+};
 pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_stamp, DenserelsWarmStats, ParentPinStamp,
     PlanStampOutcome,
 };
-use lookup::{create_fks_from_header_ranges, known_create_txid_lookup, stamp_parent_pin_archived};
 use phases::assemble_run;
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
@@ -78,7 +83,10 @@ pub use scripts::{
 };
 pub use write::confirm_write_phase;
 #[cfg(test)]
-use write::{recent_create_height_slices, recent_create_rows_for_slices, write_height_needed};
+use write::{
+    recent_create_height_slices, recent_create_rows_for_slices, write_batch_vs_tip,
+    write_height_needed, WriteBatchVsTip,
+};
 
 /// Pure-write annotate backend from global `RBITCOIN_IO`.
 #[inline]
@@ -359,6 +367,7 @@ pub fn confirm_wire_load_phase_pipelined(
     let need_fks = query
         .archive_filter_need_header_fks(&header_fks)
         .map_err(ConsensusError::from)?;
+    confirm_archive_kind(header_fks.len(), need_fks.len())?;
     let mut plan = if need_fks.is_empty() {
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
@@ -414,16 +423,6 @@ pub fn confirm_wire_load_phase_pipelined(
             if let Some(id) = m.header_fk.get() {
                 if let Some(fks) = by_header.get(&id) {
                     m.tx_fks = fks.clone();
-                }
-            }
-            if m.tx_fks.is_empty() {
-                if let Some(list) = query
-                    .store()
-                    .header_txs
-                    .get_list(m.header_fk)
-                    .map_err(ConsensusError::from)?
-                {
-                    m.tx_fks = list;
                 }
             }
             let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
@@ -594,8 +593,9 @@ impl ScriptOkBatch {
     ///
     /// Scripts enqueue height-ordered tip extensions; write drains the channel
     /// and merges so Class A + Class C + annotate run once (fewer tip fsyncs).
-    /// Returns `Err(other)` if not a contiguous height extension (caller keeps
-    /// `other` for the next batch).
+    /// Returns `Err(other)` if not a contiguous height extension **or** if
+    /// `archive_plan` polarity differs (`Some` vs `None`). Caller writes the
+    /// prefix then keeps `other` for the next meta-batch.
     pub fn append_contiguous(&mut self, mut other: Self) -> Result<(), Self> {
         if other.is_empty() {
             return Ok(());
@@ -619,13 +619,14 @@ impl ScriptOkBatch {
         {
             return Err(other);
         }
+        if self.archive_plan.is_some() != other.archive_plan.is_some() {
+            return Err(other);
+        }
         self.prepared.append(&mut other.prepared);
         self.wire_blocks.append(&mut other.wire_blocks);
         self.batch_parents.extend_from(other.batch_parents);
-        match (self.archive_plan.as_mut(), other.archive_plan.take()) {
-            (Some(dst), Some(src)) => dst.append(src),
-            (None, Some(src)) => self.archive_plan = Some(src),
-            _ => {}
+        if let (Some(dst), Some(src)) = (self.archive_plan.as_mut(), other.archive_plan.take()) {
+            dst.append(src);
         }
         Ok(())
     }

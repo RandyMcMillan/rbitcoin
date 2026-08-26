@@ -124,10 +124,9 @@ fn push_resolve_keys(
     height: u32,
     block: &Block,
     pres: &[TxPrecompute],
+    skip: &HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
     keys: &mut HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
 ) {
-    let same_block: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
-        pres.iter().map(|p| p.txid).collect();
     let bip34 = params.bip34_active_at(height);
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
@@ -135,12 +134,12 @@ fn push_resolve_keys(
                 continue;
             }
             let prev = inp.previous_output.txid.to_byte_array();
-            if prev == [0u8; 32] || same_block.contains(&prev) {
+            if prev == [0u8; 32] || skip.contains(&prev) {
                 continue;
             }
             keys.insert(prev);
         }
-        if !bip34 {
+        if !bip34 && !skip.contains(&p.txid) {
             keys.insert(p.txid);
         }
     }
@@ -208,6 +207,8 @@ pub fn confirm_bq_resolve_wave_capped(
     let mut stats = BqResolveWaveStats::default();
     let mut done: Vec<u32> = Vec::new();
     let mut all_keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
+        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut wave_creates: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
         HashSet::with_hasher(BuildHasherDefault::default());
     let mut wires: Vec<(u32, [u8; 32], ResolvedWire)> = Vec::new();
 
@@ -328,7 +329,17 @@ pub fn confirm_bq_resolve_wave_capped(
             continue;
         };
         let t_col = Instant::now();
-        push_resolve_keys(params, h, block.as_ref(), pres.as_ref(), &mut all_keys);
+        for p in pres.iter() {
+            wave_creates.insert(p.txid);
+        }
+        push_resolve_keys(
+            params,
+            h,
+            block.as_ref(),
+            pres.as_ref(),
+            &wave_creates,
+            &mut all_keys,
+        );
         stats.collect_ns = stats
             .collect_ns
             .saturating_add(t_col.elapsed().as_nanos() as u64);
@@ -612,9 +623,48 @@ mod tests {
         let pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
         let mut keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
             HashSet::with_hasher(BuildHasherDefault::default());
-        push_resolve_keys(&params, height, &block, &pres, &mut keys);
+        let skip = HashSet::with_hasher(BuildHasherDefault::default());
+        push_resolve_keys(&params, height, &block, &pres, &skip, &mut keys);
         assert_eq!(keys.len(), 1);
         assert!(keys.contains(&prev.to_byte_array()));
+    }
+
+    #[test]
+    fn same_wave_create_is_not_tiponly_need() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let g_cb = genesis.txdata[0].compute_txid();
+        let b1 = mine_with_txs(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
+        );
+        let h1_create = b1.txdata[1].compute_txid();
+        let b2 = mine_with_txs(
+            b1.block_hash(),
+            b1.header.time + 600,
+            2,
+            vec![spend_op_true(h1_create, 0, Amount::from_sat(48_0000_0000))],
+        );
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
+            .unwrap();
+        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
+            .unwrap();
+        let wave =
+            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[1, 2], None).unwrap();
+        assert_eq!(wave.items.len(), 2);
+        assert_eq!(
+            wave.stats.keys, 1,
+            "same-wave h=1 create must not be TipOnly need; archived genesis still is"
+        );
+        assert!(
+            wave.stats.hits >= 1,
+            "archived genesis parent must still TipOnly-hit"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]

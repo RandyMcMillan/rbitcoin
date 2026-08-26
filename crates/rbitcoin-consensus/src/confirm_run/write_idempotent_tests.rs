@@ -1457,6 +1457,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         )],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
+        edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
         external_parents: Default::default(),
@@ -1516,6 +1517,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         packed: vec![],
         planned_fks: vec![],
         per_header_ranges: vec![],
+        edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
         external_parents: idents,
@@ -1712,6 +1714,88 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// C1: pin reads plan.edges; packed ins may be empty.
+#[test]
+fn pin_plan_edges_without_packed_ins() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query, SpendEdge};
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    use std::sync::Arc;
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+    });
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-pin-edges-no-ins-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let q = Query::open_or_create(&path).unwrap();
+    q.enter_direct_index_mode().unwrap();
+
+    let parent_tx = TxRecord {
+        txid: [0x11u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let pin: CreatePin = Arc::new((
+        parent_tx.clone(),
+        vec![OutputRecord::unspent(50, vec![0x51])],
+    ));
+    let child_tx = TxRecord {
+        txid: [0x42u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![
+        (Arc::clone(&pin), vec![]),
+        (
+            Arc::new((child_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            vec![],
+        ),
+    ];
+    plan.planned_fks = vec![Fk(1), Fk(2)];
+    plan.batch_pin = vec![Arc::clone(&pin), Arc::clone(&plan.packed[1].0)];
+    plan.per_header_ranges = vec![(Fk(10), Fk(1), 1), (Fk(11), Fk(2), 1)];
+    plan.external_parent_vouts.insert(1, vec![0]);
+    plan.edges.insert(
+        2,
+        vec![SpendEdge {
+            prev_txid: parent_tx.txid,
+            vout: 0,
+            spend_fk: Fk(2),
+            create_fk: Fk(1),
+        }],
+    );
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    let (parents, edges, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+        .expect("pin from plan.edges with empty packed ins");
+    let child_edges = edges.get(&2).expect("child spend edges");
+    assert_eq!(child_edges.len(), 1);
+    assert_eq!(child_edges[0].create_fk, Fk(1));
+    assert!(parents.get_parent_out(Fk(1), 0).is_some());
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Need a high vout from a multi-out parent (need-vouts only, not full n_out).
 #[test]
 fn pin_sparse_need_high_vout_only() {
@@ -1785,6 +1869,7 @@ fn pin_sparse_need_high_vout_only() {
         packed: vec![(Arc::clone(&spend_pin), spend_ins)],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
+        edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
         external_parents: {
@@ -2284,6 +2369,15 @@ fn store_start_states_lookup_load_confirm() {
         let arcs = [(Height(h_s0), Arc::new(b_s0.clone()), None)];
         let stamped = confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S0 lookup");
         assert!(stamped.plan.is_some(), "S0 must plan Class A");
+        let plan = stamped.plan.as_ref().expect("plan");
+        assert!(
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "IBD stamp must not carry packed InputRecords to load/write"
+        );
+        assert!(
+            !plan.edges.is_empty(),
+            "IBD stamp must carry SpendEdges for pin/write encode"
+        );
         assert!(
             stamped.parent_pin.idents.values().any(|p| p.body.is_some()),
             "S0 lookup must stamp external parent body ranges"

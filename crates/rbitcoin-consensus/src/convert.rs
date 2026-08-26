@@ -118,6 +118,52 @@ fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusErr
     })
 }
 
+/// Class A ins from wire + stamped spend edges (write-time encode).
+pub(crate) fn input_records_from_wire(
+    tx: &Transaction,
+    spend_fk: Fk,
+    edges: &[rbitcoin_query::SpendEdge],
+) -> Result<Vec<InputRecord>, ConsensusError> {
+    if tx.input.len() != edges.len() {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: write encode spends/tx input mismatch",
+        )));
+    }
+    let mut out = Vec::with_capacity(tx.input.len());
+    for (inp, e) in tx.input.iter().zip(edges.iter()) {
+        if e.spend_fk != spend_fk {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: write encode spend_fk mismatch",
+            )));
+        }
+        let is_cb = inp.previous_output.is_null()
+            || (inp.previous_output.txid.to_byte_array() == [0u8; 32]
+                && inp.previous_output.vout == u32::MAX);
+        if is_cb {
+            out.push(InputRecord::coinbase(
+                inp.sequence.to_consensus_u32(),
+                inp.script_sig.to_bytes(),
+                inp.witness.to_vec(),
+            ));
+            continue;
+        }
+        if e.create_fk.is_null() {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: write encode missing create_fk",
+            )));
+        }
+        out.push(InputRecord {
+            prev_txid: inp.previous_output.txid.to_byte_array(),
+            create_fk: e.create_fk,
+            prev_index: inp.previous_output.vout,
+            sequence: inp.sequence.to_consensus_u32(),
+            script_sig: inp.script_sig.to_bytes(),
+            witness: inp.witness.to_vec(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +192,14 @@ mod tests {
         assert_eq!(apply.tx.txid, want);
         assert_eq!(apply.inputs.len(), 1);
         assert_eq!(apply.outputs[0].value, 50_0000_0000);
+        let edges = [rbitcoin_query::SpendEdge {
+            prev_txid: [0u8; 32],
+            vout: u32::MAX,
+            spend_fk: Fk(9),
+            create_fk: Fk::NULL,
+        }];
+        let ins = input_records_from_wire(&tx, Fk(9), &edges).unwrap();
+        assert_eq!(ins, apply.inputs);
     }
 
     #[test]

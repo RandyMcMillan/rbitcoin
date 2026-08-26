@@ -1068,12 +1068,12 @@ mod tests {
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("stamp after wave");
         let plan = stamped.plan.expect("new body needs a plan");
-        let spend = plan
-            .packed
-            .iter()
-            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+        let inp = plan
+            .edges
+            .values()
+            .flatten()
+            .find(|e| e.vout != u32::MAX)
             .expect("spend");
-        let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
         assert_eq!(inp.prev_txid, g_cb.to_byte_array());
         assert!(!inp.create_fk.is_null());
         let _ = std::fs::remove_dir_all(&path);
@@ -1206,12 +1206,12 @@ mod tests {
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
                 .expect("in-flight parent must stamp until tip covers the parent height");
         let plan = stamped.plan.expect("plan");
-        let spend = plan
-            .packed
-            .iter()
-            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+        let inp = plan
+            .edges
+            .values()
+            .flatten()
+            .find(|e| e.vout != u32::MAX)
             .expect("spend");
-        let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
         assert_eq!(inp.create_fk, parent_fk);
         log.prune_through_tip(Some(1));
         assert!(
@@ -1300,12 +1300,12 @@ mod tests {
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
                 .expect("in-flight parent must stamp while confirmed tip leads the fence");
         let plan = stamped.plan.expect("plan");
-        let spend = plan
-            .packed
-            .iter()
-            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+        let inp = plan
+            .edges
+            .values()
+            .flatten()
+            .find(|e| e.vout != u32::MAX)
             .expect("spend");
-        let inp = spend.1.iter().find(|i| !i.is_coinbase()).expect("in");
         assert_eq!(inp.create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -1334,16 +1334,12 @@ mod tests {
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("leftover connected parent must TipOnly-head, not invariant");
         let plan = stamped.plan.expect("new body needs a plan");
-        let spend = plan
-            .packed
-            .iter()
-            .find(|(_, ins)| ins.iter().any(|i| !i.is_coinbase()))
+        let inp = plan
+            .edges
+            .values()
+            .flatten()
+            .find(|e| e.vout != u32::MAX)
             .expect("spend tx");
-        let inp = spend
-            .1
-            .iter()
-            .find(|i| !i.is_coinbase())
-            .expect("spend input");
         assert_eq!(inp.prev_txid, g_cb.to_byte_array());
         assert_eq!(inp.create_fk, expect_fk);
         let _ = std::fs::remove_dir_all(&path);

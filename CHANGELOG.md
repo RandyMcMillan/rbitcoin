@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **IBD Class A ins at write:** `confirm_wire_lookup_stamp` drops packed
+  `InputRecord`s after plan (SpendEdges + CreatePin remain). Write encodes
+  ins from `Arc<Block>` + those edges. CreatePin outs stay stamp-time for
+  in-flight.
+
 - **Algo-review open list:** [`docs/algo-review.md`](docs/algo-review.md)
   is remaining work only. Landed items from that pass live here and in
   owner docs. Close a finding by deleting its row; do not append a Closed

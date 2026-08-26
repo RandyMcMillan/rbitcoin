@@ -45,7 +45,7 @@ wire / body-queue
   → load / pin (BatchParents outs by known txout range only;
             IO: txout.body — NEVER head / idx / txid.body / inwit)
   → scripts (pure CPU — NEVER any store IO)
-  → Class A commit (if ArchiveWritePlan present)
+  → Class A commit (if ArchiveWritePlan present; encode ins from Arc<Block> + SpendEdges)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
@@ -59,6 +59,10 @@ run on the **load** thread and consume `LoadBatch.pres` — they do not read
 IO** (head / idx), not load pin. After a lookup wave publishes parent P into
 live_union, load stamp of a child spending P has **zero** leftover TipOnly for
 P (`head_need_n=0`). Pack stays on load; do not move `plan_batch` onto lookup.
+
+IBD stamp drops packed `InputRecord`s after plan (SpendEdges + CreatePin
+survive freeze). Write encodes ins from `Arc<Block>` + those edges. CreatePin
+outs stay stamp-time for in-flight. Load still does not head/idx.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|

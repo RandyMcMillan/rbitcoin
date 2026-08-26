@@ -1057,7 +1057,6 @@ mod tests {
             &[g_cb.to_byte_array()],
             &rbitcoin_query::InFlightView::empty(),
             published.as_ref(),
-            q.recent_creates().as_ref(),
         )
         .expect("stamp helper after wave");
         assert_eq!(

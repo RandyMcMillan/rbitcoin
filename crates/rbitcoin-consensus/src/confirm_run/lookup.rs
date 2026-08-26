@@ -172,7 +172,6 @@ pub(super) fn stamp_parent_pin_archived(
         &need_vec,
         ifo,
         query.published_ids(),
-        query.recent_creates(),
     )
     .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
@@ -850,7 +849,6 @@ mod tests {
             &[parent_txid],
             &rbitcoin_query::InFlightView::empty(),
             q.published_ids(),
-            q.recent_creates(),
         )
         .expect("shared helper");
 

@@ -660,14 +660,12 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
-        // External parents: in-flight → published live_union → recent creates
-        // → leftover TipOnly, then idx range-fill. Same helper as plan=None.
+        // External parents: in-flight → published live_union → leftover TipOnly
         let ext = crate::stamp_external_parents(
             &self.store,
             &need_vec,
             in_flight,
             published.unwrap_or(self.published_ids.as_ref()),
-            self.recent_creates.as_ref(),
         )?;
         let inflight_ns = ext.inflight_ns;
         let head_fk_ns = ext.head_fk_ns;
@@ -1843,7 +1841,6 @@ mod tests {
             &[parent_txid],
             &crate::InFlightView::empty(),
             q.published_ids().as_ref(),
-            q.recent_creates().as_ref(),
         )
         .expect("stamp archived parent");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(1)));
@@ -2198,7 +2195,6 @@ mod tests {
             &[parent_txid],
             &crate::InFlightView::empty(),
             published.as_ref(),
-            q.recent_creates().as_ref(),
         )
         .expect("shared helper");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(88)));
@@ -2225,66 +2221,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Write-published recent identity skips leftover TipOnly (`head_need=0`).
+    /// In-flight CreatePin skips leftover TipOnly (`head_need=0`) and stamps the pin.
     #[test]
-    fn stamp_hits_recent_creates_skips_leftover() {
-        let (dir, q) = temp_query("recent-creates-stamp");
-        let parent_txid = {
-            let mut t = [0u8; 32];
-            t[0] = 0x91;
-            t
-        };
-        q.recent_creates()
-            .note(10, [(parent_txid, Fk(91), (5000, 16))]);
-        crate::archive_phase_stats::with_exclusive(|| {
-            let _ = crate::archive_phase_stats::sample_and_reset();
-            let helper = crate::stamp_external_parents(
-                q.store(),
-                &[parent_txid],
-                &crate::InFlightView::empty(),
-                q.published_ids().as_ref(),
-                q.recent_creates().as_ref(),
-            )
-            .expect("recent stamp");
-            assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(91)));
-            assert_eq!(
-                helper.idents.get(&91).and_then(|p| p.body),
-                Some((5000, 16))
-            );
-            assert_eq!(helper.recent_n, 1);
-            assert_eq!(helper.head_need_n, 0, "recent hit must skip leftover");
-            assert!(
-                helper
-                    .idents
-                    .get(&91)
-                    .and_then(|p| p.pin.as_ref())
-                    .is_none(),
-                "identity-only recent note must not carry a CreatePin"
-            );
-
-            let child = child_spend(parent_txid, 0x92);
-            let mut need = vec![(Fk(1), vec![child])];
-            let plan = q
-                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
-                .expect("S0 recent");
-            assert_eq!(plan.packed[0].1[0].create_fk, Fk(91));
-            assert_eq!(
-                plan.external_parents.get(&91).and_then(|p| p.body),
-                Some((5000, 16))
-            );
-            let mix = crate::archive_phase_stats::sample_and_reset();
-            assert_eq!(mix.head_need, 0, "plan path must skip leftover too");
-            assert!(mix.recent_n >= 1, "recent hits must be metered: {mix:?}");
-        });
-        q.recent_creates().drop_from(10);
-        assert!(q.recent_creates().get(&parent_txid).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stamp_recent_hit_carries_create_pin() {
+    fn stamp_inflight_hit_carries_create_pin() {
         use std::sync::Arc;
-        let (dir, q) = temp_query("recent-creates-pin");
+        let (dir, q) = temp_query("inflight-creates-pin");
         let parent_txid = {
             let mut t = [0u8; 32];
             t[0] = 0x93;
@@ -2302,31 +2243,42 @@ mod tests {
             },
             vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
         ));
-        q.recent_creates().note_pins(
-            10,
-            [(parent_txid, Fk(93), (5000, 16), Some(Arc::clone(&pin)))],
-        );
-        let helper = crate::stamp_external_parents(
-            q.store(),
-            &[parent_txid],
-            &crate::InFlightView::empty(),
-            q.published_ids().as_ref(),
-            q.recent_creates().as_ref(),
-        )
-        .expect("recent stamp");
-        let got = helper
-            .idents
-            .get(&93)
-            .and_then(|p| p.pin.as_ref())
-            .expect("stamp must carry CreatePin");
-        assert!(Arc::ptr_eq(got, &pin));
+        let mut log = crate::InFlightLog::new();
+        log.note_layer(crate::InFlightLayer::from_plan_pins([(Fk(93), &pin)]));
+        let ifo = log.snapshot();
+        crate::archive_phase_stats::with_exclusive(|| {
+            let _ = crate::archive_phase_stats::sample_and_reset();
+            let helper = crate::stamp_external_parents(
+                q.store(),
+                &[parent_txid],
+                &ifo,
+                q.published_ids().as_ref(),
+            )
+            .expect("inflight stamp");
+            assert_eq!(helper.head_need_n, 0, "inflight hit must skip leftover");
+            let got = helper
+                .idents
+                .get(&93)
+                .and_then(|p| p.pin.as_ref())
+                .expect("stamp must carry CreatePin");
+            assert!(Arc::ptr_eq(got, &pin));
+
+            let child = child_spend(parent_txid, 0x94);
+            let mut need = vec![(Fk(1), vec![child])];
+            let plan = q
+                .archive_plan_batch_from_store(&mut need, 1, &ifo, None)
+                .expect("S0 inflight");
+            assert_eq!(plan.packed[0].1[0].create_fk, Fk(93));
+            let mix = crate::archive_phase_stats::sample_and_reset();
+            assert_eq!(mix.head_need, 0, "plan path must skip leftover too");
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After Class A + idx, `publish_recent_creates` is what write uses.
+    /// After drain+fence, TipOnly stamps without a RAM identity ring.
     #[test]
-    fn publish_recent_creates_after_commit_skips_leftover() {
-        let (dir, q) = temp_query("recent-publish");
+    fn leftover_tiponly_after_commit_skips_when_connected() {
+        let (dir, q) = temp_query("tiponly-after-commit");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let empty = crate::InFlightView::empty();
         let plan_a = q
@@ -2335,27 +2287,19 @@ mod tests {
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
-        let creates = plan_a.batch_creates.clone();
         q.archive_commit_plan(plan_a).unwrap();
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        q.publish_recent_creates(0, creates).unwrap();
-        assert!(
-            q.recent_creates().get(&parent_txid).is_some(),
-            "write publish must expose committed identity"
-        );
+        q.on_load_pack().unwrap();
 
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
             let mut need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xec)])];
             let plan_b = q
                 .archive_plan_batch_from_store(&mut need_b, 2, &empty, None)
-                .expect("recent publish must stamp");
+                .expect("TipOnly must stamp after fence");
             assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
-            let mix = crate::archive_phase_stats::sample_and_reset();
-            assert_eq!(mix.head_need, 0, "published recent must skip leftover");
-            assert!(mix.recent_n >= 1, "recent publish must meter: {mix:?}");
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

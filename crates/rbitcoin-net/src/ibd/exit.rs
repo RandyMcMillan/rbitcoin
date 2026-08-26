@@ -64,6 +64,16 @@ pub(crate) fn empty_path_header_fan(lag: u32, inflight: usize, alive: usize) -> 
     alive.min(4).max(1)
 }
 
+/// Clear `headers_done` so empty-path `getheaders` can resume.
+///
+/// Latch is only for lag ≤ 2 (stop the tip storm). When peers advertise a
+/// higher tip, unlatch even if leftover getdata is still inflight — that
+/// used to sit behind [`path_drained`] and stall until SIGINT.
+#[inline]
+pub(crate) fn should_unlatch_headers_done(st: &IbdWorkState, tip_h: u32) -> bool {
+    st.headers_done && st.ordered.is_empty() && header_lag_behind_peers(st, tip_h) > 2
+}
+
 /// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.
 ///
 /// Must stay rare: mainnet ~1M headers ≈ 200–300ms per call. Same cadence as
@@ -304,5 +314,32 @@ mod tests {
         assert_eq!(empty_path_header_fan(100, 0, 29), 4);
         assert_eq!(empty_path_header_fan(100, 5, 29), 1);
         assert_eq!(empty_path_header_fan(100, 0, 2), 2);
+    }
+
+    /// Unlatch `headers_done` on lag>2 even with leftover inflight; never at lag≤2.
+    #[test]
+    fn should_unlatch_headers_done() {
+        use super::super::state::InflightReq;
+        use bitcoin::hashes::Hash;
+        use bitcoin::BlockHash;
+
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(100));
+        st.max_peer_height = 105;
+        st.max_ready_height = 100;
+        st.headers_done = true;
+        for i in 1u8..=7 {
+            st.inflight
+                .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
+        }
+        assert_eq!(header_lag_behind_peers(&st, 100), 5);
+        assert!(super::should_unlatch_headers_done(&st, 100));
+
+        st.max_peer_height = 100;
+        assert_eq!(header_lag_behind_peers(&st, 100), 0);
+        assert!(!super::should_unlatch_headers_done(&st, 100));
+
+        st.max_peer_height = 105;
+        st.ordered.push_back(BlockHash::from_byte_array([0xab; 32]));
+        assert!(!super::should_unlatch_headers_done(&st, 100));
     }
 }

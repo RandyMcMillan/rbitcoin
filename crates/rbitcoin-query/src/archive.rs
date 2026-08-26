@@ -1226,13 +1226,16 @@ mod tests {
         };
         let mut need_b = vec![(Fk(2), vec![child])];
         let mut inflight_log = crate::InFlightLog::new();
-        inflight_log.note_layer(crate::InFlightLayer::from_plan_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
-        ));
+        inflight_log.note_layer(
+            crate::InFlightLayer::from_plan_pins(
+                plan_a
+                    .planned_fks
+                    .iter()
+                    .zip(plan_a.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            ),
+            None,
+        );
         let inflight = inflight_log.snapshot();
         let plan_b = q
             .archive_plan_batch_from_store(&mut need_b, 2, &inflight, None)
@@ -1286,13 +1289,16 @@ mod tests {
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
         let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
-        ));
+        log.note_layer(
+            crate::InFlightLayer::from_plan_pins(
+                plan_a
+                    .planned_fks
+                    .iter()
+                    .zip(plan_a.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            ),
+            None,
+        );
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
 
@@ -1398,20 +1404,19 @@ mod tests {
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
         let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
-        ));
+        log.note_layer(
+            crate::InFlightLayer::from_plan_pins(
+                plan_a
+                    .planned_fks
+                    .iter()
+                    .zip(plan_a.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            ),
+            None,
+        );
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
-        log.prune_if_head_ready(
-            &q.store().height_fence_snapshot(),
-            q.head_drain_fk(),
-            q.class_a_hi(),
-        );
+        log.prune_if_class_c(q.tip_height().map(|h| h.0));
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
             "fence missing: prune must keep"
@@ -1478,13 +1483,16 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
         let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
-        ));
+        log.note_layer(
+            crate::InFlightLayer::from_plan_pins(
+                plan_a
+                    .planned_fks
+                    .iter()
+                    .zip(plan_a.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            ),
+            None,
+        );
         q.archive_commit_plan_defer_head(plan_a).unwrap();
         assert!(
             q.store().txs.pending_head_len() >= 1,
@@ -1493,11 +1501,7 @@ mod tests {
         q.store()
             .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
             .unwrap();
-        log.prune_if_head_ready(
-            &q.store().height_fence_snapshot(),
-            q.head_drain_fk(),
-            q.class_a_hi(),
-        );
+        log.prune_if_class_c(q.tip_height().map(|h| h.0));
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
             "drain_fk 0: prune must keep"
@@ -1764,7 +1768,10 @@ mod tests {
             .unwrap();
         // Creates-only layer: fk known, no CreatePin outs (archived mid-head race).
         let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_txid_fks([(parent_txid, Fk(1))]));
+        log.note_layer(
+            crate::InFlightLayer::from_txid_fks([(parent_txid, Fk(1))]),
+            None,
+        );
         let ifo = log.snapshot();
         assert!(ifo.get_out(1).is_none());
 
@@ -2169,7 +2176,7 @@ mod tests {
             vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
         ));
         let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins([(Fk(93), &pin)]));
+        log.note_layer(crate::InFlightLayer::from_plan_pins([(Fk(93), &pin)]), None);
         let ifo = log.snapshot();
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
@@ -2251,13 +2258,16 @@ mod tests {
             "freeze drops batch_creates; in-flight binds from batch_pin"
         );
         let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
-        ));
+        log.note_layer(
+            crate::InFlightLayer::from_plan_pins(
+                plan_a
+                    .planned_fks
+                    .iter()
+                    .zip(plan_a.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+            ),
+            None,
+        );
         assert_eq!(
             log.snapshot().get_create_fk(&txid),
             Some(fk),

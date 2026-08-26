@@ -1167,8 +1167,6 @@ pub struct Query {
     disconnect_gen: AtomicU64,
     /// Lookup-published parent identity union (wave hits still in the BQ window).
     published_ids: std::sync::Arc<crate::PublishedIds>,
-    /// Write-frozen in-flight keep-until (`height → until`), consumed at prune.
-    create_keep_until: Mutex<crate::U32Map<u32>>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1258,7 +1256,6 @@ impl Query {
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
             published_ids: std::sync::Arc::new(crate::PublishedIds::new()),
-            create_keep_until: Mutex::new(crate::U32Map::default()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -1285,13 +1282,6 @@ impl Query {
         self.disconnect_height
             .store(height, AtomicOrdering::Release);
         self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
-        {
-            let mut g = self
-                .create_keep_until
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            g.retain(|&h, _| h < height);
-        }
         let rewind = if height == 0 {
             None
         } else {
@@ -1660,27 +1650,6 @@ impl Query {
     /// Published wave-identity chain for load stamp.
     pub fn published_ids(&self) -> &std::sync::Arc<crate::PublishedIds> {
         &self.published_ids
-    }
-
-    /// Freeze in-flight keep-until at write (`until = lookup_started_hi.max(hi)`).
-    pub fn stamp_create_keep_until(&self, height: u32) {
-        let until = self.lookup_started_hi().unwrap_or(0).max(height);
-        let mut g = self
-            .create_keep_until
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        g.entry(height)
-            .and_modify(|u| *u = (*u).max(until))
-            .or_insert(until);
-    }
-
-    /// Load prune: apply then clear pending keep-until stamps.
-    pub fn take_create_keep_until(&self) -> Vec<(u32, u32)> {
-        let mut g = self
-            .create_keep_until
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        std::mem::take(&mut *g).into_iter().collect()
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.
@@ -2542,17 +2511,6 @@ mod tests {
         assert_eq!(q.lookup_taken_hi(), Some(7));
         assert_eq!(q.lookup_started_hi(), Some(7));
         assert_eq!(q.class_a_hi(), Some(7));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stamp_create_keep_until_freezes_lookup_started_hi() {
-        let (dir, q) = temp_query("keep-until");
-        q.set_lookup_started_hi(Some(40));
-        q.stamp_create_keep_until(10);
-        let rows = q.take_create_keep_until();
-        assert_eq!(rows, vec![(10, 40)]);
-        assert!(q.take_create_keep_until().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

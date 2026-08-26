@@ -1179,7 +1179,10 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
         let mut log = InFlightLog::new();
-        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        log.note_layer(
+            InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1),
+            None,
+        );
         // Production prune_committed: tip still genesis; occupied already 99.
         log.prune_through_tip(Some(0));
         let view = log.snapshot();
@@ -1262,7 +1265,10 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
         let mut log = InFlightLog::new();
-        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        log.note_layer(
+            InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1),
+            None,
+        );
         let mut dropped = log.clone();
         dropped.prune_through_tip(q.tip_height().map(|h| h.0));
         assert!(

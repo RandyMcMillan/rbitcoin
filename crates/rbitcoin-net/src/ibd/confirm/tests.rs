@@ -296,7 +296,7 @@ fn pack_confirm_run_len_policy() {
 #[test]
 fn split_wave_into_load_batches_is_eight_by_8000() {
     use super::{
-        split_wave_into_load_batches, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS,
+        split_wave_into_load_batches_kind, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS,
         LOAD_QUEUE_CAP_DEFAULT,
     };
     assert_eq!(LOAD_QUEUE_CAP_DEFAULT, 14);
@@ -305,22 +305,56 @@ fn split_wave_into_load_batches_is_eight_by_8000() {
     assert!(super::LoadBatch { items: vec![] }.items.is_empty());
     // 8 × 8001 inputs (each block overshoots 8000) → 8 batches of one.
     let wave: Vec<u32> = vec![8001; 8];
-    let parts =
-        split_wave_into_load_batches(&wave, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS);
+    let parts = split_wave_into_load_batches_kind(
+        &wave,
+        &[],
+        CONFIRM_BATCH_INPUTS_DEFAULT,
+        CONFIRM_RUN_MAX_BLOCKS,
+    );
     assert_eq!(parts, vec![1, 1, 1, 1, 1, 1, 1, 1]);
     // Exactly 8000 does not stop; two 8000-input blocks are one batch.
     assert_eq!(
-        split_wave_into_load_batches(&[8000, 8000], 8000, 144),
+        split_wave_into_load_batches_kind(&[8000, 8000], &[], 8000, 144),
         vec![2]
     );
     // Empty / single megablock.
-    assert!(split_wave_into_load_batches(&[], 8000, 144).is_empty());
-    assert_eq!(split_wave_into_load_batches(&[50_000], 8000, 144), vec![1]);
+    assert!(split_wave_into_load_batches_kind(&[], &[], 8000, 144).is_empty());
+    assert_eq!(
+        split_wave_into_load_batches_kind(&[50_000], &[], 8000, 144),
+        vec![1]
+    );
     // 144 thin blocks then 144 more → two hard-cap batches.
     let thin = vec![1u32; 288];
     assert_eq!(
-        split_wave_into_load_batches(&thin, 8000, 144),
+        split_wave_into_load_batches_kind(&thin, &[], 8000, 144),
         vec![144, 144]
+    );
+}
+
+#[test]
+fn split_wave_into_load_batches_stops_at_has_body_change() {
+    use super::split_wave_into_load_batches_kind;
+    // Crash prefix already-bodied, suffix need-body: two batches.
+    let counts = [1u32, 1, 1, 1, 1];
+    let has_body = [true, true, false, false, false];
+    assert_eq!(
+        split_wave_into_load_batches_kind(&counts, &has_body, 8000, 144),
+        vec![2, 3]
+    );
+    // Kind flip inside an 8000-input pack still splits (do not glue kinds).
+    assert_eq!(
+        split_wave_into_load_batches_kind(&[4000, 4000], &[true, false], 8000, 144),
+        vec![1, 1]
+    );
+    // Homogeneous still packs on input cap only.
+    assert_eq!(
+        split_wave_into_load_batches_kind(&[8000, 8000], &[false, false], 8000, 144),
+        vec![2]
+    );
+    assert!(split_wave_into_load_batches_kind(&[], &[], 8000, 144).is_empty());
+    assert_eq!(
+        split_wave_into_load_batches_kind(&[50_000], &[true], 8000, 144),
+        vec![1]
     );
 }
 

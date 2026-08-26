@@ -391,21 +391,32 @@ pub(crate) fn load_stamp_items(
         .collect()
 }
 
-/// Split a lookup-wave input-count run into load-sized batch lengths.
+/// Split a lookup-wave into load-sized batch lengths.
 ///
-/// Uses the same [`pack_stop_after`] rule as load pack (soft 8000 / hard 144).
-pub(crate) fn split_wave_into_load_batches(
+/// Stops on [`pack_stop_after`] (soft 8000 / hard 144) and when `has_body` flips.
+/// `has_body` is per height, same order as `input_counts`. Empty skips the kind split.
+pub(crate) fn split_wave_into_load_batches_kind(
     input_counts: &[u32],
+    has_body: &[bool],
     soft_max_inputs: u32,
     hard_max_blocks: usize,
 ) -> Vec<usize> {
+    debug_assert!(has_body.is_empty() || has_body.len() == input_counts.len());
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < input_counts.len() {
         let rest = &input_counts[i..];
+        let kind0 = has_body.get(i).copied();
         let mut sum = 0u32;
         let mut n = 0usize;
-        for &c in rest {
+        for (j, &c) in rest.iter().enumerate() {
+            if j > 0 {
+                if let (Some(k0), Some(&k)) = (kind0, has_body.get(i + j)) {
+                    if k != k0 {
+                        break;
+                    }
+                }
+            }
             sum = sum.saturating_add(c);
             n += 1;
             if pack_stop_after(sum, n, soft_max_inputs, hard_max_blocks) {
@@ -1664,8 +1675,24 @@ pub(crate) fn spawn_confirm_engine(
                                 .iter()
                                 .map(|(_, _, w)| block_input_count(w.block.as_ref()))
                                 .collect();
-                            let parts = split_wave_into_load_batches(
+                            let t_kind = Instant::now();
+                            let kinds: Vec<bool> = match wave
+                                .items
+                                .iter()
+                                .map(|(_, hash, _)| hub.query.is_block_archived(hash))
+                                .collect::<Result<Vec<_>, _>>()
+                            {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    warn!("ibd: load-batch has_body probe: {e}");
+                                    confirm_thr_stats::add_lookup_other(t_kind.elapsed());
+                                    continue;
+                                }
+                            };
+                            confirm_thr_stats::add_lookup_other(t_kind.elapsed());
+                            let parts = split_wave_into_load_batches_kind(
                                 &counts,
+                                &kinds,
                                 confirm_batch_max_inputs(),
                                 CONFIRM_RUN_MAX_BLOCKS,
                             );

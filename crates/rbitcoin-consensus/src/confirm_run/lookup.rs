@@ -409,6 +409,7 @@ pub(super) fn wire_lookup_phase(
     let need_fks = query
         .archive_filter_need_header_fks(&header_fks)
         .map_err(ConsensusError::from)?;
+    confirm_archive_kind(header_fks.len(), need_fks.len())?;
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
     let t_batch = Instant::now();
     let plan = if need_fks.is_empty() {
@@ -468,16 +469,6 @@ pub(super) fn wire_lookup_phase(
                     m.tx_fks = fks.clone();
                 }
             }
-            if m.tx_fks.is_empty() {
-                if let Some(list) = query
-                    .store()
-                    .header_txs
-                    .get_list(m.header_fk)
-                    .map_err(ConsensusError::from)?
-                {
-                    m.tx_fks = list;
-                }
-            }
             let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
@@ -494,6 +485,27 @@ pub(super) fn wire_lookup_phase(
     let plan_ns = filter_ns.saturating_add(batch_ns);
     plan_stamp_sub_stats::note(struct_ns, prepare_ns, filter_ns, batch_ns);
     Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfirmArchiveKind {
+    AllNeedBody,
+    AllHaveBody,
+}
+
+pub(super) fn confirm_archive_kind(
+    n_headers: usize,
+    n_need: usize,
+) -> Result<ConfirmArchiveKind, ConsensusError> {
+    if n_need == 0 {
+        Ok(ConfirmArchiveKind::AllHaveBody)
+    } else if n_need == n_headers {
+        Ok(ConfirmArchiveKind::AllNeedBody)
+    } else {
+        Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: confirm batch mixed archived",
+        )))
+    }
 }
 
 pub(super) fn create_fks_from_header_ranges(

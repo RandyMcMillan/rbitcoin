@@ -60,11 +60,16 @@ pub use bq_resolve::{
 use head_drain::{submit_head_drain, HEAD_DRAIN_THREAD_NAME};
 pub use lookup::lookup_stage_stats;
 pub use lookup::plan_stamp_sub_stats;
+#[cfg(test)]
+use lookup::ConfirmArchiveKind;
+use lookup::{
+    confirm_archive_kind, create_fks_from_header_ranges, known_create_txid_lookup,
+    stamp_parent_pin_archived,
+};
 pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_stamp, DenserelsWarmStats, ParentPinStamp,
     PlanStampOutcome,
 };
-use lookup::{create_fks_from_header_ranges, known_create_txid_lookup, stamp_parent_pin_archived};
 use phases::assemble_run;
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
@@ -362,6 +367,7 @@ pub fn confirm_wire_load_phase_pipelined(
     let need_fks = query
         .archive_filter_need_header_fks(&header_fks)
         .map_err(ConsensusError::from)?;
+    confirm_archive_kind(header_fks.len(), need_fks.len())?;
     let mut plan = if need_fks.is_empty() {
         for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
@@ -417,16 +423,6 @@ pub fn confirm_wire_load_phase_pipelined(
             if let Some(id) = m.header_fk.get() {
                 if let Some(fks) = by_header.get(&id) {
                     m.tx_fks = fks.clone();
-                }
-            }
-            if m.tx_fks.is_empty() {
-                if let Some(list) = query
-                    .store()
-                    .header_txs
-                    .get_list(m.header_fk)
-                    .map_err(ConsensusError::from)?
-                {
-                    m.tx_fks = list;
                 }
             }
             let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();

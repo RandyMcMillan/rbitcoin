@@ -2,15 +2,15 @@
 
 Known limitations that are **not** treated as current must-fix bugs.
 Durable confirm still uses TipOnly (connected instance). See
-[`invariants.md`](./invariants.md) leftover union and
+[`invariants.md`](./invariants.md) leftover identity and
 [`017-duplicate-txid-unconnected-instance.md`](./external_findings/017-duplicate-txid-unconnected-instance.md).
 
 ## RAM leftover maps: one fk per txid
 
-In-flight `creates`, the published `live_union` chain, and pipeline pin
-`by_txid` are `txid → one fk` (last write / newest layer). A second
-`create_fk` for the same txid **clobbers** the first in that map. Do
-not stall the pipeline on a second fk (forget cannot run).
+In-flight `creates` and pipeline pin `by_txid` are `txid → one fk` (last
+write / newest layer). A second `create_fk` for the same txid **clobbers**
+the first in that map. Do not stall the pipeline on a second fk (forget
+cannot run).
 
 **Pre-BIP30:** clobber is correct enough. The maps are a thin write-behind
 / pipeline identity, not a BIP30 instance list. Newest/last entry is an

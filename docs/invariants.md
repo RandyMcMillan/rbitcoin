@@ -56,9 +56,10 @@ IBD thread split (same IO table): lookup **thread** is decode + TipOnly +
 `take_raw` onto loadq. Structure + plan_batch (`confirm_wire_lookup_stamp`)
 run on the **load** thread and consume `LoadBatch.pres` — they do not read
 `block_queue_resolved`. Leftover TipOnly on that stamp is still **lookup-stage
-IO** (head / idx), not load pin. After a lookup wave publishes parent P into
-live_union, load stamp of a child spending P has **zero** leftover TipOnly for
-P (`head_need_n=0`). Pack stays on load; do not move `plan_batch` onto lookup.
+IO** (head / idx), not load pin, and only on **plan=None / S0**. After lookup
+puts parent P on the load-batch skeleton, load stamp of a child spending P has
+**zero** leftover TipOnly for P (`head_need_n=0`). Pack stays on load; do not
+move `plan_batch` onto lookup.
 
 IBD stamp does not build `TxApply` / packed ins (`archive_plan_batch_from_wire`).
 SpendEdges + CreatePin survive freeze. Write encodes ins from `Arc<Block>` +
@@ -74,7 +75,7 @@ not head/idx.
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have `spent.idx` range on the stamp (in-flight outs skip idx) | Missing → hard Err at stamp / pin contract |
-| Parent create_fk union | **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged layers with `max_height` **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze) → **published live_union** (height-layered chain, `ArcSwap` of the head, get walks; no union rebuild) → **TipOnly** (connected **and** idx `body_range`; leftover after drain+fence). One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs) (S0 plan and plan=None). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp. Each new layer is this wave's parent identities (re-home union hits + TipOnly misses); `skipped=` skips TipOnly IO, not the layer row. Lookup drops a layer once no height in **its span** remains on the BQ and the span does not overlap `(tip, taken_hi]`. Disconnect `store(None)` immediately and clears the lookup union from that height. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Union miss → `Corrupt("parent create_fk unresolved")` (permanent). Identity without idx range → `Corrupt("invariant: idx range missing after identity")`, not a miss |
+| Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged layers with `max_height` **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range + per-chunk need-vouts) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | **No** soft-requeue. Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")` (permanent). Identity without idx range → `Corrupt("invariant: idx range missing after identity")`, not a miss |
 | io_uring harvest | Pending `user_data` set + kind/epoch. Unexpected CQE, undrained leftover, CQ overflow, wait timeout. Held-session `begin_batch` drains leftover before a new kind/epoch wave and fails closed (`Err`) if undrained or poisoned. Drain does not ignore unmatched CQE / CQ overflow. Held idx fill must not libc-fallback on a dirty ring | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Poison + drop TLS ring. Ring-unavailable still pread-fallback |
 | Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no idx IO) | **No** idx cold outs on load; **no** `spent.idx` IO on pin; **no** `inwit` on pin |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup already stamped archived parents; write `tx_spent_range_batch` only for unstamped fks (same-batch after Class A, holes) | Idx stamp of remaining `spent.body` ranges; incomplete → `invariant:` |
@@ -122,22 +123,21 @@ published idx window.
 | `lookup stage miss (load cold denserels forbidden)` | S0/S3 | Load Forbid + parents without plan range | Lookup always fills `external_parents` body; load outs by `txout` range only |
 | `invariant: confirm batch mixed archived` | S3 | One stamp/load list spans need-body and already-bodied | Split at the `has_body` change (IBD lookup) or call one-shot twice. Do not hitchhike `get_list` on `plan=Some` |
 | `put_full_batch fk mismatch` | S4 cascade | Tip-ahead plan after tip+1 reject | Soft requeue for fk mismatch / connect height not tip+1 |
-| `parent create_fk unresolved` | S2 | Leftover union miss | **Permanent.** Fix publish order. Do not soft-requeue. |
+| `parent create_fk unresolved` | S2 | Skeleton / in-flight miss | **Permanent.** Fix lookup fill or in-flight lifetime. Do not soft-requeue. |
 | false PrevoutSpent | identity | schema-13 zero pin id | plan reverse map / lookup `txid.body` only |
 
 ## Why there is no leftover pending map
 
-In-flight is the only RAM `txid → create_fk` cache for planned creates
-(plus `CreatePin` outs). Lookup snapshots drain+fence **before** TipOnly
-and rides that height on the last load batch of the wave. Load drops
-layers with `max_height` below the snapshot **after** that batch's
-in-flight read. Stamp skips `body_range` when in-flight still has outs
-(n−1); pin needs those outs. TipOnly is the home once the layer is gone.
+In-flight is the only RAM `txid → create_fk` cache for **planned** creates
+(plus `CreatePin` outs). Archived parents ride the load-batch skeleton.
+Lookup snapshots drain+fence **before** TipOnly and rides that height on
+the last load batch of the wave. Load drops layers with `max_height`
+below the snapshot **after** that batch's in-flight read. Stamp skips
+`body_range` when in-flight still has outs (n−1); pin needs those outs.
+Skeleton / leftover TipOnly is the home once the layer is gone.
 
-Fence alone during drain/seal (67438 / 269204) does not drop the layer.
-Drain alone does not drop it (TipOnly would reject unconnected).
-Disconnect drops layers at/above the leaving height **before** the next
-bind.
+Equality (`max_height == snapshot`) keeps the layer. Disconnect drops
+layers at/above the leaving **pack** height **before** the next bind.
 
 ## Related code
 

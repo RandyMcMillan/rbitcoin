@@ -308,6 +308,7 @@ fn split_wave_into_load_batches_is_eight_by_8000() {
     assert_eq!(super::load_queue_cap(), LOAD_QUEUE_CAP_DEFAULT);
     assert!(super::LoadBatch {
         items: vec![],
+        parent_ids: None,
         drop_inflight_below: None,
     }
     .items
@@ -370,7 +371,7 @@ fn split_wave_into_load_batches_stops_at_has_body_change() {
 #[test]
 fn last_sent_load_batch_carries_wave_drain_fence() {
     use super::{load_batches_from_wave, split_wave_into_load_batches_kind};
-    use rbitcoin_query::{ResolvedWire, TxPrecompute};
+    use rbitcoin_query::{BatchParentIds, ResolvedWire, TxPrecompute};
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     let pres: Arc<[TxPrecompute]> = genesis
         .txdata
@@ -391,15 +392,17 @@ fn last_sent_load_batch_carries_wave_drain_fence() {
     let items: Vec<_> = (1..=5).map(mk).collect();
     let parts = split_wave_into_load_batches_kind(&[1, 1, 1, 1, 1], &[], 2, 2);
     assert_eq!(parts, vec![2, 2, 1]);
-    let batches = load_batches_from_wave(&items, &parts, 14, Some(40));
+    let empty_ids = BatchParentIds::default();
+    let batches = load_batches_from_wave(&items, &parts, 14, &empty_ids, Some(40));
     assert_eq!(batches.len(), 3);
     assert!(batches[0].drop_inflight_below.is_none());
     assert!(batches[1].drop_inflight_below.is_none());
     assert_eq!(batches[2].drop_inflight_below, Some(40));
     assert_eq!(batches[0].items.len(), 2);
     assert_eq!(batches[2].items.len(), 1);
+    assert!(batches.iter().all(|b| b.parent_ids.is_some()));
 
-    let truncated = load_batches_from_wave(&items, &parts, 2, Some(7));
+    let truncated = load_batches_from_wave(&items, &parts, 2, &empty_ids, Some(7));
     assert_eq!(truncated.len(), 2, "remaining loadq slots cap sent batches");
     assert!(truncated[0].drop_inflight_below.is_none());
     assert_eq!(
@@ -408,7 +411,7 @@ fn last_sent_load_batch_carries_wave_drain_fence() {
         "last sent batch of a truncated wave still carries the snapshot"
     );
 
-    let unmarked = load_batches_from_wave(&items, &parts, 14, None);
+    let unmarked = load_batches_from_wave(&items, &parts, 14, &empty_ids, None);
     assert!(unmarked.last().unwrap().drop_inflight_below.is_none());
 }
 
@@ -430,6 +433,119 @@ fn marked_load_batch_drops_inflight_below_after_read() {
     assert!(
         v.get_create_fk(&b.0.txid).is_some(),
         "height 20 stays until a later wave snapshots past it"
+    );
+}
+
+#[test]
+fn chunk_parent_ids_vouts_are_per_chunk() {
+    use super::chunk_parent_ids;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxMerkleNode, TxOut, Txid, Witness,
+    };
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParentIds, IdMap, ResolvedWire, TxPrecompute};
+    use std::sync::Arc;
+
+    let parent = {
+        let mut t = [0u8; 32];
+        t[0] = 0x42;
+        t
+    };
+    let mut ids = IdMap::default();
+    ids.insert(parent, (Fk(7), (100, 32)));
+    let wave = BatchParentIds {
+        ids: Arc::new(ids),
+        spent: Arc::new(rbitcoin_query::U64Map::default()),
+        need_vouts: rbitcoin_query::U64Map::default(),
+    };
+    let spend = Block {
+        header: Header {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+                .block_hash(),
+            merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        },
+        txdata: vec![
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array(parent),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+        ],
+    };
+    let empty = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let pres_spend: Arc<[TxPrecompute]> = spend
+        .txdata
+        .iter()
+        .map(TxPrecompute::from_tx)
+        .collect::<Vec<_>>()
+        .into();
+    let pres_empty: Arc<[TxPrecompute]> = empty
+        .txdata
+        .iter()
+        .map(TxPrecompute::from_tx)
+        .collect::<Vec<_>>()
+        .into();
+    let chunk0 = [(
+        1u32,
+        [1u8; 32],
+        ResolvedWire {
+            block: Arc::new(spend),
+            pres: pres_spend,
+        },
+    )];
+    let chunk1 = [(
+        2u32,
+        [2u8; 32],
+        ResolvedWire {
+            block: Arc::new(empty),
+            pres: pres_empty,
+        },
+    )];
+    let a = chunk_parent_ids(&wave, &chunk0);
+    let b = chunk_parent_ids(&wave, &chunk1);
+    assert_eq!(a.need_vouts.get(&7).map(|v| v.as_slice()), Some(&[0][..]));
+    assert!(
+        b.need_vouts.get(&7).is_none(),
+        "chunk that does not spend the parent must not list its vout"
+    );
+    assert!(
+        Arc::ptr_eq(&a.ids, &b.ids),
+        "chunks share the wave IdMap Arc"
     );
 }
 
@@ -459,11 +575,13 @@ fn load_recv_is_lookup_order() {
     };
     tx.send(LoadBatch {
         items: vec![mk(1), mk(2)],
+        parent_ids: None,
         drop_inflight_below: None,
     })
     .unwrap();
     tx.send(LoadBatch {
         items: vec![mk(3)],
+        parent_ids: None,
         drop_inflight_below: Some(7),
     })
     .unwrap();
@@ -496,6 +614,7 @@ fn load_stamp_items_keep_pres() {
                 pres: Arc::clone(&pres),
             },
         )],
+        parent_ids: None,
         drop_inflight_below: None,
     };
     let items = load_stamp_items(lb.items.into_iter().map(|(h, _, w)| (h, w.block, w.pres)));
@@ -515,6 +634,7 @@ fn lookup_blocks_when_loadq_full() {
     for _ in 0..LOAD_QUEUE_CAP_DEFAULT {
         tx.send(LoadBatch {
             items: vec![],
+            parent_ids: None,
             drop_inflight_below: None,
         })
         .unwrap();
@@ -522,6 +642,7 @@ fn lookup_blocks_when_loadq_full() {
     assert!(
         tx.try_send(LoadBatch {
             items: vec![],
+            parent_ids: None,
             drop_inflight_below: None,
         })
         .is_err(),
@@ -530,6 +651,7 @@ fn lookup_blocks_when_loadq_full() {
     let _ = rx.recv().unwrap();
     tx.send(LoadBatch {
         items: vec![],
+        parent_ids: None,
         drop_inflight_below: None,
     })
     .unwrap();

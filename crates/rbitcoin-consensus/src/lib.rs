@@ -76,8 +76,6 @@ pub mod confirm_phase_stats {
     pub static SCRIPT_JOBS: AtomicU64 = AtomicU64::new(0);
     /// Script jobs skipped because mempool already verified the tx (tip follow).
     pub static SCRIPT_SKIP_MEMPOOL: AtomicU64 = AtomicU64::new(0);
-    /// Lookup-thread live-union keep/reindex/publish wall.
-    pub static LOOKUP_KEEP_NS: AtomicU64 = AtomicU64::new(0);
     /// Post-script durable spentness + maturity + BIP68 + subsidy (write).
     pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     /// Durable spentness probes only (subset of structural).
@@ -539,13 +537,12 @@ pub mod confirm_phase_stats {
         )
     }
 
-    /// `(jobs, mempool_skips, lookup_keep_ns)`.
+    /// `(jobs, mempool_skips)`.
     #[inline]
-    pub fn sample_script_mix_and_reset() -> (u64, u64, u64) {
+    pub fn sample_script_mix_and_reset() -> (u64, u64) {
         (
             SCRIPT_JOBS.swap(0, Ordering::Relaxed),
             SCRIPT_SKIP_MEMPOOL.swap(0, Ordering::Relaxed),
-            LOOKUP_KEEP_NS.swap(0, Ordering::Relaxed),
         )
     }
 

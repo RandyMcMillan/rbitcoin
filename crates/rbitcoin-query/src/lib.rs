@@ -8,9 +8,8 @@ mod combined_stage;
 mod confirm_load;
 mod confirm_parent_cache;
 mod connect;
+mod id_map;
 mod in_flight;
-mod layer_chain;
-mod published_ids;
 mod reconstruct;
 mod resolved_wire;
 mod run_builder_core;
@@ -82,9 +81,6 @@ pub struct ProcessOwnedSizes {
     pub recent_fifo_keys: usize,
     /// Live CreatePin payload bytes (not 96 B/key).
     pub recent_pin_bytes: u64,
-    /// PublishedIds / LiveUnion layer chain (shared Arcs; count once).
-    pub union_layers: usize,
-    pub union_keys: usize,
     /// Confirmed hash→height map entries.
     pub h2h_keys: usize,
     /// Height-fence run count (no Vec clone).
@@ -156,16 +152,15 @@ pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::ConfirmLoadStats;
 pub use confirm_load::SpendEdges;
 pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
+pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher};
 pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
-pub use published_ids::{
-    IdLayer, IdMap, LiveUnion, OutPointHasher, OutPointSet, PublishedIds, TxidHasher,
-};
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
 };
 pub use stamp::{
-    fill_missing_parent_ranges, stamp_external_parents, ExternalParentStamp, ParentIdent,
+    fill_missing_parent_ranges, stamp_external_parents, BatchParentIds, ExternalParentStamp,
+    ParentIdent,
 };
 pub use wave_prevout::SpendEdge;
 
@@ -455,7 +450,7 @@ pub mod archive_phase_stats {
     pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
-    /// Unique prev_txids resolved from published live_union.
+    /// Unique prev_txids resolved from the load-batch skeleton.
     pub static PIN_TXID_N: AtomicU64 = AtomicU64::new(0);
     /// Wall of that consult (RAM).
     pub static PIN_TXID_NS: AtomicU64 = AtomicU64::new(0);
@@ -1165,8 +1160,6 @@ pub struct Query {
     disconnect_height: AtomicU32,
     /// Bumped on each [`Self::disconnect_tip`]. Load drops in-flight layers.
     disconnect_gen: AtomicU64,
-    /// Lookup-published parent identity union (wave hits still in the BQ window).
-    published_ids: std::sync::Arc<crate::PublishedIds>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -1255,7 +1248,6 @@ impl Query {
             head_drain_fk: AtomicU64::new(0),
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
-            published_ids: std::sync::Arc::new(crate::PublishedIds::new()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -1658,11 +1650,6 @@ impl Query {
         Ok(g.dequeue_height(height)?)
     }
 
-    /// Published wave-identity chain for load stamp.
-    pub fn published_ids(&self) -> &std::sync::Arc<crate::PublishedIds> {
-        &self.published_ids
-    }
-
     /// Index-only queue entries (no payload clone). Empty after restart.
     pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
         let g = self.block_queue.lock().unwrap();
@@ -1842,7 +1829,6 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
-        let (union_layers, union_keys) = self.published_ids.size_snapshot();
         let h2h_keys = self
             .height_by_hash
             .lock()
@@ -1871,8 +1857,6 @@ impl Query {
             recent_overlay_keys: 0,
             recent_fifo_keys: 0,
             recent_pin_bytes: 0,
-            union_layers,
-            union_keys,
             h2h_keys,
             fence_runs: self.store.height_fence_run_count(),
             bq_promoted: self.block_queue_promoted_count(),

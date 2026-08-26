@@ -85,7 +85,7 @@ pub struct PlanStampOutcome {
 /// IBD **lookup** stage: structure + stamp create_fk + parent body ranges.
 ///
 /// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
-/// Parent create_fk: in-flight → published `live_union` → recent creates → TipOnly leftover.
+/// Parent create_fk: in-flight → skeleton → leftover TipOnly (plan=None).
 /// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
 /// cloning full `Block` payloads into stamp. `pres` is lookup `TxPrecompute`
 /// when the caller already hashed (loadq); `None` hashes here.
@@ -107,7 +107,14 @@ pub fn confirm_wire_lookup_stamp(
     let ifo = pipeline.map(|p| &p.in_flight);
     let parent_pin = match plan.as_mut() {
         Some(p) => ParentPinStamp::take_from_plan(p),
-        None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, ifo)?,
+        None => stamp_parent_pin_archived(
+            query,
+            params,
+            &metas,
+            &wire_blocks,
+            ifo,
+            pipeline.and_then(|p| p.skeleton.as_ref()),
+        )?,
     };
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
@@ -130,6 +137,7 @@ pub(super) fn stamp_parent_pin_archived(
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight: Option<&rbitcoin_query::InFlightView>,
+    skeleton: Option<&rbitcoin_query::BatchParentIds>,
 ) -> Result<ParentPinStamp, ConsensusError> {
     let mut same_batch: HashMap<[u8; 32], u64> = HashMap::new();
     for m in metas {
@@ -167,13 +175,8 @@ pub(super) fn stamp_parent_pin_archived(
     let empty = rbitcoin_query::InFlightView::empty();
     let ifo = in_flight.unwrap_or(&empty);
     let need_vec: Vec<[u8; 32]> = need_external.into_keys().collect();
-    let ext = rbitcoin_query::stamp_external_parents(
-        query.store(),
-        &need_vec,
-        ifo,
-        query.published_ids(),
-    )
-    .map_err(ConsensusError::from)?;
+    let ext = rbitcoin_query::stamp_external_parents(query.store(), &need_vec, ifo, skeleton)
+        .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
         resolved: HashMap::with_capacity_and_hasher(
             ext.resolved.len().saturating_add(same_batch.len()),
@@ -195,11 +198,12 @@ pub(super) fn stamp_parent_pin_archived(
             .or_insert_with(|| rbitcoin_query::ParentIdent::new(tid))
             .txid = tid;
     }
-    // plan=None same-batch creates have no CreatePin offline — idx body_range.
-    rbitcoin_query::fill_missing_parent_ranges(query.store(), ifo, &mut stamp.idents)
-        .map_err(ConsensusError::from)?;
     // Identities are stamped from wire prev_txid at insert time — never soft-fill
     // from txid.body here (that would be a dual path after lookup promised identity).
+    if skeleton.is_none() {
+        rbitcoin_query::fill_missing_parent_ranges(query.store(), ifo, &mut stamp.idents)
+            .map_err(ConsensusError::from)?;
+    }
     for ident in stamp.idents.values() {
         if ident.txid == [0u8; 32] {
             return Err(ConsensusError::Store(StoreError::Corrupt(
@@ -447,7 +451,7 @@ pub(super) fn wire_lookup_phase(
                     &need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
-                    Some(p.published.as_ref()),
+                    p.skeleton.as_ref(),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -645,6 +649,8 @@ pub mod lookup_stage_stats {
     pub static PRECOMPUTE_NS: AtomicU64 = AtomicU64::new(0);
     /// Lookup-wave TipOnly `get_fk_by_txid_batch` + slot sort. Not load stamp.
     pub static WAVE_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// Lookup-wave `tx_spent_range_batch` for TipOnly hits.
+    pub static WAVE_SPENT_NS: AtomicU64 = AtomicU64::new(0);
 
     pub fn note(
         blocks: u64,
@@ -686,8 +692,14 @@ pub mod lookup_stage_stats {
         }
     }
 
-    /// Accrue lookup-wave decode / precompute / key-collect / TipOnly head.
-    pub fn note_wave_decode(decode_ns: u64, precompute_ns: u64, collect_ns: u64, head_ns: u64) {
+    /// Accrue lookup-wave decode / precompute / key-collect / TipOnly head / spent.idx.
+    pub fn note_wave_decode(
+        decode_ns: u64,
+        precompute_ns: u64,
+        collect_ns: u64,
+        head_ns: u64,
+        spent_ns: u64,
+    ) {
         if decode_ns > 0 {
             DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
         }
@@ -699,6 +711,9 @@ pub mod lookup_stage_stats {
         }
         if head_ns > 0 {
             WAVE_HEAD_NS.fetch_add(head_ns, Ordering::Relaxed);
+        }
+        if spent_ns > 0 {
+            WAVE_SPENT_NS.fetch_add(spent_ns, Ordering::Relaxed);
         }
     }
 
@@ -716,6 +731,7 @@ pub mod lookup_stage_stats {
         pub decode_ns: u64,
         pub precompute_ns: u64,
         pub wave_head_ns: u64,
+        pub wave_spent_ns: u64,
     }
 
     pub fn sample_and_reset() -> Sample {
@@ -732,6 +748,7 @@ pub mod lookup_stage_stats {
             decode_ns: DECODE_NS.swap(0, Ordering::Relaxed),
             precompute_ns: PRECOMPUTE_NS.swap(0, Ordering::Relaxed),
             wave_head_ns: WAVE_HEAD_NS.swap(0, Ordering::Relaxed),
+            wave_spent_ns: WAVE_SPENT_NS.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -828,9 +845,10 @@ mod tests {
         }
     }
 
-    /// plan=None rehydrate and the query helper stamp the same published parent.
+    /// plan=None rehydrate and the query helper stamp the same skeleton parent.
     #[test]
-    fn archived_stamp_matches_shared_helper_on_published() {
+    fn archived_stamp_matches_shared_helper_on_skeleton() {
+        use rbitcoin_query::BatchParentIds;
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
         let parent_txid = {
@@ -840,18 +858,22 @@ mod tests {
         };
         let mut m = IdMap::default();
         m.insert(parent_txid, (rbitcoin_primitives::Fk(88), (4000, 32)));
-        q.published_ids().publish(std::sync::Arc::new(m));
+        let skel = BatchParentIds {
+            ids: std::sync::Arc::new(m),
+            spent: std::sync::Arc::new(rbitcoin_query::U64Map::default()),
+            need_vouts: rbitcoin_query::U64Map::default(),
+        };
 
         let helper = rbitcoin_query::stamp_external_parents(
             q.store(),
             &[parent_txid],
             &rbitcoin_query::InFlightView::empty(),
-            q.published_ids(),
+            Some(&skel),
         )
         .expect("shared helper");
 
         let meta = BodyMeta {
-            height: Height(1),
+            height: Height(params.btc.bip34_height),
             hash: [0u8; 32],
             header_fk: rbitcoin_primitives::Fk::NULL,
             header_rec: HeaderRecord {
@@ -873,6 +895,7 @@ mod tests {
             &[meta],
             &[std::sync::Arc::new(spend_block(parent_txid))],
             None,
+            Some(&skel),
         )
         .expect("archived stamp");
         assert_eq!(

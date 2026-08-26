@@ -212,13 +212,13 @@ Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD u
 | Line | Level | Use |
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window, at/over 1 GiB assign-stop fill holes in the fetched range only) |
-| `ibd: perf` | DEBUG | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread. **`stamp=`** nests **`pack=`** (plan HashMap) vs **`head=`** (leftover TipOnly). After a published wave `head=` is ~0. **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`lookup_thr keep=`** is live-union splice. **`pin_txid=`** vs leftover `tx.head` |
+| `ibd: perf` | DEBUG | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread. **`stamp=`** nests **`pack=`** (plan HashMap) vs **`head=`** (leftover TipOnly; IBD skeleton keeps this ~0). **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`pin_txid=`** is skeleton hits vs leftover `tx.head` |
 | `ibd: sizes` | DEBUG | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
 | `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit** |
 
 Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / perf_dbg from the same sample. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
 
-`pin_txid%` is stamp `txid→create_fk` from the published `live_union` chain vs leftover `tx.head`. `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
+`pin_txid%` is stamp `txid→create_fk` from the load-batch skeleton vs leftover `tx.head` (IBD skeleton path should stay at 100%). `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
 tip+1 to the next in-hand body (confirmed, still on the BQ, or already taken

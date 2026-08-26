@@ -1,18 +1,40 @@
-//! External parent create_fk stamp: in-flight → published → TipOnly.
+//! External parent create_fk stamp: in-flight → skeleton → leftover TipOnly.
 //!
+//! IBD load passes a lookup-filled [`BatchParentIds`] and never leftover-probes.
+//! plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly.
 //! One function for S0 plan (`archive_plan_batch_from_store`) and plan=None
 //! rehydrate. In-flight holds CreatePins until load drops layers below a
 //! lookup-wave drain+fence snapshot taken before TipOnly.
 
-use crate::published_ids::TxidHasher;
-use crate::{CreatePin, InFlightView, PublishedIds, QueryError, U64Map, U64Set};
+use crate::id_map::{IdMap, TxidHasher};
+use crate::{CreatePin, InFlightView, QueryError, U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::Store;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
+use std::sync::Arc;
 use std::time::Instant;
 
 type TxidFkMap = HashMap<[u8; 32], Fk, BuildHasherDefault<TxidHasher>>;
+
+/// Lookup-filled parent identity for one load chunk (fk + ranges; no outs).
+#[derive(Clone, Debug, Default)]
+pub struct BatchParentIds {
+    /// Wave `txid → (create_fk, body_range)` (shared across chunks).
+    pub ids: Arc<IdMap>,
+    /// Wave `create_fk_id → spent.idx` range (shared across chunks).
+    pub spent: Arc<U64Map<(u64, u64)>>,
+    /// Per-chunk `create_fk_id → vouts` spent in this load batch.
+    pub need_vouts: U64Map<Vec<u32>>,
+}
+
+impl BatchParentIds {
+    pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64), Option<(u64, u64)>)> {
+        let &(fk, body) = self.ids.get(txid)?;
+        let spent = fk.get().and_then(|id| self.spent.get(&id).copied());
+        Some((fk, body, spent))
+    }
+}
 
 /// One create's lookup-stamped identity (body / spent / pin optional).
 #[derive(Debug, Clone, Default)]
@@ -72,18 +94,18 @@ impl ExternalParentStamp {
     }
 }
 
-/// Bind `need` txids: in-flight → published `live_union` → leftover TipOnly.
+/// Bind `need` txids: in-flight → skeleton → leftover TipOnly.
 ///
-/// Then idx range-fill for resolved creates that have no range and no
-/// in-flight outs. Same-batch identities are not inputs — callers skip them
-/// in `need` and keep them offline at pin.
+/// `skeleton = Some` is the IBD path: miss of in-flight and skeleton is
+/// `Corrupt` with no leftover `tx.head` probe. `skeleton = None` is plan=None
+/// / S0 leftover TipOnly. Same-batch identities are not inputs — callers skip
+/// them in `need` and keep them offline at pin.
 pub fn stamp_external_parents(
     store: &Store,
     need: &[[u8; 32]],
     in_flight: &InFlightView,
-    published: &PublishedIds,
+    skeleton: Option<&BatchParentIds>,
 ) -> Result<ExternalParentStamp, QueryError> {
-    let pub_head = published.load();
     let mut stamp = ExternalParentStamp {
         resolved: TxidFkMap::with_capacity_and_hasher(need.len() / 2, Default::default()),
         idents: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
@@ -111,21 +133,37 @@ pub fn stamp_external_parents(
     stamp.inflight_ns = t_inflight.elapsed().as_nanos() as u64;
 
     let t_pin_txid = Instant::now();
-    let mut after_pub: Vec<&[u8; 32]> = Vec::new();
-    for t in still_need {
-        if let Some((fk, range)) = pub_head.as_ref().and_then(|h| h.get(t)) {
-            stamp.resolved.insert(*t, fk);
-            if let Some(id) = fk.get() {
-                stamp.bind(id, *t).body = Some(range);
+    let mut after_skel: Vec<&[u8; 32]> = Vec::new();
+    if let Some(skel) = skeleton {
+        for t in still_need {
+            if let Some((fk, range, spent)) = skel.get(t) {
+                stamp.resolved.insert(*t, fk);
+                if let Some(id) = fk.get() {
+                    let e = stamp.bind(id, *t);
+                    e.body = Some(range);
+                    if let Some(sr) = spent {
+                        e.spent = Some(sr);
+                    }
+                }
+                stamp.pin_txid_n = stamp.pin_txid_n.saturating_add(1);
+                continue;
             }
-            stamp.pin_txid_n = stamp.pin_txid_n.saturating_add(1);
-            continue;
+            after_skel.push(t);
         }
-        after_pub.push(t);
+        stamp.pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
+        if !after_skel.is_empty() {
+            return Err(rbitcoin_store::StoreError::Corrupt(
+                "archive: parent create_fk unresolved (contiguous batch required)",
+            )
+            .into());
+        }
+        stamp.head_need_n = 0;
+        crate::archive_phase_stats::note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
+        crate::archive_phase_stats::note_recent(stamp.recent_n, stamp.recent_ns);
+        return Ok(stamp);
     }
+    let mut need_head: Vec<[u8; 32]> = still_need.into_iter().copied().collect();
     stamp.pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
-
-    let mut need_head: Vec<[u8; 32]> = after_pub.into_iter().copied().collect();
     stamp.head_need_n = need_head.len() as u64;
 
     let t_head = Instant::now();
@@ -189,11 +227,110 @@ pub fn stamp_external_parents(
     Ok(stamp)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::in_flight::{InFlightLayer, InFlightLog};
+    use rbitcoin_primitives::Fk;
+    use std::sync::Once;
+
+    fn head_tiny() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+    }
+
+    fn tmp_store() -> (std::path::PathBuf, crate::Query) {
+        head_tiny();
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-stamp-skel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = crate::Query::open_or_create(&path).unwrap();
+        (path, q)
+    }
+
+    fn pin(id: u64) -> CreatePin {
+        use rbitcoin_store::{OutputRecord, TxRecord};
+        let mut txid = [0u8; 32];
+        txid[..8].copy_from_slice(&id.to_le_bytes());
+        Arc::new((
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ))
+    }
+
+    #[test]
+    fn skeleton_hit_skips_leftover_head() {
+        let (dir, q) = tmp_store();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x11;
+        let mut ids = IdMap::default();
+        ids.insert(txid, (Fk(7), (10, 20)));
+        let mut spent = U64Map::default();
+        spent.insert(7, (30, 40));
+        let skel = BatchParentIds {
+            ids: Arc::new(ids),
+            spent: Arc::new(spent),
+            need_vouts: U64Map::default(),
+        };
+        let empty = InFlightView::empty();
+        let st = stamp_external_parents(q.store(), &[txid], &empty, Some(&skel)).unwrap();
+        assert_eq!(st.head_need_n, 0);
+        assert_eq!(st.resolved.get(&txid), Some(&Fk(7)));
+        assert_eq!(st.idents.get(&7).and_then(|e| e.body), Some((10, 20)));
+        assert_eq!(st.idents.get(&7).and_then(|e| e.spent), Some((30, 40)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inflight_hit_without_skeleton() {
+        let (dir, q) = tmp_store();
+        let p = pin(42);
+        let mut log = InFlightLog::new();
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1));
+        let txid = p.0.txid;
+        let st = stamp_external_parents(q.store(), &[txid], &log.snapshot(), None).unwrap();
+        assert_eq!(st.head_need_n, 0);
+        assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skeleton_miss_is_unresolved_without_head_probe() {
+        let (dir, q) = tmp_store();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x22;
+        let skel = BatchParentIds::default();
+        let empty = InFlightView::empty();
+        let err = stamp_external_parents(q.store(), &[txid], &empty, Some(&skel)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("parent create_fk unresolved"), "got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Idx body_range and spent_range for stamped create_fks with no in-flight outs.
 ///
 /// Body miss after identity is `Corrupt`. Spent miss after a **store** body fill
-/// is `Corrupt`. RAM-only identity (published/recent fake range, no `spent.idx`
-/// row) leaves spent unset — write ensure still stamps those holes.
+/// is `Corrupt`. RAM-only identity (in-flight outs, no `spent.idx` row) leaves
+/// spent unset — write ensure still stamps those holes.
 pub fn fill_missing_parent_ranges(
     store: &Store,
     in_flight: &InFlightView,

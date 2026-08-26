@@ -1,8 +1,8 @@
 //! Confirm_run unit tests (peeled from confirm_run.rs).
 
 use super::{
-    confirm_archive_kind, recent_create_height_slices, recent_create_rows_for_slices,
-    write_batch_vs_tip, write_height_needed, ConfirmArchiveKind, WriteBatchVsTip,
+    confirm_archive_kind, write_batch_vs_tip, write_height_needed, ConfirmArchiveKind,
+    WriteBatchVsTip,
 };
 
 #[test]
@@ -15,77 +15,6 @@ fn tx_head_drain_thread_is_named_and_reused() {
     assert_eq!(n1, HEAD_DRAIN_THREAD_NAME);
     assert_eq!(n2, HEAD_DRAIN_THREAD_NAME);
     assert_eq!(id1, id2, "drain must keep one OS thread across batches");
-}
-
-#[test]
-fn recent_create_height_slices_two_heights_and_remainder() {
-    assert_eq!(
-        recent_create_height_slices(&[(10, 2), (11, 3)], 5),
-        vec![(10, 0..2), (11, 2..5)]
-    );
-    assert_eq!(
-        recent_create_height_slices(&[(10, 2), (11, 3)], 7),
-        vec![(10, 0..2), (11, 2..5), (11, 5..7)],
-        "tail past prepared counts tags the last height"
-    );
-    assert!(recent_create_height_slices(&[(10, 2)], 0).is_empty());
-    assert_eq!(
-        recent_create_height_slices(&[(10, 0), (11, 4)], 4),
-        vec![(11, 0..4)]
-    );
-}
-
-#[test]
-fn recent_create_rows_skip_missing_idx_keep_heights() {
-    let tid = |b| {
-        let mut t = [0u8; 32];
-        t[0] = b;
-        t
-    };
-    let slices = recent_create_height_slices(&[(10, 2), (11, 2)], 4);
-    let pairs = [
-        (tid(1), rbitcoin_primitives::Fk(1)),
-        (tid(2), rbitcoin_primitives::Fk(2)),
-        (tid(3), rbitcoin_primitives::Fk(3)),
-        (tid(4), rbitcoin_primitives::Fk(4)),
-    ];
-    let ranges = [Some((1, 8)), None, Some((9, 8)), Some((17, 8))];
-    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges, &[]);
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, 10);
-    assert_eq!(rows[0].1.len(), 1, "missing idx at height 10 dropped");
-    assert_eq!(rows[1].0, 11);
-    assert_eq!(rows[1].1.len(), 2);
-}
-
-#[test]
-fn recent_create_rows_share_create_pin_slice() {
-    use rbitcoin_store::{OutputRecord, TxRecord};
-    use std::sync::Arc;
-    let tid = [0x11u8; 32];
-    let pin = Arc::new((
-        TxRecord {
-            txid: tid,
-            version: 1,
-            locktime: 0,
-            input_start_fk: rbitcoin_primitives::Fk::NULL,
-            input_count: 0,
-            output_start_fk: rbitcoin_primitives::Fk::NULL,
-            output_count: 1,
-        },
-        vec![OutputRecord::unspent(1, vec![0x51])],
-    ));
-    let slices = recent_create_height_slices(&[(10, 1)], 1);
-    let pairs = [(tid, rbitcoin_primitives::Fk(1))];
-    let ranges = [Some((8, 16))];
-    let pins = [Arc::clone(&pin)];
-    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges, &pins);
-    let got = rows[0].1[0].3.as_ref().expect("pin");
-    assert!(
-        Arc::ptr_eq(got, &pin),
-        "rows must Arc-clone the pin slice, not rebuild outs"
-    );
-    assert_eq!(rows[0].1[0].2, (8, 16));
 }
 
 /// Batch append: contiguous heights merge; gap returns Err(other).
@@ -2717,9 +2646,9 @@ fn structural_pinned_without_abs_is_invariant_error() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Direct write skips SH FkMap; RecentCreates body ranges match idx.
+/// Direct write skips SH FkMap; Class A idx is the body range (no RecentCreates ring).
 #[test]
-fn direct_write_skips_create_pin_map_recent_matches_idx() {
+fn direct_write_skips_create_pin_map_idx_without_recent() {
     use crate::regtest_pad::mine_empty_regtest;
     use crate::{accept_and_connect_block, ChainParams, Milestone};
     use bitcoin::hashes::Hash;
@@ -2751,11 +2680,15 @@ fn direct_write_skips_create_pin_map_recent_matches_idx() {
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
     let tid = b1.txdata[0].compute_txid().to_byte_array();
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let (fk, range) = q
-        .recent_creates()
-        .get(&tid)
-        .expect("height-1 create stays in RecentCreates while lookup_started_hi is ahead");
+    assert!(
+        q.recent_creates().get(&tid).is_none(),
+        "write must not publish RecentCreates even while lookup_started_hi is ahead"
+    );
+    let fk = q
+        .tx_fk_by_txid(&tid)
+        .expect("txid lookup")
+        .expect("height-1 create on idx");
     let idx = q.store().tx_body_range(fk).expect("idx after Class A");
-    assert_eq!(range, idx, "RecentCreates body range must be the idx row");
+    assert!(idx.1 > 0, "Class A body range must be on idx");
     let _ = std::fs::remove_dir_all(&path);
 }

@@ -91,70 +91,6 @@ pub(super) fn write_batch_vs_tip(
     }
 }
 
-/// Per-height ranges over a write batch's `planned_fks` / pins.
-///
-/// One RecentCreates fifo row per prepared height. A leftover tail (count
-/// mismatch) is tagged with the last height so no create is dropped.
-pub(super) fn recent_create_height_slices(
-    prepared: &[(u32, usize)],
-    total: usize,
-) -> Vec<(u32, std::ops::Range<usize>)> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    for &(h, n) in prepared {
-        if off >= total {
-            break;
-        }
-        if off.saturating_add(n) > total {
-            break;
-        }
-        if n > 0 {
-            out.push((h, off..off + n));
-        }
-        off = off.saturating_add(n);
-    }
-    if off < total {
-        let height = prepared.last().map(|(h, _)| *h).unwrap_or(0);
-        out.push((height, off..total));
-    }
-    out
-}
-
-/// Pair idx ranges back to per-height RecentCreates rows (skip missing idx).
-pub(super) fn recent_create_rows_for_slices(
-    slices: &[(u32, std::ops::Range<usize>)],
-    txid_fks: &[([u8; 32], rbitcoin_primitives::Fk)],
-    ranges: &[Option<(u64, u64)>],
-    pins: &[rbitcoin_query::CreatePin],
-) -> Vec<(
-    u32,
-    Vec<(
-        [u8; 32],
-        rbitcoin_primitives::Fk,
-        (u64, u64),
-        Option<rbitcoin_query::CreatePin>,
-    )>,
-)> {
-    let mut out = Vec::new();
-    for (height, range) in slices {
-        let mut rows = Vec::new();
-        for i in range.clone() {
-            let Some((txid, fk)) = txid_fks.get(i) else {
-                break;
-            };
-            let Some(body) = ranges.get(i).copied().flatten() else {
-                continue;
-            };
-            let pin = pins.get(i).map(std::sync::Arc::clone);
-            rows.push((*txid, *fk, body, pin));
-        }
-        if !rows.is_empty() {
-            out.push((*height, rows));
-        }
-    }
-    out
-}
-
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
 /// → optional SP tweak index (**Tip write-through only**; Direct defers to backfill).
 ///
@@ -195,15 +131,18 @@ pub fn confirm_write_phase(
             fill_packed_ins_from_wire(&mut plan, &batch.prepared, &batch.wire_blocks)?;
             let t_take = Instant::now();
             let planned_fks = plan.planned_fks.clone();
-            let pins: Vec<rbitcoin_query::CreatePin> =
-                if plan.batch_pin.len() == plan.planned_fks.len() {
+            let pins = if query.index_mode().is_tip() {
+                Some(if plan.batch_pin.len() == plan.planned_fks.len() {
                     std::mem::take(&mut plan.batch_pin)
                 } else {
                     plan.packed
                         .iter()
                         .map(|(pin, _)| std::sync::Arc::clone(pin))
-                        .collect()
-                };
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                None
+            };
             plan_take_ns = t_take.elapsed().as_nanos() as u64;
             let t_ca = Instant::now();
             let committed = query
@@ -214,7 +153,7 @@ pub fn confirm_write_phase(
             // already present) uses store denserels via ensure / class_c cold pins.
             // Direct SH collect is a no-op — skip the FkMap.
             if committed {
-                if query.index_mode().is_tip() {
+                if let Some(pins) = pins {
                     let t_map = Instant::now();
                     write_create_pins.reserve(planned_fks.len());
                     for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
@@ -222,13 +161,11 @@ pub fn confirm_write_phase(
                     }
                     create_map_ns = t_map.elapsed().as_nanos() as u64;
                 }
-                let t_idx = Instant::now();
+                let t_ens = Instant::now();
                 let body_ranges = query
                     .store()
                     .tx_body_range_batch(&planned_fks)
                     .map_err(ConsensusError::from)?;
-                let idx_ns = t_idx.elapsed().as_nanos() as u64;
-                let t_ens = Instant::now();
                 fill_planned_create_layout_after_commit(
                     query,
                     &mut batch.batch_parents,
@@ -236,44 +173,11 @@ pub fn confirm_write_phase(
                     &body_ranges,
                 )?;
                 ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
-                let slices = recent_create_height_slices(
-                    &batch
-                        .prepared
-                        .iter()
-                        .map(|p| (p.height.0, p.tx_fks.len()))
-                        .collect::<Vec<_>>(),
-                    planned_fks.len(),
-                );
-                let t_recent = Instant::now();
-                let txid_fks: Vec<([u8; 32], rbitcoin_primitives::Fk)> = planned_fks
-                    .iter()
-                    .zip(pins.iter())
-                    .map(|(fk, pin)| (pin.0.txid, *fk))
-                    .collect();
-                for (height, rows) in
-                    recent_create_rows_for_slices(&slices, &txid_fks, &body_ranges, &pins)
-                {
-                    query.note_recent_creates_pins(height, rows);
-                }
                 if let Some(last) = batch.prepared.last() {
                     query.set_class_a_hi(Some(last.height.0));
                 }
                 for p in &batch.prepared {
                     query.stamp_create_keep_until(p.height.0);
-                }
-                let t_clone = Instant::now();
-                query.flush_recent_creates();
-                let clone_ns = t_clone.elapsed().as_nanos() as u64;
-                let recent_ns = t_recent.elapsed().as_nanos() as u64;
-                if idx_ns > 0 {
-                    confirm_phase_stats::WRITE_RECENT_IDX_NS.fetch_add(idx_ns, Ordering::Relaxed);
-                }
-                if clone_ns > 0 {
-                    confirm_phase_stats::WRITE_RECENT_CLONE_NS
-                        .fetch_add(clone_ns, Ordering::Relaxed);
-                }
-                if recent_ns > 0 {
-                    confirm_phase_stats::WRITE_RECENT_NS.fetch_add(recent_ns, Ordering::Relaxed);
                 }
             }
         }
@@ -398,7 +302,7 @@ pub fn confirm_write_phase(
 
 /// After Class A commit, set body_range (+ spent.idx) for **pinned** creates
 /// still missing layout. Body ranges come from the write's one `tx_body_range_batch`
-/// (shared with RecentCreates). Spent holes use one `tx_spent_range_batch`.
+/// (same batch as layout fill). Spent holes use one `tx_spent_range_batch`.
 pub(super) fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,

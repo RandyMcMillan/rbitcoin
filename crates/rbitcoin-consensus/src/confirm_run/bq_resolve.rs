@@ -95,6 +95,8 @@ pub fn bq_resolve_wave_hold_partial(
 pub struct BqResolveWave {
     pub stats: BqResolveWaveStats,
     pub items: Vec<(u32, [u8; 32], ResolvedWire)>,
+    /// [`Query::drain_and_fence_hi`] immediately before this wave's TipOnly read.
+    pub drain_fence_hi: Option<u32>,
 }
 
 /// Outcome of one TipOnly wave over BQ-ready heights.
@@ -274,6 +276,7 @@ pub fn confirm_bq_resolve_wave_capped(
             return Ok(BqResolveWave {
                 stats,
                 items: Vec::new(),
+                drain_fence_hi: None,
             });
         }
     }
@@ -345,6 +348,7 @@ pub fn confirm_bq_resolve_wave_capped(
     let t_head = Instant::now();
     need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
 
+    let drain_fence_hi = query.drain_and_fence_hi();
     if let Some(&hi) = selected.last() {
         query.note_lookup_tiponly_start(hi);
     }
@@ -395,7 +399,11 @@ pub fn confirm_bq_resolve_wave_capped(
         stats.collect_ns,
         stats.head_ns,
     );
-    Ok(BqResolveWave { stats, items })
+    Ok(BqResolveWave {
+        stats,
+        items,
+        drain_fence_hi,
+    })
 }
 
 /// Dequeue BQ rows and bump `lookup_taken_hi` after a successful loadq send.
@@ -1179,12 +1187,9 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
         let mut log = InFlightLog::new();
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1),
-            None,
-        );
-        // Production prune_committed: tip still genesis; occupied already 99.
-        log.prune_through_tip(Some(0));
+        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        // Production: a wave that snapshotted drain+fence at genesis keeps height 1.
+        log.prune_below_height(Some(0));
         let view = log.snapshot();
         assert!(
             view.get_create_fk(&parent_txid).is_some(),
@@ -1219,10 +1224,10 @@ mod tests {
             .find(|e| e.vout != u32::MAX)
             .expect("spend");
         assert_eq!(inp.create_fk, parent_fk);
-        log.prune_through_tip(Some(1));
+        log.prune_below_height(Some(2));
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_none(),
-            "confirmed height is leftover TipOnly's job"
+            "after a later wave snapshots drain+fence past the pack, TipOnly owns it"
         );
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -1265,21 +1270,11 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
         let mut log = InFlightLog::new();
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1),
-            None,
-        );
-        let mut dropped = log.clone();
-        dropped.prune_through_tip(q.tip_height().map(|h| h.0));
-        assert!(
-            dropped.snapshot().get_create_fk(&parent_txid).is_none(),
-            "prune-on-confirmed-HWM is the 945952 race"
-        );
-        // Same cutoff production prune_committed must use.
-        log.prune_through_tip(q.fence_tip_height());
+        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        log.prune_below_height(q.drain_and_fence_hi());
         assert!(
             log.snapshot().get_create_fk(&parent_txid).is_some(),
-            "in-flight stays until the fence covers the pack, not confirmed HWM"
+            "in-flight stays until a wave snapshots drain+fence covering the pack, not confirmed HWM"
         );
         // Dummy height-1 confirmed row was only to tear tip vs fence; stamp
         // still connects at tip+1 from genesis.
@@ -1454,6 +1449,7 @@ mod tests {
             heights.push(h);
         }
         let mut live = rbitcoin_query::LiveUnion::new();
+        let df_before = q.drain_and_fence_hi();
         let wave = confirm_bq_resolve_wave_with_ids(
             &q,
             &params,
@@ -1463,6 +1459,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wave.items.len(), 4);
+        assert_eq!(
+            wave.drain_fence_hi, df_before,
+            "wave must snapshot drain+fence before TipOnly"
+        );
         assert!(
             q.lookup_taken_hi().is_none(),
             "resolve must not bump taken_hi before load-batch send; got {:?}",

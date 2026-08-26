@@ -24,7 +24,7 @@
 //!   with nested `decode=` / `precompute=` / `collect=` / `head=(probe= io= preads=)`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp,
-//!   clone, and post-scriptq prune (`load_thr pack/stamp/pin/asm/prune`).
+//!   clone, and post-stamp prune on a marked last load batch (`load_thr pack/stamp/pin/asm/prune`).
 //! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
 //!   `ibd-confirm`; excludes head-of-line wait for write handoff). `thr script work`
 //!   is that same ns. Recv/send are wait. Publisher parks; it does not `wait_done`

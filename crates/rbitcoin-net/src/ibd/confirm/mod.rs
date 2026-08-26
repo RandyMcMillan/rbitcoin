@@ -50,16 +50,17 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop packs whose stamped `until` is behind drain+fence.
+    /// Drop packs whose `max_height` is below a lookup-wave drain+fence snapshot.
     ///
-    /// Call **after** pin + scripts handoff so n−1 still has CreatePin outs
-    /// for load (stamp skips body_range when `get_out`).
-    ///
-    /// `next_tx_start` still tracks body count (next free create fk).
-    fn prune_committed(&mut self, hub: &ChainHub) {
+    /// Call after this load batch has finished its in-flight read (stamp).
+    fn drop_inflight_below(&mut self, hi: Option<u32>) {
+        self.in_flight.prune_below_height(hi);
+        self.publish_mem_stats();
+    }
+
+    /// Advance create-fk HWM from published body; clear last_loaded once on tip.
+    fn sync_body_hwm(&mut self, hub: &ChainHub) {
         let body_n = hub.query.tx_body_count();
-        self.in_flight
-            .prune_if_drain_fence(hub.query.drain_and_fence_hi());
         self.next_tx_start = self.next_tx_start.max(body_n.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_loaded {
             let tip = hub.tip_height().unwrap_or(0);
@@ -67,7 +68,6 @@ impl LoadAheadState {
                 self.last_loaded = None;
             }
         }
-        self.publish_mem_stats();
     }
 
     /// Publish InFlight occupancy for `ibd: sizes`. IBD has no process pstore.
@@ -95,7 +95,6 @@ impl LoadAheadState {
 
     fn note_lookup_ok(
         &mut self,
-        hub: &ChainHub,
         plan: &rbitcoin_query::ArchiveWritePlan,
         last_height: u32,
         last_hash: [u8; 32],
@@ -115,10 +114,8 @@ impl LoadAheadState {
                     .map(|((pin, _), fk)| (*fk, pin)),
             )
         };
-        self.in_flight.note_layer(
-            layer.with_max_height(last_height),
-            hub.query.lookup_started_hi(),
-        );
+        self.in_flight
+            .note_layer(layer.with_max_height(last_height));
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
@@ -169,8 +166,7 @@ impl LoadAheadState {
         if let Some(h) = max_height {
             layer = layer.with_max_height(h);
         }
-        self.in_flight
-            .note_layer(layer, hub.query.lookup_started_hi());
+        self.in_flight.note_layer(layer);
         if let Some(&(h, hash)) = heights_hashes.last() {
             self.last_loaded = Some((h, hash.to_byte_array()));
         }
@@ -367,6 +363,10 @@ pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 14;
 /// One load-sized run produced by lookup (decoded wire + pres, height-ordered).
 pub(crate) struct LoadBatch {
     pub items: Vec<(u32, [u8; 32], rbitcoin_query::ResolvedWire)>,
+    /// Drain+fence height snapshotted before this lookup wave's TipOnly.
+    /// `Some` only on the last sent batch of the wave; load drops in-flight
+    /// layers with `max_height` below this after the in-flight read.
+    pub drop_inflight_below: Option<u32>,
 }
 
 /// Stamp inputs for one loadq run. Lookup `pres` must ride through (`Some`);
@@ -427,6 +427,35 @@ pub(crate) fn split_wave_into_load_batches_kind(
         }
         out.push(n);
         i += n;
+    }
+    out
+}
+
+/// Chunk a lookup wave into loadq batches; mark the last sent with `drop_below`.
+pub(crate) fn load_batches_from_wave(
+    items: &[(u32, [u8; 32], rbitcoin_query::ResolvedWire)],
+    parts: &[usize],
+    remaining: usize,
+    drop_below: Option<u32>,
+) -> Vec<LoadBatch> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    for &n in parts {
+        if out.len() >= remaining {
+            break;
+        }
+        let end = i.saturating_add(n).min(items.len());
+        if i >= end {
+            break;
+        }
+        out.push(LoadBatch {
+            items: items[i..end].to_vec(),
+            drop_inflight_below: None,
+        });
+        i = end;
+    }
+    if let Some(last) = out.last_mut() {
+        last.drop_inflight_below = drop_below;
     }
     out
 }
@@ -1355,6 +1384,7 @@ pub(crate) fn spawn_confirm_engine(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 confirm_thr_stats::add_load_pack(t_recv.elapsed());
+                let drop_below = lb.drop_inflight_below;
                 let n = lb.items.len();
                 let wire: usize = lb.items.iter().map(|(_, _, w)| w.block.total_size()).sum();
                 queues_load.note_load_recv(n, wire);
@@ -1380,6 +1410,11 @@ pub(crate) fn spawn_confirm_engine(
 
                 let (batch, _batch_inputs) = batch;
                 if batch.is_empty() {
+                    if drop_below.is_some() {
+                        let t_prune = Instant::now();
+                        lookup_ahead.drop_inflight_below(drop_below);
+                        confirm_thr_stats::add_load_prune(t_prune.elapsed());
+                    }
                     continue;
                 }
                 let expect_h = batch[0].0;
@@ -1470,7 +1505,7 @@ pub(crate) fn spawn_confirm_engine(
                         .map(|(h, ha, _)| (*h, ha.to_byte_array()))
                         .max_by_key(|(h, _)| *h)
                     {
-                        lookup_ahead.note_lookup_ok(&hub_load, p, lh, raw);
+                        lookup_ahead.note_lookup_ok(p, lh, raw);
                     }
                 } else {
                     let hh: Vec<(u32, BlockHash)> = wire_batch
@@ -1478,6 +1513,11 @@ pub(crate) fn spawn_confirm_engine(
                         .map(|(h, ha, _)| (*h, *ha))
                         .collect();
                     lookup_ahead.note_archived_creates(&hub_load, &hh);
+                }
+                if drop_below.is_some() {
+                    let t_prune = Instant::now();
+                    lookup_ahead.drop_inflight_below(drop_below);
+                    confirm_thr_stats::add_load_prune(t_prune.elapsed());
                 }
                 let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
                 let plan_ns = stamped.work_ns;
@@ -1601,10 +1641,8 @@ pub(crate) fn spawn_confirm_engine(
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
-                // Disconnect prune: drain+fence layers are TipOnly; next claim must not see those outs.
-                let t_prune = Instant::now();
-                lookup_ahead.prune_committed(&hub_load);
-                confirm_thr_stats::add_load_prune(t_prune.elapsed());
+                // Body HWM only — in-flight drop is the marked last-batch path above.
+                lookup_ahead.sync_body_hwm(&hub_load);
             }
             drop(mat_tx);
             rbitcoin_consensus::unpark_script_publisher();
@@ -1703,28 +1741,22 @@ pub(crate) fn spawn_confirm_engine(
                                 confirm_batch_max_inputs(),
                                 CONFIRM_RUN_MAX_BLOCKS,
                             );
-                            let mut i = 0usize;
-                            let mut sent = 0usize;
-                            for n in parts {
-                                if sent >= remaining {
-                                    break;
-                                }
-                                let end = i.saturating_add(n).min(wave.items.len());
-                                if i >= end {
-                                    break;
-                                }
-                                let chunk = wave.items[i..end].to_vec();
-                                i = end;
+                            let batches = load_batches_from_wave(
+                                &wave.items,
+                                &parts,
+                                remaining,
+                                wave.drain_fence_hi,
+                            );
+                            for batch in batches {
                                 let t_send = Instant::now();
-                                let n = chunk.len();
-                                let wire: usize =
-                                    chunk.iter().map(|(_, _, w)| w.block.total_size()).sum();
-                                if load_tx
-                                    .send(LoadBatch {
-                                        items: chunk.clone(),
-                                    })
-                                    .is_err()
-                                {
+                                let n = batch.items.len();
+                                let wire: usize = batch
+                                    .items
+                                    .iter()
+                                    .map(|(_, _, w)| w.block.total_size())
+                                    .sum();
+                                let chunk = batch.items.clone();
+                                if load_tx.send(batch).is_err() {
                                     break;
                                 }
                                 if rbitcoin_consensus::take_wave_items_for_load(&hub.query, &chunk)
@@ -1733,7 +1765,6 @@ pub(crate) fn spawn_confirm_engine(
                                     break;
                                 }
                                 queues_lookup.note_load_send(n, wire);
-                                sent = sent.saturating_add(1);
                                 confirm_thr_stats::add_lookup_send_wait(t_send.elapsed());
                             }
                             feed.notify();

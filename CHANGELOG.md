@@ -77,12 +77,12 @@ before 1.0).
   a higher tip (`lag > 2`), `headers_done` unlatches and `getheaders`
   resumes. Near-tip (`lag ≤ 2`) still does not re-fan.
 
-- **In-flight until at layer create:** pin layers stay until drain+fence
-  height > `until` stamped at `note_layer` (`until = lookup_started_hi`,
-  or pack `max_height` if started_hi is `None`). Horizon is
-  `drain_and_fence_hi` (min of drain height and fence tip), not Class C
-  tip; `class_a_hi` is not a drop gate. Stamp walks
-  `InFlightView` only (then live_union, then TipOnly).
+- **In-flight drop after last load batch of a wave:** lookup snapshots
+  `drain_and_fence_hi` before TipOnly and passes it on the last load
+  batch. After that batch's in-flight read, load drops layers with
+  `max_height` below the snapshot (equality keeps). Not Class C tip;
+  `class_a_hi` is not a drop gate. Stamp walks `InFlightView` only
+  (then live_union, then TipOnly).
   [`docs/invariants.md`](docs/invariants.md),
   [`docs/concurrency.md`](docs/concurrency.md).
 

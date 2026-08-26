@@ -1279,8 +1279,9 @@ impl Query {
 
     /// Height both `tx.head` drain and the RAM fence have passed.
     ///
-    /// In-flight prune HWM. `None` when drain is 0 or the drain fk is not on
-    /// the fence (Class C/fence can lead unpublished head).
+    /// Lookup snapshots this before TipOnly; load drops in-flight below it
+    /// after the last batch of that wave. `None` when drain is 0 or the drain
+    /// fk is not on the fence (Class C/fence can lead unpublished head).
     pub fn drain_and_fence_hi(&self) -> Option<u32> {
         self.store
             .height_fence_snapshot()

@@ -6,13 +6,12 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop a tagged layer iff drain+fence height > `until` stamped at
-//! [`InFlightLog::note_layer`] (`until = lookup_started_hi`, or pack
-//! `max_height` when started_hi is `None`). Horizon is
-//! [`rbitcoin_store::HeightFence::drain_and_fence_hi`] (min of drain height and
-//! fence tip). Class C tip and `class_a_hi` are not drop gates. Disconnect
-//! still [`InFlightLog::drop_from_height`] on pack height. Call after pin so
-//! n−1 still has CreatePin outs.
+//! **Prune:** lookup snapshots [`rbitcoin_store::HeightFence::drain_and_fence_hi`]
+//! before a wave's TipOnly read and passes it on the last load batch. After
+//! that batch finishes its in-flight read, [`InFlightLog::prune_below_height`]
+//! drops tagged layers with `max_height` **below** that snapshot (equality
+//! keeps). Class C tip and `class_a_hi` are not drop gates. Disconnect still
+//! [`InFlightLog::drop_from_height`] on pack height.
 //!
 //! Lookup is newest→oldest scan over layers (O(L)).
 
@@ -29,8 +28,6 @@ pub struct InFlightLayer {
     outs: U64Map<CreatePin>,
     /// Highest block height in this pack. [`None`] = untagged (disconnect keeps it).
     max_height: Option<u32>,
-    /// Drain+fence drop horizon stamped at [`InFlightLog::note_layer`].
-    until: Option<u32>,
     /// Occupancy bytes computed at build (no per-pack script walk).
     approx_bytes: u64,
 }
@@ -51,7 +48,6 @@ impl InFlightLayer {
             creates,
             outs,
             max_height: None,
-            until: None,
             approx_bytes,
         }
     }
@@ -78,7 +74,6 @@ impl InFlightLayer {
             creates,
             outs,
             max_height: None,
-            until: None,
             approx_bytes,
         }
     }
@@ -113,15 +108,12 @@ impl InFlightLog {
 
     /// Publish one pack. Does not mutate existing layers.
     ///
-    /// `until` is `lookup_started_hi` at create, or pack `max_height` when
-    /// that atomic is still `None`. A layer with only `creates` (no outs) is
-    /// still published — plan=None archived packs use creates-only for
-    /// tip-ahead parent resolve.
-    pub fn note_layer(&mut self, mut layer: InFlightLayer, lookup_started_hi: Option<u32>) {
+    /// A layer with only `creates` (no outs) is still published — plan=None
+    /// archived packs use creates-only for tip-ahead parent resolve.
+    pub fn note_layer(&mut self, layer: InFlightLayer) {
         if layer.creates.is_empty() && layer.outs.is_empty() {
             return;
         }
-        layer.until = lookup_started_hi.or(layer.max_height);
         self.layers.push(Arc::new(layer));
     }
 
@@ -137,37 +129,21 @@ impl InFlightLog {
         self.layers.shrink_to_fit();
     }
 
-    /// Drop layers whose stamped `until` is already behind drain+fence.
+    /// Drop tagged layers with `max_height` below `hi`.
     ///
-    /// `None` hi keeps every layer. Untagged (`until == None`) stay.
-    /// Drop when `drain_fence_hi > until` (equality keeps).
-    pub fn prune_if_drain_fence(&mut self, drain_fence_hi: Option<u32>) {
-        let Some(hi) = drain_fence_hi else {
-            return;
-        };
-        if self.layers.is_empty() {
-            return;
-        }
-        self.layers.retain(|layer| match layer.until {
-            Some(u) => hi <= u,
-            None => true,
-        });
-        self.layers.shrink_to_fit();
-    }
-
-    /// Drop packs whose heights are already on the fence. `None` keeps all.
-    ///
-    /// Not the IBD pin-layer path (that is [`Self::prune_if_drain_fence`] vs
-    /// stamped `until`). Untagged layers (`max_height == None`) stay.
-    pub fn prune_through_tip(&mut self, tip: Option<u32>) {
-        let Some(t) = tip else {
+    /// `None` hi keeps every layer. Untagged (`max_height == None`) stay.
+    /// Equality keeps (`hi == max_height`). Load calls this after the last
+    /// batch of a lookup wave finishes its in-flight read, with the drain+fence
+    /// height snapshotted before that wave's TipOnly.
+    pub fn prune_below_height(&mut self, hi: Option<u32>) {
+        let Some(h) = hi else {
             return;
         };
         if self.layers.is_empty() {
             return;
         }
         self.layers.retain(|layer| match layer.max_height {
-            Some(h) => h > t,
+            Some(mh) => mh >= h,
             None => true,
         });
         self.layers.shrink_to_fit();
@@ -281,7 +257,7 @@ mod tests {
         let mut log = InFlightLog::new();
         let mut tid = [0u8; 32];
         tid[0] = 0xab;
-        log.note_layer(InFlightLayer::from_txid_fks([(tid, Fk(42))]), None);
+        log.note_layer(InFlightLayer::from_txid_fks([(tid, Fk(42))]));
         let v = log.snapshot();
         assert_eq!(v.get_create_fk(&tid), Some(Fk(42)));
         assert!(v.get_out(42).is_none(), "creates-only has no denserels pin");
@@ -292,8 +268,8 @@ mod tests {
         let mut log = InFlightLog::new();
         let p1 = pin(1);
         let p2 = pin(2);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]), None);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]));
         let (layers, entries, bytes) = log.size_snapshot();
         assert_eq!(layers, 2);
         assert_eq!(entries, 2);
@@ -318,12 +294,12 @@ mod tests {
     fn note_does_not_mutate_prior_layer_arcs() {
         let mut log = InFlightLog::new();
         let p1 = pin(1);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
         let snap = log.snapshot();
         let layer0 = Arc::clone(&log.layers[0]);
 
         let p2 = pin(2);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]));
 
         // Prior layer Arc identity unchanged (no make_mut rebuild).
         assert!(
@@ -341,124 +317,61 @@ mod tests {
         let mut log = InFlightLog::new();
         let a = pin(10);
         let b = pin(50);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1),
-            None,
-        );
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(3),
-            None,
-        );
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(3));
         assert_eq!(log.layer_count(), 2);
-        log.prune_through_tip(Some(1));
+        log.prune_below_height(Some(2));
         assert_eq!(log.layer_count(), 1);
         assert!(log.snapshot().get_out(50).is_some());
         assert!(log.snapshot().get_out(10).is_none());
     }
 
-    /// In-flight lives until the pack's heights are on the fence — not until
-    /// `tx.head` occupied or `confirmed[]` HWM (mainnet 931147 / 945952).
+    /// Drop is pack `max_height` vs the wave's pre-TipOnly drain+fence snapshot,
+    /// not `tx.head` occupied or `confirmed[]` HWM (mainnet 931147 / 945952).
     #[test]
-    fn inflight_prune_through_tip() {
+    fn prune_below_height_drops_strictly_below() {
         let mut log = InFlightLog::new();
         let confirmed = pin(10);
         let ahead = pin(50);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &confirmed)]).with_max_height(5),
-            None,
-        );
-        // Occupied already covers fk=50 (drain done) but height 6 is not confirmed.
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(50), &ahead)]).with_max_height(6),
-            None,
-        );
-        log.prune_through_tip(None);
-        assert_eq!(log.layer_count(), 2, "no tip: keep every layer");
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &confirmed)]).with_max_height(5));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &ahead)]).with_max_height(6));
+        log.prune_below_height(None);
+        assert_eq!(log.layer_count(), 2, "no snapshot: keep every layer");
 
-        log.prune_through_tip(Some(5));
+        log.prune_below_height(Some(5));
+        let v = log.snapshot();
+        assert!(
+            v.get_create_fk(&confirmed.0.txid).is_some(),
+            "equality keeps (drop is strictly below)"
+        );
+        assert!(v.get_create_fk(&ahead.0.txid).is_some());
+
+        log.prune_below_height(Some(6));
         let v = log.snapshot();
         assert!(
             v.get_create_fk(&confirmed.0.txid).is_none(),
-            "tip>=max_height drops the confirmed pack"
+            "max_height 5 is below noted 6"
         );
         assert!(
             v.get_create_fk(&ahead.0.txid).is_some(),
-            "max_fk<=occupied must not drop an unconfirmed height"
+            "max_height == noted keeps"
         );
 
-        log.prune_through_tip(Some(6));
+        log.prune_below_height(Some(7));
         assert!(log.snapshot().is_empty());
     }
 
     #[test]
-    fn prune_keeps_until_drain_fence_exceeds_stamped_until() {
+    fn prune_below_height_keeps_untagged() {
         let mut log = InFlightLog::new();
-        let p = pin(10);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(2),
-            Some(40),
-        );
-        log.prune_if_drain_fence(None);
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "no drain+fence height: keep"
-        );
-        log.prune_if_drain_fence(Some(2));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "drain lag (2) while until is 40: keep — Class C/fence tip is not the gate"
-        );
-        log.prune_if_drain_fence(Some(40));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "drain+fence == until keeps (drop is strictly >)"
-        );
-        log.prune_if_drain_fence(Some(41));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_none(),
-            "drain+fence > until drops"
-        );
-    }
-
-    #[test]
-    fn note_layer_until_is_lookup_started_hi_not_pack_height() {
-        let mut log = InFlightLog::new();
-        let p = pin(10);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(10),
-            Some(40),
-        );
-        log.prune_if_drain_fence(Some(10));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "until is started_hi 40, not pack height 10"
-        );
-        log.prune_if_drain_fence(Some(40));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "equality keeps"
-        );
-        log.prune_if_drain_fence(Some(41));
-        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
-    }
-
-    #[test]
-    fn note_layer_none_started_hi_until_is_pack_max_height() {
-        let mut log = InFlightLog::new();
-        let p = pin(10);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(10),
-            None,
-        );
-        log.prune_if_drain_fence(Some(9));
-        assert!(log.snapshot().get_create_fk(&p.0.txid).is_some());
-        log.prune_if_drain_fence(Some(10));
-        assert!(
-            log.snapshot().get_create_fk(&p.0.txid).is_some(),
-            "None started_hi: until = pack max_height; equality keeps"
-        );
-        log.prune_if_drain_fence(Some(11));
-        assert!(log.snapshot().get_create_fk(&p.0.txid).is_none());
+        let a = pin(10);
+        let b = pin(20);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(20), &b)]));
+        log.prune_below_height(Some(99));
+        let v = log.snapshot();
+        assert!(v.get_create_fk(&a.0.txid).is_none());
+        assert!(v.get_create_fk(&b.0.txid).is_some(), "untagged stays");
     }
 
     #[test]
@@ -467,15 +380,9 @@ mod tests {
         let a = pin(10);
         let b = pin(20);
         let c = pin(30);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1),
-            None,
-        );
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(20), &b)]).with_max_height(3),
-            None,
-        );
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(30), &c)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(20), &b)]).with_max_height(3));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(30), &c)]));
         log.drop_from_height(3);
         let v = log.snapshot();
         assert!(v.get_create_fk(&a.0.txid).is_some());
@@ -484,40 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn prune_if_drain_fence_keeps_higher_until() {
-        let mut log = InFlightLog::new();
-        let a = pin(10);
-        let b = pin(50);
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(2),
-            Some(2),
-        );
-        log.note_layer(
-            InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(8),
-            Some(8),
-        );
-        log.prune_if_drain_fence(Some(2));
-        let v = log.snapshot();
-        assert!(
-            v.get_create_fk(&a.0.txid).is_some(),
-            "drain+fence == until 2 keeps"
-        );
-        assert!(
-            v.get_create_fk(&b.0.txid).is_some(),
-            "until 8 still ahead of drain+fence 2"
-        );
-        log.prune_if_drain_fence(Some(3));
-        let v = log.snapshot();
-        assert!(v.get_create_fk(&a.0.txid).is_none());
-        assert!(v.get_create_fk(&b.0.txid).is_some());
-    }
-
-    #[test]
     fn clear_drops_all_layers_and_entries() {
         let mut log = InFlightLog::new();
         for i in 1u64..=5 {
             let p = pin(i);
-            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]), None);
+            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
         }
         assert_eq!(log.layer_count(), 5);
         assert_eq!(log.entry_count(), 5);
@@ -531,7 +409,7 @@ mod tests {
         assert!(held.get_out(3).is_some());
         assert!(log.snapshot().is_empty());
         let p = pin(99);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(99), &p)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(99), &p)]));
         assert_eq!(log.layer_count(), 1);
         assert!(log.snapshot().get_out(99).is_some());
         assert!(log.snapshot().get_out(1).is_none());
@@ -541,11 +419,11 @@ mod tests {
     fn snapshot_stable_while_log_notes_more() {
         let mut log = InFlightLog::new();
         let p1 = pin(1);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
         let held = log.snapshot();
         for i in 2u64..=40 {
             let p = pin(i);
-            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]), None);
+            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
         }
         // Prep-held view still only sees pack 1.
         assert_eq!(held.layer_count(), 1);
@@ -573,10 +451,9 @@ mod tests {
                     (Fk(id), p)
                 })
                 .collect();
-            log.note_layer(
-                InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))),
-                None,
-            );
+            log.note_layer(InFlightLayer::from_plan_pins(
+                pins.iter().map(|(f, p)| (*f, p)),
+            ));
         }
         let held = log.snapshot();
         assert!(held.layer_count() >= 40);
@@ -590,10 +467,9 @@ mod tests {
                     (Fk(id), p)
                 })
                 .collect();
-            log.note_layer(
-                InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))),
-                None,
-            );
+            log.note_layer(InFlightLayer::from_plan_pins(
+                pins.iter().map(|(f, p)| (*f, p)),
+            ));
         }
         let elapsed = t0.elapsed();
         // Held snapshot must remain frozen.

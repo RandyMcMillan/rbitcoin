@@ -28,30 +28,23 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
     ))
 }
 
-/// Unconfirmed pack stays until drain+fence exceeds stamped until (not pack height, not Class C).
+/// Pack stays until a later wave snapshots drain+fence past its height (not pack height alone).
 #[test]
-fn prune_inflight_keeps_until_drain_fence_exceeds_until() {
+fn prune_inflight_drops_below_wave_drain_fence_keeps_equal() {
     let mut log = InFlightLog::new();
     let pins: Vec<_> = (85u64..=100).map(|id| (Fk(id), test_pin(id))).collect();
     log.note_layer(
         InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))).with_max_height(10),
-        Some(40),
     );
-    log.prune_if_drain_fence(Some(9));
-    assert_eq!(log.entry_count(), 16, "drain+fence < until keeps the pack");
-    log.prune_if_drain_fence(Some(10));
+    log.prune_below_height(Some(9));
+    assert_eq!(log.entry_count(), 16, "noted 9: height 10 is not below");
+    log.prune_below_height(Some(10));
     assert_eq!(
         log.entry_count(),
         16,
-        "drain+fence of pack height is not enough while until is 40"
+        "equality keeps (drop is strictly below)"
     );
-    log.prune_if_drain_fence(Some(40));
-    assert_eq!(
-        log.entry_count(),
-        16,
-        "drain+fence == until keeps (mainnet 258870 Class C/fence lead)"
-    );
-    log.prune_if_drain_fence(Some(41));
+    log.prune_below_height(Some(11));
     assert_eq!(log.layer_count(), 0);
 }
 
@@ -204,11 +197,8 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
 fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
     let mut log = InFlightLog::new();
     let p = test_pin(42);
-    log.note_layer(
-        InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1),
-        None,
-    );
-    log.prune_through_tip(Some(0));
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1));
+    log.prune_below_height(Some(0));
     assert!(
         log.snapshot().get_create_fk(&p.0.txid).is_some(),
         "occupied/fence lag must not drop height > tip"
@@ -221,11 +211,11 @@ fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
 fn note_while_prep_holds_snapshot_does_not_clone_prior_layers() {
     let mut log = InFlightLog::new();
     let p1 = test_pin(1);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]), None);
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
     let held = log.snapshot();
     for i in 2u64..=30 {
         let p = test_pin(i);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]), None);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
     }
     assert_eq!(held.layer_count(), 1);
     assert!(held.get_out(1).is_some());
@@ -316,7 +306,12 @@ fn split_wave_into_load_batches_is_eight_by_8000() {
     assert_eq!(LOAD_QUEUE_CAP_DEFAULT, 14);
     assert_eq!(super::confirm_queue_caps().load, LOAD_QUEUE_CAP_DEFAULT);
     assert_eq!(super::load_queue_cap(), LOAD_QUEUE_CAP_DEFAULT);
-    assert!(super::LoadBatch { items: vec![] }.items.is_empty());
+    assert!(super::LoadBatch {
+        items: vec![],
+        drop_inflight_below: None,
+    }
+    .items
+    .is_empty());
     // 8 × 8001 inputs (each block overshoots 8000) → 8 batches of one.
     let wave: Vec<u32> = vec![8001; 8];
     let parts = split_wave_into_load_batches_kind(
@@ -373,6 +368,72 @@ fn split_wave_into_load_batches_stops_at_has_body_change() {
 }
 
 #[test]
+fn last_sent_load_batch_carries_wave_drain_fence() {
+    use super::{load_batches_from_wave, split_wave_into_load_batches_kind};
+    use rbitcoin_query::{ResolvedWire, TxPrecompute};
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let pres: Arc<[TxPrecompute]> = genesis
+        .txdata
+        .iter()
+        .map(TxPrecompute::from_tx)
+        .collect::<Vec<_>>()
+        .into();
+    let mk = |h: u32| {
+        (
+            h,
+            [h as u8; 32],
+            ResolvedWire {
+                block: Arc::new(genesis.clone()),
+                pres: Arc::clone(&pres),
+            },
+        )
+    };
+    let items: Vec<_> = (1..=5).map(mk).collect();
+    let parts = split_wave_into_load_batches_kind(&[1, 1, 1, 1, 1], &[], 2, 2);
+    assert_eq!(parts, vec![2, 2, 1]);
+    let batches = load_batches_from_wave(&items, &parts, 14, Some(40));
+    assert_eq!(batches.len(), 3);
+    assert!(batches[0].drop_inflight_below.is_none());
+    assert!(batches[1].drop_inflight_below.is_none());
+    assert_eq!(batches[2].drop_inflight_below, Some(40));
+    assert_eq!(batches[0].items.len(), 2);
+    assert_eq!(batches[2].items.len(), 1);
+
+    let truncated = load_batches_from_wave(&items, &parts, 2, Some(7));
+    assert_eq!(truncated.len(), 2, "remaining loadq slots cap sent batches");
+    assert!(truncated[0].drop_inflight_below.is_none());
+    assert_eq!(
+        truncated[1].drop_inflight_below,
+        Some(7),
+        "last sent batch of a truncated wave still carries the snapshot"
+    );
+
+    let unmarked = load_batches_from_wave(&items, &parts, 14, None);
+    assert!(unmarked.last().unwrap().drop_inflight_below.is_none());
+}
+
+#[test]
+fn marked_load_batch_drops_inflight_below_after_read() {
+    let mut log = InFlightLog::new();
+    let a = test_pin(10);
+    let b = test_pin(50);
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(5));
+    log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(20));
+    log.prune_below_height(None);
+    assert_eq!(log.layer_count(), 2, "unmarked batch does not drop");
+    log.prune_below_height(Some(10));
+    let v = log.snapshot();
+    assert!(
+        v.get_create_fk(&a.0.txid).is_none(),
+        "height 5 is below noted 10 after last-batch in-flight read"
+    );
+    assert!(
+        v.get_create_fk(&b.0.txid).is_some(),
+        "height 20 stays until a later wave snapshots past it"
+    );
+}
+
+#[test]
 fn load_recv_is_lookup_order() {
     use super::LoadBatch;
     use rbitcoin_query::{ResolvedWire, TxPrecompute};
@@ -398,14 +459,21 @@ fn load_recv_is_lookup_order() {
     };
     tx.send(LoadBatch {
         items: vec![mk(1), mk(2)],
+        drop_inflight_below: None,
     })
     .unwrap();
-    tx.send(LoadBatch { items: vec![mk(3)] }).unwrap();
+    tx.send(LoadBatch {
+        items: vec![mk(3)],
+        drop_inflight_below: Some(7),
+    })
+    .unwrap();
     let a = rx.recv().unwrap();
     let b = rx.recv().unwrap();
     assert_eq!(a.items[0].0, 1);
     assert_eq!(a.items[1].0, 2);
+    assert!(a.drop_inflight_below.is_none());
     assert_eq!(b.items[0].0, 3);
+    assert_eq!(b.drop_inflight_below, Some(7));
 }
 
 #[test]
@@ -428,6 +496,7 @@ fn load_stamp_items_keep_pres() {
                 pres: Arc::clone(&pres),
             },
         )],
+        drop_inflight_below: None,
     };
     let items = load_stamp_items(lb.items.into_iter().map(|(h, _, w)| (h, w.block, w.pres)));
     assert_eq!(items.len(), 1);
@@ -444,14 +513,26 @@ fn lookup_blocks_when_loadq_full() {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::sync_channel::<LoadBatch>(LOAD_QUEUE_CAP_DEFAULT);
     for _ in 0..LOAD_QUEUE_CAP_DEFAULT {
-        tx.send(LoadBatch { items: vec![] }).unwrap();
+        tx.send(LoadBatch {
+            items: vec![],
+            drop_inflight_below: None,
+        })
+        .unwrap();
     }
     assert!(
-        tx.try_send(LoadBatch { items: vec![] }).is_err(),
+        tx.try_send(LoadBatch {
+            items: vec![],
+            drop_inflight_below: None,
+        })
+        .is_err(),
         "9th send must wait / fail while loadq is full"
     );
     let _ = rx.recv().unwrap();
-    tx.send(LoadBatch { items: vec![] }).unwrap();
+    tx.send(LoadBatch {
+        items: vec![],
+        drop_inflight_below: None,
+    })
+    .unwrap();
 }
 
 #[test]

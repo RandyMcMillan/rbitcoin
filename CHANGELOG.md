@@ -54,6 +54,12 @@ before 1.0).
 
 ### Changed
 
+- **In-flight keep-until:** pin layers stay until drain+fence **and**
+  `class_a_hi >= until` (`until = lookup_started_hi.max(hi)` frozen at
+  write). Stamp walks `InFlightView` only (then live_union, then TipOnly).
+  [`docs/invariants.md`](docs/invariants.md),
+  [`docs/concurrency.md`](docs/concurrency.md).
+
 - **`header.head` open-grow replaces the file:** an undersized single-gen
   OA is deleted and recreated at the create target (`.mlt` kept). Crash
   after unlink is a missing `header.head`, not a zeroed live table.
@@ -169,6 +175,11 @@ before 1.0).
 
 ### Removed
 
+- **RecentCreates ring and `PipelineParentStore`:** write no longer clones
+  a second identity+outs layer list; IBD never used the Weak pin registry.
+  `ibd: sizes` `recent=` / `pstore=` stay 0. CreatePin outs live on
+  in-flight keep-until and batch-local `BatchParents`.
+
 - **Dead production APIs:** SH catalog materialize is always k-way (no
   fan-in reduce / CHECKPOINT / READY, no `RBITCOIN_SH_MERGE_FANIN` /
   `TARGET_RUN_BYTES` / `MAX_DIRECT_MERGE`). One catalog write policy (no
@@ -180,7 +191,7 @@ before 1.0).
   Unused `NodeClock::mock_value`, `ChainParams::min_difficulty_target`,
   `outbound_for_ibd`, `InvalidHashSet::{mark_path,is_invalid_fn}`,
   `MempoolHub::mining_frontier_snapshot`, `ConfirmParentCache::get_header_plan_arc`,
-  `NodeConfig::with_datadir_cold`. RecentCreates identity **and** outs stay.
+  `NodeConfig::with_datadir_cold`.
 
 ### Fixed
 

@@ -6,17 +6,17 @@
 //! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
 //! snapshot.
 //!
-//! **Prune:** drop a layer only when **both** drain has inserted its create-fk
-//! span (`fk_hi <= drain_fk`) **and** the fence covers that span. TipOnly is
-//! fence-connected; drain alone is not a home. Either signal alone keeps the
-//! layer (Class C ∥ drain/seal). Call after pin — stamp skips `body_range`
-//! when this map still has CreatePin outs.
+//! **Prune:** drain inserted the create-fk span **and** the fence covers it.
+//! Pin layers (`outs` non-empty, tagged `max_height`) also wait for write
+//! [`InFlightLog::set_keep_until`] (`until = lookup_started_hi.max(hi)`) and
+//! `class_a_hi >= until`. Creates-only /
+//! untagged layers still drop at drain+fence (TipOnly home). Drain or fence
+//! alone keeps the layer. Call after pin so n−1 still has CreatePin outs.
 //!
-//! Lookup is newest→oldest scan over layers (O(L)); pack counts are small and
-//! L is bounded by pipeline queue depth.
+//! Lookup is newest→oldest scan over layers (O(L)).
 
 use crate::archive::CreatePin;
-use crate::U64Map;
+use crate::{U32Map, U64Map};
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,11 +124,16 @@ fn layer_approx_bytes(creates: &HashMap<[u8; 32], Fk>, outs: &U64Map<CreatePin>)
 #[derive(Debug, Default, Clone)]
 pub struct InFlightLog {
     layers: Vec<Arc<InFlightLayer>>,
+    /// Write-frozen keep horizon: pack `max_height` → `until`.
+    keep_until: U32Map<u32>,
 }
 
 impl InFlightLog {
     pub fn new() -> Self {
-        Self { layers: Vec::new() }
+        Self {
+            layers: Vec::new(),
+            keep_until: U32Map::default(),
+        }
     }
 
     /// Publish one pack. Does not mutate existing layers.
@@ -151,20 +156,40 @@ impl InFlightLog {
             Some(h) => h < height,
             None => true,
         });
+        self.keep_until.retain(|&h, _| h < height);
         self.layers.shrink_to_fit();
+    }
+
+    /// Write-time keep horizon (`until = lookup_started_hi.max(height)`).
+    pub fn set_keep_until(&mut self, height: u32, until: u32) {
+        self.keep_until
+            .entry(height)
+            .and_modify(|u| *u = (*u).max(until))
+            .or_insert(until);
+    }
+
+    pub fn apply_keep_untils(&mut self, rows: impl IntoIterator<Item = (u32, u32)>) {
+        for (h, u) in rows {
+            self.set_keep_until(h, u);
+        }
     }
 
     /// Drop layers TipOnly can see: inserted **and** fenced.
     ///
-    /// Call **after** pin (scripts handoff) so n−1 still has CreatePin outs.
-    /// Stamp skips `body_range` when `get_out` hits. `drain_fk == 0` keeps
-    /// every layer. Empty-span layers stay.
-    pub fn prune_if_head_ready(&mut self, fence: &rbitcoin_store::HeightFence, drain_fk: u64) {
+    /// Pin layers with a keep-until also need `class_a_hi >= until`. Untagged
+    /// / creates-only drop at drain+fence. `drain_fk == 0` keeps every layer.
+    pub fn prune_if_head_ready(
+        &mut self,
+        fence: &rbitcoin_store::HeightFence,
+        drain_fk: u64,
+        class_a_hi: Option<u32>,
+    ) {
         if self.layers.is_empty() || drain_fk == 0 {
             return;
         }
+        let keep_until = &self.keep_until;
         self.layers
-            .retain(|layer| !layer.head_ready(fence, drain_fk));
+            .retain(|layer| !layer_drop_ready(layer, fence, drain_fk, class_a_hi, keep_until));
         self.layers.shrink_to_fit();
     }
 
@@ -188,6 +213,7 @@ impl InFlightLog {
 
     pub fn clear(&mut self) {
         self.layers.clear();
+        self.keep_until.clear();
         self.layers.shrink_to_fit();
     }
 
@@ -215,6 +241,25 @@ impl InFlightLog {
         }
         (self.layers.len(), entries, bytes)
     }
+}
+
+fn layer_drop_ready(
+    layer: &InFlightLayer,
+    fence: &rbitcoin_store::HeightFence,
+    drain_fk: u64,
+    class_a_hi: Option<u32>,
+    keep_until: &U32Map<u32>,
+) -> bool {
+    if !layer.head_ready(fence, drain_fk) {
+        return false;
+    }
+    let Some(h) = layer.max_height else {
+        return true;
+    };
+    if let Some(&until) = keep_until.get(&h) {
+        return class_a_hi.is_some_and(|c| c >= until);
+    }
+    layer.outs.is_empty()
 }
 
 /// Immutable prep/plan view over published layers (newest→oldest lookup).
@@ -410,25 +455,58 @@ mod tests {
         let covered = fence_covering(10, 1, 2);
         let empty = rbitcoin_store::HeightFence::empty();
 
-        log.prune_if_head_ready(&covered, 0);
+        log.prune_if_head_ready(&covered, 0, Some(2));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
             "drain_fk 0: insert never completed"
         );
-        log.prune_if_head_ready(&covered, 9);
+        log.prune_if_head_ready(&covered, 9, Some(2));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
             "fence covers, drain still mid-seal"
         );
-        log.prune_if_head_ready(&empty, 10);
+        log.prune_if_head_ready(&empty, 10, Some(2));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_some(),
             "drain done, fence not connected — TipOnly would drop"
         );
-        log.prune_if_head_ready(&covered, 10);
+        log.set_keep_until(2, 2);
+        log.prune_if_head_ready(&covered, 10, Some(2));
         assert!(
             log.snapshot().get_create_fk(&p.0.txid).is_none(),
-            "inserted and fenced"
+            "inserted, fenced, and class_a covers until"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_pin_layer_until_class_a_covers_keep_until() {
+        let mut log = InFlightLog::new();
+        let p = pin(10);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(2));
+        let covered = fence_covering(10, 1, 2);
+        log.set_keep_until(2, 40);
+        log.prune_if_head_ready(&covered, 10, Some(39));
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "drain+fence is not enough while class_a_hi < until"
+        );
+        log.prune_if_head_ready(&covered, 10, Some(40));
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_none(),
+            "class_a_hi >= until drops after drain+fence"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_tagged_pin_layer_until_write_stamps_keep_until() {
+        let mut log = InFlightLog::new();
+        let p = pin(10);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &p)]).with_max_height(2));
+        let covered = fence_covering(10, 1, 2);
+        log.prune_if_head_ready(&covered, 10, Some(2));
+        assert!(
+            log.snapshot().get_create_fk(&p.0.txid).is_some(),
+            "max_height pin layer waits for write keep-until"
         );
     }
 
@@ -455,7 +533,7 @@ mod tests {
         let b = pin(50);
         log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]));
         log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]));
-        log.prune_if_head_ready(&fence_covering(1, 50, 2), 10);
+        log.prune_if_head_ready(&fence_covering(1, 50, 2), 10, None);
         let v = log.snapshot();
         assert!(v.get_create_fk(&a.0.txid).is_none());
         assert!(

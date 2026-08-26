@@ -1,8 +1,8 @@
 //! Confirm_run unit tests (peeled from confirm_run.rs).
 
 use super::{
-    confirm_archive_kind, recent_create_height_slices, recent_create_rows_for_slices,
-    write_batch_vs_tip, write_height_needed, ConfirmArchiveKind, WriteBatchVsTip,
+    confirm_archive_kind, write_batch_vs_tip, write_height_needed, ConfirmArchiveKind,
+    WriteBatchVsTip,
 };
 
 #[test]
@@ -15,77 +15,6 @@ fn tx_head_drain_thread_is_named_and_reused() {
     assert_eq!(n1, HEAD_DRAIN_THREAD_NAME);
     assert_eq!(n2, HEAD_DRAIN_THREAD_NAME);
     assert_eq!(id1, id2, "drain must keep one OS thread across batches");
-}
-
-#[test]
-fn recent_create_height_slices_two_heights_and_remainder() {
-    assert_eq!(
-        recent_create_height_slices(&[(10, 2), (11, 3)], 5),
-        vec![(10, 0..2), (11, 2..5)]
-    );
-    assert_eq!(
-        recent_create_height_slices(&[(10, 2), (11, 3)], 7),
-        vec![(10, 0..2), (11, 2..5), (11, 5..7)],
-        "tail past prepared counts tags the last height"
-    );
-    assert!(recent_create_height_slices(&[(10, 2)], 0).is_empty());
-    assert_eq!(
-        recent_create_height_slices(&[(10, 0), (11, 4)], 4),
-        vec![(11, 0..4)]
-    );
-}
-
-#[test]
-fn recent_create_rows_skip_missing_idx_keep_heights() {
-    let tid = |b| {
-        let mut t = [0u8; 32];
-        t[0] = b;
-        t
-    };
-    let slices = recent_create_height_slices(&[(10, 2), (11, 2)], 4);
-    let pairs = [
-        (tid(1), rbitcoin_primitives::Fk(1)),
-        (tid(2), rbitcoin_primitives::Fk(2)),
-        (tid(3), rbitcoin_primitives::Fk(3)),
-        (tid(4), rbitcoin_primitives::Fk(4)),
-    ];
-    let ranges = [Some((1, 8)), None, Some((9, 8)), Some((17, 8))];
-    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges, &[]);
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, 10);
-    assert_eq!(rows[0].1.len(), 1, "missing idx at height 10 dropped");
-    assert_eq!(rows[1].0, 11);
-    assert_eq!(rows[1].1.len(), 2);
-}
-
-#[test]
-fn recent_create_rows_share_create_pin_slice() {
-    use rbitcoin_store::{OutputRecord, TxRecord};
-    use std::sync::Arc;
-    let tid = [0x11u8; 32];
-    let pin = Arc::new((
-        TxRecord {
-            txid: tid,
-            version: 1,
-            locktime: 0,
-            input_start_fk: rbitcoin_primitives::Fk::NULL,
-            input_count: 0,
-            output_start_fk: rbitcoin_primitives::Fk::NULL,
-            output_count: 1,
-        },
-        vec![OutputRecord::unspent(1, vec![0x51])],
-    ));
-    let slices = recent_create_height_slices(&[(10, 1)], 1);
-    let pairs = [(tid, rbitcoin_primitives::Fk(1))];
-    let ranges = [Some((8, 16))];
-    let pins = [Arc::clone(&pin)];
-    let rows = recent_create_rows_for_slices(&slices, &pairs, &ranges, &pins);
-    let got = rows[0].1[0].3.as_ref().expect("pin");
-    assert!(
-        Arc::ptr_eq(got, &pin),
-        "rows must Arc-clone the pin slice, not rebuild outs"
-    );
-    assert_eq!(rows[0].1[0].2, (8, 16));
 }
 
 /// Batch append: contiguous heights merge; gap returns Err(other).
@@ -1185,7 +1114,7 @@ fn pin_and_ensure_journey() {
     plan.planned_fks = vec![Fk(1)];
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect_err("missing parent must hard-fail pin");
     let msg = format!("{err}");
     assert!(
@@ -1253,7 +1182,7 @@ fn pin_and_ensure_journey() {
     );
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect("pin via stamped range");
     assert!(parents.contains(pfk));
     assert!(parents.get_parent_out(pfk, 0).is_some());
@@ -1275,7 +1204,7 @@ fn pin_and_ensure_journey() {
     );
     let mut empty_stamp = ParentPinStamp::default();
     fill_edges_from_packed(&mut plan2);
-    let err = pin_for_wire_batch(&q, Some(&plan2), &mut empty_stamp, &[], &[], None, None)
+    let err = pin_for_wire_batch(&q, Some(&plan2), &mut empty_stamp, &[], &[], None)
         .expect_err("plan maps must not backfill an empty stamp");
     assert!(err.to_string().contains("lookup stage miss"), "got: {err}");
 
@@ -1328,7 +1257,7 @@ fn pin_and_ensure_journey() {
     let mut stamp3 = ParentPinStamp::take_from_plan(&mut plan3);
     fill_edges_from_packed(&mut plan3);
     let (mut parents3, _, _) =
-        pin_for_wire_batch(&q, Some(&plan3), &mut stamp3, &[], &[], None, None).unwrap();
+        pin_for_wire_batch(&q, Some(&plan3), &mut stamp3, &[], &[], None).unwrap();
     assert!(
         parents3.has_abs_layout(pfk),
         "load pin copies lookup-stamped spent.idx range (no write idx)"
@@ -1362,130 +1291,10 @@ fn pin_and_ensure_journey() {
     let mut stamp4 = ParentPinStamp::take_from_plan(&mut plan4);
     fill_edges_from_packed(&mut plan4);
     let (parents4, _, _) =
-        pin_for_wire_batch(&q, Some(&plan4), &mut stamp4, &[], &[], None, None).unwrap();
+        pin_for_wire_batch(&q, Some(&plan4), &mut stamp4, &[], &[], None).unwrap();
     assert!(
         !parents4.contains(Fk(2)),
         "same-header create is wire-valued, not pinned"
-    );
-
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Cold-range pin then pstore adopt: first pin reads body, second does not.
-#[test]
-fn pin_for_wire_cold_range_then_adopt_skips_body_io() {
-    use super::{pin_for_wire_batch, ParentPinStamp};
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{PipelineParentStore, Query};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::{Arc, Once};
-
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        }
-    });
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-pin-range-adopt-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    let q = Query::open_or_create(&path).unwrap();
-
-    let parent_tx = TxRecord {
-        txid: [0xab; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let parent_outs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
-    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let pfk = q
-        .store()
-        .txs
-        .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
-        .unwrap()[0];
-    let range = q.store().tx_body_range(pfk).unwrap();
-
-    let spend_tx = TxRecord {
-        txid: [0xcd; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let spend_ins = vec![InputRecord {
-        prev_txid: parent_tx.txid,
-        create_fk: pfk,
-        prev_index: 0,
-        sequence: u32::MAX,
-        script_sig: vec![],
-        witness: vec![],
-    }];
-    let stamp_plan = || {
-        let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
-        plan.packed = vec![(
-            std::sync::Arc::new((spend_tx.clone(), spend_outs.clone())),
-            spend_ins.clone(),
-        )];
-        plan.planned_fks = vec![Fk(2)];
-        if let Some(id) = pfk.get() {
-            plan.external_parents.insert(
-                id,
-                rbitcoin_query::ParentIdent::with_body(parent_tx.txid, range),
-            );
-        }
-        plan
-    };
-
-    let store = Arc::new(PipelineParentStore::new());
-    let mut plan = stamp_plan();
-    let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
-    fill_edges_from_packed(&mut plan);
-    let (parents, _thin, _warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &mut parent_pin,
-        &[],
-        &[],
-        None,
-        Some(&store),
-    )
-    .unwrap();
-    assert!(parents.contains(pfk));
-    assert!(
-        parents.get_parent_out(pfk, 0).is_some(),
-        "cold-range pin must load the spent vout"
-    );
-
-    let mut plan2 = stamp_plan();
-    let mut parent_pin2 = ParentPinStamp::take_from_plan(&mut plan2);
-    fill_edges_from_packed(&mut plan2);
-    let (parents2, _thin2, _warm2) = pin_for_wire_batch(
-        &q,
-        Some(&plan2),
-        &mut parent_pin2,
-        &[],
-        &[],
-        None,
-        Some(&store),
-    )
-    .unwrap();
-    assert!(parents2.contains(pfk));
-    assert!(
-        parents2.get_parent_out(pfk, 0).is_some(),
-        "pstore adopt must still serve the spent vout"
     );
 
     let _ = std::fs::remove_dir_all(&path);
@@ -1575,7 +1384,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], Some(&ifo), None)
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], Some(&ifo))
         .expect_err("incomplete outs must hard-fail pin");
     let msg = format!("{err}");
     assert!(
@@ -1708,7 +1517,7 @@ fn pin_takes_stamp_parent_vouts() {
         Some(&[0u32][..])
     );
     fill_edges_from_packed(&mut plan);
-    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let (parents, _, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect("pin via taken vouts");
     assert!(stamp.parent_vouts.is_empty(), "pin must take stamp vouts");
     assert!(parents.contains(pfk));
@@ -1786,7 +1595,7 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
     plan.external_parent_vouts.insert(1, vec![0]);
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let (parents, edges, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let (parents, edges, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect("cross-height CreatePin pin");
     let child_edges = edges.get(&2).expect("child spend edges");
     assert_eq!(child_edges.len(), 1);
@@ -1879,7 +1688,7 @@ fn pin_plan_edges_without_packed_ins() {
     );
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let (parents, edges, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let (parents, edges, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect("pin from plan.edges with empty packed ins");
     let child_edges = edges.get(&2).expect("child spend edges");
     assert_eq!(child_edges.len(), 1);
@@ -1932,7 +1741,7 @@ fn pin_plan_empty_edges_is_invariant() {
     plan.planned_fks = vec![Fk(1)];
     plan.batch_pin = vec![Arc::clone(&pin)];
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None, None)
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect_err("empty edges with planned fks must not skip spends");
     let msg = format!("{err}");
     assert!(
@@ -2034,7 +1843,7 @@ fn pin_sparse_need_high_vout_only() {
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
     let (parents, _thin, _warm) =
-        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None)
             .expect("pin high vout");
     assert!(parents.get_parent_out(pfk, 3).is_some());
     assert_eq!(
@@ -2050,14 +1859,11 @@ fn pin_sparse_need_high_vout_only() {
 }
 
 /// Range-fill this window is `PIN_NEW`, not `PIN_CACHE_BODY` / `warm.already`.
-///
-/// Adopt 1 + cold-range 2 → `already=1` (cache), not 3. `pin_hit%` is
-/// `1/(1+2)=33`, not “we just loaded them.”
 #[test]
 fn pin_range_fill_does_not_count_as_cache_hit() {
     use super::{pin_for_wire_batch, ParentPinStamp};
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{ArchiveWritePlan, BatchParents, PipelineParentStore, Query};
+    use rbitcoin_query::{ArchiveWritePlan, Query};
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
     use std::sync::{Arc, Once};
 
@@ -2105,20 +1911,6 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
         ranges.push(q.store().tx_body_range(*fk).unwrap());
     }
 
-    // Live pin for parent 0 only (same Weak lifecycle as outs share).
-    let store = Arc::new(PipelineParentStore::new());
-    let mut keep = BatchParents::with_store(Arc::clone(&store), 1);
-    keep.insert_owned(
-        fks[0],
-        items[0].0.clone(),
-        vec![(0, items[0].2[0].clone())],
-        vec![0],
-        Some(false),
-        Some(ranges[0]),
-        Vec::new(),
-    );
-    keep.publish_to_store();
-
     let spend_tx = TxRecord {
         txid: [0x5cu8; 32],
         version: 1,
@@ -2155,29 +1947,20 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let (_parents, _thin, warm) = pin_for_wire_batch(
-        &q,
-        Some(&plan),
-        &mut parent_pin,
-        &[],
-        &[],
-        None,
-        Some(&store),
-    )
-    .expect("adopt 1 + range-fill 2");
+    let (_parents, _thin, warm) =
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None).expect("range-fill 3");
     assert_eq!(warm.parents, 3);
     assert_eq!(
-        warm.already, 1,
+        warm.already, 0,
         "range-fills must not increment already / PIN_CACHE_BODY"
     );
-    drop(keep);
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Write-published RecentCreates outs cover a later spend after in-flight is gone.
-/// That is `PIN_CACHE_BODY` / `warm.already`, not `PIN_NEW` / range-fill.
+/// Stamp-carried CreatePin outs cover a later spend. That is `PIN_CACHE_BODY`
+/// / `warm.already`, not `PIN_NEW` / range-fill.
 #[test]
-fn pin_recent_outs_is_cache_not_new() {
+fn pin_stamp_outs_is_cache_not_new() {
     use super::{pin_for_wire_batch, ParentPinStamp};
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
@@ -2215,8 +1998,6 @@ fn pin_recent_outs_is_cache_not_new() {
     let parent_out = OutputRecord::unspent(50, vec![0x51, 0xaa]);
     let pin: CreatePin = Arc::new((parent_tx.clone(), vec![parent_out.clone()]));
     let pfk = Fk(7);
-    q.note_recent_creates_pins(10, [(tid, pfk, (1, 8), Some(Arc::clone(&pin)))]);
-    q.flush_recent_creates();
 
     let spend_tx = TxRecord {
         txid: [0x5cu8; 32],
@@ -2256,20 +2037,19 @@ fn pin_recent_outs_is_cache_not_new() {
         Arc::ptr_eq(parent_pin.create_pin(7).expect("stamp pin"), &pin),
         "pin must use stamp-carried CreatePin"
     );
-    q.recent_creates().drop_from(0);
     fill_edges_from_packed(&mut plan);
     let (_parents, _thin, warm) =
-        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
-            .expect("stamp-carried outs must cover without a live RecentCreates ring");
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None)
+            .expect("stamp-carried outs must cover");
     assert_eq!(warm.parents, 1);
     assert_eq!(
         warm.already, 1,
-        "RecentCreates outs must count as PIN_CACHE, not PIN_NEW"
+        "stamp-carried outs must count as PIN_CACHE, not PIN_NEW"
     );
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Identity-only RecentCreates (no outs) still cold-fills by stamped range.
+/// Identity-only stamp (no outs) still cold-fills by stamped range.
 #[test]
 fn pin_recent_identity_without_outs_still_range_fills() {
     use super::{pin_for_wire_batch, ParentPinStamp};
@@ -2317,8 +2097,6 @@ fn pin_recent_identity_without_outs_still_range_fills() {
         .put_full_batch_indexed(&[parent.clone()], true)
         .unwrap();
     let range = q.store().tx_body_range(fks[0]).unwrap();
-    q.note_recent_creates_rows(10, [(tid, fks[0], range)]);
-    q.flush_recent_creates();
 
     let spend_tx = TxRecord {
         txid: [0x5du8; 32],
@@ -2351,8 +2129,8 @@ fn pin_recent_identity_without_outs_still_range_fills() {
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
     let (_parents, _thin, warm) =
-        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
-            .expect("identity-only recent still range-fills");
+        pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None)
+            .expect("identity-only stamp still range-fills");
     assert_eq!(warm.parents, 1);
     assert_eq!(
         warm.already, 0,
@@ -2717,9 +2495,9 @@ fn structural_pinned_without_abs_is_invariant_error() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Direct write skips SH FkMap; RecentCreates body ranges match idx.
+/// Direct write skips SH FkMap; Class A idx holds the body range.
 #[test]
-fn direct_write_skips_create_pin_map_recent_matches_idx() {
+fn direct_write_skips_create_pin_map_idx_without_recent() {
     use crate::regtest_pad::mine_empty_regtest;
     use crate::{accept_and_connect_block, ChainParams, Milestone};
     use bitcoin::hashes::Hash;
@@ -2751,11 +2529,11 @@ fn direct_write_skips_create_pin_map_recent_matches_idx() {
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
     let tid = b1.txdata[0].compute_txid().to_byte_array();
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let (fk, range) = q
-        .recent_creates()
-        .get(&tid)
-        .expect("height-1 create stays in RecentCreates while lookup_started_hi is ahead");
+    let fk = q
+        .tx_fk_by_txid(&tid)
+        .expect("txid lookup")
+        .expect("height-1 create on idx");
     let idx = q.store().tx_body_range(fk).expect("idx after Class A");
-    assert_eq!(range, idx, "RecentCreates body range must be the idx row");
+    assert!(idx.1 > 0, "Class A body range must be on idx");
     let _ = std::fs::remove_dir_all(&path);
 }

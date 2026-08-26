@@ -1,10 +1,10 @@
-//! External parent create_fk stamp: in-flight → published → recent creates → TipOnly.
+//! External parent create_fk stamp: in-flight → published → TipOnly.
 //!
 //! One function for S0 plan (`archive_plan_batch_from_store`) and plan=None
-//! rehydrate. Pipeline parent store is outs only — not a create_fk source.
+//! rehydrate. In-flight holds CreatePins through write keep-until.
 
 use crate::published_ids::TxidHasher;
-use crate::{CreatePin, InFlightView, PublishedIds, QueryError, RecentCreates, U64Map, U64Set};
+use crate::{CreatePin, InFlightView, PublishedIds, QueryError, U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::Store;
 use std::collections::HashMap;
@@ -71,7 +71,7 @@ impl ExternalParentStamp {
     }
 }
 
-/// Bind `need` txids: in-flight → published `live_union` → recent creates → leftover.
+/// Bind `need` txids: in-flight → published `live_union` → leftover TipOnly.
 ///
 /// Then idx range-fill for resolved creates that have no range and no
 /// in-flight outs. Same-batch identities are not inputs — callers skip them
@@ -81,10 +81,8 @@ pub fn stamp_external_parents(
     need: &[[u8; 32]],
     in_flight: &InFlightView,
     published: &PublishedIds,
-    recent: &RecentCreates,
 ) -> Result<ExternalParentStamp, QueryError> {
     let pub_head = published.load();
-    let recent_snap = recent.snapshot();
     let mut stamp = ExternalParentStamp {
         resolved: TxidFkMap::with_capacity_and_hasher(need.len() / 2, Default::default()),
         idents: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
@@ -100,7 +98,10 @@ pub fn stamp_external_parents(
         if let Some(fk) = in_flight.get_create_fk(t) {
             stamp.resolved.insert(*t, fk);
             if let Some(id) = fk.get() {
-                stamp.bind(id, *t);
+                let e = stamp.bind(id, *t);
+                if let Some(pin) = in_flight.get_out(id) {
+                    e.pin = Some(std::sync::Arc::clone(pin));
+                }
             }
         } else {
             still_need.push(t);
@@ -123,24 +124,7 @@ pub fn stamp_external_parents(
     }
     stamp.pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
 
-    let t_recent = Instant::now();
-    let mut need_head: Vec<[u8; 32]> = Vec::new();
-    for t in after_pub {
-        if let Some((fk, range)) = recent_snap.get(t) {
-            stamp.resolved.insert(*t, fk);
-            if let Some(id) = fk.get() {
-                let e = stamp.bind(id, *t);
-                e.body = Some(range);
-                if let Some(pin) = recent_snap.create_pin(t) {
-                    e.pin = Some(pin);
-                }
-            }
-            stamp.recent_n = stamp.recent_n.saturating_add(1);
-            continue;
-        }
-        need_head.push(*t);
-    }
-    stamp.recent_ns = t_recent.elapsed().as_nanos() as u64;
+    let mut need_head: Vec<[u8; 32]> = after_pub.into_iter().copied().collect();
     stamp.head_need_n = need_head.len() as u64;
 
     let t_head = Instant::now();

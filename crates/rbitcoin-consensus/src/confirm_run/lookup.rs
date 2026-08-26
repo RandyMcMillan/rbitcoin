@@ -7,7 +7,7 @@ use super::*;
 pub struct DenserelsWarmStats {
     /// Unique external parent creates considered (stamped create_fk, not same-batch).
     pub parents: u32,
-    /// Already covered via in-flight / same-batch / RecentCreates outs / pstore adopt.
+    /// Already covered via in-flight / same-batch / stamp-carried outs.
     pub already: u32,
     /// Cold denserels body loads (`txout` by stamped range). Always 0 on the
     /// shipped pin path — range-fill is `PIN_NEW`, not this field.
@@ -172,7 +172,6 @@ pub(super) fn stamp_parent_pin_archived(
         &need_vec,
         ifo,
         query.published_ids(),
-        query.recent_creates(),
     )
     .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
@@ -235,7 +234,6 @@ pub fn confirm_wire_load_from_plan(
     } = stamped;
 
     let ifo = pipeline.map(|p| &p.in_flight);
-    let parent_store = pipeline.and_then(|p| p.parent_store.as_ref());
     let (batch_parents, spend_edges, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
@@ -243,7 +241,6 @@ pub fn confirm_wire_load_from_plan(
         &metas,
         &wire_blocks,
         ifo,
-        parent_store,
     )?;
     if let Some(ref mut p) = plan {
         p.freeze_after_pin();
@@ -850,7 +847,6 @@ mod tests {
             &[parent_txid],
             &rbitcoin_query::InFlightView::empty(),
             q.published_ids(),
-            q.recent_creates(),
         )
         .expect("shared helper");
 

@@ -4,7 +4,7 @@ use super::*;
 
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
-/// Sources: plan/in-flight offline denserels → RecentCreates create_pin →
+/// Sources: plan/in-flight offline denserels → stamp-carried CreatePin →
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
 /// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
 /// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is holes-only.
@@ -15,7 +15,6 @@ pub(super) fn pin_for_wire_batch(
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight: Option<&rbitcoin_query::InFlightView>,
-    pipeline_parent_store: Option<&std::sync::Arc<rbitcoin_query::PipelineParentStore>>,
 ) -> Result<
     (
         rbitcoin_query::BatchParents,
@@ -168,18 +167,7 @@ pub(super) fn pin_for_wire_batch(
         confirm_load_stats::PIN_RECENT_OUTS_NS.fetch_add(recent_outs_ns, Ordering::Relaxed);
     }
 
-    let mut batch_parents = match pipeline_parent_store {
-        Some(store) => rbitcoin_query::BatchParents::with_store(
-            std::sync::Arc::clone(store),
-            parent_vouts.len(),
-        ),
-        None => rbitcoin_query::BatchParents::with_capacity(parent_vouts.len()),
-    };
-    let t_adopt = Instant::now();
-    if pipeline_parent_store.is_some() {
-        batch_parents.adopt_from_store(parent_vouts.keys().copied());
-    }
-    let adopt_ns = t_adopt.elapsed().as_nanos() as u64;
+    let mut batch_parents = rbitcoin_query::BatchParents::with_capacity(parent_vouts.len());
     let thin_ns = t_thin.elapsed().as_nanos() as u64;
     if thin_ns > 0 {
         confirm_load_stats::THIN_NS.fetch_add(thin_ns, Ordering::Relaxed);
@@ -190,7 +178,7 @@ pub(super) fn pin_for_wire_batch(
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
         let fk = rbitcoin_primitives::Fk(*id);
-        // Pure adopt hit: refresh meta only when plan/layout material is present
+        // Same-batch / in-flight pin: refresh meta only when plan/layout material is present
         // (skip empty refresh_pin_meta — it would reload outs).
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
@@ -351,10 +339,6 @@ pub(super) fn pin_for_wire_batch(
     }
     let contract_ns = t_contract.elapsed().as_nanos() as u64;
 
-    let t_publish = Instant::now();
-    batch_parents.publish_to_store();
-    let publish_ns = t_publish.elapsed().as_nanos() as u64;
-
     let n_unique = parent_vouts.len() as u64;
     if n_unique > 0 {
         confirm_load_stats::PARENT_UNIQUE.fetch_add(n_unique, Ordering::Relaxed);
@@ -370,25 +354,19 @@ pub(super) fn pin_for_wire_batch(
     if plan_pin_ns > 0 {
         confirm_load_stats::PLAN_PIN_NS.fetch_add(plan_pin_ns, Ordering::Relaxed);
     }
-    if adopt_ns > 0 {
-        confirm_load_stats::PIN_ADOPT_NS.fetch_add(adopt_ns, Ordering::Relaxed);
-    }
     if contract_ns > 0 {
         confirm_load_stats::PIN_CONTRACT_NS.fetch_add(contract_ns, Ordering::Relaxed);
-    }
-    if publish_ns > 0 {
-        confirm_load_stats::PIN_PUBLISH_NS.fetch_add(publish_ns, Ordering::Relaxed);
     }
     // Last-batch pin residual for slow-load logs (overwrite; not window-summed).
     let cold_batch_ns = cold_range_batch_ns
         .saturating_add(cold_io_ns)
         .saturating_add(cold_decode_ns);
     confirm_load_stats::note_last_pin(
-        adopt_ns,
+        0,
         plan_pin_ns,
         cold_batch_ns,
         contract_ns,
-        publish_ns,
+        0,
         n_plan_pin,
         n_cold.saturating_add(n_range_new),
     );

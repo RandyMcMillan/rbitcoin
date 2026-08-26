@@ -1057,7 +1057,6 @@ mod tests {
             &[g_cb.to_byte_array()],
             &rbitcoin_query::InFlightView::empty(),
             published.as_ref(),
-            q.recent_creates().as_ref(),
         )
         .expect("stamp helper after wave");
         assert_eq!(
@@ -1198,7 +1197,6 @@ mod tests {
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: view,
-            parent_store: None,
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
@@ -1292,7 +1290,6 @@ mod tests {
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: log.snapshot(),
-            parent_store: None,
             published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];

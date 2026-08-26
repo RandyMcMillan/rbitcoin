@@ -59,7 +59,9 @@ before 1.0).
   Extra hashes stayed in `requested` and were never re-asked
   (`sync_blocks` 60s overnight: `feature_minchainwork`,
   `rpc_createmultisig`, `feature_bip68_sequence`, …). First ask and
-  drain continuation use `MAX_SERVE_BLOCKS`.
+  drain continuation use `MAX_SERVE_BLOCKS`. Accepting a `CmpctBlock`
+  (node-to-node `MSG_CMPCT_BLOCK` getdata) also drops the hash from
+  `requested` so the next window can be asked.
 
 - **Nightly Miri installs nightly:** `miri.yml` asked the CodeQL-pinned
   1.95.0 `dtolnay/rust-toolchain` snapshot for `components: miri` (that

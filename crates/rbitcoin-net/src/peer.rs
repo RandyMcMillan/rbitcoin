@@ -1825,7 +1825,7 @@ async fn handle_peer_frame(
             if !any_header_path_meets_minwork(hub, pending_headers, hash) {
                 // Below -minimumchainwork: keep header, do not reconstruct/accept.
             } else {
-                let ancestors: Vec<BlockHash> = missing_blocks_on_header_path(
+                let mut ancestors: Vec<BlockHash> = fetchable_header_path_bodies(
                     hub,
                     pending_headers,
                     hash,
@@ -1835,6 +1835,7 @@ async fn handle_peer_frame(
                 .into_iter()
                 .filter(|h| *h != hash)
                 .collect();
+                ancestors.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested_blocks.len()));
                 queue_block_getdata(
                     hub,
                     out_tx,
@@ -1860,7 +1861,10 @@ async fn handle_peer_frame(
                         let _ = queue_getheaders(out_tx, hub, session, false, None);
                     }
                 } else if hub.has_block(&hash) {
+                    requested_blocks.remove(&hash);
                 } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
+                    requested_blocks.remove(&hash);
+                    pending_cmpct.remove(&hash);
                     let accepted = matches!(
                         hub.accept_received_block(block),
                         Ok(AcceptOutcome::Accepted { .. })
@@ -1938,6 +1942,7 @@ async fn handle_peer_frame(
                 match apply_cmpct_blocktxn(hub, &pc, bt) {
                     Ok(block) => match hub.accept_received_block(block) {
                         Ok(AcceptOutcome::Accepted { .. }) => {
+                            requested_blocks.remove(&hash);
                             maybe_select_hb_if_relay(hub, session);
                             if let Some(s) = session {
                                 if let Some(ph) = s.hub() {
@@ -1954,6 +1959,7 @@ async fn handle_peer_frame(
                             )?;
                         }
                         Ok(_) => {
+                            requested_blocks.remove(&hash);
                             drain_pending(
                                 hub,
                                 out_tx,

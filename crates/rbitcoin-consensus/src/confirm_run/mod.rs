@@ -154,7 +154,7 @@ pub struct WireLoadPipeline {
     /// pipeline (body-ahead-of-head). Built via [`rbitcoin_query::InFlightLog::snapshot`].
     pub in_flight: rbitcoin_query::InFlightView,
     /// Pipeline-wide sparse parent pin store (Weak map; load get-or-insert only).
-    /// `None` on IBD (RecentCreates outs + in-flight). Tip-follow may still set
+    /// `None` on IBD (in-flight keep-until). Tip-follow may still set
     /// `Some`. Batches hold `Arc` handles so concurrent stages share one payload
     /// per create when a store is present.
     pub parent_store: Option<std::sync::Arc<rbitcoin_query::PipelineParentStore>>,

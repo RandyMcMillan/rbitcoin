@@ -53,7 +53,7 @@ const CB_TRUE: u8 = 2;
 /// Immutable pin outs (compose → publish, never mutate).
 #[derive(Debug, Clone)]
 enum PinOuts {
-    /// Plan / in-flight / RecentCreates: share the CreatePin Arc.
+    /// Plan / in-flight: share the CreatePin Arc.
     Full {
         pin: crate::CreatePin,
         checked: Vec<u32>,

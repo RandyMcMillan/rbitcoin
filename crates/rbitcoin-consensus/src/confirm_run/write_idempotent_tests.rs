@@ -2103,10 +2103,10 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Write-published RecentCreates outs cover a later spend after in-flight is gone.
-/// That is `PIN_CACHE_BODY` / `warm.already`, not `PIN_NEW` / range-fill.
+/// Stamp-carried CreatePin outs cover a later spend. That is `PIN_CACHE_BODY`
+/// / `warm.already`, not `PIN_NEW` / range-fill.
 #[test]
-fn pin_recent_outs_is_cache_not_new() {
+fn pin_stamp_outs_is_cache_not_new() {
     use super::{pin_for_wire_batch, ParentPinStamp};
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{ArchiveWritePlan, CreatePin, Query};
@@ -2144,8 +2144,6 @@ fn pin_recent_outs_is_cache_not_new() {
     let parent_out = OutputRecord::unspent(50, vec![0x51, 0xaa]);
     let pin: CreatePin = Arc::new((parent_tx.clone(), vec![parent_out.clone()]));
     let pfk = Fk(7);
-    q.note_recent_creates_pins(10, [(tid, pfk, (1, 8), Some(Arc::clone(&pin)))]);
-    q.flush_recent_creates();
 
     let spend_tx = TxRecord {
         txid: [0x5cu8; 32],
@@ -2185,20 +2183,19 @@ fn pin_recent_outs_is_cache_not_new() {
         Arc::ptr_eq(parent_pin.create_pin(7).expect("stamp pin"), &pin),
         "pin must use stamp-carried CreatePin"
     );
-    q.recent_creates().drop_from(0);
     fill_edges_from_packed(&mut plan);
     let (_parents, _thin, warm) =
         pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
-            .expect("stamp-carried outs must cover without a live RecentCreates ring");
+            .expect("stamp-carried outs must cover");
     assert_eq!(warm.parents, 1);
     assert_eq!(
         warm.already, 1,
-        "RecentCreates outs must count as PIN_CACHE, not PIN_NEW"
+        "stamp-carried outs must count as PIN_CACHE, not PIN_NEW"
     );
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Identity-only RecentCreates (no outs) still cold-fills by stamped range.
+/// Identity-only stamp (no outs) still cold-fills by stamped range.
 #[test]
 fn pin_recent_identity_without_outs_still_range_fills() {
     use super::{pin_for_wire_batch, ParentPinStamp};
@@ -2246,8 +2243,6 @@ fn pin_recent_identity_without_outs_still_range_fills() {
         .put_full_batch_indexed(&[parent.clone()], true)
         .unwrap();
     let range = q.store().tx_body_range(fks[0]).unwrap();
-    q.note_recent_creates_rows(10, [(tid, fks[0], range)]);
-    q.flush_recent_creates();
 
     let spend_tx = TxRecord {
         txid: [0x5du8; 32],
@@ -2281,7 +2276,7 @@ fn pin_recent_identity_without_outs_still_range_fills() {
     fill_edges_from_packed(&mut plan);
     let (_parents, _thin, warm) =
         pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None, None)
-            .expect("identity-only recent still range-fills");
+            .expect("identity-only stamp still range-fills");
     assert_eq!(warm.parents, 1);
     assert_eq!(
         warm.already, 0,
@@ -2646,7 +2641,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Direct write skips SH FkMap; Class A idx is the body range (no RecentCreates ring).
+/// Direct write skips SH FkMap; Class A idx holds the body range.
 #[test]
 fn direct_write_skips_create_pin_map_idx_without_recent() {
     use crate::regtest_pad::mine_empty_regtest;
@@ -2680,10 +2675,6 @@ fn direct_write_skips_create_pin_map_idx_without_recent() {
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
     let tid = b1.txdata[0].compute_txid().to_byte_array();
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    assert!(
-        q.recent_creates().get(&tid).is_none(),
-        "write must not publish RecentCreates even while lookup_started_hi is ahead"
-    );
     let fk = q
         .tx_fk_by_txid(&tid)
         .expect("txid lookup")

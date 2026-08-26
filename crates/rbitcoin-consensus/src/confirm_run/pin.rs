@@ -4,7 +4,7 @@ use super::*;
 
 /// Pin parents for wire load: **only spent parents** (sparse outs).
 ///
-/// Sources: plan/in-flight offline denserels → RecentCreates create_pin →
+/// Sources: plan/in-flight offline denserels → stamp-carried CreatePin →
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
 /// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
 /// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is holes-only.

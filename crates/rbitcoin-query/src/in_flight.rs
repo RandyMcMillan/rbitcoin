@@ -9,7 +9,7 @@
 //! **Prune:** drain inserted the create-fk span **and** the fence covers it.
 //! Pin layers (`outs` non-empty, tagged `max_height`) also wait for write
 //! [`InFlightLog::set_keep_until`] (`until = lookup_started_hi.max(hi)`) and
-//! `class_a_hi >= until` — same horizon RecentCreates used. Creates-only /
+//! `class_a_hi >= until`. Creates-only /
 //! untagged layers still drop at drain+fence (TipOnly home). Drain or fence
 //! alone keeps the layer. Call after pin so n−1 still has CreatePin outs.
 //!

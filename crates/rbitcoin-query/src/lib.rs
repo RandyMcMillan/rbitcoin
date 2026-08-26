@@ -11,7 +11,6 @@ mod connect;
 mod in_flight;
 mod layer_chain;
 mod published_ids;
-mod recent_creates;
 mod reconstruct;
 mod resolved_wire;
 mod run_builder_core;
@@ -161,7 +160,6 @@ pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
 pub use published_ids::{
     IdLayer, IdMap, LiveUnion, OutPointHasher, OutPointSet, PublishedIds, TxidHasher,
 };
-pub use recent_creates::RecentCreates;
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,
@@ -198,7 +196,7 @@ pub mod confirm_load_stats {
     pub static PIN_ADOPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Post cold-range denserels: insert_owned into BatchParents (not IO).
     pub static PIN_RANGE_FILL_NS: AtomicU64 = AtomicU64::new(0);
-    /// RecentCreates create_pin probe (after in-flight / same-batch, before range fill).
+    /// Stamp-carried CreatePin probe (after in-flight / same-batch, before range fill).
     pub static PIN_RECENT_OUTS_NS: AtomicU64 = AtomicU64::new(0);
     /// Final pin contract (contains + pin_covered) wall.
     pub static PIN_CONTRACT_NS: AtomicU64 = AtomicU64::new(0);
@@ -1169,9 +1167,6 @@ pub struct Query {
     disconnect_gen: AtomicU64,
     /// Lookup-published parent identity union (wave hits still in the BQ window).
     published_ids: std::sync::Arc<crate::PublishedIds>,
-    /// Write-published just-confirmed identity (txid → fk+range). Load stamp
-    /// before leftover TipOnly. Outs are not stored.
-    recent_creates: std::sync::Arc<crate::RecentCreates>,
     /// Write-frozen in-flight keep-until (`height → until`), consumed at prune.
     create_keep_until: Mutex<crate::U32Map<u32>>,
 }
@@ -1263,7 +1258,6 @@ impl Query {
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
             published_ids: std::sync::Arc::new(crate::PublishedIds::new()),
-            recent_creates: std::sync::Arc::new(crate::RecentCreates::new()),
             create_keep_until: Mutex::new(crate::U32Map::default()),
         };
         if let Some(tip) = q.tip_height() {
@@ -1291,8 +1285,6 @@ impl Query {
         self.disconnect_height
             .store(height, AtomicOrdering::Release);
         self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
-        self.recent_creates.drop_from(height);
-        self.recent_creates.publish_if_dirty();
         {
             let mut g = self
                 .create_keep_until
@@ -1664,11 +1656,6 @@ impl Query {
         &self.published_ids
     }
 
-    /// Just-confirmed identity ring (write-published; load stamp before leftover).
-    pub fn recent_creates(&self) -> &std::sync::Arc<crate::RecentCreates> {
-        &self.recent_creates
-    }
-
     /// Freeze in-flight keep-until at write (`until = lookup_started_hi.max(hi)`).
     pub fn stamp_create_keep_until(&self, height: u32) {
         let until = self.lookup_started_hi().unwrap_or(0).max(height);
@@ -1688,92 +1675,6 @@ impl Query {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         std::mem::take(&mut *g).into_iter().collect()
-    }
-
-    /// After Class A + idx: note identity rows and flush (layer until =
-    /// `lookup_started_hi`, drop when `class_a_hi` covers it). Missing idx
-    /// range is skipped (leftover TipOnly stays the home).
-    pub fn publish_recent_creates(
-        &self,
-        height: u32,
-        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
-    ) -> Result<(), QueryError> {
-        self.note_recent_creates(height, creates)?;
-        self.expire_recent_creates(height);
-        Ok(())
-    }
-
-    /// Note identity rows and flush so a single-height caller sees `get`.
-    ///
-    /// Write batches use [`Self::note_recent_creates_defer`] + one
-    /// [`Self::flush_recent_creates`] so the live map is cloned once.
-    pub fn note_recent_creates(
-        &self,
-        height: u32,
-        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
-    ) -> Result<(), QueryError> {
-        self.note_recent_creates_defer(height, creates)?;
-        self.flush_recent_creates();
-        Ok(())
-    }
-
-    /// Note identity rows without rebuilding the load snapshot.
-    pub fn note_recent_creates_defer(
-        &self,
-        height: u32,
-        creates: impl IntoIterator<Item = ([u8; 32], Fk)>,
-    ) -> Result<(), QueryError> {
-        let pairs: Vec<([u8; 32], Fk)> = creates.into_iter().collect();
-        if pairs.is_empty() {
-            return Ok(());
-        }
-        let fks: Vec<Fk> = pairs.iter().map(|(_, fk)| *fk).collect();
-        let ranges = self.store.tx_body_range_batch(&fks)?;
-        let rows = pairs
-            .into_iter()
-            .zip(ranges)
-            .filter_map(|((txid, fk), range)| range.map(|r| (txid, fk, r)));
-        self.recent_creates.note(height, rows);
-        Ok(())
-    }
-
-    /// Note already-ranged identity rows (write batches idx once, then note).
-    pub fn note_recent_creates_rows(
-        &self,
-        height: u32,
-        rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>,
-    ) {
-        self.recent_creates.note(height, rows);
-    }
-
-    /// Same as [`Self::note_recent_creates_rows`] with optional [`CreatePin`] Arcs.
-    pub fn note_recent_creates_pins(
-        &self,
-        height: u32,
-        rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64), Option<CreatePin>)>,
-    ) {
-        self.recent_creates.note_pins(height, rows);
-    }
-
-    /// Prepend pending notes as one layer (`until = started.max(hi)`) then drop
-    /// layers with `until <= class_a_hi`.
-    pub fn flush_recent_creates(&self) {
-        let started = self.lookup_started_hi().unwrap_or(0);
-        self.recent_creates.publish_layer(started);
-        if let Some(h) = self.class_a_hi() {
-            self.recent_creates.drop_ready(h);
-        }
-    }
-
-    pub fn expire_recent_creates(&self, tip_hint: u32) {
-        self.expire_recent_creates_defer(tip_hint);
-        self.flush_recent_creates();
-    }
-
-    pub fn expire_recent_creates_defer(&self, _tip_hint: u32) {
-        if let Some(h) = self.class_a_hi() {
-            self.recent_creates.drop_ready(h);
-        }
     }
 
     /// Index-only queue entries (no payload clone). Empty after restart.
@@ -1955,7 +1856,6 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
-        let rec = self.recent_creates.size_detail();
         let (union_layers, union_keys) = self.published_ids.size_snapshot();
         let h2h_keys = self
             .height_by_hash
@@ -1979,12 +1879,12 @@ impl Query {
             pstore_weak: mem.pstore_weak,
             pstore_live: mem.pstore_live,
             pstore_bytes: mem.pstore_bytes,
-            recent_heights: rec.0,
-            recent_keys: rec.1,
-            recent_pub_keys: rec.2,
-            recent_overlay_keys: rec.3,
-            recent_fifo_keys: rec.4,
-            recent_pin_bytes: self.recent_creates.approx_pin_bytes(),
+            recent_heights: 0,
+            recent_keys: 0,
+            recent_pub_keys: 0,
+            recent_overlay_keys: 0,
+            recent_fifo_keys: 0,
+            recent_pin_bytes: 0,
             union_layers,
             union_keys,
             h2h_keys,
@@ -2637,24 +2537,6 @@ mod tests {
         let rows = q.take_create_keep_until();
         assert_eq!(rows, vec![(10, 40)]);
         assert!(q.take_create_keep_until().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn flush_recent_creates_tags_until_from_lookup_started_hi() {
-        let (dir, q) = temp_query("flush-until");
-        let mut tid = [0u8; 32];
-        tid[0] = 1;
-        q.set_lookup_started_hi(Some(40));
-        q.note_recent_creates_rows(10, [(tid, Fk(1), (1, 2))]);
-        q.flush_recent_creates();
-        assert_eq!(q.recent_creates().get(&tid), Some((Fk(1), (1, 2))));
-        q.set_class_a_hi(Some(39));
-        q.flush_recent_creates();
-        assert_eq!(q.recent_creates().get(&tid), Some((Fk(1), (1, 2))));
-        q.set_class_a_hi(Some(40));
-        q.flush_recent_creates();
-        assert!(q.recent_creates().get(&tid).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -7,7 +7,7 @@ use super::*;
 pub struct DenserelsWarmStats {
     /// Unique external parent creates considered (stamped create_fk, not same-batch).
     pub parents: u32,
-    /// Already covered via in-flight / same-batch / RecentCreates outs / pstore adopt.
+    /// Already covered via in-flight / same-batch / stamp-carried outs / pstore adopt.
     pub already: u32,
     /// Cold denserels body loads (`txout` by stamped range). Always 0 on the
     /// shipped pin path — range-fill is `PIN_NEW`, not this field.

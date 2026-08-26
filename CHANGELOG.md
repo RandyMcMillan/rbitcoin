@@ -59,6 +59,11 @@ before 1.0).
   owner docs. Close a finding by deleting its row; do not append a Closed
   graveyard.
 
+- **`load_thr stamp=` nest:** `ibd: perf` prints
+  `stamp=Nms(pack=Xms head=Yms)`. `head=` is leftover TipOnly
+  (`prep_head_fk_ns`). After a lookup wave publishes a parent, load
+  stamp leftover for that parent is 0 — pack stays on load.
+
 - **Held tx.head `.rel` pread:** after fail-closed `begin_batch` (`f07415b5`),
   a poisoned leftover ring made `pread_batch_on_ctx` return false and
   `read_rels_batch` opened a second TLS uring — nested panic on

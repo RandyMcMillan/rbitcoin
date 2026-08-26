@@ -558,7 +558,7 @@ pub async fn peer_session_with(
             let err = write_v2_msg_offload(&mut writer, msg).await.is_err();
             if full {
                 if let Some(s) = &writer_session {
-                    s.serve_inflight.fetch_sub(1, Ordering::SeqCst);
+                    note_served_write(&s.serve_inflight);
                 }
             }
             if err {
@@ -676,16 +676,18 @@ pub async fn peer_session_with(
                                     &ev.hash,
                                     peer_cmpct_version,
                                 ) {
-                                    if let Some(s) = session.as_ref() {
-                                        s.note_best_header_sent(ev.hash);
-                                    }
-                                    queue_out(&out_tx, msg)?;
-                                    // Compact-only when the peer did not send
-                                    // sendheaders. Node-to-node always sends
-                                    // sendheaders; also announce headers so a
-                                    // longer fork can reorg (`p2p_sendheaders`).
-                                    if !peer_wants_headers {
-                                        continue;
+                                    let inflight = session.as_ref().map(|s| &s.serve_inflight);
+                                    if queue_cmpct_tip_announce(&out_tx, inflight, msg)? {
+                                        if let Some(s) = session.as_ref() {
+                                            s.note_best_header_sent(ev.hash);
+                                        }
+                                        // Compact-only when the peer did not send
+                                        // sendheaders. Node-to-node always sends
+                                        // sendheaders; also announce headers so a
+                                        // longer fork can reorg (`p2p_sendheaders`).
+                                        if !peer_wants_headers {
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -1117,11 +1119,9 @@ fn mempool_live_txs(hub: &ChainHub) -> Vec<Transaction> {
         .unwrap_or_default()
 }
 
-/// Reconstruct a compact block fully from mempool short-ids (version 1/2).
+/// Reconstruct a compact block from prefilled txs plus mempool short-ids.
+/// Coinbase-only compact has no short-ids; an empty mempool map still fills.
 fn try_fill_cmpct(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> Option<Block> {
-    if hub.mempool().is_none() {
-        return None;
-    }
     let live = mempool_live_txs(hub);
     let avail = crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
     crate::compact::try_reconstruct(hsi, &avail, version).ok()
@@ -1411,6 +1411,12 @@ async fn handle_peer_frame(
                                         NetworkMessage::CmpctBlock(CmpctBlock {
                                             compact_block: hsi,
                                         }),
+                                    )?;
+                                } else {
+                                    let _ = try_queue_served_block(
+                                        out_tx,
+                                        inflight,
+                                        NetworkMessage::Block(block),
                                     )?;
                                 }
                             }
@@ -1798,6 +1804,11 @@ async fn handle_peer_frame(
         NetworkMessage::CmpctBlock(cb) => {
             let hsi = cb.compact_block.clone();
             let hash = hsi.header.block_hash();
+            if let Some(s) = session {
+                s.note_block_from_peer(hash);
+                s.note_best_known(hash);
+                s.note_last_block();
+            }
             if !crate::compact::prefilled_indexes_ok(&hsi) {
                 rbitcoin_log::info!("invalid index in cmpctblock message");
                 punish_disconnect(ban_score, session);
@@ -2455,13 +2466,30 @@ pub(crate) fn try_queue_served_block(
         }
         n.fetch_add(1, Ordering::SeqCst);
         if let Err(e) = queue_out(out, msg) {
-            n.fetch_sub(1, Ordering::SeqCst);
+            note_served_write(n);
             return Err(e);
         }
         return Ok(true);
     }
     queue_out(out, msg)?;
     Ok(true)
+}
+
+/// BIP152 high-bandwidth tip announce. Counts as a served compact so the
+/// writer decrement cannot wrap `serve_inflight` (unpaired `fetch_sub` on 0
+/// became `usize::MAX` and skipped every later getdata reconstruct).
+fn queue_cmpct_tip_announce(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    inflight: Option<&AtomicUsize>,
+    msg: NetworkMessage,
+) -> Result<bool, NetError> {
+    try_queue_served_block(out, inflight, msg)
+}
+
+fn note_served_write(n: &AtomicUsize) {
+    let _ = n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        Some(v.saturating_sub(1))
+    });
 }
 
 fn pending_header_leaves(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {

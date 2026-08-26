@@ -1637,7 +1637,10 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
         .unwrap()
         .unwrap();
     let hsi = HeaderAndShortIds::from_block(&gen, 0xabc, 2, &[]).unwrap();
-    assert!(try_fill_cmpct(&hub, &hsi, 2).is_none());
+    assert!(
+        try_fill_cmpct(&hub, &hsi, 2).is_some(),
+        "coinbase-only compact fills from prefilled txs without a mempool"
+    );
     assert!(try_cmpct_missing(&hub, &hsi, 2).is_none());
     assert!(mempool_live_txs(&hub).is_empty());
 
@@ -4951,4 +4954,199 @@ async fn inbound_handshake_timeout_after_silence() {
 #[test]
 fn inbound_handshake_timeout_is_core_60s() {
     assert_eq!(INBOUND_HANDSHAKE_TIMEOUT, Duration::from_secs(60));
+}
+
+/// Writer used to `fetch_sub` every `CmpctBlock`, including tip announces that
+/// never `fetch_add`. That wrapped `serve_inflight` to `usize::MAX` and skipped
+/// every later reconstruct (`sync_blocks` 60s on long-lived node-to-node).
+#[test]
+fn compact_tip_announce_must_not_wrap_serve_inflight() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::Network;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::runtime::Builder;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, q) = tmp_store("cmpct-ann-inflight");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let hashes = hub
+            .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let hash = hashes[0];
+
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let sess = peers.register(
+            addr,
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::OutboundFullRelay,
+        );
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let msg = cmpct_announce_msg(&hub, &hash, 2).expect("cmpct announce");
+        queue_cmpct_tip_announce(&out_tx, Some(&sess.serve_inflight), msg).unwrap();
+        note_served_write(&sess.serve_inflight);
+        assert_eq!(
+            sess.serve_inflight.load(Ordering::SeqCst),
+            0,
+            "announce write must pair with inflight, not wrap"
+        );
+        while out_rx.try_recv().is_ok() {}
+
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = true;
+        let mut cmpct_ver = 2u32;
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut ban = 0u32;
+        handle_peer_frame(
+            frame_for(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(out_rx.try_recv(), Ok(NetworkMessage::CmpctBlock(_))),
+            "getdata MSG_CMPCT_BLOCK must still serve after a compact tip announce"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+/// Coinbase-only compact must reconstruct from prefilled txs; a missing
+/// mempool hub must not force a full-getdata fallback that then never
+/// arrives (`p2p_compactblocks_hb` 1-block relay).
+#[test]
+fn coinbase_compact_fills_without_mempool() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::Network;
+    use tokio::runtime::Builder;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (src_dir, src_q) = tmp_store("cmpct-nomp-src");
+        let src = ChainHub::new(src_q, ChainParams::regtest(), Milestone::NONE);
+        src.ensure_genesis().unwrap();
+        let hashes = src
+            .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let hash = hashes[0];
+        let block = src
+            .query
+            .reconstruct_archived_block(&hash.to_byte_array())
+            .unwrap()
+            .expect("src body");
+        let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+
+        let (dir, q) = tmp_store("cmpct-nomp-dst");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        assert!(hub.mempool().is_none());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = true;
+        let mut cmpct_ver = 2u32;
+        let mut ban = 0u32;
+        handle_peer_frame(
+            frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+                compact_block: hsi,
+            })),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hub.has_block(&hash),
+            "coinbase compact must connect without a mempool hub"
+        );
+        while let Ok(msg) = out_rx.try_recv() {
+            if matches!(msg, NetworkMessage::GetData(_)) {
+                panic!("coinbase compact must not fall back to getdata, got {msg:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    });
 }

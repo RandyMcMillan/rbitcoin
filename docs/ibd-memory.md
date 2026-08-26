@@ -33,8 +33,8 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
 | **Published identity union** | Per-wave map of **this wave's** parent identities (re-home union hits + TipOnly misses; `ArcSwap` of the layer-chain head; get walks, no union rebuild) | Lookup keeps a layer while its span is on the BQ or overlaps `(tip, taken_hi]`. Disconnect stores `None`. Not a process FIFO. |
-| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only. IBD has **no** process `PipelineParentStore` | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range). Recent-window first spend uses stamp-carried RecentCreates outs |
-| **RecentCreates create-outs ring** | identity + full create outs (`CreatePin` Arc); one Arc layer per write phase; drop when `class_a_hi >= layer.until` (`until = lookup_started_hi.max(hi)` at publish) | Write notes `batch_pin` then one prepend+splice after Class A+idx; disconnect `drop_from`. Sizes: `recent=` counts layers/keys + CreatePin bytes. Not a coins cache / spend FIFO |
+| **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range). Recent-window first spend uses stamp-carried in-flight CreatePin until write keep-until |
+| **In-flight CreatePin layers** | identity + full create outs; pin layers drop when drain+fence **and** `class_a_hi >= until` (`until = lookup_started_hi.max(hi)` frozen at write) | Lookup/load note; write stamps keep-until; disconnect `drop_from`. Sizes: `iflight=`. Not a coins cache / spend FIFO |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH catalog runs** | on disk after post-IBD Class A recollect | bulk FullCold / ColdResume at tip; not during Direct confirm |
@@ -111,7 +111,7 @@ known retain structures:
 | `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap **14**) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH catalog runs / tip heads |
-| `heap … iflight= pstore= recent= union= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins + **pstore 0 on IBD** (tip-follow may still hold a store) + **RecentCreates identity+outs ring** (`recent=Nh live=/pub=/ov= fifo=≈NMiB` from CreatePin bytes) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `heap … iflight= pstore= recent= union= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins (`iflight=`) + **pstore/recent meters stay 0** (no process pin store, no RecentCreates ring) + **PublishedIds/LiveUnion layers** (`union=NL/Nk`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 

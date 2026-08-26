@@ -90,16 +90,13 @@ Pin material is **plan / batch only** (`batch_pin`, `BatchParents`). No process
 create pin FIFO. IBD confirm intake
 is **body queue wire only** → lookup → load.
 
-**RecentCreates** is a write-published Arc layer chain (same splice as
-live_union): identity **and** `CreatePin` outs after Class A+idx. Each layer
-`until = lookup_started_hi.max(hi)` at publish; drop when `class_a_hi >= until`.
-Not BQ depth, not EWMA. Stamp attaches the CreatePin; pin does not re-walk the
-ring. Not a coins cache or process pin FIFO.
+In-flight CreatePin layers drop at drain+fence **and**, for pin layers, write
+`until = lookup_started_hi.max(hi)` then `class_a_hi >= until`. Stamp attaches
+the CreatePin from `InFlightView`. Not a coins cache or process pin FIFO.
 
 Leftover union, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**
 (the only Allowed/Forbidden IO table). In-flight prune after pin + scripts
-handoff; no leftover pending / pin FIFO; RecentCreates drops when Class A
-covers lookup-started. Union miss is permanent.
+handoff; no leftover pending / pin FIFO. Union miss is permanent.
 
 ### Confirm pipeline timers
 

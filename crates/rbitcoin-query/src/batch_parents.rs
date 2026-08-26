@@ -125,6 +125,10 @@ impl PinOuts {
         live.iter().all(|(v, _)| self.get(*v).is_some())
     }
 
+    fn already_covers(&self, live: &[(u32, OutputRecord)], checked: &[u32]) -> bool {
+        self.covers_need(checked) && (live.is_empty() || self.has_all_live(live))
+    }
+
     #[cfg(test)]
     fn live_len(&self) -> usize {
         match self {
@@ -392,16 +396,14 @@ impl SharedParentPin {
         self.load_outs().covers_need(need)
     }
 
+    /// No-op (empty / already-covered `checked`+`live`) keeps the outs Arc.
     fn merge_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) {
         let snap = self.load_outs();
-        if snap.covers_need(checked) && (live.is_empty() || snap.has_all_live(&live)) {
+        if snap.already_covers(&live, checked) {
             return;
         }
         self.outs.rcu(|cur| {
-            if !checked.is_empty()
-                && cur.covers_need(checked)
-                && (live.is_empty() || cur.has_all_live(&live))
-            {
+            if cur.already_covers(&live, checked) {
                 Arc::clone(cur)
             } else {
                 Arc::new(cur.compose(live.clone(), checked))
@@ -794,9 +796,7 @@ impl BatchParents {
             std::collections::hash_map::Entry::Occupied(o) => {
                 let p = o.get();
                 let outs = p.load_outs();
-                let need_outs = !checked.is_empty()
-                    && !(outs.covers_need(&checked)
-                        && (live.is_empty() || outs.has_all_live(&live)));
+                let need_outs = !outs.already_covers(&live, &checked);
                 if need_outs {
                     p.apply_pin_delta(
                         Some((live, checked.as_slice())),
@@ -845,7 +845,7 @@ impl BatchParents {
             std::collections::hash_map::Entry::Occupied(o) => {
                 let p = o.get();
                 let outs = p.load_outs();
-                let need_outs = !checked.is_empty() && !outs.covers_need(&checked);
+                let need_outs = !outs.covers_need(&checked);
                 if need_outs {
                     let live = {
                         let (_tx, rows) = pin.as_ref();
@@ -1792,6 +1792,55 @@ mod tests {
         assert!(pin.load_outs().covers_need(&[0]));
         pin.merge_outs(vec![], &[0]);
         assert!(pin.outs.rcu.get().is_none(), "no-op cover must stay Frozen");
+    }
+
+    /// Q-M3: empty checked / already-covered live must not publish a new outs Arc.
+    #[test]
+    fn merge_outs_empty_checked_keeps_outs_arc() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            None,
+            Vec::new(),
+        );
+        let pin = Arc::clone(bp.pins.get(&1).unwrap());
+        assert!(pin.outs.rcu.get().is_none());
+        let before = pin.load_outs();
+        pin.merge_outs(vec![], &[]);
+        assert!(
+            Arc::ptr_eq(&before, &pin.load_outs()),
+            "empty checked no-op must keep outs Arc"
+        );
+        assert!(
+            pin.outs.rcu.get().is_none(),
+            "empty checked no-op must stay Frozen"
+        );
+        pin.merge_outs(vec![(0, out(10))], &[]);
+        assert!(
+            Arc::ptr_eq(&before, &pin.load_outs()),
+            "redundant live + empty checked must keep outs Arc"
+        );
+        assert!(pin.outs.rcu.get().is_none());
+
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(1, out(20))],
+            vec![],
+            None,
+            None,
+            Vec::new(),
+        );
+        let after = pin.load_outs();
+        assert!(
+            after.covers_need(&[0]) && after.get(1).is_some(),
+            "Occupied empty-checked new live must still widen"
+        );
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     #[test]

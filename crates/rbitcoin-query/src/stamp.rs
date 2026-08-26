@@ -3,11 +3,11 @@
 //! IBD load passes a lookup-filled [`BatchParentIds`] and never leftover-probes.
 //! plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly.
 //! One function for S0 plan (`archive_plan_batch_from_store`) and plan=None
-//! rehydrate. In-flight holds CreatePins until load drops layers below a
+//! rehydrate. In-flight holds CreatePins until load drops map rows below a
 //! lookup-wave drain+fence snapshot taken before TipOnly.
 
 use crate::id_map::{IdMap, TxidHasher};
-use crate::{CreatePin, InFlightView, QueryError, U64Map, U64Set};
+use crate::{CreatePin, InFlight, QueryError, U64Map, U64Set};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::Store;
 use std::collections::HashMap;
@@ -103,7 +103,7 @@ impl ExternalParentStamp {
 pub fn stamp_external_parents(
     store: &Store,
     need: &[[u8; 32]],
-    in_flight: &InFlightView,
+    in_flight: &InFlight,
     skeleton: Option<&BatchParentIds>,
 ) -> Result<ExternalParentStamp, QueryError> {
     let mut stamp = ExternalParentStamp {
@@ -230,7 +230,7 @@ pub fn stamp_external_parents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::in_flight::{InFlightLayer, InFlightLog};
+    use crate::in_flight::InFlight;
     use rbitcoin_primitives::Fk;
     use std::sync::Once;
 
@@ -290,7 +290,7 @@ mod tests {
             spent: Arc::new(spent),
             need_vouts: U64Map::default(),
         };
-        let empty = InFlightView::empty();
+        let empty = InFlight::new();
         let st = stamp_external_parents(q.store(), &[txid], &empty, Some(&skel)).unwrap();
         assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(7)));
@@ -303,10 +303,10 @@ mod tests {
     fn inflight_hit_without_skeleton() {
         let (dir, q) = tmp_store();
         let p = pin(42);
-        let mut log = InFlightLog::new();
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1));
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(42), &p)], Some(1));
         let txid = p.0.txid;
-        let st = stamp_external_parents(q.store(), &[txid], &log.snapshot(), None).unwrap();
+        let st = stamp_external_parents(q.store(), &[txid], &inflight, None).unwrap();
         assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -318,7 +318,7 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = 0x22;
         let skel = BatchParentIds::default();
-        let empty = InFlightView::empty();
+        let empty = InFlight::new();
         let err = stamp_external_parents(q.store(), &[txid], &empty, Some(&skel)).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("parent create_fk unresolved"), "got: {msg}");
@@ -333,7 +333,7 @@ mod tests {
 /// spent unset — write ensure still stamps those holes.
 pub fn fill_missing_parent_ranges(
     store: &Store,
-    in_flight: &InFlightView,
+    in_flight: &InFlight,
     idents: &mut U64Map<ParentIdent>,
 ) -> Result<(), QueryError> {
     crate::archive_phase_stats::note_fill_missing();

@@ -4584,6 +4584,154 @@ fn catchup_headers_getdata_stays_in_serve_window() {
     });
 }
 
+/// Same catch-up as above, but the peer answers with `CmpctBlock` (node-to-node
+/// `sendcmpct` / `MSG_CMPCT_BLOCK` getdata). Accepting compact must drop the
+/// hash from `requested` or drain's serve window stays full.
+#[test]
+fn catchup_compact_getdata_clears_requested_for_next_window() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::Network;
+    use rbitcoin_primitives::Height;
+    use tokio::runtime::Builder;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    fn getdata_hashes(rx: &mut mpsc::UnboundedReceiver<NetworkMessage>) -> Vec<BlockHash> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let NetworkMessage::GetData(inv) = msg {
+                for i in inv {
+                    match i {
+                        Inventory::Block(h)
+                        | Inventory::WitnessBlock(h)
+                        | Inventory::CompactBlock(h) => out.push(h),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    let n = MAX_SERVE_BLOCKS + 4;
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (src_dir, src_q) = tmp_store("catchup-cmpct-src");
+        let src = ChainHub::new(src_q, ChainParams::regtest(), Milestone::NONE);
+        src.ensure_genesis().unwrap();
+        src.generate_to_script(n as u32, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let headers: Vec<bitcoin::block::Header> = (1..=n as u32)
+            .map(|h| src.query.wire_header_at_height(Height(h)).unwrap())
+            .collect();
+
+        let (dir, q) = tmp_store("catchup-cmpct-dst");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(mp).is_ok());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = true;
+        let mut cmpct_ver = 2u32;
+        let mut ban = 0u32;
+
+        handle_peer_frame(
+            frame_for(NetworkMessage::Headers(headers.clone())),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            None,
+        )
+        .await
+        .unwrap();
+        let first = getdata_hashes(&mut out_rx);
+        assert_eq!(first.len(), MAX_SERVE_BLOCKS);
+        assert_eq!(requested.len(), MAX_SERVE_BLOCKS);
+
+        for h in &first {
+            let block = src
+                .query
+                .reconstruct_archived_block(&h.to_byte_array())
+                .unwrap()
+                .expect("src body");
+            let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+            handle_peer_frame(
+                frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+                    compact_block: hsi,
+                })),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut requested,
+                &mut ban,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            requested.len() < MAX_SERVE_BLOCKS,
+            "compact accept must free requested slots, still {}",
+            requested.len()
+        );
+        let rest = getdata_hashes(&mut out_rx);
+        assert_eq!(
+            rest.len(),
+            n - MAX_SERVE_BLOCKS,
+            "after compact window fills, remaining header-path bodies must be asked, got {}",
+            rest.len()
+        );
+        let want: HashSet<_> = headers[MAX_SERVE_BLOCKS..]
+            .iter()
+            .map(|h| h.block_hash())
+            .collect();
+        let got: HashSet<_> = rest.into_iter().collect();
+        assert_eq!(got, want);
+
+        let _ = std::fs::remove_dir_all(src_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
 #[test]
 fn queue_getheaders_from_hash_puts_it_first() {
     let (dir, q) = tmp_store("gh-from");

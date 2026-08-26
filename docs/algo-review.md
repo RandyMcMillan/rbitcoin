@@ -96,7 +96,7 @@ What the node runs. Findings follow.
 | Fee estimator | log buckets | |
 | `testmempoolaccept` | `MempoolHub::test_accept` | prepare + scripts + RBF/cluster; no commit |
 | RPC `active` | id-keyed map | `dispatch` removes by id |
-| Electrum status | `sha256(concat rows)` | confirmed rows include **blockhash** (COMPAT A-B-A); mempool rows sorted first in the preimage |
+| Electrum status | `sha256(concat rows)` | confirmed rows include **blockhash** (COMPAT A-B-A); mempool appended last (same as `get_history`) |
 | Esplora `/blocks` | reconstruct 10 full blocks | for size/weight only |
 | SH join cache | process-wide single slot | serializes clients |
 
@@ -112,27 +112,7 @@ What the node runs. Findings follow.
 
 ## 2. Highest-priority findings
 
-### High — Electrum (product-visible)
-
-#### M-H3. Electrum status ordering vs `get_history`
-
-`crates/rbitcoin-electrum/src/server.rs` concatenates
-`txid:height:blockhash:` for confirmed rows. Electrum spec is
-`txid:height:` only. **COMPAT.md** records the extra field as intentional
-A-B-A protection (same-height reorg). Conformant clients that recompute
-status from `get_history` will never match and will refetch. That is a
-product choice — vanilla Electrum desktop loops unless the client honors
-the extra field or ignores mismatch. Not counted as High.
-
-Separately, `scripthash_status_full_slot` `sort_by_key(|i| i.height)` puts
-mempool rows (0 / −1) **before** confirmed. That disagrees with this
-server's own `get_history` (mempool appended last) and with the protocol.
-That half **is** a bug even given COMPAT.
-
-**Fix (ordering):** reuse `get_history` assembly for the preimage.
-**Fix (preimage):** either drop blockhash from the hash (keep it in
-`chain_tip` JSON only) or keep COMPAT and document that vanilla clients
-will loop.
+*(none remaining — Electrum status extra `blockhash` is COMPAT, not High.)*
 
 ---
 
@@ -296,15 +276,14 @@ Do not flatten io_uring machines. Do not add a process pin FIFO.
 5. **BlockCache:** `VecDeque` + height offset.
 6. **Esplora `sh_join`:** small LRU, not one global slot.
 7. **Esplora `/blocks`:** stored summary, not reconstruct.
-8. **Electrum status:** one history-row builder for wire + preimage.
-9. **`last_push_data`:** `Script::instructions()` (gets PUSHDATA4).
-10. **`U64IdentityHasher`:** multiply by odd golden-ratio constant if
+8. **`last_push_data`:** `Script::instructions()` (gets PUSHDATA4).
+9. **`U64IdentityHasher`:** multiply by odd golden-ratio constant if
     hashbrown clustering shows.
-11. **Seqlock:** fences, or stop rolling your own for a 16-byte pair.
-12. **CLI parsers:** table-driven `take_parsed` (node + bench).
-13. **Bench hex:** use `rbitcoin_primitives::hex_*`.
-14. **Bit count:** `u8::count_ones`.
-15. **SH `put_sorted_creates` `seen`:** `put_chain` already sorts+dedups.
+10. **Seqlock:** fences, or stop rolling your own for a 16-byte pair.
+11. **CLI parsers:** table-driven `take_parsed` (node + bench).
+12. **Bench hex:** use `rbitcoin_primitives::hex_*`.
+13. **Bit count:** `u8::count_ones`.
+14. **SH `put_sorted_creates` `seen`:** `put_chain` already sorts+dedups.
 
 ---
 
@@ -377,7 +356,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 | net | 0 | compact indexes, random eviction, unbounded maps, v2 copies | INV flush, BlockCache |
 | mempool | 0 | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 0 | submitblock gate, gettxout, hashps, unbounded batch, blockmintxfee, maxfeerate | GBT depends, longpoll |
-| electrum | 1 (status **order** vs get_history) | mempool_stats | status full-history, announce O(subs) |
+| electrum | 0 | mempool_stats | status full-history, announce O(subs) |
 | esplora | 0 | stub mempool JSON, WS on runtime, sh_join slot | `/blocks` reconstruct, WS announce IO |
 | node/cli/log/bench | 0 | milestone=0 conf, minrelay silent, frozen AddrMan | log gating, api_log mutex |
 
@@ -388,10 +367,8 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 Not a plan (no red/green steps). Split-risk, then operator-visible, then
 IBD CPU.
 
-1. Electrum status **ordering**; decide COMPAT vs spec for the extra
-   blockhash.
-2. Mempool persist order, `relay_seq` unindex, AddrMan cap.
-3. Esplora `/blocks` summaries (P11) and mempool JSON stubs (X-M1).
+1. Mempool persist order, `relay_seq` unindex, AddrMan cap.
+2. Esplora `/blocks` summaries (P11) and mempool JSON stubs (X-M1).
 
 Out of scope (Won't-fix / policy): flattening uring, process pin FIFO,
 leftover `Vec<Fk>`, explorer APIs, `rbitcoin-bench` in required CI.

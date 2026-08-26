@@ -1,10 +1,13 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{
-    block_hash_hex, maybe_attach_view, not_found, parse_hash32, pin_or_reject, plain_ok, store_err,
-    AppState, AsOf,
+    block_hash_hex, maybe_attach_view, mempool_wire, not_found, parse_hash32, pin_or_reject,
+    plain_ok, store_err, AppState, AsOf,
 };
-use crate::tx_json::{build_tx_json, history_items_to_tx_json, tx_status_json_in, utxo_list_json};
+use crate::tx_json::{
+    build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
+    utxo_list_json,
+};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -14,7 +17,7 @@ use bitcoin::address::Address;
 use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
-use bitcoin::{MerkleBlock, Network};
+use bitcoin::{MerkleBlock, Network, Txid};
 use rbitcoin_primitives::{median_time_past_times, Height};
 use rbitcoin_query::{ChainViewKind, HistoryFilter, Query, ScriptHashChainStats};
 use rbitcoin_store::{script_hash, StoreError};
@@ -347,7 +350,15 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
                     .into_response(),
                 Err(e) => store_err(e),
             },
-            Ok(None) => not_found(),
+            Ok(None) => match mempool_wire(&st, &txid) {
+                Some(tx) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bitcoin::consensus::serialize(&tx),
+                )
+                    .into_response(),
+                None => not_found(),
+            },
             Err(e) => store_err(e),
         }
     })
@@ -817,21 +828,7 @@ fn combined_txs(st: &AppState, sh: &[u8; 32], asof: Option<[u8; 32]>) -> Respons
     };
     let mut out = Vec::new();
     if asof.is_none() {
-        if let Some(mp) = st.mempool.as_ref() {
-            for item in mp.scripthash_mempool(sh).into_iter().take(50) {
-                if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&item.txid) {
-                    if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
-                        out.push(v);
-                        continue;
-                    }
-                }
-                out.push(json!({
-                    "txid": block_hash_hex(&item.txid),
-                    "status": { "confirmed": false },
-                    "fee": item.fee,
-                }));
-            }
-        }
+        out.extend(mempool_txs_json(st, sh));
     }
     let filter = HistoryFilter::esplora_chain_page(None);
     let resp = if asof.is_some() {
@@ -986,24 +983,37 @@ pub async fn address_txs_mempool(
     }
 }
 
-fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
+fn mempool_txs_json(st: &AppState, sh: &[u8; 32]) -> Vec<Value> {
+    let Some(mp) = st.mempool.as_ref() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    if let Some(mp) = st.mempool.as_ref() {
-        for item in mp.scripthash_mempool(sh).into_iter().take(50) {
-            if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&item.txid) {
-                if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
-                    out.push(v);
-                    continue;
-                }
+    for item in mp.scripthash_mempool(sh).into_iter().take(50) {
+        if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&item.txid) {
+            if let Ok(v) = build_tx_json(&st.query, fk, st.network) {
+                out.push(v);
+                continue;
             }
-            out.push(json!({
-                "txid": block_hash_hex(&item.txid),
-                "status": { "confirmed": false },
-                "fee": item.fee,
-            }));
+        }
+        let txid = Txid::from_byte_array(item.txid);
+        let Some(tx) = mp.get_tx(&txid) else {
+            continue;
+        };
+        if let Ok(v) = build_tx_json_from_tx(
+            &st.query,
+            &tx,
+            st.network,
+            Some(item.fee),
+            Some(mp.as_ref()),
+        ) {
+            out.push(v);
         }
     }
-    Json(out).into_response()
+    out
+}
+
+fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
+    Json(mempool_txs_json(st, sh)).into_response()
 }
 
 pub async fn post_tx(State(st): State<AppState>, body: Bytes) -> Response {

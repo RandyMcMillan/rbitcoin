@@ -4,14 +4,14 @@
 
 use crate::handlers::resolve_address_sh;
 use crate::server::AppState;
-use crate::tx_json::{build_tx_json, tx_status_json};
+use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_status_json};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Network, Transaction, Txid};
+use bitcoin::{Transaction, Txid};
 use futures_util::{SinkExt, StreamExt};
 use rbitcoin_net::{MempoolAnnounce, TipEvent};
 use rbitcoin_primitives::{hex_encode, Height};
@@ -213,51 +213,6 @@ fn scripts_touched_full(
         }
     }
     set
-}
-
-fn mempool_tx_json(tx: &Transaction, network: Network) -> Value {
-    let txid = tx.compute_txid();
-    let mut vin = Vec::new();
-    for (i, inp) in tx.input.iter().enumerate() {
-        vin.push(json!({
-            "txid": txid_display_hex(&inp.previous_output.txid),
-            "vout": inp.previous_output.vout,
-            "scriptsig": "",
-            "scriptsig_asm": "",
-            "is_coinbase": inp.previous_output.is_null(),
-            "sequence": inp.sequence.0,
-            "vin": i,
-        }));
-    }
-    let mut vout = Vec::new();
-    for (i, o) in tx.output.iter().enumerate() {
-        let spk = o.script_pubkey.as_bytes();
-        let addr = Address::from_script(&o.script_pubkey, network)
-            .ok()
-            .map(|a| a.to_string());
-        let mut vo = json!({
-            "scriptpubkey": hex_encode(spk),
-            "scriptpubkey_asm": "",
-            "scriptpubkey_type": "",
-            "value": o.value.to_sat(),
-        });
-        if let Some(a) = addr {
-            vo["scriptpubkey_address"] = Value::String(a);
-        }
-        vo["n"] = json!(i);
-        vout.push(vo);
-    }
-    json!({
-        "txid": txid_display_hex(&txid),
-        "version": tx.version.0,
-        "locktime": tx.lock_time.to_consensus_u32(),
-        "vin": vin,
-        "vout": vout,
-        "size": bitcoin::consensus::serialize(tx).len(),
-        "weight": tx.weight().to_wu(),
-        "fee": 0,
-        "status": { "confirmed": false },
-    })
 }
 
 fn tip_push_json(ev: &TipEvent) -> Value {
@@ -553,9 +508,14 @@ async fn on_mempool_announce(
         let hit = shs.iter().any(|s| conn.addresses.contains_key(s));
         if hit {
             let body = match st.query.get_tx_by_txid(&ann.txid.to_byte_array()) {
-                Ok(Some((fk, _))) => build_tx_json(&st.query, fk, st.network)
-                    .unwrap_or_else(|_| mempool_tx_json(&tx, st.network)),
-                _ => mempool_tx_json(&tx, st.network),
+                Ok(Some((fk, _))) => {
+                    build_tx_json(&st.query, fk, st.network).unwrap_or_else(|_| {
+                        build_tx_json_from_tx(&st.query, &tx, st.network, None, Some(m.as_ref()))
+                            .unwrap_or_else(|_| json!({ "txid": txid_display_hex(&ann.txid) }))
+                    })
+                }
+                _ => build_tx_json_from_tx(&st.query, &tx, st.network, None, Some(m.as_ref()))
+                    .unwrap_or_else(|_| json!({ "txid": txid_display_hex(&ann.txid) })),
             };
             send_json(sink, &json!({ "address-transactions": [body] })).await?;
         }

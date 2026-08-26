@@ -62,6 +62,33 @@ pub(crate) fn prune_satisfied_inflight(
     }
 }
 
+/// Drop getdata that cannot feed the work path or a reorg gather.
+///
+/// Off-path leftovers otherwise block [`path_drained`](super::exit::path_drained)
+/// forever (mainnet 08:16:23: ordered empty, h2h=0, inflight=7).
+pub(crate) fn prune_off_path_inflight(st: &mut IbdWorkState) {
+    let reorg_need: HashSet<BlockHash> = st.reorg.need_getdata().into_iter().collect();
+    let drop: Vec<BlockHash> = st
+        .inflight
+        .keys()
+        .copied()
+        .filter(|h| {
+            if st.ordered_set.contains(h) || reorg_need.contains(h) {
+                return false;
+            }
+            if let Some(&ht) = st.hash_height.get(h) {
+                if st.is_on_path(h, ht) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    for h in drop {
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+    }
+}
+
 /// Record `peer` as requesting `hash` (tip-hole / park race may accumulate peers).
 pub(crate) fn inflight_add_peer(
     inflight: &mut HashMap<BlockHash, state::InflightReq>,
@@ -107,6 +134,7 @@ pub(crate) fn assign_work_ordered(
     }
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
+    prune_off_path_inflight(st);
 
     let _ = super::reorg::consider_disconnected_heavier(st, hub);
 
@@ -801,6 +829,46 @@ mod tests {
         let stats = LoopStats::default();
         let cfg = IbdConfig::for_test();
         assign_work_ordered(&mut st, &hub, &cfg, &stats, 1, AssignDepth::Full, None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Off-path getdata (mainnet 08:16:23: ordered empty, h2h=0, inflight=7)
+    /// must not occupy slots; tip+1 and reorg-need hashes stay.
+    #[test]
+    fn prune_off_path_inflight_drops_orphans_keeps_path_and_reorg() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
+        assert!(st.ordered.is_empty());
+        assert!(st.height_to_hash.is_empty() || st.height_to_hash.len() <= 1);
+
+        for i in 0..7u32 {
+            let hash = h(1000 + i);
+            st.slots[0].in_flight.insert(hash);
+            inflight_add_peer(&mut st.inflight, hash, 0);
+        }
+        let want = h(0x11);
+        let ht = hub.tip_height().unwrap_or(0).saturating_add(1);
+        st.record_height(want, ht);
+        st.slots[0].in_flight.insert(want);
+        inflight_add_peer(&mut st.inflight, want, 0);
+        let reorg_h = h(0x22);
+        st.reorg.register_explore(std::iter::once(reorg_h), None);
+        st.slots[0].in_flight.insert(reorg_h);
+        inflight_add_peer(&mut st.inflight, reorg_h, 0);
+        assert_eq!(st.inflight.len(), 9);
+
+        prune_off_path_inflight(&mut st);
+
+        assert_eq!(st.inflight.len(), 2, "orphans dropped; path+reorg kept");
+        assert!(st.inflight.contains_key(&want), "tip+1 occupant stays");
+        assert!(st.inflight.contains_key(&reorg_h), "reorg need stays");
+        for i in 0..7u32 {
+            let hash = h(1000 + i);
+            assert!(!st.inflight.contains_key(&hash), "orphan {i} dropped");
+            assert!(!st.slots[0].in_flight.contains(&hash));
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }

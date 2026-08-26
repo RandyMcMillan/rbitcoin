@@ -2,13 +2,16 @@
 //!
 //! Pack/hold uses enqueue-stamped Σ inputs (no `Block` decode). Emit runs one
 //! [`Store::get_fk_by_txid_batch`] (TipOnly) across the selected heights
-//! (soft **64000** inputs / hard **1080** blocks). Hits publish as one
-//! [`rbitcoin_query::IdLayer`] on the live union. Does not claim, structure, or stamp.
+//! (soft **64000** inputs / hard **1080** blocks). Hits ride the wave as
+//! [`rbitcoin_query::BatchParentIds`] (fk + body_range + spent_range). Does not
+//! claim, structure, or stamp. Same-wave creates are omitted from TipOnly need.
 
 use super::*;
 use crate::milestone::Milestone;
 use bitcoin::consensus::Decodable;
-use rbitcoin_query::{ResolvedWire, TxPrecompute, TxidHasher, U32Map};
+use rbitcoin_query::{
+    BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, U32Map, U64Map,
+};
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::io::Cursor;
@@ -17,14 +20,14 @@ use std::sync::Arc;
 /// Hard cap on BQ heights in one TipOnly wave (~1 week of 10-minute blocks).
 ///
 /// Load packs **8000** inputs / **144** blocks. Lookup stays at least 4× the
-/// block cap so early-IBD waves are fat enough that one published identity
-/// layer covers many heights. Soft stop is Σ `tx.input`
+/// block cap so early-IBD waves are fat enough that one skeleton covers many
+/// heights. Soft stop is Σ `tx.input`
 /// ([`BQ_RESOLVE_WAVE_MAX_INPUTS`]), include-overshoot, same shape as load.
 /// Fat-era 64 k inputs is ~16 blocks → ~20 layers at `ready≈330`.
 pub const BQ_RESOLVE_WAVE_MAX_BLOCKS: usize = 1080;
 /// Soft max Σ `tx.input` per lookup wave (8× load's 8000; overshoot included).
 pub const BQ_RESOLVE_WAVE_MAX_INPUTS: u32 = 64_000;
-/// Hard min Σ `tx.input` per published layer (same number as load's pack).
+/// Hard min Σ `tx.input` per lookup wave (same number as load's pack).
 ///
 /// Hold a thinner collect when more unresolved BQ heights can still join —
 /// including `ready=0` / load-frontier / unknown window. Last available
@@ -97,6 +100,8 @@ pub struct BqResolveWave {
     pub items: Vec<(u32, [u8; 32], ResolvedWire)>,
     /// [`Query::drain_and_fence_hi`] immediately before this wave's TipOnly read.
     pub drain_fence_hi: Option<u32>,
+    /// TipOnly hits for this wave (`need_vouts` filled per load chunk at send).
+    pub parent_ids: BatchParentIds,
 }
 
 /// Outcome of one TipOnly wave over BQ-ready heights.
@@ -105,8 +110,6 @@ pub struct BqResolveWaveStats {
     pub heights: u32,
     pub keys: u32,
     pub hits: u32,
-    /// Keys already in [`rbitcoin_query::LiveUnion`] — no TipOnly this wave.
-    pub skipped: u32,
     pub work_ns: u64,
     /// `consensus_decode` of still-raw BQ payloads (this wave).
     pub decode_ns: u64,
@@ -116,6 +119,8 @@ pub struct BqResolveWaveStats {
     pub collect_ns: u64,
     /// TipOnly `get_fk_by_txid_batch` + slot sort (this wave).
     pub head_ns: u64,
+    /// `tx_spent_range_batch` for TipOnly hits (this wave).
+    pub spent_ns: u64,
 }
 
 /// Push external prev_txids (+ pre-BIP34 create txids) into the wave set.
@@ -155,36 +160,27 @@ fn decode_bq_block(payload: &[u8]) -> Option<Block> {
 /// Skips missing / already-complete / undecodable heights. Marks each
 /// processed height resolve-complete even when some keys miss (same-batch /
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
-///
-/// When `ids` is `Some`, skip TipOnly for keys already in the live union and
-/// publish **one** layer for the whole wave (`lo..=hi`). The layer stays while
-/// any height in the span is still on the BQ or overlaps `(tip, taken_hi]`.
 pub fn confirm_bq_resolve_wave(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     heights: &[u32],
 ) -> Result<BqResolveWaveStats, ConsensusError> {
-    Ok(confirm_bq_resolve_wave_with_ids(query, params, milestone, heights, None)?.stats)
+    Ok(confirm_bq_resolve_wave_with_ids(query, params, milestone, heights)?.stats)
 }
 
-/// [`confirm_bq_resolve_wave`] with a lookup-owned live union.
+/// [`confirm_bq_resolve_wave`] returning decoded items + skeleton identity.
 pub fn confirm_bq_resolve_wave_with_ids(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     heights: &[u32],
-    ids: Option<(
-        &mut rbitcoin_query::LiveUnion,
-        &rbitcoin_query::PublishedIds,
-    )>,
 ) -> Result<BqResolveWave, ConsensusError> {
     confirm_bq_resolve_wave_capped(
         query,
         params,
         milestone,
         heights,
-        ids,
         BQ_RESOLVE_WAVE_MAX_BLOCKS,
         BQ_RESOLVE_WAVE_MAX_INPUTS,
     )
@@ -196,10 +192,6 @@ pub fn confirm_bq_resolve_wave_capped(
     params: &ChainParams,
     milestone: Milestone,
     heights: &[u32],
-    mut ids: Option<(
-        &mut rbitcoin_query::LiveUnion,
-        &rbitcoin_query::PublishedIds,
-    )>,
     max_blocks: usize,
     max_inputs: u32,
 ) -> Result<BqResolveWave, ConsensusError> {
@@ -273,11 +265,13 @@ pub fn confirm_bq_resolve_wave_capped(
                 stats.precompute_ns,
                 stats.collect_ns,
                 stats.head_ns,
+                stats.spent_ns,
             );
             return Ok(BqResolveWave {
                 stats,
                 items: Vec::new(),
                 drain_fence_hi: None,
+                parent_ids: BatchParentIds::default(),
             });
         }
     }
@@ -347,15 +341,8 @@ pub fn confirm_bq_resolve_wave_capped(
     }
 
     stats.keys = all_keys.len() as u32;
-    let mut layer = rbitcoin_query::IdMap::default();
-    let mut need = match ids.as_mut() {
-        Some((live, _)) => {
-            let (skipped, need) = live.partition_into_layer(all_keys.iter(), &mut layer);
-            stats.skipped = skipped;
-            need
-        }
-        None => all_keys.into_iter().collect(),
-    };
+    let mut layer = IdMap::default();
+    let mut need: Vec<[u8; 32]> = all_keys.into_iter().collect();
     let t_head = Instant::now();
     need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
 
@@ -377,18 +364,27 @@ pub fn confirm_bq_resolve_wave_capped(
     }
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
-    if let Some((live, published)) = ids.as_mut() {
-        if let (Some(&lo), Some(&hi)) = (done.first(), done.last()) {
-            live.note_span(lo, hi, layer);
+
+    let t_spent = Instant::now();
+    let hit_fks: Vec<rbitcoin_primitives::Fk> = layer.values().map(|(fk, _)| *fk).collect();
+    let mut spent = U64Map::default();
+    if !hit_fks.is_empty() {
+        let rows = query
+            .store()
+            .tx_spent_range_batch(&hit_fks)
+            .map_err(ConsensusError::from)?;
+        for (fk, row) in hit_fks.iter().zip(rows) {
+            if let (Some(id), Some(sr)) = (fk.get(), row) {
+                spent.insert(id, sr);
+            }
         }
-        let t_keep = Instant::now();
-        let queued = query.block_queue_queued_heights();
-        let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-        live.keep_queued_or_taken(&queued, tip, query.lookup_taken_hi());
-        live.publish(published);
-        crate::confirm_phase_stats::LOOKUP_KEEP_NS
-            .fetch_add(t_keep.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
+    stats.spent_ns = t_spent.elapsed().as_nanos() as u64;
+    let parent_ids = BatchParentIds {
+        ids: Arc::new(layer),
+        spent: Arc::new(spent),
+        need_vouts: U64Map::default(),
+    };
 
     let mut items = Vec::with_capacity(wires.len());
     let mut promote = Vec::with_capacity(wires.len());
@@ -409,11 +405,13 @@ pub fn confirm_bq_resolve_wave_capped(
         stats.precompute_ns,
         stats.collect_ns,
         stats.head_ns,
+        stats.spent_ns,
     );
     Ok(BqResolveWave {
         stats,
         items,
         drain_fence_hi,
+        parent_ids,
     })
 }
 
@@ -476,8 +474,7 @@ mod tests {
     }
 
     fn resolve_and_take(q: &Query, params: &ChainParams, heights: &[u32]) -> BqResolveWaveStats {
-        let wave =
-            confirm_bq_resolve_wave_with_ids(q, params, Milestone::NONE, heights, None).unwrap();
+        let wave = confirm_bq_resolve_wave_with_ids(q, params, Milestone::NONE, heights).unwrap();
         take_emitted(q, &wave);
         wave.stats
     }
@@ -653,8 +650,7 @@ mod tests {
             .unwrap();
         q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
             .unwrap();
-        let wave =
-            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[1, 2], None).unwrap();
+        let wave = confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[1, 2]).unwrap();
         assert_eq!(wave.items.len(), 2);
         assert_eq!(
             wave.stats.keys, 1,
@@ -691,15 +687,7 @@ mod tests {
         q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
             .unwrap();
 
-        let mut live = rbitcoin_query::LiveUnion::new();
-        let wave = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone::NONE,
-            &[1, 2],
-            Some((&mut live, q.published_ids().as_ref())),
-        )
-        .unwrap();
+        let wave = confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[1, 2]).unwrap();
         let st = wave.stats;
         assert_eq!(st.heights, 2);
         assert_eq!(wave.items.len(), 2);
@@ -713,16 +701,16 @@ mod tests {
             st.collect_ns,
             st.head_ns
         );
+        let g = g_cb.to_byte_array();
+        let (fk, _body, spent) = wave
+            .parent_ids
+            .get(&g)
+            .expect("genesis coinbase must be a TipOnly skeleton hit");
+        assert!(!fk.is_null());
         assert!(
-            q.published_ids().get(&g_cb.to_byte_array()).is_some(),
-            "genesis coinbase must be a TipOnly hit in the published union"
+            spent.is_some(),
+            "archived parent must carry spent.idx on the skeleton"
         );
-        let head = q.published_ids().load().expect("published");
-        assert!(
-            head.older.is_none(),
-            "one lookup wave is one published layer, not one layer per height"
-        );
-        assert_eq!((head.lo, head.hi), (1, 2));
         take_emitted(&q, &wave);
         assert!(!q.block_queue_has_height(1));
         assert!(!q.block_queue_has_height(2));
@@ -751,15 +739,8 @@ mod tests {
         let expect_txid = TxPrecompute::from_tx(&b1.txdata[1]).txid;
         q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
             .unwrap();
-        let mut live = rbitcoin_query::LiveUnion::new();
-        let wave = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone { height: 100 },
-            &[1],
-            Some((&mut live, q.published_ids().as_ref())),
-        )
-        .unwrap();
+        let wave =
+            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone { height: 100 }, &[1]).unwrap();
         assert_eq!(wave.items.len(), 1);
         let spend_pre = &wave.items[0].2.pres[1];
         assert_eq!(spend_pre.txid, expect_txid);
@@ -787,7 +768,7 @@ mod tests {
             heights.push(h);
         }
         let wave =
-            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &heights, None).unwrap();
+            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &heights).unwrap();
         assert_eq!(
             wave.stats.heights, 9,
             "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
@@ -1021,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn second_wave_skips_live_union_parent() {
+    fn second_wave_tiponly_archived_parent_again() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -1043,41 +1024,16 @@ mod tests {
             .unwrap();
         q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
             .unwrap();
-        let mut live = rbitcoin_query::LiveUnion::new();
-        let published = rbitcoin_query::PublishedIds::new();
-        let st1 = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone::NONE,
-            &[1],
-            Some((&mut live, &published)),
-        )
-        .unwrap()
-        .stats;
-        assert_eq!(st1.skipped, 0);
-        assert!(st1.hits >= 1);
-        assert!(published.get(&g_cb.to_byte_array()).is_some());
-        let st2 = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone::NONE,
-            &[2],
-            Some((&mut live, &published)),
-        )
-        .unwrap()
-        .stats;
+        let w1 = confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[1]).unwrap();
+        assert!(w1.stats.hits >= 1);
+        assert!(w1.parent_ids.get(&g_cb.to_byte_array()).is_some());
+        take_emitted(&q, &w1);
+        let w2 = confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[2]).unwrap();
         assert!(
-            st2.skipped >= 1,
-            "second wave must skip genesis parent already in live_union"
+            w2.stats.keys >= 1 && w2.stats.hits >= 1,
+            "second wave still TipOnlys the archived genesis parent (no live_union skip)"
         );
-        let mut queued = std::collections::BTreeSet::new();
-        queued.insert(2);
-        live.keep_queued_heights(&queued);
-        live.publish(&published);
-        assert!(
-            published.get(&g_cb.to_byte_array()).is_some(),
-            "re-home must survive drop of wave-1 span"
-        );
+        assert!(w2.parent_ids.get(&g_cb.to_byte_array()).is_some());
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -1100,35 +1056,35 @@ mod tests {
         );
         q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
             .unwrap();
-        let mut live = rbitcoin_query::LiveUnion::new();
-        let published = q.published_ids();
-        let wave = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone::NONE,
-            &[1],
-            Some((&mut live, published.as_ref())),
-        )
-        .unwrap();
+        let wave = confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[1]).unwrap();
         assert!(wave.stats.hits >= 1);
+        let g = g_cb.to_byte_array();
         assert!(
-            published.get(&g_cb.to_byte_array()).is_some(),
-            "wave must publish genesis parent into live_union"
+            wave.parent_ids.get(&g).is_some(),
+            "wave skeleton must carry the archived genesis parent"
         );
         let ext = rbitcoin_query::stamp_external_parents(
             q.store(),
-            &[g_cb.to_byte_array()],
+            &[g],
             &rbitcoin_query::InFlightView::empty(),
-            published.as_ref(),
+            Some(&wave.parent_ids),
         )
         .expect("stamp helper after wave");
         assert_eq!(
             ext.head_need_n, 0,
-            "load stamp must not TipOnly-head a wave-published parent"
+            "skeleton path must not leftover-probe tx.head"
         );
+        let pipe = crate::WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: rbitcoin_query::InFlightView::empty(),
+            skeleton: Some(wave.parent_ids.clone()),
+        };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
-        let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
-            .expect("stamp after wave");
+        let stamped =
+            crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
+                .expect("stamp after wave");
         let plan = stamped.plan.expect("new body needs a plan");
         let inp = plan
             .edges
@@ -1193,19 +1149,11 @@ mod tests {
         q.disconnect_tip().unwrap();
         assert_eq!(q.tip_height().map(|h| h.0), Some(0));
 
-        let mut live = rbitcoin_query::LiveUnion::new();
-        let wave = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone::NONE,
-            &[2],
-            Some((&mut live, q.published_ids().as_ref())),
-        )
-        .unwrap();
+        let wave = confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &[2]).unwrap();
         assert_eq!(wave.stats.heights, 1);
         take_emitted(&q, &wave);
         assert!(
-            q.published_ids().get(&cb1.to_byte_array()).is_none(),
+            wave.parent_ids.get(&cb1.to_byte_array()).is_none(),
             "abandoned-fork coinbase must not be a TipOnly hit (TipThenAny would attach it)"
         );
         assert!(!q.block_queue_has_height(2));
@@ -1260,7 +1208,7 @@ mod tests {
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: view,
-            published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
+            skeleton: None,
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped =
@@ -1346,7 +1294,7 @@ mod tests {
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
             in_flight: log.snapshot(),
-            published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
+            skeleton: None,
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped =
@@ -1498,16 +1446,9 @@ mod tests {
                 .unwrap();
             heights.push(h);
         }
-        let mut live = rbitcoin_query::LiveUnion::new();
         let df_before = q.drain_and_fence_hi();
-        let wave = confirm_bq_resolve_wave_with_ids(
-            &q,
-            &params,
-            Milestone::NONE,
-            &heights,
-            Some((&mut live, q.published_ids().as_ref())),
-        )
-        .unwrap();
+        let wave =
+            confirm_bq_resolve_wave_with_ids(&q, &params, Milestone::NONE, &heights).unwrap();
         assert_eq!(wave.items.len(), 4);
         assert_eq!(
             wave.drain_fence_hi, df_before,

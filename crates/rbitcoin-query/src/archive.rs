@@ -467,7 +467,7 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
-        published: Option<&crate::PublishedIds>,
+        skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -534,7 +534,7 @@ impl Query {
             n_headers,
             assign_ns,
             in_flight,
-            published,
+            skeleton,
         )
     }
 
@@ -547,7 +547,7 @@ impl Query {
         need: &[(Fk, &bitcoin::Block, &[[u8; 32]])],
         next_tx_start: u64,
         in_flight: &crate::InFlightView,
-        published: Option<&crate::PublishedIds>,
+        skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -613,7 +613,7 @@ impl Query {
             n_headers,
             assign_ns,
             in_flight,
-            published,
+            skeleton,
         )
     }
 
@@ -625,7 +625,7 @@ impl Query {
         n_headers: u64,
         assign_ns: u64,
         in_flight: &crate::InFlightView,
-        published: Option<&crate::PublishedIds>,
+        skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::HashSet;
         use std::time::Instant;
@@ -660,13 +660,7 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
-        // External parents: in-flight → published live_union → leftover TipOnly
-        let ext = crate::stamp_external_parents(
-            &self.store,
-            &need_vec,
-            in_flight,
-            published.unwrap_or(self.published_ids.as_ref()),
-        )?;
+        let ext = crate::stamp_external_parents(&self.store, &need_vec, in_flight, skeleton)?;
         let inflight_ns = ext.inflight_ns;
         let head_fk_ns = ext.head_fk_ns;
         let resolved = ext.resolved;
@@ -794,7 +788,7 @@ impl Query {
             vouts.sort_unstable();
             vouts.dedup();
         }
-        if prestamp_parents {
+        if prestamp_parents && skeleton.is_none() {
             crate::fill_missing_parent_ranges(&self.store, in_flight, &mut external_parents)?;
         }
 
@@ -1838,7 +1832,7 @@ mod tests {
             q.store(),
             &[parent_txid],
             &crate::InFlightView::empty(),
-            q.published_ids().as_ref(),
+            None,
         )
         .expect("stamp archived parent");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(1)));
@@ -2058,26 +2052,34 @@ mod tests {
 
     /// Published union supplies create_fk + range with no pin, BQ hits, or head row.
     #[test]
-    fn archive_plan_batch_from_store_hits_published_ids() {
-        use crate::IdMap;
+    fn archive_plan_batch_from_store_hits_skeleton() {
+        use crate::{BatchParentIds, IdMap};
         use std::sync::Arc;
-        let (dir, q) = temp_query("published-ids-stamp");
+        let (dir, q) = temp_query("skeleton-ids-stamp");
         let parent_txid = {
             let mut t = [0u8; 32];
             t[0] = 0x55;
             t
         };
-        let published = q.published_ids();
         let mut m = IdMap::default();
         m.insert(parent_txid, (Fk(66), (3000, 24)));
-        published.publish(Arc::new(m));
+        let skel = BatchParentIds {
+            ids: Arc::new(m),
+            spent: Arc::new(crate::U64Map::default()),
+            need_vouts: crate::U64Map::default(),
+        };
         let child = child_spend(parent_txid, 0x66);
         let mut need = vec![(Fk(1), vec![child])];
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
             let plan = q
-                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
-                .expect("published union stamp");
+                .archive_plan_batch_from_store(
+                    &mut need,
+                    1,
+                    &crate::InFlightView::empty(),
+                    Some(&skel),
+                )
+                .expect("skeleton stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));
             assert_eq!(
                 plan.external_parents.get(&66).and_then(|p| p.body),
@@ -2085,22 +2087,16 @@ mod tests {
             );
             assert_eq!(plan.external_parent_txid(66), Some(parent_txid));
             let mix = crate::archive_phase_stats::sample_and_reset();
-            assert_eq!(
-                mix.pin_txid_n, 1,
-                "published union hits use the id_cache meter"
-            );
-            assert_eq!(
-                mix.head_need, 0,
-                "published union must skip leftover TipOnly"
-            );
+            assert_eq!(mix.pin_txid_n, 1, "skeleton hits use the id_cache meter");
+            assert_eq!(mix.head_need, 0, "skeleton must skip leftover TipOnly");
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// S0 plan and the shared helper stamp the same published parent (one union).
+    /// S0 plan and the shared helper stamp the same skeleton parent.
     #[test]
-    fn stamp_external_parents_matches_plan_batch_on_published() {
-        use crate::IdMap;
+    fn stamp_external_parents_matches_plan_batch_on_skeleton() {
+        use crate::{BatchParentIds, IdMap};
         use std::sync::Arc;
         let (dir, q) = temp_query("stamp-helper-plan");
         let parent_txid = {
@@ -2108,16 +2104,19 @@ mod tests {
             t[0] = 0x71;
             t
         };
-        let published = q.published_ids();
         let mut m = IdMap::default();
         m.insert(parent_txid, (Fk(88), (4000, 32)));
-        published.publish(Arc::new(m));
+        let skel = BatchParentIds {
+            ids: Arc::new(m),
+            spent: Arc::new(crate::U64Map::default()),
+            need_vouts: crate::U64Map::default(),
+        };
 
         let helper = crate::stamp_external_parents(
             q.store(),
             &[parent_txid],
             &crate::InFlightView::empty(),
-            published.as_ref(),
+            Some(&skel),
         )
         .expect("shared helper");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(88)));
@@ -2130,7 +2129,7 @@ mod tests {
         let child = child_spend(parent_txid, 0x72);
         let mut need = vec![(Fk(1), vec![child])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), Some(&skel))
             .expect("S0 plan");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(88));
         assert_eq!(
@@ -2171,13 +2170,8 @@ mod tests {
         let ifo = log.snapshot();
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
-            let helper = crate::stamp_external_parents(
-                q.store(),
-                &[parent_txid],
-                &ifo,
-                q.published_ids().as_ref(),
-            )
-            .expect("inflight stamp");
+            let helper = crate::stamp_external_parents(q.store(), &[parent_txid], &ifo, None)
+                .expect("inflight stamp");
             assert_eq!(helper.head_need_n, 0, "inflight hit must skip leftover");
             let got = helper
                 .idents

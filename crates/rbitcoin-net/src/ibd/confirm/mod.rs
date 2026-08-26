@@ -21,8 +21,6 @@ struct LoadAheadState {
     next_tx_start: u64,
     /// Append-only published packs (lookup thread only mutates via note/prune/clear).
     in_flight: rbitcoin_query::InFlightLog,
-    /// Lookup-published identity union (wave hits still live in the BQ window).
-    published: std::sync::Arc<rbitcoin_query::PublishedIds>,
     /// Last height successfully loaded (still in pipeline or already committed).
     last_loaded: Option<(u32, [u8; 32])>,
     /// Last applied [`Query::take_disconnect`] generation.
@@ -35,7 +33,6 @@ impl LoadAheadState {
         Self {
             next_tx_start: next,
             in_flight: rbitcoin_query::InFlightLog::new(),
-            published: std::sync::Arc::clone(hub.query.published_ids()),
             last_loaded: None,
             disconnect_gen_seen: 0,
         }
@@ -45,7 +42,6 @@ impl LoadAheadState {
     fn apply_disconnect(&mut self, hub: &ChainHub) {
         if let Some(h) = hub.query.take_disconnect(&mut self.disconnect_gen_seen) {
             self.in_flight.drop_from_height(h);
-            self.published.unpublish();
             self.publish_mem_stats();
         }
     }
@@ -76,7 +72,12 @@ impl LoadAheadState {
         rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, 0, 0, 0);
     }
 
-    fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WireLoadPipeline {
+    fn pipeline_for(
+        &self,
+        path_lo: u32,
+        store_path_lo: u32,
+        skeleton: Option<rbitcoin_query::BatchParentIds>,
+    ) -> WireLoadPipeline {
         let parent_hash = if path_lo == store_path_lo {
             None
         } else {
@@ -89,7 +90,7 @@ impl LoadAheadState {
             parent_hash,
             next_tx_start: self.next_tx_start,
             in_flight: self.in_flight.snapshot(),
-            published: std::sync::Arc::clone(&self.published),
+            skeleton,
         }
     }
 
@@ -363,6 +364,7 @@ pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 14;
 /// One load-sized run produced by lookup (decoded wire + pres, height-ordered).
 pub(crate) struct LoadBatch {
     pub items: Vec<(u32, [u8; 32], rbitcoin_query::ResolvedWire)>,
+    pub parent_ids: Option<rbitcoin_query::BatchParentIds>,
     /// Drain+fence height snapshotted before this lookup wave's TipOnly.
     /// `Some` only on the last sent batch of the wave; load drops in-flight
     /// layers with `max_height` below this after the in-flight read.
@@ -431,11 +433,47 @@ pub(crate) fn split_wave_into_load_batches_kind(
     out
 }
 
+/// Per-chunk need-vouts for a load batch (shared wave ids/spent).
+pub(crate) fn chunk_parent_ids(
+    wave: &rbitcoin_query::BatchParentIds,
+    items: &[(u32, [u8; 32], rbitcoin_query::ResolvedWire)],
+) -> rbitcoin_query::BatchParentIds {
+    let mut need_vouts: rbitcoin_query::U64Map<Vec<u32>> = rbitcoin_query::U64Map::default();
+    for (_, _, w) in items {
+        for tx in &w.block.txdata {
+            for inp in &tx.input {
+                if inp.previous_output.is_null() {
+                    continue;
+                }
+                let prev = inp.previous_output.txid.to_byte_array();
+                if let Some((fk, _)) = wave.ids.get(&prev) {
+                    if let Some(id) = fk.get() {
+                        need_vouts
+                            .entry(id)
+                            .or_default()
+                            .push(inp.previous_output.vout);
+                    }
+                }
+            }
+        }
+    }
+    for vouts in need_vouts.values_mut() {
+        vouts.sort_unstable();
+        vouts.dedup();
+    }
+    rbitcoin_query::BatchParentIds {
+        ids: std::sync::Arc::clone(&wave.ids),
+        spent: std::sync::Arc::clone(&wave.spent),
+        need_vouts,
+    }
+}
+
 /// Chunk a lookup wave into loadq batches; mark the last sent with `drop_below`.
 pub(crate) fn load_batches_from_wave(
     items: &[(u32, [u8; 32], rbitcoin_query::ResolvedWire)],
     parts: &[usize],
     remaining: usize,
+    wave_ids: &rbitcoin_query::BatchParentIds,
     drop_below: Option<u32>,
 ) -> Vec<LoadBatch> {
     let mut out = Vec::new();
@@ -448,8 +486,10 @@ pub(crate) fn load_batches_from_wave(
         if i >= end {
             break;
         }
+        let chunk = &items[i..end];
         out.push(LoadBatch {
-            items: items[i..end].to_vec(),
+            items: chunk.to_vec(),
+            parent_ids: Some(chunk_parent_ids(wave_ids, chunk)),
             drop_inflight_below: None,
         });
         i = end;
@@ -1388,6 +1428,7 @@ pub(crate) fn spawn_confirm_engine(
                 let n = lb.items.len();
                 let wire: usize = lb.items.iter().map(|(_, _, w)| w.block.total_size()).sum();
                 queues_load.note_load_recv(n, wire);
+                let parent_ids = lb.parent_ids;
                 let batch: Vec<(u32, BlockHash, rbitcoin_query::ResolvedWire)> = {
                     let mut g = feed_load.inner.lock().unwrap();
                     let mut run = Vec::with_capacity(lb.items.len());
@@ -1434,7 +1475,7 @@ pub(crate) fn spawn_confirm_engine(
                     None => 0u32,
                     Some(t) => t.saturating_add(1),
                 };
-                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
+                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo, parent_ids.clone());
                 let use_pipe = pipe.path_lo >= store_path_lo;
                 let wire_batch = batch;
                 let t_clone = Instant::now();
@@ -1519,7 +1560,7 @@ pub(crate) fn spawn_confirm_engine(
                     lookup_ahead.drop_inflight_below(drop_below);
                     confirm_thr_stats::add_load_prune(t_prune.elapsed());
                 }
-                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo);
+                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo, parent_ids);
                 let plan_ns = stamped.work_ns;
                 let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
                     .iter()
@@ -1657,15 +1698,12 @@ pub(crate) fn spawn_confirm_engine(
         .spawn(move || {
             info!("ibd: confirm lookup on dedicated OS thread (in-order BQ take → loadq)");
             let queues_lookup = queues_lookup;
-            let mut live_union = rbitcoin_query::LiveUnion::new();
             let mut disco_seen = 0u64;
             loop {
                 if feed.stopped() {
                     break;
                 }
                 if hub.query.take_disconnect(&mut disco_seen).is_some() {
-                    live_union = rbitcoin_query::LiveUnion::new();
-                    hub.query.published_ids().unpublish();
                     hub.query.set_lookup_taken_hi(None);
                 }
                 let t_sel = Instant::now();
@@ -1709,7 +1747,6 @@ pub(crate) fn spawn_confirm_engine(
                         &hub.params,
                         hub.milestone,
                         &wave_h,
-                        Some((&mut live_union, hub.query.published_ids().as_ref())),
                         max_blocks,
                         max_inputs,
                     ) {
@@ -1745,6 +1782,7 @@ pub(crate) fn spawn_confirm_engine(
                                 &wave.items,
                                 &parts,
                                 remaining,
+                                &wave.parent_ids,
                                 wave.drain_fence_hi,
                             );
                             for batch in batches {

@@ -153,8 +153,8 @@ pub struct WireLoadPipeline {
     /// Load looks up create fk / full CreatePin for parents still only in the
     /// pipeline (body-ahead-of-head). Built via [`rbitcoin_query::InFlightLog::snapshot`].
     pub in_flight: rbitcoin_query::InFlightView,
-    /// Lookup-published parent identity union (wave hits still live in the BQ window).
-    pub published: std::sync::Arc<rbitcoin_query::PublishedIds>,
+    /// Lookup-filled parent identity for this load batch (IBD skeleton).
+    pub skeleton: Option<rbitcoin_query::BatchParentIds>,
 }
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
@@ -398,7 +398,7 @@ pub fn confirm_wire_load_phase_pipelined(
                     &need,
                     p.next_tx_start.max(1),
                     &p.in_flight,
-                    Some(p.published.as_ref()),
+                    p.skeleton.as_ref(),
                 )
                 .map_err(ConsensusError::from)?,
             None => query
@@ -433,7 +433,14 @@ pub fn confirm_wire_load_phase_pipelined(
     let inflight = pipeline.map(|p| &p.in_flight);
     let mut parent_pin = match plan.as_mut() {
         Some(p) => ParentPinStamp::take_from_plan(p),
-        None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, inflight)?,
+        None => stamp_parent_pin_archived(
+            query,
+            params,
+            &metas,
+            &wire_blocks,
+            inflight,
+            pipeline.and_then(|p| p.skeleton.as_ref()),
+        )?,
     };
     let (batch_parents, spend_edges, _warm) = pin_for_wire_batch(
         query,

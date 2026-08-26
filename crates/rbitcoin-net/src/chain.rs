@@ -2547,7 +2547,7 @@ mod tests {
             parent_hash: None,
             next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
             in_flight: rbitcoin_query::InFlightView::empty(),
-            published: std::sync::Arc::new(rbitcoin_query::PublishedIds::new()),
+            skeleton: None,
         };
         let mat1 = hub
             .confirm_wire_load_phase_pipelined(&batch1, Some(&pipe))

@@ -21,10 +21,12 @@
 //!
 //! Stage walls (window sums; stages overlap on OS threads):
 //! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`
-//!   with nested `decode=` / `precompute=` / `collect=` / `head=(probe= io= preads=)`)
+//!   with nested `decode=` / `precompute=` / `collect=` /
+//!   `head=(probe= io= preads=)` / `spent=`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
-//!   load OS-thread wall. Load thread also does pack decode, leftover stamp,
-//!   clone, and post-stamp prune on a marked last load batch (`load_thr pack/stamp/pin/asm/prune`).
+//!   load OS-thread wall. Load thread also does pack decode, leftover stamp
+//!   (plan=None / S0 only), clone, and post-stamp prune on a marked last load
+//!   batch (`load_thr pack/stamp/pin/asm/prune`).
 //! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
 //!   `ibd-confirm`; excludes head-of-line wait for write handoff). `thr script work`
 //!   is that same ns. Recv/send are wait. Publisher parks; it does not `wait_done`
@@ -41,7 +43,7 @@
 //! `scriptq` can stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
 //! `ready=` + `scriptq_hwm=` (OS-thread occupancy + queue high-water). High
 //! `load_thr stamp=` nests `pack=` (plan HashMap) vs `head=` (leftover TipOnly
-//! `prep_head_fk_ns`). After a published wave `head=` is ~0. High `head=` +
+//! `prep_head_fk_ns`). IBD skeleton path keeps `head=` ~0. High `head=` +
 //! `ready>0` + `scriptq=1` ⇒ leftover TipOnly on load, not “scripts hungry.”
 //! High load_recv_wait + ready=0 ⇒ lookup is the pole.
 //!
@@ -354,7 +356,6 @@ pub(crate) struct IbdPerfSample {
     pub thr_load_asm_ms: u64,
     pub thr_load_prune_ms: u64,
     pub thr_load_send_wait_ms: u64,
-    pub thr_lookup_keep_ms: u64,
     pub script_jobs: u64,
     pub script_skip: u64,
     pub thr_script_recv_wait_ms: u64,
@@ -379,6 +380,8 @@ pub(crate) struct IbdPerfSample {
     pub lookup_wave_head_io_ms: u64,
     /// TipOnly `txid.body` / identity preads this window.
     pub lookup_wave_head_preads: u64,
+    /// Lookup-wave `tx_spent_range_batch` for TipOnly hits (`wave=… spent=`).
+    pub lookup_wave_spent_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
     pub plan_cold: u64,
@@ -617,7 +620,6 @@ impl Default for IbdPerfSample {
             thr_load_asm_ms: 0,
             thr_load_prune_ms: 0,
             thr_load_send_wait_ms: 0,
-            thr_lookup_keep_ms: 0,
             script_jobs: 0,
             script_skip: 0,
             thr_script_recv_wait_ms: 0,
@@ -636,6 +638,7 @@ impl Default for IbdPerfSample {
             lookup_wave_head_probe_ms: 0,
             lookup_wave_head_io_ms: 0,
             lookup_wave_head_preads: 0,
+            lookup_wave_spent_ms: 0,
             plan_parents: 0,
             plan_already: 0,
             plan_cold: 0,
@@ -861,7 +864,7 @@ pub(crate) fn sample(
     let tweak_ns = rbitcoin_consensus::confirm_phase_stats::sample_tweak_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
-    let (script_jobs, script_skip, lookup_keep_ns) =
+    let (script_jobs, script_skip) =
         rbitcoin_consensus::confirm_phase_stats::sample_script_mix_and_reset();
     let (ann_ns, ann_n, ann_pread_skip, ann_pread) =
         rbitcoin_consensus::confirm_phase_stats::sample_spend_ann_and_reset();
@@ -1080,7 +1083,6 @@ pub(crate) fn sample(
         thr_load_asm_ms: ns_ms(thr.load_asm_ns),
         thr_load_prune_ms: ns_ms(thr.load_prune_ns),
         thr_load_send_wait_ms: ns_ms(thr.load_send_wait_ns),
-        thr_lookup_keep_ms: ns_ms(lookup_keep_ns),
         script_jobs,
         script_skip,
         thr_script_recv_wait_ms: ns_ms(thr.script_recv_wait_ns),
@@ -1099,6 +1101,7 @@ pub(crate) fn sample(
         lookup_wave_head_probe_ms: ns_ms(head_res.probe_ns),
         lookup_wave_head_io_ms: ns_ms(head_res.body_ns.saturating_add(head_res.idx_ns)),
         lookup_wave_head_preads: head_res.body_lookups,
+        lookup_wave_spent_ms: ns_ms(dens.wave_spent_ns),
         plan_parents: dens.parents,
         plan_already: dens.already,
         plan_cold: dens.cold,
@@ -1237,10 +1240,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.peers,
     );
     let load_wall_ms = load_stage_wall_ms(s);
-    let thr_lookup_busy = s
-        .thr_lookup_stamp_ms
-        .saturating_add(s.thr_lookup_other_ms)
-        .saturating_add(s.thr_lookup_keep_ms);
+    let thr_lookup_busy = s.thr_lookup_stamp_ms.saturating_add(s.thr_lookup_other_ms);
     let thr_lookup_wait = s
         .thr_lookup_claim_ms
         .saturating_add(s.thr_lookup_send_wait_ms);
@@ -1261,7 +1261,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let stamp_pack_ms = s.thr_load_stamp_ms.saturating_sub(stamp_head_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
-         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={})) keep={}ms other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={}) spent={}ms) other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms(pack={}ms head={}ms) pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
@@ -1282,7 +1282,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.lookup_wave_head_probe_ms,
         s.lookup_wave_head_io_ms,
         s.lookup_wave_head_preads,
-        s.thr_lookup_keep_ms,
+        s.lookup_wave_spent_ms,
         s.thr_lookup_other_ms,
         s.thr_lookup_send_wait_ms,
         thr_load_busy,
@@ -1356,7 +1356,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms stamp_head={}ms cold_io={}ms)",
+            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms spent={}ms stamp_head={}ms cold_io={}ms)",
             s.plan_blks,
             s.plan_parents,
             s.plan_already,
@@ -1366,6 +1366,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.lookup_decode_ms,
             s.lookup_precompute_ms,
             s.lookup_wave_head_ms,
+            s.lookup_wave_spent_ms,
             s.plan_head_ms,
             s.plan_cold_io_ms,
         ));
@@ -1851,8 +1852,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     // CreatePin payload bytes (Arc-shared with in-flight while overlapping).
     let recent_bytes = o.recent_pin_bytes;
     let recent_mib = recent_bytes / (1024 * 1024);
-    let union_bytes = (o.union_keys as u64).saturating_mul(88);
-    let union_mib = union_bytes / (1024 * 1024);
     let h2h_mib = (o.h2h_keys as u64).saturating_mul(48) / (1024 * 1024);
     let fence_mib = (o.fence_runs as u64).saturating_mul(16) / (1024 * 1024);
     let conf_wire_mib = (load_wire_mib
@@ -1866,7 +1865,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(if_mib)
         .saturating_add(ps_mib)
         .saturating_add(recent_mib)
-        .saturating_add(union_mib)
         .saturating_add(h2h_mib)
         .saturating_add(fence_mib)
         .saturating_add(conf_wire_mib)
@@ -1885,7 +1883,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | conf loadq={}/{} blks={} wire={}MiB scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB recent={}h live={}k/pub={}k/ov={} fifo={}k≈{}MiB \
-           union={}L/{}k≈{}MiB h2h={}k≈{}MiB fence={}≈{}MiB \
+           h2h={}k≈{}MiB fence={}≈{}MiB \
            pstore weak={}/live={}≈{}MiB \
            wire={}MiB fuse8={}MiB mphf_g={}MiB open_keys={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
@@ -1939,9 +1937,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.recent_overlay_keys,
         o.recent_fifo_keys,
         recent_mib,
-        o.union_layers,
-        o.union_keys,
-        union_mib,
         o.h2h_keys,
         h2h_mib,
         o.fence_runs,
@@ -2140,7 +2135,6 @@ mod tests {
         assert!(line.contains("load_thr busy/wait="), "{line}");
         assert!(line.contains("pack=0ms"), "{line}");
         assert!(line.contains("prune=0ms"), "{line}");
-        assert!(line.contains("keep=0ms"), "{line}");
         s.thr_load_pack_ms = 100;
         s.thr_load_stamp_ms = 1700;
         s.thr_load_pin_ms = 700;
@@ -2446,7 +2440,7 @@ mod tests {
         assert!(info.contains("collect=3ms"), "{info}");
         assert!(
             info.contains(
-                "wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms(probe=0ms io=0ms preads=0))"
+                "wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms(probe=0ms io=0ms preads=0) spent=0ms)"
             ),
             "{info}"
         );
@@ -2604,8 +2598,6 @@ mod tests {
         s.owned.recent_pub_keys = 400;
         s.owned.recent_overlay_keys = 0;
         s.owned.recent_fifo_keys = 400;
-        s.owned.union_layers = 2;
-        s.owned.union_keys = 100;
         s.owned.h2h_keys = 50;
         s.owned.fence_runs = 10;
         s.owned.pstore_weak = 20_000;
@@ -2671,7 +2663,7 @@ mod tests {
             line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB recent=12h live=400k/pub=400k/ov=0 fifo=400k≈0MiB"),
             "{line}"
         );
-        assert!(line.contains("union=2L/100k≈0MiB"), "{line}");
+        assert!(!line.contains("union="), "{line}");
         assert!(line.contains("h2h=50k≈0MiB"), "{line}");
         assert!(line.contains("fence=10≈0MiB"), "{line}");
         assert!(line.contains("pstore weak=20000/live=8000≈16MiB"), "{line}");

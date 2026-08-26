@@ -1576,9 +1576,14 @@ fn confirm_load_ahead_of_write_does_not_badprev() {
     // Batch B: load 11..=20 while tip still genesis (IBD load queue depth ≥ 2).
     // Regression: used to permanent-BadPrev on height 11 (prev not in confirmed[]).
     let batch_b = &all[10..];
-    let mut pipe = WireLoadPipeline::default();
-    pipe.path_lo = 11;
-    pipe.parent_hash = Some(all[9].1.block_hash().to_byte_array());
+    let inflight = rbitcoin_query::InFlight::new();
+    let pipe = WireLoadPipeline {
+        path_lo: 11,
+        parent_hash: Some(all[9].1.block_hash().to_byte_array()),
+        next_tx_start: 0,
+        in_flight: &inflight,
+        skeleton: None,
+    };
     let mat_b = confirm_wire_load_phase_pipelined(&q, &params, ms, batch_b, &none, Some(&pipe))
         .unwrap_or_else(|e| {
             panic!("load 11..=20 ahead of write must not fail (got {e}); tip still genesis");
@@ -2034,22 +2039,26 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     let spend_b = spend_anyone_can_spend(a_out_txid, 0, Amount::from_sat(48_0000_0000));
     let bb = mine_regtest_block(ha_hash, tip_time + 1200, hb, vec![spend_b]);
 
-    let mut pipe = WireLoadPipeline {
-        path_lo: ha,
-        parent_hash: None,
-        next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-        in_flight: rbitcoin_query::InFlightView::empty(),
-        skeleton: None,
+    let mut inflight = rbitcoin_query::InFlight::new();
+    let mut next_tx_start = q.tx_body_count().saturating_add(1).max(1);
+    let mat_a = {
+        let pipe = WireLoadPipeline {
+            path_lo: ha,
+            parent_hash: None,
+            next_tx_start,
+            in_flight: &inflight,
+            skeleton: None,
+        };
+        confirm_wire_load_phase_pipelined(
+            &q,
+            &params,
+            ms,
+            &[(Height(ha), ba.clone())],
+            &ScriptPreverified::new(),
+            Some(&pipe),
+        )
+        .expect("prep A")
     };
-    let mat_a = confirm_wire_load_phase_pipelined(
-        &q,
-        &params,
-        ms,
-        &[(Height(ha), ba.clone())],
-        &ScriptPreverified::new(),
-        Some(&pipe),
-    )
-    .expect("prep A");
     assert_eq!(q.tip_height(), Some(Height(maturity)), "prep must not tip");
 
     let plan_a = mat_a.batch.archive_plan.as_ref().expect("plan A");
@@ -2066,45 +2075,49 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
             "packed and batch_pin must share CreatePin"
         );
     }
-    {
-        let mut log = rbitcoin_query::InFlightLog::new();
-        let layer = if plan_a.batch_pin.len() == plan_a.planned_fks.len() {
-            rbitcoin_query::InFlightLayer::from_plan_pins(
-                plan_a
-                    .planned_fks
-                    .iter()
-                    .zip(plan_a.batch_pin.iter())
-                    .map(|(fk, pin)| (*fk, pin)),
-            )
-        } else {
-            rbitcoin_query::InFlightLayer::from_plan_pins(
-                plan_a
-                    .packed
-                    .iter()
-                    .zip(plan_a.planned_fks.iter())
-                    .map(|((pin, _), fk)| (*fk, pin)),
-            )
-        };
-        log.note_layer(layer);
-        pipe.in_flight = log.snapshot();
+    if plan_a.batch_pin.len() == plan_a.planned_fks.len() {
+        inflight.note_pins(
+            plan_a
+                .planned_fks
+                .iter()
+                .zip(plan_a.batch_pin.iter())
+                .map(|(fk, pin)| (*fk, pin)),
+            None,
+        );
+    } else {
+        inflight.note_pins(
+            plan_a
+                .packed
+                .iter()
+                .zip(plan_a.planned_fks.iter())
+                .map(|((pin, _), fk)| (*fk, pin)),
+            None,
+        );
     }
     if let Some(last) = plan_a.planned_fks.last().and_then(|f| f.get()) {
-        pipe.next_tx_start = last.saturating_add(1).max(1);
+        next_tx_start = last.saturating_add(1).max(1);
     }
-    pipe.path_lo = hb;
-    pipe.parent_hash = Some(ha_hash.to_byte_array());
 
-    // Prep B while A is still uncommitted — parent pin uses in_flight view
+    // Prep B while A is still uncommitted — parent pin uses in_flight
     // (no denserels). This is the IBD prep∥write pipeline shape.
-    let mat_b = confirm_wire_load_phase_pipelined(
-        &q,
-        &params,
-        ms,
-        &[(Height(hb), bb.clone())],
-        &ScriptPreverified::new(),
-        Some(&pipe),
-    )
-    .expect("prep B while tip still at maturity");
+    let mat_b = {
+        let pipe = WireLoadPipeline {
+            path_lo: hb,
+            parent_hash: Some(ha_hash.to_byte_array()),
+            next_tx_start,
+            in_flight: &inflight,
+            skeleton: None,
+        };
+        confirm_wire_load_phase_pipelined(
+            &q,
+            &params,
+            ms,
+            &[(Height(hb), bb.clone())],
+            &ScriptPreverified::new(),
+            Some(&pipe),
+        )
+        .expect("prep B while tip still at maturity")
+    };
     assert_eq!(q.tip_height(), Some(Height(maturity)));
 
     let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");

@@ -12,15 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Lookup-thread state so lookup(N+1) can run while write(N) has not advanced tip.
+/// Load-thread pipeline caches so load(N+1) can run while write(N) has not advanced tip.
 ///
-/// In-flight creates are an **immutable layer log** ([`rbitcoin_query::InFlightLog`]):
-/// each successful lookup pack publishes a frozen layer; load receives
-/// [`InFlightLog::snapshot`] (Arc bumps only — no `Arc::make_mut` of a shared map).
+/// In-flight creates are one [`rbitcoin_query::InFlight`] map this thread owns:
+/// stamp/pin borrow it, then [`rbitcoin_query::InFlight::note_pins`] inserts the
+/// current pack.
 struct LoadAheadState {
     next_tx_start: u64,
-    /// Append-only published packs (lookup thread only mutates via note/prune/clear).
-    in_flight: rbitcoin_query::InFlightLog,
+    in_flight: rbitcoin_query::InFlight,
     /// Last height successfully loaded (still in pipeline or already committed).
     last_loaded: Option<(u32, [u8; 32])>,
     /// Last applied [`Query::take_disconnect`] generation.
@@ -32,13 +31,13 @@ impl LoadAheadState {
         let next = hub.query.tx_body_count().saturating_add(1).max(1);
         Self {
             next_tx_start: next,
-            in_flight: rbitcoin_query::InFlightLog::new(),
+            in_flight: rbitcoin_query::InFlight::new(),
             last_loaded: None,
             disconnect_gen_seen: 0,
         }
     }
 
-    /// Drop reorged layers **before** bind so disconnected creates cannot stamp.
+    /// Drop reorged packs **before** bind so disconnected creates cannot stamp.
     fn apply_disconnect(&mut self, hub: &ChainHub) {
         if let Some(h) = hub.query.take_disconnect(&mut self.disconnect_gen_seen) {
             self.in_flight.drop_from_height(h);
@@ -46,7 +45,7 @@ impl LoadAheadState {
         }
     }
 
-    /// Drop packs whose `max_height` is below a lookup-wave drain+fence snapshot.
+    /// Drop packs whose height is below a lookup-wave drain+fence snapshot.
     ///
     /// Call after this load batch has finished its in-flight read (stamp).
     fn drop_inflight_below(&mut self, hi: Option<u32>) {
@@ -77,7 +76,7 @@ impl LoadAheadState {
         path_lo: u32,
         store_path_lo: u32,
         skeleton: Option<rbitcoin_query::BatchParentIds>,
-    ) -> WireLoadPipeline {
+    ) -> WireLoadPipeline<'_> {
         let parent_hash = if path_lo == store_path_lo {
             None
         } else {
@@ -89,7 +88,7 @@ impl LoadAheadState {
             path_lo,
             parent_hash,
             next_tx_start: self.next_tx_start,
-            in_flight: self.in_flight.snapshot(),
+            in_flight: &self.in_flight,
             skeleton,
         }
     }
@@ -100,23 +99,23 @@ impl LoadAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        let layer = if plan.batch_pin.len() == plan.planned_fks.len() {
-            rbitcoin_query::InFlightLayer::from_plan_pins(
+        if plan.batch_pin.len() == plan.planned_fks.len() {
+            self.in_flight.note_pins(
                 plan.planned_fks
                     .iter()
                     .zip(plan.batch_pin.iter())
                     .map(|(fk, pin)| (*fk, pin)),
-            )
+                Some(last_height),
+            );
         } else {
-            rbitcoin_query::InFlightLayer::from_plan_pins(
+            self.in_flight.note_pins(
                 plan.packed
                     .iter()
                     .zip(plan.planned_fks.iter())
                     .map(|((pin, _), fk)| (*fk, pin)),
-            )
-        };
-        self.in_flight
-            .note_layer(layer.with_max_height(last_height));
+                Some(last_height),
+            );
+        }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
@@ -163,11 +162,7 @@ impl LoadAheadState {
         }
         let _ = max_fk;
         let max_height = heights_hashes.iter().map(|(h, _)| *h).max();
-        let mut layer = rbitcoin_query::InFlightLayer::from_txid_fks(pairs);
-        if let Some(h) = max_height {
-            layer = layer.with_max_height(h);
-        }
-        self.in_flight.note_layer(layer);
+        self.in_flight.note_creates(pairs, max_height);
         if let Some(&(h, hash)) = heights_hashes.last() {
             self.last_loaded = Some((h, hash.to_byte_array()));
         }
@@ -1126,7 +1121,7 @@ pub(crate) mod confirm_thr_stats {
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
-/// from in-flight + published union + TipOnly `tx.head` + pin + assemble) → scriptq →
+/// from in-flight + skeleton + pin + assemble) → scriptq →
 /// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
@@ -1475,8 +1470,7 @@ pub(crate) fn spawn_confirm_engine(
                     None => 0u32,
                     Some(t) => t.saturating_add(1),
                 };
-                let pipe = lookup_ahead.pipeline_for(expect_h, store_path_lo, parent_ids.clone());
-                let use_pipe = pipe.path_lo >= store_path_lo;
+                let use_pipe = expect_h >= store_path_lo;
                 let wire_batch = batch;
                 let t_clone = Instant::now();
                 let plan_items = load_stamp_items(wire_batch.iter().map(|(h, _, w)| {
@@ -1488,13 +1482,17 @@ pub(crate) fn spawn_confirm_engine(
                 }));
                 confirm_thr_stats::add_load_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
-                let plan_res = rbitcoin_consensus::confirm_wire_lookup_stamp(
-                    &hub_load.query,
-                    &hub_load.params,
-                    hub_load.milestone,
-                    &plan_items,
-                    if use_pipe { Some(&pipe) } else { None },
-                );
+                let plan_res = {
+                    let pipe =
+                        lookup_ahead.pipeline_for(expect_h, store_path_lo, parent_ids.clone());
+                    rbitcoin_consensus::confirm_wire_lookup_stamp(
+                        &hub_load.query,
+                        &hub_load.params,
+                        hub_load.milestone,
+                        &plan_items,
+                        if use_pipe { Some(&pipe) } else { None },
+                    )
+                };
                 confirm_thr_stats::add_load_stamp(t_stamp.elapsed());
                 let stamped = match plan_res {
                     Ok(s) => s,

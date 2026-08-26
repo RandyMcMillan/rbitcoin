@@ -1066,7 +1066,7 @@ mod tests {
         let ext = rbitcoin_query::stamp_external_parents(
             q.store(),
             &[g],
-            &rbitcoin_query::InFlightView::empty(),
+            &rbitcoin_query::InFlight::new(),
             Some(&wave.parent_ids),
         )
         .expect("stamp helper after wave");
@@ -1074,11 +1074,12 @@ mod tests {
             ext.head_need_n, 0,
             "skeleton path must not leftover-probe tx.head"
         );
+        let inflight = rbitcoin_query::InFlight::new();
         let pipe = crate::WireLoadPipeline {
             path_lo: 1,
             parent_hash: None,
             next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-            in_flight: rbitcoin_query::InFlightView::empty(),
+            in_flight: &inflight,
             skeleton: Some(wave.parent_ids.clone()),
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
@@ -1164,7 +1165,7 @@ mod tests {
     /// height is confirmed so stamp does not MissingPrevout (931147 / 933474).
     #[test]
     fn stamp_uses_inflight_until_tip_covers_parent_height() {
-        use rbitcoin_query::{InFlightLayer, InFlightLog};
+        use rbitcoin_query::InFlight;
         use rbitcoin_store::{OutputRecord, TxRecord};
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
@@ -1184,13 +1185,12 @@ mod tests {
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
-        let mut log = InFlightLog::new();
-        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        let mut log = InFlight::new();
+        log.note_pins([(parent_fk, &pin)], Some(1));
         // Production: a wave that snapshotted drain+fence at genesis keeps height 1.
         log.prune_below_height(Some(0));
-        let view = log.snapshot();
         assert!(
-            view.get_create_fk(&parent_txid).is_some(),
+            log.get_create_fk(&parent_txid).is_some(),
             "in-flight must survive drain while parent height is unconfirmed"
         );
         let b1 = mine_with_txs(
@@ -1203,17 +1203,18 @@ mod tests {
                 Amount::from_sat(49_0000_0000),
             )],
         );
-        let pipe = crate::WireLoadPipeline {
-            path_lo: 1,
-            parent_hash: None,
-            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-            in_flight: view,
-            skeleton: None,
-        };
-        let items = [(Height(1), std::sync::Arc::new(b1), None)];
-        let stamped =
+        let stamped = {
+            let pipe = crate::WireLoadPipeline {
+                path_lo: 1,
+                parent_hash: None,
+                next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+                in_flight: &log,
+                skeleton: None,
+            };
+            let items = [(Height(1), std::sync::Arc::new(b1), None)];
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
-                .expect("in-flight parent must stamp until tip covers the parent height");
+                .expect("in-flight parent must stamp until tip covers the parent height")
+        };
         let plan = stamped.plan.expect("plan");
         let inp = plan
             .edges
@@ -1224,7 +1225,7 @@ mod tests {
         assert_eq!(inp.create_fk, parent_fk);
         log.prune_below_height(Some(2));
         assert!(
-            log.snapshot().get_create_fk(&parent_txid).is_none(),
+            log.get_create_fk(&parent_txid).is_none(),
             "after a later wave snapshots drain+fence past the pack, TipOnly owns it"
         );
         let _ = std::fs::remove_dir_all(&path);
@@ -1235,7 +1236,7 @@ mod tests {
     /// would drop the parent (mainnet 945952 leftover_n=3546 hit=2811).
     #[test]
     fn stamp_uses_inflight_when_confirmed_tip_leads_fence() {
-        use rbitcoin_query::{InFlightLayer, InFlightLog};
+        use rbitcoin_query::InFlight;
         use rbitcoin_store::{OutputRecord, TxRecord};
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();
@@ -1267,11 +1268,11 @@ mod tests {
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
         ));
-        let mut log = InFlightLog::new();
-        log.note_layer(InFlightLayer::from_plan_pins([(parent_fk, &pin)]).with_max_height(1));
+        let mut log = InFlight::new();
+        log.note_pins([(parent_fk, &pin)], Some(1));
         log.prune_below_height(q.drain_and_fence_hi());
         assert!(
-            log.snapshot().get_create_fk(&parent_txid).is_some(),
+            log.get_create_fk(&parent_txid).is_some(),
             "in-flight stays until a wave snapshots drain+fence covering the pack, not confirmed HWM"
         );
         // Dummy height-1 confirmed row was only to tear tip vs fence; stamp
@@ -1289,17 +1290,18 @@ mod tests {
                 Amount::from_sat(49_0000_0000),
             )],
         );
-        let pipe = crate::WireLoadPipeline {
-            path_lo: 1,
-            parent_hash: None,
-            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-            in_flight: log.snapshot(),
-            skeleton: None,
-        };
-        let items = [(Height(1), std::sync::Arc::new(b1), None)];
-        let stamped =
+        let stamped = {
+            let pipe = crate::WireLoadPipeline {
+                path_lo: 1,
+                parent_hash: None,
+                next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+                in_flight: &log,
+                skeleton: None,
+            };
+            let items = [(Height(1), std::sync::Arc::new(b1), None)];
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
-                .expect("in-flight parent must stamp while confirmed tip leads the fence");
+                .expect("in-flight parent must stamp while confirmed tip leads the fence")
+        };
         let plan = stamped.plan.expect("plan");
         let inp = plan
             .edges
@@ -1382,12 +1384,7 @@ mod tests {
         };
         let mut need = vec![(rbitcoin_primitives::Fk(1), vec![child])];
         let err = q
-            .archive_plan_batch_from_store(
-                &mut need,
-                1,
-                &rbitcoin_query::InFlightView::empty(),
-                None,
-            )
+            .archive_plan_batch_from_store(&mut need, 1, &rbitcoin_query::InFlight::new(), None)
             .expect_err("disconnected leftover must not TipThenAny-fill");
         let msg = err.to_string();
         assert!(msg.contains("parent create_fk unresolved"), "got: {msg}");

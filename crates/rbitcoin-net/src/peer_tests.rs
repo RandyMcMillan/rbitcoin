@@ -5015,12 +5015,12 @@ fn compact_tip_announce_must_not_wrap_serve_inflight() {
         );
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let msg = cmpct_announce_msg(&hub, &hash, 2).expect("cmpct announce");
-        queue_cmpct_tip_announce(&out_tx, Some(&sess.serve_inflight), msg).unwrap();
+        queue_cmpct_tip_announce(&out_tx, msg).unwrap();
         note_served_write(&sess.serve_inflight);
         assert_eq!(
             sess.serve_inflight.load(Ordering::SeqCst),
             0,
-            "announce write must pair with inflight, not wrap"
+            "unpaired announce write must saturating-sub, not wrap"
         );
         while out_rx.try_recv().is_ok() {}
 
@@ -5055,6 +5055,112 @@ fn compact_tip_announce_must_not_wrap_serve_inflight() {
         assert!(
             matches!(out_rx.try_recv(), Ok(NetworkMessage::CmpctBlock(_))),
             "getdata MSG_CMPCT_BLOCK must still serve after a compact tip announce"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+/// Compact tip announce must not occupy reconstruct slots. A burst of
+/// `MAX_SERVE_BLOCKS` announces (generate-to 432 with `sync_fun=no_op`)
+/// left `serve_inflight` at cap and skipped later getdata
+/// (`feature_bip68_sequence` activateCSV `sync_blocks`).
+#[test]
+fn compact_tip_announce_must_not_consume_serve_slots() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::Network;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::runtime::Builder;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            payload: full[24..].to_vec(),
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, q) = tmp_store("cmpct-ann-slots");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let hashes = hub
+            .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let hash = hashes[0];
+
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = bitcoin::p2p::message_network::VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let sess = peers.register(
+            addr,
+            addr,
+            &ver,
+            false,
+            crate::peers::PeerConnType::OutboundFullRelay,
+        );
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        for _ in 0..MAX_SERVE_BLOCKS {
+            let msg = cmpct_announce_msg(&hub, &hash, 2).expect("cmpct announce");
+            queue_cmpct_tip_announce(&out_tx, msg).unwrap();
+        }
+        assert_eq!(
+            sess.serve_inflight.load(Ordering::SeqCst),
+            0,
+            "announce must not occupy reconstruct slots"
+        );
+        while out_rx.try_recv().is_ok() {}
+
+        let mut wants_headers = false;
+        let mut wtxid = false;
+        let mut send_cmpct = true;
+        let mut cmpct_ver = 2u32;
+        let mut pending_headers = HashMap::new();
+        let mut pending_blocks = HashMap::new();
+        let mut pending_cmpct = HashMap::new();
+        let mut from_peer = HashMap::new();
+        let mut requested = HashSet::new();
+        let mut ban = 0u32;
+        handle_peer_frame(
+            frame_for(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)])),
+            &hub,
+            &out_tx,
+            &mut wants_headers,
+            &mut wtxid,
+            &mut send_cmpct,
+            &mut cmpct_ver,
+            &mut pending_headers,
+            &mut pending_blocks,
+            &mut pending_cmpct,
+            &mut from_peer,
+            &mut requested,
+            &mut ban,
+            Some(sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(out_rx.try_recv(), Ok(NetworkMessage::CmpctBlock(_))),
+            "getdata MSG_CMPCT_BLOCK must still serve after a burst of compact announces"
         );
         let _ = std::fs::remove_dir_all(dir);
     });

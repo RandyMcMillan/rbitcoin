@@ -676,18 +676,16 @@ pub async fn peer_session_with(
                                     &ev.hash,
                                     peer_cmpct_version,
                                 ) {
-                                    let inflight = session.as_ref().map(|s| &s.serve_inflight);
-                                    if queue_cmpct_tip_announce(&out_tx, inflight, msg)? {
-                                        if let Some(s) = session.as_ref() {
-                                            s.note_best_header_sent(ev.hash);
-                                        }
-                                        // Compact-only when the peer did not send
-                                        // sendheaders. Node-to-node always sends
-                                        // sendheaders; also announce headers so a
-                                        // longer fork can reorg (`p2p_sendheaders`).
-                                        if !peer_wants_headers {
-                                            continue;
-                                        }
+                                    queue_cmpct_tip_announce(&out_tx, msg)?;
+                                    if let Some(s) = session.as_ref() {
+                                        s.note_best_header_sent(ev.hash);
+                                    }
+                                    // Compact-only when the peer did not send
+                                    // sendheaders. Node-to-node always sends
+                                    // sendheaders; also announce headers so a
+                                    // longer fork can reorg (`p2p_sendheaders`).
+                                    if !peer_wants_headers {
+                                        continue;
                                     }
                                 }
                             }
@@ -2475,15 +2473,14 @@ pub(crate) fn try_queue_served_block(
     Ok(true)
 }
 
-/// BIP152 high-bandwidth tip announce. Counts as a served compact so the
-/// writer decrement cannot wrap `serve_inflight` (unpaired `fetch_sub` on 0
-/// became `usize::MAX` and skipped every later getdata reconstruct).
+/// BIP152 high-bandwidth tip announce. Does **not** count on
+/// `serve_inflight` (that cap is reconstruct getdata). Writer still
+/// saturating-subs every `CmpctBlock`, so an unpaired decrement cannot wrap.
 fn queue_cmpct_tip_announce(
     out: &mpsc::UnboundedSender<NetworkMessage>,
-    inflight: Option<&AtomicUsize>,
     msg: NetworkMessage,
-) -> Result<bool, NetError> {
-    try_queue_served_block(out, inflight, msg)
+) -> Result<(), NetError> {
+    queue_out(out, msg)
 }
 
 fn note_served_write(n: &AtomicUsize) {

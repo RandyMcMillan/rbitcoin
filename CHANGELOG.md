@@ -161,6 +161,10 @@ before 1.0).
 
 ### Fixed
 
+- **Electrum subscribe status row order matches `get_history`:** confirmed
+  height-asc, then mempool tail (no `sort_by_key` on height). Extra
+  confirming `blockhash` in the preimage is unchanged (A-B-A).
+
 - **`testmempoolaccept` is dry-run:** `MempoolHub::test_accept` runs
   prepare + scripts + RBF/cluster checks without commit, announce, or
   conflict eviction.

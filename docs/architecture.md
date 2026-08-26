@@ -123,7 +123,11 @@ The node follows the **fully valid** chain with **strictly most cumulative
 work** (Bitcoin rule). Header work only **ranks candidates**; full block
 connect decides the tip. IBD reorg depth is **any** (DoS/RAM caps only).
 Tip-follow pending cap is **128** (`MAX_PENDING_BLOCKS`) so a ≥99-block
-divergence can still be assembled.
+divergence can still be assembled. Catch-up `getdata` is windowed to
+**16** (`MAX_SERVE_BLOCKS`) so it matches per-session reconstruct serve;
+drain continues the header path after that window connects. Writer
+saturating-subs `serve_inflight` so unpaired compact tip announce cannot
+wrap the counter; announce itself is not counted on that cap.
 
 ```text
 # IBD

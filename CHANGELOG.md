@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **Nightly Miri installs nightly:** `miri.yml` asked the CodeQL-pinned
+  1.95.0 `dtolnay/rust-toolchain` snapshot for `components: miri` (that
+  action has no `toolchain` input). First scheduled run died in 9s.
+  Nightly + miri is a `rustup` step; product rustc stays 1.95.
+
 - **IBD exits to tip follow at the peer horizon:** leftover off-path
   `getdata` is dropped so catch-up can complete; if peers then advertise
   a higher tip (`lag > 2`), `headers_done` unlatches and `getheaders`

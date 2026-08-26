@@ -29,10 +29,13 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
-        with:
-          toolchain: nightly
-          components: miri, rust-src
+      # a5f673d0 is the 1.95.0 action snapshot (CodeQL SHA). It has no
+      # `toolchain` input — `with: toolchain: nightly` is ignored and
+      # `components: miri` then fails (`miri` is not a 1.95 component).
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+
+      - name: rustup nightly + miri
+        run: rustup toolchain install nightly --component miri --component rust-src --profile minimal --allow-downgrade --no-self-update
 
       - name: cargo miri test -p rbitcoin-primitives
         env:

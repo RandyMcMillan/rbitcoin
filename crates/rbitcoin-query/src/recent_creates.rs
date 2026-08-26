@@ -105,9 +105,15 @@ impl RecentCreates {
             hi = hi.max(e.height);
         }
         let until = until.max(hi);
-        let older = self.head.load_full();
-        self.head
-            .store(Some(ChainLayer::prepend(older, lo, hi, until, hits)));
+        layer_chain::rcu_head(&self.head, |older| {
+            Some(ChainLayer::prepend(
+                older.clone(),
+                lo,
+                hi,
+                until,
+                Arc::clone(&hits),
+            ))
+        });
     }
 
     /// Merge pending into a layer that is never drop_ready until Class A HWMs exist.
@@ -117,9 +123,9 @@ impl RecentCreates {
 
     /// Drop layers with `until <= class_a_hi`. Kept nodes reuse `hits` Arc.
     pub fn drop_ready(&self, class_a_hi: u32) {
-        let head = self.head.load_full();
-        let next = layer_chain::splice_kept(head, |l| l.meta > class_a_hi);
-        self.head.store(next);
+        layer_chain::rcu_head(&self.head, |head| {
+            layer_chain::splice_kept(head.clone(), |l| l.meta > class_a_hi)
+        });
     }
 
     pub fn note(&self, height: u32, rows: impl IntoIterator<Item = ([u8; 32], Fk, (u64, u64))>) {
@@ -177,8 +183,9 @@ impl RecentCreates {
         keep_layer: impl Fn(&RecentLayer) -> bool,
         keep_ent: impl Fn(&LiveEnt) -> bool,
     ) {
-        let head = self.head.load_full();
-        self.head.store(filter_chain(head, &keep_layer, &keep_ent));
+        layer_chain::rcu_head(&self.head, |head| {
+            filter_chain(head.clone(), &keep_layer, &keep_ent)
+        });
     }
 
     pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64))> {
@@ -545,6 +552,45 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a.pending, &c.pending),
             "empty pending after drop_from reuses the same empty Arc"
+        );
+    }
+
+    #[test]
+    fn stale_publish_cas_does_not_restore_drop_from() {
+        let r = RecentCreates::new();
+        r.note(10, [(tid(1), Fk(1), (1, 2))]);
+        r.publish_layer(10);
+        let stale = r.head.load_full();
+        r.drop_from(10);
+        assert!(r.get(&tid(1)).is_none());
+        r.note(12, [(tid(2), Fk(2), (3, 4))]);
+        let hits = {
+            let g = r.inner.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(&g.pending)
+        };
+        let mut lo = u32::MAX;
+        let mut hi = 0u32;
+        for e in hits.values() {
+            lo = lo.min(e.height);
+            hi = hi.max(e.height);
+        }
+        let next = ChainLayer::prepend(stale.clone(), lo, hi, hi.max(12), hits);
+        assert!(
+            layer_chain::cas_head(&r.head, &stale, Some(next)).is_err(),
+            "CAS against a stale head must fail"
+        );
+        assert!(
+            r.get(&tid(1)).is_none(),
+            "stale publish must not restore drop_from heights"
+        );
+        assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
+        r.publish_layer(12);
+        assert!(r.get(&tid(1)).is_none());
+        assert_eq!(r.get(&tid(2)), Some((Fk(2), (3, 4))));
+        let head = r.head.load_full().expect("published");
+        assert!(
+            head.older.is_none(),
+            "CAS retry must prepend onto the current head, not the stale drop_from chain"
         );
     }
 }

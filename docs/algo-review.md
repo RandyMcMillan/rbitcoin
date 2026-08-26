@@ -151,9 +151,6 @@ What the node runs. Findings follow.
 
 ### Query
 
-- **Q-M1.** `retain_headers_needing_body` (`archive.rs`): missing `first`
-  fk → `unwrap_or(0)` keeps the wrong span. Should be
-  `Corrupt("invariant: …")`.
 - **Q-M3.** `merge_outs` clones script bytes on every RCU retry; empty
   `checked` always publishes a new Arc (breaks `ptr_eq` / sticky).
 
@@ -345,7 +342,7 @@ Intentional COMPAT Electrum status extra field is **not** counted as High.
 |-------|------|--------|------------------|
 | store | 0 | seqlock, flush lost-update, fuse8 OOB, spender cycle, sidecar fsync, runs_io | BDZ fill, bulk_fill, SH N² |
 | consensus + primitives | 0 | *(none remaining)* | historical MTP walks, rehash txids |
-| query | 0 | retain fallback, merge_outs clone | BQ scan, SipHash in-flight |
+| query | 0 | merge_outs clone | BQ scan, SipHash in-flight |
 | net | 0 | compact indexes, random eviction, AddrMan/cmpct unbounded, v2 copies | INV flush, BlockCache |
 | mempool | 0 | orphan vout, eviction tie, persist order, package feerate | free slot, persist_all |
 | rpc | 0 | submitblock gate, gettxout, hashps, unbounded batch, blockmintxfee, maxfeerate | GBT depends, longpoll |

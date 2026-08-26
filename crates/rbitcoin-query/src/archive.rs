@@ -176,7 +176,7 @@ impl ArchiveWritePlan {
                 .planned_fks
                 .iter()
                 .position(|f| *f == first)
-                .unwrap_or(0);
+                .ok_or(StoreError::Corrupt("invariant: retain first fk missing"))?;
             let end = start.saturating_add(n as usize).min(self.planned_fks.len());
             for f in &self.planned_fks[start..end] {
                 if let Some(id) = f.get() {
@@ -2589,5 +2589,33 @@ mod tests {
         assert!(plan.external_parents.is_empty());
         plan.append(super::ArchiveWritePlan::empty());
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn retain_headers_missing_first_fk_is_corrupt() {
+        let dummy_pin = std::sync::Arc::new((
+            TxRecord {
+                txid: [5u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            },
+            Vec::new(),
+        ));
+        let mut plan = super::ArchiveWritePlan::empty();
+        plan.planned_fks = vec![Fk(5)];
+        plan.per_header_ranges = vec![(Fk(10), Fk(99), 1)];
+        plan.packed = vec![(dummy_pin, Vec::new())];
+        let err = plan
+            .retain_headers_needing_body(|_| Ok(false))
+            .expect_err("missing first fk must not keep the wrong span");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invariant") && msg.contains("retain first fk"),
+            "unexpected err: {msg}"
+        );
     }
 }

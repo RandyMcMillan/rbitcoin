@@ -1,6 +1,9 @@
 //! Confirm_run unit tests (peeled from confirm_run.rs).
 
-use super::{recent_create_height_slices, recent_create_rows_for_slices, write_height_needed};
+use super::{
+    recent_create_height_slices, recent_create_rows_for_slices, write_batch_vs_tip,
+    write_height_needed, WriteBatchVsTip,
+};
 
 #[test]
 fn tx_head_drain_thread_is_named_and_reused() {
@@ -195,23 +198,30 @@ fn script_ok_append_contiguous_and_gap() {
     assert!(no_plan.archive_plan.is_none());
 }
 
-/// Heights at or below tip must be stripped before structural write
-/// (dup pipeline race after scripts claim the same tip+1 twice).
-/// Write filter + stage entry points + empty scripts purity (one surface).
+/// Write vs tip is all-old (no-op), all-new (proceed), or spans tip (Corrupt).
 /// External three-stage path: rbitcoin-test three_stage_confirm_and_parent_pin_surface.
 #[test]
 fn three_stage_write_filter_and_scripts_surface() {
     let tip = Some(100u32);
-    let heights = [98u32, 99, 100, 101, 102];
-    let kept: Vec<u32> = heights
-        .into_iter()
-        .filter(|&h| write_height_needed(tip, h))
-        .collect();
-    assert_eq!(kept, vec![101, 102]);
+    assert_eq!(
+        write_batch_vs_tip(tip, [98u32, 99, 100, 101, 102]),
+        WriteBatchVsTip::SpansTip
+    );
+    assert_eq!(
+        write_batch_vs_tip(tip, [98u32, 99, 100]),
+        WriteBatchVsTip::AllOld
+    );
+    assert_eq!(
+        write_batch_vs_tip(tip, [101u32, 102]),
+        WriteBatchVsTip::AllNew
+    );
+    assert_eq!(
+        write_batch_vs_tip(tip, std::iter::empty()),
+        WriteBatchVsTip::AllOld
+    );
     assert!(!write_height_needed(tip, 100));
     assert!(!write_height_needed(Some(0), 0));
     assert!(write_height_needed(Some(0), 1));
-    // Empty chain: genesis (and all heights) still need write.
     assert!(write_height_needed(None, 0));
     assert!(write_height_needed(None, 1));
 

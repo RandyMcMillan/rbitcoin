@@ -61,6 +61,36 @@ pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriteBatchVsTip {
+    AllOld,
+    AllNew,
+    SpansTip,
+}
+
+pub(super) fn write_batch_vs_tip(
+    tip: Option<u32>,
+    heights: impl IntoIterator<Item = u32>,
+) -> WriteBatchVsTip {
+    let mut any_old = false;
+    let mut any_new = false;
+    for h in heights {
+        if write_height_needed(tip, h) {
+            any_new = true;
+        } else {
+            any_old = true;
+        }
+        if any_old && any_new {
+            return WriteBatchVsTip::SpansTip;
+        }
+    }
+    if any_new {
+        WriteBatchVsTip::AllNew
+    } else {
+        WriteBatchVsTip::AllOld
+    }
+}
+
 /// Per-height ranges over a write batch's `planned_fks` / pins.
 ///
 /// One RecentCreates fifo row per prepared height. A leftover tail (count
@@ -140,26 +170,16 @@ pub fn confirm_write_phase(
     milestone: Milestone,
     mut batch: ScriptOkBatch,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    // Idempotent: skip heights already on the confirmed tip (dup pipeline race).
     let tip = query.tip_height().map(|h| h.0);
-    let mut kept = Vec::with_capacity(batch.prepared.len());
-    let mut wires = Vec::with_capacity(batch.wire_blocks.len());
-    for (p, w) in batch
-        .prepared
-        .into_iter()
-        .zip(batch.wire_blocks.into_iter())
-    {
-        if !write_height_needed(tip, p.height.0) {
-            continue;
+    match write_batch_vs_tip(tip, batch.prepared.iter().map(|p| p.height.0)) {
+        WriteBatchVsTip::AllOld => return Ok(Vec::new()),
+        WriteBatchVsTip::SpansTip => {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: write batch spans tip",
+            )));
         }
-        kept.push(p);
-        wires.push(w);
+        WriteBatchVsTip::AllNew => {}
     }
-    if kept.is_empty() {
-        return Ok(Vec::new());
-    }
-    batch.prepared = kept;
-    batch.wire_blocks = wires;
 
     let t_wall = Instant::now();
 

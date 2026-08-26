@@ -871,11 +871,19 @@ fn drain_script_ok_write_queue(
                         parts = parts.saturating_add(1);
                     }
                     Err(leftover) => {
-                        // Height gap / leftover union — write the contiguous prefix first.
-                        warn!(
-                            "ibd: write batch drain gap after parts={parts} leftover_blks={}",
-                            leftover.len()
-                        );
+                        let polarity =
+                            batch.archive_plan.is_some() != leftover.archive_plan.is_some();
+                        if polarity {
+                            warn!(
+                                "ibd: write batch drain plan polarity after parts={parts} leftover_blks={}",
+                                leftover.len()
+                            );
+                        } else {
+                            warn!(
+                                "ibd: write batch drain gap after parts={parts} leftover_blks={}",
+                                leftover.len()
+                            );
+                        }
                         return (batch, parts, Some(leftover));
                     }
                 }

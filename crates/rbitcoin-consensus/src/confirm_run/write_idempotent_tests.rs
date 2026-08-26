@@ -163,7 +163,7 @@ fn script_ok_append_contiguous_and_gap() {
     let err = good.append_contiguous(bad).err().expect("len mismatch");
     assert_eq!(err.len(), 1);
 
-    // archive_plan merge: None + Some, Some + Some, Some + None.
+    // archive_plan merge: Some+Some concatenates; mixed polarity is leftover.
     let mut with_plan = batch_one(70);
     with_plan.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
     let mut next = batch_one(71);
@@ -171,16 +171,28 @@ fn script_ok_append_contiguous_and_gap() {
     assert!(with_plan.append_contiguous(next).is_ok());
     assert!(with_plan.archive_plan.is_some());
     let mut only_other = batch_one(72);
-    // Self plan remains Some; other None keeps it.
     only_other.archive_plan = None;
-    assert!(with_plan.append_contiguous(only_other).is_ok());
+    let err = with_plan
+        .append_contiguous(only_other)
+        .err()
+        .expect("Some+None polarity");
+    assert_eq!(err.len(), 1);
+    assert_eq!(with_plan.len(), 2);
     assert!(with_plan.archive_plan.is_some());
-    // Self None absorbs other's plan.
     let mut no_plan = batch_one(80);
     let mut has = batch_one(81);
     has.archive_plan = Some(rbitcoin_query::ArchiveWritePlan::empty());
-    assert!(no_plan.append_contiguous(has).is_ok());
-    assert!(no_plan.archive_plan.is_some());
+    let err = no_plan
+        .append_contiguous(has)
+        .err()
+        .expect("None+Some polarity");
+    assert_eq!(err.len(), 1);
+    assert_eq!(no_plan.len(), 1);
+    assert!(no_plan.archive_plan.is_none());
+    let n2 = batch_one(81);
+    assert!(no_plan.append_contiguous(n2).is_ok());
+    assert_eq!(no_plan.len(), 2);
+    assert!(no_plan.archive_plan.is_none());
 }
 
 /// Heights at or below tip must be stripped before structural write

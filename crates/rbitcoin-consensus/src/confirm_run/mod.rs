@@ -594,8 +594,9 @@ impl ScriptOkBatch {
     ///
     /// Scripts enqueue height-ordered tip extensions; write drains the channel
     /// and merges so Class A + Class C + annotate run once (fewer tip fsyncs).
-    /// Returns `Err(other)` if not a contiguous height extension (caller keeps
-    /// `other` for the next batch).
+    /// Returns `Err(other)` if not a contiguous height extension **or** if
+    /// `archive_plan` polarity differs (`Some` vs `None`). Caller writes the
+    /// prefix then keeps `other` for the next meta-batch.
     pub fn append_contiguous(&mut self, mut other: Self) -> Result<(), Self> {
         if other.is_empty() {
             return Ok(());
@@ -619,13 +620,14 @@ impl ScriptOkBatch {
         {
             return Err(other);
         }
+        if self.archive_plan.is_some() != other.archive_plan.is_some() {
+            return Err(other);
+        }
         self.prepared.append(&mut other.prepared);
         self.wire_blocks.append(&mut other.wire_blocks);
         self.batch_parents.extend_from(other.batch_parents);
-        match (self.archive_plan.as_mut(), other.archive_plan.take()) {
-            (Some(dst), Some(src)) => dst.append(src),
-            (None, Some(src)) => self.archive_plan = Some(src),
-            _ => {}
+        if let (Some(dst), Some(src)) = (self.archive_plan.as_mut(), other.archive_plan.take()) {
+            dst.append(src);
         }
         Ok(())
     }

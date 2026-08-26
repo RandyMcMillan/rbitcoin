@@ -205,10 +205,24 @@ impl HeightFence {
 
     /// Highest confirmed height present on any run (`None` if empty).
     ///
-    /// In-flight prune HWM. Distinct from `confirmed[]` length (`tip_height`):
-    /// `set_many` can publish tip before [`Self::extend`].
+    /// Distinct from `confirmed[]` length (`tip_height`): `set_many` can
+    /// publish tip before [`Self::extend`]. In-flight prune uses
+    /// [`Self::drain_and_fence_hi`], not this alone.
     pub fn max_height(&self) -> Option<u32> {
         self.runs.iter().map(|r| r.height).max()
+    }
+
+    /// Height both head drain and this fence have passed (`None` keeps inflight).
+    ///
+    /// `drain_fk == 0` or a drain fk not on a run (drain ahead of fence, or
+    /// fence ahead of drain) is `None`. Fence tip can lead unpublished
+    /// `tx.head`; inflight must wait for the min.
+    pub fn drain_and_fence_hi(&self, drain_fk: u64) -> Option<u32> {
+        if drain_fk == 0 {
+            return None;
+        }
+        let drain_h = self.height_of(Fk(drain_fk))?;
+        Some(drain_h.min(self.max_height()?))
     }
 
     /// Highest create_fk in any connected run (`0` if empty).
@@ -425,6 +439,26 @@ mod tests {
         let f = HeightFence::from_runs(vec![run(1, 2, 0), run(10, 3, 2)]);
         assert_eq!(f.max_height(), Some(2));
         assert_eq!(f.max_connected_fk(), 12);
+    }
+
+    /// Mainnet 258870: fence tip 40, drain still on height 2 → ready height 2.
+    #[test]
+    fn drain_and_fence_hi_is_min_of_drain_height_and_fence_tip() {
+        assert_eq!(HeightFence::empty().drain_and_fence_hi(1), None);
+        let f = HeightFence::from_runs(vec![run(1, 50, 2), run(51, 50, 40)]);
+        assert_eq!(f.drain_and_fence_hi(0), None, "no drain: keep all inflight");
+        assert_eq!(
+            f.drain_and_fence_hi(40),
+            Some(2),
+            "drain on height 2 while fence tip is 40"
+        );
+        assert_eq!(f.max_height(), Some(40));
+        assert_eq!(f.drain_and_fence_hi(90), Some(40), "drain on fence tip");
+        assert_eq!(
+            f.drain_and_fence_hi(200),
+            None,
+            "drain fk not on fence (drain ahead of fence)"
+        );
     }
 
     #[test]

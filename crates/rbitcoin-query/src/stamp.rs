@@ -1,7 +1,7 @@
 //! External parent create_fk stamp: in-flight → published → TipOnly.
 //!
 //! One function for S0 plan (`archive_plan_batch_from_store`) and plan=None
-//! rehydrate. In-flight holds CreatePins until Class C covers stamped until.
+//! rehydrate. In-flight holds CreatePins until drain+fence exceeds stamped until.
 
 use crate::published_ids::TxidHasher;
 use crate::{CreatePin, InFlightView, PublishedIds, QueryError, U64Map, U64Set};

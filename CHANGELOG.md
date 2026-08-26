@@ -166,6 +166,9 @@ before 1.0).
 
 ### Fixed
 
+- **Mempool `relay_seq` / `accept_at` drop on unindex:** confirm, RBF, and
+  eviction no longer leak per-admit INV maps for the process lifetime.
+
 - **Electrum subscribe status row order matches `get_history`:** confirmed
   height-asc, then mempool tail (no `sort_by_key` on height). Extra
   confirming `blockhash` in the preimage is unchanged (A-B-A).

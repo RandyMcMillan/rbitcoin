@@ -79,12 +79,17 @@ before 1.0).
 
 - **In-flight drop after last load batch of a wave:** lookup snapshots
   `drain_and_fence_hi` before TipOnly and passes it on the last load
-  batch. After that batch's in-flight read, load drops layers with
-  `max_height` below the snapshot (equality keeps). Not Class C tip;
-  `class_a_hi` is not a drop gate. Stamp walks `InFlightView` then
-  skeleton (IBD); leftover TipOnly for plan=None / S0.
+  batch. After that batch's in-flight read, load drops map rows with
+  pack height below the snapshot (equality keeps). Not Class C tip;
+  `class_a_hi` is not a drop gate. Stamp walks the load-thread `InFlight`
+  map then skeleton (IBD); leftover TipOnly for plan=None / S0.
   [`docs/invariants.md`](docs/invariants.md),
   [`docs/concurrency.md`](docs/concurrency.md).
+
+- **In-flight is a load-thread map:** one `txid → fk` / `fk → CreatePin`
+  HashMap with a height index (not `InFlightLog` layer snapshots). Insert
+  after stamp so the current pack is invisible to that stamp. Disconnect
+  `drop_from_height` on pack height.
 
 - **Load-batch parent skeleton:** lookup TipOnly-fills `BatchParentIds`
   (fk + body/spent ranges + per-chunk need-vouts) onto each `LoadBatch`.

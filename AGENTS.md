@@ -96,10 +96,10 @@ TipOnly and passes it on that batch; load then drops tagged layers with
 `max_height` below the snapshot. Stamp attaches the CreatePin from
 `InFlightView`. Not a coins cache or process pin FIFO.
 
-Leftover union, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**
+Leftover identity, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**
 (the only Allowed/Forbidden IO table). In-flight prune after the last
 load batch of a lookup wave finishes its in-flight read; no leftover
-pending / pin FIFO. Union miss is permanent.
+pending / pin FIFO. Skeleton miss is permanent.
 
 ### Confirm pipeline timers
 

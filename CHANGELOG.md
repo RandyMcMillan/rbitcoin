@@ -81,10 +81,16 @@ before 1.0).
   `drain_and_fence_hi` before TipOnly and passes it on the last load
   batch. After that batch's in-flight read, load drops layers with
   `max_height` below the snapshot (equality keeps). Not Class C tip;
-  `class_a_hi` is not a drop gate. Stamp walks `InFlightView` only
-  (then live_union, then TipOnly).
+  `class_a_hi` is not a drop gate. Stamp walks `InFlightView` then
+  skeleton (IBD); leftover TipOnly for plan=None / S0.
   [`docs/invariants.md`](docs/invariants.md),
   [`docs/concurrency.md`](docs/concurrency.md).
+
+- **Load-batch parent skeleton:** lookup TipOnly-fills `BatchParentIds`
+  (fk + body/spent ranges + per-chunk need-vouts) onto each `LoadBatch`.
+  Load binds same-batch → in-flight → skeleton → `Corrupt`. Published
+  `live_union` / `PublishedIds` are gone. plan=None / S0 still leftover
+  TipOnly. Lookup `wave=… spent=` is `tx_spent_range_batch` for those hits.
 
 - **`header.head` open-grow replaces the file:** an undersized single-gen
   OA is deleted and recreated at the create target (`.mlt` kept). Crash

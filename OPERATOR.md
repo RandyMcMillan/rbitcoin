@@ -26,9 +26,10 @@ install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
 ```
 
 Do not use `cargo build --release` under `nix-shell` for the operator binary —
-that produces a Nix-glibc dynamic link that fails outside the store. Dev/test
-builds stay on `nix develop` / `cargo test`; release is always musl static.
-See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
+that produces a Nix-glibc dynamic link that fails outside the store. Release on
+Linux is always musl static. Compiling the tree as a contributor (rustup, no
+Nix, macOS/Windows): [`CONTRIBUTING.md`](./CONTRIBUTING.md). See
+[`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 **GitHub Release** (`v*.*.*` tags) is the operator snapshot: Linux musl +
 Windows CRT-static PE + Darwin aarch64 binaries + SHA256SUMS. Merge the version-bump PR into

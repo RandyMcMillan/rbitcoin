@@ -23,6 +23,7 @@ consensus/script** path.
 | **Platform** | **Linux musl** is the operator path. Windows / Darwin are published snapshots (no IoRing; Darwin not notarized) |
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.5.x** supported published line; no LTS until 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
+| **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
 
 ## Why this node is different
 
@@ -105,7 +106,23 @@ Custom Signets are supported with `--signetchallenge` and
 
 ## Build
 
-### Portable static release (recommended)
+### Develop (any OS, Nix optional)
+
+**Nix is not required.** Rust **1.95** via [rustup](https://rustup.rs)
+([`rust-toolchain.toml`](./rust-toolchain.toml)). Clone, first build, `--smoke`,
+and Windows/macOS notes: **[`CONTRIBUTING.md`](./CONTRIBUTING.md)** (Getting
+started).
+
+```bash
+git clone https://github.com/reardencode/rbitcoin.git && cd rbitcoin
+cargo build -p rbitcoin-node -p rbitcoin-cli
+```
+
+Linux-only optional pin (`nix develop` / `nix-shell`, same `flake.lock` as
+release). Agents use a worktree branch and let Actions run workspace/coverage
+gates — [`AGENTS.md`](./AGENTS.md).
+
+### Portable static release (Linux operator)
 
 Pinned **nixpkgs + Cargo.lock** produce a **fully static, portable**
 `rbitcoin-node` / `rbitcoin-cli` (musl) that runs on ordinary Linux hosts without
@@ -124,21 +141,6 @@ Do **not** use `cargo build --release` inside `nix-shell` / `nix develop` as the
 operator binary — that links against the Nix store glibc and fails outside the
 store (`No such file or directory` at exec). Details:
 [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
-
-### Dev / CI path
-
-Requires Rust **1.95** (workspace `rust-version`, matching Nix/CI). Prefer the
-**same pin** as release builds for tests and clippy:
-
-```bash
-nix develop   # or: nix-shell  (both use flake.lock, not floating <nixpkgs>)
-cargo build --workspace
-cargo test --workspace
-./scripts/coverage.sh   # PR bar (Actions); see CONTRIBUTING.md / AGENTS.md
-```
-
-Agents implement on a worktree branch and let GitHub Actions run the
-workspace/coverage gates — see [`AGENTS.md`](./AGENTS.md).
 
 Operator binary: always the static install under `./target/release/` (or
 `./result/bin/`), or the GitHub Release for a `v*.*.*` tag. PR CI smokes
@@ -173,7 +175,7 @@ Full map (one owner per fact): **[`docs/README.md`](./docs/README.md)**.
 |----------|-------|
 | Operator | [`OPERATOR.md`](./OPERATOR.md) |
 | Product / interop | [`COMPAT.md`](./COMPAT.md) |
-| Contributor | [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
+| Contributor | [`CONTRIBUTING.md`](./CONTRIBUTING.md) (getting started: rustup, Linux / macOS / Windows) |
 | Agent | [`AGENTS.md`](./AGENTS.md) |
 | On-disk | [`SCHEMA.md`](./SCHEMA.md) |
 | Tests | [`TESTING.md`](./TESTING.md) |

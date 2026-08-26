@@ -42,10 +42,13 @@ not a musl product bin. Suites and packed `--corpus` lists:
 
 ## Running tests
 
+Install rustc **1.95** and a first build: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+(Getting started). **Nix is not required.** `nix-shell` / `nix develop` are a
+Linux-only pin (they set `CARGO_TARGET_DIR=target/dev` and `RUSTFLAGS=-Dwarnings`).
+
 ```bash
-nix-shell
-# Warnings are errors (workspace.lints + RUSTFLAGS=-Dwarnings in shell.nix)
-# CARGO_TARGET_DIR defaults to target/dev (see Artifact silos below)
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/dev}"   # see Artifact silos
+# Warnings are errors (workspace.lints; Nix shell also sets RUSTFLAGS=-Dwarnings)
 cargo build --workspace --all-targets
 # Default suite: unit + scenarios + **fast** multi-node only (no --ignored)
 cargo test --workspace
@@ -55,6 +58,9 @@ cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
   (echo "FAIL: bitcoinconsensus still in dependency tree" && cargo tree -i bitcoinconsensus && exit 1)
 ```
 
+Windows/macOS PR surface is `./scripts/ci-os-smoke.sh`, not this full suite —
+see CONTRIBUTING (What works on each OS).
+
 ### Artifact silos (do not mix)
 
 Host **gnu** objects are not interchangeable with **musl** release or with
@@ -62,12 +68,13 @@ Host **gnu** objects are not interchangeable with **musl** release or with
 
 | Silo | Where | Used by |
 |------|--------|---------|
-| **Dev** | `target/dev` (`CARGO_TARGET_DIR` from `nix-shell` / `nix develop`) | fmt, clippy, `cargo test`, ad-hoc `cargo build` |
+| **Dev** | `target/dev` (`CARGO_TARGET_DIR`; `nix-shell` / `nix develop` set it — rustup users should export it) | fmt, clippy, `cargo test`, ad-hoc `cargo build` |
 | **Coverage** | `target/cov` (forced in `scripts/coverage.sh`) | `./scripts/coverage.sh` only |
 | **Musl release** | Nix store via crane (`cargoArtifacts` + app) | `nix build .#rbitcoin-musl` — **not** `./target` |
 
-Override dev dir only when intentional: `CARGO_TARGET_DIR=… nix-shell`.  
-Override coverage dir: `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
+Override dev dir only when intentional: `CARGO_TARGET_DIR=…` (Nix shell
+reads it; rustup users export it). Override coverage dir:
+`CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
 **Default vs heavy tiers**
 

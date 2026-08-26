@@ -63,7 +63,7 @@ pub struct ProcessOwnedSizes {
     pub sh_heads: usize,
     /// Segmented `tx.head.*` occupancy (logical sizes; no shadow resize).
     pub head: rbitcoin_store::HeadResizeSizeSnapshot,
-    /// Prep-ahead in-flight CreatePin layers (from plan thread atomics).
+    /// Prep-ahead in-flight CreatePin occupancy (from load-thread atomics).
     pub inflight_layers: usize,
     pub inflight_pins: usize,
     pub inflight_bytes: u64,
@@ -91,7 +91,7 @@ pub struct ProcessOwnedSizes {
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
 ///
-/// Updated after each plan note/prune (InFlightLog). IBD pstore counts stay 0.
+/// Updated after each load note/prune ([`InFlight`]). IBD pstore counts stay 0.
 /// Sampled by the ~5s IBD sizes line.
 pub mod process_mem_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -153,7 +153,7 @@ pub use confirm_load::ConfirmLoadStats;
 pub use confirm_load::SpendEdges;
 pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
 pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher};
-pub use in_flight::{InFlightLayer, InFlightLog, InFlightView};
+pub use in_flight::InFlight;
 pub use scripthash::{
     apply_history_filter, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
     ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo, ShJoinSlot,

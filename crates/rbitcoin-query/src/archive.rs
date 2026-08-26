@@ -397,7 +397,7 @@ impl Query {
             let plan = self.archive_plan_batch_from_store(
                 &mut need,
                 start,
-                &crate::InFlightView::empty(),
+                &crate::InFlight::new(),
                 None,
             )?;
             self.archive_commit_plan(plan)?;
@@ -466,7 +466,7 @@ impl Query {
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
         next_tx_start: u64,
-        in_flight: &crate::InFlightView,
+        in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
@@ -546,7 +546,7 @@ impl Query {
         &self,
         need: &[(Fk, &bitcoin::Block, &[[u8; 32]])],
         next_tx_start: u64,
-        in_flight: &crate::InFlightView,
+        in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
@@ -624,7 +624,7 @@ impl Query {
         per_header_ranges: Vec<(Fk, Fk, u32)>,
         n_headers: u64,
         assign_ns: u64,
-        in_flight: &crate::InFlightView,
+        in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::HashSet;
@@ -1037,7 +1037,7 @@ mod tests {
         let (dir, q) = temp_query("batch-pin-arc");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), None)
             .unwrap();
         assert_eq!(plan.batch_pin.len(), plan.planned_fks.len());
         assert_eq!(plan.batch_pin.len(), plan.packed.len());
@@ -1080,7 +1080,7 @@ mod tests {
             let (dir, q) = temp_query("arch-phases");
             let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
             let plan = q
-                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), None)
                 .unwrap();
             assert_eq!(plan.planned_fks.len(), 2);
             q.archive_commit_plan(plan).unwrap();
@@ -1115,7 +1115,7 @@ mod tests {
             .archive_plan_batch_from_store(
                 &mut need0,
                 q.tx_body_count() + 1,
-                &crate::InFlightView::empty(),
+                &crate::InFlight::new(),
                 None,
             )
             .unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
         assert_eq!(q.tx_body_count(), 1);
 
         // Reserve two plans as prep would with write queue depth 2.
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let mut next = q.tx_body_count() + 1;
         let mut need_a = vec![(Fk(10), vec![coinbase_apply(10), coinbase_apply(11)])];
         let plan_a = q
@@ -1155,7 +1155,7 @@ mod tests {
     fn overlap_plan_resolves_parent_via_inflight_creates() {
         let (dir, q) = temp_query("inflight-parent");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
@@ -1219,15 +1219,15 @@ mod tests {
             outputs: vec![OutputRecord::unspent(1, vec![0x51])],
         };
         let mut need_b = vec![(Fk(2), vec![child])];
-        let mut inflight_log = crate::InFlightLog::new();
-        inflight_log.note_layer(crate::InFlightLayer::from_plan_pins(
+        let mut inflight = crate::InFlight::new();
+        inflight.note_pins(
             plan_a
                 .planned_fks
                 .iter()
                 .zip(plan_a.batch_pin.iter())
                 .map(|(fk, pin)| (*fk, pin)),
-        ));
-        let inflight = inflight_log.snapshot();
+            None,
+        );
         let plan_b = q
             .archive_plan_batch_from_store(&mut need_b, 2, &inflight, None)
             .expect("inflight parent resolve");
@@ -1273,26 +1273,27 @@ mod tests {
     fn inflight_binds_parent_after_commit_before_prune() {
         let (dir, q) = temp_query("inflight-n-minus-1");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
-        let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
+        let mut log = crate::InFlight::new();
+        log.note_pins(
             plan_a
                 .planned_fks
                 .iter()
                 .zip(plan_a.batch_pin.iter())
                 .map(|(fk, pin)| (*fk, pin)),
-        ));
+            None,
+        );
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
 
         let mut need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xef)])];
         let plan_b = q
-            .archive_plan_batch_from_store(&mut need_b, 2, &log.snapshot(), None)
+            .archive_plan_batch_from_store(&mut need_b, 2, &log, None)
             .expect("in-flight must stamp n−1 without leftover");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1302,7 +1303,7 @@ mod tests {
     fn leftover_keeps_prev_pack_after_drain_done() {
         let (dir, q) = temp_query("leftover-keep-prev");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
@@ -1385,20 +1386,21 @@ mod tests {
     fn inflight_binds_after_drain_before_fence() {
         let (dir, q) = temp_query("inflight-drain-before-fence");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
-        let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
+        let mut log = crate::InFlight::new();
+        log.note_pins(
             plan_a
                 .planned_fks
                 .iter()
                 .zip(plan_a.batch_pin.iter())
                 .map(|(fk, pin)| (*fk, pin)),
-        ));
+            None,
+        );
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
         log.prune_below_height(q.drain_and_fence_hi());
@@ -1408,12 +1410,12 @@ mod tests {
             "drain fk not on fence: keep inflight"
         );
         assert!(
-            log.snapshot().get_create_fk(&parent_txid).is_some(),
+            log.get_create_fk(&parent_txid).is_some(),
             "fence missing: prune must keep"
         );
         let mut need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xee)])];
         let plan_b = q
-            .archive_plan_batch_from_store(&mut need_b, 2, &log.snapshot(), None)
+            .archive_plan_batch_from_store(&mut need_b, 2, &log, None)
             .expect("in-flight binds after drain, before fence");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1424,7 +1426,7 @@ mod tests {
     fn leftover_tiponly_after_fence_clears_pending() {
         let (dir, q) = temp_query("leftover-fence-clears-pending");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
@@ -1449,7 +1451,7 @@ mod tests {
     #[test]
     fn leftover_miss_dumps_probe_diag() {
         let (dir, q) = temp_query("leftover-miss-diag");
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let ghost = [0xDDu8; 32];
         let mut need = vec![(Fk(1), vec![child_spend(ghost, 0xaa)])];
         let _ = q.archive_plan_batch_from_store(&mut need, 1, &empty, None);
@@ -1465,21 +1467,22 @@ mod tests {
     fn inflight_binds_after_fence_before_drain() {
         let (dir, q) = temp_query("inflight-fence-before-drain");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
         let parent_txid = plan_a.batch_creates[0].0;
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
-        let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
+        let mut log = crate::InFlight::new();
+        log.note_pins(
             plan_a
                 .planned_fks
                 .iter()
                 .zip(plan_a.batch_pin.iter())
                 .map(|(fk, pin)| (*fk, pin)),
-        ));
+            None,
+        );
         q.archive_commit_plan_defer_head(plan_a).unwrap();
         assert!(
             q.store().txs.pending_head_len() >= 1,
@@ -1491,12 +1494,12 @@ mod tests {
         log.prune_below_height(q.drain_and_fence_hi());
         assert_eq!(q.drain_and_fence_hi(), None, "drain_fk 0: HWM is None");
         assert!(
-            log.snapshot().get_create_fk(&parent_txid).is_some(),
+            log.get_create_fk(&parent_txid).is_some(),
             "drain_fk 0: prune must keep"
         );
         let mut need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xec)])];
         let plan_b = q
-            .archive_plan_batch_from_store(&mut need_b, 2, &log.snapshot(), None)
+            .archive_plan_batch_from_store(&mut need_b, 2, &log, None)
             .expect("in-flight binds after fence, before drain");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1590,7 +1593,7 @@ mod tests {
         };
         let mut need = vec![(Fk(2), vec![child])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 2, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need, 2, &crate::InFlight::new(), None)
             .expect("parent via head");
         assert_eq!(plan.planned_fks, vec![Fk(2)]);
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
@@ -1628,7 +1631,7 @@ mod tests {
         let child = child_spend(parent_txid, 0xcd);
         let mut same = vec![(Fk(1), vec![parent.clone(), child.clone()])];
         let plan_same = q
-            .archive_plan_batch_from_store(&mut same, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut same, 1, &crate::InFlight::new(), None)
             .expect("same header");
         assert_eq!(plan_same.planned_fks, vec![Fk(1), Fk(2)]);
         assert!(
@@ -1641,7 +1644,7 @@ mod tests {
             (Fk(11), vec![child_spend(parent_txid, 0xce)]),
         ];
         let plan_cross = q
-            .archive_plan_batch_from_store(&mut cross, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut cross, 1, &crate::InFlight::new(), None)
             .expect("cross height");
         assert_eq!(
             plan_cross
@@ -1679,7 +1682,7 @@ mod tests {
             let _ = crate::archive_phase_stats::FILL_MISSING_N.swap(0, Ordering::Relaxed);
             let mut need = vec![(Fk(2), vec![child_spend(parent_txid, 0xcd)])];
             let plan = q
-                .archive_plan_batch_from_store(&mut need, 2, &crate::InFlightView::empty(), None)
+                .archive_plan_batch_from_store(&mut need, 2, &crate::InFlight::new(), None)
                 .expect("parent via head");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
             assert!(plan
@@ -1723,7 +1726,7 @@ mod tests {
         child.inputs[0].create_fk = Fk(1);
         let mut need = vec![(Fk(2), vec![child])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 2, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need, 2, &crate::InFlight::new(), None)
             .expect("prestamp parent");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
@@ -1754,10 +1757,10 @@ mod tests {
                 /*index=*/ true,
             )
             .unwrap();
-        // Creates-only layer: fk known, no CreatePin outs (archived mid-head race).
-        let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_txid_fks([(parent_txid, Fk(1))]));
-        let ifo = log.snapshot();
+        // Creates-only: fk known, no CreatePin outs (archived mid-head race).
+        let mut log = crate::InFlight::new();
+        log.note_creates([(parent_txid, Fk(1))], None);
+        let ifo = &log;
         assert!(ifo.get_out(1).is_none());
 
         let mut child_txid = [0u8; 32];
@@ -1784,7 +1787,7 @@ mod tests {
         };
         let mut need = vec![(Fk(2), vec![child])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 2, &ifo, None)
+            .archive_plan_batch_from_store(&mut need, 2, ifo, None)
             .expect("parent via creates-only in_flight");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
@@ -1828,13 +1831,9 @@ mod tests {
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         let spent = q.store.txs.spent_range(Fk(1)).expect("spent.idx");
-        let helper = crate::stamp_external_parents(
-            q.store(),
-            &[parent_txid],
-            &crate::InFlightView::empty(),
-            None,
-        )
-        .expect("stamp archived parent");
+        let helper =
+            crate::stamp_external_parents(q.store(), &[parent_txid], &crate::InFlight::new(), None)
+                .expect("stamp archived parent");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(1)));
         assert!(helper
             .idents
@@ -1880,7 +1879,7 @@ mod tests {
         let parent_txid = parent.tx.txid;
         let mut need = vec![(Fk(1), vec![parent, child_spend(parent_txid, 0xee)])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), None)
             .expect("plan");
         assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2)]);
         let cb = plan.edges.get(&1).expect("coinbase edges");
@@ -1970,7 +1969,7 @@ mod tests {
             .archive_plan_batch_from_wire(
                 &[(Fk(1), &block, txids.as_slice())],
                 1,
-                &crate::InFlightView::empty(),
+                &crate::InFlight::new(),
                 None,
             )
             .expect("wire plan");
@@ -2006,7 +2005,7 @@ mod tests {
         let (dir, q) = temp_query("shared-create-pin");
         let mut need = vec![(Fk(1), vec![coinbase_apply(1)])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), None)
             .unwrap();
         assert_eq!(plan.packed.len(), 1);
         assert_eq!(plan.batch_pin.len(), 1);
@@ -2037,7 +2036,7 @@ mod tests {
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
             let err = q
-                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), None)
+                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), None)
                 .expect_err("bq parent_hits map is not a stamp source");
             assert!(
                 err.to_string().contains("parent create_fk unresolved"),
@@ -2073,12 +2072,7 @@ mod tests {
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
             let plan = q
-                .archive_plan_batch_from_store(
-                    &mut need,
-                    1,
-                    &crate::InFlightView::empty(),
-                    Some(&skel),
-                )
+                .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), Some(&skel))
                 .expect("skeleton stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));
             assert_eq!(
@@ -2115,7 +2109,7 @@ mod tests {
         let helper = crate::stamp_external_parents(
             q.store(),
             &[parent_txid],
-            &crate::InFlightView::empty(),
+            &crate::InFlight::new(),
             Some(&skel),
         )
         .expect("shared helper");
@@ -2129,7 +2123,7 @@ mod tests {
         let child = child_spend(parent_txid, 0x72);
         let mut need = vec![(Fk(1), vec![child])];
         let plan = q
-            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlightView::empty(), Some(&skel))
+            .archive_plan_batch_from_store(&mut need, 1, &crate::InFlight::new(), Some(&skel))
             .expect("S0 plan");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(88));
         assert_eq!(
@@ -2165,12 +2159,12 @@ mod tests {
             },
             vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
         ));
-        let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins([(Fk(93), &pin)]));
-        let ifo = log.snapshot();
+        let mut log = crate::InFlight::new();
+        log.note_pins([(Fk(93), &pin)], None);
+        let ifo = &log;
         crate::archive_phase_stats::with_exclusive(|| {
             let _ = crate::archive_phase_stats::sample_and_reset();
-            let helper = crate::stamp_external_parents(q.store(), &[parent_txid], &ifo, None)
+            let helper = crate::stamp_external_parents(q.store(), &[parent_txid], ifo, None)
                 .expect("inflight stamp");
             assert_eq!(helper.head_need_n, 0, "inflight hit must skip leftover");
             let got = helper
@@ -2183,7 +2177,7 @@ mod tests {
             let child = child_spend(parent_txid, 0x94);
             let mut need = vec![(Fk(1), vec![child])];
             let plan = q
-                .archive_plan_batch_from_store(&mut need, 1, &ifo, None)
+                .archive_plan_batch_from_store(&mut need, 1, ifo, None)
                 .expect("S0 inflight");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(93));
             let mix = crate::archive_phase_stats::sample_and_reset();
@@ -2197,7 +2191,7 @@ mod tests {
     fn leftover_tiponly_after_commit_skips_when_connected() {
         let (dir, q) = temp_query("tiponly-after-commit");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlightView::empty();
+        let empty = crate::InFlight::new();
         let plan_a = q
             .archive_plan_batch_from_store(&mut need_a, 1, &empty, None)
             .unwrap();
@@ -2228,7 +2222,7 @@ mod tests {
         let (dir, q) = temp_query("freeze-append");
         let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let mut plan_a = q
-            .archive_plan_batch_from_store(&mut need_a, 1, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need_a, 1, &crate::InFlight::new(), None)
             .unwrap();
         // Simulate residual stamp staging (must not survive freeze/append).
         plan_a
@@ -2242,23 +2236,24 @@ mod tests {
             plan_a.batch_creates.is_empty(),
             "freeze drops batch_creates; in-flight binds from batch_pin"
         );
-        let mut log = crate::InFlightLog::new();
-        log.note_layer(crate::InFlightLayer::from_plan_pins(
+        let mut log = crate::InFlight::new();
+        log.note_pins(
             plan_a
                 .planned_fks
                 .iter()
                 .zip(plan_a.batch_pin.iter())
                 .map(|(fk, pin)| (*fk, pin)),
-        ));
+            None,
+        );
         assert_eq!(
-            log.snapshot().get_create_fk(&txid),
+            log.get_create_fk(&txid),
             Some(fk),
             "in-flight still has txid→fk after freeze"
         );
 
         let mut need_b = vec![(Fk(2), vec![coinbase_apply(2), coinbase_apply(3)])];
         let mut plan_b = q
-            .archive_plan_batch_from_store(&mut need_b, 2, &crate::InFlightView::empty(), None)
+            .archive_plan_batch_from_store(&mut need_b, 2, &crate::InFlight::new(), None)
             .unwrap();
         plan_b
             .external_parents
@@ -2308,7 +2303,7 @@ mod tests {
             .archive_plan_batch_from_store(
                 &mut need,
                 q.tx_body_count() + 1,
-                &crate::InFlightView::empty(),
+                &crate::InFlight::new(),
                 None,
             )
             .unwrap();
@@ -2324,7 +2319,7 @@ mod tests {
             .archive_plan_batch_from_store(
                 &mut need2,
                 q.tx_body_count() + 1,
-                &crate::InFlightView::empty(),
+                &crate::InFlight::new(),
                 None,
             )
             .unwrap();

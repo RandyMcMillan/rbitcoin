@@ -14,7 +14,7 @@ pub(super) fn pin_for_wire_batch(
     parent_pin: &mut ParentPinStamp,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
-    in_flight: Option<&rbitcoin_query::InFlightView>,
+    in_flight: Option<&rbitcoin_query::InFlight>,
 ) -> Result<
     (
         rbitcoin_query::BatchParents,

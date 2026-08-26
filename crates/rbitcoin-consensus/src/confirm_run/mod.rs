@@ -137,22 +137,19 @@ pub type ScriptPreverified = std::collections::HashSet<[u8; 32]>;
 
 /// Pipeline context so lookup(N+1) can run while write(N) has not advanced tip.
 ///
-/// Lookup thread owns reserved create-fk HWM and in-flight creates/outs from
+/// Load thread owns reserved create-fk HWM and the in-flight map from
 /// batches sitting in load→scripts→write queues. Write remains sole Class A
 /// appender and applies batches in height order.
-#[derive(Clone, Debug, Default)]
-pub struct WireLoadPipeline {
+#[derive(Clone, Debug)]
+pub struct WireLoadPipeline<'a> {
     /// Expected first height of this batch (store tip+1, or last loaded + 1).
     pub path_lo: u32,
     /// Parent of `path_lo` when ahead of store tip (last wire hash of prior loaded batch).
     pub parent_hash: Option<[u8; 32]>,
     /// Inclusive create-fk start for [`Query::archive_plan_batch_from_wire`].
     pub next_tx_start: u64,
-    /// Prior uncommitted packs: immutable layer snapshot (no shared mutable map).
-    ///
-    /// Load looks up create fk / full CreatePin for parents still only in the
-    /// pipeline (body-ahead-of-head). Built via [`rbitcoin_query::InFlightLog::snapshot`].
-    pub in_flight: rbitcoin_query::InFlightView,
+    /// Prior uncommitted packs (load-thread map; stamp/pin borrow).
+    pub in_flight: &'a rbitcoin_query::InFlight,
     /// Lookup-filled parent identity for this load batch (IBD skeleton).
     pub skeleton: Option<rbitcoin_query::BatchParentIds>,
 }
@@ -397,7 +394,7 @@ pub fn confirm_wire_load_phase_pipelined(
                 .archive_plan_batch_from_wire(
                     &need,
                     p.next_tx_start.max(1),
-                    &p.in_flight,
+                    p.in_flight,
                     p.skeleton.as_ref(),
                 )
                 .map_err(ConsensusError::from)?,
@@ -405,7 +402,7 @@ pub fn confirm_wire_load_phase_pipelined(
                 .archive_plan_batch_from_wire(
                     &need,
                     query.tx_body_count().saturating_add(1).max(1),
-                    &rbitcoin_query::InFlightView::empty(),
+                    &rbitcoin_query::InFlight::new(),
                     None,
                 )
                 .map_err(ConsensusError::from)?,
@@ -430,7 +427,7 @@ pub fn confirm_wire_load_phase_pipelined(
     };
     let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
-    let inflight = pipeline.map(|p| &p.in_flight);
+    let inflight = pipeline.map(|p| p.in_flight);
     let mut parent_pin = match plan.as_mut() {
         Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(

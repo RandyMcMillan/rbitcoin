@@ -1,232 +1,173 @@
-//! Immutable prep-ahead in-flight create material (confirm pipeline Phase A).
+//! Load-thread in-flight create material (confirm pipeline).
 //!
-//! **Publish model:** each planned pack becomes an [`InFlightLayer`] (frozen
-//! maps of create pins). The plan thread appends layers to an [`InFlightLog`]
-//! and hands prep an [`InFlightView`] (Arc slice of layers). Prior layers are
-//! never mutated — no `Arc::make_mut` of a shared whole-map while prep holds a
-//! snapshot.
+//! IBD load is sequential: stamp/pin read this map, **then**
+//! [`InFlight::note_pins`] / [`InFlight::note_creates`] insert the current pack
+//! so that stamp cannot see it. One HashMap for `txid → fk` and one for
+//! `fk → CreatePin` (outs for pin adopt). A height index drops keys without
+//! scanning the maps.
 //!
 //! **Prune:** lookup snapshots [`rbitcoin_store::HeightFence::drain_and_fence_hi`]
 //! before a wave's TipOnly read and passes it on the last load batch. After
-//! that batch finishes its in-flight read, [`InFlightLog::prune_below_height`]
-//! drops tagged layers with `max_height` **below** that snapshot (equality
+//! that batch finishes its in-flight read, [`InFlight::prune_below_height`]
+//! drops tagged packs with pack height **below** that snapshot (equality
 //! keeps). Class C tip and `class_a_hi` are not drop gates. Disconnect still
-//! [`InFlightLog::drop_from_height`] on pack height.
-//!
-//! Lookup is newest→oldest scan over layers (O(L)).
+//! [`InFlight::drop_from_height`] on pack height.
 
 use crate::archive::CreatePin;
+use crate::id_map::TxidHasher;
 use crate::U64Map;
 use rbitcoin_primitives::Fk;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
-/// One planned pack's published creates (immutable after construction).
-#[derive(Debug, Clone)]
-pub struct InFlightLayer {
-    creates: HashMap<[u8; 32], Fk>,
-    outs: U64Map<CreatePin>,
-    /// Highest block height in this pack. [`None`] = untagged (disconnect keeps it).
-    max_height: Option<u32>,
-    /// Occupancy bytes computed at build (no per-pack script walk).
+type TxidFkMap = HashMap<[u8; 32], Fk, BuildHasherDefault<TxidHasher>>;
+
+#[derive(Debug, Default)]
+struct HeightKeys {
+    txids: Vec<[u8; 32]>,
+    out_ids: Vec<u64>,
     approx_bytes: u64,
 }
 
-impl InFlightLayer {
-    /// Build from planned fks + batch_pin (or packed pin half) Arc clones.
-    pub fn from_plan_pins<'a>(pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>) -> Self {
-        let mut creates = HashMap::new();
-        let mut outs = U64Map::default();
+impl HeightKeys {
+    fn is_empty(&self) -> bool {
+        self.txids.is_empty() && self.out_ids.is_empty()
+    }
+}
+
+/// Load-owned map of prior uncommitted creates (O(1) get; drop by pack height).
+#[derive(Debug, Default)]
+pub struct InFlight {
+    creates: TxidFkMap,
+    outs: U64Map<CreatePin>,
+    by_height: BTreeMap<u32, HeightKeys>,
+    untagged: HeightKeys,
+    approx_bytes: u64,
+}
+
+impl InFlight {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert planned fks + CreatePin outs. `height` is the pack's max height
+    /// ([`None`] = untagged: disconnect and prune keep it).
+    pub fn note_pins<'a>(
+        &mut self,
+        pins: impl IntoIterator<Item = (Fk, &'a CreatePin)>,
+        height: Option<u32>,
+    ) {
+        let mut keys = HeightKeys::default();
         for (fk, pin) in pins {
-            creates.insert(pin.0.txid, fk);
+            self.creates.insert(pin.0.txid, fk);
+            keys.txids.push(pin.0.txid);
+            keys.approx_bytes = keys.approx_bytes.saturating_add(40);
             if let Some(id) = fk.get() {
-                outs.insert(id, Arc::clone(pin));
+                self.outs.insert(id, Arc::clone(pin));
+                keys.out_ids.push(id);
+                keys.approx_bytes = keys
+                    .approx_bytes
+                    .saturating_add(40)
+                    .saturating_add(crate::archive::create_pin_approx_bytes(pin) as u64);
             }
         }
-        let approx_bytes = layer_approx_bytes(&creates, &outs);
-        Self {
-            creates,
-            outs,
-            max_height: None,
-            approx_bytes,
-        }
+        self.commit_keys(keys, height);
     }
 
-    /// Tag the pack's highest height so disconnect prune can drop it.
-    pub fn with_max_height(mut self, height: u32) -> Self {
-        self.max_height = Some(height);
-        self
-    }
-
-    /// Creates-only layer (txid→fk) for already-archived packs without denserels pins.
-    ///
-    /// Lookup tip-ahead needs parent create_fk resolution while Class A of prior
-    /// heights is already on disk but may still be mid-head-insert; publishing
-    /// txid→fk here bridges the gap without requiring full CreatePin outs.
-    pub fn from_txid_fks(pairs: impl IntoIterator<Item = ([u8; 32], Fk)>) -> Self {
-        let mut creates = HashMap::new();
+    /// Creates-only rows (txid→fk, no outs) for already-archived packs.
+    pub fn note_creates(
+        &mut self,
+        pairs: impl IntoIterator<Item = ([u8; 32], Fk)>,
+        height: Option<u32>,
+    ) {
+        let mut keys = HeightKeys::default();
         for (txid, fk) in pairs {
-            creates.insert(txid, fk);
+            self.creates.insert(txid, fk);
+            keys.txids.push(txid);
+            keys.approx_bytes = keys.approx_bytes.saturating_add(40);
         }
-        let outs = U64Map::default();
-        let approx_bytes = layer_approx_bytes(&creates, &outs);
-        Self {
-            creates,
-            outs,
-            max_height: None,
-            approx_bytes,
+        self.commit_keys(keys, height);
+    }
+
+    fn commit_keys(&mut self, keys: HeightKeys, height: Option<u32>) {
+        if keys.is_empty() {
+            return;
         }
+        self.approx_bytes = self.approx_bytes.saturating_add(keys.approx_bytes);
+        let slot = match height {
+            Some(h) => self.by_height.entry(h).or_default(),
+            None => &mut self.untagged,
+        };
+        slot.approx_bytes = slot.approx_bytes.saturating_add(keys.approx_bytes);
+        slot.txids.extend(keys.txids);
+        slot.out_ids.extend(keys.out_ids);
+    }
+
+    fn remove_keys(&mut self, keys: HeightKeys) {
+        for tid in &keys.txids {
+            self.creates.remove(tid);
+        }
+        for id in &keys.out_ids {
+            self.outs.remove(id);
+        }
+        self.approx_bytes = self.approx_bytes.saturating_sub(keys.approx_bytes);
+    }
+
+    /// Drop tagged packs at or above a disconnected height. Untagged stay.
+    pub fn drop_from_height(&mut self, height: u32) {
+        let drop = self.by_height.split_off(&height);
+        for keys in drop.into_values() {
+            self.remove_keys(keys);
+        }
+    }
+
+    /// Drop tagged packs with height below `hi`.
+    ///
+    /// `None` hi keeps every pack. Untagged stay. Equality keeps
+    /// (`hi == pack height`). Load calls this after the last batch of a lookup
+    /// wave finishes its in-flight read, with the drain+fence height
+    /// snapshotted before that wave's TipOnly.
+    pub fn prune_below_height(&mut self, hi: Option<u32>) {
+        let Some(h) = hi else {
+            return;
+        };
+        let keep = self.by_height.split_off(&h);
+        let drop = std::mem::replace(&mut self.by_height, keep);
+        for keys in drop.into_values() {
+            self.remove_keys(keys);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new();
     }
 
     pub fn is_empty(&self) -> bool {
         self.creates.is_empty() && self.outs.is_empty()
     }
 
-    pub fn outs_len(&self) -> usize {
-        self.outs.len()
-    }
-}
-
-fn layer_approx_bytes(creates: &HashMap<[u8; 32], Fk>, outs: &U64Map<CreatePin>) -> u64 {
-    let mut bytes = (creates.len().saturating_add(outs.len()) as u64).saturating_mul(40);
-    for pin in outs.values() {
-        bytes = bytes.saturating_add(crate::archive::create_pin_approx_bytes(pin) as u64);
-    }
-    bytes
-}
-
-/// Plan-owned append-only log of immutable layers.
-#[derive(Debug, Default, Clone)]
-pub struct InFlightLog {
-    layers: Vec<Arc<InFlightLayer>>,
-}
-
-impl InFlightLog {
-    pub fn new() -> Self {
-        Self { layers: Vec::new() }
-    }
-
-    /// Publish one pack. Does not mutate existing layers.
-    ///
-    /// A layer with only `creates` (no outs) is still published — plan=None
-    /// archived packs use creates-only for tip-ahead parent resolve.
-    pub fn note_layer(&mut self, layer: InFlightLayer) {
-        if layer.creates.is_empty() && layer.outs.is_empty() {
-            return;
-        }
-        self.layers.push(Arc::new(layer));
-    }
-
-    /// Drop layers at or above a disconnected height (reorg). Untagged stay.
-    pub fn drop_from_height(&mut self, height: u32) {
-        if self.layers.is_empty() {
-            return;
-        }
-        self.layers.retain(|layer| match layer.max_height {
-            Some(h) => h < height,
-            None => true,
-        });
-        self.layers.shrink_to_fit();
-    }
-
-    /// Drop tagged layers with `max_height` below `hi`.
-    ///
-    /// `None` hi keeps every layer. Untagged (`max_height == None`) stay.
-    /// Equality keeps (`hi == max_height`). Load calls this after the last
-    /// batch of a lookup wave finishes its in-flight read, with the drain+fence
-    /// height snapshotted before that wave's TipOnly.
-    pub fn prune_below_height(&mut self, hi: Option<u32>) {
-        let Some(h) = hi else {
-            return;
-        };
-        if self.layers.is_empty() {
-            return;
-        }
-        self.layers.retain(|layer| match layer.max_height {
-            Some(mh) => mh >= h,
-            None => true,
-        });
-        self.layers.shrink_to_fit();
-    }
-
-    pub fn clear(&mut self) {
-        self.layers.clear();
-        self.layers.shrink_to_fit();
-    }
-
-    /// Prep-facing snapshot: Arc bumps only (no map clone).
-    pub fn snapshot(&self) -> InFlightView {
-        let layers: Arc<[Arc<InFlightLayer>]> = self.layers.iter().cloned().collect();
-        InFlightView { layers }
-    }
-
-    pub fn layer_count(&self) -> usize {
-        self.layers.len()
+    pub fn pack_count(&self) -> usize {
+        self.by_height.len() + usize::from(!self.untagged.is_empty())
     }
 
     pub fn entry_count(&self) -> usize {
-        self.layers.iter().map(|l| l.outs.len()).sum()
+        self.outs.len()
     }
 
-    /// Occupancy for IBD `sizes`: layers, create-pin entries, approx payload bytes.
+    /// Occupancy for IBD `sizes`: height buckets, create-pin entries, approx bytes.
     pub fn size_snapshot(&self) -> (usize, usize, u64) {
-        let mut entries = 0usize;
-        let mut bytes = 0u64;
-        for layer in &self.layers {
-            entries = entries.saturating_add(layer.outs.len());
-            bytes = bytes.saturating_add(layer.approx_bytes);
-        }
-        (self.layers.len(), entries, bytes)
-    }
-}
-
-/// Immutable prep/plan view over published layers (newest→oldest lookup).
-#[derive(Debug, Clone)]
-pub struct InFlightView {
-    layers: Arc<[Arc<InFlightLayer>]>,
-}
-
-impl Default for InFlightView {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl InFlightView {
-    pub fn empty() -> Self {
-        Self {
-            layers: Arc::from([]),
-        }
+        (self.pack_count(), self.outs.len(), self.approx_bytes)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.layers.is_empty() || self.layers.iter().all(|l| l.is_empty())
-    }
-
-    pub fn layer_count(&self) -> usize {
-        self.layers.len()
-    }
-
-    /// Pin material for create fk id (scan newest layer first).
     #[inline]
     pub fn get_out(&self, id: u64) -> Option<&CreatePin> {
-        for layer in self.layers.iter().rev() {
-            if let Some(p) = layer.outs.get(&id) {
-                return Some(p);
-            }
-        }
-        None
+        self.outs.get(&id)
     }
 
-    /// Create fk for txid from prior uncommitted packs.
     #[inline]
     pub fn get_create_fk(&self, txid: &[u8; 32]) -> Option<Fk> {
-        for layer in self.layers.iter().rev() {
-            if let Some(fk) = layer.creates.get(txid) {
-                return Some(*fk);
-            }
-        }
-        None
+        self.creates.get(txid).copied()
     }
 }
 
@@ -253,246 +194,170 @@ mod tests {
     }
 
     #[test]
-    fn creates_only_layer_resolves_txid() {
-        let mut log = InFlightLog::new();
+    fn creates_only_resolves_txid() {
+        let mut m = InFlight::new();
         let mut tid = [0u8; 32];
         tid[0] = 0xab;
-        log.note_layer(InFlightLayer::from_txid_fks([(tid, Fk(42))]));
-        let v = log.snapshot();
-        assert_eq!(v.get_create_fk(&tid), Some(Fk(42)));
-        assert!(v.get_out(42).is_none(), "creates-only has no denserels pin");
+        m.note_creates([(tid, Fk(42))], None);
+        assert_eq!(m.get_create_fk(&tid), Some(Fk(42)));
+        assert!(m.get_out(42).is_none(), "creates-only has no denserels pin");
     }
 
     #[test]
-    fn size_snapshot_counts_layers_and_bytes() {
-        let mut log = InFlightLog::new();
+    fn size_snapshot_counts_packs_and_bytes() {
+        let mut m = InFlight::new();
         let p1 = pin(1);
         let p2 = pin(2);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]));
-        let (layers, entries, bytes) = log.size_snapshot();
-        assert_eq!(layers, 2);
+        m.note_pins([(Fk(1), &p1)], Some(1));
+        m.note_pins([(Fk(2), &p2)], Some(2));
+        let (packs, entries, bytes) = m.size_snapshot();
+        assert_eq!(packs, 2);
         assert_eq!(entries, 2);
         assert!(bytes > 0, "expected non-zero approx bytes");
-        // Two pins with tiny scripts should stay well under 4 KiB.
         assert!(bytes < 4096, "bytes={bytes}");
-        crate::process_mem_stats::note(layers, entries, bytes, 10, 2, 100);
+        crate::process_mem_stats::note(packs, entries, bytes, 10, 2, 100);
         let s = crate::process_mem_stats::load();
         assert_eq!(s.inflight_layers, 2);
         assert_eq!(s.inflight_pins, 2);
         assert_eq!(s.pstore_weak, 10);
         assert_eq!(s.pstore_live, 2);
-        let again = log.size_snapshot();
+        let again = m.size_snapshot();
         assert_eq!(
-            (layers, entries, bytes),
+            (packs, entries, bytes),
             again,
-            "size_snapshot must reuse layer-cached bytes (no per-pack pin walk)"
+            "size_snapshot must reuse cached bytes (no pin walk)"
         );
     }
 
     #[test]
-    fn note_does_not_mutate_prior_layer_arcs() {
-        let mut log = InFlightLog::new();
-        let p1 = pin(1);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
-        let snap = log.snapshot();
-        let layer0 = Arc::clone(&log.layers[0]);
-
-        let p2 = pin(2);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]));
-
-        // Prior layer Arc identity unchanged (no make_mut rebuild).
-        assert!(
-            Arc::ptr_eq(&layer0, &log.layers[0]),
-            "prior layer must not be rebuilt when noting a new pack"
-        );
-        assert_eq!(snap.layer_count(), 1);
-        assert!(snap.get_out(1).is_some());
-        assert!(snap.get_out(2).is_none(), "snapshot is frozen");
-        assert!(log.snapshot().get_out(2).is_some());
+    fn get_misses_until_note() {
+        let mut m = InFlight::new();
+        let p = pin(1);
+        assert!(m.get_create_fk(&p.0.txid).is_none());
+        m.note_pins([(Fk(1), &p)], Some(1));
+        assert!(m.get_create_fk(&p.0.txid).is_some());
+        assert!(m.get_out(1).is_some());
     }
 
     #[test]
-    fn prune_drops_whole_old_layers() {
-        let mut log = InFlightLog::new();
+    fn prune_drops_whole_old_packs() {
+        let mut m = InFlight::new();
         let a = pin(10);
         let b = pin(50);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(3));
-        assert_eq!(log.layer_count(), 2);
-        log.prune_below_height(Some(2));
-        assert_eq!(log.layer_count(), 1);
-        assert!(log.snapshot().get_out(50).is_some());
-        assert!(log.snapshot().get_out(10).is_none());
+        m.note_pins([(Fk(10), &a)], Some(1));
+        m.note_pins([(Fk(50), &b)], Some(3));
+        assert_eq!(m.pack_count(), 2);
+        m.prune_below_height(Some(2));
+        assert_eq!(m.pack_count(), 1);
+        assert!(m.get_out(50).is_some());
+        assert!(m.get_out(10).is_none());
     }
 
-    /// Drop is pack `max_height` vs the wave's pre-TipOnly drain+fence snapshot,
+    /// Drop is pack height vs the wave's pre-TipOnly drain+fence snapshot,
     /// not `tx.head` occupied or `confirmed[]` HWM (mainnet 931147 / 945952).
     #[test]
     fn prune_below_height_drops_strictly_below() {
-        let mut log = InFlightLog::new();
+        let mut m = InFlight::new();
         let confirmed = pin(10);
         let ahead = pin(50);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &confirmed)]).with_max_height(5));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &ahead)]).with_max_height(6));
-        log.prune_below_height(None);
-        assert_eq!(log.layer_count(), 2, "no snapshot: keep every layer");
+        m.note_pins([(Fk(10), &confirmed)], Some(5));
+        m.note_pins([(Fk(50), &ahead)], Some(6));
+        m.prune_below_height(None);
+        assert_eq!(m.pack_count(), 2, "no snapshot: keep every pack");
 
-        log.prune_below_height(Some(5));
-        let v = log.snapshot();
+        m.prune_below_height(Some(5));
         assert!(
-            v.get_create_fk(&confirmed.0.txid).is_some(),
+            m.get_create_fk(&confirmed.0.txid).is_some(),
             "equality keeps (drop is strictly below)"
         );
-        assert!(v.get_create_fk(&ahead.0.txid).is_some());
+        assert!(m.get_create_fk(&ahead.0.txid).is_some());
 
-        log.prune_below_height(Some(6));
-        let v = log.snapshot();
+        m.prune_below_height(Some(6));
         assert!(
-            v.get_create_fk(&confirmed.0.txid).is_none(),
-            "max_height 5 is below noted 6"
+            m.get_create_fk(&confirmed.0.txid).is_none(),
+            "height 5 is below noted 6"
         );
         assert!(
-            v.get_create_fk(&ahead.0.txid).is_some(),
-            "max_height == noted keeps"
+            m.get_create_fk(&ahead.0.txid).is_some(),
+            "height == noted keeps"
         );
 
-        log.prune_below_height(Some(7));
-        assert!(log.snapshot().is_empty());
+        m.prune_below_height(Some(7));
+        assert!(m.is_empty());
     }
 
     #[test]
     fn prune_below_height_keeps_untagged() {
-        let mut log = InFlightLog::new();
+        let mut m = InFlight::new();
         let a = pin(10);
         let b = pin(20);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(20), &b)]));
-        log.prune_below_height(Some(99));
-        let v = log.snapshot();
-        assert!(v.get_create_fk(&a.0.txid).is_none());
-        assert!(v.get_create_fk(&b.0.txid).is_some(), "untagged stays");
+        m.note_pins([(Fk(10), &a)], Some(1));
+        m.note_pins([(Fk(20), &b)], None);
+        m.prune_below_height(Some(99));
+        assert!(m.get_create_fk(&a.0.txid).is_none());
+        assert!(m.get_create_fk(&b.0.txid).is_some(), "untagged stays");
+    }
+
+    #[test]
+    fn prune_below_height_drops_height_index_prefix() {
+        let mut m = InFlight::new();
+        let pins: Vec<_> = (1u32..=20).map(|h| (h, pin(u64::from(h)))).collect();
+        for (h, p) in &pins {
+            m.note_pins([(Fk(u64::from(*h)), p)], Some(*h));
+        }
+        m.prune_below_height(Some(10));
+        assert_eq!(m.pack_count(), 11, "heights 10..=20");
+        assert!(m.get_out(9).is_none());
+        assert!(m.get_out(10).is_some());
+        assert!(m.get_out(20).is_some());
+        m.drop_from_height(15);
+        assert!(m.get_out(14).is_some());
+        assert!(m.get_out(15).is_none());
+        assert!(m.get_out(20).is_none());
+        assert_eq!(m.pack_count(), 5, "heights 10..=14");
     }
 
     #[test]
     fn drop_from_height_keeps_lower_and_untagged() {
-        let mut log = InFlightLog::new();
+        let mut m = InFlight::new();
         let a = pin(10);
         let b = pin(20);
         let c = pin(30);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(1));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(20), &b)]).with_max_height(3));
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(30), &c)]));
-        log.drop_from_height(3);
-        let v = log.snapshot();
-        assert!(v.get_create_fk(&a.0.txid).is_some());
-        assert!(v.get_create_fk(&b.0.txid).is_none());
-        assert!(v.get_create_fk(&c.0.txid).is_some(), "untagged stays");
+        m.note_pins([(Fk(10), &a)], Some(1));
+        m.note_pins([(Fk(20), &b)], Some(3));
+        m.note_pins([(Fk(30), &c)], None);
+        m.drop_from_height(3);
+        assert!(m.get_create_fk(&a.0.txid).is_some());
+        assert!(m.get_create_fk(&b.0.txid).is_none());
+        assert!(m.get_create_fk(&c.0.txid).is_some(), "untagged stays");
     }
 
     #[test]
-    fn clear_drops_all_layers_and_entries() {
-        let mut log = InFlightLog::new();
+    fn clear_drops_all_packs_and_entries() {
+        let mut m = InFlight::new();
         for i in 1u64..=5 {
             let p = pin(i);
-            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
+            m.note_pins([(Fk(i), &p)], Some(i as u32));
         }
-        assert_eq!(log.layer_count(), 5);
-        assert_eq!(log.entry_count(), 5);
-        let held = log.snapshot();
-        assert_eq!(held.layer_count(), 5);
-        log.clear();
-        assert_eq!(log.layer_count(), 0);
-        assert_eq!(log.entry_count(), 0);
-        // Prior snapshot stays valid (immutable); log is empty for new notes.
-        assert_eq!(held.layer_count(), 5);
-        assert!(held.get_out(3).is_some());
-        assert!(log.snapshot().is_empty());
+        assert_eq!(m.pack_count(), 5);
+        assert_eq!(m.entry_count(), 5);
+        m.clear();
+        assert_eq!(m.pack_count(), 0);
+        assert_eq!(m.entry_count(), 0);
+        assert!(m.is_empty());
         let p = pin(99);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(99), &p)]));
-        assert_eq!(log.layer_count(), 1);
-        assert!(log.snapshot().get_out(99).is_some());
-        assert!(log.snapshot().get_out(1).is_none());
+        m.note_pins([(Fk(99), &p)], Some(9));
+        assert_eq!(m.pack_count(), 1);
+        assert!(m.get_out(99).is_some());
+        assert!(m.get_out(1).is_none());
     }
 
     #[test]
-    fn snapshot_stable_while_log_notes_more() {
-        let mut log = InFlightLog::new();
-        let p1 = pin(1);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
-        let held = log.snapshot();
-        for i in 2u64..=40 {
-            let p = pin(i);
-            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
-        }
-        // Prep-held view still only sees pack 1.
-        assert_eq!(held.layer_count(), 1);
-        assert!(held.get_out(1).is_some());
-        assert!(held.get_out(40).is_none());
-        assert_eq!(log.layer_count(), 40);
-    }
-
-    /// Timed multi-pack note while a prep snapshot is held — must stay O(C)
-    /// per pack (no O(N) whole-map clone). Guards Phase A performance.
-    #[test]
-    fn multi_pack_note_under_held_snapshot_is_cheap() {
-        use std::time::Instant;
-
-        const PACKS: u64 = 80;
-        const PER_PACK: u64 = 2_000;
-
-        let mut log = InFlightLog::new();
-        // Seed depth so N is large before the timed region.
-        for pack in 0..40u64 {
-            let pins: Vec<_> = (0..PER_PACK)
-                .map(|i| {
-                    let id = pack * PER_PACK + i + 1;
-                    let p = pin(id);
-                    (Fk(id), p)
-                })
-                .collect();
-            log.note_layer(InFlightLayer::from_plan_pins(
-                pins.iter().map(|(f, p)| (*f, p)),
-            ));
-        }
-        let held = log.snapshot();
-        assert!(held.layer_count() >= 40);
-
-        let t0 = Instant::now();
-        for pack in 40..PACKS {
-            let pins: Vec<_> = (0..PER_PACK)
-                .map(|i| {
-                    let id = pack * PER_PACK + i + 1;
-                    let p = pin(id);
-                    (Fk(id), p)
-                })
-                .collect();
-            log.note_layer(InFlightLayer::from_plan_pins(
-                pins.iter().map(|(f, p)| (*f, p)),
-            ));
-        }
-        let elapsed = t0.elapsed();
-        // Held snapshot must remain frozen.
-        assert_eq!(held.layer_count(), 40);
-        assert!(held.get_out(1).is_some());
-        assert!(held.get_out(40 * PER_PACK + 1).is_none());
-
-        // 40 packs × 2000 pins under a held snapshot of 40 prior packs
-        // (≈80k live entries when finishing). Old make_mut path cloned O(N)
-        // HashMap shells each tick → multi-second; immutable note is O(C).
-        eprintln!(
-            "inflight_bench: packs={} per_pack={} note_under_hold={:?} final_layers={} final_entries={}",
-            PACKS - 40,
-            PER_PACK,
-            elapsed,
-            log.layer_count(),
-            log.entry_count()
-        );
-        assert!(
-            elapsed.as_millis() < 2_000,
-            "note under held snapshot too slow: {elapsed:?} (possible map-clone regression)"
-        );
-        assert_eq!(log.layer_count(), PACKS as usize);
-        let _ = held;
+    fn empty_note_is_noop() {
+        let mut m = InFlight::new();
+        m.note_pins(std::iter::empty(), Some(1));
+        m.note_creates(std::iter::empty(), Some(1));
+        assert!(m.is_empty());
+        assert_eq!(m.pack_count(), 0);
     }
 }

@@ -2542,17 +2542,20 @@ mod tests {
 
         // Batch 1 at store tip+1 (path_lo=1).
         let batch1 = [(rbitcoin_primitives::Height(1), b1.clone())];
-        let mut pipe = WireLoadPipeline {
-            path_lo: 1,
-            parent_hash: None,
-            next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
-            in_flight: rbitcoin_query::InFlightView::empty(),
-            skeleton: None,
+        let mut inflight = rbitcoin_query::InFlight::new();
+        let mut next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
+        let mat1 = {
+            let pipe = WireLoadPipeline {
+                path_lo: 1,
+                parent_hash: None,
+                next_tx_start,
+                in_flight: &inflight,
+                skeleton: None,
+            };
+            hub.confirm_wire_load_phase_pipelined(&batch1, Some(&pipe))
+                .expect("prep1")
+                .expect("prep1 some")
         };
-        let mat1 = hub
-            .confirm_wire_load_phase_pipelined(&batch1, Some(&pipe))
-            .expect("prep1")
-            .expect("prep1 some");
         assert_eq!(mat1.batch.len(), 1);
         assert!(mat1.batch.archive_plan.is_some());
         assert_eq!(
@@ -2561,40 +2564,43 @@ mod tests {
             "tip must not advance on load alone"
         );
 
-        // Update pipeline caches from plan (lookup-thread note_lookup_ok).
+        // Update pipeline caches from plan (load-thread note_lookup_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
-        {
-            let mut log = rbitcoin_query::InFlightLog::new();
-            let layer = if plan.batch_pin.len() == plan.planned_fks.len() {
-                rbitcoin_query::InFlightLayer::from_plan_pins(
-                    plan.planned_fks
-                        .iter()
-                        .zip(plan.batch_pin.iter())
-                        .map(|(fk, pin)| (*fk, pin)),
-                )
-            } else {
-                rbitcoin_query::InFlightLayer::from_plan_pins(
-                    plan.packed
-                        .iter()
-                        .zip(plan.planned_fks.iter())
-                        .map(|((pin, _), fk)| (*fk, pin)),
-                )
-            };
-            log.note_layer(layer);
-            pipe.in_flight = log.snapshot();
+        if plan.batch_pin.len() == plan.planned_fks.len() {
+            inflight.note_pins(
+                plan.planned_fks
+                    .iter()
+                    .zip(plan.batch_pin.iter())
+                    .map(|(fk, pin)| (*fk, pin)),
+                None,
+            );
+        } else {
+            inflight.note_pins(
+                plan.packed
+                    .iter()
+                    .zip(plan.planned_fks.iter())
+                    .map(|((pin, _), fk)| (*fk, pin)),
+                None,
+            );
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
-            pipe.next_tx_start = last.saturating_add(1).max(1);
+            next_tx_start = last.saturating_add(1).max(1);
         }
-        pipe.path_lo = 2;
-        pipe.parent_hash = Some(h1.to_byte_array());
 
         // Batch 2 while tip still 0 — must NOT Ok(None).
         let batch2 = [(rbitcoin_primitives::Height(2), b2.clone())];
-        let mat2 = hub
-            .confirm_wire_load_phase_pipelined(&batch2, Some(&pipe))
-            .expect("prep2 err")
-            .expect("prep2 must Some — pipeline path_lo=2 with tip=0");
+        let mat2 = {
+            let pipe = WireLoadPipeline {
+                path_lo: 2,
+                parent_hash: Some(h1.to_byte_array()),
+                next_tx_start,
+                in_flight: &inflight,
+                skeleton: None,
+            };
+            hub.confirm_wire_load_phase_pipelined(&batch2, Some(&pipe))
+                .expect("prep2 err")
+                .expect("prep2 must Some — pipeline path_lo=2 with tip=0")
+        };
         assert_eq!(mat2.batch.len(), 1);
         assert!(mat2.batch.archive_plan.is_some());
         // Reserved fks for batch2 start after batch1's plan.

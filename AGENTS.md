@@ -90,11 +90,11 @@ Pin material is **plan / batch only** (`batch_pin`, `BatchParents`). No process
 create pin FIFO. IBD confirm intake
 is **body queue wire only** → lookup → load.
 
-In-flight CreatePin layers drop after load finishes the last batch of a
-lookup wave: lookup snapshots `HeightFence::drain_and_fence_hi` before
-TipOnly and passes it on that batch; load then drops tagged layers with
-`max_height` below the snapshot. Stamp attaches the CreatePin from
-`InFlightView`. Not a coins cache or process pin FIFO.
+In-flight CreatePin map is load-thread owned. Drop after load finishes the
+last batch of a lookup wave: lookup snapshots `HeightFence::drain_and_fence_hi`
+before TipOnly and passes it on that batch; load then drops tagged packs with
+height below the snapshot. Stamp attaches the CreatePin from `InFlight`.
+Not a coins cache or process pin FIFO.
 
 Leftover identity, stage IO, S0–S4: **[`docs/invariants.md`](docs/invariants.md)**
 (the only Allowed/Forbidden IO table). In-flight prune after the last

@@ -104,7 +104,7 @@ pub fn confirm_wire_lookup_stamp(
     query.on_load_pack().map_err(ConsensusError::from)?;
     let (mut plan, metas, wire_blocks, plan_ns) =
         wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
-    let ifo = pipeline.map(|p| &p.in_flight);
+    let ifo = pipeline.map(|p| p.in_flight);
     let parent_pin = match plan.as_mut() {
         Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(
@@ -136,7 +136,7 @@ pub(super) fn stamp_parent_pin_archived(
     params: &ChainParams,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
-    in_flight: Option<&rbitcoin_query::InFlightView>,
+    in_flight: Option<&rbitcoin_query::InFlight>,
     skeleton: Option<&rbitcoin_query::BatchParentIds>,
 ) -> Result<ParentPinStamp, ConsensusError> {
     let mut same_batch: HashMap<[u8; 32], u64> = HashMap::new();
@@ -172,7 +172,7 @@ pub(super) fn stamp_parent_pin_archived(
             }
         }
     }
-    let empty = rbitcoin_query::InFlightView::empty();
+    let empty = rbitcoin_query::InFlight::new();
     let ifo = in_flight.unwrap_or(&empty);
     let need_vec: Vec<[u8; 32]> = need_external.into_keys().collect();
     let ext = rbitcoin_query::stamp_external_parents(query.store(), &need_vec, ifo, skeleton)
@@ -237,7 +237,7 @@ pub fn confirm_wire_load_from_plan(
         ..
     } = stamped;
 
-    let ifo = pipeline.map(|p| &p.in_flight);
+    let ifo = pipeline.map(|p| p.in_flight);
     let (batch_parents, spend_edges, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
@@ -450,7 +450,7 @@ pub(super) fn wire_lookup_phase(
                 .archive_plan_batch_from_wire(
                     &need,
                     p.next_tx_start.max(1),
-                    &p.in_flight,
+                    p.in_flight,
                     p.skeleton.as_ref(),
                 )
                 .map_err(ConsensusError::from)?,
@@ -458,7 +458,7 @@ pub(super) fn wire_lookup_phase(
                 .archive_plan_batch_from_wire(
                     &need,
                     query.tx_body_count().saturating_add(1).max(1),
-                    &rbitcoin_query::InFlightView::empty(),
+                    &rbitcoin_query::InFlight::new(),
                     None,
                 )
                 .map_err(ConsensusError::from)?,
@@ -867,7 +867,7 @@ mod tests {
         let helper = rbitcoin_query::stamp_external_parents(
             q.store(),
             &[parent_txid],
-            &rbitcoin_query::InFlightView::empty(),
+            &rbitcoin_query::InFlight::new(),
             Some(&skel),
         )
         .expect("shared helper");

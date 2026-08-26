@@ -7,7 +7,7 @@ use super::{
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;
-use rbitcoin_query::{InFlightLayer, InFlightLog};
+use rbitcoin_query::InFlight;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::sync::Arc;
 
@@ -31,11 +31,9 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
 /// Pack stays until a later wave snapshots drain+fence past its height (not pack height alone).
 #[test]
 fn prune_inflight_drops_below_wave_drain_fence_keeps_equal() {
-    let mut log = InFlightLog::new();
+    let mut log = InFlight::new();
     let pins: Vec<_> = (85u64..=100).map(|id| (Fk(id), test_pin(id))).collect();
-    log.note_layer(
-        InFlightLayer::from_plan_pins(pins.iter().map(|(f, p)| (*f, p))).with_max_height(10),
-    );
+    log.note_pins(pins.iter().map(|(f, p)| (*f, p)), Some(10));
     log.prune_below_height(Some(9));
     assert_eq!(log.entry_count(), 16, "noted 9: height 10 is not below");
     log.prune_below_height(Some(10));
@@ -45,7 +43,7 @@ fn prune_inflight_drops_below_wave_drain_fence_keeps_equal() {
         "equality keeps (drop is strictly below)"
     );
     log.prune_below_height(Some(11));
-    assert_eq!(log.layer_count(), 0);
+    assert_eq!(log.pack_count(), 0);
 }
 
 /// Mainnet 187: first pack writes (drain+fence), next pack spends those creates.
@@ -195,33 +193,14 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
 /// Drain can lead fence; tip prune must still keep the unconfirmed height.
 #[test]
 fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
-    let mut log = InFlightLog::new();
+    let mut log = InFlight::new();
     let p = test_pin(42);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(42), &p)]).with_max_height(1));
+    log.note_pins([(Fk(42), &p)], Some(1));
     log.prune_below_height(Some(0));
     assert!(
-        log.snapshot().get_create_fk(&p.0.txid).is_some(),
+        log.get_create_fk(&p.0.txid).is_some(),
         "occupied/fence lag must not drop height > tip"
     );
-}
-
-/// Lookup may note new packs while load holds a prior snapshot — prior Arc
-/// layers must stay frozen (no whole-map make_mut).
-#[test]
-fn note_while_prep_holds_snapshot_does_not_clone_prior_layers() {
-    let mut log = InFlightLog::new();
-    let p1 = test_pin(1);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
-    let held = log.snapshot();
-    for i in 2u64..=30 {
-        let p = test_pin(i);
-        log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
-    }
-    assert_eq!(held.layer_count(), 1);
-    assert!(held.get_out(1).is_some());
-    assert!(held.get_out(30).is_none());
-    assert_eq!(log.layer_count(), 30);
-    assert!(log.snapshot().get_out(30).is_some());
 }
 
 fn bh(b: u8) -> BlockHash {
@@ -417,21 +396,20 @@ fn last_sent_load_batch_carries_wave_drain_fence() {
 
 #[test]
 fn marked_load_batch_drops_inflight_below_after_read() {
-    let mut log = InFlightLog::new();
+    let mut log = InFlight::new();
     let a = test_pin(10);
     let b = test_pin(50);
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(10), &a)]).with_max_height(5));
-    log.note_layer(InFlightLayer::from_plan_pins([(Fk(50), &b)]).with_max_height(20));
+    log.note_pins([(Fk(10), &a)], Some(5));
+    log.note_pins([(Fk(50), &b)], Some(20));
     log.prune_below_height(None);
-    assert_eq!(log.layer_count(), 2, "unmarked batch does not drop");
+    assert_eq!(log.pack_count(), 2, "unmarked batch does not drop");
     log.prune_below_height(Some(10));
-    let v = log.snapshot();
     assert!(
-        v.get_create_fk(&a.0.txid).is_none(),
+        log.get_create_fk(&a.0.txid).is_none(),
         "height 5 is below noted 10 after last-batch in-flight read"
     );
     assert!(
-        v.get_create_fk(&b.0.txid).is_some(),
+        log.get_create_fk(&b.0.txid).is_some(),
         "height 20 stays until a later wave snapshots past it"
     );
 }

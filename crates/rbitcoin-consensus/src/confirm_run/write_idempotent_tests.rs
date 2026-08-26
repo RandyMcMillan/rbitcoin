@@ -1375,16 +1375,12 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         output_count: 0,
     };
     let pin = std::sync::Arc::new((parent_tx, Vec::new()));
-    let mut log = rbitcoin_query::InFlightLog::new();
-    log.note_layer(rbitcoin_query::InFlightLayer::from_plan_pins([(
-        Fk(parent_id),
-        &pin,
-    )]));
-    let ifo = log.snapshot();
+    let mut inflight = rbitcoin_query::InFlight::new();
+    inflight.note_pins([(Fk(parent_id), &pin)], None);
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
-    let err = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], Some(&ifo))
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], Some(&inflight))
         .expect_err("incomplete outs must hard-fail pin");
     let msg = format!("{err}");
     assert!(

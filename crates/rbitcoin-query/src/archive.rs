@@ -43,6 +43,7 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
 #[derive(Debug)]
 pub struct ArchiveWritePlan {
     /// Body-append rows: shared [`CreatePin`] (tx + outs) + inputs.
+    /// IBD stamp clears ins after plan; write fills from wire + [`Self::edges`].
     /// Outs live once in the pin Arc (not duplicated alongside inputs).
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,

@@ -109,6 +109,12 @@ pub fn confirm_wire_lookup_stamp(
         Some(p) => ParentPinStamp::take_from_plan(p),
         None => stamp_parent_pin_archived(query, params, &metas, &wire_blocks, ifo)?,
     };
+    if let Some(ref mut p) = plan {
+        for (_, ins) in &mut p.packed {
+            ins.clear();
+            ins.shrink_to_fit();
+        }
+    }
     lookup_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     lookup_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
     let work_ns = t0.elapsed().as_nanos() as u64;

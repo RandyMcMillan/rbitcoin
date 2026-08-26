@@ -2369,6 +2369,15 @@ fn store_start_states_lookup_load_confirm() {
         let arcs = [(Height(h_s0), Arc::new(b_s0.clone()), None)];
         let stamped = confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("S0 lookup");
         assert!(stamped.plan.is_some(), "S0 must plan Class A");
+        let plan = stamped.plan.as_ref().expect("plan");
+        assert!(
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "IBD stamp must not carry packed InputRecords to load/write"
+        );
+        assert!(
+            !plan.edges.is_empty(),
+            "IBD stamp must carry SpendEdges for pin/write encode"
+        );
         assert!(
             stamped.parent_pin.idents.values().any(|p| p.body.is_some()),
             "S0 lookup must stamp external parent body ranges"

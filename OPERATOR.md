@@ -384,31 +384,31 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **20** | Open. |
-| **19** or **18**, empty `tx.head` | Rewrite `meta` to 20, then open. Occupied SH is kept. |
-| **19** or **18**, occupied `tx.head` | **Refuse.** Wipe `store/tx.head`, keep Class A and SH, restart (head rebuilds). |
+| **20** | Open (SH is compact `BDZ3`). |
+| **19** or **18**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 20, then open. |
+| **19** or **18**, occupied `tx.head` or any `scripthash*` | **Refuse.** Wipe `store/tx.head` and `store/scripthash*`, keep Class A, restart. |
 | **17**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 20, then open. |
 | **17**, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
 | Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
 
 A **19 binary** refuses 20 `meta` (do not downgrade in place).
 
-When the 20 `tx.head` refuse fires, the log line is:
+When the 20 index refuse fires, the log line is:
 
 ```text
-schema 20 refuses schema-18/19 tx.head; wipe store/tx.head then restart (Class A and scripthash kept; tx.head rebuilds)
+schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)
 ```
 
 Copy-paste (node stopped with SIGTERM):
 
 ```bash
 DATADIR=/path/to/datadir
-rm -rf "$DATADIR/store/tx.head"
+rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
 ```
 
-Keep Class A (`txout` / `inwit` / `spent` + idx, `txid.body`, headers),
-Class C, and `scripthash*`. Restart the same binary: `tx.head` rebuilds from
-Class A. Do **not** `rm -rf store/`.
+Keep Class A (`txout` / `inwit` / `spent` + idx, `txid.body`, headers) and
+Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
+`--shindex`, SH rematerializes. Do **not** `rm -rf store/`.
 
 When the 17-index refuse fires, the log line is:
 

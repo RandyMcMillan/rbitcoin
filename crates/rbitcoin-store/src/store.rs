@@ -252,6 +252,14 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
+        if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
+            if crate::segmented_head::SegmentedTxHead::disk_occupied(&path)
+                || scripthash_index_data_present(&path)
+            {
+                return Err(StoreError::Corrupt(SCHEMA20_INDEX_REFUSE));
+            }
+            rewrite_meta_current(&path)?;
+        }
         let leftover_epoch = path.join("archive_epoch");
         if leftover_epoch.exists() {
             eprintln!(
@@ -322,12 +330,6 @@ impl Store {
         if meta_ver == 17 {
             if schema17_index_data_present(&path) {
                 return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
-            }
-            rewrite_meta_current(&path)?;
-        }
-        if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
-            if crate::segmented_head::SegmentedTxHead::disk_occupied(&path) {
-                return Err(StoreError::Corrupt(SCHEMA20_TX_HEAD_REFUSE));
             }
             rewrite_meta_current(&path)?;
         }
@@ -1419,8 +1421,8 @@ fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
 /// One-line 17→18 index refuse (`Store::open` + tests).
 const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
 
-/// One-line 18/19→20 `tx.head` refuse (`Store::open` + tests).
-const SCHEMA20_TX_HEAD_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head; wipe store/tx.head then restart (Class A and scripthash kept; tx.head rebuilds)";
+/// One-line 18/19→20 index refuse (`Store::open` + tests).
+const SCHEMA20_INDEX_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)";
 
 fn schema17_index_data_present(dir: &Path) -> bool {
     crate::segmented_head::SegmentedTxHead::disk_occupied(dir) || scripthash_index_data_present(dir)
@@ -2074,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn open_schema18_occupied_scripthash_upgrades_meta_to_19() {
+    fn open_schema18_occupied_scripthash_refused() {
         let dir = tmp();
         let sh = [0xabu8; 32];
         {
@@ -2086,12 +2088,14 @@ mod tests {
             assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
         }
         write_store_meta_ver(&dir, 18);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema-18 scripthash data"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
         assert_eq!(read_store_meta_ver(&dir), 18);
-        let s = Store::open(&dir).unwrap();
-        assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 20);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2190,7 +2194,7 @@ mod tests {
         match Store::open(&dir) {
             Ok(_) => panic!("expected refuse for schema-19 tx.head occupancy"),
             Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA20_TX_HEAD_REFUSE);
+                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2212,7 +2216,7 @@ mod tests {
         match Store::open(&dir) {
             Ok(_) => panic!("expected refuse for schema-18 tx.head occupancy"),
             Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA20_TX_HEAD_REFUSE);
+                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2239,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn open_schema19_scripthash_only_upgrades() {
+    fn open_schema19_scripthash_only_refused() {
         let dir = tmp();
         let sh = [0xcdu8; 32];
         {
@@ -2250,10 +2254,14 @@ mod tests {
             s.flush().unwrap();
         }
         write_store_meta_ver(&dir, 19);
-        let s = Store::open(&dir).unwrap();
-        assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema-19 scripthash data"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 19);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

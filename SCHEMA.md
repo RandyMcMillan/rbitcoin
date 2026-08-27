@@ -2,12 +2,14 @@
 
 **Version:** `SCHEMA_VERSION = 20` (`rbitcoin_primitives`).  
 **Status:** 20 replaces sealed `tx.head` MPHF+`.rel` with a value-assigned
-packed BDZ (`BDZ2`; `index(key) = rel−1`). Fuse8 stays 8-bit RAM. Occupied
-schema 18/19 `tx.head` is **refused** (wipe `store/tx.head`, keep Class A and
-SH). Empty 18/19 `tx.head` rewrites `meta` to 20 and rebuilds from Class A.
-An 19 binary refuses 20 `meta`. A 17 datadir with populated `tx.head`
-or `scripthash*` is **refused** (wipe those dirs, keep Class A, restart to
-rebuild). Empty 17 indexes rewrite `meta` to 20.
+packed BDZ (`BDZ2`; `index(key) = rel−1`) and sealed SH MPHF with compact
+`BDZ3` (2-bit `g` + occupancy rank; mix64 tags + pack8 `.val` unchanged).
+Fuse8 on `tx.head` stays 8-bit RAM. Occupied schema 18/19 `tx.head` or
+`scripthash*` is **refused** (wipe those index dirs, keep Class A). Empty
+18/19 indexes rewrite `meta` to 20; `tx.head` rebuilds from Class A; SH
+rematerializes with `--shindex`. An 19 binary refuses 20 `meta`. A 17
+datadir with populated `tx.head` or `scripthash*` is **refused**. Empty 17
+indexes rewrite `meta` to 20.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
@@ -30,10 +32,10 @@ Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 `schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
 Empty 17 indexes rewrite `meta` to 20 **before** `TxTable::open` (so a following
 head rebuild cannot trip the refuse).  
-**18/19→20 open:** If `tx.head` occupancy exists:
-`schema 20 refuses schema-18/19 tx.head; wipe store/tx.head then restart (Class A and scripthash kept; tx.head rebuilds)`.
-Empty `tx.head` rewrites `meta` to 20 **before** `TxTable::open`. Occupied SH
-without `tx.head` stays; 19 SH pages remain readable.  
+**18/19→20 open:** If `tx.head` occupancy or any `scripthash*` data exists:
+`schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)`.
+Empty 18/19 indexes rewrite `meta` to 20 **before** `ScriptHashTable::open` /
+`TxTable::open`. `meta=20` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
 **18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
 Mode 10 paged heads stay readable; new megakeys write mode 11.  
 **Endianness:** little-endian for all multi-byte integers.
@@ -514,11 +516,13 @@ wrote them; inserting a later block before an earlier one can leave permanent ho
 Cold bulk: pick the **exact** geometric class from the run-group length (or emit
 pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 
-### Head (schema 18 / 19)
+### Head (schema 20)
 
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
-- **Main (sealed):** `scripthash.head/NN.mphf` (BDZ 3-graph, then `n` mix64(key16)
-  tags) + `NN.val` (`n × 8` pack8). MPHF maps into `[0, n)`; a miss fails the
+- **Main (sealed):** `scripthash.head/NN.mphf` (`BDZ3` 32 B header, packed 2-bit
+  `g[m]`, occupancy bitvector `[m]`, then `n` mix64(key16) tags) + `NN.val`
+  (`n × 8` pack8). Packed `g` is FdOnly 4 KiB pages; occupancy is
+  sequential-read into RAM on open. MPHF maps into `[0, n)`; a miss fails the
   tag check (no main `.fuse8`). Record count is immutable after seal. Existing
   keys pwrite pack8 at `i×8`. New keys are **not** punched into main.
 - pack8 (LE u64): bits 63–62 mode; `00` = 1-fk `create_fk`; `01` = slab

@@ -54,6 +54,11 @@ before 1.0).
 
 ### Changed
 
+- **Parallel `tx.head` wipe-rebuild:** ranges seal concurrently,
+  min(CPUs, free RAM / **750 MiB**, range count). Distinct from SH
+  materialize (1.5 GiB/worker). `RBITCOIN_TX_HEAD_REBUILD_WORKERS`
+  overrides (`1` = serial).
+
 - **`tx.head` seal uses less RAM:** uniqueness is an in-place sort (no
   per-key `HashMap<Vec>`), BDZ peel is XOR-degree with reused scratch
   (no CSR+edge list), fuse builds from the unique key vec, packed BDZ2

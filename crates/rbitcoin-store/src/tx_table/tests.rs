@@ -2523,161 +2523,167 @@ fn segmented_head_roll_and_lookup_via_tx_table() {
 #[test]
 fn empty_occupancy_head_open_rebuilds_mphf_not_oa_backfill() {
     TxTable::test_with_rebuild_seal_bits(6, || {
-        let dir = tempfile_dir("empty-occ-rebuild");
-        let layout = crate::address_head::default_layout();
-        {
-            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
-            let recs: Vec<TxRecord> = (0..65u64)
-                .map(|i| {
-                    let mut txid = [0u8; 32];
-                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                    TxRecord {
-                        txid,
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 0,
-                        output_start_fk: Fk::NULL,
-                        output_count: 0,
-                    }
-                })
-                .collect();
-            t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                .unwrap();
-            t.flush().unwrap();
-        }
-        crate::segmented_head::wipe_segmented_head_files(&dir);
-        crate::segmented_head::SegmentedTxHead::create(&dir, layout).unwrap();
-        assert!(crate::segmented_head::head_meta_exists(&dir));
-        let t = TxTable::open(&dir).unwrap();
-        assert!(
-            t.head.sealed_segment_count() >= 2,
-            "empty occupancy must full-rebuild, sealed={}",
-            t.head.sealed_segment_count()
-        );
-        assert!(!dir.join("tx.head").join("000000").is_file());
-        let mut txid = [0u8; 32];
-        txid[0..8].copy_from_slice(&65u64.to_le_bytes());
-        assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(65)));
-        let _ = std::fs::remove_dir_all(&dir);
+        TxTable::test_with_rebuild_workers(2, || {
+            let dir = tempfile_dir("empty-occ-rebuild");
+            let layout = crate::address_head::default_layout();
+            {
+                let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+                let recs: Vec<TxRecord> = (0..65u64)
+                    .map(|i| {
+                        let mut txid = [0u8; 32];
+                        txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                        TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 0,
+                            output_start_fk: Fk::NULL,
+                            output_count: 0,
+                        }
+                    })
+                    .collect();
+                t.put_full_batch_indexed(&meta_only_items(&recs), true)
+                    .unwrap();
+                t.flush().unwrap();
+            }
+            crate::segmented_head::wipe_segmented_head_files(&dir);
+            crate::segmented_head::SegmentedTxHead::create(&dir, layout).unwrap();
+            assert!(crate::segmented_head::head_meta_exists(&dir));
+            let t = TxTable::open(&dir).unwrap();
+            assert!(
+                t.head.sealed_segment_count() >= 2,
+                "empty occupancy must full-rebuild, sealed={}",
+                t.head.sealed_segment_count()
+            );
+            assert!(!dir.join("tx.head").join("000000").is_file());
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&65u64.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(65)));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     });
 }
 
 #[test]
 fn rebuild_head_direct_mphf_empty_tail() {
     TxTable::test_with_rebuild_seal_bits(6, || {
-        let dir = tempfile_dir("rebuild-direct-mphf");
-        {
-            let t = create_tiny(&dir);
-            let recs: Vec<TxRecord> = (0..65u64)
-                .map(|i| {
-                    let mut txid = [0u8; 32];
-                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                    TxRecord {
-                        txid,
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 0,
-                        output_start_fk: Fk::NULL,
-                        output_count: 0,
-                    }
-                })
-                .collect();
-            t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                .unwrap();
-            t.flush().unwrap();
-        }
-        crate::segmented_head::wipe_segmented_head_files(&dir);
-        let t = TxTable::open(&dir).unwrap();
-        assert!(
-            t.head.sealed_segment_count() >= 2,
-            "T=64, n=65 must seal two MPHF ranges, sealed={} segs={}",
-            t.head.sealed_segment_count(),
-            t.head.segment_count()
-        );
-        let root = dir.join("tx.head");
-        assert!(
-            !root.join("000000").is_file(),
-            "sealed range must not keep an OA file"
-        );
-        assert!(
-            !root.join("000001").is_file(),
-            "remainder must seal, not stay OA"
-        );
-        assert!(crate::tx_head_mphf::TxHeadMphf::exists(
-            &root.join("000000")
-        ));
-        assert!(crate::tx_head_mphf::TxHeadMphf::exists(
-            &root.join("000001")
-        ));
-        assert!(!crate::tx_head_mphf::rel_path(&root.join("000000")).is_file());
-        assert!(!crate::tx_head_mphf::rel_path(&root.join("000001")).is_file());
-        assert_eq!(
-            &std::fs::read(crate::tx_head_mphf::mphf_path(&root.join("000000"))).unwrap()[0..4],
-            b"BDZ2"
-        );
-        match t.head.open_tail_range() {
-            Some((_, 0)) => {}
-            other => panic!("expected empty open tail, got {other:?}"),
-        }
-        for i in [1u64, 64, 65] {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        TxTable::test_with_rebuild_workers(2, || {
+            let dir = tempfile_dir("rebuild-direct-mphf");
+            {
+                let t = create_tiny(&dir);
+                let recs: Vec<TxRecord> = (0..65u64)
+                    .map(|i| {
+                        let mut txid = [0u8; 32];
+                        txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                        TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 0,
+                            output_start_fk: Fk::NULL,
+                            output_count: 0,
+                        }
+                    })
+                    .collect();
+                t.put_full_batch_indexed(&meta_only_items(&recs), true)
+                    .unwrap();
+                t.flush().unwrap();
+            }
+            crate::segmented_head::wipe_segmented_head_files(&dir);
+            let t = TxTable::open(&dir).unwrap();
+            assert!(
+                t.head.sealed_segment_count() >= 2,
+                "T=64, n=65 must seal two MPHF ranges, sealed={} segs={}",
+                t.head.sealed_segment_count(),
+                t.head.segment_count()
+            );
+            let root = dir.join("tx.head");
+            assert!(
+                !root.join("000000").is_file(),
+                "sealed range must not keep an OA file"
+            );
+            assert!(
+                !root.join("000001").is_file(),
+                "remainder must seal, not stay OA"
+            );
+            assert!(crate::tx_head_mphf::TxHeadMphf::exists(
+                &root.join("000000")
+            ));
+            assert!(crate::tx_head_mphf::TxHeadMphf::exists(
+                &root.join("000001")
+            ));
+            assert!(!crate::tx_head_mphf::rel_path(&root.join("000000")).is_file());
+            assert!(!crate::tx_head_mphf::rel_path(&root.join("000001")).is_file());
+            assert_eq!(
+                &std::fs::read(crate::tx_head_mphf::mphf_path(&root.join("000000"))).unwrap()[0..4],
+                b"BDZ2"
+            );
+            match t.head.open_tail_range() {
+                Some((_, 0)) => {}
+                other => panic!("expected empty open tail, got {other:?}"),
+            }
+            for i in [1u64, 64, 65] {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     });
 }
 
 #[test]
 fn rebuild_head_direct_mphf_bip30_newest_first() {
     TxTable::test_with_rebuild_seal_bits(6, || {
-        let dir = tempfile_dir("rebuild-direct-bip30");
-        {
-            let t = create_tiny(&dir);
+        TxTable::test_with_rebuild_workers(2, || {
+            let dir = tempfile_dir("rebuild-direct-bip30");
+            {
+                let t = create_tiny(&dir);
+                let mut shared = [0u8; 32];
+                shared[0..8].copy_from_slice(&1u64.to_le_bytes());
+                let r1 = TxRecord {
+                    txid: shared,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                };
+                let r2 = r1.clone();
+                let mut rest: Vec<TxRecord> = (3..=65u64)
+                    .map(|i| {
+                        let mut txid = [0u8; 32];
+                        txid[0..8].copy_from_slice(&i.to_le_bytes());
+                        TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 0,
+                            output_start_fk: Fk::NULL,
+                            output_count: 0,
+                        }
+                    })
+                    .collect();
+                let mut recs = vec![r1, r2];
+                recs.append(&mut rest);
+                t.put_full_batch_indexed(&meta_only_items(&recs), true)
+                    .unwrap();
+                t.flush().unwrap();
+            }
+            crate::segmented_head::wipe_segmented_head_files(&dir);
+            let t = TxTable::open(&dir).unwrap();
             let mut shared = [0u8; 32];
             shared[0..8].copy_from_slice(&1u64.to_le_bytes());
-            let r1 = TxRecord {
-                txid: shared,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 0,
-                output_start_fk: Fk::NULL,
-                output_count: 0,
-            };
-            let r2 = r1.clone();
-            let mut rest: Vec<TxRecord> = (3..=65u64)
-                .map(|i| {
-                    let mut txid = [0u8; 32];
-                    txid[0..8].copy_from_slice(&i.to_le_bytes());
-                    TxRecord {
-                        txid,
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 0,
-                        output_start_fk: Fk::NULL,
-                        output_count: 0,
-                    }
-                })
-                .collect();
-            let mut recs = vec![r1, r2];
-            recs.append(&mut rest);
-            t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                .unwrap();
-            t.flush().unwrap();
-        }
-        crate::segmented_head::wipe_segmented_head_files(&dir);
-        let t = TxTable::open(&dir).unwrap();
-        let mut shared = [0u8; 32];
-        shared[0..8].copy_from_slice(&1u64.to_le_bytes());
-        let all = t.get_all_by_txid(&shared).unwrap();
-        assert_eq!(all.len(), 2, "both BIP30 creates");
-        assert_eq!(all[0].0, Fk(2), "newest first {all:?}");
-        assert_eq!(all[1].0, Fk(1));
-        let _ = std::fs::remove_dir_all(&dir);
+            let all = t.get_all_by_txid(&shared).unwrap();
+            assert_eq!(all.len(), 2, "both BIP30 creates");
+            assert_eq!(all[0].0, Fk(2), "newest first {all:?}");
+            assert_eq!(all[1].0, Fk(1));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     });
 }
 
@@ -2772,6 +2778,38 @@ fn parse_rebuild_seal_bits_default_25() {
     assert_eq!(parse_rebuild_seal_bits(Some("foo")), 25);
     assert_eq!(parse_rebuild_seal_bits(Some("5")), 6);
     assert_eq!(parse_rebuild_seal_bits(Some("99")), 26);
+}
+
+#[test]
+fn parse_rebuild_workers_and_750mib_cap() {
+    assert_eq!(parse_rebuild_workers(None), None);
+    assert_eq!(parse_rebuild_workers(Some("foo")), None);
+    assert_eq!(parse_rebuild_workers(Some("1")), Some(1));
+    assert_eq!(parse_rebuild_workers(Some("0")), Some(1));
+    assert_eq!(parse_rebuild_workers(Some("8")), Some(8));
+    assert_eq!(parse_rebuild_workers(Some("999")), Some(256));
+    const MIB: u64 = 1024 * 1024;
+    assert_eq!(tx_head_rebuild_workers_for_free_ram(8, 0), 1);
+    assert_eq!(tx_head_rebuild_workers_for_free_ram(8, 750 * MIB), 1);
+    assert_eq!(tx_head_rebuild_workers_for_free_ram(8, 1500 * MIB), 2);
+    assert_eq!(tx_head_rebuild_workers_for_free_ram(4, 20 * 750 * MIB), 4);
+    assert_eq!(
+        crate::sorted_run::sh_workers_for_free_ram(8, 1500 * MIB),
+        1,
+        "SH cap is 1.5 GiB, not 750 MiB"
+    );
+}
+
+#[test]
+fn rebuild_workers_override_is_thread_local() {
+    TxTable::test_with_rebuild_workers(3, || {
+        assert_eq!(TxTable::rebuild_workers(), 3);
+        let other = std::thread::spawn(TxTable::rebuild_workers)
+            .join()
+            .expect("join");
+        assert_eq!(TxTable::rebuild_workers(), 3);
+        assert_ne!(other, 3);
+    });
 }
 
 #[test]

@@ -39,6 +39,7 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH catalog runs** | on disk after post-IBD Class A recollect | bulk FullCold / ColdResume at tip; not during Direct confirm |
 | **SH recollect / k-way workers** | min(CPUs, host free RAM / 1.5 GiB); floor 1. Linux `/proc/meminfo` `MemAvailable`; Darwin `host_statistics64` free+inactive pages; Windows `GlobalMemoryStatusEx` `ullAvailPhys`. Unknown OS → 1 worker. Env `RBITCOIN_SH_RECOLLECT_WORKERS` / `RBITCOIN_SH_MERGE_WORKERS` override | Start of recollect / tip materialize. Logs `workers=` `free_GiB=` |
+| **`tx.head` wipe-rebuild workers** | min(CPUs, host free RAM / 750 MiB, range count); floor 1. Same free-RAM probe as SH. **Not** the SH 1.5 GiB cap. Env `RBITCOIN_TX_HEAD_REBUILD_WORKERS` override (`1` = serial) | Empty/wipe `tx.head` rebuild from `txid.body`. Logs `workers=` `free_GiB=` |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
 
 Tests that need a clean process must call these **same** entry points (or drop the

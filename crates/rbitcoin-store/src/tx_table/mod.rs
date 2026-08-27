@@ -13,12 +13,26 @@ use std::path::Path;
 thread_local! {
     static TEST_REBUILD_SEAL_BITS: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
+    static TEST_REBUILD_WORKERS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
+
+/// Host RAM budget per parallel `tx.head` rebuild worker (not SH's 1.5 GiB).
+pub const TX_HEAD_REBUILD_WORKER_FREE_RAM_BYTES: u64 = 750 * 1024 * 1024;
 
 pub(crate) fn parse_rebuild_seal_bits(raw: Option<&str>) -> u32 {
     raw.and_then(|s| s.parse::<u32>().ok())
         .map(|b| b.clamp(6, 26))
         .unwrap_or(25)
+}
+
+pub(crate) fn parse_rebuild_workers(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 256))
+}
+
+pub(crate) fn tx_head_rebuild_workers_for_free_ram(cpus: usize, free_bytes: u64) -> usize {
+    crate::sorted_run::workers_for_free_ram(cpus, free_bytes, TX_HEAD_REBUILD_WORKER_FREE_RAM_BYTES)
 }
 
 /// Class A tx row (no wire blob — reconstruct from txout + inwit).
@@ -522,8 +536,10 @@ impl TxTable {
             let slots = t.head_slots();
             rbitcoin_log::info!(
                 "store: tx.head rebuild begin n={n_bodies} bits={bits} slots={slots} \
-                 seal_bits={} (segmented)",
-                Self::rebuild_seal_bits()
+                 seal_bits={} workers={} free_GiB={} (segmented)",
+                Self::rebuild_seal_bits(),
+                Self::rebuild_workers(),
+                crate::free_gib_label(),
             );
             let inserted = t.rebuild_head_from_bodies(|done, total, ins| {
                 if done == total || done % 1_000_000 == 0 {
@@ -1503,6 +1519,8 @@ impl TxTable {
     ///
     /// Range width is [`Self::rebuild_seal_keys`] (default 2²⁵). Remainder is
     /// sealed too; an empty open tail is created for later inserts.
+    /// Workers: [`Self::rebuild_workers`] (min of CPUs, free RAM / 750 MiB,
+    /// and range count). Distinct from SH's 1.5 GiB cap.
     pub fn rebuild_head_from_bodies(
         &self,
         mut on_progress: impl FnMut(u64, u64, u64),
@@ -1512,47 +1530,123 @@ impl TxTable {
             return Ok(0);
         }
         let ranges = self.plan_head_rebuild_ranges()?;
+        let n_jobs = ranges.len();
+        let workers = Self::rebuild_workers().min(n_jobs).max(1);
         let seal_bits = Self::rebuild_seal_bits();
         rbitcoin_log::info!(
-            "store: tx.head rebuild mphf n={n} seal_bits={seal_bits} ranges={}",
-            ranges.len()
+            "store: tx.head rebuild mphf n={n} seal_bits={seal_bits} ranges={n_jobs} \
+             workers={workers} free_GiB={}",
+            crate::free_gib_label()
         );
-        const CHUNK: u64 = 65_536;
-        let mut sealed = Vec::with_capacity(ranges.len());
+        let jobs: Vec<(u32, u64, u64)> = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(i, (first, count))| (i as u32, first, count))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots: Vec<
+            std::sync::Mutex<
+                Option<Result<(u64, u64, crate::segmented_head::SealPublish), StoreError>>,
+            >,
+        > = (0..n_jobs).map(|_| std::sync::Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let jobs = &jobs;
+                let next = &next;
+                let slots = &slots;
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n_jobs {
+                        break;
+                    }
+                    let (file_id, first, count) = jobs[i];
+                    let r = self.seal_rebuild_range(file_id, first, count);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                });
+            }
+        });
+        let mut sealed = Vec::with_capacity(n_jobs);
         let mut inserted = 0u64;
-        for (file_id, (first, count)) in ranges.into_iter().enumerate() {
-            if count == 0 {
-                return Err(StoreError::Corrupt("tx.head rebuild empty range"));
-            }
-            let last = first.saturating_add(count).saturating_sub(1);
-            let mut pairs = Vec::with_capacity(count as usize);
-            let mut rel = 1u32;
-            let mut cur = first;
-            while cur <= last {
-                let end = (cur + CHUNK - 1).min(last);
-                let txids = self.body_txid_range(cur, end)?;
-                for txid in txids {
-                    pairs.push((
-                        crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(&txid)),
-                        rel,
-                    ));
-                    rel = rel.saturating_add(1);
-                }
-                cur = end + 1;
-            }
-            if pairs.len() as u64 != count {
-                return Err(StoreError::Corrupt("tx.head rebuild pair count"));
-            }
-            let pubd = self
-                .head
-                .write_sealed_pairs(file_id as u32, first, count, pairs)?;
-            sealed.push((first, count, pubd));
+        for cell in slots {
+            let (first, count, pubd) = cell
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .ok_or(StoreError::Corrupt("tx.head rebuild worker silent"))??;
             inserted += count;
-            on_progress(last, n, inserted);
+            on_progress(first.saturating_add(count).saturating_sub(1), n, inserted);
+            sealed.push((first, count, pubd));
         }
         self.head
             .install_rebuild_sealed(sealed, n.saturating_add(1))?;
         Ok(inserted)
+    }
+
+    fn seal_rebuild_range(
+        &self,
+        file_id: u32,
+        first: u64,
+        count: u64,
+    ) -> Result<(u64, u64, crate::segmented_head::SealPublish), StoreError> {
+        if count == 0 {
+            return Err(StoreError::Corrupt("tx.head rebuild empty range"));
+        }
+        const CHUNK: u64 = 65_536;
+        let last = first.saturating_add(count).saturating_sub(1);
+        let mut pairs = Vec::with_capacity(count as usize);
+        let mut rel = 1u32;
+        let mut cur = first;
+        while cur <= last {
+            let end = (cur + CHUNK - 1).min(last);
+            let txids = self.body_txid_range(cur, end)?;
+            for txid in txids {
+                pairs.push((
+                    crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(&txid)),
+                    rel,
+                ));
+                rel = rel.saturating_add(1);
+            }
+            cur = end + 1;
+        }
+        if pairs.len() as u64 != count {
+            return Err(StoreError::Corrupt("tx.head rebuild pair count"));
+        }
+        let pubd = self.head.write_sealed_pairs(file_id, first, count, pairs)?;
+        Ok((first, count, pubd))
+    }
+
+    /// Parallel wipe-rebuild workers. Env `RBITCOIN_TX_HEAD_REBUILD_WORKERS`;
+    /// default min(CPUs, free RAM / 750 MiB). Not SH's 1.5 GiB cap.
+    pub fn rebuild_workers() -> usize {
+        #[cfg(test)]
+        if let Some(n) = TEST_REBUILD_WORKERS.with(std::cell::Cell::get) {
+            return n;
+        }
+        if let Some(n) = parse_rebuild_workers(
+            std::env::var("RBITCOIN_TX_HEAD_REBUILD_WORKERS")
+                .ok()
+                .as_deref(),
+        ) {
+            return n;
+        }
+        tx_head_rebuild_workers_for_free_ram(
+            crate::sorted_run::logical_cpus(),
+            crate::host_mem_available_bytes().unwrap_or(0),
+        )
+    }
+
+    /// Hold this thread's rebuild worker count for `f`.
+    #[cfg(test)]
+    pub fn test_with_rebuild_workers<R>(n: usize, f: impl FnOnce() -> R) -> R {
+        let n = n.clamp(1, 256);
+        let prev = TEST_REBUILD_WORKERS.with(|c| c.replace(Some(n)));
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_REBUILD_WORKERS.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(prev);
+        f()
     }
 
     /// Rebuild MPHF range width: `2^bits` keys. Default **25**; **26** is wider.

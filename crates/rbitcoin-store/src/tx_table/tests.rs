@@ -2611,6 +2611,12 @@ fn rebuild_head_direct_mphf_empty_tail() {
         assert!(crate::tx_head_mphf::TxHeadMphf::exists(
             &root.join("000001")
         ));
+        assert!(!crate::tx_head_mphf::rel_path(&root.join("000000")).is_file());
+        assert!(!crate::tx_head_mphf::rel_path(&root.join("000001")).is_file());
+        assert_eq!(
+            &std::fs::read(crate::tx_head_mphf::mphf_path(&root.join("000000"))).unwrap()[0..4],
+            b"BDZ2"
+        );
         match t.head.open_tail_range() {
             Some((_, 0)) => {}
             other => panic!("expected empty open tail, got {other:?}"),

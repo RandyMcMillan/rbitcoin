@@ -1559,6 +1559,11 @@ mod tests {
         let sealed = dir.join("tx.head").join("000000");
         assert!(!sealed.is_file(), "sealed OA file must be unlinked");
         assert!(crate::tx_head_mphf::TxHeadMphf::exists(&sealed));
+        assert!(!crate::tx_head_mphf::rel_path(&sealed).is_file());
+        assert_eq!(
+            &std::fs::read(crate::tx_head_mphf::mphf_path(&sealed)).unwrap()[0..4],
+            b"BDZ2"
+        );
         assert!(dir.join("tx.head").join("000000.fuse8").is_file());
         let cands = h.probe_candidates(&mixed(1)).unwrap();
         assert_eq!(cands.len(), 1, "cands={cands:?}");

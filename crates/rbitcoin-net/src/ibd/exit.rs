@@ -142,12 +142,6 @@ pub fn ibd_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
     }
 }
 
-/// Success exit after path drain. Prefer [`ibd_caught_up`].
-#[inline]
-pub fn catchup_complete_after_drain(st: &IbdWorkState, tip_h: u32) -> bool {
-    ibd_caught_up(st, tip_h)
-}
-
 /// Outcome when every peer slot is dead (or retained empty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllPeersDead {
@@ -210,16 +204,16 @@ mod tests {
         path.max_peer_height = 313_000;
         path.max_ready_height = 2000;
         path.headers_done = true;
-        assert!(!catchup_complete_after_drain(&path, 2000));
+        assert!(!ibd_caught_up(&path, 2000));
         path.max_peer_height = 2001;
-        assert!(catchup_complete_after_drain(&path, 2000));
+        assert!(ibd_caught_up(&path, 2000));
 
         // Regression: tip=0 + peer horizon must not look complete (false tip mode).
         let mut zero = IbdWorkState::new(Vec::new(), None, Some(0));
         zero.max_peer_height = 958_900;
         zero.max_ready_height = 0;
         zero.headers_done = false;
-        assert!(!catchup_complete_after_drain(&zero, 0));
+        assert!(!ibd_caught_up(&zero, 0));
         assert!(!ibd_caught_up(&zero, 0));
         assert_eq!(
             all_peers_dead_action(&zero, 0, false, 0),
@@ -243,7 +237,7 @@ mod tests {
         busy.ordered
             .push_back(BlockHash::from_byte_array([1u8; 32]));
         assert!(!path_drained(&busy));
-        assert!(!catchup_complete_after_drain(&busy, 10));
+        assert!(!ibd_caught_up(&busy, 10));
 
         // ibd_caught_up: tip at/within 1 of horizon and not behind archive.
         let mut near = IbdWorkState::new(Vec::new(), None, Some(100));
@@ -269,11 +263,11 @@ mod tests {
                 .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
         }
         assert!(path_drained(&at_horizon));
-        assert!(catchup_complete_after_drain(&at_horizon, 964_108));
+        assert!(ibd_caught_up(&at_horizon, 964_108));
         prune_off_path_inflight(&mut at_horizon);
         assert!(at_horizon.inflight.is_empty());
         assert!(path_drained(&at_horizon));
-        assert!(catchup_complete_after_drain(&at_horizon, 964_108));
+        assert!(ibd_caught_up(&at_horizon, 964_108));
 
         // Mid-chain on-path inflight (tip+1 in h2h) must not complete after prune.
         let mut mid_inf = IbdWorkState::new(Vec::new(), None, Some(161_249));
@@ -286,7 +280,7 @@ mod tests {
         prune_off_path_inflight(&mut mid_inf);
         assert!(mid_inf.inflight.contains_key(&on_path));
         assert!(!path_drained(&mid_inf));
-        assert!(!catchup_complete_after_drain(&mid_inf, 161_249));
+        assert!(!ibd_caught_up(&mid_inf, 161_249));
     }
 
     /// Empty-headers lag WARN/reget cadence (mainnet log flood regression).
@@ -406,7 +400,7 @@ mod tests {
                 .register_explore(std::iter::once(hash), Some(hash));
         }
         assert!(
-            catchup_complete_after_drain(&explore, tip),
+            ibd_caught_up(&explore, tip),
             "explore inflight at horizon must not block catch-up"
         );
 
@@ -419,7 +413,7 @@ mod tests {
             orphans.inflight.insert(h(i), InflightReq::new(0));
         }
         assert!(
-            catchup_complete_after_drain(&orphans, tip),
+            ibd_caught_up(&orphans, tip),
             "orphan inflight at horizon must not block catch-up"
         );
 
@@ -435,7 +429,7 @@ mod tests {
             "lag from path high water, not competing hash_height"
         );
         assert!(
-            !catchup_complete_after_drain(&fork, 100),
+            !ibd_caught_up(&fork, 100),
             "empty h2h two short of peers is a header hole, not catch-up"
         );
 
@@ -444,7 +438,7 @@ mod tests {
         chatter.max_peer_height = 101;
         chatter.max_ready_height = 100;
         chatter.headers_done = true;
-        assert!(catchup_complete_after_drain(&chatter, 100));
+        assert!(ibd_caught_up(&chatter, 100));
 
         // Live awaiting-reorg gather blocks exit even with empty ordered/inflight.
         let mut await_st = IbdWorkState::new(Vec::new(), None, Some(100));
@@ -453,7 +447,7 @@ mod tests {
         await_st.headers_done = true;
         await_st.reorg.set_awaiting(dummy_held(), vec![h(0xcc)]);
         assert!(
-            !catchup_complete_after_drain(&await_st, 100),
+            !ibd_caught_up(&await_st, 100),
             "awaiting reorg gather is remainder"
         );
 
@@ -463,7 +457,7 @@ mod tests {
         hole.max_ready_height = 100;
         hole.headers_done = true;
         hole.record_height(h(0x2a), 101);
-        assert!(!catchup_complete_after_drain(&hole, 100));
+        assert!(!ibd_caught_up(&hole, 100));
 
         // Mid-chain on-path inflight.
         let mut mid_inf = IbdWorkState::new(Vec::new(), None, Some(161_249));
@@ -472,13 +466,13 @@ mod tests {
         mid_inf.headers_done = true;
         mid_inf.record_height(h(0x2a), 161_250);
         mid_inf.inflight.insert(h(0x2a), InflightReq::new(0));
-        assert!(!catchup_complete_after_drain(&mid_inf, 161_249));
+        assert!(!ibd_caught_up(&mid_inf, 161_249));
 
         // tip=0 never complete; dead peers give up.
         let mut zero = IbdWorkState::new(Vec::new(), None, Some(0));
         zero.max_peer_height = 958_900;
         zero.max_ready_height = 0;
-        assert!(!catchup_complete_after_drain(&zero, 0));
+        assert!(!ibd_caught_up(&zero, 0));
         assert_eq!(
             all_peers_dead_action(&zero, 0, false, 0),
             AllPeersDead::GiveUpMidCatchup
@@ -499,7 +493,7 @@ mod tests {
         signet.max_peer_height = 313_000;
         signet.max_ready_height = 2000;
         signet.headers_done = true;
-        assert!(!catchup_complete_after_drain(&signet, 2000));
+        assert!(!ibd_caught_up(&signet, 2000));
         assert!(super::should_unlatch_headers_done(&signet, 2000));
     }
 

@@ -351,11 +351,11 @@ New stores: **header.head** = **single** open-address file (~96 MiB sparse at
 2²² slots; overflow `header.head.gN`). Leftover 256-way `header.head/` is
 **refused** — wipe `store/header.head` and `store/header.body` and reindex.
 **scripthash** **64** shards, **tx.head** = **segmented** fixed **25-bit**
-heads (`tx.head/meta` + open `NNNNNN` OA, sealed `NNNNNN.mphf|.rel|.fuse8`).
+heads (`tx.head/meta` + open `NNNNNN` OA, sealed `NNNNNN.mphf|.fuse8`).
 Capacity ends at **80% of head slots** (~26.8 M creates at 25-bit): seal
-builds MPHF + dense rel + **binary fuse8**, unlinks OA, then opens a new
+builds a value-assigned MPHF + **binary fuse8**, unlinks OA, then opens a new
 segment. Idx 16 GiB soft-span does not cut `tx.head`. Open segment has **no** filter (always probed); sealed segments are
-fuse-gated then one MPHF+rel pread. Legacy monolithic `tx.head` / `.new` /
+fuse-gated then one packed MPHF probe (`rel−1`). Legacy monolithic `tx.head` / `.new` /
 `.resize` / `.overflow` are **refused** — reindex. Schema 17 populated indexes
 versus this binary: [Schema upgrade](#schema-upgrade). Create height is a RAM fence (no
 `tx_height` file; schema 16).
@@ -375,7 +375,7 @@ RSS vs page cache. Working-set sizes:
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 19`). This section is
+Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 20`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store. An older `store/meta` either
@@ -384,13 +384,31 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **19** | Open. |
-| **18** (empty or occupied) | Rewrite `meta` to 19. No wipe. Mode 10 SH pages stay readable; new megakeys write mode 11. |
-| **17**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 19, then open. |
+| **20** | Open. |
+| **19** or **18**, empty `tx.head` | Rewrite `meta` to 20, then open. Occupied SH is kept. |
+| **19** or **18**, occupied `tx.head` | **Refuse.** Wipe `store/tx.head`, keep Class A and SH, restart (head rebuilds). |
+| **17**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 20, then open. |
 | **17**, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
 | Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
 
-An **18 binary** refuses 19 `meta` (do not downgrade in place).
+A **19 binary** refuses 20 `meta` (do not downgrade in place).
+
+When the 20 `tx.head` refuse fires, the log line is:
+
+```text
+schema 20 refuses schema-18/19 tx.head; wipe store/tx.head then restart (Class A and scripthash kept; tx.head rebuilds)
+```
+
+Copy-paste (node stopped with SIGTERM):
+
+```bash
+DATADIR=/path/to/datadir
+rm -rf "$DATADIR/store/tx.head"
+```
+
+Keep Class A (`txout` / `inwit` / `spent` + idx, `txid.body`, headers),
+Class C, and `scripthash*`. Restart the same binary: `tx.head` rebuilds from
+Class A. Do **not** `rm -rf store/`.
 
 When the 17-index refuse fires, the log line is:
 

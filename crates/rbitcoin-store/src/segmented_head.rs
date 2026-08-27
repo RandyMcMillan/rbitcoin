@@ -6,7 +6,7 @@
 //!   tx.head/
 //!     meta                       # segment descriptors
 //!     000000                     # open OA only (unlinked after seal)
-//!     000000.mphf + .rel + .fuse8  # sealed: MPHF + u32 rel + fuse8
+//!     000000.mphf + .fuse8     # sealed: value-assigned MPHF + fuse8
 //!     …
 //! ```
 //!
@@ -148,9 +148,7 @@ impl SegmentedTxHead {
             let sealed = d.flags & FLAG_SEALED != 0;
             let (head, pack) = if sealed {
                 if !TxHeadMphf::exists(&path) {
-                    return Err(StoreError::Corrupt(
-                        "tx.head sealed segment missing mphf/rel",
-                    ));
+                    return Err(StoreError::Corrupt("tx.head sealed segment missing mphf"));
                 }
                 (None, Some(Arc::new(TxHeadMphf::open(&path)?)))
             } else {

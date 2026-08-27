@@ -325,7 +325,10 @@ impl Store {
             }
             rewrite_meta_current(&path)?;
         }
-        if meta_ver == 18 && SCHEMA_VERSION >= 19 {
+        if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
+            if crate::segmented_head::SegmentedTxHead::disk_occupied(&path) {
+                return Err(StoreError::Corrupt(SCHEMA20_TX_HEAD_REFUSE));
+            }
             rewrite_meta_current(&path)?;
         }
         let inwit_dir = resolve_inwit_dir(&layout)?;
@@ -1416,6 +1419,9 @@ fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
 /// One-line 17→18 index refuse (`Store::open` + tests).
 const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
 
+/// One-line 18/19→20 `tx.head` refuse (`Store::open` + tests).
+const SCHEMA20_TX_HEAD_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head; wipe store/tx.head then restart (Class A and scripthash kept; tx.head rebuilds)";
+
 fn schema17_index_data_present(dir: &Path) -> bool {
     crate::segmented_head::SegmentedTxHead::disk_occupied(dir) || scripthash_index_data_present(dir)
 }
@@ -2085,7 +2091,7 @@ mod tests {
         assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 19);
+        assert_eq!(SCHEMA_VERSION, 20);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2166,6 +2172,86 @@ mod tests {
         write_store_meta_ver(&dir, 17);
         let s = Store::open(&dir).unwrap();
         assert_eq!(s.get_fk_by_txid(&[0x22u8; 32]).unwrap(), Some(Fk(1)));
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema19_with_tx_head_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 19);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema-19 tx.head occupancy"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA20_TX_HEAD_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 19);
+        assert!(dir.join("txout.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema18_with_tx_head_refused() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let item = coinbase_item([0x33u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 18);
+        match Store::open(&dir) {
+            Ok(_) => panic!("expected refuse for schema-18 tx.head occupancy"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA20_TX_HEAD_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        assert_eq!(read_store_meta_ver(&dir), 18);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema19_empty_tx_head_upgrades_and_rebuilds() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        crate::segmented_head::wipe_segmented_head_files(&dir);
+        write_store_meta_ver(&dir, 19);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.get_fk_by_txid(&[0x22u8; 32]).unwrap(), Some(Fk(1)));
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema19_scripthash_only_upgrades() {
+        let dir = tmp();
+        let sh = [0xcdu8; 32];
+        {
+            let s = Store::create(&dir).unwrap();
+            s.scripthash
+                .put_create(&crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)))
+                .unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 19);
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 19`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 20`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | **Current** |
+| **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`). Refuse occupied 18/19 `tx.head`. | **Current** |
+| **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | Prior |
 | **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | Prior |
 | **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Prior |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
@@ -32,6 +33,15 @@ Versions below are listed **newest → oldest** after the summary table.
 | **≤3** | Early mmap store; fat heads; mixed prev encoding | Mostly gone |
 
 ---
+
+## v20 (assigned packed tx.head MPHF)
+
+Index-only. Sealed `tx.head` writes `BDZ2` packed `g[]` whose output is
+`rel−1` (modulus = segment create count). No `.rel` sidecar. Fuse8 stays
+8-bit / ~9 bits/key in RAM; packed `g` stays FdOnly 4 KiB pages. Occupied
+schema 18/19 `tx.head` is refused (wipe `store/tx.head`, keep Class A and
+SH). Empty `tx.head` rewrites `meta` to 20 and rebuilds from `txid.body`.
+SH MPHF stays `BDZ1` + `.val`. Open OA is still 4 B rel.
 
 ## v19 (megakey extent)
 

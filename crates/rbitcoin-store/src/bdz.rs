@@ -9,14 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"BDZ1";
-#[allow(dead_code)]
 const MAGIC2: &[u8; 4] = b"BDZ2";
 const VERSION: u32 = 1;
 const GAMMA_NUM: u64 = 123;
 const GAMMA_DEN: u64 = 100;
 const MAX_SEED: u32 = 256;
 const HEADER_LEN: u64 = 24;
-#[allow(dead_code)]
 const HEADER_LEN2: u64 = 32;
 const G_PAGE_BYTES: usize = 4096;
 const G_PAGE_WORDS: u32 = (G_PAGE_BYTES / 4) as u32;
@@ -88,7 +86,7 @@ impl BdzMphf {
         self.n
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn modulus(&self) -> u32 {
         self.modulus
     }
@@ -273,7 +271,6 @@ impl BdzMphf {
         Self::build_from_ranks(keys, &ranks, n)
     }
 
-    #[allow(dead_code)]
     pub fn build_assigned(keys: &[u64], values: &[u32], modulus: u32) -> Result<Self, StoreError> {
         if keys.len() != values.len() {
             return Err(StoreError::Corrupt("bdz mphf: assigned len"));
@@ -353,7 +350,6 @@ impl BdzMphf {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn write_packed_to(&self, path: &Path) -> Result<(), StoreError> {
         let GStore::Ram(g) = &self.g else {
             return Err(StoreError::Corrupt("bdz mphf: write requires RAM g"));
@@ -418,7 +414,6 @@ impl BdzMphf {
         })
     }
 
-    #[allow(dead_code)]
     pub fn read_packed_from(path: &Path) -> Result<Self, StoreError> {
         let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
         let mut hdr = [0u8; HEADER_LEN2 as usize];
@@ -653,7 +648,6 @@ fn stream_g_pages(
     run
 }
 
-#[allow(dead_code)]
 fn g_bits_for_modulus(modulus: u32) -> u32 {
     if modulus <= 1 {
         return 1;
@@ -661,13 +655,11 @@ fn g_bits_for_modulus(modulus: u32) -> u32 {
     32 - (modulus - 1).leading_zeros()
 }
 
-#[allow(dead_code)]
 fn packed_g_bytes(n_verts: u32, g_bits: u32) -> u64 {
     let bits = u64::from(n_verts) * u64::from(g_bits);
     bits.div_ceil(8)
 }
 
-#[allow(dead_code)]
 fn pack_g(g: &[u32], g_bits: u32) -> Vec<u8> {
     let mut out = vec![0u8; packed_g_bytes(g.len() as u32, g_bits) as usize];
     let mask = if g_bits == 32 {

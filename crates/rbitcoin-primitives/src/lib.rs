@@ -79,10 +79,10 @@ pub const SCHEMA_VERSION: u16 = 20;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **20** is current. Schema **18/19** with occupied `tx.head` are
-/// refused; empty 18/19 indexes rewrite `meta`. Schema **17** still refuses
-/// populated `tx.head` / `scripthash*` or rewrites empty indexes. Schema
-/// **13**–**16** still soft-open empty Class A / empty SH (meta rewrite).
+/// Schema **20** is current. Schema **18/19** with occupied `tx.head` or
+/// `scripthash*` are refused; empty 18/19 indexes rewrite `meta`. Schema **17**
+/// still refuses populated `tx.head` / `scripthash*` or rewrites empty indexes.
+/// Schema **13**–**16** still soft-open empty Class A / empty SH (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
     ver == SCHEMA_VERSION || (SCHEMA_VERSION == 20 && matches!(ver, 13..=19))

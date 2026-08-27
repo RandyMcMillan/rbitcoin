@@ -16,7 +16,7 @@ txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead
                     open: 4 B rel, page-local mix_txid; seal: MPHF+fuse8
                     (fuse in RAM; packed BDZ g FdOnly 4 KiB pages; index = rel-1)
 
-spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no fuse)
+spk hash    ──► scripthash.head/NN.mphf+.val  sealed BDZ3 main (2-bit g + rank; pack8; tags, no fuse)
             ──► scripthash.body/NN     dir-variant main slabs/pages (file variant: scripthash.body)
             ──► scripthash.ovf/ingest  incremental + post-seal new keys (key16+pack8)
             ──► scripthash.ovf/body    dir-variant ingest + sealed ovf slabs
@@ -29,7 +29,7 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no 
 |--------|---------|-------------|--------------|
 | `HashHead` | `header.head` (+ `.gN`) | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
 | `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁵** keys/range in parallel (no OA). Open keeps fuse8 in RAM; packed BDZ `g` is FdOnly (4 KiB page stream); MPHF output is `rel−1`. | Confirm **lookup** stamp after live pin miss |
-| Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators. BDZ `g` FdOnly; tags/val already FdOnly. | After tip bulk |
+| Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators. Compact BDZ3: packed 2-bit `g` FdOnly; occupancy RAM; tags/val FdOnly. | After tip bulk |
 | Ingest + L0/L1 ovf | `scripthash.ovf/ingest`, L0 `SHSR`, L1 MPHF, `ovf/body` | Same pack8 key for incremental / post-seal new keys | Tip; lookup ingest → L0 → L1 → main |
 
 `tx.head` is **not** a `HashHead`. `HeadRole` is only Header. Sorted/MPHF SH shards are `sh_main_shard_count` (tiny=1, mainnet=64), not a HashHead. Leftover 256-way `header.head/` is Layout refuse.

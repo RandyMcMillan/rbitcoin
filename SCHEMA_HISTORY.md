@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`). Refuse occupied 18/19 `tx.head`. | **Current** |
+| **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`); sealed SH compact `BDZ3` (2-bit `g` + rank). Refuse occupied 18/19 `tx.head` / `scripthash*`. | **Current** |
 | **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | Prior |
 | **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | Prior |
 | **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Prior |
@@ -34,14 +34,16 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v20 (assigned packed tx.head MPHF)
+## v20 (assigned packed tx.head + compact SH MPHF)
 
 Index-only. Sealed `tx.head` writes `BDZ2` packed `g[]` whose output is
 `rel−1` (modulus = segment create count). No `.rel` sidecar. Fuse8 stays
-8-bit / ~9 bits/key in RAM; packed `g` stays FdOnly 4 KiB pages. Occupied
-schema 18/19 `tx.head` is refused (wipe `store/tx.head`, keep Class A and
-SH). Empty `tx.head` rewrites `meta` to 20 and rebuilds from `txid.body`.
-SH MPHF stays `BDZ1` + `.val`. Open OA is still 4 B rel.
+8-bit / ~9 bits/key in RAM; packed `g` stays FdOnly 4 KiB pages. Sealed SH
+main/L1 writes `BDZ3`: 3-partite peel, 2-bit `g`, occupancy rank (RAM on
+open), then mix64 tags + pack8 `.val`. Occupied schema 18/19 `tx.head` or
+`scripthash*` is refused (wipe those dirs, keep Class A). Empty indexes
+rewrite `meta` to 20; `tx.head` rebuilds from `txid.body`; SH rematerializes
+with `--shindex`. Open OA is still 4 B rel.
 
 ## v19 (megakey extent)
 

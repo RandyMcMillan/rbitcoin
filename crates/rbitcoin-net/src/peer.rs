@@ -251,8 +251,8 @@ pub async fn connect_and_handshake(
     Ok((their_version, reader, writer, wire))
 }
 
-/// Core VERSION/VERACK bound: 60s from TCP accept. Timeout drops the stream.
-pub const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Core VERSION/VERACK bound: 60s from TCP connect/accept. Timeout drops the stream.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) async fn inbound_connect_and_handshake(
     stream: TcpStream,
@@ -264,7 +264,7 @@ pub(crate) async fn inbound_connect_and_handshake(
     policy: HandshakePolicy<'_>,
 ) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes), NetError> {
     connect_and_handshake_timed(
-        INBOUND_HANDSHAKE_TIMEOUT,
+        HANDSHAKE_TIMEOUT,
         stream,
         magic,
         our_addr,
@@ -307,6 +307,43 @@ pub(crate) async fn connect_and_handshake_timed(
 
 /// Feeler: send version (relay=0), read their version, close. No verack, no session.
 pub async fn run_feeler(
+    stream: TcpStream,
+    magic: Magic,
+    our_addr: SocketAddr,
+    their_addr: SocketAddr,
+    start_height: i32,
+    user_agent: &str,
+) -> Result<(), NetError> {
+    run_feeler_timed(
+        HANDSHAKE_TIMEOUT,
+        stream,
+        magic,
+        our_addr,
+        their_addr,
+        start_height,
+        user_agent,
+    )
+    .await
+}
+
+pub(crate) async fn run_feeler_timed(
+    limit: Duration,
+    stream: TcpStream,
+    magic: Magic,
+    our_addr: SocketAddr,
+    their_addr: SocketAddr,
+    start_height: i32,
+    user_agent: &str,
+) -> Result<(), NetError> {
+    tokio::time::timeout(
+        limit,
+        run_feeler_inner(stream, magic, our_addr, their_addr, start_height, user_agent),
+    )
+    .await
+    .map_err(|_| NetError::Timeout)?
+}
+
+async fn run_feeler_inner(
     stream: TcpStream,
     magic: Magic,
     our_addr: SocketAddr,

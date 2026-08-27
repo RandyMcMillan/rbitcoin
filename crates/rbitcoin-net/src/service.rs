@@ -5,8 +5,8 @@ use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
 use crate::peer::{
-    connect_and_handshake, inbound_connect_and_handshake, peer_session_with, FollowSessionMeta,
-    HandshakePolicy,
+    connect_and_handshake_timed, inbound_connect_and_handshake, peer_session_with,
+    FollowSessionMeta, HandshakePolicy, HANDSHAKE_TIMEOUT,
 };
 use crate::peer_dos::{inbound_semaphore, DEFAULT_MAX_INBOUND};
 use crate::peers::{DialRequest, LivePeer, PeerConnType, PeerHub};
@@ -426,7 +426,8 @@ async fn prepare_outbound_session(
     // during handshake (p2p_handshake self-connect wait_until + assert_debug_log).
     let provisional = peers.register_connecting(peer, bind, typ);
     let provisional_id = provisional.id;
-    let handshake = connect_and_handshake(
+    let handshake = connect_and_handshake_timed(
+        HANDSHAKE_TIMEOUT,
         stream,
         magic,
         local,

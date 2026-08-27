@@ -4998,7 +4998,79 @@ async fn inbound_handshake_timeout_after_silence() {
 
 #[test]
 fn inbound_handshake_timeout_is_core_60s() {
-    assert_eq!(INBOUND_HANDSHAKE_TIMEOUT, Duration::from_secs(60));
+    assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(60));
+}
+
+#[tokio::test]
+async fn outbound_handshake_timeout_after_silence() {
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let _accepted = listener.accept().await.unwrap();
+
+    let handle = tokio::spawn(async move {
+        connect_and_handshake_timed(
+            Duration::from_millis(50),
+            stream,
+            Magic::REGTEST,
+            addr,
+            addr,
+            0,
+            false,
+            "/rbitcoin:test/",
+            HandshakePolicy::plain(),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!handle.is_finished(), "must still wait during handshake");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handle.is_finished(),
+        "silence past the bound must end handshake"
+    );
+    match handle.await.unwrap() {
+        Err(NetError::Timeout) => {}
+        Err(e) => panic!("expected Timeout, got {e}"),
+        Ok(_) => panic!("handshake succeeded on a silent peer"),
+    }
+}
+
+#[tokio::test]
+async fn feeler_handshake_timeout_after_silence() {
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let _accepted = listener.accept().await.unwrap();
+
+    let handle = tokio::spawn(async move {
+        run_feeler_timed(
+            Duration::from_millis(50),
+            stream,
+            Magic::REGTEST,
+            addr,
+            addr,
+            0,
+            "/rbitcoin:test/",
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!handle.is_finished(), "must still wait during feeler");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handle.is_finished(),
+        "silence past the bound must end feeler"
+    );
+    match handle.await.unwrap() {
+        Err(NetError::Timeout) => {}
+        Err(e) => panic!("expected Timeout, got {e}"),
+        Ok(_) => panic!("feeler succeeded on a silent peer"),
+    }
 }
 
 /// Writer used to `fetch_sub` every `CmpctBlock`, including tip announces that

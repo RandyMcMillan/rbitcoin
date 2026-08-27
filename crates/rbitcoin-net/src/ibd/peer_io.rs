@@ -7,7 +7,7 @@
 use crate::codec::MAX_INV_SIZE;
 use crate::error::NetError;
 use crate::msg_decode::spawn_decode_then_with_err;
-use crate::peer::{connect_and_handshake, HandshakePolicy};
+use crate::peer::{connect_and_handshake_timed, HandshakePolicy, HANDSHAKE_TIMEOUT};
 use crate::v2::{read_v2_frame_with_progress, write_v2_msg_offload};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
@@ -177,7 +177,8 @@ pub(crate) async fn spawn_peer(
     let stream = TcpStream::connect(addr).await?;
     let ua = rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
         .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
-    let (ver, reader, writer, _wire) = connect_and_handshake(
+    let (ver, reader, writer, _wire) = connect_and_handshake_timed(
+        HANDSHAKE_TIMEOUT,
         stream,
         magic,
         local,

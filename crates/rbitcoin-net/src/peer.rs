@@ -251,8 +251,8 @@ pub async fn connect_and_handshake(
     Ok((their_version, reader, writer, wire))
 }
 
-/// Core VERSION/VERACK bound: 60s from TCP accept. Timeout drops the stream.
-pub const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Core VERSION/VERACK bound: 60s from TCP connect/accept. Timeout drops the stream.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) async fn inbound_connect_and_handshake(
     stream: TcpStream,
@@ -264,7 +264,7 @@ pub(crate) async fn inbound_connect_and_handshake(
     policy: HandshakePolicy<'_>,
 ) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes), NetError> {
     connect_and_handshake_timed(
-        INBOUND_HANDSHAKE_TIMEOUT,
+        HANDSHAKE_TIMEOUT,
         stream,
         magic,
         our_addr,
@@ -307,6 +307,50 @@ pub(crate) async fn connect_and_handshake_timed(
 
 /// Feeler: send version (relay=0), read their version, close. No verack, no session.
 pub async fn run_feeler(
+    stream: TcpStream,
+    magic: Magic,
+    our_addr: SocketAddr,
+    their_addr: SocketAddr,
+    start_height: i32,
+    user_agent: &str,
+) -> Result<(), NetError> {
+    run_feeler_timed(
+        HANDSHAKE_TIMEOUT,
+        stream,
+        magic,
+        our_addr,
+        their_addr,
+        start_height,
+        user_agent,
+    )
+    .await
+}
+
+pub(crate) async fn run_feeler_timed(
+    limit: Duration,
+    stream: TcpStream,
+    magic: Magic,
+    our_addr: SocketAddr,
+    their_addr: SocketAddr,
+    start_height: i32,
+    user_agent: &str,
+) -> Result<(), NetError> {
+    tokio::time::timeout(
+        limit,
+        run_feeler_inner(
+            stream,
+            magic,
+            our_addr,
+            their_addr,
+            start_height,
+            user_agent,
+        ),
+    )
+    .await
+    .map_err(|_| NetError::Timeout)?
+}
+
+async fn run_feeler_inner(
     stream: TcpStream,
     magic: Magic,
     our_addr: SocketAddr,
@@ -1249,7 +1293,14 @@ async fn handle_peer_frame(
     ban_score: &mut u32,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
-    let msg = decode_framed_offload(frame).await?;
+    let msg = match decode_framed_offload(frame).await {
+        Ok(m) => m,
+        Err(NetError::MessageTooLarge(n)) => {
+            *ban_score = ban_score.saturating_add(OVERSIZE_BAN_SCORE);
+            return Err(NetError::MessageTooLarge(n));
+        }
+        Err(e) => return Err(e),
+    };
     match msg.payload() {
         NetworkMessage::Version(_) => {
             if let Some(s) = session {
@@ -1621,7 +1672,7 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Headers(headers) => {
-            let n = headers.len().min(MAX_HEADERS_RESULTS);
+            let n = headers.len();
             let _ = session.is_some_and(|s| s.take_awaiting_headers());
             if n == 0 {
                 // Empty headers is a failed getheaders response, not an announcement.
@@ -1663,9 +1714,9 @@ async fn handle_peer_frame(
                     // (`p2p_headers_sync_with_minchainwork` height=14).
                     let announced_h = announced_headers_height(hub, pending_headers, last);
                     let noban = session.is_some_and(|s| s.hub().is_some_and(|ph| ph.is_noban()));
-                    let branch = header_branch_vs_tip(hub, pending_headers, last);
+                    let work_cmp = announced_work_cmp(hub, pending_headers, last);
                     let our_tip = hub.tip_height().unwrap_or(0);
-                    if announced_tip_is_hopeless(our_tip, announced_h, branch) && !noban {
+                    if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
                         rbitcoin_log::info!(
                             "p2p: disconnect stale fork tip announced={announced_h} our={our_tip}"
                         );
@@ -2247,15 +2298,26 @@ fn header_announcement_connects(
 /// tip-follow (Core `NODE_NETWORK_LIMITED` window, ~2 days).
 pub(crate) const ANCIENT_TIP_BLOCKS: u32 = 288;
 
-/// Connecting header path that cannot beat our tip and whose announced height
-/// is more than [`ANCIENT_TIP_BLOCKS`] behind — BIP-110-class minority fork.
+/// Connecting header path whose **work** cannot beat our tip and whose announced
+/// height is more than [`ANCIENT_TIP_BLOCKS`] behind — BIP-110-class minority fork.
 pub(crate) fn announced_tip_is_hopeless(
     our_tip: u32,
     announced_h: u32,
-    branch: Option<std::cmp::Ordering>,
+    work_cmp: Option<std::cmp::Ordering>,
 ) -> bool {
-    matches!(branch, Some(std::cmp::Ordering::Less))
+    matches!(work_cmp, Some(std::cmp::Ordering::Less))
         && announced_h.saturating_add(ANCIENT_TIP_BLOCKS) < our_tip
+}
+
+/// Announced path work vs our tip work. `None` if the walk cannot sum work.
+fn announced_work_cmp(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    start: BlockHash,
+) -> Option<std::cmp::Ordering> {
+    let announced = work_of_header_path(hub, pending, start)?;
+    let ours = hub.chain_work().ok()?;
+    Some(announced.cmp(&ours))
 }
 
 /// Compare announced header-chain length (equal-bits ≈ work) to our path
@@ -2377,7 +2439,7 @@ fn fetchable_header_path_bodies(
         return Vec::new();
     }
     if matches!(
-        header_branch_vs_tip(hub, pending, tip),
+        announced_work_cmp(hub, pending, tip),
         Some(std::cmp::Ordering::Less)
     ) {
         return Vec::new();

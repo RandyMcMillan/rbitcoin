@@ -960,14 +960,6 @@ impl ScriptCheckJob {
     }
 
     #[inline]
-    pub(crate) fn pre_arc(&self) -> std::sync::Arc<rbitcoin_query::TxPrecompute> {
-        match self.job_pre() {
-            JobPre::Owned(a) => std::sync::Arc::clone(a),
-            JobPre::Slice { slice, idx } => std::sync::Arc::new(slice[*idx].clone()),
-        }
-    }
-
-    #[inline]
     pub(crate) fn pre(&self) -> &rbitcoin_query::TxPrecompute {
         match self.job_pre() {
             JobPre::Owned(a) => a.as_ref(),

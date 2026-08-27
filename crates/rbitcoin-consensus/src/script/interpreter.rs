@@ -13,6 +13,7 @@
 //! This module implements **consensus** checks only. Relay / standardness lives
 //! in [`crate::policy`] and must never reject blocks.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
 use bitcoin::hashes::Hash;
@@ -182,8 +183,8 @@ pub(crate) struct EvalContext<'a> {
     codeseparator_script_off: Cell<Option<usize>>,
     /// Legacy / taproot midstate. Created on first use (WitnessV0 uses `pre` only).
     cache: RefCell<Option<SighashCache<&'a Transaction>>>,
-    /// Structure/lookup midstates (WitnessV0 BIP143). Tests `new` compute once.
-    pre: std::sync::Arc<rbitcoin_query::TxPrecompute>,
+    /// Structure/lookup midstates (WitnessV0 BIP143).
+    pre: Cow<'a, rbitcoin_query::TxPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
     validation_weight_left: Cell<i64>,
 }
@@ -233,7 +234,7 @@ impl<'a> EvalContext<'a> {
             bip65_active,
             bip112_active,
             bip66_active,
-            std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(tx)),
+            Cow::Owned(rbitcoin_query::TxPrecompute::from_tx(tx)),
         )
     }
 
@@ -247,7 +248,7 @@ impl<'a> EvalContext<'a> {
         bip65_active: bool,
         bip112_active: bool,
         bip66_active: bool,
-        pre: std::sync::Arc<rbitcoin_query::TxPrecompute>,
+        pre: Cow<'a, rbitcoin_query::TxPrecompute>,
     ) -> Self {
         Self {
             tx,
@@ -318,7 +319,7 @@ impl<'a> EvalContext<'a> {
             job.bip65_active,
             job.bip112_active,
             job.bip66_active,
-            job.pre_arc(),
+            Cow::Borrowed(job.pre()),
         )
         .apply_job_flags(job)
     }

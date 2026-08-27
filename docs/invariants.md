@@ -135,6 +135,8 @@ the last load batch of the wave. Load drops map rows with pack height
 below the snapshot **after** that batch's in-flight read. Stamp skips
 `body_range` when in-flight still has outs (n−1); pin needs those outs.
 Skeleton / leftover TipOnly is the home once the pack is gone.
+Last-write identity and write-phase reject of an out-of-order in-flight
+bind: [`errata.md`](./errata.md).
 
 Equality (`pack height == snapshot`) keeps the row. Disconnect drops
 packs at/above the leaving **pack** height **before** the next bind.

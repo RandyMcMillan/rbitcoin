@@ -16,6 +16,12 @@ cannot run).
 / pipeline identity, not a BIP30 instance list. Newest/last entry is an
 acceptable single identity; durable TipOnly still prefers connected.
 
+Stamp/load may bind a parent `create_fk` from in-flight that is **ahead of**
+or **not** the write-batch’s create (same txid at two live pack heights, or
+a spend whose in-flight identity is the later overwrite). Write rejects that
+bind fail-closed (spentness / missing create / `SpansTip`). That is not a
+fork.
+
 **Post-BIP30:** a second *connected* create of the same txid is invalid.
 The only realistic overlap is a **disconnected** Class A sibling (reorg,
 same tx on the new tip) still sitting in a RAM map while the new fk is

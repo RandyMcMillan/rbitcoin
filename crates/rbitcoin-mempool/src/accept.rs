@@ -442,7 +442,7 @@ impl ActiveMempool {
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
         self.last_accept_stages = AcceptStageUs::default();
-        let prep = self.prepare_admit(tx, utxos, tip, 0)?;
+        let prep = self.prepare_admit(tx, utxos, tip, 0, true)?;
         let t_script = Instant::now();
         let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
         self.last_accept_stages.script_us = self
@@ -466,6 +466,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
         fee_delta: i64,
+        park_orphans: bool,
     ) -> Result<PreparedAdmit, AcceptError> {
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);
@@ -545,11 +546,12 @@ impl ActiveMempool {
             .saturating_add(t_utxo.elapsed().as_micros() as u64);
 
         if !missing_parents.is_empty() {
-            // Park when any parent is unknown (Core TX_MISSING_INPUTS → orphanage).
-            if self.orphanage.insert(tx.clone(), missing_parents) {
-                return Err(AcceptError::Orphaned(txid));
+            if park_orphans {
+                if self.orphanage.insert(tx.clone(), missing_parents) {
+                    return Err(AcceptError::Orphaned(txid));
+                }
+                return Err(AcceptError::MissingPrevout(tx.input[0].previous_output));
             }
-            // Cap full / overweight: surface as missing for diagnostics.
             return Err(AcceptError::MissingPrevout(tx.input[0].previous_output));
         }
 
@@ -782,7 +784,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<AcceptResult, AcceptError> {
-        let prep = self.prepare_admit(tx, utxos, tip, 0)?;
+        let prep = self.prepare_admit(tx, utxos, tip, 0, true)?;
         let t_script = Instant::now();
         let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
         self.last_accept_stages.script_us = self
@@ -1964,7 +1966,7 @@ mod tests {
         let low_id = low.compute_txid();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
-        let prep = mp.prepare_admit(&high, &utxos, TIP_OK, 0).unwrap();
+        let prep = mp.prepare_admit(&high, &utxos, TIP_OK, 0, true).unwrap();
         let r = mp
             .evaluate_after_script(&high, prep, &utxos, TIP_OK)
             .expect("preview");
@@ -2381,6 +2383,44 @@ mod tests {
         );
         assert_eq!(mp.orphan_count(), 0);
         assert_eq!(mp.live_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dry-run must not park: a later parent accept must not promote the child.
+    #[test]
+    fn prepare_admit_without_park_does_not_orphan() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let parent = spend_tx(op, 99_000);
+        let parent_id = parent.compute_txid();
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            98_000,
+        );
+        let child_id = child.compute_txid();
+
+        let err = mp
+            .prepare_admit(&child, &utxos, TIP_OK, 0, false)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AcceptError::MissingPrevout(_) | AcceptError::Orphaned(_)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(mp.orphan_count(), 0);
+
+        mp.accept_tx(&parent, &utxos, TIP_OK).expect("parent");
+        assert!(mp.graph.contains(&parent_id));
+        assert!(
+            !mp.graph.contains(&child_id),
+            "dry-run child must not promote when parent arrives"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

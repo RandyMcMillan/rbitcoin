@@ -9,6 +9,9 @@ use std::sync::{Mutex, RwLock};
 pub const HEADER_HEAD_DIR_REFUSE: &str =
     "header.head is a shard directory; wipe header.head and header.body and reindex";
 
+pub const HEADER_HEAD_EMPTY_REFUSE: &str =
+    "header.head is empty at target slots; wipe header.head, header.head.mlt, and header.body and reindex";
+
 /// Fixed-size header body record (88 bytes). See SCHEMA.md.
 pub const HEADER_RECORD_LEN: usize = 88;
 
@@ -103,7 +106,7 @@ impl HeaderHead {
         })
     }
 
-    fn open(base: PathBuf) -> Result<Self, StoreError> {
+    fn open(base: PathBuf, body_count: u64) -> Result<Self, StoreError> {
         if base.is_dir() {
             return Err(StoreError::Layout(HEADER_HEAD_DIR_REFUSE.to_string()));
         }
@@ -113,6 +116,7 @@ impl HeaderHead {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "header.head missing"),
             ));
         }
+        crate::hashhead::discard_grow_part(&base);
         let target_slots = initial_slots_for(HeadRole::Header);
         let mut gens = vec![HashHead::open(&base)?];
         let mut i = 1usize;
@@ -127,6 +131,12 @@ impl HeaderHead {
         if gens.len() == 1 && gens[0].slots() < target_slots {
             let g = gens.remove(0);
             gens.push(g.rewrite_to_slots(target_slots)?);
+        } else if gens.len() == 1
+            && gens[0].slots() >= target_slots
+            && gens[0].occupied() == 0
+            && (body_count > 0 || gens[0].multi_count() > 0)
+        {
+            return Err(StoreError::Layout(HEADER_HEAD_EMPTY_REFUSE.to_string()));
         }
         Ok(Self {
             base,
@@ -216,12 +226,12 @@ impl HeaderTable {
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
-        let head = HeaderHead::open(dir.join("header.head"))?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body_len % HEADER_RECORD_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("header body size"));
         }
         let count = body_len / HEADER_RECORD_LEN as u64;
+        let head = HeaderHead::open(dir.join("header.head"), count)?;
         Ok(Self {
             body,
             head,
@@ -565,6 +575,36 @@ mod tests {
             !dir.join("header.head.g1").is_file(),
             "open-grow to 64 slots must absorb 40 headers without rolling"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_head_empty_target_sized_gen0_with_body_is_layout_refuse() {
+        let dir = tmp();
+        let t = HeaderTable::create(&dir).unwrap();
+        t.ensure(&sample([0x44; 32])).unwrap();
+        t.flush().unwrap();
+        drop(t);
+        std::fs::remove_file(dir.join("header.head")).unwrap();
+        let slots = initial_slots_for(HeadRole::Header);
+        let staging = tmp();
+        let h = HashHead::create_with_slots(staging.join("header.head"), slots).unwrap();
+        h.flush().unwrap();
+        drop(h);
+        std::fs::rename(staging.join("header.head"), dir.join("header.head")).unwrap();
+        let _ = std::fs::remove_dir_all(&staging);
+        let err = match HeaderTable::open(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Layout refuse for empty target-sized header.head"),
+        };
+        match err {
+            StoreError::Layout(m) => {
+                assert!(m.contains("header.head"), "{m}");
+                assert!(m.contains("header.body"), "{m}");
+                assert!(m.contains("header.head.mlt"), "{m}");
+            }
+            other => panic!("expected Layout, got {other}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

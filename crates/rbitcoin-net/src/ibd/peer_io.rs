@@ -4,10 +4,10 @@
 //! - reader: decrypt frame + cheap ping handling; heavy decode off-thread
 //! - writer: encode offloaded for heavy payloads; then encrypt + write
 
-use crate::codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE};
+use crate::codec::MAX_INV_SIZE;
 use crate::error::NetError;
 use crate::msg_decode::spawn_decode_then_with_err;
-use crate::peer::{connect_and_handshake, HandshakePolicy};
+use crate::peer::{connect_and_handshake_timed, HandshakePolicy, HANDSHAKE_TIMEOUT};
 use crate::v2::{read_v2_frame_with_progress, write_v2_msg_offload};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
@@ -177,7 +177,8 @@ pub(crate) async fn spawn_peer(
     let stream = TcpStream::connect(addr).await?;
     let ua = rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
         .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
-    let (ver, reader, writer, _wire) = connect_and_handshake(
+    let (ver, reader, writer, _wire) = connect_and_handshake_timed(
+        HANDSHAKE_TIMEOUT,
         stream,
         magic,
         local,
@@ -275,12 +276,10 @@ pub(crate) async fn spawn_peer(
                             move |msg| {
                                 match msg.into_payload() {
                                     NetworkMessage::Headers(h) => {
-                                        let headers = if h.len() > MAX_HEADERS_RESULTS {
-                                            h[..MAX_HEADERS_RESULTS].to_vec()
-                                        } else {
-                                            h
-                                        };
-                                        sinks_d.send_ctrl(PeerEvent::Headers { peer: id, headers });
+                                        sinks_d.send_ctrl(PeerEvent::Headers {
+                                            peer: id,
+                                            headers: h,
+                                        });
                                     }
                                     NetworkMessage::NotFound(inv) => {
                                         touch_block_progress(&progress);
@@ -317,7 +316,15 @@ pub(crate) async fn spawn_peer(
                                     _other => {}
                                 }
                             },
-                            move || {},
+                            {
+                                let sinks_e = sinks_r.clone();
+                                move |e| {
+                                    sinks_e.send_body(PeerEvent::Dead {
+                                        peer: id,
+                                        reason: e.to_string(),
+                                    });
+                                }
+                            },
                         );
                     }
                     Err(NetError::InvalidV2Type { .. }) => {

@@ -64,7 +64,7 @@ pub async fn decode_framed_offload(frame: FramedMessage) -> Result<RawNetworkMes
         // Tiny messages (verack, ping already handled, sendheaders, …): cheap
         // enough that a spawn_blocking round-trip is pure overhead. Still keep
         // this path free of multi-MB work.
-        Ok(frame.decode())
+        frame.try_decode()
     }
 }
 
@@ -73,12 +73,12 @@ async fn decode_with_permit(
     permit: OwnedSemaphorePermit,
 ) -> Result<RawNetworkMessage, NetError> {
     let msg = tokio::task::spawn_blocking(move || {
-        let msg = frame.decode();
+        let msg = frame.try_decode();
         drop(permit);
         msg
     })
     .await
-    .map_err(|_| NetError::Protocol("decode task join failed"))?;
+    .map_err(|_| NetError::Protocol("decode task join failed"))??;
     Ok(msg)
 }
 
@@ -86,8 +86,8 @@ async fn decode_with_permit(
 ///
 /// Used by IBD peer readers so one slow `block` deserialize never blocks the
 /// next TCP read on that peer. `on_done` runs on the async runtime after decode
-/// (keep it light — only channel sends). `on_err` runs if the blocking join /
-/// semaphore fails (optional re-request path for framed block hashes).
+/// (keep it light — only channel sends). `on_err` runs if decode fails
+/// (join / semaphore / oversize headers).
 ///
 /// **Invariant:** readers must not await a decode permit (or any other soft
 /// body-queue gate) before the next TCP read. Soft BQ depth is enforced
@@ -96,12 +96,12 @@ async fn decode_with_permit(
 pub fn spawn_decode_then_with_err<F, E>(frame: FramedMessage, on_done: F, on_err: E)
 where
     F: FnOnce(RawNetworkMessage) + Send + 'static,
-    E: FnOnce() + Send + 'static,
+    E: FnOnce(NetError) + Send + 'static,
 {
     tokio::spawn(async move {
         match decode_framed_offload(frame).await {
             Ok(msg) => on_done(msg),
-            Err(_) => on_err(),
+            Err(e) => on_err(e),
         }
     });
 }
@@ -139,7 +139,7 @@ mod tests {
                 move |_| {
                     *d2.lock().unwrap() = true;
                 },
-                || panic!("should not err"),
+                |_| panic!("should not err"),
             );
             // Yield so the spawned task can finish.
             tokio::task::yield_now().await;

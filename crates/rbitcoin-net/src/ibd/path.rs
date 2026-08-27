@@ -142,9 +142,25 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     tips
 }
 
+/// Connected work-path hashes strictly above `tip_h` (`height_to_hash` occupants).
+///
+/// Competing `hash_height` entries are not path work — hard reset must not
+/// promote them onto `ordered`.
+pub(crate) fn path_hashes_above_tip(st: &IbdWorkState, tip_h: u32) -> Vec<(u32, BlockHash)> {
+    let mut above: Vec<(u32, BlockHash)> = st
+        .height_to_hash
+        .iter()
+        .filter(|(&ht, _)| ht > tip_h)
+        .map(|(&ht, &h)| (ht, h))
+        .collect();
+    above.sort_by_key(|(ht, _)| *ht);
+    above
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::state::IbdWorkState;
+    use super::path_hashes_above_tip;
     use super::work_path_tips;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
@@ -201,6 +217,16 @@ mod tests {
         let tips = work_path_tips(&st);
         // rev walk: 3 (live), 2 (ghost skip), 1 (live) — only set members.
         assert_eq!(tips, vec![h(3), h(1)]);
+    }
+
+    #[test]
+    fn path_hashes_above_tip_skips_competing_hash_height() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(10));
+        let occupant = h(1);
+        st.record_height(occupant, 11);
+        st.hash_height.insert(h(9), 12);
+        assert_eq!(path_hashes_above_tip(&st, 10), vec![(11, occupant)]);
+        assert!(path_hashes_above_tip(&st, 11).is_empty());
     }
 
     /// Exploration tips merge into locator tips (cap 8, dedupe ordered members).

@@ -2551,5 +2551,31 @@ fn path_slot_first_wins_chained_via_headers() {
         !st.ordered_set.contains(&hb),
         "later sibling must not enter ordered"
     );
+    assert!(
+        !st.is_on_path(&hb, 1),
+        "competitor is hash_height-only, not path occupancy"
+    );
+    assert!(
+        st.reorg.explore_need_hashes().contains(&hb),
+        "occupied-height sibling registers explore, not path"
+    );
+    let lag = super::super::exit::header_lag_behind_peers(&st, 0);
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![dummy_header(gen, 3)],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert_eq!(
+        super::super::exit::header_lag_behind_peers(&st, 0),
+        lag,
+        "further competitors must not inflate path lag"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -42,9 +42,9 @@ use events::{
 };
 use exit::{
     all_peers_dead_action, best_chain_remainder, empty_path_header_fan, header_lag_behind_peers,
-    ibd_caught_up, should_unlatch_headers_done, AllPeersDead,
+    ibd_caught_up, path_drained, should_unlatch_headers_done, AllPeersDead,
 };
-use path::{seed_work_path_from_store, work_path_tips};
+use path::{path_hashes_above_tip, seed_work_path_from_store, work_path_tips};
 use peer_io::{PeerCmd, PeerEvent, PeerEventSinks};
 use progress::{
     claim_ready, format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput,
@@ -628,21 +628,17 @@ pub async fn ibd_cancellable(
         }
 
         // Hard reset only when ordered is empty — a full queue still waiting on getdata is not stalled.
+        // Explore leftover inflight is not idle-block; a live awaiting gather is.
         if last_progress.elapsed() > cfg.stall.saturating_mul(6)
-            && st.ordered.is_empty()
-            && st.inflight.is_empty()
+            && path_drained(&st)
+            && st.reorg.awaiting().is_none()
         {
             let tip_now = hub.tip_height().unwrap_or(0);
-            let mut above: Vec<(u32, bitcoin::BlockHash)> = st
-                .hash_height
-                .iter()
-                .filter(|(_, &ht)| ht > tip_now)
-                .filter(|(h, _)| !hub.has_block(h) && !st.body.is_rejected(h))
-                .map(|(&h, &ht)| (ht, h))
-                .collect();
-            above.sort_by_key(|(ht, _)| *ht);
             let mut rebuilt = 0usize;
-            for (_ht, h) in above {
+            for (_ht, h) in path_hashes_above_tip(&st, tip_now) {
+                if hub.has_block(&h) || st.body.is_rejected(&h) {
+                    continue;
+                }
                 if st.ordered.len() >= MAX_ORDERED_HEADERS {
                     break;
                 }
@@ -660,11 +656,6 @@ pub async fn ibd_cancellable(
                 st.ordered.len()
             );
             st.headers_done = false;
-            for (&h, &ht) in &st.hash_height {
-                if st.ordered_set.contains(&h) {
-                    st.height_to_hash.insert(ht, h);
-                }
-            }
             let tips = work_path_tips(&st);
             let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
             last_progress = Instant::now();

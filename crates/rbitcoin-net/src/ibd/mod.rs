@@ -604,7 +604,7 @@ pub async fn ibd_cancellable(
                 let min_cache = window.saturating_mul(8).max(4096);
                 let alive = st.slots.iter().filter(|s| s.alive).count();
                 if live == 0 {
-                    let fan = empty_path_header_fan(lag, st.inflight.len(), alive);
+                    let fan = empty_path_header_fan(&st, tip_h, alive);
                     if fan == 0 {
                         st.headers_done = true;
                     } else {

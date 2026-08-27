@@ -20,6 +20,12 @@ pub(crate) fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
         .saturating_sub(path_high_water(st, tip_h))
 }
 
+/// `height_to_hash` already holds the connecting header at tip+1.
+#[inline]
+pub(crate) fn has_tip_plus_one(st: &IbdWorkState, tip_h: u32) -> bool {
+    st.height_to_hash.contains_key(&tip_h.saturating_add(1))
+}
+
 fn on_path_inflight(st: &IbdWorkState) -> bool {
     st.inflight.keys().any(|h| {
         if st.ordered_set.contains(h) {
@@ -74,14 +80,19 @@ pub(crate) fn should_advance_locator_after_known_batch(
 
 /// How many peers to `getheaders` when the ordered path is empty.
 ///
-/// Mid-sync (`lag > 2`): fan a few so one zombie cannot stall. Near tip
-/// (`lag ≤ 2`): never fan — remaining work is inflight/BQ/confirm, not
-/// another locator walk. Caller marks `headers_done` when fan is 0.
-pub(crate) fn empty_path_header_fan(lag: u32, inflight: usize, alive: usize) -> usize {
-    if lag <= 2 {
+/// At path high water vs peers (`lag == 0`), or near tip with tip+1 already
+/// on the path: do not fan — remaining work is getdata/BQ/confirm.
+/// A connecting-header hole (peers ahead, no tip+1) always fans, including
+/// `lag <= 2` (mainnet 04:14 latched `headers_done` and stopped asking).
+pub(crate) fn empty_path_header_fan(st: &IbdWorkState, tip_h: u32, alive: usize) -> usize {
+    let lag = header_lag_behind_peers(st, tip_h);
+    if lag == 0 {
         return 0;
     }
-    if inflight > 0 {
+    if lag <= 2 && has_tip_plus_one(st, tip_h) {
+        return 0;
+    }
+    if on_path_inflight(st) {
         return 1.min(alive);
     }
     alive.min(4).max(1)
@@ -89,12 +100,15 @@ pub(crate) fn empty_path_header_fan(lag: u32, inflight: usize, alive: usize) -> 
 
 /// Clear `headers_done` so empty-path `getheaders` can resume.
 ///
-/// Latch is only for lag ≤ 2 (stop the tip storm). When peers advertise a
-/// higher tip, unlatch even if leftover getdata is still inflight — that
-/// used to sit behind [`path_drained`] and stall until SIGINT.
+/// Latch is only to stop the tip storm. Unlatch when peers are more than one
+/// ahead **or** the connecting header is missing while they still advertise.
 #[inline]
 pub(crate) fn should_unlatch_headers_done(st: &IbdWorkState, tip_h: u32) -> bool {
-    st.headers_done && st.ordered.is_empty() && header_lag_behind_peers(st, tip_h) > 2
+    if !st.headers_done || !st.ordered.is_empty() {
+        return false;
+    }
+    let lag = header_lag_behind_peers(st, tip_h);
+    lag > 1 || (lag > 0 && !has_tip_plus_one(st, tip_h))
 }
 
 /// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.
@@ -324,13 +338,32 @@ mod tests {
             8_000, 10, false, false
         ));
 
-        // Empty path near tip: no fan (finish sync / SH / tip follow).
-        assert_eq!(empty_path_header_fan(0, 0, 29), 0);
-        assert_eq!(empty_path_header_fan(2, 3, 29), 0);
-        // Mid-sync empty: fan (cap 4); one peer if getdata already inflight.
-        assert_eq!(empty_path_header_fan(100, 0, 29), 4);
-        assert_eq!(empty_path_header_fan(100, 5, 29), 1);
-        assert_eq!(empty_path_header_fan(100, 0, 2), 2);
+        // Empty path at horizon: no fan (finish sync / SH / tip follow).
+        let mut at = IbdWorkState::new(Vec::new(), None, Some(100));
+        at.max_peer_height = 100;
+        at.max_ready_height = 100;
+        assert_eq!(empty_path_header_fan(&at, 100, 29), 0);
+        // Near tip with connecting header on path: getdata, not locators.
+        let mut near = IbdWorkState::new(Vec::new(), None, Some(100));
+        near.max_peer_height = 102;
+        near.max_ready_height = 100;
+        near.record_height(h(0x2a), 101);
+        near.inflight
+            .insert(h(0x2a), super::super::state::InflightReq::new(0));
+        assert_eq!(empty_path_header_fan(&near, 100, 29), 0);
+        // Mid-sync empty: fan (cap 4); one peer if on-path getdata already inflight.
+        let mut mid = IbdWorkState::new(Vec::new(), None, Some(100));
+        mid.max_peer_height = 200;
+        mid.max_ready_height = 100;
+        assert_eq!(empty_path_header_fan(&mid, 100, 29), 4);
+        mid.record_height(h(0x2a), 101);
+        mid.inflight
+            .insert(h(0x2a), super::super::state::InflightReq::new(0));
+        assert_eq!(empty_path_header_fan(&mid, 100, 29), 1);
+        let mut few = IbdWorkState::new(Vec::new(), None, Some(100));
+        few.max_peer_height = 200;
+        few.max_ready_height = 100;
+        assert_eq!(empty_path_header_fan(&few, 100, 2), 2);
     }
 
     fn h(b: u8) -> bitcoin::BlockHash {
@@ -481,7 +514,7 @@ mod tests {
         let lag = header_lag_behind_peers(&hole, 100);
         assert_eq!(lag, 2, "competing hash_height must not hide a 2-block hole");
         assert!(
-            empty_path_header_fan(lag, hole.inflight.len(), 29) >= 1,
+            empty_path_header_fan(&hole, 100, 29) >= 1,
             "empty h2h with peers ahead must fan getheaders"
         );
         assert!(
@@ -493,10 +526,7 @@ mod tests {
         let mut at = IbdWorkState::new(Vec::new(), None, Some(100));
         at.max_peer_height = 100;
         at.max_ready_height = 100;
-        assert_eq!(
-            empty_path_header_fan(header_lag_behind_peers(&at, 100), 0, 29),
-            0
-        );
+        assert_eq!(empty_path_header_fan(&at, 100, 29), 0);
         at.headers_done = true;
         assert!(!super::should_unlatch_headers_done(&at, 100));
     }

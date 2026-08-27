@@ -62,18 +62,19 @@ pub(crate) fn prune_satisfied_inflight(
     }
 }
 
-/// Drop getdata that cannot feed the work path or a reorg gather.
+/// Drop getdata that cannot feed the work path or a live awaiting-reorg gather.
 ///
-/// Off-path leftovers otherwise block [`path_drained`](super::exit::path_drained)
-/// forever (mainnet 08:16:23: ordered empty, h2h=0, inflight=7).
+/// Speculative `explore_need` is not kept: assign re-issues it while remainder
+/// is live. Off-path leftovers otherwise sat in inflight forever (mainnet
+/// 08:16:23 / 04:14).
 pub(crate) fn prune_off_path_inflight(st: &mut IbdWorkState) {
-    let reorg_need: HashSet<BlockHash> = st.reorg.need_getdata().into_iter().collect();
+    let await_need: HashSet<BlockHash> = st.reorg.awaiting_need_getdata().into_iter().collect();
     let drop: Vec<BlockHash> = st
         .inflight
         .keys()
         .copied()
         .filter(|h| {
-            if st.ordered_set.contains(h) || reorg_need.contains(h) {
+            if st.ordered_set.contains(h) || await_need.contains(h) {
                 return false;
             }
             if let Some(&ht) = st.hash_height.get(h) {
@@ -834,9 +835,12 @@ mod tests {
     }
 
     /// Off-path getdata (mainnet 08:16:23: ordered empty, h2h=0, inflight=7)
-    /// must not occupy slots; tip+1 and reorg-need hashes stay.
+    /// must not occupy slots; tip+1 and live awaiting-reorg need stay.
+    /// Speculative explore-need at an empty remainder is leftover — drop it.
     #[test]
     fn prune_off_path_inflight_drops_orphans_keeps_path_and_reorg() {
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
@@ -853,22 +857,50 @@ mod tests {
         st.record_height(want, ht);
         st.slots[0].in_flight.insert(want);
         inflight_add_peer(&mut st.inflight, want, 0);
-        let reorg_h = h(0x22);
-        st.reorg.register_explore(std::iter::once(reorg_h), None);
-        st.slots[0].in_flight.insert(reorg_h);
-        inflight_add_peer(&mut st.inflight, reorg_h, 0);
-        assert_eq!(st.inflight.len(), 9);
+        let explore_h = h(0x22);
+        st.reorg.register_explore(std::iter::once(explore_h), None);
+        st.slots[0].in_flight.insert(explore_h);
+        inflight_add_peer(&mut st.inflight, explore_h, 0);
+        let await_h = h(0x33);
+        st.reorg.set_awaiting(
+            bitcoin::Block {
+                header: Header {
+                    version: Version::from_consensus(4),
+                    prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time: 1,
+                    bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                    nonce: 0,
+                },
+                txdata: vec![],
+            },
+            vec![await_h],
+        );
+        st.slots[0].in_flight.insert(await_h);
+        inflight_add_peer(&mut st.inflight, await_h, 0);
+        assert_eq!(st.inflight.len(), 10);
 
         prune_off_path_inflight(&mut st);
 
-        assert_eq!(st.inflight.len(), 2, "orphans dropped; path+reorg kept");
         assert!(st.inflight.contains_key(&want), "tip+1 occupant stays");
-        assert!(st.inflight.contains_key(&reorg_h), "reorg need stays");
+        assert!(
+            st.inflight.contains_key(&await_h),
+            "awaiting reorg need stays"
+        );
+        assert!(
+            !st.inflight.contains_key(&explore_h),
+            "explore-need at empty remainder is leftover"
+        );
         for i in 0..7u32 {
             let hash = h(1000 + i);
             assert!(!st.inflight.contains_key(&hash), "orphan {i} dropped");
             assert!(!st.slots[0].in_flight.contains(&hash));
         }
+        assert_eq!(
+            st.inflight.len(),
+            2,
+            "orphans+explore dropped; path+awaiting kept"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

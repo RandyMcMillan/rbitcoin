@@ -181,11 +181,9 @@ impl IbdReorgState {
         self.explore_tips.clear();
     }
 
-    /// Hashes densify/getdata should still pull for an incomplete reorg
-    /// (awaiting gather **or** proactive exploration).
-    pub fn need_getdata(&self) -> Vec<BlockHash> {
-        let mut out: Vec<BlockHash> = self
-            .awaiting
+    /// Hashes still needed for an incomplete **awaiting** gather (not explore).
+    pub fn awaiting_need_getdata(&self) -> Vec<BlockHash> {
+        self.awaiting
             .as_ref()
             .map(|a| {
                 a.need
@@ -194,7 +192,13 @@ impl IbdReorgState {
                     .copied()
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// Hashes densify/getdata should still pull for an incomplete reorg
+    /// (awaiting gather **or** proactive exploration).
+    pub fn need_getdata(&self) -> Vec<BlockHash> {
+        let mut out = self.awaiting_need_getdata();
         for h in &self.explore_need {
             if !self.held_bodies.contains_key(h) && !out.contains(h) {
                 out.push(*h);

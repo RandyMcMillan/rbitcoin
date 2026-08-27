@@ -41,9 +41,8 @@ use events::{
     drain_ready_peer_and_archive_events, try_complete_awaiting_reorg, update_confirm_lag,
 };
 use exit::{
-    all_peers_dead_action, catchup_complete_after_drain, empty_path_header_fan,
-    header_lag_behind_peers, path_drained, peer_caught_up, should_unlatch_headers_done,
-    AllPeersDead,
+    all_peers_dead_action, best_chain_remainder, empty_path_header_fan, header_lag_behind_peers,
+    ibd_caught_up, should_unlatch_headers_done, AllPeersDead,
 };
 use path::{seed_work_path_from_store, work_path_tips};
 use peer_io::{PeerCmd, PeerEvent, PeerEventSinks};
@@ -923,15 +922,12 @@ pub async fn ibd_cancellable(
             last_status = Instant::now();
         }
 
-        // Exit only when the work path is drained **and** we are at (or past)
-        // peer-advertised height, or headers_done with no lag. Never exit solely
-        // on headers_done while max_peer_height still dwarfs our tip (signet:
-        // false headers_done at h≈2000 with peers at ~313k). See `exit` module.
+        // Exit when the connected best chain has no remainder and peers are
+        // not advertising a header hole. Never exit solely on headers_done
+        // while max_peer_height still dwarfs our tip (signet: false
+        // headers_done at h≈2000 with peers at ~313k). See `exit` module.
         let tip_h = hub.tip_height().unwrap_or(0);
-        if path_drained(&st)
-            && (peer_caught_up(&st, tip_h)
-                || (st.headers_done && header_lag_behind_peers(&st, tip_h) <= 2))
-        {
+        if ibd_caught_up(&st, tip_h) {
             offer_confirm_ready(
                 &confirm_feed,
                 &st.height_to_hash,
@@ -942,7 +938,7 @@ pub async fn ibd_cancellable(
             );
             update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
             let tip_h = hub.tip_height().unwrap_or(0);
-            if catchup_complete_after_drain(&st, tip_h) {
+            if ibd_caught_up(&st, tip_h) {
                 info!(
                     "ibd: catch-up complete tip={tip_h} max_peer_height={} max_ready={} headers_done={} — exiting IBD",
                     st.max_peer_height, st.max_ready_height, st.headers_done
@@ -1061,10 +1057,10 @@ pub async fn ibd_cancellable(
                 // while peers die" as success → node entered tip mode at height 0.
                 if last_progress.elapsed() > cfg.stall
                     && st.ordered.is_empty()
-                    && st.inflight.is_empty()
+                    && !best_chain_remainder(&st, hub.tip_height().unwrap_or(0))
                 {
                     let tip_h = hub.tip_height().unwrap_or(0);
-                    if catchup_complete_after_drain(&st, tip_h) {
+                    if ibd_caught_up(&st, tip_h) {
                         info!(
                             "ibd: catch-up complete (stall, path empty) tip={tip_h} max_peer_height={} — exiting IBD",
                             st.max_peer_height

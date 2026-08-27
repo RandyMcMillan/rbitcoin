@@ -8,13 +8,36 @@ use super::state::IbdWorkState;
 /// Max empty redial rounds while fully dark before giving up mid catch-up.
 pub const MAX_DARK_EMPTY_REDIALS: u32 = 4;
 
-/// How far our known work path lags peer-advertised height.
+/// Highest connected best-chain height we already occupy (not competing `hash_height`).
+pub(crate) fn path_high_water(st: &IbdWorkState, tip_h: u32) -> u32 {
+    let h2h_hi = st.height_to_hash.keys().copied().max().unwrap_or(0);
+    st.max_ready_height.max(h2h_hi).max(tip_h)
+}
+
+/// How far the connected work path lags peer-advertised height.
 pub(crate) fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
-    let known_hi = st
-        .max_ready_height
-        .max(st.hash_height.values().copied().max().unwrap_or(0))
-        .max(tip_h);
-    st.max_peer_height.saturating_sub(known_hi)
+    st.max_peer_height
+        .saturating_sub(path_high_water(st, tip_h))
+}
+
+fn on_path_inflight(st: &IbdWorkState) -> bool {
+    st.inflight.keys().any(|h| {
+        if st.ordered_set.contains(h) {
+            return true;
+        }
+        st.hash_height
+            .get(h)
+            .is_some_and(|&ht| st.is_on_path(h, ht))
+    })
+}
+
+/// Work still owed to the confirmed best chain (not explore/orphan getdata).
+pub(crate) fn best_chain_remainder(st: &IbdWorkState, tip_h: u32) -> bool {
+    !st.ordered.is_empty()
+        || st.height_to_hash.keys().any(|&h| h > tip_h)
+        || st.max_ready_height > tip_h
+        || st.reorg.awaiting().is_some()
+        || on_path_inflight(st)
 }
 
 /// WARN cadence for empty `headers` while still lagging peer horizon.
@@ -83,34 +106,32 @@ pub(crate) fn should_reseed_work_path_on_empty_lag(streak: u32) -> bool {
     should_log_empty_headers_lag(streak)
 }
 
-/// Work path idle: no ordered hashes, no inflight getdata.
+/// Work path idle: no ordered hashes, no on-path getdata.
 ///
-/// Off-path leftover getdata is dropped by
-/// [`super::assign::prune_off_path_inflight`] before this is consulted — not a
-/// second meaning of drained.
+/// Off-path leftover getdata is not drain. [`best_chain_remainder`] is the
+/// exit remainder (also BQ/awaiting/h2h above tip).
 #[inline]
 pub fn path_drained(st: &IbdWorkState) -> bool {
-    st.ordered.is_empty() && st.inflight.is_empty()
+    st.ordered.is_empty() && !on_path_inflight(st)
 }
 
-/// True when tip is within 2 of peer horizon and archive is not ahead of tip.
+/// IBD densify may exit: no best-chain remainder and at (or one chatter block from) peers.
 #[inline]
-pub fn peer_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
-    let lag = header_lag_behind_peers(st, tip_h);
-    tip_h > 0 && lag <= 2 && tip_h >= st.max_ready_height
+pub fn ibd_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
+    if tip_h == 0 || best_chain_remainder(st, tip_h) {
+        return false;
+    }
+    match header_lag_behind_peers(st, tip_h) {
+        0 => true,
+        1 => st.headers_done,
+        _ => false,
+    }
 }
 
-/// Success exit after path drain: headers_done or tip near max_peer_height.
+/// Success exit after path drain. Prefer [`ibd_caught_up`].
 #[inline]
 pub fn catchup_complete_after_drain(st: &IbdWorkState, tip_h: u32) -> bool {
-    if !path_drained(st) {
-        return false;
-    }
-    let lag = header_lag_behind_peers(st, tip_h);
-    if lag > 2 {
-        return false;
-    }
-    st.headers_done || tip_h >= st.max_peer_height.saturating_sub(2)
+    ibd_caught_up(st, tip_h)
 }
 
 /// Outcome when every peer slot is dead (or retained empty).
@@ -131,13 +152,7 @@ pub fn all_peers_dead_action(
     redial_in_flight: bool,
     dark_redial_empty: u32,
 ) -> AllPeersDead {
-    let lag = header_lag_behind_peers(st, tip_h);
-    let path_ok = path_drained(st);
-    let caught_up = path_ok
-        && tip_h > 0
-        && lag <= 2
-        && (st.headers_done || tip_h >= st.max_peer_height.saturating_sub(2));
-    if caught_up {
+    if ibd_caught_up(st, tip_h) {
         return AllPeersDead::CatchupComplete;
     }
     if !redial_in_flight || dark_redial_empty >= MAX_DARK_EMPTY_REDIALS {
@@ -191,7 +206,7 @@ mod tests {
         zero.max_ready_height = 0;
         zero.headers_done = false;
         assert!(!catchup_complete_after_drain(&zero, 0));
-        assert!(!peer_caught_up(&zero, 0));
+        assert!(!ibd_caught_up(&zero, 0));
         assert_eq!(
             all_peers_dead_action(&zero, 0, false, 0),
             AllPeersDead::GiveUpMidCatchup
@@ -216,17 +231,18 @@ mod tests {
         assert!(!path_drained(&busy));
         assert!(!catchup_complete_after_drain(&busy, 10));
 
-        // peer_caught_up: tip near horizon and not behind archive.
+        // ibd_caught_up: tip at/within 1 of horizon and not behind archive.
         let mut near = IbdWorkState::new(Vec::new(), None, Some(100));
         near.max_peer_height = 101;
         near.max_ready_height = 100;
-        assert!(peer_caught_up(&near, 100));
+        near.headers_done = true;
+        assert!(ibd_caught_up(&near, 100));
         near.max_ready_height = 105;
-        assert!(!peer_caught_up(&near, 100));
+        assert!(!ibd_caught_up(&near, 100));
         assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
 
         // Mainnet 08:16:23: ordered empty, headers_done, tip=horizon, 7 off-path
-        // inflight. Prune then drain — do not treat leftover getdata as work.
+        // inflight. Remainder ignores leftover getdata — prune is hygiene only.
         use super::super::assign::prune_off_path_inflight;
         use super::super::state::InflightReq;
         let mut at_horizon = IbdWorkState::new(Vec::new(), None, Some(964_108));
@@ -238,9 +254,10 @@ mod tests {
                 .inflight
                 .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
         }
-        assert!(!path_drained(&at_horizon));
-        assert!(!catchup_complete_after_drain(&at_horizon, 964_108));
+        assert!(path_drained(&at_horizon));
+        assert!(catchup_complete_after_drain(&at_horizon, 964_108));
         prune_off_path_inflight(&mut at_horizon);
+        assert!(at_horizon.inflight.is_empty());
         assert!(path_drained(&at_horizon));
         assert!(catchup_complete_after_drain(&at_horizon, 964_108));
 

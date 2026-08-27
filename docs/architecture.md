@@ -69,6 +69,7 @@ for unknown-height bodies (mark missing → re-getdata).
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Script verification | Pure Rust in-tree (`rbitcoin-consensus::script`) | libbitcoinconsensus / script interpreter in C++ |
 | Electrum | In-process index on confirm | External (Fulcrum, ElectrumX, …) |
+| IBD vs “current” | Dedicated densify loop exits when the **connected work path** has no remainder and is at (or one chatter block from) advertised peer height; then disconnect and `enter_tip_mode`. Relay / RPC `initialblockdownload` after the switch is Core-like: `-minimumchainwork` + `-maxtipage` (24h). | Same header/block pipeline throughout. `IsInitialBlockDownload` latches false on min chain work + tip timestamp recency (`nMaxTipAge`). btcd/libbitcoin also latch on tip time, not empty getdata. |
 | Product scope | Full node + Electrum backend; **no** wallet/mining/GUI/prune | Full Core product surface |
 
 Product / wire intentional differences: [`COMPAT.md`](../COMPAT.md).

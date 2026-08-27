@@ -55,7 +55,12 @@ The 2-wave split is sealed age, not an IO flag.
 | **Direct** | IBD (`enter_direct_index_mode`) | confirmed-strong annotations | commit-stage head insert; spend annotate in same stage | append-only target-sized runs + SEAL → bulk at tip |
 | **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | write-behind after tip commit (may lag live tip by 1+ blocks) |
 
-Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
+Do not enter Tip until IBD catch-up complete: no best-chain remainder
+(ordered / `height_to_hash` above tip / BQ ready ahead / awaiting reorg /
+on-path getdata) and path high water at or within 1 of max peer height
+(one-block version chatter only when `headers_done`). Competing
+`hash_height` and leftover explore getdata are not remainder. Tip entry
+bulk-materializes SH
 (runs → sliced k-way per prefix shard, workers
 capped at one per 1.5 GiB host free RAM, writing `scripthash.body/NN`
 and sealing `scripthash.head/NN` themselves). Shared file `scripthash.body`

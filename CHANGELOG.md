@@ -232,6 +232,12 @@ before 1.0).
 
 ### Fixed
 
+- **IBD catch-up complete ignores leftover explore/orphan getdata and
+  competing `hash_height`:** exit uses connected-path remainder vs peer
+  height (one-block version chatter). Empty path with a missing tip+1
+  keeps `getheaders` instead of latching `headers_done` two blocks short
+  of the horizon.
+
 - **Esplora mempool-only tx JSON includes vin/vout/size/weight:** Class A
   miss uses the mempool wire body (`GET /tx`, `/txs`, `/txs/mempool`, WS
   address-transactions). No more txid+fee stub.

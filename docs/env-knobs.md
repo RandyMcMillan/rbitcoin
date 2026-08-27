@@ -26,7 +26,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_BULK_IO_WORKERS` | backend default | pread worker count when `RBITCOIN_IO=pread` |
 | `RBITCOIN_CLASS_C_INRAM_MAX_MB` | 256 | L2 cap for `confirmed` / `header_txs_*`; over → fd L0. `strong_tx` always L2 |
 | `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
-| `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS` | 26 | Wipe/empty-head MPHF range `2^bits` (25 low-RAM; clamp 6..=26) |
+| `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS` | 25 | Wipe/empty-head MPHF range `2^bits` (26 wider; clamp 6..=26) |
 | `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Per-stem idx soft rollover (do not set above 32 GiB hard span). Does **not** cut `tx.head`. |
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots (power of two) |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |

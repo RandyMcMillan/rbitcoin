@@ -54,6 +54,13 @@ before 1.0).
 
 ### Changed
 
+- **`tx.head` seal uses less RAM:** uniqueness is an in-place sort (no
+  per-key `HashMap<Vec>`), BDZ peel is XOR-degree with reused scratch
+  (no CSR+edge list), fuse builds from the unique key vec, packed BDZ2
+  streams `g[]` in 4 KiB pages. Wipe-rebuild default range is **2²⁵**
+  keys (`RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS=26` still available). Same
+  on-disk BDZ2. Live IBD roll-seal uses the same path.
+
 - **`header.head` open-grow is sibling then rename:** undersized single-gen
   rewrite writes `header.head.grow`, fsyncs, then rename over the live file
   (`.mlt` kept). Crash during rewrite leaves the previous OA. A target-sized

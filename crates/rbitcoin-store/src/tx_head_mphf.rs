@@ -1,21 +1,15 @@
-//! Sealed `tx.head` shard: BDZ MPHF + dense `u32` rels (one candidate).
+//! Sealed `tx.head` shard: value-assigned BDZ MPHF (one candidate).
 //!
-//! `base.mphf` is BDZ. `base.rel` is `n × 4` (1-based relative fk). Optional
-//! `base.mlt` holds extra older rels for BIP30 (same mixed key, newer first
-//! in `.rel`, rest here). A miss is fuse-gated by the caller.
+//! `base.mphf` is BDZ2: `index(key) = newest_rel - 1`. Optional `base.mlt`
+//! holds extra older rels for BIP30. A miss is fuse-gated by the caller.
 
 use crate::bdz::BdzMphf;
-use crate::bulk_io::{pread_batch, pread_batch_on_ctx, ReadOp};
 use crate::error::StoreError;
-use crate::io_handle::IoHandle;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 pub struct TxHeadMphf {
-    base: PathBuf,
     mphf: BdzMphf,
-    rel: File,
     mlt: HashMap<u32, Vec<u32>>,
 }
 
@@ -39,7 +33,7 @@ fn sidecar(base: &Path, ext: &str) -> PathBuf {
 
 impl TxHeadMphf {
     pub fn exists(base: &Path) -> bool {
-        mphf_path(base).is_file() && rel_path(base).is_file()
+        mphf_path(base).is_file()
     }
 
     pub fn write(base: impl AsRef<Path>, pairs: &[(u64, u32)]) -> Result<Self, StoreError> {
@@ -48,39 +42,32 @@ impl TxHeadMphf {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut by_key: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut modulus = 0u32;
         for &(k, rel) in pairs {
             if rel == 0 {
                 return Err(StoreError::Corrupt("tx.head mphf: rel 0"));
             }
+            modulus = modulus.max(rel);
             by_key.entry(k).or_default().push(rel);
         }
-        let keys: Vec<u64> = by_key.keys().copied().collect();
-        let mphf = BdzMphf::build(&keys)?;
-        let n = keys.len();
-        let mut rels = vec![0u32; n];
+        let mut keys = Vec::with_capacity(by_key.len());
+        let mut values = Vec::with_capacity(by_key.len());
         let mut mlt: HashMap<u32, Vec<u32>> = HashMap::new();
         for (k, mut rs) in by_key {
             let newest = rs.pop().unwrap();
-            let slot = mphf.index(k)?;
-            rels[slot as usize] = newest;
+            let slot = newest - 1;
+            keys.push(k);
+            values.push(slot);
             if !rs.is_empty() {
                 rs.reverse();
                 mlt.insert(slot, rs);
             }
         }
-        mphf.write_to(&mphf_path(base))?;
-        {
-            let rp = rel_path(base);
-            let mut buf = Vec::with_capacity(n.saturating_mul(4));
-            for r in &rels {
-                buf.extend_from_slice(&r.to_le_bytes());
-            }
-            std::fs::write(&rp, &buf).map_err(|e| StoreError::io(&rp, e))?;
-            let f = OpenOptions::new()
-                .write(true)
-                .open(&rp)
-                .map_err(|e| StoreError::io(&rp, e))?;
-            f.sync_all().map_err(|e| StoreError::io(&rp, e))?;
+        let mphf = BdzMphf::build_assigned(&keys, &values, modulus)?;
+        mphf.write_packed_to(&mphf_path(base))?;
+        let rp = rel_path(base);
+        if rp.is_file() {
+            let _ = std::fs::remove_file(&rp);
         }
         write_mlt(&mlt_path(base), &mlt)?;
         Self::open(base)
@@ -89,24 +76,14 @@ impl TxHeadMphf {
     pub fn open(base: impl AsRef<Path>) -> Result<Self, StoreError> {
         let base = base.as_ref().to_path_buf();
         let mp = mphf_path(&base);
+        let mphf = BdzMphf::read_packed_from(&mp)?;
         let rp = rel_path(&base);
-        let mphf = BdzMphf::read_from(&mp)?;
-        let rel = OpenOptions::new()
-            .read(true)
-            .open(&rp)
-            .map_err(|e| StoreError::io(&rp, e))?;
-        let n = mphf.n() as u64;
-        let meta = rel.metadata().map_err(|e| StoreError::io(&rp, e))?;
-        if meta.len() != n.saturating_mul(4) {
-            return Err(StoreError::Corrupt("tx.head mphf: rel length"));
+        if rp.is_file() {
+            eprintln!("store: dropping leftover tx.head .rel (schema 20 MPHF is value-assigned)");
+            let _ = std::fs::remove_file(&rp);
         }
         let mlt = read_mlt(&mlt_path(&base))?;
-        Ok(Self {
-            base,
-            mphf,
-            rel,
-            mlt,
-        })
+        Ok(Self { mphf, mlt })
     }
 
     #[cfg(test)]
@@ -134,46 +111,12 @@ impl TxHeadMphf {
     pub fn read_rels_batch(
         &self,
         slots: &[u32],
-        ctx: &mut crate::IoCtx<'_>,
+        _ctx: &mut crate::IoCtx<'_>,
     ) -> Result<Vec<Vec<u32>>, StoreError> {
-        let fd = IoHandle::from_file(&self.rel);
-        let mut bufs = vec![[0u8; 4]; slots.len()];
         let mut out = vec![Vec::new(); slots.len()];
-        {
-            let mut ops: Vec<ReadOp<'_>> = bufs
-                .iter_mut()
-                .zip(slots.iter())
-                .map(|(buf, &slot)| ReadOp {
-                    fd,
-                    offset: u64::from(slot) * 4,
-                    buf: &mut buf[..],
-                    result: 0,
-                })
-                .collect();
-            if !ops.is_empty() {
-                match pread_batch_on_ctx(ctx, &mut ops)? {
-                    true => {}
-                    false => pread_batch(&mut ops),
-                }
-                for op in &ops {
-                    if op.result < 4 {
-                        return Err(StoreError::io(
-                            &rel_path(&self.base),
-                            std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "tx.head rel pread short",
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        for (i, buf) in bufs.iter().enumerate() {
-            let rel = u32::from_le_bytes(*buf);
-            if rel != 0 {
-                out[i].push(rel);
-            }
-            if let Some(extra) = self.mlt.get(&slots[i]) {
+        for (i, &slot) in slots.iter().enumerate() {
+            out[i].push(slot + 1);
+            if let Some(extra) = self.mlt.get(&slot) {
                 out[i].extend_from_slice(extra);
             }
         }
@@ -380,8 +323,11 @@ mod tests {
             .collect();
         let h = TxHeadMphf::write(&base, &pairs).unwrap();
         assert_eq!(h.mphf.g_bytes_resident(), 0);
+        assert!(!rel_path(&base).is_file());
+        assert_eq!(&std::fs::read(mphf_path(&base)).unwrap()[0..4], b"BDZ2");
         let slots = h.slots_for(&[pairs[0].0]).unwrap();
         assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0], pairs[0].1 - 1);
         let rels = h
             .read_rels_batch(&slots, &mut crate::IoCtx::none())
             .unwrap();
@@ -389,39 +335,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Held `.rel` pread must fail closed on a poisoned TLS ring (f07415b5).
-    /// Falling through to `pread_batch` nests `with_thread_local` and panics
-    /// lookup (`ibd-confirm-lookup` nested thread-local io_uring).
     #[test]
-    #[cfg(target_os = "linux")]
-    fn held_rel_pread_poisoned_session_does_not_nest_tls() {
-        if !crate::bulk_io::io_uring_enabled() {
-            return;
-        }
-        let dir = tmp("held-rel-poison");
+    fn tx_head_mphf_unlinks_leftover_rel_and_bip30_mlt() {
+        let dir = tmp("leftover-rel");
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("000000");
-        let pairs = vec![(0x1111_u64, 1u32), (0x2222, 2)];
+        let key = 0xB1B0_u64;
+        let pairs = vec![(key, 1u32), (0x2222, 2), (key, 3)];
+        std::fs::write(rel_path(&base), [1u8, 2, 3, 4]).unwrap();
         let h = TxHeadMphf::write(&base, &pairs).unwrap();
-        let slots = h.slots_for(&[pairs[0].0]).unwrap();
-
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::uring_session::with_thread_local(
-                crate::uring_session::DEFAULT_ENTRIES,
-                |session| {
-                    session.poison();
-                    h.read_rels_batch(&slots, &mut IoCtx::held(session))
-                },
-            )
-        }));
+        assert!(!rel_path(&base).is_file());
+        let slots = h.slots_for(&[key]).unwrap();
+        assert_eq!(slots, vec![2]);
+        let rels = h
+            .read_rels_batch(&slots, &mut crate::IoCtx::none())
+            .unwrap();
+        assert_eq!(rels[0], vec![3, 1]);
+        std::fs::write(rel_path(&base), [9u8; 4]).unwrap();
+        let h2 = TxHeadMphf::open(&base).unwrap();
+        assert!(!rel_path(&base).is_file());
+        assert_eq!(
+            h2.read_rels_batch(&slots, &mut crate::IoCtx::none())
+                .unwrap()[0],
+            vec![3, 1]
+        );
         let _ = std::fs::remove_dir_all(&dir);
-        match caught {
-            Ok(Ok(Err(StoreError::Corrupt(msg))))
-                if msg.contains("poisoned") || msg.contains("held") => {}
-            Ok(Ok(Ok(_))) => panic!("poisoned held rel must fail closed, not succeed"),
-            Ok(Err(e)) => panic!("with_thread_local setup failed: {e}"),
-            Err(_) => panic!("nested thread-local io_uring: held rel must not open a second ring"),
-            Ok(Ok(Err(e))) => panic!("unexpected held rel error: {e}"),
-        }
     }
 }

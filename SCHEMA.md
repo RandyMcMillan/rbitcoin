@@ -1,11 +1,13 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 19` (`rbitcoin_primitives`).  
-**Status:** 19 adds megakey SH **extent** pack8 mode 11 (`ver=2` last page).
-Class A / C stay 17 bytes. An 18 datadir (occupied or empty) rewrites `meta`
-to 19. An 18 binary refuses 19 `meta`. A 17 datadir with populated `tx.head`
+**Version:** `SCHEMA_VERSION = 20` (`rbitcoin_primitives`).  
+**Status:** 20 replaces sealed `tx.head` MPHF+`.rel` with a value-assigned
+packed BDZ (`BDZ2`; `index(key) = rel−1`). Fuse8 stays 8-bit RAM. Occupied
+schema 18/19 `tx.head` is **refused** (wipe `store/tx.head`, keep Class A and
+SH). Empty 18/19 `tx.head` rewrites `meta` to 20 and rebuilds from Class A.
+An 19 binary refuses 20 `meta`. A 17 datadir with populated `tx.head`
 or `scripthash*` is **refused** (wipe those dirs, keep Class A, restart to
-rebuild). Empty 17 indexes rewrite `meta` to 19.
+rebuild). Empty 17 indexes rewrite `meta` to 20.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
@@ -26,9 +28,13 @@ Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
 **17→18/19 open:** If `tx.head` occupancy or any `scripthash*` data exists:
 `schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
-Empty 17 indexes rewrite `meta` to 19 **before** `TxTable::open` (so a following
+Empty 17 indexes rewrite `meta` to 20 **before** `TxTable::open` (so a following
 head rebuild cannot trip the refuse).  
-**18→19 open:** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
+**18/19→20 open:** If `tx.head` occupancy exists:
+`schema 20 refuses schema-18/19 tx.head; wipe store/tx.head then restart (Class A and scripthash kept; tx.head rebuilds)`.
+Empty `tx.head` rewrites `meta` to 20 **before** `TxTable::open`. Occupied SH
+without `tx.head` stays; 19 SH pages remain readable.  
+**18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
 Mode 10 paged heads stay readable; new megakeys write mode 11.  
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -131,7 +137,7 @@ itself changed.
 | Class A body | **Split** `txout` (thin meta + template outs) + `inwit` + `spent` (8 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
 | Class A identity | Dense **`txid.body`** sidefile (32 B header + 32 B/txid by create_fk) | Fixed `fk → offset`; head-resolve multi-cand without Prefix33 body peeks |
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
-| Txid → create | Segmented keyless **`tx.head.*`** (25-bit OA open + MPHF/rel/fuse sealed) | Open page from `mix_txid`; seal-time MPHF + fuse8; **txid.body** verifies identity |
+| Txid → create | Segmented keyless **`tx.head.*`** (25-bit OA open + MPHF/fuse sealed) | Open page from `mix_txid`; seal-time value-assigned MPHF + fuse8; **txid.body** verifies identity |
 | Spentness | Annotation on **create output** (+ rare multi-list) | No multi-GiB `point.head` open-hash |
 | Electrum index | Thin **create_tx_fk only** (inline ≤2 / geometric slabs / megakey pages) | Packed to ~run size; expand vouts/value/height at query via Class A + Class C |
 | Best-chain commit | Advance **`confirmed[]` last** | Tip is the commit point; strong/height may lead tip after kill |
@@ -151,7 +157,7 @@ itself changed.
     spent.body / spent.idx/                         # sole-spender 8 B × n_out
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
-    tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.rel|.fuse8
+    tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
@@ -434,26 +440,26 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head/meta` + open `tx.head/NNNNNN`; sealed `NNNNNN.mphf` + `.rel` + `.fuse8` |
+| Files | `tx.head/meta` + open `tx.head/NNNNNN`; sealed `NNNNNN.mphf` + `.fuse8` |
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
 | Capacity | Segment ends at **80% of head slots** (`max_keys`) → open next OA, seal previous on a sidecar. Idx 16 GiB soft-span does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode (open migrates to v2 from Class A; does **not** wipe head) |
-| Probe | Open OA: page-local double-hash (1024 slots/page); one 4 KiB load. Sealed: RAM fuse skip, then unique 4 KiB BDZ `g` pages (not loaded into process heap) + `.rel` pread |
+| Probe | Open OA: page-local double-hash (1024 slots/page); one 4 KiB load. Sealed: RAM fuse skip, then unique 4 KiB packed BDZ `g` pages (not loaded into process heap); MPHF output is `rel−1` |
 | Insert | First empty in-page (or same relative id idempotent); second same-txid goes **deeper** |
 | Lookup | Pin by txid → **hot** (open + ages ≤3) → ID/idx → **cold** (ages ≥4) if needed; fuse-gate sealed; body-verify ([`docs/heads.md`](./docs/heads.md)) |
 | Legacy | Monolithic `tx.head` / `tx.head.new` / `tx.head.resize` / `tx.head.overflow` **refused on open** — reindex |
 
 **Publish order on seal:** flush the full OA → open the next head and persist
-`tx.head.meta` (two unsealed) → sidecar writes fuse8 + MPHF/rel → mark the
+`tx.head.meta` (two unsealed) → sidecar writes fuse8 + value-assigned MPHF → mark the
 previous segment sealed in meta → unlink the OA. Insert does not join the
 sidecar. Lookup Open-wave probes every unsealed OA until publish.
 
 **Probe note:** open OA candidates for a key share one page (single IO).
 Keyless slots cannot Robin-Hood. Sealed: RAM fuse skip, then unique 4 KiB
-BDZ `g` pages (`KIND_MPHF_G`) + `.rel` pread. Kill mid-seal leaves at most
+BDZ `g` pages (`KIND_MPHF_G`). Kill mid-seal leaves at most
 one unsealed non-tail OA; open rebuilds its fuse keys from Class A and
 seals it. Two unsealed non-tails is **Corrupt**.
 

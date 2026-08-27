@@ -6,7 +6,7 @@
 //!   tx.head/
 //!     meta                       # segment descriptors
 //!     000000                     # open OA only (unlinked after seal)
-//!     000000.mphf + .rel + .fuse8  # sealed: MPHF + u32 rel + fuse8
+//!     000000.mphf + .fuse8     # sealed: value-assigned MPHF + fuse8
 //!     …
 //! ```
 //!
@@ -148,9 +148,7 @@ impl SegmentedTxHead {
             let sealed = d.flags & FLAG_SEALED != 0;
             let (head, pack) = if sealed {
                 if !TxHeadMphf::exists(&path) {
-                    return Err(StoreError::Corrupt(
-                        "tx.head sealed segment missing mphf/rel",
-                    ));
+                    return Err(StoreError::Corrupt("tx.head sealed segment missing mphf"));
                 }
                 (None, Some(Arc::new(TxHeadMphf::open(&path)?)))
             } else {
@@ -1561,6 +1559,11 @@ mod tests {
         let sealed = dir.join("tx.head").join("000000");
         assert!(!sealed.is_file(), "sealed OA file must be unlinked");
         assert!(crate::tx_head_mphf::TxHeadMphf::exists(&sealed));
+        assert!(!crate::tx_head_mphf::rel_path(&sealed).is_file());
+        assert_eq!(
+            &std::fs::read(crate::tx_head_mphf::mphf_path(&sealed)).unwrap()[0..4],
+            b"BDZ2"
+        );
         assert!(dir.join("tx.head").join("000000.fuse8").is_file());
         let cands = h.probe_candidates(&mixed(1)).unwrap();
         assert_eq!(cands.len(), 1, "cands={cands:?}");

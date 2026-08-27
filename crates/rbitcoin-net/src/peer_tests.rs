@@ -4190,6 +4190,51 @@ fn announced_tip_is_hopeless_less_and_288_behind() {
 }
 
 #[test]
+fn shorter_higher_work_fork_is_not_hopeless() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::{CompactTarget, TxMerkleNode};
+    use rbitcoin_primitives::Height;
+
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
+    let (dir, q) = tmp_store("short-high-work-fork");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(5, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let gen = hub.query.wire_header_at_height(Height(0)).unwrap();
+    let hard = Header {
+        version: Version::from_consensus(4),
+        prev_blockhash: gen.block_hash(),
+        merkle_root: TxMerkleNode::from_byte_array([0x5a; 32]),
+        time: gen.time.saturating_add(600),
+        bits: CompactTarget::from_consensus(0x1d00ffff),
+        nonce: 0,
+    };
+    let tip = hard.block_hash();
+    let mut pending = HashMap::new();
+    pending.insert(tip, hard);
+    let work_cmp = announced_work_cmp(&hub, &pending, tip);
+    assert_eq!(
+        work_cmp,
+        Some(std::cmp::Ordering::Greater),
+        "one mainnet-diff header must outwork 300 regtest blocks"
+    );
+    let announced_h = announced_headers_height(&hub, &pending, tip);
+    assert!(
+        !announced_tip_is_hopeless(hub.tip_height().unwrap(), announced_h, work_cmp),
+        "shorter higher-work path must not be hopeless"
+    );
+    let want = fetchable_header_path_bodies(&hub, &pending, tip, &HashMap::new(), &HashSet::new());
+    assert!(
+        !want.is_empty(),
+        "must not skip bodies on a shorter higher-work path"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn connecting_ancient_weaker_headers_request_disconnect() {
     use bitcoin::block::{Header, Version};
     use bitcoin::consensus::encode::serialize;

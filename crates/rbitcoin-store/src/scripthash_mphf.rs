@@ -1,7 +1,8 @@
-//! Sealed SH shard: BDZ MPHF + dense 8 B pack8 locators.
+//! Sealed SH shard: compact BDZ MPHF + dense 8 B pack8 locators.
 //!
-//! `base.mphf` is BDZ then `n` mix64(key16) tags (not loaded into RAM).
-//! `base.val` is `n × 8` pack8. A key not in the set fails the tag check.
+//! `base.mphf` is BDZ3 (2-bit `g` + occupancy) then `n` mix64(key16) tags
+//! (not loaded into RAM). `base.val` is `n × 8` pack8. A key not in the set
+//! fails the tag check.
 
 use crate::bdz::BdzMphf;
 use crate::error::StoreError;
@@ -13,8 +14,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-
-const HEADER_LEN: u64 = 24;
 
 pub struct MphfHead {
     base: PathBuf,
@@ -94,7 +93,7 @@ impl MphfHead {
             }
             keys.push(ku);
         }
-        let mphf = BdzMphf::build(&keys)?;
+        let mphf = BdzMphf::build_compact(&keys)?;
         let n = recs.len();
         let mut val = vec![0u8; n.saturating_mul(8)];
         let mut tags = vec![0u8; n.saturating_mul(8)];
@@ -105,7 +104,7 @@ impl MphfHead {
             val[slot * 8..slot * 8 + 8].copy_from_slice(&w.to_le_bytes());
         }
         let mp = mphf_path(base);
-        mphf.write_to(&mp)?;
+        mphf.write_compact_to(&mp)?;
         {
             let mut f = OpenOptions::new()
                 .append(true)
@@ -130,8 +129,8 @@ impl MphfHead {
         let base = base.as_ref().to_path_buf();
         let mp = mphf_path(&base);
         let vp = val_path(&base);
-        let mphf = BdzMphf::read_from(&mp)?;
-        let tags_off = HEADER_LEN + mphf.g_bytes() as u64;
+        let mphf = BdzMphf::read_compact_from(&mp)?;
+        let tags_off = mphf.trailer_off();
         let mphf_file = File::open(&mp).map_err(|e| StoreError::io(&mp, e))?;
         let val_file = OpenOptions::new()
             .read(true)
@@ -290,6 +289,13 @@ mod tests {
         let b = ShHeadValue::inline_one(Fk(22));
         let recs = [(key(1), pack8(&a).unwrap()), (key(2), pack8(&b).unwrap())];
         let h = MphfHead::write_pack8(&base, &recs).unwrap();
+        let raw = std::fs::read(mphf_path(&base)).unwrap();
+        assert_eq!(&raw[0..4], b"BDZ3");
+        let compact = BdzMphf::read_compact_from(&mphf_path(&base)).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            compact.trailer_off() + (recs.len() as u64) * 8
+        );
         assert_eq!(h.get(&key(1)).unwrap().unwrap(), a);
         assert_eq!(h.get(&key(2)).unwrap().unwrap(), b);
         assert!(h.get(&key(9)).unwrap().is_none());

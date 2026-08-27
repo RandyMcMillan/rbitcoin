@@ -9,14 +9,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const MAGIC: &[u8; 4] = b"BDZ1";
 const MAGIC2: &[u8; 4] = b"BDZ2";
 const MAGIC3: &[u8; 4] = b"BDZ3";
 const VERSION: u32 = 1;
 const GAMMA_NUM: u64 = 123;
 const GAMMA_DEN: u64 = 100;
 const MAX_SEED: u32 = 256;
-const HEADER_LEN: u64 = 24;
 const HEADER_LEN2: u64 = 32;
 const HEADER_LEN3: u64 = 32;
 const G_PAGE_BYTES: usize = 4096;
@@ -124,6 +122,7 @@ impl BdzMphf {
         self.modulus
     }
 
+    #[cfg(test)]
     pub fn g_bytes(&self) -> usize {
         match &self.g {
             GStore::Ram(g) => g.len() * 4,
@@ -316,6 +315,7 @@ impl BdzMphf {
         }
     }
 
+    #[cfg(test)]
     pub fn build(keys: &[u64]) -> Result<Self, StoreError> {
         let n = keys.len() as u32;
         let ranks: Vec<u32> = (0..n).collect();
@@ -392,7 +392,10 @@ impl BdzMphf {
         Err(StoreError::Corrupt("bdz mphf: graph did not peel"))
     }
 
+    #[cfg(test)]
     pub fn write_to(&self, path: &Path) -> Result<(), StoreError> {
+        const MAGIC: &[u8; 4] = b"BDZ1";
+        const HEADER_LEN: u64 = 24;
         let GStore::Ram(g) = &self.g else {
             return Err(StoreError::Corrupt("bdz mphf: write requires RAM g"));
         };
@@ -429,7 +432,10 @@ impl BdzMphf {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn read_from(path: &Path) -> Result<Self, StoreError> {
+        const MAGIC: &[u8; 4] = b"BDZ1";
+        const HEADER_LEN: u64 = 24;
         let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
         let mut hdr = [0u8; HEADER_LEN as usize];
         pread_exact(&file, path, 0, &mut hdr)?;
@@ -656,9 +662,6 @@ impl BdzMphf {
     }
 
     pub fn trailer_off(&self) -> u64 {
-        if self.compact.is_none() {
-            return HEADER_LEN + self.g_bytes() as u64;
-        }
         if self.n == 0 {
             return HEADER_LEN3;
         }

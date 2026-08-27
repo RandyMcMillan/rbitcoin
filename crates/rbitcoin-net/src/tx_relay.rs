@@ -853,6 +853,15 @@ impl MempoolHub {
                 }
                 Err(e) => Err(e),
             };
+            if let Ok(ref ar) = r {
+                for old in &ar.replaced {
+                    self.unindex_txid(old);
+                }
+                let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
+                let w = tx.compute_wtxid();
+                self.insert_relay_maps(ar.txid, w, seq);
+                self.reorg_servable.lock().unwrap().remove(&w);
+            }
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             r
@@ -865,9 +874,6 @@ impl MempoolHub {
                 self.meter_accept_wall(us, true);
                 self.note_fee_flow_admit(r.weight, r.fee_sat);
                 self.push_recent(tx, &r);
-                for old in &r.replaced {
-                    self.unindex_txid(old);
-                }
                 self.index_txid(r.txid, tx);
                 let shs = self
                     .sh_index
@@ -879,10 +885,6 @@ impl MempoolHub {
                     .unwrap_or_default();
                 self.publish_announce(&r, shs);
                 self.note_template_update();
-                let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
-                let w = tx.compute_wtxid();
-                self.insert_relay_maps(r.txid, w, seq);
-                self.reorg_servable.lock().unwrap().remove(&w);
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -1229,8 +1231,7 @@ impl MempoolHub {
         let tip = self.chain_tip_ctx();
         let mut g = self.inner.write().unwrap();
         let results = g.reorg_disconnect_reaccept(txs, &utxo, tip);
-        drop(g);
-        let mut n = 0;
+        let mut admitted: Vec<&Transaction> = Vec::new();
         {
             let mut s = self.reorg_servable.lock().unwrap();
             for (tx, r) in txs.iter().filter(|t| !t.is_coinbase()).zip(results) {
@@ -1238,12 +1239,15 @@ impl MempoolHub {
                     let w = tx.compute_wtxid();
                     s.insert(w);
                     self.insert_relay_maps(tx.compute_txid(), w, 0);
-                    self.index_txid(tx.compute_txid(), tx);
-                    n += 1;
+                    admitted.push(tx);
                 }
             }
         }
-        n
+        drop(g);
+        for tx in &admitted {
+            self.index_txid(tx.compute_txid(), tx);
+        }
+        admitted.len()
     }
 
     /// True if this wtxid entered the mempool from a disconnected block.
@@ -1776,7 +1780,15 @@ mod tests {
             let tx = spend_true(cbs[0], 1_000, spk.clone());
             assert!(!hub.is_reorg_servable(&tx.compute_wtxid()));
             assert_eq!(hub.reorg_reaccept(std::slice::from_ref(&tx)), 1);
-            assert!(hub.is_reorg_servable(&tx.compute_wtxid()));
+            let w = tx.compute_wtxid();
+            assert!(hub.is_reorg_servable(&w));
+            assert!(hub.get_tx_by_wtxid(&w).is_some());
+            assert!(hub.remove_for_block(&[tx.compute_txid()]) >= 1);
+            assert!(hub.get_tx_by_wtxid(&w).is_none());
+            assert!(
+                !hub.is_relay_servable(&w, u64::MAX),
+                "unindex must drop relay maps with the live graph entry"
+            );
             let _ = std::fs::remove_dir_all(&mp);
         }
 
@@ -1897,12 +1909,17 @@ mod tests {
             assert!(rows.iter().any(|r| r.height == -1));
             let delta = hub.scripthash_unconfirmed_delta(&sh);
             assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
+            assert!(hub.is_relay_servable(&wtxid, hub.current_relay_seq()));
             assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
             assert!(
                 !hub.contains_wtxid(&wtxid),
                 "wtxid index must drop with the live entry"
             );
             assert!(hub.get_tx_by_wtxid(&wtxid).is_none());
+            assert!(
+                !hub.is_relay_servable(&wtxid, u64::MAX),
+                "unindex must drop relay maps with the live graph entry"
+            );
             assert!(hub.list_live().len() < 3);
             let _ = std::fs::remove_dir_all(&mp);
         }

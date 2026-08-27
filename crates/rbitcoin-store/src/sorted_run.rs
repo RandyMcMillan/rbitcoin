@@ -1584,11 +1584,19 @@ pub fn merge_runs_to_file_with_policy(
 /// Darwin free+inactive pages, Windows `AvailPhys`).
 pub const SH_WORKER_FREE_RAM_BYTES: u64 = 3 << 29;
 
+/// Cap workers at 1 per `per_worker` free bytes (floor 1, clamp 1..=256 vs CPUs).
+pub fn workers_for_free_ram(cpus: usize, free_bytes: u64, per_worker: u64) -> usize {
+    let cpus = cpus.clamp(1, 256);
+    if per_worker == 0 {
+        return 1;
+    }
+    let ram_cap = (free_bytes / per_worker) as usize;
+    cpus.min(ram_cap.clamp(1, 256))
+}
+
 /// Cap SH workers at 1 per [`SH_WORKER_FREE_RAM_BYTES`] of free RAM (floor 1).
 pub fn sh_workers_for_free_ram(cpus: usize, free_bytes: u64) -> usize {
-    let cpus = cpus.clamp(1, 256);
-    let ram_cap = (free_bytes / SH_WORKER_FREE_RAM_BYTES) as usize;
-    cpus.min(ram_cap.clamp(1, 256))
+    workers_for_free_ram(cpus, free_bytes, SH_WORKER_FREE_RAM_BYTES)
 }
 
 /// `MemAvailable` from `/proc/meminfo` text (kB → bytes).
@@ -1725,7 +1733,7 @@ pub fn free_gib_label() -> String {
         .unwrap_or_else(|| "?".into())
 }
 
-fn sh_logical_cpus() -> usize {
+pub fn logical_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
@@ -1734,7 +1742,7 @@ fn sh_logical_cpus() -> usize {
 
 /// CPUs capped by 1.5 GiB host free RAM per worker. Unknown free → 1.
 pub fn sh_workers_capped_by_free_ram() -> usize {
-    sh_workers_for_free_ram(sh_logical_cpus(), host_mem_available_bytes().unwrap_or(0))
+    sh_workers_for_free_ram(logical_cpus(), host_mem_available_bytes().unwrap_or(0))
 }
 
 /// How many parallel k-way materialize workers.
@@ -1963,6 +1971,20 @@ mod tests {
     }
 
     #[test]
+    fn workers_for_free_ram_750mib_is_not_sh_1_5gib() {
+        const MIB: u64 = 1024 * 1024;
+        const HEAD: u64 = 750 * MIB;
+        assert_eq!(workers_for_free_ram(8, 0, HEAD), 1);
+        assert_eq!(workers_for_free_ram(8, HEAD.saturating_sub(1), HEAD), 1);
+        assert_eq!(workers_for_free_ram(8, HEAD, HEAD), 1);
+        assert_eq!(workers_for_free_ram(8, 2 * HEAD, HEAD), 2);
+        assert_eq!(workers_for_free_ram(8, 3 * HEAD, HEAD), 3);
+        assert_eq!(workers_for_free_ram(4, 20 * HEAD, HEAD), 4);
+        assert_eq!(workers_for_free_ram(8, 3 * (1 << 30) / 2, HEAD), 2);
+        assert_eq!(sh_workers_for_free_ram(8, 3 * (1 << 30) / 2), 1);
+    }
+
+    #[test]
     fn mem_available_parses_proc_meminfo() {
         let text = "MemTotal:       16384000 kB\nMemFree:         1000000 kB\nMemAvailable:    3145728 kB\nBuffers:          200000 kB\n";
         assert_eq!(mem_available_from_meminfo(text), Some(3145728 * 1024));
@@ -1985,7 +2007,7 @@ mod tests {
         assert!(n >= 1024 * 1024, "probe too small: {n}");
         let w = sh_workers_capped_by_free_ram();
         assert!((1..=256).contains(&w));
-        assert!(w <= sh_logical_cpus());
+        assert!(w <= logical_cpus());
         let label = free_gib_label();
         assert!(label == "?" || label.parse::<f64>().is_ok(), "{label}");
     }

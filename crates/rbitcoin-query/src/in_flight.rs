@@ -4,7 +4,8 @@
 //! [`InFlight::note_pins`] / [`InFlight::note_creates`] insert the current pack
 //! so that stamp cannot see it. One HashMap for `txid → fk` and one for
 //! `fk → CreatePin` (outs for pin adopt). A height index drops keys without
-//! scanning the maps.
+//! scanning the maps. Same-txid overwrite (BIP30) records a count on a
+//! side map; prune is the current path when that map is empty.
 //!
 //! **Prune:** lookup snapshots [`rbitcoin_store::HeightFence::drain_and_fence_hi`]
 //! before a wave's TipOnly read and passes it on the last load batch. After
@@ -22,6 +23,7 @@ use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
 type TxidFkMap = HashMap<[u8; 32], Fk, BuildHasherDefault<TxidHasher>>;
+type TxidEvictMap = HashMap<[u8; 32], u32, BuildHasherDefault<TxidHasher>>;
 
 #[derive(Debug, Default)]
 struct HeightKeys {
@@ -43,6 +45,9 @@ pub struct InFlight {
     outs: U64Map<CreatePin>,
     by_height: BTreeMap<u32, HeightKeys>,
     untagged: HeightKeys,
+    /// Count of older packs still listing a txid after a later `creates` clobber.
+    /// Empty on the IBD hot path; prune skips the per-key check when empty.
+    evictions: TxidEvictMap,
     approx_bytes: u64,
 }
 
@@ -60,7 +65,7 @@ impl InFlight {
     ) {
         let mut keys = HeightKeys::default();
         for (fk, pin) in pins {
-            self.creates.insert(pin.0.txid, fk);
+            self.note_create_fk(pin.0.txid, fk);
             keys.txids.push(pin.0.txid);
             keys.approx_bytes = keys.approx_bytes.saturating_add(40);
             if let Some(id) = fk.get() {
@@ -83,7 +88,7 @@ impl InFlight {
     ) {
         let mut keys = HeightKeys::default();
         for (txid, fk) in pairs {
-            self.creates.insert(txid, fk);
+            self.note_create_fk(txid, fk);
             keys.txids.push(txid);
             keys.approx_bytes = keys.approx_bytes.saturating_add(40);
         }
@@ -104,9 +109,37 @@ impl InFlight {
         slot.out_ids.extend(keys.out_ids);
     }
 
+    fn note_create_fk(&mut self, txid: [u8; 32], fk: Fk) {
+        if let Some(old) = self.creates.insert(txid, fk) {
+            if old != fk {
+                *self.evictions.entry(txid).or_insert(0) += 1;
+            }
+        }
+    }
+
+    fn consume_eviction(&mut self, tid: &[u8; 32]) -> bool {
+        let Some(n) = self.evictions.get_mut(tid) else {
+            return false;
+        };
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.evictions.remove(tid);
+        }
+        true
+    }
+
     fn remove_keys(&mut self, keys: HeightKeys) {
-        for tid in &keys.txids {
-            self.creates.remove(tid);
+        if self.evictions.is_empty() {
+            for tid in &keys.txids {
+                self.creates.remove(tid);
+            }
+        } else {
+            for tid in &keys.txids {
+                if self.consume_eviction(tid) {
+                    continue;
+                }
+                self.creates.remove(tid);
+            }
         }
         for id in &keys.out_ids {
             self.outs.remove(id);
@@ -179,6 +212,10 @@ mod tests {
     fn pin(id: u64) -> CreatePin {
         let mut txid = [0u8; 32];
         txid[..8].copy_from_slice(&id.to_le_bytes());
+        pin_with_txid(txid)
+    }
+
+    fn pin_with_txid(txid: [u8; 32]) -> CreatePin {
         Arc::new((
             TxRecord {
                 txid,
@@ -350,6 +387,39 @@ mod tests {
         assert_eq!(m.pack_count(), 1);
         assert!(m.get_out(99).is_some());
         assert!(m.get_out(1).is_none());
+    }
+
+    /// BIP30 overwrite (91722 then 91880): prune of the older pack must not
+    /// drop the last-write fk from `creates`.
+    #[test]
+    fn prune_older_pack_keeps_newer_same_txid_last_write() {
+        let mut m = InFlight::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xe3;
+        let old = pin_with_txid(txid);
+        let new = pin_with_txid(txid);
+        m.note_pins([(Fk(91722), &old)], Some(91722));
+        m.note_pins([(Fk(91880), &new)], Some(91880));
+        assert_eq!(m.get_create_fk(&txid), Some(Fk(91880)));
+        m.prune_below_height(Some(91750));
+        assert_eq!(
+            m.get_create_fk(&txid),
+            Some(Fk(91880)),
+            "prune of 91722 must not drop last-write at 91880"
+        );
+        assert!(m.get_out(91880).is_some());
+        assert!(m.get_out(91722).is_none());
+    }
+
+    #[test]
+    fn prune_older_creates_only_keeps_newer_same_txid() {
+        let mut m = InFlight::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xe3;
+        m.note_creates([(txid, Fk(1))], Some(91722));
+        m.note_creates([(txid, Fk(2))], Some(91880));
+        m.prune_below_height(Some(91750));
+        assert_eq!(m.get_create_fk(&txid), Some(Fk(2)));
     }
 
     #[test]

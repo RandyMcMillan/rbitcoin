@@ -5,6 +5,7 @@
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -318,9 +319,14 @@ impl BdzMphf {
             .max(u64::from(n) + 3)
             .max(3) as u32;
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut scratch = PeelScratch::default();
         for _try in 0..MAX_SEED {
             let seed = splitmix64(&mut rng);
-            if let Some(g) = try_peel(keys, ranks, seed, m, modulus) {
+            scratch.prepare(m as usize, keys.len());
+            if peel_order(keys, seed, m, &mut scratch) {
+                let order = std::mem::take(&mut scratch.order);
+                drop(scratch);
+                let g = assign_g(keys, ranks, seed, m, modulus, &order);
                 return Ok(Self {
                     n,
                     m,
@@ -355,17 +361,18 @@ impl BdzMphf {
             return Err(StoreError::Corrupt("bdz mphf: write requires RAM g"));
         };
         let g_bits = g_bits_for_modulus(self.modulus);
-        let packed = pack_g(g, g_bits);
-        let mut buf = Vec::with_capacity(HEADER_LEN2 as usize + packed.len());
-        buf.extend_from_slice(MAGIC2);
-        buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&self.n.to_le_bytes());
-        buf.extend_from_slice(&self.m.to_le_bytes());
-        buf.extend_from_slice(&self.seed.to_le_bytes());
-        buf.extend_from_slice(&self.modulus.to_le_bytes());
-        buf.extend_from_slice(&g_bits.to_le_bytes());
-        buf.extend_from_slice(&packed);
-        std::fs::write(path, &buf).map_err(|e| StoreError::io(path, e))?;
+        let mut f = std::fs::File::create(path).map_err(|e| StoreError::io(path, e))?;
+        let mut hdr = [0u8; HEADER_LEN2 as usize];
+        hdr[0..4].copy_from_slice(MAGIC2);
+        hdr[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        hdr[8..12].copy_from_slice(&self.n.to_le_bytes());
+        hdr[12..16].copy_from_slice(&self.m.to_le_bytes());
+        hdr[16..24].copy_from_slice(&self.seed.to_le_bytes());
+        hdr[24..28].copy_from_slice(&self.modulus.to_le_bytes());
+        hdr[28..32].copy_from_slice(&g_bits.to_le_bytes());
+        f.write_all(&hdr).map_err(|e| StoreError::io(path, e))?;
+        pack_g_write(g, g_bits, &mut f).map_err(|e| StoreError::io(path, e))?;
+        f.sync_all().map_err(|e| StoreError::io(path, e))?;
         Ok(())
     }
 
@@ -660,25 +667,45 @@ fn packed_g_bytes(n_verts: u32, g_bits: u32) -> u64 {
     bits.div_ceil(8)
 }
 
-fn pack_g(g: &[u32], g_bits: u32) -> Vec<u8> {
-    let mut out = vec![0u8; packed_g_bytes(g.len() as u32, g_bits) as usize];
+fn pack_g_write<W: Write>(g: &[u32], g_bits: u32, w: &mut W) -> std::io::Result<()> {
+    const PAGE: usize = 4096;
     let mask = if g_bits == 32 {
         u32::MAX
     } else {
         (1u32 << g_bits) - 1
     };
-    for (v, &val) in g.iter().enumerate() {
-        let start = u64::from(v as u32) * u64::from(g_bits);
-        let bits = val & mask;
-        for i in 0..g_bits {
-            if bits & (1 << i) != 0 {
-                let bit = start + u64::from(i);
-                let byte = (bit / 8) as usize;
-                let rem = (bit % 8) as u32;
-                out[byte] |= 1 << rem;
+    let mut page = [0u8; PAGE];
+    let mut n = 0usize;
+    let mut acc = 0u64;
+    let mut acc_bits = 0u32;
+    for &val in g {
+        acc |= u64::from(val & mask) << acc_bits;
+        acc_bits += g_bits;
+        while acc_bits >= 8 {
+            page[n] = acc as u8;
+            n += 1;
+            acc >>= 8;
+            acc_bits -= 8;
+            if n == PAGE {
+                w.write_all(&page)?;
+                n = 0;
             }
         }
     }
+    if acc_bits > 0 {
+        page[n] = acc as u8;
+        n += 1;
+    }
+    if n > 0 {
+        w.write_all(&page[..n])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn pack_g(g: &[u32], g_bits: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(packed_g_bytes(g.len() as u32, g_bits) as usize);
+    pack_g_write(g, g_bits, &mut out).unwrap();
     out
 }
 
@@ -734,66 +761,83 @@ fn vertex_straddles_page(v: u32, g_bits: u32) -> bool {
     a.is_some() && b.is_some()
 }
 
-fn try_peel(keys: &[u64], ranks: &[u32], seed: u64, m: u32, modulus: u32) -> Option<Vec<u32>> {
-    let m_us = m as usize;
-    let mut edges = vec![[0u32; 3]; keys.len()];
-    let mut deg = vec![0u32; m_us];
+#[derive(Default)]
+struct PeelScratch {
+    deg: Vec<u8>,
+    xor_e: Vec<u32>,
+    q: Vec<u32>,
+    order: Vec<(u32, u32)>,
+}
+
+impl PeelScratch {
+    fn prepare(&mut self, m: usize, n: usize) {
+        self.deg.clear();
+        self.deg.resize(m, 0);
+        self.xor_e.clear();
+        self.xor_e.resize(m, 0);
+        self.q.clear();
+        self.order.clear();
+        self.order.reserve(n);
+    }
+}
+
+fn peel_order(keys: &[u64], seed: u64, m: u32, scratch: &mut PeelScratch) -> bool {
+    let n = keys.len();
     for (i, &k) in keys.iter().enumerate() {
-        let h = hash3(k, seed, m);
-        edges[i] = h;
-        for v in h {
-            deg[v as usize] = deg[v as usize].saturating_add(1);
+        let ei = i as u32;
+        for v in hash3(k, seed, m) {
+            let d = &mut scratch.deg[v as usize];
+            if *d == 255 {
+                return false;
+            }
+            *d += 1;
+            scratch.xor_e[v as usize] ^= ei;
         }
     }
-    let mut off = vec![0u32; m_us + 1];
-    for i in 0..m_us {
-        off[i + 1] = off[i].saturating_add(deg[i]);
-    }
-    let mut adj = vec![0u32; off[m_us] as usize];
-    let mut wr = off[..m_us].to_vec();
-    for (i, h) in edges.iter().enumerate() {
-        for &v in h {
-            let slot = wr[v as usize] as usize;
-            adj[slot] = i as u32;
-            wr[v as usize] = wr[v as usize].saturating_add(1);
-        }
-    }
-    let mut live = vec![true; keys.len()];
-    let mut q: Vec<u32> = Vec::new();
-    for (v, &d) in deg.iter().enumerate() {
+    for (v, &d) in scratch.deg.iter().enumerate() {
         if d == 1 {
-            q.push(v as u32);
+            scratch.q.push(v as u32);
         }
     }
-    let mut order: Vec<(u32, u32)> = Vec::with_capacity(keys.len());
     let mut qi = 0usize;
-    while qi < q.len() {
-        let v = q[qi];
+    while qi < scratch.q.len() {
+        let v = scratch.q[qi];
         qi += 1;
-        if deg[v as usize] != 1 {
+        if scratch.deg[v as usize] != 1 {
             continue;
         }
-        let lo = off[v as usize] as usize;
-        let hi = off[v as usize + 1] as usize;
-        let Some(&ei) = adj[lo..hi].iter().find(|&&e| live[e as usize]) else {
-            continue;
-        };
-        live[ei as usize] = false;
-        order.push((ei, v));
-        for u in edges[ei as usize] {
-            deg[u as usize] = deg[u as usize].saturating_sub(1);
-            if deg[u as usize] == 1 {
-                q.push(u);
+        let ei = scratch.xor_e[v as usize];
+        if ei as usize >= n {
+            return false;
+        }
+        scratch.order.push((ei, v));
+        for u in hash3(keys[ei as usize], seed, m) {
+            let d = &mut scratch.deg[u as usize];
+            if *d == 0 {
+                return false;
+            }
+            *d -= 1;
+            scratch.xor_e[u as usize] ^= ei;
+            if *d == 1 {
+                scratch.q.push(u);
             }
         }
     }
-    if order.len() != keys.len() {
-        return None;
-    }
+    scratch.order.len() == n
+}
+
+fn assign_g(
+    keys: &[u64],
+    ranks: &[u32],
+    seed: u64,
+    m: u32,
+    modulus: u32,
+    order: &[(u32, u32)],
+) -> Vec<u32> {
     let mut g = vec![0u32; m as usize];
     let mut assigned = vec![false; m as usize];
     for &(ei, v) in order.iter().rev() {
-        let h = edges[ei as usize];
+        let h = hash3(keys[ei as usize], seed, m);
         let mut s = 0u32;
         for u in h {
             if assigned[u as usize] {
@@ -804,7 +848,7 @@ fn try_peel(keys: &[u64], ranks: &[u32], seed: u64, m: u32, modulus: u32) -> Opt
         g[v as usize] = (rank + modulus - (s % modulus)) % modulus;
         assigned[v as usize] = true;
     }
-    Some(g)
+    g
 }
 
 #[cfg(test)]
@@ -947,6 +991,24 @@ mod tests {
     }
 
     #[test]
+    fn assigned_peel_2k_permutation() {
+        let n = 2_000u32;
+        let keys: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11))
+            .collect();
+        let values: Vec<u32> = (0..n).map(|i| (i * 17 + 3) % n).collect();
+        let mut seen = vec![false; n as usize];
+        for &v in &values {
+            assert!(!seen[v as usize], "test permutation");
+            seen[v as usize] = true;
+        }
+        let f = BdzMphf::build_assigned(&keys, &values, n).unwrap();
+        for (&k, &want) in keys.iter().zip(values.iter()) {
+            assert_eq!(f.index(k).unwrap(), want);
+        }
+    }
+
+    #[test]
     fn g_bits_for_modulus_width() {
         assert_eq!(g_bits_for_modulus(1), 1);
         assert_eq!(g_bits_for_modulus(2), 1);
@@ -956,7 +1018,7 @@ mod tests {
 
     #[test]
     fn pack_g_roundtrip_bits() {
-        for g_bits in [1u32, 2, 24, 25] {
+        for g_bits in [1u32, 2, 24, 25, 26, 32] {
             let g: Vec<u32> = (0..64).map(|i| i % (1u32 << (g_bits.min(5)))).collect();
             let packed = pack_g(&g, g_bits);
             for (v, &want) in g.iter().enumerate() {

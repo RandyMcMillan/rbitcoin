@@ -13,6 +13,54 @@ pub struct TxHeadMphf {
     mlt: HashMap<u32, Vec<u32>>,
 }
 
+pub(crate) struct AssignedKeys {
+    pub keys: Vec<u64>,
+    pub values: Vec<u32>,
+    pub mlt: HashMap<u32, Vec<u32>>,
+    pub modulus: u32,
+}
+
+/// Unique mixed keys; highest rel per key is the MPHF value, older rels in `mlt`.
+pub(crate) fn group_assigned_pairs(pairs: &mut [(u64, u32)]) -> Result<AssignedKeys, StoreError> {
+    let mut modulus = 0u32;
+    for &(_, rel) in pairs.iter() {
+        if rel == 0 {
+            return Err(StoreError::Corrupt("tx.head mphf: rel 0"));
+        }
+        modulus = modulus.max(rel);
+    }
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut mlt = HashMap::new();
+    let mut i = 0usize;
+    while i < pairs.len() {
+        let k = pairs[i].0;
+        let mut j = i + 1;
+        while j < pairs.len() && pairs[j].0 == k {
+            j += 1;
+        }
+        let newest = pairs[j - 1].1;
+        let slot = newest - 1;
+        keys.push(k);
+        values.push(slot);
+        if j - i > 1 {
+            let mut extra: Vec<u32> = pairs[i..j - 1].iter().map(|p| p.1).collect();
+            extra.reverse();
+            mlt.insert(slot, extra);
+        }
+        i = j;
+    }
+    keys.shrink_to_fit();
+    values.shrink_to_fit();
+    Ok(AssignedKeys {
+        keys,
+        values,
+        mlt,
+        modulus,
+    })
+}
+
 pub fn mphf_path(base: &Path) -> PathBuf {
     sidecar(base, ".mphf")
 }
@@ -36,40 +84,30 @@ impl TxHeadMphf {
         mphf_path(base).is_file()
     }
 
+    #[cfg(test)]
     pub fn write(base: impl AsRef<Path>, pairs: &[(u64, u32)]) -> Result<Self, StoreError> {
+        let mut owned = pairs.to_vec();
+        let grouped = group_assigned_pairs(&mut owned)?;
+        drop(owned);
+        Self::write_grouped(base, grouped)
+    }
+
+    pub(crate) fn write_grouped(
+        base: impl AsRef<Path>,
+        grouped: AssignedKeys,
+    ) -> Result<Self, StoreError> {
         let base = base.as_ref();
         if let Some(parent) = base.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let mut by_key: HashMap<u64, Vec<u32>> = HashMap::new();
-        let mut modulus = 0u32;
-        for &(k, rel) in pairs {
-            if rel == 0 {
-                return Err(StoreError::Corrupt("tx.head mphf: rel 0"));
-            }
-            modulus = modulus.max(rel);
-            by_key.entry(k).or_default().push(rel);
-        }
-        let mut keys = Vec::with_capacity(by_key.len());
-        let mut values = Vec::with_capacity(by_key.len());
-        let mut mlt: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (k, mut rs) in by_key {
-            let newest = rs.pop().unwrap();
-            let slot = newest - 1;
-            keys.push(k);
-            values.push(slot);
-            if !rs.is_empty() {
-                rs.reverse();
-                mlt.insert(slot, rs);
-            }
-        }
-        let mphf = BdzMphf::build_assigned(&keys, &values, modulus)?;
+        let mphf = BdzMphf::build_assigned(&grouped.keys, &grouped.values, grouped.modulus)?;
         mphf.write_packed_to(&mphf_path(base))?;
+        drop(mphf);
         let rp = rel_path(base);
         if rp.is_file() {
             let _ = std::fs::remove_file(&rp);
         }
-        write_mlt(&mlt_path(base), &mlt)?;
+        write_mlt(&mlt_path(base), &grouped.mlt)?;
         Self::open(base)
     }
 
@@ -333,6 +371,28 @@ mod tests {
             .unwrap();
         assert_eq!(rels[0][0], pairs[0].1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_assigned_pairs_unique_and_bip30_newest() {
+        assert!(group_assigned_pairs(&mut []).unwrap().keys.is_empty());
+        assert!(matches!(
+            group_assigned_pairs(&mut [(1, 0)]),
+            Err(StoreError::Corrupt(_))
+        ));
+        let mut pairs = vec![(10u64, 2u32), (20, 1), (10, 5), (10, 3), (30, 4)];
+        let g = group_assigned_pairs(&mut pairs).unwrap();
+        assert_eq!(g.modulus, 5);
+        let mut got: Vec<(u64, u32)> = g
+            .keys
+            .iter()
+            .copied()
+            .zip(g.values.iter().copied())
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(10, 4), (20, 0), (30, 3)]);
+        assert_eq!(g.mlt.get(&4), Some(&vec![3, 2]));
+        assert_eq!(g.mlt.len(), 1);
     }
 
     #[test]

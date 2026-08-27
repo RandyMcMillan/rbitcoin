@@ -28,7 +28,7 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed MPHF main (pack8, no 
 | Module | On disk | Key → value | Who reads it |
 |--------|---------|-------------|--------------|
 | `HashHead` | `header.head` (+ `.gN`) | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
-| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁶** keys/range (no OA). Open keeps fuse8 in RAM; packed BDZ `g` is FdOnly (4 KiB page stream); MPHF output is `rel−1`. | Confirm **lookup** stamp after live pin miss |
+| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁵** keys/range (no OA). Open keeps fuse8 in RAM; packed BDZ `g` is FdOnly (4 KiB page stream); MPHF output is `rel−1`. | Confirm **lookup** stamp after live pin miss |
 | Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators. BDZ `g` FdOnly; tags/val already FdOnly. | After tip bulk |
 | Ingest + L0/L1 ovf | `scripthash.ovf/ingest`, L0 `SHSR`, L1 MPHF, `ovf/body` | Same pack8 key for incremental / post-seal new keys | Tip; lookup ingest → L0 → L1 → main |
 

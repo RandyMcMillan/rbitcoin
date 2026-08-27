@@ -316,6 +316,174 @@ mod tests {
         assert_eq!(empty_path_header_fan(100, 0, 2), 2);
     }
 
+    fn h(b: u8) -> bitcoin::BlockHash {
+        use bitcoin::hashes::Hash;
+        bitcoin::BlockHash::from_byte_array([b; 32])
+    }
+
+    fn dummy_held() -> bitcoin::Block {
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        bitcoin::Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1,
+                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![],
+        }
+    }
+
+    /// IBD → tip-follow catch-up matrix (competing headers, explore leftovers, holes).
+    #[test]
+    fn ibd_caught_up_transition_matrix() {
+        use super::super::state::InflightReq;
+
+        // Explore-need inflight at advertised horizon is not best-chain remainder.
+        let tip = 964_243;
+        let mut explore = IbdWorkState::new(Vec::new(), None, Some(tip));
+        explore.max_peer_height = tip;
+        explore.max_ready_height = tip;
+        explore.headers_done = true;
+        for i in 1u8..=7 {
+            let hash = h(i);
+            explore.inflight.insert(hash, InflightReq::new(0));
+            explore
+                .reorg
+                .register_explore(std::iter::once(hash), Some(hash));
+        }
+        assert!(
+            catchup_complete_after_drain(&explore, tip),
+            "explore inflight at horizon must not block catch-up"
+        );
+
+        // Orphan getdata at horizon is not remainder (no prune required).
+        let mut orphans = IbdWorkState::new(Vec::new(), None, Some(tip));
+        orphans.max_peer_height = tip;
+        orphans.max_ready_height = tip;
+        orphans.headers_done = true;
+        for i in 1u8..=7 {
+            orphans.inflight.insert(h(i), InflightReq::new(0));
+        }
+        assert!(
+            catchup_complete_after_drain(&orphans, tip),
+            "orphan inflight at horizon must not block catch-up"
+        );
+
+        // Competing hash_height above tip must not zero lag or complete two short.
+        let mut fork = IbdWorkState::new(Vec::new(), None, Some(100));
+        fork.max_peer_height = 102;
+        fork.max_ready_height = 100;
+        fork.headers_done = true;
+        fork.hash_height.insert(h(0xee), 110);
+        assert_eq!(
+            header_lag_behind_peers(&fork, 100),
+            2,
+            "lag from path high water, not competing hash_height"
+        );
+        assert!(
+            !catchup_complete_after_drain(&fork, 100),
+            "empty h2h two short of peers is a header hole, not catch-up"
+        );
+
+        // Version LastBlock chatter: one ahead, empty headers, no tip+1 → complete.
+        let mut chatter = IbdWorkState::new(Vec::new(), None, Some(100));
+        chatter.max_peer_height = 101;
+        chatter.max_ready_height = 100;
+        chatter.headers_done = true;
+        assert!(catchup_complete_after_drain(&chatter, 100));
+
+        // Live awaiting-reorg gather blocks exit even with empty ordered/inflight.
+        let mut await_st = IbdWorkState::new(Vec::new(), None, Some(100));
+        await_st.max_peer_height = 100;
+        await_st.max_ready_height = 100;
+        await_st.headers_done = true;
+        await_st.reorg.set_awaiting(dummy_held(), vec![h(0xcc)]);
+        assert!(
+            !catchup_complete_after_drain(&await_st, 100),
+            "awaiting reorg gather is remainder"
+        );
+
+        // tip+1 sitting in h2h (not yet ordered) is remainder.
+        let mut hole = IbdWorkState::new(Vec::new(), None, Some(100));
+        hole.max_peer_height = 100;
+        hole.max_ready_height = 100;
+        hole.headers_done = true;
+        hole.record_height(h(0x2a), 101);
+        assert!(!catchup_complete_after_drain(&hole, 100));
+
+        // Mid-chain on-path inflight.
+        let mut mid_inf = IbdWorkState::new(Vec::new(), None, Some(161_249));
+        mid_inf.max_peer_height = 958_820;
+        mid_inf.max_ready_height = 161_000;
+        mid_inf.headers_done = true;
+        mid_inf.record_height(h(0x2a), 161_250);
+        mid_inf.inflight.insert(h(0x2a), InflightReq::new(0));
+        assert!(!catchup_complete_after_drain(&mid_inf, 161_249));
+
+        // tip=0 never complete; dead peers give up.
+        let mut zero = IbdWorkState::new(Vec::new(), None, Some(0));
+        zero.max_peer_height = 958_900;
+        zero.max_ready_height = 0;
+        assert!(!catchup_complete_after_drain(&zero, 0));
+        assert_eq!(
+            all_peers_dead_action(&zero, 0, false, 0),
+            AllPeersDead::GiveUpMidCatchup
+        );
+
+        // Dead peers at horizon with empty remainder → complete.
+        let mut done = IbdWorkState::new(Vec::new(), None, Some(100));
+        done.max_peer_height = 100;
+        done.max_ready_height = 100;
+        done.headers_done = true;
+        assert_eq!(
+            all_peers_dead_action(&done, 100, false, 0),
+            AllPeersDead::CatchupComplete
+        );
+
+        // Signet false headers_done at h≈2000 with peers at ~313k.
+        let mut signet = IbdWorkState::new(Vec::new(), None, Some(2000));
+        signet.max_peer_height = 313_000;
+        signet.max_ready_height = 2000;
+        signet.headers_done = true;
+        assert!(!catchup_complete_after_drain(&signet, 2000));
+        assert!(super::should_unlatch_headers_done(&signet, 2000));
+    }
+
+    /// Empty path with a connecting-header hole must keep getheaders, not latch.
+    #[test]
+    fn header_fan_unlatch_at_path_hole() {
+        let mut hole = IbdWorkState::new(Vec::new(), None, Some(100));
+        hole.max_peer_height = 102;
+        hole.max_ready_height = 100;
+        hole.headers_done = true;
+        hole.hash_height.insert(h(0xee), 110);
+        let lag = header_lag_behind_peers(&hole, 100);
+        assert_eq!(lag, 2, "competing hash_height must not hide a 2-block hole");
+        assert!(
+            empty_path_header_fan(lag, hole.inflight.len(), 29) >= 1,
+            "empty h2h with peers ahead must fan getheaders"
+        );
+        assert!(
+            super::should_unlatch_headers_done(&hole, 100),
+            "headers_done must unlatch while the connecting header is missing"
+        );
+
+        // True horizon, no hole: do not storm locators.
+        let mut at = IbdWorkState::new(Vec::new(), None, Some(100));
+        at.max_peer_height = 100;
+        at.max_ready_height = 100;
+        assert_eq!(
+            empty_path_header_fan(header_lag_behind_peers(&at, 100), 0, 29),
+            0
+        );
+        at.headers_done = true;
+        assert!(!super::should_unlatch_headers_done(&at, 100));
+    }
+
     /// Unlatch `headers_done` on lag>2 even with leftover inflight; never at lag≤2.
     #[test]
     fn should_unlatch_headers_done() {

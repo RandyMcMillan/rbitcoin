@@ -15,6 +15,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+pub(crate) fn parse_rebuild_seal_bits(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.parse::<u32>().ok())
+        .map(|b| b.clamp(6, 26))
+        .unwrap_or(25)
+}
+
 /// Class A tx row (no wire blob — reconstruct from txout + inwit).
 ///
 /// On-disk `txout.body` (schema **17**): thin LAYOUT17 meta then outputs (no spender).
@@ -1495,7 +1501,7 @@ impl TxTable {
 
     /// Rebuild sealed MPHF+fuse8 from Class A (`txid.body`), no historical OA.
     ///
-    /// Range width is [`Self::rebuild_seal_keys`] (default 2²⁶). Remainder is
+    /// Range width is [`Self::rebuild_seal_keys`] (default 2²⁵). Remainder is
     /// sealed too; an empty open tail is created for later inserts.
     pub fn rebuild_head_from_bodies(
         &self,
@@ -1539,8 +1545,7 @@ impl TxTable {
             }
             let pubd = self
                 .head
-                .write_sealed_pairs(file_id as u32, first, count, &pairs)?;
-            drop(pairs);
+                .write_sealed_pairs(file_id as u32, first, count, pairs)?;
             sealed.push((first, count, pubd));
             inserted += count;
             on_progress(last, n, inserted);
@@ -1550,7 +1555,7 @@ impl TxTable {
         Ok(inserted)
     }
 
-    /// Rebuild MPHF range width: `2^bits` keys. Default **26**; **25** is low-RAM.
+    /// Rebuild MPHF range width: `2^bits` keys. Default **25**; **26** is wider.
     ///
     /// Env `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS`. Operator: 25 or 26. Tests may
     /// pin 6..=26 on the calling thread without mutating process env.
@@ -1559,10 +1564,11 @@ impl TxTable {
         if let Some(b) = TEST_REBUILD_SEAL_BITS.with(std::cell::Cell::get) {
             return b;
         }
-        match std::env::var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS") {
-            Ok(s) => s.parse::<u32>().ok().map(|b| b.clamp(6, 26)).unwrap_or(26),
-            Err(_) => 26,
-        }
+        parse_rebuild_seal_bits(
+            std::env::var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS")
+                .ok()
+                .as_deref(),
+        )
     }
 
     /// Hold this thread's rebuild seal bits for `f` (does not mutate process env).

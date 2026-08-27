@@ -990,7 +990,7 @@ impl SegmentedTxHead {
         let (tx, rx) = mpsc::channel();
         *self.seal_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
         std::thread::spawn(move || {
-            let _ = tx.send(build_seal_publish(&dir, file_id, first_fk, count, &pairs));
+            let _ = tx.send(build_seal_publish(&dir, file_id, first_fk, count, pairs));
         });
     }
 
@@ -1007,7 +1007,7 @@ impl SegmentedTxHead {
         if count == 0 {
             return Ok(());
         }
-        let pairs = seg.open_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pairs = seg.open_keys.lock().unwrap_or_else(|e| e.into_inner());
         if pairs.len() as u64 != count {
             return Err(StoreError::Corrupt(
                 "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
@@ -1016,8 +1016,9 @@ impl SegmentedTxHead {
         if let Some(h) = seg.head.as_ref() {
             h.flush()?;
         }
-        let pubd = build_seal_publish(&self.dir, file_id, seg.first_fk, count, &pairs)?;
+        let taken = std::mem::take(&mut *pairs);
         drop(pairs);
+        let pubd = build_seal_publish(&self.dir, file_id, seg.first_fk, count, taken)?;
         self.apply_seal_publish_locked(pubd)
     }
 
@@ -1081,7 +1082,7 @@ impl SegmentedTxHead {
         file_id: u32,
         first_fk: u64,
         count: u64,
-        pairs: &[(u64, u32)],
+        pairs: Vec<(u64, u32)>,
     ) -> Result<SealPublish, StoreError> {
         build_seal_publish(&self.dir, file_id, first_fk, count, pairs)
     }
@@ -1150,21 +1151,20 @@ fn build_seal_publish(
     file_id: u32,
     first_fk: u64,
     count: u64,
-    pairs: &[(u64, u32)],
+    mut pairs: Vec<(u64, u32)>,
 ) -> Result<SealPublish, StoreError> {
     let raw_n = pairs.len();
-    let mut fuse_keys: Vec<u64> = pairs.iter().map(|(k, _)| *k).collect();
-    fuse_keys.sort_unstable();
-    fuse_keys.dedup();
-    let unique_n = fuse_keys.len();
+    let grouped = crate::tx_head_mphf::group_assigned_pairs(&mut pairs)?;
+    drop(pairs);
+    let unique_n = grouped.keys.len();
     rbitcoin_log::info!(
         "store: tx.head seal begin file_id={file_id} first_fk={first_fk} count={count} \
          fuse_keys_raw={raw_n} fuse_keys_unique={unique_n}"
     );
     let t0 = Instant::now();
-    let fuse = SealedFuse8::build(&fuse_keys)?;
+    let fuse = SealedFuse8::build(&grouped.keys)?;
     fuse.write_to(&segment_fuse_path(dir, file_id))?;
-    let pack = TxHeadMphf::write(&segment_head_path(dir, file_id), pairs)?;
+    let pack = TxHeadMphf::write_grouped(&segment_head_path(dir, file_id), grouped)?;
     let fuse_bytes = fuse.fingerprint_bytes();
     rbitcoin_log::info!(
         "store: tx.head seal done file_id={file_id} count={count} fuse_keys_unique={unique_n} \

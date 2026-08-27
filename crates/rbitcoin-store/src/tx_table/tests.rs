@@ -2765,6 +2765,16 @@ fn plan_head_rebuild_ranges_ignores_body_soft_span() {
 }
 
 #[test]
+fn parse_rebuild_seal_bits_default_25() {
+    assert_eq!(parse_rebuild_seal_bits(None), 25);
+    assert_eq!(parse_rebuild_seal_bits(Some("25")), 25);
+    assert_eq!(parse_rebuild_seal_bits(Some("26")), 26);
+    assert_eq!(parse_rebuild_seal_bits(Some("foo")), 25);
+    assert_eq!(parse_rebuild_seal_bits(Some("5")), 6);
+    assert_eq!(parse_rebuild_seal_bits(Some("99")), 26);
+}
+
+#[test]
 fn rebuild_seal_bits_override_is_thread_local() {
     TxTable::test_with_rebuild_seal_bits(6, || {
         assert_eq!(TxTable::rebuild_seal_bits(), 6);

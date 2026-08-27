@@ -11,14 +11,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::{Transaction, Txid};
+use bitcoin::{Network, Transaction, Txid};
 use futures_util::{SinkExt, StreamExt};
-use rbitcoin_net::{MempoolAnnounce, TipEvent};
+use rbitcoin_net::{MempoolAnnounce, MempoolHub, TipEvent};
 use rbitcoin_primitives::{hex_encode, Height};
 use rbitcoin_query::Query;
 use rbitcoin_store::script_hash;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::{broadcast, OwnedSemaphorePermit};
 
 /// Parse one client JSON text frame (pure; unit-tested).
@@ -449,35 +450,39 @@ async fn add_txids(
     Ok(())
 }
 
-async fn on_mempool_announce(
-    st: &AppState,
-    conn: &mut ConnState,
-    ann: &MempoolAnnounce,
-    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-) -> Result<(), ()> {
-    let mp = st.mempool.as_ref();
+struct MempoolAnnounceFrames {
+    replaced: Option<Value>,
+    address_txs: Option<Value>,
+    tx_status: bool,
+}
 
-    // Wallet-scoped RBF: notify if tracked old txid **or** watchlist intersects
-    // replaced bodies' scripthashes (plumbed before eviction on AcceptResult).
+fn mempool_announce_frames(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    network: Network,
+    watched: &HashMap<[u8; 32], String>,
+    tracked: &HashSet<Txid>,
+    ann: &MempoolAnnounce,
+) -> MempoolAnnounceFrames {
+    let mut replaced = None;
     if !ann.replaced.is_empty() {
-        let addr_hit_old = !conn.addresses.is_empty()
+        let addr_hit_old = !watched.is_empty()
             && ann
                 .replaced_scripthashes
                 .iter()
-                .any(|sh| conn.addresses.contains_key(sh));
-        // Also if the *replacement* pays a watched script (receive RBF to same watchlist).
+                .any(|sh| watched.contains_key(sh));
         let mut addr_hit_new = false;
-        if !conn.addresses.is_empty() {
-            if let Some(m) = mp {
+        if !watched.is_empty() {
+            if let Some(m) = mempool {
                 if let Some(tx) = m.get_tx(&ann.txid) {
-                    let shs = scripts_touched_full(&st.query, Some(m.as_ref()), &tx);
-                    addr_hit_new = shs.iter().any(|s| conn.addresses.contains_key(s));
+                    let shs = scripts_touched_full(query, Some(m), &tx);
+                    addr_hit_new = shs.iter().any(|s| watched.contains_key(s));
                 }
             }
         }
         let mut replaced_for_client = Vec::new();
         for old in &ann.replaced {
-            if conn.txids.contains(old) || addr_hit_old || addr_hit_new {
+            if tracked.contains(old) || addr_hit_old || addr_hit_new {
                 replaced_for_client.push(json!({
                     "txid": txid_display_hex(old),
                     "replaced-by": txid_display_hex(&ann.txid),
@@ -485,44 +490,85 @@ async fn on_mempool_announce(
             }
         }
         if !replaced_for_client.is_empty() {
-            send_json(
-                sink,
-                &json!({ "replaced-transactions": replaced_for_client }),
-            )
-            .await?;
+            replaced = Some(json!({ "replaced-transactions": replaced_for_client }));
         }
     }
 
-    let Some(m) = mp else {
-        return Ok(());
+    let Some(m) = mempool else {
+        return MempoolAnnounceFrames {
+            replaced,
+            address_txs: None,
+            tx_status: tracked.contains(&ann.txid),
+        };
     };
     let Some(tx) = m.get_tx(&ann.txid) else {
-        if conn.txids.contains(&ann.txid) {
-            push_tx_status(st, conn, &ann.txid, sink).await?;
-        }
-        return Ok(());
+        return MempoolAnnounceFrames {
+            replaced,
+            address_txs: None,
+            tx_status: tracked.contains(&ann.txid),
+        };
     };
 
-    if !conn.addresses.is_empty() {
-        let shs = scripts_touched_full(&st.query, Some(m.as_ref()), &tx);
-        let hit = shs.iter().any(|s| conn.addresses.contains_key(s));
-        if hit {
-            let body = match st.query.get_tx_by_txid(&ann.txid.to_byte_array()) {
-                Ok(Some((fk, _))) => {
-                    build_tx_json(&st.query, fk, st.network).unwrap_or_else(|_| {
-                        build_tx_json_from_tx(&st.query, &tx, st.network, None, Some(m.as_ref()))
-                            .unwrap_or_else(|_| json!({ "txid": txid_display_hex(&ann.txid) }))
-                    })
-                }
-                _ => build_tx_json_from_tx(&st.query, &tx, st.network, None, Some(m.as_ref()))
+    let mut address_txs = None;
+    if !watched.is_empty() {
+        let shs = scripts_touched_full(query, Some(m), &tx);
+        if shs.iter().any(|s| watched.contains_key(s)) {
+            let body = match query.get_tx_by_txid(&ann.txid.to_byte_array()) {
+                Ok(Some((fk, _))) => build_tx_json(query, fk, network).unwrap_or_else(|_| {
+                    build_tx_json_from_tx(query, &tx, network, None, Some(m))
+                        .unwrap_or_else(|_| json!({ "txid": txid_display_hex(&ann.txid) }))
+                }),
+                _ => build_tx_json_from_tx(query, &tx, network, None, Some(m))
                     .unwrap_or_else(|_| json!({ "txid": txid_display_hex(&ann.txid) })),
             };
-            send_json(sink, &json!({ "address-transactions": [body] })).await?;
+            address_txs = Some(json!({ "address-transactions": [body] }));
         }
     }
 
-    if conn.txids.contains(&ann.txid) {
-        push_tx_status(st, conn, &ann.txid, sink).await?;
+    MempoolAnnounceFrames {
+        replaced,
+        address_txs,
+        tx_status: tracked.contains(&ann.txid),
+    }
+}
+
+async fn on_mempool_announce(
+    st: &AppState,
+    conn: &mut ConnState,
+    ann: &MempoolAnnounce,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) -> Result<(), ()> {
+    let query = Arc::clone(&st.query);
+    let mempool = st.mempool.clone();
+    let network = st.network;
+    let watched = conn.addresses.clone();
+    let tracked = conn.txids.clone();
+    let txid = ann.txid;
+    let ann = ann.clone();
+    let frames = match tokio::task::spawn_blocking(move || {
+        mempool_announce_frames(
+            query.as_ref(),
+            mempool.as_deref(),
+            network,
+            &watched,
+            &tracked,
+            &ann,
+        )
+    })
+    .await
+    {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+
+    if let Some(v) = frames.replaced {
+        send_json(sink, &v).await?;
+    }
+    if let Some(v) = frames.address_txs {
+        send_json(sink, &v).await?;
+    }
+    if frames.tx_status {
+        push_tx_status(st, conn, &txid, sink).await?;
     }
     Ok(())
 }

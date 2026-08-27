@@ -978,13 +978,7 @@ impl PeelScratch {
     }
 }
 
-fn peel_order(
-    keys: &[u64],
-    seed: u64,
-    m: u32,
-    scratch: &mut PeelScratch,
-    partite: bool,
-) -> bool {
+fn peel_order(keys: &[u64], seed: u64, m: u32, scratch: &mut PeelScratch, partite: bool) -> bool {
     let n = keys.len();
     for (i, &k) in keys.iter().enumerate() {
         let ei = i as u32;

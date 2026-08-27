@@ -817,7 +817,7 @@ impl MempoolHub {
             let mut g = self.inner.write().unwrap();
             g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
             let delta = self.fee_delta(&tx.compute_txid());
-            let r = g.prepare_admit(tx, &utxo, tip, delta);
+            let r = g.prepare_admit(tx, &utxo, tip, delta, true);
             stages.utxo_us = g.last_accept_stages.utxo_us;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             r
@@ -907,7 +907,7 @@ impl MempoolHub {
             let mut g = self.inner.write().unwrap();
             g.last_accept_stages = rbitcoin_mempool::AcceptStageUs::default();
             let delta = self.fee_delta(&tx.compute_txid());
-            let r = g.prepare_admit(tx, &utxo, tip, delta);
+            let r = g.prepare_admit(tx, &utxo, tip, delta, false);
             stages.utxo_us = g.last_accept_stages.utxo_us;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             r
@@ -2080,6 +2080,15 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
+        let err = hub.test_accept(&tx).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AcceptError::MissingPrevout(_) | AcceptError::Orphaned(_)
+            ),
+            "dry-run missing parent: {err}"
+        );
+        assert_eq!(hub.orphan_count(), 0);
         let err = hub.accept_tx(&tx).unwrap_err();
         assert!(matches!(err, AcceptError::Orphaned(_)), "{err}");
         assert_eq!(hub.orphan_count(), 1);

@@ -11,15 +11,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"BDZ1";
 const MAGIC2: &[u8; 4] = b"BDZ2";
+const MAGIC3: &[u8; 4] = b"BDZ3";
 const VERSION: u32 = 1;
 const GAMMA_NUM: u64 = 123;
 const GAMMA_DEN: u64 = 100;
 const MAX_SEED: u32 = 256;
 const HEADER_LEN: u64 = 24;
 const HEADER_LEN2: u64 = 32;
+const HEADER_LEN3: u64 = 32;
 const G_PAGE_BYTES: usize = 4096;
 const G_PAGE_WORDS: u32 = (G_PAGE_BYTES / 4) as u32;
 const G_BITS_WORDS: u32 = 32;
+const COMPACT_G_BITS: u32 = 2;
+const RANK_SUPER_BITS: u32 = 512;
 
 #[derive(Debug)]
 enum GStore {
@@ -35,12 +39,20 @@ enum GStore {
 }
 
 #[derive(Debug)]
+struct CompactRank {
+    m: u32,
+    occ: Box<[u64]>,
+    supers: Box<[u32]>,
+}
+
+#[derive(Debug)]
 pub struct BdzMphf {
     n: u32,
     m: u32,
     seed: u64,
     modulus: u32,
     g: GStore,
+    compact: Option<CompactRank>,
 }
 
 #[inline]
@@ -82,6 +94,26 @@ fn hash3(key: u64, seed: u64, m: u32) -> [u32; 3] {
     out
 }
 
+#[inline]
+fn hash3_partite(key: u64, seed: u64, m: u32) -> [u32; 3] {
+    let part = m / 3;
+    let h = mix64(key.wrapping_add(seed));
+    let p = part as u64;
+    let a = ((h as u128 * p as u128) >> 64) as u32;
+    let b = ((h.rotate_left(21) as u128 * p as u128) >> 64) as u32;
+    let c = ((h.rotate_left(42) as u128 * p as u128) >> 64) as u32;
+    [a, part + b, 2 * part + c]
+}
+
+#[inline]
+fn hash_verts(key: u64, seed: u64, m: u32, partite: bool) -> [u32; 3] {
+    if partite {
+        hash3_partite(key, seed, m)
+    } else {
+        hash3(key, seed, m)
+    }
+}
+
 impl BdzMphf {
     pub fn n(&self) -> u32 {
         self.n
@@ -111,7 +143,7 @@ impl BdzMphf {
         if self.n <= 1 {
             return [0, 0, 0];
         }
-        hash3(key, self.seed, self.m)
+        hash_verts(key, self.seed, self.m, self.compact.is_some())
     }
 
     pub fn index(&self, key: u64) -> Result<u32, StoreError> {
@@ -141,17 +173,27 @@ impl BdzMphf {
             return Ok(vec![self.one_key_index()?; keys.len()]);
         }
         match &self.g {
-            GStore::Ram(g) => Ok(keys
-                .iter()
-                .map(|&k| {
-                    let [a, b, c] = hash3(k, self.seed, self.m);
-                    g[a as usize]
-                        .wrapping_add(g[b as usize])
-                        .wrapping_add(g[c as usize])
-                        % self.modulus
-                })
-                .collect()),
+            GStore::Ram(g) => Ok(keys.iter().map(|&k| self.index_from_g(g, k)).collect()),
             GStore::Fd { .. } => self.index_batch_fd(keys, ctx),
+        }
+    }
+
+    fn index_from_g(&self, g: &[u32], key: u64) -> u32 {
+        let partite = self.compact.is_some();
+        let [a, b, c] = hash_verts(key, self.seed, self.m, partite);
+        let ga = g[a as usize];
+        let gb = g[b as usize];
+        let gc = g[c as usize];
+        self.finish_index(ga, gb, gc, [a, b, c])
+    }
+
+    fn finish_index(&self, ga: u32, gb: u32, gc: u32, verts: [u32; 3]) -> u32 {
+        if let Some(rank) = self.compact.as_ref() {
+            let i = (ga.wrapping_add(gb).wrapping_add(gc) % 3) as usize;
+            let v = verts[i];
+            rank.rank1(v).min(self.n.saturating_sub(1))
+        } else {
+            ga.wrapping_add(gb).wrapping_add(gc) % self.modulus
         }
     }
 
@@ -172,7 +214,11 @@ impl BdzMphf {
         else {
             return Err(StoreError::Corrupt("bdz mphf: fd batch"));
         };
-        let verts: Vec<[u32; 3]> = keys.iter().map(|&k| hash3(k, self.seed, self.m)).collect();
+        let partite = self.compact.is_some();
+        let verts: Vec<[u32; 3]> = keys
+            .iter()
+            .map(|&k| hash_verts(k, self.seed, self.m, partite))
+            .collect();
         if *g_bits == G_BITS_WORDS {
             let mut page_ids: Vec<u32> = verts
                 .iter()
@@ -205,7 +251,8 @@ impl BdzMphf {
             )?;
             return Ok(words
                 .iter()
-                .map(|[a, b, c]| a.wrapping_add(*b).wrapping_add(*c) % self.modulus)
+                .zip(verts.iter())
+                .map(|([ga, gb, gc], verts)| self.finish_index(*ga, *gb, *gc, *verts))
                 .collect());
         }
         let mut page_ids: Vec<u32> = verts
@@ -234,16 +281,19 @@ impl BdzMphf {
         )?;
         Ok(verts
             .iter()
-            .map(|[a, b, c]| {
-                unpack_g_from_pages(&loaded, *a, *g_bits)
-                    .wrapping_add(unpack_g_from_pages(&loaded, *b, *g_bits))
-                    .wrapping_add(unpack_g_from_pages(&loaded, *c, *g_bits))
-                    % self.modulus
+            .map(|&[a, b, c]| {
+                let ga = unpack_g_from_pages(&loaded, a, *g_bits);
+                let gb = unpack_g_from_pages(&loaded, b, *g_bits);
+                let gc = unpack_g_from_pages(&loaded, c, *g_bits);
+                self.finish_index(ga, gb, gc, [a, b, c])
             })
             .collect())
     }
 
     fn one_key_index(&self) -> Result<u32, StoreError> {
+        if self.compact.is_some() {
+            return Ok(0);
+        }
         match &self.g {
             GStore::Ram(g) => Ok(g.first().copied().unwrap_or(0)),
             GStore::Fd {
@@ -304,6 +354,7 @@ impl BdzMphf {
                 seed: 0,
                 modulus,
                 g: GStore::Ram(Box::new([])),
+                compact: None,
             });
         }
         if n == 1 {
@@ -313,6 +364,7 @@ impl BdzMphf {
                 seed: 1,
                 modulus,
                 g: GStore::Ram(vec![ranks[0]].into_boxed_slice()),
+                compact: None,
             });
         }
         let m = ((u64::from(n) * GAMMA_NUM + GAMMA_DEN - 1) / GAMMA_DEN)
@@ -323,7 +375,7 @@ impl BdzMphf {
         for _try in 0..MAX_SEED {
             let seed = splitmix64(&mut rng);
             scratch.prepare(m as usize, keys.len());
-            if peel_order(keys, seed, m, &mut scratch) {
+            if peel_order(keys, seed, m, &mut scratch, false) {
                 let order = std::mem::take(&mut scratch.order);
                 drop(scratch);
                 let g = assign_g(keys, ranks, seed, m, modulus, &order);
@@ -333,6 +385,7 @@ impl BdzMphf {
                     seed,
                     modulus,
                     g: GStore::Ram(g.into_boxed_slice()),
+                    compact: None,
                 });
             }
         }
@@ -397,6 +450,7 @@ impl BdzMphf {
                 seed: 0,
                 modulus: 0,
                 g: GStore::Ram(Box::new([])),
+                compact: None,
             });
         }
         let n_words = if n == 1 { 1 } else { m };
@@ -418,6 +472,7 @@ impl BdzMphf {
                 g_bits: G_BITS_WORDS,
                 page_preads: AtomicU64::new(0),
             },
+            compact: None,
         })
     }
 
@@ -447,6 +502,7 @@ impl BdzMphf {
                 seed: 0,
                 modulus,
                 g: GStore::Ram(Box::new([])),
+                compact: None,
             });
         }
         let n_verts = if n == 1 { 1 } else { m };
@@ -468,7 +524,145 @@ impl BdzMphf {
                 g_bits,
                 page_preads: AtomicU64::new(0),
             },
+            compact: None,
         })
+    }
+
+    pub fn build_compact(keys: &[u64]) -> Result<Self, StoreError> {
+        let n = keys.len() as u32;
+        if n == 0 {
+            return Ok(Self {
+                n: 0,
+                m: 0,
+                seed: 0,
+                modulus: 0,
+                g: GStore::Ram(Box::new([])),
+                compact: Some(CompactRank::empty()),
+            });
+        }
+        if n == 1 {
+            let mut occ = vec![0u64; 1];
+            occ_set(&mut occ, 0);
+            return Ok(Self {
+                n: 1,
+                m: 1,
+                seed: 1,
+                modulus: 1,
+                g: GStore::Ram(vec![0].into_boxed_slice()),
+                compact: Some(CompactRank::from_occ(occ.into_boxed_slice(), 1)),
+            });
+        }
+        let m = compact_vertex_count(n);
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut scratch = PeelScratch::default();
+        for _try in 0..MAX_SEED {
+            let seed = splitmix64(&mut rng);
+            scratch.prepare(m as usize, keys.len());
+            if peel_order(keys, seed, m, &mut scratch, true) {
+                let order = std::mem::take(&mut scratch.order);
+                drop(scratch);
+                let (g, occ) = assign_compact(keys, seed, m, &order);
+                return Ok(Self {
+                    n,
+                    m,
+                    seed,
+                    modulus: n,
+                    g: GStore::Ram(g.into_boxed_slice()),
+                    compact: Some(CompactRank::from_occ(occ, m)),
+                });
+            }
+        }
+        Err(StoreError::Corrupt("bdz mphf: graph did not peel"))
+    }
+
+    pub fn write_compact_to(&self, path: &Path) -> Result<(), StoreError> {
+        let GStore::Ram(g) = &self.g else {
+            return Err(StoreError::Corrupt("bdz mphf: write requires RAM g"));
+        };
+        let Some(rank) = self.compact.as_ref() else {
+            return Err(StoreError::Corrupt("bdz mphf: compact write"));
+        };
+        let mut f = std::fs::File::create(path).map_err(|e| StoreError::io(path, e))?;
+        let mut hdr = [0u8; HEADER_LEN3 as usize];
+        hdr[0..4].copy_from_slice(MAGIC3);
+        hdr[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        hdr[8..12].copy_from_slice(&self.n.to_le_bytes());
+        hdr[12..16].copy_from_slice(&self.m.to_le_bytes());
+        hdr[16..24].copy_from_slice(&self.seed.to_le_bytes());
+        hdr[24..28].copy_from_slice(&0u32.to_le_bytes());
+        hdr[28..32].copy_from_slice(&COMPACT_G_BITS.to_le_bytes());
+        f.write_all(&hdr).map_err(|e| StoreError::io(path, e))?;
+        if self.n > 0 {
+            pack_g_write(g, COMPACT_G_BITS, &mut f).map_err(|e| StoreError::io(path, e))?;
+            write_occ(&rank.occ, rank.m, &mut f).map_err(|e| StoreError::io(path, e))?;
+        }
+        f.sync_all().map_err(|e| StoreError::io(path, e))?;
+        Ok(())
+    }
+
+    pub fn read_compact_from(path: &Path) -> Result<Self, StoreError> {
+        let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
+        let mut hdr = [0u8; HEADER_LEN3 as usize];
+        pread_exact(&file, path, 0, &mut hdr)?;
+        if &hdr[0..4] != MAGIC3 {
+            return Err(StoreError::Corrupt("bdz mphf: bad magic"));
+        }
+        let ver = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        if ver != VERSION {
+            return Err(StoreError::Corrupt("bdz mphf: bad version"));
+        }
+        let n = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        let m = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+        let seed = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+        let g_bits = u32::from_le_bytes(hdr[28..32].try_into().unwrap());
+        if g_bits != COMPACT_G_BITS {
+            return Err(StoreError::Corrupt("bdz mphf: g_bits"));
+        }
+        if n == 0 {
+            return Ok(Self {
+                n: 0,
+                m: 0,
+                seed: 0,
+                modulus: 0,
+                g: GStore::Ram(Box::new([])),
+                compact: Some(CompactRank::empty()),
+            });
+        }
+        let n_verts = if n == 1 { 1 } else { m };
+        let g_bytes = packed_g_bytes(n_verts, COMPACT_G_BITS);
+        let occ_n = occ_packed_bytes(n_verts) as usize;
+        let meta = file.metadata().map_err(|e| StoreError::io(path, e))?;
+        if meta.len() < HEADER_LEN3 + g_bytes + occ_n as u64 {
+            return Err(StoreError::Corrupt("bdz mphf: g length"));
+        }
+        let mut occ_buf = vec![0u8; occ_n];
+        pread_exact(&file, path, HEADER_LEN3 + g_bytes, &mut occ_buf)?;
+        let occ = read_occ(&occ_buf, n_verts);
+        Ok(Self {
+            n,
+            m: n_verts,
+            seed,
+            modulus: n,
+            g: GStore::Fd {
+                file,
+                path: path.to_path_buf(),
+                off: HEADER_LEN3,
+                n_bytes: g_bytes,
+                g_bits: COMPACT_G_BITS,
+                page_preads: AtomicU64::new(0),
+            },
+            compact: Some(CompactRank::from_occ(occ, n_verts)),
+        })
+    }
+
+    pub fn trailer_off(&self) -> u64 {
+        if self.compact.is_none() {
+            return HEADER_LEN + self.g_bytes() as u64;
+        }
+        if self.n == 0 {
+            return HEADER_LEN3;
+        }
+        HEADER_LEN3 + packed_g_bytes(self.m, COMPACT_G_BITS) + occ_packed_bytes(self.m)
     }
 }
 
@@ -781,11 +975,17 @@ impl PeelScratch {
     }
 }
 
-fn peel_order(keys: &[u64], seed: u64, m: u32, scratch: &mut PeelScratch) -> bool {
+fn peel_order(
+    keys: &[u64],
+    seed: u64,
+    m: u32,
+    scratch: &mut PeelScratch,
+    partite: bool,
+) -> bool {
     let n = keys.len();
     for (i, &k) in keys.iter().enumerate() {
         let ei = i as u32;
-        for v in hash3(k, seed, m) {
+        for v in hash_verts(k, seed, m, partite) {
             let d = &mut scratch.deg[v as usize];
             if *d == 255 {
                 return false;
@@ -811,7 +1011,7 @@ fn peel_order(keys: &[u64], seed: u64, m: u32, scratch: &mut PeelScratch) -> boo
             return false;
         }
         scratch.order.push((ei, v));
-        for u in hash3(keys[ei as usize], seed, m) {
+        for u in hash_verts(keys[ei as usize], seed, m, partite) {
             let d = &mut scratch.deg[u as usize];
             if *d == 0 {
                 return false;
@@ -849,6 +1049,124 @@ fn assign_g(
         assigned[v as usize] = true;
     }
     g
+}
+
+fn compact_vertex_count(n: u32) -> u32 {
+    let m = ((u64::from(n) * GAMMA_NUM + GAMMA_DEN - 1) / GAMMA_DEN)
+        .max(u64::from(n) + 3)
+        .max(3);
+    let m = m.div_ceil(3) * 3;
+    m as u32
+}
+
+fn assign_compact(keys: &[u64], seed: u64, m: u32, order: &[(u32, u32)]) -> (Vec<u32>, Box<[u64]>) {
+    let mut g = vec![0u32; m as usize];
+    let mut assigned = vec![false; m as usize];
+    let mut occ = vec![0u64; (m as usize).div_ceil(64)];
+    let part = m / 3;
+    for &(ei, v) in order.iter().rev() {
+        let h = hash3_partite(keys[ei as usize], seed, m);
+        let i = if v < part {
+            0
+        } else if v < 2 * part {
+            1
+        } else {
+            2
+        };
+        let mut s = 0u32;
+        for u in h {
+            if assigned[u as usize] {
+                s = s.wrapping_add(g[u as usize]);
+            }
+        }
+        g[v as usize] = (i + 3 - (s % 3)) % 3;
+        assigned[v as usize] = true;
+        occ_set(&mut occ, v);
+    }
+    (g, occ.into_boxed_slice())
+}
+
+fn occ_packed_bytes(m: u32) -> u64 {
+    u64::from(m).div_ceil(8)
+}
+
+fn occ_set(occ: &mut [u64], v: u32) {
+    occ[(v / 64) as usize] |= 1u64 << (v % 64);
+}
+
+fn write_occ(occ: &[u64], m: u32, w: &mut impl Write) -> std::io::Result<()> {
+    let n = occ_packed_bytes(m) as usize;
+    let mut buf = vec![0u8; n];
+    for v in 0..m {
+        if occ[(v / 64) as usize] & (1u64 << (v % 64)) != 0 {
+            buf[(v / 8) as usize] |= 1 << (v % 8);
+        }
+    }
+    w.write_all(&buf)
+}
+
+fn read_occ(buf: &[u8], m: u32) -> Box<[u64]> {
+    let mut occ = vec![0u64; (m as usize).div_ceil(64)];
+    for v in 0..m {
+        let byte = buf.get((v / 8) as usize).copied().unwrap_or(0);
+        if byte & (1 << (v % 8)) != 0 {
+            occ_set(&mut occ, v);
+        }
+    }
+    occ.into_boxed_slice()
+}
+
+fn popcount_range(occ: &[u64], lo: usize, hi: usize) -> u32 {
+    let mut n = 0u32;
+    let mut b = lo;
+    while b < hi {
+        let word = b / 64;
+        let bit = b % 64;
+        let take = (64 - bit).min(hi - b);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << take) - 1) << bit
+        };
+        n += (occ.get(word).copied().unwrap_or(0) & mask).count_ones();
+        b += take;
+    }
+    n
+}
+
+impl CompactRank {
+    fn empty() -> Self {
+        Self {
+            m: 0,
+            occ: Box::new([]),
+            supers: Box::new([0]),
+        }
+    }
+
+    fn from_occ(occ: Box<[u64]>, m: u32) -> Self {
+        let n_supers = (m as usize).div_ceil(RANK_SUPER_BITS as usize);
+        let mut supers = vec![0u32; n_supers + 1];
+        let mut acc = 0u32;
+        for i in 0..n_supers {
+            supers[i] = acc;
+            let bit0 = i * RANK_SUPER_BITS as usize;
+            let bit1 = ((i + 1) * RANK_SUPER_BITS as usize).min(m as usize);
+            acc += popcount_range(&occ, bit0, bit1);
+        }
+        supers[n_supers] = acc;
+        Self {
+            m,
+            occ,
+            supers: supers.into_boxed_slice(),
+        }
+    }
+
+    fn rank1(&self, v: u32) -> u32 {
+        let v = v.min(self.m);
+        let si = (v / RANK_SUPER_BITS) as usize;
+        let rem_lo = si * RANK_SUPER_BITS as usize;
+        self.supers[si] + popcount_range(&self.occ, rem_lo, v as usize)
+    }
 }
 
 #[cfg(test)]
@@ -1089,6 +1407,71 @@ mod tests {
             pages.len() >= 2,
             "straddle vertex must include both page sides"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_injective_2k() {
+        let keys: Vec<u64> = (0..2_000u64)
+            .map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11))
+            .collect();
+        let f = BdzMphf::build_compact(&keys).unwrap();
+        let mut seen = vec![false; keys.len()];
+        for &k in &keys {
+            let i = f.index(k).unwrap() as usize;
+            assert!(i < keys.len());
+            assert!(!seen[i], "collision at {i}");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|&b| b));
+        let miss = f.index(0xDEAD_BEEF_u64).unwrap();
+        assert!(miss < keys.len() as u32);
+    }
+
+    #[test]
+    fn compact_empty_and_one() {
+        let z = BdzMphf::build_compact(&[]).unwrap();
+        assert_eq!(z.n(), 0);
+        let one = BdzMphf::build_compact(&[42]).unwrap();
+        assert_eq!(one.index(42).unwrap(), 0);
+        assert_eq!(one.index(99).unwrap(), 0);
+    }
+
+    #[test]
+    fn compact_packed_fd_is_bdz3_and_matches_ram() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-bdz3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys: Vec<u64> = (0..2_000u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13))
+            .collect();
+        let ram = BdzMphf::build_compact(&keys).unwrap();
+        let p = dir.join("t.mphf");
+        ram.write_compact_to(&p).unwrap();
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(&raw[0..4], b"BDZ3");
+        assert_ne!(&raw[0..4], b"BDZ2");
+        let g_bits = u32::from_le_bytes(raw[28..32].try_into().unwrap());
+        assert_eq!(g_bits, 2);
+        let fd = BdzMphf::read_compact_from(&p).unwrap();
+        assert_eq!(fd.g_bytes_resident(), 0);
+        assert_eq!(raw.len() as u64, ram.trailer_off());
+        assert_eq!(fd.trailer_off(), ram.trailer_off());
+        for &k in &keys {
+            assert_eq!(ram.index(k).unwrap(), fd.index(k).unwrap());
+        }
+        let miss = 0xDEAD_BEEF_u64;
+        assert_eq!(ram.index(miss).unwrap(), fd.index(miss).unwrap());
+        assert!(fd.index(miss).unwrap() < keys.len() as u32);
+        let _ = fd.take_g_page_preads();
+        assert_eq!(fd.index(keys[0]).unwrap(), ram.index(keys[0]).unwrap());
+        assert!(fd.take_g_page_preads() >= 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

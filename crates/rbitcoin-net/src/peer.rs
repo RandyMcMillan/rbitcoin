@@ -1249,7 +1249,14 @@ async fn handle_peer_frame(
     ban_score: &mut u32,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
-    let msg = decode_framed_offload(frame).await?;
+    let msg = match decode_framed_offload(frame).await {
+        Ok(m) => m,
+        Err(NetError::MessageTooLarge(n)) => {
+            *ban_score = ban_score.saturating_add(OVERSIZE_BAN_SCORE);
+            return Err(NetError::MessageTooLarge(n));
+        }
+        Err(e) => return Err(e),
+    };
     match msg.payload() {
         NetworkMessage::Version(_) => {
             if let Some(s) = session {
@@ -1621,7 +1628,7 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Headers(headers) => {
-            let n = headers.len().min(MAX_HEADERS_RESULTS);
+            let n = headers.len();
             let _ = session.is_some_and(|s| s.take_awaiting_headers());
             if n == 0 {
                 // Empty headers is a failed getheaders response, not an announcement.

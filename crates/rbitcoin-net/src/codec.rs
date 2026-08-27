@@ -106,6 +106,21 @@ impl FramedMessage {
         Some(bitcoin::BlockHash::from_byte_array(dig.to_byte_array()))
     }
 
+    /// Extra bytes / unknown command → [`NetworkMessage::Unknown`].
+    /// Oversize `headers` (`n > MAX_HEADERS_RESULTS`) is [`NetError::MessageTooLarge`].
+    pub fn try_decode(self) -> Result<RawNetworkMessage, crate::error::NetError> {
+        if self.is_headers() {
+            let mut sl = self.payload.as_slice();
+            if let Ok(n) = bitcoin::consensus::encode::VarInt::consensus_decode(&mut sl) {
+                let n = n.0 as usize;
+                if n > MAX_HEADERS_RESULTS {
+                    return Err(crate::error::NetError::MessageTooLarge(n));
+                }
+            }
+        }
+        Ok(self.decode())
+    }
+
     /// Deserialize the application payload (no v1 header, no checksum).
     ///
     /// Extra bytes / unknown command → [`NetworkMessage::Unknown`].
@@ -218,7 +233,12 @@ fn decode_cmd_payload(
         }
         "headers" => {
             let n = bitcoin::consensus::encode::VarInt::consensus_decode(d)?.0 as usize;
-            let mut hs = Vec::with_capacity(n.min(16 * 1024));
+            if n > MAX_HEADERS_RESULTS {
+                return Err(bitcoin::consensus::encode::Error::ParseFailed(
+                    "too many headers",
+                ));
+            }
+            let mut hs = Vec::with_capacity(n);
             for _ in 0..n {
                 hs.push(bitcoin::block::Header::consensus_decode(d)?);
                 let txn: u8 = Decodable::consensus_decode(d)?;
@@ -302,6 +322,38 @@ mod tests {
         assert_eq!(MAX_LOCATOR_SZ, 101);
         // Stricter than rust-bitcoin's 5MB
         assert!(MAX_PROTOCOL_MESSAGE_LENGTH < bitcoin::p2p::message::MAX_MSG_SIZE);
+    }
+
+    #[test]
+    fn headers_count_over_2000_is_message_too_large() {
+        use crate::error::NetError;
+        use bitcoin::consensus::encode::{Encodable, VarInt};
+
+        fn count_payload(n: u64) -> Vec<u8> {
+            let mut v = Vec::new();
+            VarInt(n).consensus_encode(&mut v).unwrap();
+            v
+        }
+
+        let over = FramedMessage {
+            magic: signet_magic(),
+            command: *b"headers\0\0\0\0\0",
+            payload: count_payload((MAX_HEADERS_RESULTS as u64) + 1),
+        };
+        match over.try_decode() {
+            Err(NetError::MessageTooLarge(n)) => assert_eq!(n, MAX_HEADERS_RESULTS + 1),
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+
+        let at_cap = FramedMessage {
+            magic: signet_magic(),
+            command: *b"headers\0\0\0\0\0",
+            payload: count_payload(MAX_HEADERS_RESULTS as u64),
+        };
+        assert!(
+            !matches!(at_cap.try_decode(), Err(NetError::MessageTooLarge(_))),
+            "n=2000 must not be MessageTooLarge"
+        );
     }
 
     #[test]

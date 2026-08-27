@@ -337,7 +337,14 @@ pub(crate) async fn run_feeler_timed(
 ) -> Result<(), NetError> {
     tokio::time::timeout(
         limit,
-        run_feeler_inner(stream, magic, our_addr, their_addr, start_height, user_agent),
+        run_feeler_inner(
+            stream,
+            magic,
+            our_addr,
+            their_addr,
+            start_height,
+            user_agent,
+        ),
     )
     .await
     .map_err(|_| NetError::Timeout)?

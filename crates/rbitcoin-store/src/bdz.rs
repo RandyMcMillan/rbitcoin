@@ -34,6 +34,7 @@ pub struct BdzMphf {
     n: u32,
     m: u32,
     seed: u64,
+    modulus: u32,
     g: GStore,
 }
 
@@ -81,6 +82,10 @@ impl BdzMphf {
         self.n
     }
 
+    pub fn modulus(&self) -> u32 {
+        self.modulus
+    }
+
     pub fn g_bytes(&self) -> usize {
         match &self.g {
             GStore::Ram(g) => g.len() * 4,
@@ -123,8 +128,11 @@ impl BdzMphf {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        if self.n == 0 || self.n == 1 {
+        if self.n == 0 {
             return Ok(vec![0; keys.len()]);
+        }
+        if self.n == 1 {
+            return Ok(vec![self.one_key_index()?; keys.len()]);
         }
         match &self.g {
             GStore::Ram(g) => Ok(keys
@@ -134,7 +142,7 @@ impl BdzMphf {
                     g[a as usize]
                         .wrapping_add(g[b as usize])
                         .wrapping_add(g[c as usize])
-                        % self.n
+                        % self.modulus
                 })
                 .collect()),
             GStore::Fd { .. } => self.index_batch_fd(keys, ctx),
@@ -200,17 +208,60 @@ impl BdzMphf {
         }
         Ok(words
             .iter()
-            .map(|[a, b, c]| a.wrapping_add(*b).wrapping_add(*c) % self.n)
+            .map(|[a, b, c]| a.wrapping_add(*b).wrapping_add(*c) % self.modulus)
             .collect())
     }
 
+    fn one_key_index(&self) -> Result<u32, StoreError> {
+        match &self.g {
+            GStore::Ram(g) => Ok(g.first().copied().unwrap_or(0)),
+            GStore::Fd {
+                file, path, off, ..
+            } => {
+                let mut buf = [0u8; 4];
+                pread_exact(file, path, *off, &mut buf)?;
+                Ok(u32::from_le_bytes(buf))
+            }
+        }
+    }
+
     pub fn build(keys: &[u64]) -> Result<Self, StoreError> {
+        let n = keys.len() as u32;
+        let ranks: Vec<u32> = (0..n).collect();
+        Self::build_from_ranks(keys, &ranks, n)
+    }
+
+    pub fn build_assigned(keys: &[u64], values: &[u32], modulus: u32) -> Result<Self, StoreError> {
+        if keys.len() != values.len() {
+            return Err(StoreError::Corrupt("bdz mphf: assigned len"));
+        }
+        if keys.is_empty() {
+            return Self::build_from_ranks(keys, values, modulus);
+        }
+        if modulus == 0 {
+            return Err(StoreError::Corrupt("bdz mphf: assigned modulus"));
+        }
+        let mut seen = vec![false; modulus as usize];
+        for &v in values {
+            if v >= modulus {
+                return Err(StoreError::Corrupt("bdz mphf: assigned value"));
+            }
+            if seen[v as usize] {
+                return Err(StoreError::Corrupt("bdz mphf: assigned duplicate"));
+            }
+            seen[v as usize] = true;
+        }
+        Self::build_from_ranks(keys, values, modulus)
+    }
+
+    fn build_from_ranks(keys: &[u64], ranks: &[u32], modulus: u32) -> Result<Self, StoreError> {
         let n = keys.len() as u32;
         if n == 0 {
             return Ok(Self {
                 n: 0,
                 m: 0,
                 seed: 0,
+                modulus,
                 g: GStore::Ram(Box::new([])),
             });
         }
@@ -219,7 +270,8 @@ impl BdzMphf {
                 n: 1,
                 m: 1,
                 seed: 1,
-                g: GStore::Ram(vec![0u32].into_boxed_slice()),
+                modulus,
+                g: GStore::Ram(vec![ranks[0]].into_boxed_slice()),
             });
         }
         let m = ((u64::from(n) * GAMMA_NUM + GAMMA_DEN - 1) / GAMMA_DEN)
@@ -228,11 +280,12 @@ impl BdzMphf {
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         for _try in 0..MAX_SEED {
             let seed = splitmix64(&mut rng);
-            if let Some(g) = try_peel(keys, seed, m, n) {
+            if let Some(g) = try_peel(keys, ranks, seed, m, modulus) {
                 return Ok(Self {
                     n,
                     m,
                     seed,
+                    modulus,
                     g: GStore::Ram(g.into_boxed_slice()),
                 });
             }
@@ -276,6 +329,7 @@ impl BdzMphf {
                 n: 0,
                 m: 0,
                 seed: 0,
+                modulus: 0,
                 g: GStore::Ram(Box::new([])),
             });
         }
@@ -289,6 +343,7 @@ impl BdzMphf {
             n,
             m: n_words,
             seed,
+            modulus: n,
             g: GStore::Fd {
                 file,
                 path: path.to_path_buf(),
@@ -451,7 +506,7 @@ fn stream_g_pages(
     run
 }
 
-fn try_peel(keys: &[u64], seed: u64, m: u32, n: u32) -> Option<Vec<u32>> {
+fn try_peel(keys: &[u64], ranks: &[u32], seed: u64, m: u32, modulus: u32) -> Option<Vec<u32>> {
     let m_us = m as usize;
     let mut edges = vec![[0u32; 3]; keys.len()];
     let mut deg = vec![0u32; m_us];
@@ -517,8 +572,8 @@ fn try_peel(keys: &[u64], seed: u64, m: u32, n: u32) -> Option<Vec<u32>> {
                 s = s.wrapping_add(g[u as usize]);
             }
         }
-        let rank = ei % n;
-        g[v as usize] = (rank + n - (s % n)) % n;
+        let rank = ranks[ei as usize];
+        g[v as usize] = (rank + modulus - (s % modulus)) % modulus;
         assigned[v as usize] = true;
     }
     Some(g)
@@ -624,5 +679,41 @@ mod tests {
         assert_eq!(ram.index(miss_k).unwrap(), fd.index(miss_k).unwrap());
         assert!(fd.index(miss_k).unwrap() < keys.len() as u32);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assigned_peel_index_is_rel_minus_one() {
+        let keys = [10u64, 20, 30, 40];
+        let rels = [3u32, 1, 4, 2];
+        let values: Vec<u32> = rels.iter().map(|r| r - 1).collect();
+        let f = BdzMphf::build_assigned(&keys, &values, 4).unwrap();
+        assert_eq!(f.modulus(), 4);
+        for (&k, &rel) in keys.iter().zip(rels.iter()) {
+            assert_eq!(f.index(k).unwrap(), rel - 1);
+        }
+        let miss = f.index(0xDEAD_BEEF_u64).unwrap();
+        assert!(miss < 4);
+    }
+
+    #[test]
+    fn assigned_peel_modulus_hole_and_bip30_newest() {
+        let keys = [1u64, 2, 3];
+        let values = [0u32, 2, 3];
+        let modulus = 4u32;
+        let f = BdzMphf::build_assigned(&keys, &values, modulus).unwrap();
+        assert_eq!(f.n(), 3);
+        assert_eq!(f.modulus(), modulus);
+        assert_eq!(f.index(1).unwrap(), 0);
+        assert_eq!(f.index(2).unwrap(), 2);
+        assert_eq!(f.index(3).unwrap(), 3);
+        let miss = f.index(99).unwrap();
+        assert!(miss < modulus);
+
+        let newest_key = 7u64;
+        let newest_rel = 5u32;
+        let f2 = BdzMphf::build_assigned(&[newest_key, 8], &[newest_rel - 1, 0], 5).unwrap();
+        assert_eq!(f2.index(newest_key).unwrap(), newest_rel - 1);
+        assert_eq!(f2.index(8).unwrap(), 0);
+        assert!(f2.index(123).unwrap() < 5);
     }
 }

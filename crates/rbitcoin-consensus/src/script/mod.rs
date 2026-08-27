@@ -146,15 +146,21 @@ pub(crate) fn verify_input<'a>(
             if !job.bip16_active {
                 return verify_bare(job, input_index, tx, prevout);
             }
-            if let Some(res) =
-                nested::try_p2sh_nested_segwit(job, input_index, tx, sighash_cache(cache, tx), pre)
-            {
+            let stack = nested::p2sh_script_sig_stack(job, input_index, tx)?;
+            if let Some(res) = nested::try_p2sh_nested_segwit(
+                job,
+                input_index,
+                tx,
+                sighash_cache(cache, tx),
+                pre,
+                &stack,
+            ) {
                 return res;
             }
             if job.witness_active && has_witness {
                 return Err(ConsensusError::Script("WITNESS_UNEXPECTED".into()));
             }
-            nested::verify_p2sh_legacy(job, input_index, tx)
+            nested::verify_p2sh_legacy(job, input_index, tx, stack)
         }
         ScriptKind::Bare | ScriptKind::P2wpkh | ScriptKind::P2wsh | ScriptKind::P2tr => {
             verify_bare(job, input_index, tx, prevout)

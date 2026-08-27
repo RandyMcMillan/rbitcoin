@@ -54,6 +54,13 @@ before 1.0).
 
 ### Changed
 
+- **`header.head` open-grow is sibling then rename:** undersized single-gen
+  rewrite writes `header.head.grow`, fsyncs, then rename over the live file
+  (`.mlt` kept). Crash during rewrite leaves the previous OA. A target-sized
+  empty gen0 with a non-empty `header.body` / `.mlt` is Layout refuse
+  (wipe `header.head`, `header.head.mlt`, `header.body`).
+  [`SCHEMA.md`](SCHEMA.md), [`docs/concurrency.md`](docs/concurrency.md).
+
 - **Tip-follow catch-up getdata matches serve cap:** connecting headers
   asked the whole path while a peer reconstructs at most 16 bodies.
   Extra hashes stayed in `requested` and were never re-asked
@@ -96,11 +103,6 @@ before 1.0).
   Load binds same-batch → in-flight → skeleton → `Corrupt`. Published
   `live_union` / `PublishedIds` are gone. plan=None / S0 still leftover
   TipOnly. Lookup `wave=… spent=` is `tx_spent_range_batch` for those hits.
-
-- **`header.head` open-grow replaces the file:** an undersized single-gen
-  OA is deleted and recreated at the create target (`.mlt` kept). Crash
-  after unlink is a missing `header.head`, not a zeroed live table.
-  [`SCHEMA.md`](SCHEMA.md), [`docs/concurrency.md`](docs/concurrency.md).
 
 - **Confirm Class A kind per batch:** a load/write batch is all need-body
   (`plan=Some`) or all already-bodied (`plan=None`). Lookup splits loadq

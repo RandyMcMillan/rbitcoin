@@ -301,6 +301,34 @@ struct HashState {
     occupied: u64,
 }
 
+fn grow_part_path(head_path: &Path) -> PathBuf {
+    let mut p = head_path.as_os_str().to_os_string();
+    p.push(".grow");
+    PathBuf::from(p)
+}
+
+fn mlt_path(head_path: &Path) -> PathBuf {
+    let mut p = head_path.as_os_str().to_os_string();
+    p.push(".mlt");
+    PathBuf::from(p)
+}
+
+pub(crate) fn discard_grow_part(head_path: &Path) {
+    let grow = grow_part_path(head_path);
+    let _ = std::fs::remove_file(&grow);
+    let _ = std::fs::remove_file(mlt_path(&grow));
+}
+
+fn install_grown_oa(from: &Path, to: &Path) -> Result<(), StoreError> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::remove_file(to).map_err(|e| StoreError::io(to, e))?;
+            std::fs::rename(from, to).map_err(|e| StoreError::io(to, e))
+        }
+    }
+}
+
 impl HashHead {
     /// Create with an explicit power-of-two slot count (sparse-allocated).
     pub fn create_with_slots(
@@ -415,9 +443,12 @@ impl HashHead {
     }
 
     /// Number of occupied hash slots (open-address load observer).
-    #[cfg(test)]
     pub(crate) fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
+    }
+
+    pub(crate) fn multi_count(&self) -> u64 {
+        *self.multi.count.lock().unwrap()
     }
 
     pub(crate) fn slots(&self) -> u64 {
@@ -668,6 +699,9 @@ impl HashHead {
     }
 
     /// Replace the OA file with a larger power-of-two. Open-only (no concurrent probes).
+    ///
+    /// Writes `path.grow`, fsyncs, then rename over the live file so a crash
+    /// during rewrite leaves the previous undersized OA.
     pub(crate) fn rewrite_to_slots(self, new_slots: u64) -> Result<Self, StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
         let (old_slots, occupied) = {
@@ -705,8 +739,10 @@ impl HashHead {
 
         let path = self.file.path().to_path_buf();
         drop(self);
-        std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
-        let fresh = Self::create_replaced_oa(&path, new_slots)?;
+
+        let grow = grow_part_path(&path);
+        discard_grow_part(&path);
+        let fresh = Self::create_replaced_oa(&grow, new_slots)?;
 
         entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
         let n_entries = entries.len() as u64;
@@ -723,14 +759,20 @@ impl HashHead {
         cache.flush()?;
         drop(cache);
         fresh.state.lock().unwrap().occupied = n_entries;
+        fresh.flush()?;
+        drop(fresh);
+
+        install_grown_oa(&grow, &path)?;
+        let _ = std::fs::remove_file(mlt_path(&grow));
+
         rbitcoin_log::warn!(
             "store: header.head open-grow path={} {}→{} slots occupied={}",
-            fresh.file.path().display(),
+            path.display(),
             old_slots,
             new_slots,
             n_entries
         );
-        Ok(fresh)
+        Self::open(&path)
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
@@ -1135,6 +1177,7 @@ mod tests {
         let mut mlt = path.as_os_str().to_os_string();
         mlt.push(".mlt");
         let _ = std::fs::remove_file(mlt);
+        discard_grow_part(path);
     }
 
     #[test]
@@ -1280,6 +1323,26 @@ mod tests {
             );
             drop(old);
         }
+        cleanup_hh(&path);
+    }
+
+    #[test]
+    fn rewrite_to_slots_discards_leftover_grow_keeps_old_keys() {
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, 32).unwrap();
+        let mut k = [0u8; 32];
+        k[0] = 0x33;
+        h.insert(&k, Fk(9)).unwrap();
+        h.flush().unwrap();
+        let grow = grow_part_path(&path);
+        std::fs::write(&grow, b"stale-grow").unwrap();
+        let h = h.rewrite_to_slots(64).unwrap();
+        assert_eq!(h.slots(), 64);
+        assert_eq!(h.get(&k).unwrap(), Some(Fk(9)));
+        assert!(
+            !grow.exists(),
+            "leftover .grow must not remain after rewrite"
+        );
         cleanup_hh(&path);
     }
 

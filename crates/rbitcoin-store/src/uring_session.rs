@@ -21,17 +21,13 @@ use crate::io_handle::IoHandle;
 use crate::io_session_pool::PoolEngine;
 use std::cell::Cell;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Default SQ/CQ depth for all store io_uring sessions (bulk, plan head-resolve,
 /// spend annotate). TLS rings open at this size; [`with_thread_local`] may grow
 /// if a caller requests more (none currently do).
 pub const DEFAULT_ENTRIES: u32 = 128;
-
-/// Cap for [`UringSession::submit_and_wait_one`]. Lost CQEs must fail the wave
-/// instead of parking the lookup thread for the rest of IBD.
-const WAIT_ONE_TIMEOUT_SECS: u64 = 5;
-const WAIT_ONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(WAIT_ONE_TIMEOUT_SECS);
 
 /// One `drain_all` wait window. Progress in a window resets the zero-CQE clock.
 const DRAIN_WINDOW: Duration = Duration::from_millis(100);
@@ -49,8 +45,14 @@ pub(crate) enum DrainVerdict {
     HardCap,
 }
 
+enum WaitOneWindow {
+    Ready,
+    TimedOut,
+    Idle,
+    Enter(StoreError),
+}
+
 pub(crate) struct DrainBudget {
-    window: Duration,
     hard: Duration,
     zero: Duration,
     elapsed: Duration,
@@ -60,7 +62,6 @@ pub(crate) struct DrainBudget {
 impl DrainBudget {
     pub(crate) fn new(hard: Duration) -> Self {
         Self {
-            window: DRAIN_WINDOW,
             hard,
             zero: Duration::ZERO,
             elapsed: Duration::ZERO,
@@ -76,13 +77,13 @@ impl DrainBudget {
         self.elapsed
     }
 
-    pub(crate) fn note_window(&mut self, completed: usize) -> DrainVerdict {
-        self.elapsed += self.window;
-        self.since_slow_log += self.window;
+    pub(crate) fn note(&mut self, dt: Duration, completed: usize) -> DrainVerdict {
+        self.elapsed = self.elapsed.saturating_add(dt);
+        self.since_slow_log = self.since_slow_log.saturating_add(dt);
         if completed > 0 {
             self.zero = Duration::ZERO;
         } else {
-            self.zero += self.window;
+            self.zero = self.zero.saturating_add(dt);
             if self.zero >= self.hard {
                 return DrainVerdict::HardCap;
             }
@@ -100,18 +101,15 @@ fn drain_hard_cap() -> Duration {
     if let Some(d) = TEST_DRAIN_HARD.with(|c| c.get()) {
         return d;
     }
-    let secs = std::env::var("RBITCOIN_URING_DRAIN_HARD_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DRAIN_HARD_DEFAULT_SECS);
-    #[cfg(test)]
-    {
-        let _ = secs;
-        return Duration::from_millis(500);
-    }
-    #[cfg(not(test))]
-    Duration::from_secs(secs)
+    static CAP: OnceLock<Duration> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let secs = std::env::var("RBITCOIN_URING_DRAIN_HARD_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DRAIN_HARD_DEFAULT_SECS);
+        Duration::from_secs(secs)
+    })
 }
 
 #[cfg(test)]
@@ -134,7 +132,7 @@ pub fn abort_uring_unusable(reason: &str) -> ! {
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("unnamed");
     rbitcoin_log::error!(
-        "store: io_uring unusable thread={thread} {reason} — aborting; restart with RBITCOIN_IO=pread if the filesystem or IO scheduling class cannot complete io_uring"
+        "store: completion session unusable thread={thread} {reason} — aborting; restart with RBITCOIN_IO=pread if the filesystem or IO scheduling class cannot complete bulk IO"
     );
     std::process::abort();
 }
@@ -497,45 +495,74 @@ impl UringSession {
 
     /// Submit pending SQEs and wait for at least one CQE. Does not harvest.
     ///
-    /// Bounded: a lost CQE / phantom pending must not park lookup forever.
+    /// Slow-log after 5 s of zero completions; poison at the drain hard cap.
+    /// A lost CQE / phantom pending must not park lookup forever.
     pub fn submit_and_wait_one(&mut self) -> Result<(), StoreError> {
         self.check_live()?;
         if self.pending.is_empty() {
             return Ok(());
         }
+        let mut budget = DrainBudget::with_defaults();
+        loop {
+            let t0 = Instant::now();
+            match self.wait_one_window() {
+                WaitOneWindow::Ready => return Ok(()),
+                WaitOneWindow::Idle => {
+                    self.poisoned = true;
+                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
+                }
+                WaitOneWindow::Enter(err) => {
+                    self.poisoned = true;
+                    return Err(err);
+                }
+                WaitOneWindow::TimedOut => match budget.note(t0.elapsed(), 0) {
+                    DrainVerdict::Continue => {}
+                    DrainVerdict::LogSlow => self.note_slow_drain(budget.elapsed()),
+                    DrainVerdict::HardCap => {
+                        self.poisoned = true;
+                        return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
+                    }
+                },
+            }
+        }
+    }
+
+    fn wait_one_window(&mut self) -> WaitOneWindow {
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
                 ring.submission().sync();
-                let ts = io_uring::types::Timespec::new().sec(WAIT_ONE_TIMEOUT_SECS);
+                let ts = io_uring::types::Timespec::new().nsec(DRAIN_WAIT_NS);
                 let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-                loop {
-                    match ring.submitter().submit_with_args(1, &args) {
-                        Ok(_) => return Ok(()),
-                        Err(e) => {
-                            if e.raw_os_error() == Some(libc::ETIME) {
-                                self.poisoned = true;
-                                return Err(StoreError::Corrupt(
-                                    "invariant: io_uring wait timeout",
-                                ));
-                            }
-                            if let Some(err) = map_enter_err(&e) {
-                                self.poisoned = true;
-                                return Err(err);
-                            }
+                match ring.submitter().submit_with_args(1, &args) {
+                    Ok(_) => WaitOneWindow::Ready,
+                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => WaitOneWindow::TimedOut,
+                    Err(e) => {
+                        if let Some(err) = map_enter_err(&e) {
+                            WaitOneWindow::Enter(err)
+                        } else {
+                            WaitOneWindow::TimedOut
                         }
                     }
                 }
             }
             SessionBackend::Pool(pool) => {
-                if !pool.wait_one_cqe_timeout(WAIT_ONE_TIMEOUT) {
-                    self.poisoned = true;
-                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
+                if pool.wait_one_cqe_timeout(DRAIN_WINDOW) {
+                    WaitOneWindow::Ready
+                } else if pool.inflight() == 0 {
+                    WaitOneWindow::Idle
+                } else {
+                    WaitOneWindow::TimedOut
                 }
-                Ok(())
             }
             #[cfg(windows)]
-            SessionBackend::Iocp(eng) => eng.wait_one_cqe(),
+            SessionBackend::Iocp(eng) => {
+                if eng.wait_one_cqe_timeout(100) {
+                    WaitOneWindow::Ready
+                } else {
+                    WaitOneWindow::TimedOut
+                }
+            }
         }
     }
 
@@ -608,7 +635,11 @@ impl UringSession {
     /// harvest of only-ready CQEs is not enough — the kernel may still write
     /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
     pub fn drain_all(&mut self) -> Result<(), StoreError> {
-        self.drain_all_harvest()?;
+        self.drain_all_inner(true)
+    }
+
+    fn drain_all_inner(&mut self, fail_closed: bool) -> Result<(), StoreError> {
+        self.drain_all_harvest(fail_closed)?;
         if let Err(e) = self.pending.assert_drained() {
             let already = self.poisoned;
             self.poisoned = true;
@@ -620,44 +651,60 @@ impl UringSession {
         Ok(())
     }
 
-    fn drain_all_harvest(&mut self) -> Result<(), StoreError> {
+    fn drain_all_harvest(&mut self, fail_closed: bool) -> Result<(), StoreError> {
         match &self.backend {
             #[cfg(target_os = "linux")]
-            SessionBackend::Uring(_) => self.drain_all_uring(),
-            SessionBackend::Pool(_) => self.drain_all_pool(),
+            SessionBackend::Uring(_) => self.drain_all_uring(fail_closed),
+            SessionBackend::Pool(_) => self.drain_all_pool(fail_closed),
             #[cfg(windows)]
-            SessionBackend::Iocp(_) => self.drain_all_iocp(),
+            SessionBackend::Iocp(_) => self.drain_all_iocp(fail_closed),
         }
+    }
+
+    fn note_slow_drain(&self, waited: Duration) {
+        URING_METERS
+            .slow_drain
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+        rbitcoin_log::warn!(
+            "store: io_uring drain slow pending={} waited={:?} thread={thread}",
+            self.pending.len(),
+            waited,
+        );
     }
 
     fn apply_drain_window(
         &mut self,
         budget: &mut DrainBudget,
         completed: usize,
+        dt: Duration,
+        fail_closed: bool,
     ) -> Result<(), StoreError> {
-        match budget.note_window(completed) {
+        match budget.note(dt, completed) {
             DrainVerdict::Continue => Ok(()),
             DrainVerdict::LogSlow => {
-                URING_METERS
-                    .slow_drain
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let thread = std::thread::current();
-                let thread = thread.name().unwrap_or("unnamed");
-                rbitcoin_log::warn!(
-                    "store: io_uring drain slow pending={} waited={:?} thread={thread}",
-                    self.pending.len(),
-                    budget.elapsed(),
-                );
+                self.note_slow_drain(budget.elapsed());
                 Ok(())
             }
             DrainVerdict::HardCap => {
                 self.poisoned = true;
-                finish_drain_hard_cap(self.pending.len())
+                if fail_closed {
+                    finish_drain_hard_cap(self.pending.len())
+                } else {
+                    let thread = std::thread::current();
+                    let thread = thread.name().unwrap_or("unnamed");
+                    rbitcoin_log::warn!(
+                        "store: io_uring drain hard cap on drop pending={} thread={thread}",
+                        self.pending.len()
+                    );
+                    Err(StoreError::Corrupt("invariant: io_uring undrained"))
+                }
             }
         }
     }
 
-    fn drain_all_pool(&mut self) -> Result<(), StoreError> {
+    fn drain_all_pool(&mut self, fail_closed: bool) -> Result<(), StoreError> {
         let mut budget = DrainBudget::with_defaults();
         loop {
             let inflight = match &self.backend {
@@ -680,6 +727,7 @@ impl UringSession {
                 return self.apply_drain_cqes(uds);
             }
             let before = self.pending.len();
+            let t0 = Instant::now();
             let uds = match &mut self.backend {
                 SessionBackend::Pool(pool) => {
                     let _ = pool.wait_one_cqe_timeout(DRAIN_WINDOW);
@@ -692,15 +740,16 @@ impl UringSession {
             };
             self.apply_drain_cqes(uds)?;
             let completed = before.saturating_sub(self.pending.len());
-            self.apply_drain_window(&mut budget, completed)?;
+            self.apply_drain_window(&mut budget, completed, t0.elapsed(), fail_closed)?;
         }
     }
 
     #[cfg(windows)]
-    fn drain_all_iocp(&mut self) -> Result<(), StoreError> {
+    fn drain_all_iocp(&mut self, fail_closed: bool) -> Result<(), StoreError> {
         let mut budget = DrainBudget::with_defaults();
         loop {
             let before = self.pending.len();
+            let t0 = Instant::now();
             let wait_res = match &mut self.backend {
                 SessionBackend::Iocp(eng) => eng.wait_idle(),
                 _ => Ok(()),
@@ -717,7 +766,7 @@ impl UringSession {
                 return Ok(());
             }
             let completed = before.saturating_sub(self.pending.len());
-            self.apply_drain_window(&mut budget, completed)?;
+            self.apply_drain_window(&mut budget, completed, t0.elapsed(), fail_closed)?;
         }
     }
 
@@ -750,7 +799,7 @@ impl UringSession {
     }
 
     #[cfg(target_os = "linux")]
-    fn drain_all_uring(&mut self) -> Result<(), StoreError> {
+    fn drain_all_uring(&mut self, fail_closed: bool) -> Result<(), StoreError> {
         let mut unexpected = false;
         let mut overflow = 0u32;
         let mut enter_err = None;
@@ -758,12 +807,15 @@ impl UringSession {
         self.uring_sync_sq();
         while !self.pending.is_empty() {
             let before = self.pending.len();
+            let t0 = Instant::now();
             self.uring_drain_window(&mut unexpected, &mut overflow, &mut enter_err);
             if enter_err.is_some() || unexpected || overflow != 0 {
                 break;
             }
             let completed = before.saturating_sub(self.pending.len());
-            if let Err(e) = self.apply_drain_window(&mut budget, completed) {
+            if let Err(e) =
+                self.apply_drain_window(&mut budget, completed, t0.elapsed(), fail_closed)
+            {
                 enter_err = Some(e);
                 break;
             }
@@ -844,7 +896,7 @@ impl UringSession {
 
 impl Drop for UringSession {
     fn drop(&mut self) {
-        let _ = self.drain_all();
+        let _ = self.drain_all_inner(false);
     }
 }
 
@@ -1299,40 +1351,52 @@ mod tests {
 
     #[test]
     fn drain_budget_progress_resets_zero_clock() {
+        let dt = Duration::from_millis(100);
         let mut b = DrainBudget::new(Duration::from_millis(300));
-        assert_eq!(b.note_window(0), DrainVerdict::Continue);
-        assert_eq!(b.note_window(0), DrainVerdict::Continue);
-        assert_eq!(b.note_window(1), DrainVerdict::Continue);
-        assert_eq!(b.note_window(0), DrainVerdict::Continue);
-        assert_eq!(b.note_window(0), DrainVerdict::Continue);
-        assert_eq!(b.note_window(0), DrainVerdict::HardCap);
+        assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 1), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 0), DrainVerdict::HardCap);
     }
 
     #[test]
     fn drain_budget_five_seconds_with_progress_logs_slow_not_hard_cap() {
+        let dt = Duration::from_millis(100);
         let mut b = DrainBudget::new(Duration::from_secs(120));
         for _ in 0..49 {
-            assert_eq!(b.note_window(1), DrainVerdict::Continue);
+            assert_eq!(b.note(dt, 1), DrainVerdict::Continue);
         }
-        assert_eq!(b.note_window(1), DrainVerdict::LogSlow);
-        assert_eq!(b.note_window(1), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 1), DrainVerdict::LogSlow);
+        assert_eq!(b.note(dt, 1), DrainVerdict::Continue);
     }
 
     #[test]
     fn drain_budget_five_seconds_zero_progress_logs_slow_before_hard_cap() {
+        let dt = Duration::from_millis(100);
         let mut b = DrainBudget::new(Duration::from_secs(120));
         for _ in 0..49 {
-            assert_eq!(b.note_window(0), DrainVerdict::Continue);
+            assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
         }
-        assert_eq!(b.note_window(0), DrainVerdict::LogSlow);
-        assert_eq!(b.note_window(0), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 0), DrainVerdict::LogSlow);
+        assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
     }
 
     #[test]
     fn drain_budget_hard_cap_only_after_hard_duration_of_zero() {
+        let dt = Duration::from_millis(100);
         let mut b = DrainBudget::new(Duration::from_millis(200));
-        assert_eq!(b.note_window(0), DrainVerdict::Continue);
-        assert_eq!(b.note_window(0), DrainVerdict::HardCap);
+        assert_eq!(b.note(dt, 0), DrainVerdict::Continue);
+        assert_eq!(b.note(dt, 0), DrainVerdict::HardCap);
+    }
+
+    #[test]
+    fn drain_budget_eintr_spin_does_not_hit_hard_cap() {
+        let mut b = DrainBudget::new(Duration::from_millis(200));
+        for _ in 0..10_000 {
+            assert_ne!(b.note(Duration::from_nanos(1), 0), DrainVerdict::HardCap);
+        }
     }
 
     #[test]
@@ -1340,11 +1404,14 @@ mod tests {
         let mut session = UringSession::try_open(32)
             .unwrap_or_else(|_| UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool"));
         session.pending.insert(1).unwrap();
-        with_drain_hard_cap(Duration::from_millis(200), || match session.drain_all() {
-            Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
-            other => panic!("expected undrained after hard cap, got {other:?}"),
+        with_drain_hard_cap(Duration::from_millis(200), || {
+            match session.drain_all() {
+                Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
+                other => panic!("expected undrained after hard cap, got {other:?}"),
+            }
+            assert!(session.is_poisoned());
+            drop(session);
         });
-        assert!(session.is_poisoned());
     }
 
     /// A CQE whose `user_data` was removed from `pending` is not a silent

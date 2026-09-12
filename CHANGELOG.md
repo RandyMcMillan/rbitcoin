@@ -15,6 +15,10 @@ before 1.0).
   leftover SQEs (that freed in-flight buffers). Every TLS session waits while
   CQEs arrive; a 120 s zero-completion stall aborts explicit drain (session
   `Drop` does not abort). `io_uring undrained` is `EngineFault`, not Cascade.
+- **SH megakey unlink on reorg:** `DisconnectTip` bulk-pread of an Extent
+  list is capped at 64 MiB. A larger or past-EOF `extent_n` walks the linked
+  pages instead of `Corrupt` (mainnet equal-work rewind after compact
+  reconstruct). Tweaks truncate with the SH unlink.
 - **Compact reconstruct merkle-checks before `Ok`:** a unique short-id (or
   `blocktxn`) fill is not a block until the txs match the compact header
   merkle (BIP152 `FinishBlock`). Empty missing → `getdata`, not

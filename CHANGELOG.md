@@ -9,6 +9,16 @@ before 1.0).
 
 ## [Unreleased]
 
+### Fixed
+
+- **IBD io_uring drain stall:** `drain_all` no longer returns after 5 s with
+  leftover SQEs (that freed in-flight buffers). Every TLS session waits while
+  CQEs arrive; a 120 s zero-completion stall aborts explicit drain (session
+  `Drop` does not abort). `io_uring undrained` is `EngineFault`, not Cascade.
+- **Same-block coinbase maturity:** a later tx in the same block that spends
+  the coinbase is `coinbase immature` (Core `nHeight < coinbaseHeight + 100`).
+  Structural spentness used to skip NULL (same-block) creates.
+
 ## [0.6.0] — 2026-09-08
 
 Named published **0.6** line. **Not 1.0.** Patch branch is `v0.6.x`. Schema 20

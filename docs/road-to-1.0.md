@@ -3,8 +3,7 @@
 What an operator or library user should be able to **count on** at **1.0**.
 Day-to-day ranked work stays in [`quality.md`](./quality.md).
 
-**Today (0.6.0):** named published 0.6 line. Patch branch is **`v0.6.x`**.
-Last 0.5 tags are **0.5.1** and the **0.5.2** maintenance branch. Schema **20**
+**Today (0.6.1):** named published 0.6 line (`v0.6.x` patches). Schema **20**
 (BDZ2 `tx.head` / BDZ3 SH) can still refuse a named index wipe.
 Electrum/Esplora need `--shindex` (default off). BIP324 v2-only. Install is
 a GitHub Release (Linux musl; Windows/Darwin snapshots). Nightly

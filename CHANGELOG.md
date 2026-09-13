@@ -9,6 +9,32 @@ before 1.0).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-13
+
+Tagged on the **0.6.0** maintenance line (`v0.6.x`). Schema 20 unchanged.
+Replace a 0.6.0 binary in place (same datadir). After compact/`BLOCK_FAILED`
+poison, most-work reorg once bodies densify.
+
+### Highlights
+
+- **Compact reconstruct:** a unique short-id fill is not a block until the
+  txs merkle to the compact header. Merkle-mutated compact is not cached
+  `BLOCK_FAILED` (mainnet 966500/966501). Upgrade, then reorg.
+- **SH megakey rewind:** `DisconnectTip` walks linked SH pages when
+  `extent_n` exceeds the 64 MiB span-pread cap (Corrupt used to block
+  equal-work sibling rewind).
+- **io_uring drain:** `drain_all` waits for CQEs; 120 s of zero completions
+  aborts (`RBITCOIN_URING_DRAIN_HARD_SECS`). Restart with `RBITCOIN_IO=pread`
+  if the ring cannot complete.
+- **Resume seed:** cyclic `prev_fk` edges no longer hang
+  `resume seed walk start`.
+- **Same-block coinbase** spends are immature; IBD `lookup_taken_hi` rewinds
+  on post-lookup confirm reject so densify can re-getdata.
+
+### Changed
+
+- **`getnetworkinfo.version`:** `rpc_client_version("0.6.1") == 601`.
+
 ### Fixed
 
 - **IBD io_uring drain stall:** `drain_all` no longer returns after 5 s with
@@ -34,6 +60,8 @@ before 1.0).
 - **IBD `lookup_taken_hi` rewind:** merkle/witness SoftWire, Cascade,
   EngineFault, and ConsensusInvalid rewind the lookup consume high-water to
   the confirmed tip so densify can re-getdata. Previously only BadPrev did.
+- **IBD resume seed cycles:** scoring skips on-stack `prev_fk` nodes so a
+  cyclic header graph cannot hang `resume seed walk start`.
 
 ## [0.6.0] — 2026-09-08
 

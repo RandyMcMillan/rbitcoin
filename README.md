@@ -7,7 +7,7 @@ index via `--shindex`, default off; not a graphical block-explorer stack) — bu
 around a **libbitcoin-class relational archive** and a **pure-Rust
 consensus/script** path.
 
-> **0.6.0** is the current **named published** 0.x line (GitHub Release:
+> **0.6.1** is the current **named published** 0.x line (GitHub Release:
 > Linux musl + Windows CRT-static + Darwin aarch64). Patch line is **`v0.6.x`**.
 > **Not 1.0:** schema can still refuse a named wipe ([`SCHEMA.md`](./SCHEMA.md),
 > [`OPERATOR.md`](./OPERATOR.md));
@@ -20,7 +20,7 @@ consensus/script** path.
 | | |
 |--|--|
 | **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
-| **Version** | **0.6.0** — [`CHANGELOG.md`](./CHANGELOG.md) |
+| **Version** | **0.6.1** — [`CHANGELOG.md`](./CHANGELOG.md) |
 | **Platform** | **Linux musl** is the operator path. Windows / Darwin are published snapshots (no IoRing; Darwin not notarized) |
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.6.x** supported published line; no LTS until 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |

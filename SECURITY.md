@@ -15,7 +15,7 @@ and [`OPERATOR.md`](./OPERATOR.md).
 
 | Version | Support |
 |---------|---------|
-| **0.6.x** | Supported **published** line (0.6.0). Security-relevant fixes land here until **0.7** or **1.0**. No LTS. Report against the tag. |
+| **0.6.x** | Supported **published** line (0.6.1). Security-relevant fixes land here until **0.7** or **1.0**. No LTS. Report against the tag. |
 | **0.5.x** | Previous published line (0.5.1 / 0.5.2). Report against the tag. |
 | **1.0+** (future) | Will define a clearer support window once the on-disk schema and public surface stabilize. |
 

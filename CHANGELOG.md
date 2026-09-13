@@ -9,6 +9,32 @@ before 1.0).
 
 ## [Unreleased]
 
+### Fixed
+
+- **IBD io_uring drain stall:** `drain_all` no longer returns after 5 s with
+  leftover SQEs (that freed in-flight buffers). Every TLS session waits while
+  CQEs arrive; a 120 s zero-completion stall aborts explicit drain (session
+  `Drop` does not abort). `io_uring undrained` is `EngineFault`, not Cascade.
+- **SH megakey unlink on reorg:** `DisconnectTip` bulk-pread of an Extent
+  list is capped at 64 MiB. A larger or past-EOF `extent_n` walks the linked
+  pages instead of `Corrupt` (mainnet equal-work rewind after compact
+  reconstruct). Tweaks truncate with the SH unlink.
+- **Compact reconstruct merkle-checks before `Ok`:** a unique short-id (or
+  `blocktxn`) fill is not a block until the txs match the compact header
+  merkle (BIP152 `FinishBlock`). Empty missing → `getdata`, not
+  `accept_branch`. Defense in depth: a merkle/`bad-txnmrklroot` that still
+  reaches `accept_branch` is not cached `BLOCK_FAILED` (ConnectFailed wrap
+  used to poison the hash; mainnet 966500/966501, 2026-09-11). True
+  consensus rejects (`bad-txns-inputs-missingorspent`) still mark
+  `BLOCK_FAILED`.
+- **Same-block coinbase maturity:** a later tx in the same block that spends
+  the coinbase is `coinbase immature` (Core `nHeight < coinbaseHeight + 100`).
+  Assemble already maps this block’s txids (`txid_index`); parent index 0
+  is the coinbase. Durable maturity still uses `create_fk == first_tx_fk`.
+- **IBD `lookup_taken_hi` rewind:** merkle/witness SoftWire, Cascade,
+  EngineFault, and ConsensusInvalid rewind the lookup consume high-water to
+  the confirmed tip so densify can re-getdata. Previously only BadPrev did.
+
 ## [0.6.0] — 2026-09-08
 
 Named published **0.6** line. **Not 1.0.** Patch branch is `v0.6.x`. Schema 20

@@ -1,6 +1,6 @@
 # Experimental mainnet runbook
 
-**Status:** **0.6.0** is lab-to-operator: **early production / high-scrutiny**,
+**Status:** **0.6.1** is lab-to-operator: **early production / high-scrutiny**,
 not a soak-certified badge. **Not** 1.0. **Not** a Bitcoin Core or Fulcrum
 replacement. Default `--milestone 840000` skips historical script/sig checks.
 Schema can still refuse a named index wipe ([`SCHEMA.md`](../SCHEMA.md)).
@@ -128,7 +128,7 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 | Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). Experimental user-agent still limits inbound |
 | Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB** (Core-class); **scripts verified on accept** |
 | Confirm lookup/load | **Load** recvs load-sized batches (soft **8000** inputs / hard **144** blocks) from `loadq=14`. Dense mainnet is typically **a few blocks per batch**. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, in order from `path_lo`. Real queues loadq=14 · scriptq=4 · writeq=14 |
-| Not Core/Fulcrum | No production SLA; 0.6.0 is high-scrutiny 0.x; schema unstable until 1.0; reindex on incompatible layout changes |
+| Not Core/Fulcrum | No production SLA; 0.6.1 is high-scrutiny 0.x; schema unstable until 1.0; reindex on incompatible layout changes |
 
 ## Related docs
 

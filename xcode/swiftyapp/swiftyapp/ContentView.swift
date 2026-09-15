@@ -25,6 +25,12 @@ struct ContentView: View {
     @State private var storeHeaderCount = ""
     @State private var queryPath = ""
     @State private var queryBlockQueue = ""
+    @State private var mempoolPath = ""
+    @State private var mempoolLiveCount = ""
+    @State private var mempoolSlotStats = ""
+    @State private var feeTargetBlocks = "1"
+    @State private var feeStockAbove = "0"
+    @State private var feeResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -450,6 +456,111 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("rbitcoin mempool", systemImage: "memorychip.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("unconfirmed")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Mempool path")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Documents subdirectory", text: $mempoolPath)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                    .onAppear {
+                                        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+                                        mempoolPath = docs.appendingPathComponent("rbitcoin-mempool").path
+                                    }
+                            }
+
+                            Button {
+                                do {
+                                    let mempool = try FfiMempool.openOrCreate(path: mempoolPath)
+                                    let count = mempool.liveCount()
+                                    let stats = mempool.slotStats()
+                                    mempoolLiveCount = "\(count) live"
+                                    mempoolSlotStats = "free: \(stats.free), live: \(stats.live), dead: \(stats.dead)"
+                                } catch {
+                                    mempoolLiveCount = "error"
+                                    mempoolSlotStats = ""
+                                }
+                            } label: {
+                                Label("Open or create mempool", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !mempoolLiveCount.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(mempoolLiveCount)
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                    Text(mempoolSlotStats)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText.opacity(0.68))
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Fee estimation", systemImage: "chart.line.uptrend.xyaxis")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-mempool")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Target blocks")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                HStack(spacing: 8) {
+                                    TextField("Blocks", text: $feeTargetBlocks)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    Text("stock above (WU)")
+                                        .font(.caption)
+                                        .foregroundStyle(primaryText.opacity(0.68))
+                                    TextField("WU", text: $feeStockAbove)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 100)
+                                    Spacer()
+                                }
+                                .onChange(of: feeTargetBlocks) { _ in updateFeeResult() }
+                                .onChange(of: feeStockAbove) { _ in updateFeeResult() }
+                                if !feeResult.isEmpty {
+                                    Text(feeResult)
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        updateFeeResult()
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -462,6 +573,7 @@ struct ContentView: View {
                                 "Real rbitcoin primitives",
                                 "Consensus verification",
                                 "Store + Query FFI",
+                                "Mempool + Fee estimation",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")
@@ -589,6 +701,20 @@ struct ContentView: View {
             blockValidationResult = "Valid"
         } catch {
             blockValidationResult = "Invalid"
+        }
+    }
+
+    private func updateFeeResult() {
+        guard let nBlocks = UInt32(feeTargetBlocks), let stock = UInt64(feeStockAbove) else {
+            feeResult = ""
+            return
+        }
+        let inflow = Array(repeating: UInt64(0), count: Int(feeBucketCount()))
+        let candidates = feeDefaultCandidateRates()
+        if let rate = feeMinRateForCapacitySimple(stockAbove: stock, inflowWuPerSByBucket: inflow, nBlocks: nBlocks, candidateRates: candidates) {
+            feeResult = "\(rate) sat/kvB"
+        } else {
+            feeResult = "no fit"
         }
     }
 

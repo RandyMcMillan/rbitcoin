@@ -7,11 +7,13 @@ use bitcoin::hashes::{sha256d, Hash};
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_primitives::Height;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Debug, uniffi::Error)]
 pub enum RustyError {
     InvalidInput,
     ConsensusError,
+    StoreError,
 }
 
 impl std::fmt::Display for RustyError {
@@ -19,6 +21,7 @@ impl std::fmt::Display for RustyError {
         match self {
             RustyError::InvalidInput => write!(f, "invalid input"),
             RustyError::ConsensusError => write!(f, "consensus error"),
+            RustyError::StoreError => write!(f, "store error"),
         }
     }
 }
@@ -32,6 +35,12 @@ fn chain_params_for_network(network: &str) -> Result<ChainParams, RustyError> {
         _ => Err(RustyError::InvalidInput),
     }
 }
+
+fn parse_hash32(hex: &str) -> Result<[u8; 32], RustyError> {
+    rbitcoin_primitives::parse_display_hash32(hex).map_err(|_| RustyError::InvalidInput)
+}
+
+// --- Primitives FFI ---
 
 #[uniffi::export]
 fn rust_hello() -> String {
@@ -98,7 +107,7 @@ pub fn hash256(bytes: Vec<u8>) -> String {
     hash.to_string()
 }
 
-// --- rbitcoin-consensus FFI ---
+// --- Consensus FFI ---
 
 #[uniffi::export]
 pub fn check_block_wire(block_hex: String) -> Result<(), RustyError> {
@@ -143,4 +152,194 @@ pub fn verify_tx_scripts(prevouts_hex: Vec<String>, tx_hex: String) -> Result<()
     let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
     rbitcoin_consensus::verify_tx_scripts_detached(prevouts, tx)
         .map_err(|_| RustyError::ConsensusError)
+}
+
+// --- Store FFI ---
+
+#[derive(uniffi::Record)]
+pub struct FfiHeaderRecord {
+    pub prev_fk: u64,
+    pub version: i32,
+    pub timestamp: u32,
+    pub bits: u32,
+    pub nonce: u32,
+    pub merkle_root: String,
+    pub hash: String,
+    pub size: u32,
+    pub weight: u32,
+}
+
+impl From<rbitcoin_store::HeaderRecord> for FfiHeaderRecord {
+    fn from(h: rbitcoin_store::HeaderRecord) -> Self {
+        Self {
+            prev_fk: h.prev_fk.0,
+            version: h.version,
+            timestamp: h.timestamp,
+            bits: h.bits,
+            nonce: h.nonce,
+            merkle_root: rbitcoin_primitives::hex_encode(&h.merkle_root),
+            hash: rbitcoin_primitives::hex_encode(&h.hash),
+            size: h.size,
+            weight: h.weight,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiTxRecord {
+    pub txid: String,
+    pub version: i32,
+    pub locktime: u32,
+    pub input_count: u32,
+    pub output_count: u32,
+}
+
+impl From<rbitcoin_store::TxRecord> for FfiTxRecord {
+    fn from(t: rbitcoin_store::TxRecord) -> Self {
+        Self {
+            txid: rbitcoin_primitives::hex_encode(&t.txid),
+            version: t.version,
+            locktime: t.locktime,
+            input_count: t.input_count,
+            output_count: t.output_count,
+        }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct FfiStore {
+    inner: rbitcoin_store::Store,
+}
+
+#[uniffi::export]
+impl FfiStore {
+    #[uniffi::constructor]
+    pub fn open(path: String) -> Result<Arc<Self>, RustyError> {
+        let store = rbitcoin_store::Store::open(&path).map_err(|_| RustyError::StoreError)?;
+        Ok(Arc::new(Self { inner: store }))
+    }
+
+    #[uniffi::constructor]
+    pub fn create(path: String) -> Result<Arc<Self>, RustyError> {
+        let store = rbitcoin_store::Store::create(&path).map_err(|_| RustyError::StoreError)?;
+        Ok(Arc::new(Self { inner: store }))
+    }
+
+    pub fn tip_height(&self) -> Option<u64> {
+        self.inner.tip_height().map(|h| h.0 as u64)
+    }
+
+    pub fn header_count(&self) -> u64 {
+        self.inner.header_count()
+    }
+
+    pub fn get_header_by_hash(&self, hash_hex: String) -> Result<Option<FfiHeaderRecord>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let rec = self.inner.get_header_by_hash(&hash).map_err(|_| RustyError::StoreError)?;
+        Ok(rec.map(|(_fk, h)| h.into()))
+    }
+
+    pub fn get_tx_by_txid(&self, txid_hex: String) -> Result<Option<FfiTxRecord>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let rec = self.inner.get_tx_by_txid(&txid).map_err(|_| RustyError::StoreError)?;
+        Ok(rec.map(|(_, t)| t.into()))
+    }
+}
+
+// --- Query FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiQuery {
+    inner: rbitcoin_query::Query,
+}
+
+#[uniffi::export]
+impl FfiQuery {
+    #[uniffi::constructor]
+    pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
+        let query = rbitcoin_query::Query::open_or_create(&path).map_err(|_| RustyError::StoreError)?;
+        Ok(Arc::new(Self { inner: query }))
+    }
+
+    pub fn tip_height(&self) -> Option<u64> {
+        self.inner.tip_height().map(|h| h.0 as u64)
+    }
+
+    pub fn get_tx_by_txid(&self, txid_hex: String) -> Result<Option<FfiTxRecord>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let rec = self.inner.get_tx_by_txid(&txid).map_err(|_| RustyError::StoreError)?;
+        Ok(rec.map(|(_, t)| t.into()))
+    }
+
+    pub fn is_outpoint_spent(&self, txid_hex: String, vout: u32) -> Result<bool, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        self.inner.is_outpoint_spent(&txid, vout).map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn block_queue_count(&self) -> u64 {
+        self.inner.block_queue_count() as u64
+    }
+
+    pub fn block_queue_max_height(&self) -> Option<u64> {
+        self.inner.block_queue_max_height().map(|h| h as u64)
+    }
+}
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rust_add() {
+        assert_eq!(rust_add(2, 3), 5);
+    }
+
+    #[test]
+    fn test_hex_roundtrip() {
+        let bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let hex = hex_encode(bytes.clone());
+        assert_eq!(hex, "deadbeef");
+        let decoded = hex_decode(hex).unwrap();
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn test_validate_address_mainnet() {
+        assert!(validate_address("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string()));
+        assert_eq!(
+            address_network("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string()).unwrap(),
+            "mainnet"
+        );
+    }
+
+    #[test]
+    fn test_hash256() {
+        let result = hash256(b"hello".to_vec());
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_block_subsidy_halving() {
+        let pre = block_subsidy(839999, "mainnet".to_string()).unwrap();
+        let post = block_subsidy(840000, "mainnet".to_string()).unwrap();
+        assert_eq!(pre, 625_000_000);
+        assert_eq!(post, 312_500_000);
+    }
+
+    #[test]
+    fn test_store_create_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store").to_str().unwrap().to_string();
+        {
+            let store = FfiStore::create(path.clone()).unwrap();
+            assert_eq!(store.tip_height(), None);
+            assert_eq!(store.header_count(), 0);
+        }
+        {
+            let store = FfiStore::open(path).unwrap();
+            assert_eq!(store.tip_height(), None);
+        }
+    }
 }

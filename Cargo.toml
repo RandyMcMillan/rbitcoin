@@ -15,6 +15,7 @@ members = [
     "crates/rbitcoin-node",
     "crates/rbitcoin-test",
     "crates/rbitcoin-bench",
+    "xcode/rustylib",
 ]
 default-members = ["crates/rbitcoin-node"]
 

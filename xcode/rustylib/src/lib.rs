@@ -186,6 +186,55 @@ pub fn median_time_past_times(times: Vec<u32>) -> u32 {
     rbitcoin_primitives::median_time_past_times(&times)
 }
 
+#[derive(uniffi::Record)]
+pub struct FfiTxInfo {
+    pub txid: String,
+    pub wtxid: String,
+    pub version: i32,
+    pub locktime: u32,
+    pub input_count: u32,
+    pub output_count: u32,
+    pub weight: u64,
+    pub vsize: u64,
+}
+
+#[uniffi::export]
+pub fn txid_from_hex(tx_hex: String) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.compute_txid().to_string())
+}
+
+#[uniffi::export]
+pub fn wtxid_from_hex(tx_hex: String) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.compute_wtxid().to_string())
+}
+
+#[uniffi::export]
+pub fn parse_tx(tx_hex: String) -> Result<FfiTxInfo, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let weight = tx.weight().to_wu() as u64;
+    Ok(FfiTxInfo {
+        txid: tx.compute_txid().to_string(),
+        wtxid: tx.compute_wtxid().to_string(),
+        version: tx.version.0,
+        locktime: tx.lock_time.to_consensus_u32(),
+        input_count: tx.input.len() as u32,
+        output_count: tx.output.len() as u32,
+        weight,
+        vsize: weight.div_ceil(4),
+    })
+}
+
+#[uniffi::export]
+pub fn block_hash_from_header(header_hex: String) -> Result<String, RustyError> {
+    let header: BlockHeader = deserialize_hex(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(header.block_hash().to_string())
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -578,5 +627,40 @@ mod tests {
     fn test_median_time_past() {
         let times = vec![1000u32, 2000, 1500];
         assert_eq!(median_time_past_times(times), 1500);
+    }
+
+    #[test]
+    fn test_txid_from_hex() {
+        // Coinbase tx from block 0 (genesis)
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+        let txid = txid_from_hex(tx_hex.to_string()).unwrap();
+        assert_eq!(
+            txid,
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+    }
+
+    #[test]
+    fn test_parse_tx() {
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+        let info = parse_tx(tx_hex.to_string()).unwrap();
+        assert_eq!(
+            info.txid,
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+        assert_eq!(info.version, 1);
+        assert_eq!(info.input_count, 1);
+        assert_eq!(info.output_count, 1);
+    }
+
+    #[test]
+    fn test_block_hash_from_header() {
+        // Genesis block header hex
+        let header_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+        let hash = block_hash_from_header(header_hex.to_string()).unwrap();
+        assert_eq!(
+            hash,
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
     }
 }

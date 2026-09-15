@@ -37,3 +37,4 @@ signet*.log
 
 # cargo mutants output
 mutants.out/
+third_party/.init-bitcoin.lock

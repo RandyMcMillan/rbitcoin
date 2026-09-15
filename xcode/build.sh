@@ -20,7 +20,7 @@ RELDIR="release"
 STATIC_LIB_NAME="lib${MY_CRATE}.a"
 NEW_HEADER_DIR="out/include"
 
-targets=("aarch64-apple-ios" "aarch64-apple-ios-sim" "aarch64-apple-darwin")
+targets=("aarch64-apple-ios" "aarch64-apple-ios-sim" "aarch64-apple-darwin" "aarch64-apple-tvos" "aarch64-apple-tvos-sim")
 
 for target in "${targets[@]}"; do
     cargo build --target "${target}" --release
@@ -38,6 +38,8 @@ xcodebuild -create-xcframework \
     -library "${TARGETDIR}/aarch64-apple-ios/${RELDIR}/${STATIC_LIB_NAME}" -headers "${NEW_HEADER_DIR}" \
     -library "${TARGETDIR}/aarch64-apple-ios-sim/${RELDIR}/${STATIC_LIB_NAME}" -headers "${NEW_HEADER_DIR}" \
     -library "${TARGETDIR}/aarch64-apple-darwin/${RELDIR}/${STATIC_LIB_NAME}" -headers "${NEW_HEADER_DIR}" \
+    -library "${TARGETDIR}/aarch64-apple-tvos/${RELDIR}/${STATIC_LIB_NAME}" -headers "${NEW_HEADER_DIR}" \
+    -library "${TARGETDIR}/aarch64-apple-tvos-sim/${RELDIR}/${STATIC_LIB_NAME}" -headers "${NEW_HEADER_DIR}" \
     -output "${OUTDIR}/${MY_CRATE}_framework.xcframework"
 
 rm -rf "${NEW_HEADER_DIR}"

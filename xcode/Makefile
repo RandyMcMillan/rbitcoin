@@ -18,7 +18,7 @@ CATALYST_APP_PATH := $(SYMROOT)/$(CONFIGURATION)-maccatalyst/$(APP_NAME)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help rust resolve app catalyst install clean
+.PHONY: help rust resolve app catalyst tvos install clean
 
 help:
 	@printf '%s\n' \
@@ -26,6 +26,7 @@ help:
 		'make resolve   - resolve local Swift package dependencies' \
 		'make app       - build the iOS app for a generic simulator destination' \
 		'make catalyst  - build the app for Mac Catalyst' \
+		'make tvos      - build the Rust library for tvOS' \
 		'make install   - install the Mac Catalyst app into ~/Applications' \
 		'make clean     - clean Rust and Xcode build artifacts'
 
@@ -60,6 +61,9 @@ catalyst: rust resolve
 		ARCHS="$(HOST_ARCH)" \
 		ONLY_ACTIVE_ARCH=YES \
 		build
+
+tvos: rust
+	@printf '%s\n' 'tvOS Rust library built — xcframework includes tvos-arm64 and tvos-arm64-simulator'
 
 install: catalyst
 	mkdir -p "$(INSTALL_DIR)"

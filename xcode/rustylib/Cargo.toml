@@ -20,6 +20,8 @@ rbitcoin-store = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-mempool = { workspace = true }
 rbitcoin-net = { workspace = true }
+rbitcoin-rpc = { workspace = true }
+rbitcoin-electrum = { workspace = true }
 bitcoin = { workspace = true }
 
 [dev-dependencies]

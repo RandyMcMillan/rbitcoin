@@ -1219,10 +1219,12 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "rbitcoin-consensus",
+ "rbitcoin-electrum",
  "rbitcoin-mempool",
  "rbitcoin-net",
  "rbitcoin-primitives",
  "rbitcoin-query",
+ "rbitcoin-rpc",
  "rbitcoin-store",
  "tempfile",
  "uniffi",

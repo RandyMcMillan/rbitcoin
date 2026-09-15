@@ -1218,6 +1218,7 @@ name = "rustylib"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
+ "rbitcoin-cli",
  "rbitcoin-consensus",
  "rbitcoin-electrum",
  "rbitcoin-mempool",
@@ -1226,6 +1227,7 @@ dependencies = [
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
+ "serde_json",
  "tempfile",
  "uniffi",
 ]

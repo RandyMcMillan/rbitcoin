@@ -290,6 +290,22 @@ pub fn electrum_scripthash_hex(script_hex: String) -> Result<String, RustyError>
     Ok(rbitcoin_electrum::electrum_scripthash_hex(&script))
 }
 
+#[uniffi::export]
+pub fn rpc_call_json(
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    method: String,
+    params_json: String,
+) -> Result<String, RustyError> {
+    let params: Vec<serde_json::Value> =
+        serde_json::from_str(&params_json).map_err(|_| RustyError::InvalidInput)?;
+    let result = rbitcoin_cli::rpc_call(&host, port, &user, &password, &method, &params)
+        .map_err(|_| RustyError::InvalidInput)?;
+    serde_json::to_string(&result).map_err(|_| RustyError::InvalidInput)
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -744,5 +760,20 @@ mod tests {
         let hash = electrum_scripthash_hex(script_hex.to_string()).unwrap();
         assert!(!hash.is_empty());
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn test_rpc_call_json_parsing() {
+        // We can't test an actual RPC call without a server, but we can test
+        // that invalid params are rejected.
+        let result = rpc_call_json(
+            "127.0.0.1".to_string(),
+            8332,
+            "".to_string(),
+            "".to_string(),
+            "getblockchaininfo".to_string(),
+            "not valid json".to_string(),
+        );
+        assert!(result.is_err());
     }
 }

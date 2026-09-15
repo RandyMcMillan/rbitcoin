@@ -14,6 +14,7 @@ pub enum RustyError {
     InvalidInput,
     ConsensusError,
     StoreError,
+    MempoolError,
 }
 
 impl std::fmt::Display for RustyError {
@@ -22,6 +23,7 @@ impl std::fmt::Display for RustyError {
             RustyError::InvalidInput => write!(f, "invalid input"),
             RustyError::ConsensusError => write!(f, "consensus error"),
             RustyError::StoreError => write!(f, "store error"),
+            RustyError::MempoolError => write!(f, "mempool error"),
         }
     }
 }
@@ -303,6 +305,74 @@ impl FfiQuery {
     }
 }
 
+// --- Mempool FFI ---
+
+#[derive(uniffi::Record)]
+pub struct FfiMempoolMeta {
+    pub generation: u64,
+    pub slot_cap: u32,
+    pub live_count: u32,
+}
+
+impl From<rbitcoin_mempool::MempoolMeta> for FfiMempoolMeta {
+    fn from(m: rbitcoin_mempool::MempoolMeta) -> Self {
+        Self {
+            generation: m.generation,
+            slot_cap: m.slot_cap,
+            live_count: m.live_count,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiMempoolSlotStats {
+    pub free: u32,
+    pub live: u32,
+    pub dead: u32,
+}
+
+#[derive(uniffi::Object)]
+pub struct FfiMempool {
+    inner: std::sync::Mutex<rbitcoin_mempool::Mempool>,
+}
+
+#[uniffi::export]
+impl FfiMempool {
+    #[uniffi::constructor]
+    pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
+        let mempool =
+            rbitcoin_mempool::Mempool::open_or_create(&path).map_err(|_| RustyError::MempoolError)?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(mempool),
+        }))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().generation()
+    }
+
+    pub fn live_count(&self) -> u32 {
+        self.inner.lock().unwrap().live_count()
+    }
+
+    pub fn meta(&self) -> FfiMempoolMeta {
+        self.inner.lock().unwrap().meta().into()
+    }
+
+    pub fn slot_stats(&self) -> FfiMempoolSlotStats {
+        let (free, live, dead) = self.inner.lock().unwrap().slot_stats();
+        FfiMempoolSlotStats { free, live, dead }
+    }
+
+    pub fn flush(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .flush()
+            .map_err(|_| RustyError::MempoolError)
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -360,6 +430,24 @@ mod tests {
         {
             let store = FfiStore::open(path).unwrap();
             assert_eq!(store.tip_height(), None);
+        }
+    }
+
+    #[test]
+    fn test_mempool_open_or_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mempool").to_str().unwrap().to_string();
+        {
+            let mempool = FfiMempool::open_or_create(path.clone()).unwrap();
+            assert_eq!(mempool.live_count(), 0);
+            let meta = mempool.meta();
+            assert_eq!(meta.live_count, 0);
+            let stats = mempool.slot_stats();
+            assert_eq!(stats.live, 0);
+        }
+        {
+            let mempool = FfiMempool::open_or_create(path).unwrap();
+            assert_eq!(mempool.live_count(), 0);
         }
     }
 }

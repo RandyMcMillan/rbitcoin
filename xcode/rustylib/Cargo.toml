@@ -18,6 +18,7 @@ rbitcoin-primitives = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-query = { workspace = true }
+rbitcoin-mempool = { workspace = true }
 bitcoin = { workspace = true }
 
 [dev-dependencies]

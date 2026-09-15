@@ -530,6 +530,169 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 
+public protocol FfiMempoolProtocol : AnyObject {
+    
+    func flush() throws 
+    
+    func generation()  -> UInt64
+    
+    func liveCount()  -> UInt32
+    
+    func meta()  -> FfiMempoolMeta
+    
+    func slotStats()  -> FfiMempoolSlotStats
+    
+}
+
+open class FfiMempool:
+    FfiMempoolProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffimempool(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffimempool(pointer, $0) }
+    }
+
+    
+public static func openOrCreate(path: String)throws  -> FfiMempool {
+    return try  FfiConverterTypeFfiMempool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffimempool_open_or_create(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+open func flush()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_flush(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func generation() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempool_generation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func liveCount() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempool_live_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func meta() -> FfiMempoolMeta {
+    return try!  FfiConverterTypeFfiMempoolMeta.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempool_meta(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func slotStats() -> FfiMempoolSlotStats {
+    return try!  FfiConverterTypeFfiMempoolSlotStats.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempool_slot_stats(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMempool: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiMempool
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiMempool {
+        return FfiMempool(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiMempool) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMempool {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiMempool, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempool_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiMempool {
+    return try FfiConverterTypeFfiMempool.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempool_lower(_ value: FfiMempool) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiMempool.lower(value)
+}
+
+
+
+
 public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueCount()  -> UInt64
@@ -982,6 +1145,154 @@ public func FfiConverterTypeFfiHeaderRecord_lower(_ value: FfiHeaderRecord) -> R
 }
 
 
+public struct FfiMempoolMeta {
+    public var generation: UInt64
+    public var slotCap: UInt32
+    public var liveCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(generation: UInt64, slotCap: UInt32, liveCount: UInt32) {
+        self.generation = generation
+        self.slotCap = slotCap
+        self.liveCount = liveCount
+    }
+}
+
+
+
+extension FfiMempoolMeta: Equatable, Hashable {
+    public static func ==(lhs: FfiMempoolMeta, rhs: FfiMempoolMeta) -> Bool {
+        if lhs.generation != rhs.generation {
+            return false
+        }
+        if lhs.slotCap != rhs.slotCap {
+            return false
+        }
+        if lhs.liveCount != rhs.liveCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(generation)
+        hasher.combine(slotCap)
+        hasher.combine(liveCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMempoolMeta: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMempoolMeta {
+        return
+            try FfiMempoolMeta(
+                generation: FfiConverterUInt64.read(from: &buf), 
+                slotCap: FfiConverterUInt32.read(from: &buf), 
+                liveCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiMempoolMeta, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.generation, into: &buf)
+        FfiConverterUInt32.write(value.slotCap, into: &buf)
+        FfiConverterUInt32.write(value.liveCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolMeta_lift(_ buf: RustBuffer) throws -> FfiMempoolMeta {
+    return try FfiConverterTypeFfiMempoolMeta.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolMeta_lower(_ value: FfiMempoolMeta) -> RustBuffer {
+    return FfiConverterTypeFfiMempoolMeta.lower(value)
+}
+
+
+public struct FfiMempoolSlotStats {
+    public var free: UInt32
+    public var live: UInt32
+    public var dead: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(free: UInt32, live: UInt32, dead: UInt32) {
+        self.free = free
+        self.live = live
+        self.dead = dead
+    }
+}
+
+
+
+extension FfiMempoolSlotStats: Equatable, Hashable {
+    public static func ==(lhs: FfiMempoolSlotStats, rhs: FfiMempoolSlotStats) -> Bool {
+        if lhs.free != rhs.free {
+            return false
+        }
+        if lhs.live != rhs.live {
+            return false
+        }
+        if lhs.dead != rhs.dead {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(free)
+        hasher.combine(live)
+        hasher.combine(dead)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMempoolSlotStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMempoolSlotStats {
+        return
+            try FfiMempoolSlotStats(
+                free: FfiConverterUInt32.read(from: &buf), 
+                live: FfiConverterUInt32.read(from: &buf), 
+                dead: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiMempoolSlotStats, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.free, into: &buf)
+        FfiConverterUInt32.write(value.live, into: &buf)
+        FfiConverterUInt32.write(value.dead, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolSlotStats_lift(_ buf: RustBuffer) throws -> FfiMempoolSlotStats {
+    return try FfiConverterTypeFfiMempoolSlotStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolSlotStats_lower(_ value: FfiMempoolSlotStats) -> RustBuffer {
+    return FfiConverterTypeFfiMempoolSlotStats.lower(value)
+}
+
+
 public struct FfiTxRecord {
     public var txid: String
     public var version: Int32
@@ -1079,6 +1390,7 @@ public enum RustyError {
     case InvalidInput
     case ConsensusError
     case StoreError
+    case MempoolError
 }
 
 
@@ -1098,6 +1410,7 @@ public struct FfiConverterTypeRustyError: FfiConverterRustBuffer {
         case 1: return .InvalidInput
         case 2: return .ConsensusError
         case 3: return .StoreError
+        case 4: return .MempoolError
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1120,6 +1433,10 @@ public struct FfiConverterTypeRustyError: FfiConverterRustBuffer {
         
         case .StoreError:
             writeInt(&buf, Int32(3))
+        
+        
+        case .MempoolError:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -1389,6 +1706,21 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_verify_tx_scripts() != 58820) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempool_flush() != 54725) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_generation() != 36589) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_live_count() != 13707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_meta() != 51552) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_slot_stats() != 60716) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_count() != 45316) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1414,6 +1746,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tip_height() != 61582) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiquery_open_or_create() != 65007) {

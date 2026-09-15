@@ -11,6 +11,10 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var firstValue = 10
     @State private var secondValue = 32
+    @State private var addressInput = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
+    @State private var addressNetworkResult = ""
+    @State private var hashInput = "Hello rbitcoin"
+    @State private var hashResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -169,6 +173,72 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("rbitcoin primitives", systemImage: "bitcoinsign.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text(rbitcoinVersion())
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Bitcoin address")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Enter address", text: $addressInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                    .onChange(of: addressInput) { _ in updateAddressResult() }
+                            }
+
+                            HStack(spacing: 12) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: validateAddress(address: addressInput) ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                        .foregroundStyle(validateAddress(address: addressInput) ? Color.green : Color.red)
+                                    Text(validateAddress(address: addressInput) ? "Valid" : "Invalid")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                if !addressNetworkResult.isEmpty {
+                                    Text(addressNetworkResult)
+                                        .font(.caption.weight(.semibold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 4)
+                                        .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                        .foregroundStyle(accentText)
+                                }
+                            }
+
+                            Divider()
+                                .overlay(accentFill.opacity(colorScheme == .dark ? 0.22 : 0.16))
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Hash256")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Enter text to hash", text: $hashInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onChange(of: hashInput) { _ in updateHashResult() }
+                                if !hashResult.isEmpty {
+                                    Text(hashResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        updateAddressResult()
+                        updateHashResult()
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -178,6 +248,7 @@ struct ContentView: View {
                                 "SwiftUI rendering",
                                 "State-driven interactions",
                                 "Native Rust function calls",
+                                "Real rbitcoin primitives",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")
@@ -261,6 +332,23 @@ struct ContentView: View {
                     .stroke(accentFill.opacity(colorScheme == .dark ? 0.20 : 0.14), lineWidth: 1)
             )
             .shadow(color: .black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 18, x: 0, y: 10)
+    }
+
+    private func updateAddressResult() {
+        if validateAddress(address: addressInput) {
+            do {
+                addressNetworkResult = try addressNetwork(address: addressInput)
+            } catch {
+                addressNetworkResult = "error"
+            }
+        } else {
+            addressNetworkResult = ""
+        }
+    }
+
+    private func updateHashResult() {
+        let data = Data(hashInput.utf8)
+        hashResult = hash256(bytes: data)
     }
 
     private func stepperRow(title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {

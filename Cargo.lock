@@ -1219,6 +1219,7 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "rbitcoin-consensus",
+ "rbitcoin-mempool",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",

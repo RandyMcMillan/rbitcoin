@@ -180,8 +180,8 @@ impl From<rbitcoin_store::HeaderRecord> for FfiHeaderRecord {
             timestamp: h.timestamp,
             bits: h.bits,
             nonce: h.nonce,
-            merkle_root: rbitcoin_primitives::hex_encode(&h.merkle_root),
-            hash: rbitcoin_primitives::hex_encode(&h.hash),
+            merkle_root: rbitcoin_primitives::hex_encode(h.merkle_root),
+            hash: rbitcoin_primitives::hex_encode(h.hash),
             size: h.size,
             weight: h.weight,
         }
@@ -200,7 +200,7 @@ pub struct FfiTxRecord {
 impl From<rbitcoin_store::TxRecord> for FfiTxRecord {
     fn from(t: rbitcoin_store::TxRecord) -> Self {
         Self {
-            txid: rbitcoin_primitives::hex_encode(&t.txid),
+            txid: rbitcoin_primitives::hex_encode(t.txid),
             version: t.version,
             locktime: t.locktime,
             input_count: t.input_count,

@@ -620,7 +620,7 @@ pub fn host_mem_available_bytes() -> Option<u64> {
     }
     #[cfg(windows)]
     {
-        return mem_available_from_windows_host();
+        mem_available_from_windows_host()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {

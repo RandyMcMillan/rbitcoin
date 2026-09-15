@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "label": "coverage",
+  "message": "91.29%",
+  "color": "brightgreen",
+  "pct": 91.29,
+  "lh": 103528,
+  "lf": 113404,
+  "gate": 90,
+  "scope": "production",
+  "sha": "4218cc085a28",
+  "date": "2026-09-15",
+  "base_lh": 103502,
+  "base_lf": 113404,
+  "base_pct": 91.27
+}

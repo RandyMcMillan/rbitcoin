@@ -20,6 +20,11 @@ struct ContentView: View {
     @State private var subsidyHeight = "840000"
     @State private var subsidyNetwork = "mainnet"
     @State private var subsidyResult = ""
+    @State private var storePath = ""
+    @State private var storeTipHeight = ""
+    @State private var storeHeaderCount = ""
+    @State private var queryPath = ""
+    @State private var queryBlockQueue = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -313,6 +318,138 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("rbitcoin store", systemImage: "externaldrive.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("embedded")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Store path")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Documents subdirectory", text: $storePath)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                    .onAppear {
+                                        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+                                        storePath = docs.appendingPathComponent("rbitcoin-store").path
+                                    }
+                            }
+
+                            HStack(spacing: 12) {
+                                Button {
+                                    do {
+                                        let store = try FfiStore.create(path: storePath)
+                                        storeTipHeight = store.tipHeight().map(String.init) ?? "none"
+                                        storeHeaderCount = String(store.headerCount())
+                                    } catch {
+                                        storeTipHeight = "error"
+                                        storeHeaderCount = ""
+                                    }
+                                } label: {
+                                    Label("Create", systemImage: "plus.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+
+                                Button {
+                                    do {
+                                        let store = try FfiStore.open(path: storePath)
+                                        storeTipHeight = store.tipHeight().map(String.init) ?? "none"
+                                        storeHeaderCount = String(store.headerCount())
+                                    } catch {
+                                        storeTipHeight = "error"
+                                        storeHeaderCount = ""
+                                    }
+                                } label: {
+                                    Label("Open", systemImage: "folder.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                            }
+
+                            if !storeTipHeight.isEmpty {
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Tip height")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeTipHeight)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Headers")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeHeaderCount)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("rbitcoin query", systemImage: "magnifyingglass.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("chain view")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Query path")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Documents subdirectory", text: $queryPath)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                    .onAppear {
+                                        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+                                        queryPath = docs.appendingPathComponent("rbitcoin-query").path
+                                    }
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: queryPath)
+                                    let count = query.blockQueueCount()
+                                    let maxH = query.blockQueueMaxHeight().map(String.init) ?? "none"
+                                    queryBlockQueue = "\(count) blocks, max height: \(maxH)"
+                                } catch {
+                                    queryBlockQueue = "error"
+                                }
+                            } label: {
+                                Label("Open or create query", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryBlockQueue.isEmpty {
+                                Text(queryBlockQueue)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -324,6 +461,7 @@ struct ContentView: View {
                                 "Native Rust function calls",
                                 "Real rbitcoin primitives",
                                 "Consensus verification",
+                                "Store + Query FFI",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

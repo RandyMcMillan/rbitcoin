@@ -415,6 +415,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -512,12 +528,557 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 }
 
 
+
+
+public protocol FfiQueryProtocol : AnyObject {
+    
+    func blockQueueCount()  -> UInt64
+    
+    func blockQueueMaxHeight()  -> UInt64?
+    
+    func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
+    
+    func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
+    
+    func tipHeight()  -> UInt64?
+    
+}
+
+open class FfiQuery:
+    FfiQueryProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffiquery(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffiquery(pointer, $0) }
+    }
+
+    
+public static func openOrCreate(path: String)throws  -> FfiQuery {
+    return try  FfiConverterTypeFfiQuery.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffiquery_open_or_create(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+open func blockQueueCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueMaxHeight() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_max_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
+    return try  FfiConverterOptionTypeFfiTxRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_get_tx_by_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func isOutpointSpent(txidHex: String, vout: UInt32)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_is_outpoint_spent(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func tipHeight() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiQuery: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiQuery
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiQuery {
+        return FfiQuery(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiQuery) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiQuery {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiQuery, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQuery_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiQuery {
+    return try FfiConverterTypeFfiQuery.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQuery_lower(_ value: FfiQuery) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiQuery.lower(value)
+}
+
+
+
+
+public protocol FfiStoreProtocol : AnyObject {
+    
+    func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
+    
+    func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
+    
+    func headerCount()  -> UInt64
+    
+    func tipHeight()  -> UInt64?
+    
+}
+
+open class FfiStore:
+    FfiStoreProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffistore(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffistore(pointer, $0) }
+    }
+
+    
+public static func create(path: String)throws  -> FfiStore {
+    return try  FfiConverterTypeFfiStore.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffistore_create(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+public static func `open`(path: String)throws  -> FfiStore {
+    return try  FfiConverterTypeFfiStore.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffistore_open(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+
+    
+open func getHeaderByHash(hashHex: String)throws  -> FfiHeaderRecord? {
+    return try  FfiConverterOptionTypeFfiHeaderRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_header_by_hash(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
+    return try  FfiConverterOptionTypeFfiTxRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_tx_by_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func headerCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_header_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tipHeight() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiStore: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiStore
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiStore {
+        return FfiStore(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiStore) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStore {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiStore, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStore_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiStore {
+    return try FfiConverterTypeFfiStore.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStore_lower(_ value: FfiStore) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiStore.lower(value)
+}
+
+
+public struct FfiHeaderRecord {
+    public var prevFk: UInt64
+    public var version: Int32
+    public var timestamp: UInt32
+    public var bits: UInt32
+    public var nonce: UInt32
+    public var merkleRoot: String
+    public var hash: String
+    public var size: UInt32
+    public var weight: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UInt32, nonce: UInt32, merkleRoot: String, hash: String, size: UInt32, weight: UInt32) {
+        self.prevFk = prevFk
+        self.version = version
+        self.timestamp = timestamp
+        self.bits = bits
+        self.nonce = nonce
+        self.merkleRoot = merkleRoot
+        self.hash = hash
+        self.size = size
+        self.weight = weight
+    }
+}
+
+
+
+extension FfiHeaderRecord: Equatable, Hashable {
+    public static func ==(lhs: FfiHeaderRecord, rhs: FfiHeaderRecord) -> Bool {
+        if lhs.prevFk != rhs.prevFk {
+            return false
+        }
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.timestamp != rhs.timestamp {
+            return false
+        }
+        if lhs.bits != rhs.bits {
+            return false
+        }
+        if lhs.nonce != rhs.nonce {
+            return false
+        }
+        if lhs.merkleRoot != rhs.merkleRoot {
+            return false
+        }
+        if lhs.hash != rhs.hash {
+            return false
+        }
+        if lhs.size != rhs.size {
+            return false
+        }
+        if lhs.weight != rhs.weight {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(prevFk)
+        hasher.combine(version)
+        hasher.combine(timestamp)
+        hasher.combine(bits)
+        hasher.combine(nonce)
+        hasher.combine(merkleRoot)
+        hasher.combine(hash)
+        hasher.combine(size)
+        hasher.combine(weight)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHeaderRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHeaderRecord {
+        return
+            try FfiHeaderRecord(
+                prevFk: FfiConverterUInt64.read(from: &buf), 
+                version: FfiConverterInt32.read(from: &buf), 
+                timestamp: FfiConverterUInt32.read(from: &buf), 
+                bits: FfiConverterUInt32.read(from: &buf), 
+                nonce: FfiConverterUInt32.read(from: &buf), 
+                merkleRoot: FfiConverterString.read(from: &buf), 
+                hash: FfiConverterString.read(from: &buf), 
+                size: FfiConverterUInt32.read(from: &buf), 
+                weight: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiHeaderRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.prevFk, into: &buf)
+        FfiConverterInt32.write(value.version, into: &buf)
+        FfiConverterUInt32.write(value.timestamp, into: &buf)
+        FfiConverterUInt32.write(value.bits, into: &buf)
+        FfiConverterUInt32.write(value.nonce, into: &buf)
+        FfiConverterString.write(value.merkleRoot, into: &buf)
+        FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterUInt32.write(value.size, into: &buf)
+        FfiConverterUInt32.write(value.weight, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeaderRecord_lift(_ buf: RustBuffer) throws -> FfiHeaderRecord {
+    return try FfiConverterTypeFfiHeaderRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeaderRecord_lower(_ value: FfiHeaderRecord) -> RustBuffer {
+    return FfiConverterTypeFfiHeaderRecord.lower(value)
+}
+
+
+public struct FfiTxRecord {
+    public var txid: String
+    public var version: Int32
+    public var locktime: UInt32
+    public var inputCount: UInt32
+    public var outputCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txid: String, version: Int32, locktime: UInt32, inputCount: UInt32, outputCount: UInt32) {
+        self.txid = txid
+        self.version = version
+        self.locktime = locktime
+        self.inputCount = inputCount
+        self.outputCount = outputCount
+    }
+}
+
+
+
+extension FfiTxRecord: Equatable, Hashable {
+    public static func ==(lhs: FfiTxRecord, rhs: FfiTxRecord) -> Bool {
+        if lhs.txid != rhs.txid {
+            return false
+        }
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.locktime != rhs.locktime {
+            return false
+        }
+        if lhs.inputCount != rhs.inputCount {
+            return false
+        }
+        if lhs.outputCount != rhs.outputCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txid)
+        hasher.combine(version)
+        hasher.combine(locktime)
+        hasher.combine(inputCount)
+        hasher.combine(outputCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTxRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTxRecord {
+        return
+            try FfiTxRecord(
+                txid: FfiConverterString.read(from: &buf), 
+                version: FfiConverterInt32.read(from: &buf), 
+                locktime: FfiConverterUInt32.read(from: &buf), 
+                inputCount: FfiConverterUInt32.read(from: &buf), 
+                outputCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTxRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.txid, into: &buf)
+        FfiConverterInt32.write(value.version, into: &buf)
+        FfiConverterUInt32.write(value.locktime, into: &buf)
+        FfiConverterUInt32.write(value.inputCount, into: &buf)
+        FfiConverterUInt32.write(value.outputCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxRecord_lift(_ buf: RustBuffer) throws -> FfiTxRecord {
+    return try FfiConverterTypeFfiTxRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxRecord_lower(_ value: FfiTxRecord) -> RustBuffer {
+    return FfiConverterTypeFfiTxRecord.lower(value)
+}
+
+
 public enum RustyError {
 
     
     
     case InvalidInput
     case ConsensusError
+    case StoreError
 }
 
 
@@ -536,6 +1097,7 @@ public struct FfiConverterTypeRustyError: FfiConverterRustBuffer {
         
         case 1: return .InvalidInput
         case 2: return .ConsensusError
+        case 3: return .StoreError
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -555,6 +1117,10 @@ public struct FfiConverterTypeRustyError: FfiConverterRustBuffer {
         case .ConsensusError:
             writeInt(&buf, Int32(2))
         
+        
+        case .StoreError:
+            writeInt(&buf, Int32(3))
+        
         }
     }
 }
@@ -565,6 +1131,78 @@ extension RustyError: Equatable, Hashable {}
 extension RustyError: Foundation.LocalizedError {
     public var errorDescription: String? {
         String(reflecting: self)
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiHeaderRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FfiHeaderRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiHeaderRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiHeaderRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiTxRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTxRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiTxRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiTxRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
     }
 }
 
@@ -749,6 +1387,42 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_verify_tx_scripts() != 58820) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_count() != 45316) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_max_height() != 61436) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_get_tx_by_txid() != 24667) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_is_outpoint_spent() != 59128) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tip_height() != 22733) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_header_by_hash() != 58892) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_tx_by_txid() != 7572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_header_count() != 37489) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tip_height() != 61582) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffiquery_open_or_create() != 65007) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffistore_create() != 42995) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffistore_open() != 41108) {
         return InitializationResult.apiChecksumMismatch
     }
 

@@ -53,6 +53,9 @@ pub use fee_est::{
     block_individual_p10_sat_kvb, default_candidate_rates, depth_rate_sat_kvb,
     enforce_monotone_desc, fine_candidate_rates, flow_for_depth, hold_defined_then_monotone,
     min_rate_for_capacity, percentile_sat, BLOCK_WEIGHT_WU, CONFIDENCE_FAR, CONFIDENCE_NEAR,
+    bucket_count, bucket_index, capacity_wu, default_candidate_rates, effective_capacity_wu,
+    horizon_secs, min_rate_for_capacity, projected_inflow_wu_above, BLOCK_WEIGHT_WU,
+    FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
 };
 pub use fee_flow::FeeFlowMeter;
 pub use graph::{

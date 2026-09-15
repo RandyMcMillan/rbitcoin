@@ -1526,6 +1526,31 @@ fileprivate struct FfiConverterOptionTypeFfiTxRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt64]
+
+    public static func write(_ value: [UInt64], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt64.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt64] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt64]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt64.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -1567,6 +1592,71 @@ public func checkBlockWire(blockHex: String)throws  {try rustCallWithError(FfiCo
         FfiConverterString.lower(blockHex),$0
     )
 }
+}
+public func feeBucketCount() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_bucket_count($0
+    )
+})
+}
+public func feeBucketEdges() -> [UInt64] {
+    return try!  FfiConverterSequenceUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_bucket_edges($0
+    )
+})
+}
+public func feeBucketIndex(rateSatPerKvb: UInt64) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_bucket_index(
+        FfiConverterUInt64.lower(rateSatPerKvb),$0
+    )
+})
+}
+public func feeCapacityWu(nBlocks: UInt32) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_capacity_wu(
+        FfiConverterUInt32.lower(nBlocks),$0
+    )
+})
+}
+public func feeDefaultCandidateRates() -> [UInt64] {
+    return try!  FfiConverterSequenceUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_default_candidate_rates($0
+    )
+})
+}
+public func feeEffectiveCapacityWu(nBlocks: UInt32) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_effective_capacity_wu(
+        FfiConverterUInt32.lower(nBlocks),$0
+    )
+})
+}
+public func feeHorizonSecs(nBlocks: UInt32) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_horizon_secs(
+        FfiConverterUInt32.lower(nBlocks),$0
+    )
+})
+}
+public func feeMinRateForCapacitySimple(stockAbove: UInt64, inflowWuPerSByBucket: [UInt64], nBlocks: UInt32, candidateRates: [UInt64]) -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_min_rate_for_capacity_simple(
+        FfiConverterUInt64.lower(stockAbove),
+        FfiConverterSequenceUInt64.lower(inflowWuPerSByBucket),
+        FfiConverterUInt32.lower(nBlocks),
+        FfiConverterSequenceUInt64.lower(candidateRates),$0
+    )
+})
+}
+public func feeProjectedInflowWuAbove(inflowWuPerSByBucket: [UInt64], rateSatPerKvb: UInt64, horizonSecs: UInt64) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_fee_projected_inflow_wu_above(
+        FfiConverterSequenceUInt64.lower(inflowWuPerSByBucket),
+        FfiConverterUInt64.lower(rateSatPerKvb),
+        FfiConverterUInt64.lower(horizonSecs),$0
+    )
+})
 }
 public func hash256(bytes: Data) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1671,6 +1761,33 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_check_block_wire() != 22734) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_bucket_count() != 44190) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_bucket_edges() != 59685) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_bucket_index() != 58372) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_capacity_wu() != 63938) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_default_candidate_rates() != 50688) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_effective_capacity_wu() != 53442) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_horizon_secs() != 18777) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_min_rate_for_capacity_simple() != 4521) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_fee_projected_inflow_wu_above() != 562) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_hash256() != 5458) {

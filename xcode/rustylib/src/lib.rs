@@ -1,9 +1,9 @@
 uniffi::setup_scaffolding!();
 
-use bitcoin::{Address, Network};
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::{Address, Network};
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_primitives::Height;
 use std::str::FromStr;
@@ -76,7 +76,8 @@ pub fn hex_decode(hex: String) -> Result<Vec<u8>, RustyError> {
 
 #[uniffi::export]
 pub fn script_sigops(script_hex: String, accurate: bool) -> Result<u64, RustyError> {
-    let script = rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
     Ok(rbitcoin_primitives::script_sigop_count(&script, accurate))
 }
 
@@ -111,7 +112,8 @@ pub fn hash256(bytes: Vec<u8>) -> String {
 
 #[uniffi::export]
 pub fn check_block_wire(block_hex: String) -> Result<(), RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
     rbitcoin_consensus::check_block_wire(&bytes).map_err(|_| RustyError::ConsensusError)
 }
 
@@ -149,7 +151,8 @@ pub fn verify_tx_scripts(prevouts_hex: Vec<String>, tx_hex: String) -> Result<()
         .iter()
         .map(|h| deserialize_hex(h).map_err(|_| RustyError::InvalidInput))
         .collect::<Result<Vec<_>, _>>()?;
-    let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
     rbitcoin_consensus::verify_tx_scripts_detached(prevouts, tx)
         .map_err(|_| RustyError::ConsensusError)
 }
@@ -233,15 +236,24 @@ impl FfiStore {
         self.inner.header_count()
     }
 
-    pub fn get_header_by_hash(&self, hash_hex: String) -> Result<Option<FfiHeaderRecord>, RustyError> {
+    pub fn get_header_by_hash(
+        &self,
+        hash_hex: String,
+    ) -> Result<Option<FfiHeaderRecord>, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        let rec = self.inner.get_header_by_hash(&hash).map_err(|_| RustyError::StoreError)?;
+        let rec = self
+            .inner
+            .get_header_by_hash(&hash)
+            .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_fk, h)| h.into()))
     }
 
     pub fn get_tx_by_txid(&self, txid_hex: String) -> Result<Option<FfiTxRecord>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
-        let rec = self.inner.get_tx_by_txid(&txid).map_err(|_| RustyError::StoreError)?;
+        let rec = self
+            .inner
+            .get_tx_by_txid(&txid)
+            .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_, t)| t.into()))
     }
 }
@@ -257,7 +269,8 @@ pub struct FfiQuery {
 impl FfiQuery {
     #[uniffi::constructor]
     pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
-        let query = rbitcoin_query::Query::open_or_create(&path).map_err(|_| RustyError::StoreError)?;
+        let query =
+            rbitcoin_query::Query::open_or_create(&path).map_err(|_| RustyError::StoreError)?;
         Ok(Arc::new(Self { inner: query }))
     }
 
@@ -267,13 +280,18 @@ impl FfiQuery {
 
     pub fn get_tx_by_txid(&self, txid_hex: String) -> Result<Option<FfiTxRecord>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
-        let rec = self.inner.get_tx_by_txid(&txid).map_err(|_| RustyError::StoreError)?;
+        let rec = self
+            .inner
+            .get_tx_by_txid(&txid)
+            .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_, t)| t.into()))
     }
 
     pub fn is_outpoint_spent(&self, txid_hex: String, vout: u32) -> Result<bool, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
-        self.inner.is_outpoint_spent(&txid, vout).map_err(|_| RustyError::StoreError)
+        self.inner
+            .is_outpoint_spent(&txid, vout)
+            .map_err(|_| RustyError::StoreError)
     }
 
     pub fn block_queue_count(&self) -> u64 {
@@ -307,7 +325,9 @@ mod tests {
 
     #[test]
     fn test_validate_address_mainnet() {
-        assert!(validate_address("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string()));
+        assert!(validate_address(
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string()
+        ));
         assert_eq!(
             address_network("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string()).unwrap(),
             "mainnet"

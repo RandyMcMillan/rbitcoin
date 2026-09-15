@@ -1,0 +1,58 @@
+name: xcode
+
+on:
+  push:
+    branches: [master, main, "v*.*.x"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-ffi:
+    name: rust-ffi-build
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-xcode-rust
+      - name: Install iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+      - name: Build Rust FFI (make rust)
+        run: cd xcode && make rust
+      - name: Run rustylib tests
+        run: cd xcode/rustylib && cargo test --lib
+
+  xcode-build:
+    name: xcode-build
+    runs-on: macos-14
+    timeout-minutes: 30
+    needs: rust-ffi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-xcode-rust
+      - name: Install iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+      - name: Build Rust FFI
+        run: cd xcode && make rust
+      - name: Build Xcode project
+        run: |
+          cd xcode/swiftyapp
+          xcodebuild -project swiftyapp.xcodeproj -scheme swiftyapp -destination 'platform=iOS Simulator,name=iPhone 15' build

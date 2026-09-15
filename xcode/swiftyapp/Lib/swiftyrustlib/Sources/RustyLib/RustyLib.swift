@@ -517,6 +517,7 @@ public enum RustyError {
     
     
     case InvalidInput
+    case ConsensusError
 }
 
 
@@ -534,6 +535,7 @@ public struct FfiConverterTypeRustyError: FfiConverterRustBuffer {
 
         
         case 1: return .InvalidInput
+        case 2: return .ConsensusError
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -548,6 +550,10 @@ public struct FfiConverterTypeRustyError: FfiConverterRustBuffer {
         
         case .InvalidInput:
             writeInt(&buf, Int32(1))
+        
+        
+        case .ConsensusError:
+            writeInt(&buf, Int32(2))
         
         }
     }
@@ -592,6 +598,20 @@ public func addressNetwork(address: String)throws  -> String {
         FfiConverterString.lower(address),$0
     )
 })
+}
+public func blockSubsidy(height: UInt32, network: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_subsidy(
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+public func checkBlockWire(blockHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_check_block_wire(
+        FfiConverterString.lower(blockHex),$0
+    )
+}
 }
 public func hash256(bytes: Data) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -656,6 +676,23 @@ public func validateAddress(address: String) -> Bool {
     )
 })
 }
+public func validateHeaderOnParent(headerHex: String, network: String, height: UInt32, parentMtp: UInt32, expectedBits: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_validate_header_on_parent(
+        FfiConverterString.lower(headerHex),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),
+        FfiConverterUInt32.lower(parentMtp),
+        FfiConverterUInt32.lower(expectedBits),$0
+    )
+}
+}
+public func verifyTxScripts(prevoutsHex: [String], txHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_verify_tx_scripts(
+        FfiConverterSequenceString.lower(prevoutsHex),
+        FfiConverterString.lower(txHex),$0
+    )
+}
+}
 
 private enum InitializationResult {
     case ok
@@ -673,6 +710,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_rustylib_checksum_func_address_network() != 7866) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_block_subsidy() != 16642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_check_block_wire() != 22734) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_hash256() != 5458) {
@@ -700,6 +743,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_validate_address() != 11887) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_validate_header_on_parent() != 9664) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_verify_tx_scripts() != 58820) {
         return InitializationResult.apiChecksumMismatch
     }
 

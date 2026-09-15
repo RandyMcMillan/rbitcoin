@@ -15,6 +15,11 @@ struct ContentView: View {
     @State private var addressNetworkResult = ""
     @State private var hashInput = "Hello rbitcoin"
     @State private var hashResult = ""
+    @State private var blockHexInput = ""
+    @State private var blockValidationResult = ""
+    @State private var subsidyHeight = "840000"
+    @State private var subsidyNetwork = "mainnet"
+    @State private var subsidyResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -239,6 +244,75 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("rbitcoin consensus", systemImage: "shield.checkered")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("stateless")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Block subsidy")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                HStack(spacing: 8) {
+                                    TextField("Height", text: $subsidyHeight)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 100)
+                                    Picker("Network", selection: $subsidyNetwork) {
+                                        Text("mainnet").tag("mainnet")
+                                        Text("testnet").tag("testnet")
+                                        Text("regtest").tag("regtest")
+                                        Text("signet").tag("signet")
+                                    }
+                                    .pickerStyle(.menu)
+                                    .tint(accentText)
+                                    Spacer()
+                                }
+                                .onChange(of: subsidyHeight) { _ in updateSubsidy() }
+                                .onChange(of: subsidyNetwork) { _ in updateSubsidy() }
+                                if !subsidyResult.isEmpty {
+                                    Text(subsidyResult)
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+
+                            Divider()
+                                .overlay(accentFill.opacity(colorScheme == .dark ? 0.22 : 0.16))
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Block wire validation")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Paste block hex", text: $blockHexInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .onChange(of: blockHexInput) { _ in updateBlockValidation() }
+                                if !blockValidationResult.isEmpty {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: blockValidationResult == "Valid" ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                            .foregroundStyle(blockValidationResult == "Valid" ? Color.green : Color.red)
+                                        Text(blockValidationResult)
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        updateSubsidy()
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -249,6 +323,7 @@ struct ContentView: View {
                                 "State-driven interactions",
                                 "Native Rust function calls",
                                 "Real rbitcoin primitives",
+                                "Consensus verification",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")
@@ -349,6 +424,34 @@ struct ContentView: View {
     private func updateHashResult() {
         let data = Data(hashInput.utf8)
         hashResult = hash256(bytes: data)
+    }
+
+    private func updateSubsidy() {
+        guard let height = UInt32(subsidyHeight) else {
+            subsidyResult = ""
+            return
+        }
+        do {
+            let satoshis = try blockSubsidy(height: height, network: subsidyNetwork)
+            let btc = Double(satoshis) / 100_000_000.0
+            subsidyResult = String(format: "%.8f BTC", btc)
+        } catch {
+            subsidyResult = "error"
+        }
+    }
+
+    private func updateBlockValidation() {
+        let hex = blockHexInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hex.isEmpty else {
+            blockValidationResult = ""
+            return
+        }
+        do {
+            try checkBlockWire(blockHex: hex)
+            blockValidationResult = "Valid"
+        } catch {
+            blockValidationResult = "Invalid"
+        }
     }
 
     private func stepperRow(title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {

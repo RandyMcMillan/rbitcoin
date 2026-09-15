@@ -14,6 +14,7 @@ path = "uniffi-bindgen.rs"
 [dependencies]
 uniffi = { version = "0.28.0", features = [ "cli" ] }
 rbitcoin-primitives = { workspace = true }
+rbitcoin-consensus = { workspace = true }
 bitcoin = { workspace = true }
 
 [build-dependencies]

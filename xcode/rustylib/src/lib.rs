@@ -159,6 +159,33 @@ pub fn verify_tx_scripts(prevouts_hex: Vec<String>, tx_hex: String) -> Result<()
         .map_err(|_| RustyError::ConsensusError)
 }
 
+#[uniffi::export]
+pub fn virtual_size(weight: u64) -> u64 {
+    rbitcoin_consensus::policy::get_virtual_size(weight)
+}
+
+#[uniffi::export]
+pub fn meets_min_relay_fee(fee_sat: u64, weight: u64) -> bool {
+    rbitcoin_consensus::policy::meets_min_relay_fee(fee_sat, weight)
+}
+
+#[uniffi::export]
+pub fn fee_rate_sat_per_kvb(fee_sat: u64, weight: u64) -> u64 {
+    rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight)
+}
+
+#[uniffi::export]
+pub fn is_annex_standard(annex_hex: String) -> Result<bool, RustyError> {
+    let annex =
+        rbitcoin_primitives::hex_decode(&annex_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::policy::is_annex_standard(&annex))
+}
+
+#[uniffi::export]
+pub fn median_time_past_times(times: Vec<u32>) -> u32 {
+    rbitcoin_primitives::median_time_past_times(&times)
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -340,8 +367,8 @@ pub struct FfiMempool {
 impl FfiMempool {
     #[uniffi::constructor]
     pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
-        let mempool =
-            rbitcoin_mempool::Mempool::open_or_create(&path).map_err(|_| RustyError::MempoolError)?;
+        let mempool = rbitcoin_mempool::Mempool::open_or_create(&path)
+            .map_err(|_| RustyError::MempoolError)?;
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(mempool),
         }))
@@ -532,5 +559,24 @@ mod tests {
         assert_eq!(projected, 0);
         let min_rate = fee_min_rate_for_capacity_simple(0, inflow, 1, rates.clone());
         assert!(min_rate.is_some());
+    }
+
+    #[test]
+    fn test_consensus_policy() {
+        assert_eq!(virtual_size(4_000_000), 1_000_000);
+        assert!(meets_min_relay_fee(3000, 1000));
+        // vsize(1000) = 250; min_relay = 100 sat/kvB
+        // 100 * 1000 >= 250 * 100 → true (fee of 100 is enough for 250 vbytes at 100 sat/kvB)
+        assert!(meets_min_relay_fee(100, 1000));
+        // vsize(4000) = 1000; need 1000 * 100 / 1000 = 100 sat minimum
+        assert!(!meets_min_relay_fee(99, 4000));
+        let rate = fee_rate_sat_per_kvb(3000, 1000);
+        assert!(rate > 0);
+    }
+
+    #[test]
+    fn test_median_time_past() {
+        let times = vec![1000u32, 2000, 1500];
+        assert_eq!(median_time_past_times(times), 1500);
     }
 }

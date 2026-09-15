@@ -373,6 +373,71 @@ impl FfiMempool {
     }
 }
 
+// --- Fee Estimation FFI ---
+
+#[uniffi::export]
+pub fn fee_bucket_edges() -> Vec<u64> {
+    rbitcoin_mempool::FEE_BUCKET_EDGES_SAT_PER_KVB.to_vec()
+}
+
+#[uniffi::export]
+pub fn fee_bucket_index(rate_sat_per_kvb: u64) -> u32 {
+    rbitcoin_mempool::bucket_index(rate_sat_per_kvb) as u32
+}
+
+#[uniffi::export]
+pub fn fee_bucket_count() -> u32 {
+    rbitcoin_mempool::bucket_count() as u32
+}
+
+#[uniffi::export]
+pub fn fee_capacity_wu(n_blocks: u32) -> u64 {
+    rbitcoin_mempool::capacity_wu(n_blocks)
+}
+
+#[uniffi::export]
+pub fn fee_effective_capacity_wu(n_blocks: u32) -> u64 {
+    rbitcoin_mempool::effective_capacity_wu(n_blocks)
+}
+
+#[uniffi::export]
+pub fn fee_horizon_secs(n_blocks: u32) -> u64 {
+    rbitcoin_mempool::horizon_secs(n_blocks)
+}
+
+#[uniffi::export]
+pub fn fee_default_candidate_rates() -> Vec<u64> {
+    rbitcoin_mempool::default_candidate_rates()
+}
+
+#[uniffi::export]
+pub fn fee_projected_inflow_wu_above(
+    inflow_wu_per_s_by_bucket: Vec<u64>,
+    rate_sat_per_kvb: u64,
+    horizon_secs: u64,
+) -> u64 {
+    rbitcoin_mempool::projected_inflow_wu_above(
+        &inflow_wu_per_s_by_bucket,
+        rate_sat_per_kvb,
+        horizon_secs,
+    )
+}
+
+#[uniffi::export]
+pub fn fee_min_rate_for_capacity_simple(
+    stock_above: u64,
+    inflow_wu_per_s_by_bucket: Vec<u64>,
+    n_blocks: u32,
+    candidate_rates: Vec<u64>,
+) -> Option<u64> {
+    rbitcoin_mempool::min_rate_for_capacity(
+        |_r| stock_above,
+        &inflow_wu_per_s_by_bucket,
+        n_blocks,
+        &candidate_rates,
+    )
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -449,5 +514,23 @@ mod tests {
             let mempool = FfiMempool::open_or_create(path).unwrap();
             assert_eq!(mempool.live_count(), 0);
         }
+    }
+
+    #[test]
+    fn test_fee_estimation_basics() {
+        let edges = fee_bucket_edges();
+        assert!(!edges.is_empty());
+        assert_eq!(fee_bucket_count() as usize, edges.len() + 1);
+        assert_eq!(fee_bucket_index(100), 0);
+        assert_eq!(fee_capacity_wu(1), 4_000_000);
+        assert_eq!(fee_effective_capacity_wu(1), 3_800_000);
+        assert_eq!(fee_horizon_secs(1), 600);
+        let rates = fee_default_candidate_rates();
+        assert!(!rates.is_empty());
+        let inflow = vec![0u64; fee_bucket_count() as usize];
+        let projected = fee_projected_inflow_wu_above(inflow.clone(), 1000, 600);
+        assert_eq!(projected, 0);
+        let min_rate = fee_min_rate_for_capacity_simple(0, inflow, 1, rates.clone());
+        assert!(min_rate.is_some());
     }
 }

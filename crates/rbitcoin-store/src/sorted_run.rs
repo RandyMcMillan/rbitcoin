@@ -621,11 +621,11 @@ pub fn host_mem_available_bytes() -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return mem_available_from_darwin_host();
+        mem_available_from_darwin_host()
     }
     #[cfg(windows)]
     {
-        return mem_available_from_windows_host();
+        mem_available_from_windows_host()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {

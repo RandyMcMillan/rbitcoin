@@ -276,6 +276,20 @@ pub fn p2p_target_peers() -> u32 {
     rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
 }
 
+// --- RPC / Electrum FFI ---
+
+#[uniffi::export]
+pub fn node_rpc_path() -> String {
+    rbitcoin_rpc::node_rpc_path().to_string()
+}
+
+#[uniffi::export]
+pub fn electrum_scripthash_hex(script_hex: String) -> Result<String, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_electrum::electrum_scripthash_hex(&script))
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -716,5 +730,19 @@ mod tests {
         let hosts = p2p_fixed_seed_hosts("mainnet".to_string()).unwrap();
         assert!(!hosts.is_empty());
         assert_eq!(p2p_target_peers(), 16);
+    }
+
+    #[test]
+    fn test_rpc_path() {
+        assert_eq!(node_rpc_path(), "/");
+    }
+
+    #[test]
+    fn test_electrum_scripthash() {
+        // P2PKH script for 76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac
+        let script_hex = "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac";
+        let hash = electrum_scripthash_hex(script_hex.to_string()).unwrap();
+        assert!(!hash.is_empty());
+        assert_eq!(hash.len(), 64);
     }
 }

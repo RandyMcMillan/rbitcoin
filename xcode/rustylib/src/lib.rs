@@ -235,6 +235,47 @@ pub fn block_hash_from_header(header_hex: String) -> Result<String, RustyError> 
     Ok(header.block_hash().to_string())
 }
 
+// --- Network FFI ---
+
+fn rbitcoin_network(network: &str) -> Result<rbitcoin_primitives::Network, RustyError> {
+    match network {
+        "mainnet" => Ok(rbitcoin_primitives::Network::Mainnet),
+        "testnet" => Ok(rbitcoin_primitives::Network::Testnet),
+        "regtest" => Ok(rbitcoin_primitives::Network::Regtest),
+        "signet" => Ok(rbitcoin_primitives::Network::Signet),
+        _ => Err(RustyError::InvalidInput),
+    }
+}
+
+#[uniffi::export]
+pub fn p2p_default_port(network: String) -> Result<u16, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::default_port(net))
+}
+
+#[uniffi::export]
+pub fn p2p_dns_seeds(network: String) -> Result<Vec<String>, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::dns_seeds(net)
+        .iter()
+        .map(|s| s.to_string())
+        .collect())
+}
+
+#[uniffi::export]
+pub fn p2p_fixed_seed_hosts(network: String) -> Result<Vec<String>, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::fixed_seed_hosts(net)
+        .iter()
+        .map(|s| s.to_string())
+        .collect())
+}
+
+#[uniffi::export]
+pub fn p2p_target_peers() -> u32 {
+    rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -662,5 +703,18 @@ mod tests {
             hash,
             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
         );
+    }
+
+    #[test]
+    fn test_p2p_network_info() {
+        assert_eq!(p2p_default_port("mainnet".to_string()).unwrap(), 8333);
+        assert_eq!(p2p_default_port("testnet".to_string()).unwrap(), 18333);
+        assert_eq!(p2p_default_port("regtest".to_string()).unwrap(), 18444);
+        assert_eq!(p2p_default_port("signet".to_string()).unwrap(), 38333);
+        let seeds = p2p_dns_seeds("mainnet".to_string()).unwrap();
+        assert!(!seeds.is_empty());
+        let hosts = p2p_fixed_seed_hosts("mainnet".to_string()).unwrap();
+        assert!(!hosts.is_empty());
+        assert_eq!(p2p_target_peers(), 16);
     }
 }

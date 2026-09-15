@@ -1,4 +1,3 @@
-[workspace]
 [package]
 name = "rustylib"
 version = "0.1.0"
@@ -13,21 +12,9 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-rbitcoin-bench = { version = "0.6.99", path = "../../crates/rbitcoin-bench", features = ["cli"] }
-rbitcoin-cli = { version = "0.6.99", path = "../../crates/rbitcoin-cli" }
-rbitcoin-consensus = { version = "0.6.99", path = "../../crates/rbitcoin-consensus" }
-rbitcoin-electrum = { version = "0.6.99", path = "../../crates/rbitcoin-electrum" }
-rbitcoin-esplora = { version = "0.6.99", path = "../../crates/rbitcoin-esplora" }
-rbitcoin-log = { version = "0.6.99", path = "../../crates/rbitcoin-log", features = ["fmt-fuzz-anchor"] }
-rbitcoin-mempool = { version = "0.6.99", path = "../../crates/rbitcoin-mempool" }
-rbitcoin-net = { version = "0.6.99", path = "../../crates/rbitcoin-net" }
-rbitcoin-node = { version = "0.6.99", path = "../../crates/rbitcoin-node" }
-rbitcoin-primitives = { version = "0.6.99", path = "../../crates/rbitcoin-primitives" }
-rbitcoin-query = { version = "0.6.99", path = "../../crates/rbitcoin-query" }
-rbitcoin-rpc = { version = "0.6.99", path = "../../crates/rbitcoin-rpc" }
-rbitcoin-store = { version = "0.6.99", path = "../../crates/rbitcoin-store" }
-rbitcoin-test = { version = "0.6.99", path = "../../crates/rbitcoin-test" }
 uniffi = { version = "0.28.0", features = [ "cli" ] }
+rbitcoin-primitives = { workspace = true }
+bitcoin = { workspace = true }
 
 [build-dependencies]
 uniffi = { version = "0.28.0", features = [ "build" ] }

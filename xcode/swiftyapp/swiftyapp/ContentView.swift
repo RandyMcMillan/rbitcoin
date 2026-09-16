@@ -66,6 +66,13 @@ struct ContentView: View {
     @State private var feeAtResult = ""
     @State private var archiveHashInput = ""
     @State private var archiveResult = ""
+    @State private var witnessWtxids = ""
+    @State private var witnessReserved = "0000000000000000000000000000000000000000000000000000000000000000"
+    @State private var witnessScriptResult = ""
+    @State private var sigopsTxHex = ""
+    @State private var sigopsResult = ""
+    @State private var bip68TxHex = ""
+    @State private var bip68Result = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -1279,6 +1286,143 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Witness commitment", systemImage: "doc.plaintext.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Wtxids (comma-separated)", text: $witnessWtxids)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Reserved", text: $witnessReserved)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let wtxids = witnessWtxids.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                    do {
+                                        let script = try witnessCommitmentScript(nonCbWtxidsHex: wtxids, reservedHex: witnessReserved)
+                                        witnessScriptResult = script
+                                    } catch {
+                                        witnessScriptResult = "error"
+                                    }
+                                } label: {
+                                    Label("Build script", systemImage: "hammer.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !witnessScriptResult.isEmpty {
+                                    Text(witnessScriptResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Sigops", systemImage: "function")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Tx hex", text: $sigopsTxHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = sigopsTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        sigopsResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let legacy = try legacySigopCount(txHex: hex)
+                                        let gbt = try txGbtSigops(txHex: hex)
+                                        sigopsResult = "legacy: \(legacy) gbt: \(gbt)"
+                                    } catch {
+                                        sigopsResult = "invalid tx"
+                                    }
+                                } label: {
+                                    Label("Count sigops", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !sigopsResult.isEmpty {
+                                    Text(sigopsResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("BIP68 check", systemImage: "lock.shield.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Tx hex", text: $bip68TxHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = bip68TxHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        bip68Result = ""
+                                        return
+                                    }
+                                    do {
+                                        let active = try bip68ActiveForTx(txHex: hex)
+                                        let locks = try sequenceLocksSatisfied(txHex: hex, prevHeights: [], prevCoinMtps: [], blockHeight: 100, blockPrevMtp: 100)
+                                        bip68Result = active ? "BIP68 active, locks: \(locks)" : "BIP68 inactive"
+                                    } catch {
+                                        bip68Result = "invalid tx"
+                                    }
+                                } label: {
+                                    Label("Check BIP68", systemImage: "checkmark.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !bip68Result.isEmpty {
+                                    Text(bip68Result)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -1300,6 +1444,8 @@ struct ContentView: View {
                                 "Versionbits + Merkle root",
                                 "Query stats + Archive probe",
                                 "Header hash + Fee at rate",
+                                "Witness commitment + Sigops",
+                                "BIP68 check",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

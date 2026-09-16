@@ -541,6 +541,74 @@ pub fn meets_min_relay_fee_at(fee_sat: u64, weight: u64, sat_kvb: u64) -> bool {
     rbitcoin_consensus::policy::meets_min_relay_fee_at(fee_sat, weight, sat_kvb)
 }
 
+// --- Block Script / Sigops FFI ---
+
+#[uniffi::export]
+pub fn witness_commitment_script(
+    non_cb_wtxids_hex: Vec<String>,
+    reserved_hex: String,
+) -> Result<String, RustyError> {
+    let wtxids: Vec<[u8; 32]> = non_cb_wtxids_hex
+        .iter()
+        .map(|h| {
+            let bytes = rbitcoin_primitives::hex_decode(h).map_err(|_| RustyError::InvalidInput)?;
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok(arr)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let reserved_bytes =
+        rbitcoin_primitives::hex_decode(&reserved_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut reserved = [0u8; 32];
+    reserved.copy_from_slice(&reserved_bytes);
+    let script = rbitcoin_consensus::witness_commitment_script(wtxids, &reserved);
+    Ok(rbitcoin_primitives::hex_encode(script))
+}
+
+#[uniffi::export]
+pub fn legacy_sigop_count(tx_hex: String) -> Result<u64, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::legacy_sigop_count(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_gbt_sigops(tx_hex: String) -> Result<u64, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::tx_gbt_sigops(&tx))
+}
+
+#[uniffi::export]
+pub fn bip68_active_for_tx(tx_hex: String) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::bip68_active_for_tx(&tx))
+}
+
+#[uniffi::export]
+pub fn sequence_locks_satisfied(
+    tx_hex: String,
+    prev_heights: Vec<u32>,
+    prev_coin_mtps: Vec<u32>,
+    block_height: u32,
+    block_prev_mtp: u32,
+) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::sequence_locks_satisfied(
+        &tx,
+        &prev_heights,
+        &prev_coin_mtps,
+        block_height,
+        block_prev_mtp,
+    ))
+}
+
 // --- Primitives Hash FFI ---
 
 #[uniffi::export]
@@ -1532,5 +1600,39 @@ mod tests {
             )
             .unwrap());
         assert!(!query.header_has_class_a_body(1).unwrap());
+    }
+
+    #[test]
+    fn test_witness_commitment_script() {
+        let wtxids =
+            vec!["0000000000000000000000000000000000000000000000000000000000000000".to_string()];
+        let reserved = "0000000000000000000000000000000000000000000000000000000000000000";
+        let script = witness_commitment_script(wtxids, reserved.to_string()).unwrap();
+        assert!(!script.is_empty());
+        assert!(script.starts_with("6a24aa21a9ed"));
+    }
+
+    #[test]
+    fn test_legacy_sigop_count() {
+        // P2PKH tx with one input, one output
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+        let count = legacy_sigop_count(tx_hex.to_string()).unwrap();
+        assert!(count > 0);
+        let gbt = tx_gbt_sigops(tx_hex.to_string()).unwrap();
+        assert_eq!(gbt, count * 4);
+    }
+
+    #[test]
+    fn test_bip68_active_for_tx() {
+        // Version 1 tx
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+        assert!(!bip68_active_for_tx(tx_hex.to_string()).unwrap());
+    }
+
+    #[test]
+    fn test_sequence_locks_satisfied() {
+        // Version 1 tx (no sequence locks)
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+        assert!(sequence_locks_satisfied(tx_hex.to_string(), vec![], vec![], 100, 100).unwrap());
     }
 }

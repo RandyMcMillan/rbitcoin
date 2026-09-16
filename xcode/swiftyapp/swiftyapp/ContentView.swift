@@ -46,6 +46,15 @@ struct ContentView: View {
     @State private var milestoneResult = ""
     @State private var resolvedSeedsResult = ""
     @State private var constantsResult = ""
+    @State private var regtestPrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
+    @State private var regtestTime = "1296688602"
+    @State private var regtestHeight = "0"
+    @State private var regtestBlockResult = ""
+    @State private var serviceFlagsResult = ""
+    @State private var versionbitsResult = ""
+    @State private var merkleTxids = ""
+    @State private var merkleRootResult = ""
+    @State private var queryExtendedResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -900,6 +909,215 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Regtest mining", systemImage: "hammer.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    TextField("Prev hash", text: $regtestPrevHash)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(.caption, design: .monospaced))
+                                    TextField("Time", text: $regtestTime)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 100)
+                                    TextField("Height", text: $regtestHeight)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 60)
+                                }
+                                Button {
+                                    guard let time = UInt32(regtestTime), let height = UInt32(regtestHeight) else {
+                                        regtestBlockResult = "invalid input"
+                                        return
+                                    }
+                                    do {
+                                        let hex = try mineEmptyRegtest(prevHashHex: regtestPrevHash, time: time, height: height)
+                                        regtestBlockResult = "block: \(hex.prefix(32))…"
+                                    } catch {
+                                        regtestBlockResult = "error"
+                                    }
+                                } label: {
+                                    Label("Mine block", systemImage: "hammer.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !regtestBlockResult.isEmpty {
+                                    Text(regtestBlockResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Service flags", systemImage: "flag.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let local = localServiceFlagsU64()
+                                let desirable = desirableServiceFlags(offered: local, tipDepthBlocks: 0)
+                                let hasAll = hasAllDesirableServiceFlags(offered: local, tipDepthBlocks: 0)
+                                serviceFlagsResult = "local=0x\(String(local, radix: 16)) desirable=0x\(String(desirable, radix: 16)) hasAll=\(hasAll)"
+                            } label: {
+                                Label("Check service flags", systemImage: "antenna.radiowaves.left.and.right")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !serviceFlagsResult.isEmpty {
+                                Text(serviceFlagsResult)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Versionbits", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let period = try warnPeriodThreshold(network: "mainnet")
+                                    let warning = unknownRulesWarning(bit: 0)
+                                    versionbitsResult = "period: \(period.start)-\(period.end) warn: \(warning.prefix(20))…"
+                                } catch {
+                                    versionbitsResult = "error"
+                                }
+                            } label: {
+                                Label("Load warnings", systemImage: "bell.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !versionbitsResult.isEmpty {
+                                Text(versionbitsResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Merkle root", systemImage: "tree.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-store")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Txids (comma-separated)", text: $merkleTxids)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let txids = merkleTxids.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                    do {
+                                        let root = try merkleRootFromTxids(txidsHex: txids)
+                                        merkleRootResult = root
+                                    } catch {
+                                        merkleRootResult = "error"
+                                    }
+                                } label: {
+                                    Label("Compute root", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !merkleRootResult.isEmpty {
+                                    Text(merkleRootResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query stats", systemImage: "chart.bar.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-demo")
+                                    let window = query.softConfirmWindow()
+                                    let archived = try query.archivedBlockCount()
+                                    let txBody = query.txBodyCount()
+                                    let txHead = query.txHeadOccupied()
+                                    queryExtendedResult = "window=\(window) archived=\(archived) txBody=\(txBody) txHead=\(txHead)"
+                                } catch {
+                                    queryExtendedResult = "error"
+                                }
+                            } label: {
+                                Label("Load query stats", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryExtendedResult.isEmpty {
+                                Text(queryExtendedResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -917,6 +1135,9 @@ struct ContentView: View {
                                 "P2P network + Electrum",
                                 "Log control + Genesis",
                                 "Seed resolution + Constants",
+                                "Regtest mining + Service flags",
+                                "Versionbits + Merkle root",
+                                "Query stats",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

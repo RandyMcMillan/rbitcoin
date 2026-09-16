@@ -443,6 +443,139 @@ pub fn signet_magic_hex(challenge_hex: String) -> Result<String, RustyError> {
     Ok(rbitcoin_primitives::hex_encode(magic))
 }
 
+#[uniffi::export]
+pub fn default_signet_challenge_hex() -> String {
+    rbitcoin_primitives::hex_encode(rbitcoin_consensus::default_signet_challenge().as_bytes())
+}
+
+#[uniffi::export]
+pub fn validate_signet_block_solution(block_hex: String, challenge_hex: String) -> Result<(), RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let challenge_bytes = rbitcoin_primitives::hex_decode(&challenge_hex).map_err(|_| RustyError::InvalidInput)?;
+    let challenge = bitcoin::Script::from_bytes(&challenge_bytes);
+    rbitcoin_consensus::validate_signet_block_solution(&block, challenge)
+        .map_err(|_| RustyError::ConsensusError)
+}
+
+// --- Regtest Mining FFI ---
+
+#[uniffi::export]
+pub fn mine_empty_regtest(prev_hash_hex: String, time: u32, height: u32) -> Result<String, RustyError> {
+    let prev_bytes = rbitcoin_primitives::hex_decode(&prev_hash_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut prev_arr = [0u8; 32];
+    prev_arr.copy_from_slice(&prev_bytes);
+    prev_arr.reverse();
+    let prev = bitcoin::BlockHash::from_byte_array(prev_arr);
+    let block = rbitcoin_consensus::mine_empty_regtest(prev, time, height);
+    Ok(bitcoin::consensus::encode::serialize_hex(&block))
+}
+
+#[uniffi::export]
+pub fn grind_regtest_pow(header_hex: String) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    rbitcoin_consensus::grind_regtest_pow(&mut header);
+    Ok(bitcoin::consensus::encode::serialize_hex(&header))
+}
+
+#[uniffi::export]
+pub fn regtest_pow_bits() -> u32 {
+    rbitcoin_consensus::REGTEST_POW_BITS
+}
+
+#[uniffi::export]
+pub fn regtest_block_spacing() -> u32 {
+    rbitcoin_consensus::REGTEST_BLOCK_SPACING
+}
+
+// --- Block Helpers FFI ---
+
+#[uniffi::export]
+pub fn block_has_witness(block_hex: String) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::block_has_witness(&block))
+}
+
+#[uniffi::export]
+pub fn is_final_tx(tx_hex: String, block_height: u32, lock_time_cutoff: u32) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::is_final_tx(&tx, block_height, lock_time_cutoff))
+}
+
+#[uniffi::export]
+pub fn bip34_height_script(height: u32) -> String {
+    rbitcoin_primitives::hex_encode(&rbitcoin_consensus::bip34_height_script(height))
+}
+
+// --- Network Service Flags FFI ---
+
+#[uniffi::export]
+pub fn local_service_flags_u64() -> u64 {
+    rbitcoin_net::local_service_flags().to_u64()
+}
+
+#[uniffi::export]
+pub fn desirable_service_flags(offered: u64, tip_depth_blocks: i64) -> u64 {
+    let offered = bitcoin::p2p::ServiceFlags::from(offered);
+    rbitcoin_net::desirable_service_flags(offered, tip_depth_blocks).to_u64()
+}
+
+#[uniffi::export]
+pub fn has_all_desirable_service_flags(offered: u64, tip_depth_blocks: i64) -> bool {
+    let offered = bitcoin::p2p::ServiceFlags::from(offered);
+    rbitcoin_net::has_all_desirable_service_flags(offered, tip_depth_blocks)
+}
+
+// --- Versionbits Warnings FFI ---
+
+#[derive(uniffi::Record)]
+pub struct FfiWarnPeriod {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[uniffi::export]
+pub fn warn_period_threshold(network: String) -> Result<FfiWarnPeriod, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let (start, end) = rbitcoin_net::warn_period_threshold(net);
+    Ok(FfiWarnPeriod { start, end })
+}
+
+#[uniffi::export]
+pub fn unknown_rules_warning(bit: i32) -> String {
+    rbitcoin_net::unknown_rules_warning(bit)
+}
+
+// --- Store Integrity FFI ---
+
+#[uniffi::export]
+pub fn merkle_root_from_txids(txids_hex: Vec<String>) -> Result<String, RustyError> {
+    let txids: Vec<[u8; 32]> = txids_hex
+        .iter()
+        .map(|h| {
+            let bytes = rbitcoin_primitives::hex_decode(h).map_err(|_| RustyError::InvalidInput)?;
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok(arr)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let root = rbitcoin_store::merkle_root_from_txids(&txids);
+    Ok(rbitcoin_primitives::hex_encode(root))
+}
+
+#[uniffi::export]
+pub fn block_wire_input_count(block_hex: String) -> Result<u32, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_store::block_wire_input_count(&bytes))
+}
+
 // --- Mempool Constants FFI ---
 
 #[uniffi::export]
@@ -659,6 +792,26 @@ impl FfiQuery {
             bytes,
             count: count as u64,
         }
+    }
+
+    pub fn soft_confirm_window(&self) -> u32 {
+        self.inner.soft_confirm_window()
+    }
+
+    pub fn fence_tip_height(&self) -> Option<u64> {
+        self.inner.fence_tip_height().map(|h| h as u64)
+    }
+
+    pub fn archived_block_count(&self) -> Result<u64, RustyError> {
+        self.inner.archived_block_count().map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn tx_body_count(&self) -> u64 {
+        self.inner.tx_body_count()
+    }
+
+    pub fn tx_head_occupied(&self) -> u64 {
+        self.inner.tx_head_occupied()
     }
 }
 
@@ -1123,5 +1276,99 @@ mod tests {
         let script_hex = "512103add177f3e3c6d9f3c8e4c5b9a7e2d1f0c3b6a5d8e7f4c1b0a3d6e5f8c7b4a1d0e3f6c5b8a7d4e1f0c3b6a5d8e7f4c1b0a3d6e5f8c7b4a1d0e3f6c5b8ac";
         let magic = signet_magic_hex(script_hex.to_string()).unwrap();
         assert_eq!(magic.len(), 8);
+    }
+
+    #[test]
+    fn test_default_signet_challenge() {
+        let challenge = default_signet_challenge_hex();
+        assert!(!challenge.is_empty());
+    }
+
+    #[test]
+    fn test_regtest_mining() {
+        assert_eq!(regtest_pow_bits(), 0x207f_ffff);
+        assert_eq!(regtest_block_spacing(), 600);
+        // Genesis hash for regtest is all zeros
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        assert!(!block_hex.is_empty());
+    }
+
+    #[test]
+    fn test_grind_regtest_pow() {
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        let bytes = hex_decode(block_hex.clone()).unwrap();
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes).unwrap();
+        let header_hex = bitcoin::consensus::encode::serialize_hex(&block.header);
+        let ground = grind_regtest_pow(header_hex).unwrap();
+        assert!(!ground.is_empty());
+    }
+
+    #[test]
+    fn test_is_final_tx() {
+        // A simple final tx (no locktime, sequence max)
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+        assert!(is_final_tx(tx_hex.to_string(), 100, 100).unwrap());
+    }
+
+    #[test]
+    fn test_bip34_height_script() {
+        let script = bip34_height_script(1);
+        assert!(!script.is_empty());
+    }
+
+    #[test]
+    fn test_local_service_flags() {
+        let flags = local_service_flags_u64();
+        assert!(flags > 0);
+    }
+
+    #[test]
+    fn test_desirable_service_flags() {
+        let offered = local_service_flags_u64();
+        let desirable = desirable_service_flags(offered, 0);
+        assert!(desirable > 0);
+        assert!(has_all_desirable_service_flags(offered, 0));
+    }
+
+    #[test]
+    fn test_versionbits_warnings() {
+        let period = warn_period_threshold("mainnet".to_string()).unwrap();
+        assert!(period.start > 0);
+        assert!(period.end > 0);
+        let warning = unknown_rules_warning(0);
+        assert!(!warning.is_empty());
+    }
+
+    #[test]
+    fn test_merkle_root_from_txids() {
+        let txids = vec![
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+        ];
+        let root = merkle_root_from_txids(txids).unwrap();
+        assert_eq!(root.len(), 64);
+    }
+
+    #[test]
+    fn test_block_wire_input_count() {
+        // Genesis block hex (regtest)
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        let count = block_wire_input_count(block_hex).unwrap();
+        assert_eq!(count, 1); // coinbase only
+    }
+
+    #[test]
+    fn test_query_extended_methods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query3").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.soft_confirm_window(), 0); // default unknown rate
+        assert_eq!(query.fence_tip_height(), None);
+        assert_eq!(query.archived_block_count().unwrap(), 0);
+        assert_eq!(query.tx_body_count(), 0);
+        assert_eq!(query.tx_head_occupied(), 0);
     }
 }

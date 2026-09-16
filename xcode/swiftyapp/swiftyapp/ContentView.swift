@@ -184,6 +184,9 @@ struct ContentView: View {
     @State private var peerConstantsResult = ""
     @State private var peerLogResult = ""
     @State private var moreConstantsResult = ""
+    @State private var keypairNetwork = "mainnet"
+    @State private var keypairResult = ""
+    @State private var keypairAddress = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3662,6 +3665,61 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Key & Address", systemImage: "key.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("bitcoin crate")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                Picker("Network", selection: $keypairNetwork) {
+                                    Text("mainnet").tag("mainnet")
+                                    Text("testnet").tag("testnet")
+                                    Text("regtest").tag("regtest")
+                                    Text("signet").tag("signet")
+                                }
+                                .pickerStyle(.menu)
+                                .tint(accentText)
+                                Button {
+                                    do {
+                                        let kp = try generateKeypair(network: keypairNetwork)
+                                        keypairResult = "pk: \(kp.publicKeyHex.prefix(16))…"
+                                        let addr = try p2wpkhAddressFromPubkey(pubkeyHex: kp.publicKeyHex, network: keypairNetwork)
+                                        keypairAddress = addr
+                                    } catch {
+                                        keypairResult = "error"
+                                        keypairAddress = ""
+                                    }
+                                } label: {
+                                    Label("Generate", systemImage: "arrow.clockwise.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+
+                            if !keypairResult.isEmpty {
+                                Text(keypairResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                            if !keypairAddress.isEmpty {
+                                Text(keypairAddress)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3713,6 +3771,7 @@ struct ContentView: View {
                                 "Soft densify + Esplora script + Esplora perf",
                                 "Peer constants + Peer logs",
                                 "More constants",
+                                "Key & Address generation",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

@@ -1628,6 +1628,40 @@ impl FfiQuery {
             .collect()
     }
 
+    pub fn block_queue_list_meta(&self) -> Vec<FfiQueuedBlockMeta> {
+        self.inner
+            .block_queue_list_meta()
+            .into_iter()
+            .map(|m| m.into())
+            .collect()
+    }
+
+    pub fn block_queue_has_height(&self, height: u32) -> bool {
+        self.inner.block_queue_has_height(height)
+    }
+
+    pub fn block_queue_hash_at_height(&self, height: u32) -> Option<String> {
+        self.inner
+            .block_queue_hash_at_height(height)
+            .map(rbitcoin_primitives::hex_encode)
+    }
+
+    pub fn block_queue_is_resolve_complete(&self, height: u32) -> bool {
+        self.inner.block_queue_is_resolve_complete(height)
+    }
+
+    pub fn block_queue_payload(&self, height: u32) -> Result<Option<Vec<u8>>, RustyError> {
+        self.inner
+            .block_queue_payload(height)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn block_queue_raw_payload(&self, height: u32) -> Result<Option<Vec<u8>>, RustyError> {
+        self.inner
+            .block_queue_raw_payload(height)
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -1803,6 +1837,31 @@ pub struct FfiBlockQueueStats {
     pub assign_stop_bytes: u64,
     pub bytes: u64,
     pub count: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiQueuedBlockMeta {
+    pub id: u64,
+    pub height: u32,
+    pub hash: String,
+    pub header_fk: u64,
+    pub payload_len: u64,
+    pub n_inputs: u32,
+    pub resolve_complete: bool,
+}
+
+impl From<rbitcoin_store::QueuedBlockMeta> for FfiQueuedBlockMeta {
+    fn from(m: rbitcoin_store::QueuedBlockMeta) -> Self {
+        Self {
+            id: m.id,
+            height: m.height,
+            hash: rbitcoin_primitives::hex_encode(m.hash),
+            header_fk: m.header_fk,
+            payload_len: m.payload_len,
+            n_inputs: m.n_inputs,
+            resolve_complete: m.resolve_complete,
+        }
+    }
 }
 
 // --- Mempool FFI ---
@@ -3028,6 +3087,12 @@ mod tests {
         assert_eq!(query.tip_header_fk().unwrap(), None);
         assert_eq!(query.head_drain_fk(), 0);
         assert!(query.block_queue_queued_heights().is_empty());
+        assert!(query.block_queue_list_meta().is_empty());
+        assert!(!query.block_queue_has_height(0));
+        assert_eq!(query.block_queue_hash_at_height(0), None);
+        assert!(!query.block_queue_is_resolve_complete(0));
+        assert_eq!(query.block_queue_payload(0).unwrap(), None);
+        assert_eq!(query.block_queue_raw_payload(0).unwrap(), None);
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
     }

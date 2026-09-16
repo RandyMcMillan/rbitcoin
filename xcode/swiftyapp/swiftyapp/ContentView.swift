@@ -35,6 +35,7 @@ struct ContentView: View {
     @State private var queryPath = ""
     @State private var queryBlockQueue = ""
     @State private var queryMoreResult = ""
+    @State private var queryListMetaResult = ""
     @State private var mempoolPath = ""
     @State private var mempoolLiveCount = ""
     @State private var mempoolSlotStats = ""
@@ -771,6 +772,31 @@ struct ContentView: View {
 
                             if !queryMoreResult.isEmpty {
                                 Text(queryMoreResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: queryPath)
+                                    let meta = query.blockQueueListMeta()
+                                    if meta.isEmpty {
+                                        queryListMetaResult = "empty"
+                                    } else {
+                                        let first = meta.first!
+                                        queryListMetaResult = "count=\(meta.count) first[id=\(first.id) h=\(first.height) hash=\(first.hash) fk=\(first.headerFk) len=\(first.payloadLen) inputs=\(first.nInputs) resolved=\(first.resolveComplete)]"
+                                    }
+                                } catch {
+                                    queryListMetaResult = "error"
+                                }
+                            } label: {
+                                Label("List block-queue meta", systemImage: "list.bullet.rectangle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryListMetaResult.isEmpty {
+                                Text(queryListMetaResult)
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(primaryText)
                             }

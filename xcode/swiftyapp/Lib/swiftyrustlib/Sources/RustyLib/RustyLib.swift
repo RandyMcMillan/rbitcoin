@@ -803,11 +803,23 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueCount()  -> UInt64
     
+    func blockQueueHasHeight(height: UInt32)  -> Bool
+    
+    func blockQueueHashAtHeight(height: UInt32)  -> String?
+    
+    func blockQueueIsResolveComplete(height: UInt32)  -> Bool
+    
+    func blockQueueListMeta()  -> [FfiQueuedBlockMeta]
+    
     func blockQueueMaxHeight()  -> UInt64?
+    
+    func blockQueuePayload(height: UInt32) throws  -> Data?
     
     func blockQueuePromotedCount()  -> UInt64
     
     func blockQueueQueuedHeights()  -> [UInt32]
+    
+    func blockQueueRawPayload(height: UInt32) throws  -> Data?
     
     func blockQueueSoftPressure()  -> Bool
     
@@ -1001,9 +1013,48 @@ open func blockQueueCount() -> UInt64 {
 })
 }
     
+open func blockQueueHasHeight(height: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_has_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func blockQueueHashAtHeight(height: UInt32) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_hash_at_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func blockQueueIsResolveComplete(height: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_is_resolve_complete(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func blockQueueListMeta() -> [FfiQueuedBlockMeta] {
+    return try!  FfiConverterSequenceTypeFfiQueuedBlockMeta.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_list_meta(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func blockQueueMaxHeight() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_max_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueuePayload(height: UInt32)throws  -> Data? {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_payload(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
     )
 })
 }
@@ -1018,6 +1069,14 @@ open func blockQueuePromotedCount() -> UInt64 {
 open func blockQueueQueuedHeights() -> [UInt32] {
     return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_queued_heights(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueRawPayload(height: UInt32)throws  -> Data? {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_raw_payload(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
     )
 })
 }
@@ -2589,6 +2648,112 @@ public func FfiConverterTypeFfiMempoolSlotStats_lower(_ value: FfiMempoolSlotSta
 }
 
 
+public struct FfiQueuedBlockMeta {
+    public var id: UInt64
+    public var height: UInt32
+    public var hash: String
+    public var headerFk: UInt64
+    public var payloadLen: UInt64
+    public var nInputs: UInt32
+    public var resolveComplete: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt64, height: UInt32, hash: String, headerFk: UInt64, payloadLen: UInt64, nInputs: UInt32, resolveComplete: Bool) {
+        self.id = id
+        self.height = height
+        self.hash = hash
+        self.headerFk = headerFk
+        self.payloadLen = payloadLen
+        self.nInputs = nInputs
+        self.resolveComplete = resolveComplete
+    }
+}
+
+
+
+extension FfiQueuedBlockMeta: Equatable, Hashable {
+    public static func ==(lhs: FfiQueuedBlockMeta, rhs: FfiQueuedBlockMeta) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.height != rhs.height {
+            return false
+        }
+        if lhs.hash != rhs.hash {
+            return false
+        }
+        if lhs.headerFk != rhs.headerFk {
+            return false
+        }
+        if lhs.payloadLen != rhs.payloadLen {
+            return false
+        }
+        if lhs.nInputs != rhs.nInputs {
+            return false
+        }
+        if lhs.resolveComplete != rhs.resolveComplete {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(height)
+        hasher.combine(hash)
+        hasher.combine(headerFk)
+        hasher.combine(payloadLen)
+        hasher.combine(nInputs)
+        hasher.combine(resolveComplete)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiQueuedBlockMeta: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiQueuedBlockMeta {
+        return
+            try FfiQueuedBlockMeta(
+                id: FfiConverterUInt64.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf), 
+                hash: FfiConverterString.read(from: &buf), 
+                headerFk: FfiConverterUInt64.read(from: &buf), 
+                payloadLen: FfiConverterUInt64.read(from: &buf), 
+                nInputs: FfiConverterUInt32.read(from: &buf), 
+                resolveComplete: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiQueuedBlockMeta, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.id, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+        FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterUInt64.write(value.headerFk, into: &buf)
+        FfiConverterUInt64.write(value.payloadLen, into: &buf)
+        FfiConverterUInt32.write(value.nInputs, into: &buf)
+        FfiConverterBool.write(value.resolveComplete, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQueuedBlockMeta_lift(_ buf: RustBuffer) throws -> FfiQueuedBlockMeta {
+    return try FfiConverterTypeFfiQueuedBlockMeta.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQueuedBlockMeta_lower(_ value: FfiQueuedBlockMeta) -> RustBuffer {
+    return FfiConverterTypeFfiQueuedBlockMeta.lower(value)
+}
+
+
 public struct FfiServePerfSample {
     public var n: UInt64
     public var bytes: UInt64
@@ -3256,6 +3421,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiChainView: FfiConverterRustBuffer {
     typealias SwiftType = FfiChainView?
 
@@ -3519,6 +3708,31 @@ fileprivate struct FfiConverterSequenceTypeFfiInboundEvictCandidate: FfiConverte
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiInboundEvictCandidate.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiQueuedBlockMeta: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiQueuedBlockMeta]
+
+    public static func write(_ value: [FfiQueuedBlockMeta], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiQueuedBlockMeta.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiQueuedBlockMeta] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiQueuedBlockMeta]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiQueuedBlockMeta.read(from: &buf))
         }
         return seq
     }
@@ -5765,13 +5979,31 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_count() != 45316) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_has_height() != 41358) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_hash_at_height() != 22869) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_is_resolve_complete() != 18553) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_list_meta() != 63167) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_max_height() != 61436) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_payload() != 53504) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_promoted_count() != 34768) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_queued_heights() != 4259) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_raw_payload() != 6394) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_soft_pressure() != 43521) {

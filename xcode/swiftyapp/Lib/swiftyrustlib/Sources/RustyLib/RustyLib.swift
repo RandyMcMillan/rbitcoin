@@ -787,9 +787,17 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueMaxHeight()  -> UInt64?
     
+    func blockQueuePromotedCount()  -> UInt64
+    
+    func blockQueueSoftPressure()  -> Bool
+    
     func blockQueueStats()  -> FfiBlockQueueStats
     
+    func blockQueueTakeRawCloneN()  -> UInt64
+    
     func blockQueueUpdateSoftPressure(rateBlocksPerS: Double?)  -> Bool
+    
+    func classAHi()  -> UInt64?
     
     func clearArchivedBody(hashHex: String) throws  -> Bool
     
@@ -805,7 +813,11 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func fenceTipHeight()  -> UInt64?
     
+    func flush() throws 
+    
     func flushForShutdown() throws 
+    
+    func flushHeaderArchive() throws 
     
     func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
     
@@ -825,6 +837,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func isOutpointSpentAt(txidHex: String, vout: UInt32, tip: UInt32?) throws  -> Bool
     
+    func lookupStartedHi()  -> UInt64?
+    
     func lookupTakenHi()  -> UInt64?
     
     func maxShCreates()  -> UInt32
@@ -837,11 +851,15 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func pinShChainView() throws  -> FfiChainView?
     
+    func pointEdgeCount()  -> UInt64
+    
     func requestConfirmCancel() 
     
     func sampleResetReconstructArchived()  -> UInt64
     
     func sampleResetThinTweakBodyBytes()  -> UInt64
+    
+    func scripthashEntryCount()  -> UInt64
     
     func setMaxShCreates(n: UInt32) 
     
@@ -852,6 +870,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func softConfirmWindow()  -> UInt32
     
     func spendIndexEnabled()  -> Bool
+    
+    func tipHeaderFk() throws  -> UInt64?
     
     func tipHeight()  -> UInt64?
     
@@ -966,9 +986,30 @@ open func blockQueueMaxHeight() -> UInt64? {
 })
 }
     
+open func blockQueuePromotedCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_promoted_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueSoftPressure() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_soft_pressure(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func blockQueueStats() -> FfiBlockQueueStats {
     return try!  FfiConverterTypeFfiBlockQueueStats.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_stats(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueTakeRawCloneN() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_take_raw_clone_n(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -977,6 +1018,13 @@ open func blockQueueUpdateSoftPressure(rateBlocksPerS: Double?) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_update_soft_pressure(self.uniffiClonePointer(),
         FfiConverterOptionDouble.lower(rateBlocksPerS),$0
+    )
+})
+}
+    
+open func classAHi() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_class_a_hi(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1035,8 +1083,20 @@ open func fenceTipHeight() -> UInt64? {
 })
 }
     
+open func flush()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_flush(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func flushForShutdown()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_flush_for_shutdown(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func flushHeaderArchive()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_flush_header_archive(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -1115,6 +1175,13 @@ open func isOutpointSpentAt(txidHex: String, vout: UInt32, tip: UInt32?)throws  
 })
 }
     
+open func lookupStartedHi() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_lookup_started_hi(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func lookupTakenHi() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_lookup_taken_hi(self.uniffiClonePointer(),$0
@@ -1157,6 +1224,13 @@ open func pinShChainView()throws  -> FfiChainView? {
 })
 }
     
+open func pointEdgeCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_point_edge_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func requestConfirmCancel() {try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_request_confirm_cancel(self.uniffiClonePointer(),$0
     )
@@ -1173,6 +1247,13 @@ open func sampleResetReconstructArchived() -> UInt64 {
 open func sampleResetThinTweakBodyBytes() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_sample_reset_thin_tweak_body_bytes(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func scripthashEntryCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_scripthash_entry_count(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1208,6 +1289,13 @@ open func softConfirmWindow() -> UInt32 {
 open func spendIndexEnabled() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_spend_index_enabled(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tipHeaderFk()throws  -> UInt64? {
+    return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tip_header_fk(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -5493,10 +5581,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_max_height() != 61436) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_promoted_count() != 34768) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_soft_pressure() != 43521) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_stats() != 60518) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_take_raw_clone_n() != 24052) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_update_soft_pressure() != 59654) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_class_a_hi() != 33403) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_clear_archived_body() != 5629) {
@@ -5520,7 +5620,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_fence_tip_height() != 44726) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_flush() != 21656) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_flush_for_shutdown() != 62355) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_flush_header_archive() != 39215) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_get_header_by_hash() != 39748) {
@@ -5550,6 +5656,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_is_outpoint_spent_at() != 60926) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_lookup_started_hi() != 12161) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_lookup_taken_hi() != 41401) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5568,6 +5677,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_pin_sh_chain_view() != 23094) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_point_edge_count() != 22384) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_request_confirm_cancel() != 48956) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5575,6 +5687,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_sample_reset_thin_tweak_body_bytes() != 47600) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_scripthash_entry_count() != 11033) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_set_max_sh_creates() != 45313) {
@@ -5590,6 +5705,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_spend_index_enabled() != 28416) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tip_header_fk() != 41103) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tip_height() != 22733) {

@@ -29,6 +29,7 @@ struct ContentView: View {
     @State private var storeSplit = ""
     @State private var queryPath = ""
     @State private var queryBlockQueue = ""
+    @State private var queryMoreResult = ""
     @State private var mempoolPath = ""
     @State private var mempoolLiveCount = ""
     @State private var mempoolSlotStats = ""
@@ -672,6 +673,32 @@ struct ContentView: View {
                             if !queryBlockQueue.isEmpty {
                                 Text(queryBlockQueue)
                                     .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: queryPath)
+                                    let started = query.lookupStartedHi().map(String.init) ?? "none"
+                                    let classA = query.classAHi().map(String.init) ?? "none"
+                                    let softPressure = query.blockQueueSoftPressure() ? "yes" : "no"
+                                    let promoted = query.blockQueuePromotedCount()
+                                    let scCount = query.scripthashEntryCount()
+                                    let edgeCount = query.pointEdgeCount()
+                                    let tipFk = try query.tipHeaderFk().map { String($0) } ?? "none"
+                                    queryMoreResult = "started=\(started) classA=\(classA) pressure=\(softPressure) promoted=\(promoted) sh=\(scCount) edge=\(edgeCount) tipFk=\(tipFk)"
+                                } catch {
+                                    queryMoreResult = "error"
+                                }
+                            } label: {
+                                Label("Read more stats", systemImage: "chart.bar.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryMoreResult.isEmpty {
+                                Text(queryMoreResult)
+                                    .font(.caption.weight(.semibold))
                                     .foregroundStyle(primaryText)
                             }
                         }

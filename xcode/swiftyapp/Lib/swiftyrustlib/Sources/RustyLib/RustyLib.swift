@@ -1788,6 +1788,10 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func flushHeaderArchive() throws 
     
+    func getFkByTxid(txidHex: String) throws  -> UInt64?
+    
+    func getFkByTxidTip(txidHex: String) throws  -> UInt64?
+    
     func getHeader(fk: UInt64) throws  -> FfiHeaderRecord
     
     func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
@@ -1937,6 +1941,22 @@ open func flushHeaderArchive()throws  {try rustCallWithError(FfiConverterTypeRus
     uniffi_rustylib_fn_method_ffistore_flush_header_archive(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+open func getFkByTxid(txidHex: String)throws  -> UInt64? {
+    return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_fk_by_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func getFkByTxidTip(txidHex: String)throws  -> UInt64? {
+    return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_fk_by_txid_tip(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
 }
     
 open func getHeader(fk: UInt64)throws  -> FfiHeaderRecord {
@@ -6880,6 +6900,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_flush_header_archive() != 19979) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_fk_by_txid() != 13218) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_fk_by_txid_tip() != 3315) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_get_header() != 23114) {

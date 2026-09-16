@@ -1498,6 +1498,24 @@ impl FfiStore {
             .tx_height_get(rbitcoin_primitives::Fk(tx_fk))
             .map_err(|_| RustyError::StoreError)
     }
+
+    pub fn get_fk_by_txid(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let fk = self
+            .inner
+            .get_fk_by_txid(&txid)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.map(|f| f.0))
+    }
+
+    pub fn get_fk_by_txid_tip(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let fk = self
+            .inner
+            .get_fk_by_txid_tip(&txid)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.map(|f| f.0))
+    }
 }
 
 // --- Query FFI ---
@@ -3383,6 +3401,8 @@ mod tests {
         let path = tmp.path().join("store3").to_str().unwrap().to_string();
         let store = FfiStore::open_or_create(path).unwrap();
         assert_eq!(store.tx_height_get(1).unwrap(), None);
+        assert_eq!(store.get_fk_by_txid("0".repeat(64)).unwrap(), None);
+        assert_eq!(store.get_fk_by_txid_tip("0".repeat(64)).unwrap(), None);
     }
 
     #[test]

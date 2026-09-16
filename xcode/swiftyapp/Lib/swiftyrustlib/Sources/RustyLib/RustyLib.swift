@@ -935,6 +935,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func putHeader(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UInt32, nonce: UInt32, merkleRootHex: String, hashHex: String, size: UInt32, weight: UInt32) throws  -> UInt64
     
+    func putSpend(outTxidHex: String, outIndex: UInt32, spendingTxFk: UInt64, spendingVin: UInt32) throws  -> UInt64
+    
     func requestConfirmCancel() 
     
     func sampleResetReconstructArchived()  -> UInt64
@@ -1454,6 +1456,17 @@ open func putHeader(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UIn
         FfiConverterString.lower(hashHex),
         FfiConverterUInt32.lower(size),
         FfiConverterUInt32.lower(weight),$0
+    )
+})
+}
+    
+open func putSpend(outTxidHex: String, outIndex: UInt32, spendingTxFk: UInt64, spendingVin: UInt32)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_put_spend(self.uniffiClonePointer(),
+        FfiConverterString.lower(outTxidHex),
+        FfiConverterUInt32.lower(outIndex),
+        FfiConverterUInt64.lower(spendingTxFk),
+        FfiConverterUInt32.lower(spendingVin),$0
     )
 })
 }
@@ -6711,6 +6724,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_put_header() != 31999) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_put_spend() != 12976) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_request_confirm_cancel() != 48956) {

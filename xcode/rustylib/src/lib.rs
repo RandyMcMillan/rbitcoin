@@ -1913,6 +1913,21 @@ impl FfiQuery {
         Ok(fk.0)
     }
 
+    pub fn put_spend(
+        &self,
+        out_txid_hex: String,
+        out_index: u32,
+        spending_tx_fk: u64,
+        spending_vin: u32,
+    ) -> Result<u64, RustyError> {
+        let out_txid = parse_hash32(&out_txid_hex)?;
+        let fk = self
+            .inner
+            .put_spend(&out_txid, out_index, rbitcoin_primitives::Fk(spending_tx_fk), spending_vin)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.0)
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -3424,6 +3439,14 @@ mod tests {
         let header = query.get_header(fk).unwrap();
         assert_eq!(header.version, 0x20000000);
         assert_eq!(header.timestamp, 1231006505);
+    }
+
+    #[test]
+    fn test_query_put_spend_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query6").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert!(query.put_spend("0".repeat(64), 0, 1, 0).is_err());
     }
 
     #[test]

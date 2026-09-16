@@ -1928,6 +1928,20 @@ impl FfiQuery {
         Ok(fk.0)
     }
 
+    pub fn set_tx_index(&self, enabled: bool) {
+        self.inner.set_tx_index(enabled);
+    }
+
+    pub fn set_spend_index(&self, enabled: bool) {
+        self.inner.set_spend_index(enabled);
+    }
+
+    pub fn unspent_create_vouts(&self, create_fk: u64, vouts: Vec<u32>) -> Result<Vec<u32>, RustyError> {
+        self.inner
+            .unspent_create_vouts(rbitcoin_primitives::Fk(create_fk), &vouts)
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -3447,6 +3461,15 @@ mod tests {
         let path = tmp.path().join("query6").to_str().unwrap().to_string();
         let query = FfiQuery::open_or_create(path).unwrap();
         assert!(query.put_spend("0".repeat(64), 0, 1, 0).is_err());
+        query.set_tx_index(true);
+        assert!(query.tx_index_enabled());
+        query.set_tx_index(false);
+        assert!(!query.tx_index_enabled());
+        query.set_spend_index(true);
+        assert!(query.spend_index_enabled());
+        query.set_spend_index(false);
+        assert!(!query.spend_index_enabled());
+        assert!(query.unspent_create_vouts(1, vec![0, 1]).is_err());
     }
 
     #[test]

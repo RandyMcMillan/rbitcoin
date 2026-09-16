@@ -953,6 +953,10 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func setMaxShCreates(n: UInt32) 
     
+    func setSpendIndex(enabled: Bool) 
+    
+    func setTxIndex(enabled: Bool) 
+    
     func shIndexEnabled()  -> Bool
     
     func shIndexedThroughHeight()  -> UInt64?
@@ -988,6 +992,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func txOutput(txidHex: String, vout: UInt32) throws  -> FfiOutputRecord
     
     func txOutputAtFk(createFk: UInt64, vout: UInt32) throws  -> FfiOutputRecord
+    
+    func unspentCreateVouts(createFk: UInt64, vouts: [UInt32]) throws  -> [UInt32]
     
     func validateHeader(network: String, height: UInt32, headerHex: String) throws 
     
@@ -1526,6 +1532,20 @@ open func setMaxShCreates(n: UInt32) {try! rustCall() {
 }
 }
     
+open func setSpendIndex(enabled: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_set_spend_index(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+    
+open func setTxIndex(enabled: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_set_tx_index(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+    
 open func shIndexEnabled() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_sh_index_enabled(self.uniffiClonePointer(),$0
@@ -1665,6 +1685,15 @@ open func txOutputAtFk(createFk: UInt64, vout: UInt32)throws  -> FfiOutputRecord
     uniffi_rustylib_fn_method_ffiquery_tx_output_at_fk(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(createFk),
         FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func unspentCreateVouts(createFk: UInt64, vouts: [UInt32])throws  -> [UInt32] {
+    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_unspent_create_vouts(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(createFk),
+        FfiConverterSequenceUInt32.lower(vouts),$0
     )
 })
 }
@@ -6753,6 +6782,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_set_max_sh_creates() != 45313) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_set_spend_index() != 53842) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_set_tx_index() != 8988) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_sh_index_enabled() != 26927) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6805,6 +6840,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tx_output_at_fk() != 24851) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_unspent_create_vouts() != 53168) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_validate_header() != 45565) {

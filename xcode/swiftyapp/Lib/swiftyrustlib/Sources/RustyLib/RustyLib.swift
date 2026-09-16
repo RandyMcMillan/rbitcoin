@@ -793,6 +793,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func clearArchivedBody(hashHex: String) throws  -> Bool
     
+    func clearConfirmCancel() 
+    
     func confirmBlock(height: UInt32, hashHex: String) throws  -> UInt64
     
     func confirmCancelled()  -> Bool
@@ -826,6 +828,10 @@ public protocol FfiQueryProtocol : AnyObject {
     func maxShCreates()  -> UInt32
     
     func medianTimePast(height: UInt32) throws  -> UInt32
+    
+    func onLoadPack() throws 
+    
+    func requestConfirmCancel() 
     
     func sampleResetReconstructArchived()  -> UInt64
     
@@ -977,6 +983,12 @@ open func clearArchivedBody(hashHex: String)throws  -> Bool {
 })
 }
     
+open func clearConfirmCancel() {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_clear_confirm_cancel(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func confirmBlock(height: UInt32, hashHex: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_confirm_block(self.uniffiClonePointer(),
@@ -1109,6 +1121,18 @@ open func medianTimePast(height: UInt32)throws  -> UInt32 {
         FfiConverterUInt32.lower(height),$0
     )
 })
+}
+    
+open func onLoadPack()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_on_load_pack(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func requestConfirmCancel() {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_request_confirm_cancel(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func sampleResetReconstructArchived() -> UInt64 {
@@ -1883,6 +1907,96 @@ public func FfiConverterTypeFfiMempoolSlotStats_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeFfiMempoolSlotStats_lower(_ value: FfiMempoolSlotStats) -> RustBuffer {
     return FfiConverterTypeFfiMempoolSlotStats.lower(value)
+}
+
+
+public struct FfiServePerfSample {
+    public var n: UInt64
+    public var bytes: UInt64
+    public var ntx: UInt64
+    public var wallNs: UInt64
+    public var maxNs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(n: UInt64, bytes: UInt64, ntx: UInt64, wallNs: UInt64, maxNs: UInt64) {
+        self.n = n
+        self.bytes = bytes
+        self.ntx = ntx
+        self.wallNs = wallNs
+        self.maxNs = maxNs
+    }
+}
+
+
+
+extension FfiServePerfSample: Equatable, Hashable {
+    public static func ==(lhs: FfiServePerfSample, rhs: FfiServePerfSample) -> Bool {
+        if lhs.n != rhs.n {
+            return false
+        }
+        if lhs.bytes != rhs.bytes {
+            return false
+        }
+        if lhs.ntx != rhs.ntx {
+            return false
+        }
+        if lhs.wallNs != rhs.wallNs {
+            return false
+        }
+        if lhs.maxNs != rhs.maxNs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(n)
+        hasher.combine(bytes)
+        hasher.combine(ntx)
+        hasher.combine(wallNs)
+        hasher.combine(maxNs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiServePerfSample: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiServePerfSample {
+        return
+            try FfiServePerfSample(
+                n: FfiConverterUInt64.read(from: &buf), 
+                bytes: FfiConverterUInt64.read(from: &buf), 
+                ntx: FfiConverterUInt64.read(from: &buf), 
+                wallNs: FfiConverterUInt64.read(from: &buf), 
+                maxNs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiServePerfSample, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.n, into: &buf)
+        FfiConverterUInt64.write(value.bytes, into: &buf)
+        FfiConverterUInt64.write(value.ntx, into: &buf)
+        FfiConverterUInt64.write(value.wallNs, into: &buf)
+        FfiConverterUInt64.write(value.maxNs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiServePerfSample_lift(_ buf: RustBuffer) throws -> FfiServePerfSample {
+    return try FfiConverterTypeFfiServePerfSample.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiServePerfSample_lower(_ value: FfiServePerfSample) -> RustBuffer {
+    return FfiConverterTypeFfiServePerfSample.lower(value)
 }
 
 
@@ -2929,6 +3043,22 @@ public func feeRateSatPerKvb(feeSat: UInt64, weight: UInt64) -> UInt64 {
     )
 })
 }
+public func formatDisconnectTipLine(height: UInt32, hashHex: String, nTx: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_format_disconnect_tip_line(
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(hashHex),
+        FfiConverterUInt32.lower(nTx),$0
+    )
+})
+}
+public func formatServePerf(sample: FfiServePerfSample) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_format_serve_perf(
+        FfiConverterTypeFfiServePerfSample.lower(sample),$0
+    )
+})
+}
 public func genesisBlockHash(network: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_genesis_block_hash(
@@ -3328,6 +3458,12 @@ public func rustHello() -> String {
     )
 })
 }
+public func sampleResetServePerf() -> FfiServePerfSample {
+    return try!  FfiConverterTypeFfiServePerfSample.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_sample_reset_serve_perf($0
+    )
+})
+}
 public func scriptSigops(scriptHex: String, accurate: Bool)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_script_sigops(
@@ -3587,6 +3723,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_fee_rate_sat_per_kvb() != 56144) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_format_disconnect_tip_line() != 30018) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_format_serve_perf() != 24386) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_genesis_block_hash() != 47359) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3752,6 +3894,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_rust_hello() != 11814) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_sample_reset_serve_perf() != 14009) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_script_sigops() != 10909) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3854,6 +3999,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_clear_archived_body() != 5629) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_clear_confirm_cancel() != 1404) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_confirm_block() != 61964) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3903,6 +4051,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_median_time_past() != 38475) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_on_load_pack() != 59619) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_request_confirm_cancel() != 48956) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_sample_reset_reconstruct_archived() != 25053) {

@@ -181,6 +181,8 @@ struct ContentView: View {
     @State private var esploraScriptNetwork = "mainnet"
     @State private var esploraScriptResult = ""
     @State private var esploraPerfResult = ""
+    @State private var peerConstantsResult = ""
+    @State private var peerLogResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3564,6 +3566,58 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Peer constants", systemImage: "antenna.radiowaves.left.and.right")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let ban = banScoreThreshold()
+                                let maxServe = maxServeBlocks()
+                                let minVer = minPeerProtoVersion()
+                                let timeout = handshakeTimeoutSecs()
+                                peerConstantsResult = "ban=\(ban) maxServe=\(maxServe) minVer=\(minVer) timeout=\(timeout)s"
+                            } label: {
+                                Label("Load peer constants", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !peerConstantsResult.isEmpty {
+                                Text(peerConstantsResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+
+                            Button {
+                                let log1 = feelerConnectionCompletedLog()
+                                let log2 = versionHandshakeTimeoutLog(peer: 1)
+                                let log3 = obsoleteVersionLog(version: 70015, peer: 1)
+                                peerLogResult = "\(log1.prefix(20))… | \(log2.prefix(20))…"
+                            } label: {
+                                Label("Sample peer logs", systemImage: "doc.text.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !peerLogResult.isEmpty {
+                                Text(peerLogResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3613,6 +3667,7 @@ struct ContentView: View {
                                 "Last height + Seal subscribe",
                                 "Script hash",
                                 "Soft densify + Esplora script + Esplora perf",
+                                "Peer constants + Peer logs",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

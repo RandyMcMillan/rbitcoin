@@ -41,30 +41,28 @@ pub use compact::{
 pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
-pub use i2p_sam::I2pSam;
+pub use i2p_sam::I2Psam;
 pub use ibd::{
-<<<<<<< HEAD
     connect_timeout_for, format_tip_perf_sizes, read_platform_rss, rehydrate_block_queue_residue,
     IbdConfig, ProcessRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
+    is_bad_prev_err, read_platform_rss as read_proc_rss, ProcessRss as ProcRss,
 };
-pub use most_work::{sum_work, WorkOverflow};
+pub use most_work::{sum_work, work_better, WorkOverflow};
 pub use net_permissions::{
     apply_implicit, parse_whitebind, parse_whitelist, NetPermTable, NetPermissionFlags,
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
 pub use netaddr::{is_cjdns_ip, NetAddr, OnlyNet};
-=======
-    format_tip_perf_sizes, is_bad_prev_err, read_proc_rss, rehydrate_block_queue_residue,
-    IbdConfig, ProcRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
-};
-pub use most_work::{sum_work, work_better};
->>>>>>> 79363b31a (ffi: expose work_better, is_bad_prev_err, headers_download_timeout_secs, pick_stale_follow_evict, apply_witness_commitment)
 pub use netgroup::netgroup;
 pub use peer::{
-    desirable_service_flags, drain_pending_now, flush_tx_invs, force_announce_txid,
+    addrv2_message_size_log, advertising_address_log, connected_to_self_log,
+    desirable_service_flags, drain_pending_now, expected_services_disconnect_log,
+    feeler_connection_completed_log, flush_tx_invs, force_announce_txid,
     has_all_desirable_service_flags, local_service_flags, local_service_flags_pruned,
-    run_feeler_timed, set_compact_filters_service, PendingBlocks, V2PlainSession,
-    MAX_SERVE_BLOCKS,
+    non_version_before_handshake_log, obsolete_version_log, ping_prior_to_verack_log,
+    run_feeler_timed, sendaddrv2_after_verack_log, set_compact_filters_service,
+    unsupported_before_verack_log, version_handshake_timeout_log, PendingBlocks, V2PlainSession,
+    BAN_SCORE_THRESHOLD, HANDSHAKE_TIMEOUT, MAX_SERVE_BLOCKS, MIN_PEER_PROTO_VERSION,
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{
@@ -77,10 +75,9 @@ pub(crate) use rbitcoin_mempool::MempoolGraphStats;
 pub use rbitcoin_mempool::{AcceptError, Selected};
 pub use reactor::BlockingRegion;
 pub use seeds::{
-    default_port, default_rpc_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds,
-    default_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts, required_seed_services,
-    resolve_dns_seeds, resolve_fixed_seeds, seed_lookup_names, socks_dns_seed_dests, AddrMan,
-    PeerEntry, PeerFlags, MAX_ADDR_MAN,
+    default_port, default_rpc_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts,
+    required_seed_services, resolve_all_seeds, resolve_dns_seeds, resolve_fixed_seeds,
+    seed_lookup_names, socks_dns_seed_dests, AddrMan, PeerEntry, PeerFlags, MAX_ADDR_MAN,
 };
 pub use serve_perf::{
     format_serve_perf, sample_reset_serve_perf, serve_perf_totals, ServePerfSample,

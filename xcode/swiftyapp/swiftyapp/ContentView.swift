@@ -92,6 +92,15 @@ struct ContentView: View {
     @State private var asmapResult = ""
     @State private var queryDrainResult = ""
     @State private var queryShResult = ""
+    @State private var blockStructHex = ""
+    @State private var blockStructResult = ""
+    @State private var netgroupIp = "1.2.3.4"
+    @State private var netgroupPort = "8333"
+    @State private var netgroupResult = ""
+    @State private var workHexes = ""
+    @State private var workResult = ""
+    @State private var tweaksHeight = "0"
+    @State private var tweaksResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -1800,6 +1809,191 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Block structure", systemImage: "cube.transparent")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hex", text: $blockStructHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = blockStructHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        blockStructResult = ""
+                                        return
+                                    }
+                                    do {
+                                        try validateBlockStructure(blockHex: hex, network: "regtest", height: 0, enforceHeightGates: true)
+                                        blockStructResult = "Valid structure"
+                                    } catch {
+                                        blockStructResult = "Invalid structure"
+                                    }
+                                } label: {
+                                    Label("Validate", systemImage: "checkmark.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !blockStructResult.isEmpty {
+                                    Text(blockStructResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Netgroup", systemImage: "network")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("IP", text: $netgroupIp)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 120)
+                                TextField("Port", text: $netgroupPort)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                Button {
+                                    guard let port = UInt16(netgroupPort) else {
+                                        netgroupResult = "invalid port"
+                                        return
+                                    }
+                                    do {
+                                        let group = try netgroup(ip: netgroupIp, port: port, asmapHex: nil)
+                                        netgroupResult = "group: \(group)"
+                                    } catch {
+                                        netgroupResult = "error"
+                                    }
+                                } label: {
+                                    Label("Lookup", systemImage: "arrow.right.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !netgroupResult.isEmpty {
+                                Text(netgroupResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Work sum", systemImage: "sum")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Work hexes (comma-separated)", text: $workHexes)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hexes = workHexes.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                    guard !hexes.isEmpty else {
+                                        workResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let sum = try sumWorkHex(workHexes: hexes)
+                                        workResult = sum
+                                    } catch {
+                                        workResult = "invalid"
+                                    }
+                                } label: {
+                                    Label("Sum", systemImage: "plus.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !workResult.isEmpty {
+                                    Text(workResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("SP tweaks at height", systemImage: "ear.badge.waveform")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Height", text: $tweaksHeight)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                Button {
+                                    guard let height = UInt32(tweaksHeight) else {
+                                        tweaksResult = "invalid height"
+                                        return
+                                    }
+                                    do {
+                                        let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-sp")
+                                        let tweaks = try query.tweaksAtHeight(network: "mainnet", height: height)
+                                        tweaksResult = "\(tweaks.count) tweaks"
+                                    } catch {
+                                        tweaksResult = "error"
+                                    }
+                                } label: {
+                                    Label("Load", systemImage: "arrow.down.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !tweaksResult.isEmpty {
+                                Text(tweaksResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -1827,6 +2021,8 @@ struct ContentView: View {
                                 "Query tx lookup + Warnings",
                                 "Silent payments + ASMap",
                                 "Query internals",
+                                "Block structure + Netgroup",
+                                "Work sum + SP tweaks",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

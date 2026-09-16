@@ -1883,6 +1883,36 @@ impl FfiQuery {
         Ok(output.into())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_header(
+        &self,
+        prev_fk: u64,
+        version: i32,
+        timestamp: u32,
+        bits: u32,
+        nonce: u32,
+        merkle_root_hex: String,
+        hash_hex: String,
+        size: u32,
+        weight: u32,
+    ) -> Result<u64, RustyError> {
+        let merkle_root = parse_hash32(&merkle_root_hex)?;
+        let hash = parse_hash32(&hash_hex)?;
+        let rec = rbitcoin_store::HeaderRecord {
+            prev_fk: rbitcoin_primitives::Fk(prev_fk),
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root,
+            hash,
+            size,
+            weight,
+        };
+        let fk = self.inner.put_header(&rec).map_err(|_| RustyError::StoreError)?;
+        Ok(fk.0)
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -3379,6 +3409,21 @@ mod tests {
         assert!(query.tx_output("0".repeat(64), 0).is_err());
         assert!(query.tx_input_at_fk(1, 0).is_err());
         assert!(query.tx_output_at_fk(1, 0).is_err());
+    }
+
+    #[test]
+    fn test_query_put_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query5").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let zero_hash = "0".repeat(64);
+        let fk = query
+            .put_header(0, 0x20000000, 1231006505, 0x1d00ffff, 2083236893, zero_hash.clone(), zero_hash.clone(), 80, 320)
+            .unwrap();
+        assert!(fk > 0);
+        let header = query.get_header(fk).unwrap();
+        assert_eq!(header.version, 0x20000000);
+        assert_eq!(header.timestamp, 1231006505);
     }
 
     #[test]

@@ -933,6 +933,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func pointEdgeCount()  -> UInt64
     
+    func putHeader(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UInt32, nonce: UInt32, merkleRootHex: String, hashHex: String, size: UInt32, weight: UInt32) throws  -> UInt64
+    
     func requestConfirmCancel() 
     
     func sampleResetReconstructArchived()  -> UInt64
@@ -1436,6 +1438,22 @@ open func pinShChainView()throws  -> FfiChainView? {
 open func pointEdgeCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_point_edge_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func putHeader(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UInt32, nonce: UInt32, merkleRootHex: String, hashHex: String, size: UInt32, weight: UInt32)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_put_header(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(prevFk),
+        FfiConverterInt32.lower(version),
+        FfiConverterUInt32.lower(timestamp),
+        FfiConverterUInt32.lower(bits),
+        FfiConverterUInt32.lower(nonce),
+        FfiConverterString.lower(merkleRootHex),
+        FfiConverterString.lower(hashHex),
+        FfiConverterUInt32.lower(size),
+        FfiConverterUInt32.lower(weight),$0
     )
 })
 }
@@ -6690,6 +6708,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_point_edge_count() != 22384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_put_header() != 31999) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_request_confirm_cancel() != 48956) {

@@ -4597,6 +4597,12 @@ public func rpcCallJson(host: String, port: UInt16, user: String, password: Stri
     )
 })
 }
+public func rpcPerUtxoOverhead() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_rpc_per_utxo_overhead($0
+    )
+})
+}
 public func rustAdd(a: UInt32, b: UInt32) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_rust_add(
@@ -5444,6 +5450,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_rpc_call_json() != 63144) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_rpc_per_utxo_overhead() != 30582) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_rust_add() != 47653) {

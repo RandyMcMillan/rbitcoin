@@ -1995,6 +1995,11 @@ pub fn percentiles_by_weight(
     Ok(result.to_vec())
 }
 
+#[uniffi::export]
+pub fn rpc_per_utxo_overhead() -> i64 {
+    rbitcoin_rpc::PER_UTXO_OVERHEAD
+}
+
 // --- Work Comparison FFI ---
 
 #[uniffi::export]
@@ -3665,6 +3670,11 @@ mod tests {
     fn test_percentiles_by_weight_mismatch() {
         let result = percentiles_by_weight(vec![1, 2], vec![10], 10);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rpc_per_utxo_overhead() {
+        assert_eq!(rpc_per_utxo_overhead(), 41);
     }
 
     #[test]

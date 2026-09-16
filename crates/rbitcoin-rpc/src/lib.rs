@@ -10,6 +10,7 @@ mod server;
 pub use auth::{default_socket_path, default_token_path, read_cookie_file, RpcAuth};
 pub use blockstats::{
     is_unspendable, percentiles_by_weight, truncated_median, txout_serialized_size,
+    PER_UTXO_OVERHEAD,
 };
 pub use methods::{
     difficulty_rpc_f64, gbt_template, submit_received_block, RpcActive, RpcContext, RpcRegtest,

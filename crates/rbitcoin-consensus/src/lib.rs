@@ -62,7 +62,7 @@ pub use block::{
     bip34_height_script, bip68_active_for_tx, block_has_witness, block_subsidy, check_block_wire,
     is_final_tx, legacy_sigop_count, sequence_locks_satisfied, tx_gbt_sigops, tx_sigop_cost,
     validate_block_structure, witness_commitment_script, ValidationContext, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
+    MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT, apply_witness_commitment,
 };
 pub(crate) use block::{validate_block_structure_hashed, TxPrecompute};
 pub use clock::{with_now, NodeClock};

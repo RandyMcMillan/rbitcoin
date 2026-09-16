@@ -33,7 +33,7 @@ mod versionbits_warn;
 
 pub use asmap::{interpret, ip16_for_lookup, sanity_check, AsMap, TWO_PREFIX_ASMAP};
 pub use cache::BlockCache;
-pub use chain::{AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
+pub use chain::{headers_download_timeout_secs, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use compact::{
     classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
     CmpctPeerFrame,
@@ -43,6 +43,7 @@ pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
 pub use i2p_sam::I2pSam;
 pub use ibd::{
+<<<<<<< HEAD
     connect_timeout_for, format_tip_perf_sizes, read_platform_rss, rehydrate_block_queue_residue,
     IbdConfig, ProcessRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
@@ -52,6 +53,12 @@ pub use net_permissions::{
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
 pub use netaddr::{is_cjdns_ip, NetAddr, OnlyNet};
+=======
+    format_tip_perf_sizes, is_bad_prev_err, read_proc_rss, rehydrate_block_queue_residue,
+    IbdConfig, ProcRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
+};
+pub use most_work::{sum_work, work_better};
+>>>>>>> 79363b31a (ffi: expose work_better, is_bad_prev_err, headers_download_timeout_secs, pick_stale_follow_evict, apply_witness_commitment)
 pub use netgroup::netgroup;
 pub use peer::{
     desirable_service_flags, drain_pending_now, flush_tx_invs, force_announce_txid,

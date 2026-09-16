@@ -146,6 +146,20 @@ struct ContentView: View {
     @State private var percentileScores = "1, 2, 3, 4, 5"
     @State private var percentileWeights = "10, 10, 10, 10, 10"
     @State private var percentileResult = ""
+    @State private var workNewHex = "0000000000000000000000000000000000000000000000000000000000000002"
+    @State private var workOldHex = "0000000000000000000000000000000000000000000000000000000000000001"
+    @State private var workBetterResult = ""
+    @State private var badPrevErr = "unexpected previous header"
+    @State private var badPrevResult = ""
+    @State private var timeoutNow = "1000"
+    @State private var timeoutBest = "500"
+    @State private var timeoutResult = ""
+    @State private var staleIds = "1, 2, 3"
+    @State private var staleGroups = "10, 20, 10"
+    @State private var staleSalt = "0"
+    @State private var staleResult = ""
+    @State private var witnessBlockHex = ""
+    @State private var witnessCommitResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2956,6 +2970,233 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Work comparison", systemImage: "scale.3d")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("New work hex", text: $workNewHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Old work hex", text: $workOldHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let new = workNewHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let old = workOldHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !new.isEmpty, !old.isEmpty else {
+                                        workBetterResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let better = try workBetter(newWorkHex: new, oldWorkHex: old)
+                                        workBetterResult = better ? "new > old" : "new ≤ old"
+                                    } catch {
+                                        workBetterResult = "invalid"
+                                    }
+                                } label: {
+                                    Label("Compare", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !workBetterResult.isEmpty {
+                                    Text(workBetterResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Bad prev error", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Error text", text: $badPrevErr)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onChange(of: badPrevErr) { _ in
+                                        badPrevResult = isBadPrevErr(err: badPrevErr) ? "bad prev" : "other"
+                                    }
+                                if !badPrevResult.isEmpty {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: badPrevResult == "bad prev" ? "xmark.circle.fill" : "checkmark.circle.fill")
+                                            .foregroundStyle(badPrevResult == "bad prev" ? Color.red : Color.green)
+                                        Text(badPrevResult)
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        badPrevResult = isBadPrevErr(err: badPrevErr) ? "bad prev" : "other"
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Header timeout", systemImage: "clock.badge.exclamationmark.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Now", text: $timeoutNow)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 100)
+                                TextField("Best header", text: $timeoutBest)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 100)
+                                Button {
+                                    guard let now = UInt64(timeoutNow), let best = UInt64(timeoutBest) else {
+                                        timeoutResult = "invalid"
+                                        return
+                                    }
+                                    let t = headersDownloadTimeoutSecs(now: now, bestHeaderTime: best)
+                                    timeoutResult = "\(t)"
+                                } label: {
+                                    Label("Timeout", systemImage: "arrow.right.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !timeoutResult.isEmpty {
+                                Text(timeoutResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Stale follow evict", systemImage: "person.2.badge.minus")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("IDs (comma-separated)", text: $staleIds)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Groups (comma-separated)", text: $staleGroups)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    TextField("Salt", text: $staleSalt)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    Button {
+                                        let idParts = staleIds.split(separator: ",").compactMap { UInt64($0.trimmingCharacters(in: .whitespaces)) }
+                                        let groupParts = staleGroups.split(separator: ",").compactMap { UInt64($0.trimmingCharacters(in: .whitespaces)) }
+                                        guard let salt = UInt64(staleSalt), !idParts.isEmpty else {
+                                            staleResult = "invalid"
+                                            return
+                                        }
+                                        let evicted = pickStaleFollowEvict(ids: idParts, salt: salt, groups: groupParts)
+                                        staleResult = evicted != nil ? "evicted: \(evicted!)" : "none"
+                                    } label: {
+                                        Label("Evict", systemImage: "arrow.right.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !staleResult.isEmpty {
+                                    Text(staleResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Witness commitment", systemImage: "doc.badge.checkmark.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hex", text: $witnessBlockHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = witnessBlockHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        witnessCommitResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let result = try applyWitnessCommitment(blockHex: hex)
+                                        witnessCommitResult = "committed: \(result.prefix(32))…"
+                                    } catch {
+                                        witnessCommitResult = "invalid"
+                                    }
+                                } label: {
+                                    Label("Apply", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !witnessCommitResult.isEmpty {
+                                    Text(witnessCommitResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2998,6 +3239,9 @@ struct ContentView: View {
                                 "Tip future check + Unspendable script",
                                 "TxOut size + Truncated median",
                                 "Percentiles by weight",
+                                "Work comparison + Bad prev error",
+                                "Header timeout + Stale follow evict",
+                                "Witness commitment",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

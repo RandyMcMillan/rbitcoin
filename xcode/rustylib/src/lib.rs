@@ -1881,6 +1881,55 @@ pub fn percentiles_by_weight(
     Ok(result.to_vec())
 }
 
+// --- Work Comparison FFI ---
+
+#[uniffi::export]
+pub fn work_better(new_work_hex: String, old_work_hex: String) -> Result<bool, RustyError> {
+    let new_bytes =
+        rbitcoin_primitives::hex_decode(&new_work_hex).map_err(|_| RustyError::InvalidInput)?;
+    let new_arr: [u8; 32] = new_bytes.try_into().map_err(|_| RustyError::InvalidInput)?;
+    let old_bytes =
+        rbitcoin_primitives::hex_decode(&old_work_hex).map_err(|_| RustyError::InvalidInput)?;
+    let old_arr: [u8; 32] = old_bytes.try_into().map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::work_better(
+        bitcoin::Work::from_be_bytes(new_arr),
+        bitcoin::Work::from_be_bytes(old_arr),
+    ))
+}
+
+// --- Reorg / Bad Prev FFI ---
+
+#[uniffi::export]
+pub fn is_bad_prev_err(err: String) -> bool {
+    rbitcoin_net::is_bad_prev_err(&err)
+}
+
+// --- Header Download Timeout FFI ---
+
+#[uniffi::export]
+pub fn headers_download_timeout_secs(now: u64, best_header_time: u64) -> u64 {
+    rbitcoin_net::headers_download_timeout_secs(now, best_header_time)
+}
+
+// --- Stale Follow Eviction FFI ---
+
+#[uniffi::export]
+pub fn pick_stale_follow_evict(ids: Vec<u64>, salt: u64, groups: Vec<u64>) -> Option<u64> {
+    rbitcoin_net::pick_stale_follow_evict(&ids, salt, &groups)
+}
+
+// --- Witness Commitment FFI ---
+
+#[uniffi::export]
+pub fn apply_witness_commitment(block_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    rbitcoin_consensus::apply_witness_commitment(&mut block);
+    Ok(bitcoin::consensus::encode::serialize_hex(&block))
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -2893,5 +2942,45 @@ mod tests {
     fn test_percentiles_by_weight_mismatch() {
         let result = percentiles_by_weight(vec![1, 2], vec![10], 10);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_work_better() {
+        let w1 = "0000000000000000000000000000000000000000000000000000000000000001";
+        let w2 = "0000000000000000000000000000000000000000000000000000000000000002";
+        assert!(work_better(w2.to_string(), w1.to_string()).unwrap());
+        assert!(!work_better(w1.to_string(), w2.to_string()).unwrap());
+        assert!(!work_better(w1.to_string(), w1.to_string()).unwrap());
+    }
+
+    #[test]
+    fn test_is_bad_prev_err() {
+        assert!(is_bad_prev_err("unexpected previous header".to_string()));
+        assert!(is_bad_prev_err("unexpected previous".to_string()));
+        assert!(!is_bad_prev_err("some other error".to_string()));
+    }
+
+    #[test]
+    fn test_headers_download_timeout_secs() {
+        let timeout = headers_download_timeout_secs(1000, 500);
+        assert!(timeout > 1000);
+    }
+
+    #[test]
+    fn test_pick_stale_follow_evict() {
+        let ids = vec![1u64, 2, 3];
+        let groups = vec![10u64, 20, 10];
+        let evicted = pick_stale_follow_evict(ids.clone(), 0, groups);
+        assert!(evicted.is_some());
+        assert!(ids.contains(&evicted.unwrap()));
+    }
+
+    #[test]
+    fn test_apply_witness_commitment_no_witness() {
+        // Regtest block without witness
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        let result = apply_witness_commitment(block_hex).unwrap();
+        assert!(!result.is_empty());
     }
 }

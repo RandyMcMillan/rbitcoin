@@ -716,7 +716,9 @@ struct ContentView: View {
                                     let scCount = query.scripthashEntryCount()
                                     let edgeCount = query.pointEdgeCount()
                                     let tipFk = try query.tipHeaderFk().map { String($0) } ?? "none"
-                                    queryMoreResult = "started=\(started) classA=\(classA) pressure=\(softPressure) promoted=\(promoted) sh=\(scCount) edge=\(edgeCount) tipFk=\(tipFk)"
+                                    let drainFk = query.headDrainFk()
+                                    let heights = query.blockQueueQueuedHeights().map(String.init).joined(separator: ",")
+                                    queryMoreResult = "started=\(started) classA=\(classA) pressure=\(softPressure) promoted=\(promoted) sh=\(scCount) edge=\(edgeCount) tipFk=\(tipFk) drainFk=\(drainFk) heights=[\(heights)]"
                                 } catch {
                                     queryMoreResult = "error"
                                 }

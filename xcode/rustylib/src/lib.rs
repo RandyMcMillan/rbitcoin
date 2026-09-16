@@ -798,6 +798,39 @@ pub fn asmap_interpret(asmap_hex: String, ip16: Vec<u8>) -> Result<u32, RustyErr
     Ok(rbitcoin_net::interpret(&bytes, &arr))
 }
 
+// --- Script Verify Forks FFI ---
+
+#[uniffi::export]
+pub fn verify_tx_scripts_detached_forks(
+    prevouts_hex: Vec<String>,
+    tx_hex: String,
+    bip65_active: bool,
+    bip112_active: bool,
+    bip66_active: bool,
+    bip16_active: bool,
+    taproot_active: bool,
+) -> Result<(), RustyError> {
+    let prevouts: Vec<bitcoin::TxOut> = prevouts_hex
+        .iter()
+        .map(|h| {
+            let b = rbitcoin_primitives::hex_decode(h).map_err(|_| RustyError::InvalidInput)?;
+            bitcoin::consensus::encode::deserialize(&b).map_err(|_| RustyError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    rbitcoin_consensus::verify_tx_scripts_detached_forks(
+        prevouts,
+        tx,
+        bip65_active,
+        bip112_active,
+        bip66_active,
+        bip16_active,
+        taproot_active,
+    )
+    .map_err(|_| RustyError::ConsensusError)
+}
+
 // --- Accept and Connect Block FFI ---
 
 #[uniffi::export]
@@ -827,6 +860,36 @@ pub fn accept_and_connect_block(
     )
     .map_err(|_| RustyError::ConsensusError)?;
     Ok(fk.0)
+}
+
+// --- Commit Class A Block FFI ---
+
+#[uniffi::export]
+pub fn commit_class_a_block(
+    query_path: String,
+    network: String,
+    height: u32,
+    block_hex: String,
+    milestone_height: u32,
+) -> Result<(), RustyError> {
+    let query =
+        rbitcoin_query::Query::open_or_create(&query_path).map_err(|_| RustyError::StoreError)?;
+    let params = chain_params_for_network(&network)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let milestone = rbitcoin_consensus::Milestone {
+        height: milestone_height,
+    };
+    rbitcoin_consensus::commit_class_a_block(
+        &query,
+        &params,
+        rbitcoin_primitives::Height(height),
+        &block,
+        milestone,
+    )
+    .map_err(|_| RustyError::ConsensusError)
 }
 
 // --- Block Structure FFI ---
@@ -1495,6 +1558,18 @@ impl FfiQuery {
 
     pub fn clear_confirm_cancel(&self) {
         self.inner.clear_confirm_cancel();
+    }
+
+    pub fn get_header_by_hash(
+        &self,
+        hash_hex: String,
+    ) -> Result<Option<FfiHeaderRecord>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let rec = self
+            .inner
+            .get_header_by_hash(&hash)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(rec.map(|(_fk, h)| h.into()))
     }
 }
 
@@ -2556,5 +2631,48 @@ mod tests {
         assert!(query.confirm_cancelled());
         query.clear_confirm_cancel();
         assert!(!query.confirm_cancelled());
+    }
+
+    #[test]
+    fn test_query_get_header_by_hash_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_ghbh").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let header = query
+            .get_header_by_hash(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            )
+            .unwrap();
+        assert_eq!(header, None);
+    }
+
+    #[test]
+    fn test_verify_tx_scripts_detached_forks() {
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+        let result = verify_tx_scripts_detached_forks(
+            vec![],
+            tx_hex.to_string(),
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_commit_class_a_block_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_commit_a")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 1).unwrap();
+        // Just ensure it doesn't panic; empty chain behavior may vary
+        let _ = commit_class_a_block(path, "regtest".to_string(), 1, block_hex, 0);
     }
 }

@@ -807,6 +807,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func flushForShutdown() throws 
     
+    func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
+    
     func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
     
     func headerAtHeight(height: UInt32) throws  -> FfiHeaderRecord?
@@ -1033,6 +1035,14 @@ open func flushForShutdown()throws  {try rustCallWithError(FfiConverterTypeRusty
     uniffi_rustylib_fn_method_ffiquery_flush_for_shutdown(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+open func getHeaderByHash(hashHex: String)throws  -> FfiHeaderRecord? {
+    return try  FfiConverterOptionTypeFfiHeaderRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_get_header_by_hash(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
 }
     
 open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
@@ -2929,6 +2939,16 @@ public func checkLibreAnnex(txHex: String)throws  -> String {
     )
 })
 }
+public func commitClassABlock(queryPath: String, network: String, height: UInt32, blockHex: String, milestoneHeight: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_commit_class_a_block(
+        FfiConverterString.lower(queryPath),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(blockHex),
+        FfiConverterUInt32.lower(milestoneHeight),$0
+    )
+}
+}
 public func defaultMilestoneHeight(network: String)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_default_milestone_height(
@@ -3579,6 +3599,18 @@ public func verifyTxScripts(prevoutsHex: [String], txHex: String)throws  {try ru
     )
 }
 }
+public func verifyTxScriptsDetachedForks(prevoutsHex: [String], txHex: String, bip65Active: Bool, bip112Active: Bool, bip66Active: Bool, bip16Active: Bool, taprootActive: Bool)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_verify_tx_scripts_detached_forks(
+        FfiConverterSequenceString.lower(prevoutsHex),
+        FfiConverterString.lower(txHex),
+        FfiConverterBool.lower(bip65Active),
+        FfiConverterBool.lower(bip112Active),
+        FfiConverterBool.lower(bip66Active),
+        FfiConverterBool.lower(bip16Active),
+        FfiConverterBool.lower(taprootActive),$0
+    )
+}
+}
 public func virtualSize(weight: UInt64) -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_virtual_size(
@@ -3673,6 +3705,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_check_libre_annex() != 29787) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_commit_class_a_block() != 27043) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_default_milestone_height() != 45427) {
@@ -3942,6 +3977,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_verify_tx_scripts() != 58820) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_verify_tx_scripts_detached_forks() != 50917) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_virtual_size() != 6608) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4018,6 +4056,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_flush_for_shutdown() != 62355) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_get_header_by_hash() != 39748) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_get_tx_by_txid() != 24667) {

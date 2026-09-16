@@ -3505,6 +3505,22 @@ public func defaultSignetChallengeHex() -> String {
     )
 })
 }
+public func deriveXpriv(xprivString: String, path: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_derive_xpriv(
+        FfiConverterString.lower(xprivString),
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+public func deriveXpub(xpubString: String, path: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_derive_xpub(
+        FfiConverterString.lower(xpubString),
+        FfiConverterString.lower(path),$0
+    )
+})
+}
 public func desirableServiceFlags(offered: UInt64, tipDepthBlocks: Int64) -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_desirable_service_flags(
@@ -4039,6 +4055,15 @@ public func p2wpkhAddressFromPubkey(pubkeyHex: String, network: String)throws  -
     )
 })
 }
+public func p2wpkhAddressFromXpub(xpubString: String, path: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2wpkh_address_from_xpub(
+        FfiConverterString.lower(xpubString),
+        FfiConverterString.lower(path),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func parseDisplayHash32(hex: String)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_parse_display_hash32(
@@ -4544,6 +4569,21 @@ public func wtxidFromHex(txHex: String)throws  -> String {
     )
 })
 }
+public func xprivFromSeed(seedHex: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_xpriv_from_seed(
+        FfiConverterString.lower(seedHex),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+public func xpubFromXpriv(xprivString: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_xpub_from_xpriv(
+        FfiConverterString.lower(xprivString),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -4639,6 +4679,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_default_signet_challenge_hex() != 44586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_derive_xpriv() != 61199) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_derive_xpub() != 11415) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_desirable_service_flags() != 42267) {
@@ -4866,6 +4912,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_p2wpkh_address_from_pubkey() != 48692) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_p2wpkh_address_from_xpub() != 4204) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_parse_display_hash32() != 60706) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5068,6 +5117,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_wtxid_from_hex() != 62498) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_xpriv_from_seed() != 44710) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_xpub_from_xpriv() != 63931) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_compact() != 45973) {

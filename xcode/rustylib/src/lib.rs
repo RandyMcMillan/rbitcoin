@@ -2278,6 +2278,68 @@ fn known_hrp(net: rbitcoin_primitives::Network) -> bitcoin::address::KnownHrp {
     }
 }
 
+// --- BIP32 HD Wallet FFI ---
+
+#[uniffi::export]
+pub fn xpriv_from_seed(seed_hex: String, network: String) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let seed = rbitcoin_primitives::hex_decode(&seed_hex).map_err(|_| RustyError::InvalidInput)?;
+    let xpriv = bitcoin::bip32::Xpriv::new_master(bitcoin_network(net), &seed)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(xpriv.to_string())
+}
+
+#[uniffi::export]
+pub fn xpub_from_xpriv(xpriv_string: String) -> Result<String, RustyError> {
+    let xpriv: bitcoin::bip32::Xpriv =
+        xpriv_string.parse().map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let xpub = bitcoin::bip32::Xpub::from_priv(&secp, &xpriv);
+    Ok(xpub.to_string())
+}
+
+#[uniffi::export]
+pub fn derive_xpriv(xpriv_string: String, path: String) -> Result<String, RustyError> {
+    let xpriv: bitcoin::bip32::Xpriv =
+        xpriv_string.parse().map_err(|_| RustyError::InvalidInput)?;
+    let dp: bitcoin::bip32::DerivationPath = path.parse().map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let derived = xpriv
+        .derive_priv(&secp, &dp)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(derived.to_string())
+}
+
+#[uniffi::export]
+pub fn derive_xpub(xpub_string: String, path: String) -> Result<String, RustyError> {
+    let xpub: bitcoin::bip32::Xpub = xpub_string.parse().map_err(|_| RustyError::InvalidInput)?;
+    let dp: bitcoin::bip32::DerivationPath = path.parse().map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let derived = xpub
+        .derive_pub(&secp, &dp)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(derived.to_string())
+}
+
+#[uniffi::export]
+pub fn p2wpkh_address_from_xpub(
+    xpub_string: String,
+    path: String,
+    network: String,
+) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let xpub: bitcoin::bip32::Xpub = xpub_string.parse().map_err(|_| RustyError::InvalidInput)?;
+    let dp: bitcoin::bip32::DerivationPath = path.parse().map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let derived = xpub
+        .derive_pub(&secp, &dp)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let pk = derived.to_pub();
+    let hrp = known_hrp(net);
+    let addr = bitcoin::Address::p2wpkh(&pk, hrp);
+    Ok(addr.to_string())
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3478,5 +3540,42 @@ mod tests {
         // Need x-only pubkey (32 bytes) for P2TR; CompressedPublicKey is 33 bytes.
         // Just verify the function exists and rejects bad input.
         assert!(p2tr_address_from_pubkey("00".to_string(), "mainnet".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_bip32_xpriv_from_seed() {
+        let seed = "000102030405060708090a0b0c0d0e0f";
+        let xpriv = xpriv_from_seed(seed.to_string(), "mainnet".to_string()).unwrap();
+        assert!(xpriv.starts_with("xprv"));
+    }
+
+    #[test]
+    fn test_bip32_xpub_from_xpriv() {
+        let seed = "000102030405060708090a0b0c0d0e0f";
+        let xpriv = xpriv_from_seed(seed.to_string(), "mainnet".to_string()).unwrap();
+        let xpub = xpub_from_xpriv(xpriv).unwrap();
+        assert!(xpub.starts_with("xpub"));
+    }
+
+    #[test]
+    fn test_bip32_derive_xpriv() {
+        let seed = "000102030405060708090a0b0c0d0e0f";
+        let xpriv = xpriv_from_seed(seed.to_string(), "mainnet".to_string()).unwrap();
+        let derived = derive_xpriv(xpriv, "m/44'/0'/0'/0/0".to_string()).unwrap();
+        assert!(derived.starts_with("xprv"));
+    }
+
+    #[test]
+    fn test_bip32_p2wpkh_address_from_xpub() {
+        let seed = "000102030405060708090a0b0c0d0e0f";
+        let xpriv = xpriv_from_seed(seed.to_string(), "mainnet".to_string()).unwrap();
+        let _xpub = xpub_from_xpriv(xpriv.clone()).unwrap();
+        // Derive account xpriv first (hardened), then get its xpub for non-hardened child derivation
+        let account_xpriv = derive_xpriv(xpriv, "m/44'/0'/0'".to_string()).unwrap();
+        let account_xpub = xpub_from_xpriv(account_xpriv).unwrap();
+        let addr =
+            p2wpkh_address_from_xpub(account_xpub, "m/0/0".to_string(), "mainnet".to_string())
+                .unwrap();
+        assert!(addr.starts_with("bc1q"));
     }
 }

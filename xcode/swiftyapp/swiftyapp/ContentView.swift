@@ -33,6 +33,8 @@ struct ContentView: View {
     @State private var mempoolPath = ""
     @State private var mempoolLiveCount = ""
     @State private var mempoolSlotStats = ""
+    @State private var mempoolBodyLen = ""
+    @State private var mempoolDir = ""
     @State private var feeTargetBlocks = "1"
     @State private var feeStockAbove = "0"
     @State private var feeResult = ""
@@ -739,9 +741,13 @@ struct ContentView: View {
                                     let stats = mempool.slotStats()
                                     mempoolLiveCount = "\(count) live"
                                     mempoolSlotStats = "free: \(stats.free), live: \(stats.live), dead: \(stats.dead)"
+                                    mempoolBodyLen = String(try mempool.bodyLogicalLen())
+                                    mempoolDir = mempool.dir()
                                 } catch {
                                     mempoolLiveCount = "error"
                                     mempoolSlotStats = ""
+                                    mempoolBodyLen = ""
+                                    mempoolDir = ""
                                 }
                             } label: {
                                 Label("Open or create mempool", systemImage: "arrow.up.doc.fill")
@@ -757,6 +763,13 @@ struct ContentView: View {
                                     Text(mempoolSlotStats)
                                         .font(.caption.weight(.semibold))
                                         .foregroundStyle(primaryText.opacity(0.68))
+                                    Text("bodyLen: \(mempoolBodyLen)")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText.opacity(0.68))
+                                    Text("dir: \(mempoolDir)")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText.opacity(0.68))
+                                        .lineLimit(1)
                                 }
                             }
                         }

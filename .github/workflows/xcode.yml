@@ -55,4 +55,4 @@ jobs:
       - name: Build Xcode project (iOS)
         run: |
           cd xcode/swiftyapp
-          xcodebuild -project swiftyapp.xcodeproj -scheme swiftyapp -destination 'platform=iOS Simulator,name=iPhone 17' build
+          xcodebuild -project swiftyapp.xcodeproj -scheme swiftyapp -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build

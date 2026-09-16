@@ -813,6 +813,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func tipHeight()  -> UInt64?
     
+    func tweaksAtHeight(network: String, height: UInt32) throws  -> [FfiHeightTweak]
+    
     func txBodyCount()  -> UInt64
     
     func txFkByTxid(txidHex: String) throws  -> UInt64?
@@ -1074,6 +1076,15 @@ open func spendIndexEnabled() -> Bool {
 open func tipHeight() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tweaksAtHeight(network: String, height: UInt32)throws  -> [FfiHeightTweak] {
+    return try  FfiConverterSequenceTypeFfiHeightTweak.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tweaks_at_height(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),$0
     )
 })
 }
@@ -1554,6 +1565,80 @@ public func FfiConverterTypeFfiHeaderRecord_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiHeaderRecord_lower(_ value: FfiHeaderRecord) -> RustBuffer {
     return FfiConverterTypeFfiHeaderRecord.lower(value)
+}
+
+
+public struct FfiHeightTweak {
+    public var txid: String
+    public var tweak: String
+    public var outputPubkeys: [FfiTaprootOut]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txid: String, tweak: String, outputPubkeys: [FfiTaprootOut]) {
+        self.txid = txid
+        self.tweak = tweak
+        self.outputPubkeys = outputPubkeys
+    }
+}
+
+
+
+extension FfiHeightTweak: Equatable, Hashable {
+    public static func ==(lhs: FfiHeightTweak, rhs: FfiHeightTweak) -> Bool {
+        if lhs.txid != rhs.txid {
+            return false
+        }
+        if lhs.tweak != rhs.tweak {
+            return false
+        }
+        if lhs.outputPubkeys != rhs.outputPubkeys {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txid)
+        hasher.combine(tweak)
+        hasher.combine(outputPubkeys)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHeightTweak: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHeightTweak {
+        return
+            try FfiHeightTweak(
+                txid: FfiConverterString.read(from: &buf), 
+                tweak: FfiConverterString.read(from: &buf), 
+                outputPubkeys: FfiConverterSequenceTypeFfiTaprootOut.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiHeightTweak, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.txid, into: &buf)
+        FfiConverterString.write(value.tweak, into: &buf)
+        FfiConverterSequenceTypeFfiTaprootOut.write(value.outputPubkeys, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeightTweak_lift(_ buf: RustBuffer) throws -> FfiHeightTweak {
+    return try FfiConverterTypeFfiHeightTweak.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeightTweak_lower(_ value: FfiHeightTweak) -> RustBuffer {
+    return FfiConverterTypeFfiHeightTweak.lower(value)
 }
 
 
@@ -2258,6 +2343,30 @@ fileprivate struct FfiConverterOptionDouble: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiHeaderRecord: FfiConverterRustBuffer {
     typealias SwiftType = FfiHeaderRecord?
 
@@ -2422,6 +2531,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiHeightTweak: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiHeightTweak]
+
+    public static func write(_ value: [FfiHeightTweak], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiHeightTweak.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiHeightTweak] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiHeightTweak]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiHeightTweak.read(from: &buf))
         }
         return seq
     }
@@ -2856,6 +2990,15 @@ public func mineRegtestPaying(prevHashHex: String, time: UInt32, height: UInt32,
     )
 })
 }
+public func netgroup(ip: String, port: UInt16, asmapHex: String?)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_netgroup(
+        FfiConverterString.lower(ip),
+        FfiConverterUInt16.lower(port),
+        FfiConverterOptionString.lower(asmapHex),$0
+    )
+})
+}
 public func nodeCoreMaxconnectionsOutboundReserve() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_node_core_maxconnections_outbound_reserve($0
@@ -3059,6 +3202,13 @@ public func signetMagicHex(challengeHex: String)throws  -> String {
     )
 })
 }
+public func sumWorkHex(workHexes: [String])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_sum_work_hex(
+        FfiConverterSequenceString.lower(workHexes),$0
+    )
+})
+}
 public func takeLogs() -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_take_logs($0
@@ -3100,6 +3250,15 @@ public func validateAddress(address: String) -> Bool {
         FfiConverterString.lower(address),$0
     )
 })
+}
+public func validateBlockStructure(blockHex: String, network: String, height: UInt32, enforceHeightGates: Bool)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_validate_block_structure(
+        FfiConverterString.lower(blockHex),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),
+        FfiConverterBool.lower(enforceHeightGates),$0
+    )
+}
 }
 public func validateHeaderOnParent(headerHex: String, network: String, height: UInt32, parentMtp: UInt32, expectedBits: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_validate_header_on_parent(
@@ -3335,6 +3494,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_mine_regtest_paying() != 11833) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_netgroup() != 17242) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_node_core_maxconnections_outbound_reserve() != 34) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3422,6 +3584,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_signet_magic_hex() != 22600) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_sum_work_hex() != 24879) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_take_logs() != 10115) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3438,6 +3603,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_validate_address() != 11887) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_validate_block_structure() != 55503) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_validate_header_on_parent() != 9664) {
@@ -3558,6 +3726,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tip_height() != 22733) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tweaks_at_height() != 60833) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tx_body_count() != 40862) {

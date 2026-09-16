@@ -798,6 +798,73 @@ pub fn asmap_interpret(asmap_hex: String, ip16: Vec<u8>) -> Result<u32, RustyErr
     Ok(rbitcoin_net::interpret(&bytes, &arr))
 }
 
+// --- Block Structure FFI ---
+
+#[uniffi::export]
+pub fn validate_block_structure(
+    block_hex: String,
+    network: String,
+    height: u32,
+    enforce_height_gates: bool,
+) -> Result<(), RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let params = chain_params_for_network(&network)?;
+    let milestone = rbitcoin_consensus::Milestone { height };
+    let ctx = rbitcoin_consensus::ValidationContext {
+        params: &params,
+        height: rbitcoin_primitives::Height(height),
+        milestone,
+        enforce_height_gates,
+    };
+    rbitcoin_consensus::validate_block_structure(&block, &ctx)
+        .map_err(|_| RustyError::ConsensusError)
+}
+
+// --- Network Netgroup FFI ---
+
+#[uniffi::export]
+pub fn netgroup(ip: String, port: u16, asmap_hex: Option<String>) -> Result<u64, RustyError> {
+    let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| RustyError::InvalidInput)?;
+    let addr = std::net::SocketAddr::new(ip_addr, port);
+    let asmap = match asmap_hex {
+        Some(hex) => {
+            let bytes =
+                rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+            Some(rbitcoin_net::AsMap::from_bytes(bytes).ok_or(RustyError::InvalidInput)?)
+        }
+        None => None,
+    };
+    Ok(rbitcoin_net::netgroup(addr, asmap.as_ref()))
+}
+
+// --- Work FFI ---
+
+#[uniffi::export]
+pub fn sum_work_hex(work_hexes: Vec<String>) -> Result<String, RustyError> {
+    let works: Vec<bitcoin::Work> = work_hexes
+        .iter()
+        .map(|h| {
+            let bytes = rbitcoin_primitives::hex_decode(h).map_err(|_| RustyError::InvalidInput)?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| RustyError::InvalidInput)?;
+            Ok(bitcoin::Work::from_be_bytes(arr))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sum = rbitcoin_net::sum_work(works.into_iter());
+    Ok(rbitcoin_primitives::hex_encode(sum.to_be_bytes()))
+}
+
+// --- Silent Payments Query FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiHeightTweak {
+    pub txid: String,
+    pub tweak: String,
+    pub output_pubkeys: Vec<FfiTaprootOut>,
+}
+
 // --- Network Service Flags FFI ---
 
 #[uniffi::export]
@@ -1210,6 +1277,36 @@ impl FfiQuery {
 
     pub fn sample_reset_thin_tweak_body_bytes(&self) -> u64 {
         self.inner.sample_reset_thin_tweak_body_bytes()
+    }
+
+    pub fn tweaks_at_height(
+        &self,
+        network: String,
+        height: u32,
+    ) -> Result<Vec<FfiHeightTweak>, RustyError> {
+        let params = chain_params_for_network(&network)?;
+        let map = rbitcoin_consensus::tweaks_for_height(
+            &self.inner,
+            &params,
+            rbitcoin_primitives::Height(height),
+        )
+        .map_err(|_| RustyError::ConsensusError)?;
+        Ok(map
+            .into_iter()
+            .map(|(txid, tt)| FfiHeightTweak {
+                txid: rbitcoin_primitives::hex_encode(txid),
+                tweak: rbitcoin_primitives::hex_encode(tt.tweak),
+                output_pubkeys: tt
+                    .output_pubkeys
+                    .into_iter()
+                    .map(|o| FfiTaprootOut {
+                        vout: o.vout,
+                        xonly: rbitcoin_primitives::hex_encode(o.xonly),
+                        value: o.value,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 }
 
@@ -2048,5 +2145,35 @@ mod tests {
         let query = FfiQuery::open_or_create(path).unwrap();
         assert_eq!(query.sample_reset_reconstruct_archived(), 0);
         assert_eq!(query.sample_reset_thin_tweak_body_bytes(), 0);
+    }
+
+    #[test]
+    fn test_validate_block_structure_genesis() {
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1231006505, 0).unwrap();
+        validate_block_structure(block_hex, "regtest".to_string(), 0, true).unwrap();
+    }
+
+    #[test]
+    fn test_netgroup_v4() {
+        let group = netgroup("1.2.3.4".to_string(), 8333, None).unwrap();
+        assert!(group > 0);
+    }
+
+    #[test]
+    fn test_sum_work() {
+        let w1 = "0000000000000000000000000000000000000000000000000000000000000001";
+        let w2 = "0000000000000000000000000000000000000000000000000000000000000002";
+        let sum = sum_work_hex(vec![w1.to_string(), w2.to_string()]).unwrap();
+        assert!(!sum.is_empty());
+    }
+
+    #[test]
+    fn test_query_tweaks_at_height_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_sp").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let tweaks = query.tweaks_at_height("mainnet".to_string(), 0).unwrap();
+        assert!(tweaks.is_empty());
     }
 }

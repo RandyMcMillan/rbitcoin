@@ -124,6 +124,11 @@ struct ContentView: View {
     @State private var disconnectResult = ""
     @State private var servePerfResult = ""
     @State private var queryLoadResult = ""
+    @State private var scriptForksTxHex = ""
+    @State private var scriptForksResult = ""
+    @State private var classAHeight = "1"
+    @State private var classABlockHex = ""
+    @State private var classAResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2491,6 +2496,102 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Script verify forks", systemImage: "checkmark.shield.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Tx hex", text: $scriptForksTxHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = scriptForksTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        scriptForksResult = ""
+                                        return
+                                    }
+                                    do {
+                                        try verifyTxScriptsDetachedForks(prevoutsHex: [], txHex: hex, bip65Active: true, bip112Active: true, bip66Active: true, bip16Active: true, taprootActive: true)
+                                        scriptForksResult = "scripts valid"
+                                    } catch {
+                                        scriptForksResult = "scripts invalid"
+                                    }
+                                } label: {
+                                    Label("Verify", systemImage: "checkmark.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !scriptForksResult.isEmpty {
+                                    Text(scriptForksResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Class A commit", systemImage: "archivebox.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hex", text: $classABlockHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    TextField("Height", text: $classAHeight)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    Button {
+                                        let hex = classABlockHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !hex.isEmpty, let height = UInt32(classAHeight) else {
+                                            classAResult = "invalid input"
+                                            return
+                                        }
+                                        do {
+                                            try commitClassABlock(queryPath: NSTemporaryDirectory() + "rbitcoin-class-a-demo", network: "regtest", height: height, blockHex: hex, milestoneHeight: 0)
+                                            classAResult = "committed"
+                                        } catch {
+                                            classAResult = "rejected"
+                                        }
+                                    } label: {
+                                        Label("Commit", systemImage: "arrow.right.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !classAResult.isEmpty {
+                                    Text(classAResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2527,6 +2628,7 @@ struct ContentView: View {
                                 "MTP",
                                 "Disconnect tip + Serve perf",
                                 "Query load pack",
+                                "Script verify forks + Class A commit",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

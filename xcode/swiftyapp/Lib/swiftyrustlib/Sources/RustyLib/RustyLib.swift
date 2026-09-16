@@ -803,6 +803,10 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueCount()  -> UInt64
     
+    func blockQueueDequeueHeight(height: UInt32) throws  -> UInt64
+    
+    func blockQueueHasHash(hashHex: String) throws  -> Bool
+    
     func blockQueueHasHeight(height: UInt32)  -> Bool
     
     func blockQueueHashAtHeight(height: UInt32)  -> String?
@@ -810,6 +814,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func blockQueueIsResolveComplete(height: UInt32)  -> Bool
     
     func blockQueueListMeta()  -> [FfiQueuedBlockMeta]
+    
+    func blockQueueMarkResolveComplete(height: UInt32) throws 
     
     func blockQueueMaxHeight()  -> UInt64?
     
@@ -895,6 +901,12 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func scripthashEntryCount()  -> UInt64
     
+    func setClassAHi(hi: UInt32?) 
+    
+    func setLookupStartedHi(hi: UInt32?) 
+    
+    func setLookupTakenHi(hi: UInt32?) 
+    
     func setMaxShCreates(n: UInt32) 
     
     func shIndexEnabled()  -> Bool
@@ -914,6 +926,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func txBodyCount()  -> UInt64
     
     func txFkByTxid(txidHex: String) throws  -> UInt64?
+    
+    func txFkByTxidTip(txidHex: String) throws  -> UInt64?
     
     func txHeadOccupied()  -> UInt64
     
@@ -1013,6 +1027,22 @@ open func blockQueueCount() -> UInt64 {
 })
 }
     
+open func blockQueueDequeueHeight(height: UInt32)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_dequeue_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func blockQueueHasHash(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_has_hash(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
 open func blockQueueHasHeight(height: UInt32) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_has_height(self.uniffiClonePointer(),
@@ -1042,6 +1072,13 @@ open func blockQueueListMeta() -> [FfiQueuedBlockMeta] {
     uniffi_rustylib_fn_method_ffiquery_block_queue_list_meta(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func blockQueueMarkResolveComplete(height: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_mark_resolve_complete(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+}
 }
     
 open func blockQueueMaxHeight() -> UInt64? {
@@ -1353,6 +1390,27 @@ open func scripthashEntryCount() -> UInt64 {
 })
 }
     
+open func setClassAHi(hi: UInt32?) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_set_class_a_hi(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(hi),$0
+    )
+}
+}
+    
+open func setLookupStartedHi(hi: UInt32?) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_set_lookup_started_hi(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(hi),$0
+    )
+}
+}
+    
+open func setLookupTakenHi(hi: UInt32?) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_set_lookup_taken_hi(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(hi),$0
+    )
+}
+}
+    
 open func setMaxShCreates(n: UInt32) {try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_set_max_sh_creates(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(n),$0
@@ -1421,6 +1479,14 @@ open func txBodyCount() -> UInt64 {
 open func txFkByTxid(txidHex: String)throws  -> UInt64? {
     return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_tx_fk_by_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func txFkByTxidTip(txidHex: String)throws  -> UInt64? {
+    return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tx_fk_by_txid_tip(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
     )
 })
@@ -5979,6 +6045,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_count() != 45316) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_dequeue_height() != 48079) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_has_hash() != 56360) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_has_height() != 41358) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5989,6 +6061,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_list_meta() != 63167) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_mark_resolve_complete() != 29201) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_max_height() != 61436) {
@@ -6117,6 +6192,15 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_scripthash_entry_count() != 11033) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_set_class_a_hi() != 4667) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_set_lookup_started_hi() != 41468) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_set_lookup_taken_hi() != 57921) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_set_max_sh_creates() != 45313) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6145,6 +6229,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tx_fk_by_txid() != 27661) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tx_fk_by_txid_tip() != 6225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tx_head_occupied() != 12047) {

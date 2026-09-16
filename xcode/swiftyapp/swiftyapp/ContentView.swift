@@ -183,6 +183,7 @@ struct ContentView: View {
     @State private var esploraPerfResult = ""
     @State private var peerConstantsResult = ""
     @State private var peerLogResult = ""
+    @State private var moreConstantsResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3618,6 +3619,49 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("More constants", systemImage: "number.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-mempool + net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let bw = mempoolBlockWeightWu()
+                                let spb = mempoolSecondsPerBlock()
+                                let mpc = mempoolMaxPackageCount()
+                                let mpw = mempoolMaxPackageWeight()
+                                let rnum = mempoolRbfrRatioNum()
+                                let rden = mempoolRbfrRatioDen()
+                                let maxMsgs = peerDefaultMaxMsgsPerSec()
+                                let maxBytes = peerDefaultMaxBytesPerSec()
+                                let rlBan = peerRateLimitBanScore()
+                                let osBan = peerOversizeBanScore()
+                                let maxAddr = peerMaxAddrToSend()
+                                let maxPct = peerMaxPctAddrToSend()
+                                moreConstantsResult = "bw=\(bw) spb=\(spb) pkg=\(mpc)/\(mpw) rbfr=\(rnum)/\(rden) msgs=\(maxMsgs) bytes=\(maxBytes) rl=\(rlBan) os=\(osBan) addr=\(maxAddr)/\(maxPct)"
+                            } label: {
+                                Label("Load more constants", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !moreConstantsResult.isEmpty {
+                                Text(moreConstantsResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3668,6 +3712,7 @@ struct ContentView: View {
                                 "Script hash",
                                 "Soft densify + Esplora script + Esplora perf",
                                 "Peer constants + Peer logs",
+                                "More constants",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

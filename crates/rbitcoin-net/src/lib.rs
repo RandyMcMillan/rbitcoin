@@ -62,9 +62,13 @@ pub use peer::{
     non_version_before_handshake_log, obsolete_version_log, ping_prior_to_verack_log,
     run_feeler_timed, sendaddrv2_after_verack_log, set_compact_filters_service,
     unsupported_before_verack_log, version_handshake_timeout_log, PendingBlocks, V2PlainSession,
-    BAN_SCORE_THRESHOLD, HANDSHAKE_TIMEOUT, MAX_SERVE_BLOCKS, MIN_PEER_PROTO_VERSION,
+    BAN_SCORE_THRESHOLD, HANDSHAKE_TIMEOUT, MAX_ADDR_TO_SEND, MAX_PCT_ADDR_TO_SEND,
+    MAX_SERVE_BLOCKS, MIN_PEER_PROTO_VERSION,
 };
-pub use peer_dos::DEFAULT_MAX_INBOUND;
+pub use peer_dos::{
+    DEFAULT_MAX_BYTES_PER_SEC, DEFAULT_MAX_INBOUND, DEFAULT_MAX_MSGS_PER_SEC, OVERSIZE_BAN_SCORE,
+    RATE_LIMIT_BAN_SCORE,
+};
 pub use peers::{
     connection_counts, outbound_time_offset, parse_peer_addr, parse_peer_addr_with_port,
     parse_peer_net, pick_stale_follow_evict, DialRequest, DialTarget, LivePeer, PeerConnType,

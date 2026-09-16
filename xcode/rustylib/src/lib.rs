@@ -2149,6 +2149,34 @@ pub fn bq_soft_confirm_secs() -> u64 {
 }
 
 #[uniffi::export]
+pub fn soft_densify_band_hi(
+    path_lo: u32,
+    densify_hi: u32,
+    depth_bytes: u64,
+    rate_blocks_per_s: Option<f64>,
+    assign_stop_bytes: u64,
+    fetched_hi: Option<u32>,
+) -> u32 {
+    rbitcoin_query::soft_densify_band_hi(
+        path_lo,
+        densify_hi,
+        depth_bytes,
+        rate_blocks_per_s,
+        assign_stop_bytes,
+        fetched_hi,
+    )
+}
+
+#[uniffi::export]
+pub fn soft_confirm_window_covered(
+    depth_n: u32,
+    depth_bytes: u64,
+    rate_blocks_per_s: Option<f64>,
+) -> bool {
+    rbitcoin_query::soft_confirm_window_covered(depth_n, depth_bytes, rate_blocks_per_s)
+}
+
+#[uniffi::export]
 pub fn mempool_admit_half_life_secs() -> u64 {
     rbitcoin_mempool::ADMIT_HALF_LIFE_SECS as u64
 }
@@ -3788,6 +3816,16 @@ mod tests {
         assert!(!soft_assign_restricted(0));
         assert!(!soft_assign_stopped(0, u64::MAX));
         assert!(bq_assign_stop_bytes() > 0);
+        assert_eq!(
+            soft_densify_band_hi(0, 100, 0, Some(1.0), bq_assign_stop_bytes(), None),
+            100
+        );
+        assert!(!soft_confirm_window_covered(0, 0, Some(1.0)));
+        assert!(soft_confirm_window_covered(
+            100,
+            200 * 1024 * 1024,
+            Some(1.0)
+        ));
     }
 
     #[test]

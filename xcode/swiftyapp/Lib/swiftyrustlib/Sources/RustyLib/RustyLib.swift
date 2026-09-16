@@ -596,7 +596,11 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol FfiMempoolProtocol : AnyObject {
     
+    func bodyLogicalLen() throws  -> UInt64
+    
     func compact() throws  -> String
+    
+    func dir()  -> String
     
     func flush() throws 
     
@@ -670,9 +674,23 @@ public static func openOrCreate(path: String)throws  -> FfiMempool {
     
 
     
+open func bodyLogicalLen()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_body_logical_len(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func compact()throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffimempool_compact(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func dir() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempool_dir(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3719,6 +3737,15 @@ public func electrumDefaultTweaksMinDust() -> UInt64 {
     )
 })
 }
+public func electrumLastHeight(start: UInt32, count: UInt32, tip: UInt32?) -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_electrum_last_height(
+        FfiConverterUInt32.lower(start),
+        FfiConverterUInt32.lower(count),
+        FfiConverterOptionUInt32.lower(tip),$0
+    )
+})
+}
 public func electrumScripthashHex(scriptHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_electrum_scripthash_hex(
@@ -5056,6 +5083,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_electrum_default_tweaks_min_dust() != 58605) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_electrum_last_height() != 64261) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_electrum_scripthash_hex() != 39984) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5563,7 +5593,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_xpub_from_xpriv() != 63931) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempool_body_logical_len() != 42298) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempool_compact() != 45973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_dir() != 57057) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_flush() != 54725) {

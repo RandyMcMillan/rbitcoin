@@ -1187,6 +1187,11 @@ pub fn electrum_default_tweaks_min_dust() -> u64 {
     rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST
 }
 
+#[uniffi::export]
+pub fn electrum_last_height(start: u32, count: u32, tip: Option<u32>) -> Option<u32> {
+    rbitcoin_electrum::last_height(start, count, tip)
+}
+
 // --- Primitives Constants FFI ---
 
 #[uniffi::export]
@@ -1820,6 +1825,25 @@ impl FfiMempool {
         let mut guard = self.inner.lock().unwrap();
         let (dead, shrunk) = guard.compact().map_err(|_| RustyError::MempoolError)?;
         Ok(format!("dead={dead} shrunk={shrunk}"))
+    }
+
+    pub fn body_logical_len(&self) -> Result<u64, RustyError> {
+        let len = self
+            .inner
+            .lock()
+            .unwrap()
+            .body_logical_len()
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(len as u64)
+    }
+
+    pub fn dir(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap()
+            .dir()
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -2914,6 +2938,15 @@ mod tests {
         assert!(mempool.has_free_slot());
         let compact = mempool.compact().unwrap();
         assert!(compact.starts_with("dead="));
+        assert!(mempool.body_logical_len().unwrap() > 0);
+        assert!(!mempool.dir().is_empty());
+    }
+
+    #[test]
+    fn test_electrum_last_height() {
+        assert_eq!(electrum_last_height(0, 10, Some(5)), Some(5));
+        assert_eq!(electrum_last_height(0, 10, Some(100)), Some(9));
+        assert_eq!(electrum_last_height(10, 5, Some(5)), None);
     }
 
     #[test]

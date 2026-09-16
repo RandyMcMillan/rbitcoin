@@ -399,6 +399,22 @@ fileprivate class UniffiHandleMap<T> {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -765,6 +781,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func archivedBlockCount() throws  -> UInt64
     
+    func backfillSpTweaks(network: String) throws  -> UInt32
+    
     func blockQueueCount()  -> UInt64
     
     func blockQueueMaxHeight()  -> UInt64?
@@ -774,6 +792,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func blockQueueUpdateSoftPressure(rateBlocksPerS: Double?)  -> Bool
     
     func clearArchivedBody(hashHex: String) throws  -> Bool
+    
+    func confirmBlock(height: UInt32, hashHex: String) throws  -> UInt64
     
     func confirmCancelled()  -> Bool
     
@@ -793,6 +813,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func heightOfHash(hashHex: String) throws  -> UInt64?
     
+    func indexMode()  -> UInt8
+    
     func isBlockArchived(hashHex: String) throws  -> Bool
     
     func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
@@ -808,6 +830,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func sampleResetThinTweakBodyBytes()  -> UInt64
     
     func setMaxShCreates(n: UInt32) 
+    
+    func shIndexEnabled()  -> Bool
     
     func shIndexedThroughHeight()  -> UInt64?
     
@@ -904,6 +928,14 @@ open func archivedBlockCount()throws  -> UInt64 {
 })
 }
     
+open func backfillSpTweaks(network: String)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_backfill_sp_tweaks(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+    
 open func blockQueueCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_count(self.uniffiClonePointer(),$0
@@ -936,6 +968,15 @@ open func blockQueueUpdateSoftPressure(rateBlocksPerS: Double?) -> Bool {
 open func clearArchivedBody(hashHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_clear_archived_body(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func confirmBlock(height: UInt32, hashHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_confirm_block(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),
         FfiConverterString.lower(hashHex),$0
     )
 })
@@ -1010,6 +1051,13 @@ open func heightOfHash(hashHex: String)throws  -> UInt64? {
 })
 }
     
+open func indexMode() -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_index_mode(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func isBlockArchived(hashHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_is_block_archived(self.uniffiClonePointer(),
@@ -1070,6 +1118,13 @@ open func setMaxShCreates(n: UInt32) {try! rustCall() {
         FfiConverterUInt32.lower(n),$0
     )
 }
+}
+    
+open func shIndexEnabled() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_sh_index_enabled(self.uniffiClonePointer(),$0
+    )
+})
 }
     
 open func shIndexedThroughHeight() -> UInt64? {
@@ -3092,6 +3147,19 @@ public func parseTx(txHex: String)throws  -> FfiTxInfo {
     )
 })
 }
+public func parseV2Regtest(contentsHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_parse_v2_regtest(
+        FfiConverterString.lower(contentsHex),$0
+    )
+}
+}
+public func parseV2RegtestNamed(command: String, payloadHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_parse_v2_regtest_named(
+        FfiConverterString.lower(command),
+        FfiConverterString.lower(payloadHex),$0
+    )
+}
+}
 public func pureRbfrPays(newFee: UInt64, newWeight: UInt64, directFee: UInt64, directWeight: UInt64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_func_pure_rbfr_pays(
@@ -3582,6 +3650,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_parse_tx() != 26241) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_parse_v2_regtest() != 38258) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_parse_v2_regtest_named() != 47237) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_pure_rbfr_pays() != 25186) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3717,6 +3791,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_archived_block_count() != 52553) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_backfill_sp_tweaks() != 23196) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_count() != 45316) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3730,6 +3807,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_clear_archived_body() != 5629) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_confirm_block() != 61964) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_confirm_cancelled() != 34129) {
@@ -3759,6 +3839,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_height_of_hash() != 45413) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_index_mode() != 16153) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_is_block_archived() != 53320) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3781,6 +3864,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_set_max_sh_creates() != 45313) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_sh_index_enabled() != 26927) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_sh_indexed_through_height() != 1071) {

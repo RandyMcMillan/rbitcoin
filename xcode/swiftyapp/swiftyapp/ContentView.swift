@@ -176,6 +176,11 @@ struct ContentView: View {
     @State private var sealResult = ""
     @State private var shHashInput = "76a914000000000000000000000000000000000000000088ac"
     @State private var shHashResult = ""
+    @State private var softDensifyResult = ""
+    @State private var esploraScriptInput = "76a914000000000000000000000000000000000000000088ac"
+    @State private var esploraScriptNetwork = "mainnet"
+    @State private var esploraScriptResult = ""
+    @State private var esploraPerfResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3442,6 +3447,123 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Soft densify", systemImage: "slider.horizontal.3")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let window = softConfirmWindowN(rateBlocksPerS: 1.0)
+                                let restricted = softAssignRestricted(depthBytes: 0)
+                                let stopped = softAssignStopped(depthBytes: 0, stopBytes: UInt64.max)
+                                let stopBytes = bqAssignStopBytes()
+                                softDensifyResult = "window=\(window) restricted=\(restricted) stopped=\(stopped) stopBytes=\(stopBytes)"
+                            } label: {
+                                Label("Query soft densify", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !softDensifyResult.isEmpty {
+                                Text(softDensifyResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Esplora script", systemImage: "doc.text.magnifyingglass")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-esplora")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Script hex", text: $esploraScriptInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    Picker("Network", selection: $esploraScriptNetwork) {
+                                        Text("mainnet").tag("mainnet")
+                                        Text("testnet").tag("testnet")
+                                        Text("regtest").tag("regtest")
+                                        Text("signet").tag("signet")
+                                    }
+                                    .pickerStyle(.menu)
+                                    .tint(accentText)
+                                    Button {
+                                        do {
+                                            let fields = try esploraScriptFields(scriptHex: esploraScriptInput, network: esploraScriptNetwork)
+                                            esploraScriptResult = "type=\(fields.scriptType) addr=\(fields.address ?? "none")"
+                                        } catch {
+                                            esploraScriptResult = "error"
+                                        }
+                                    } label: {
+                                        Label("Project", systemImage: "arrow.right.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !esploraScriptResult.isEmpty {
+                                    Text(esploraScriptResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Esplora perf", systemImage: "chart.line.uptrend.xyaxis")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-esplora")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let sample = sampleResetEsploraPerf()
+                                esploraPerfResult = "req=\(sample.requests) bytes=\(sample.bytes) ms=\(sample.elapsedMs)"
+                            } label: {
+                                Label("Sample reset perf", systemImage: "arrow.counterclockwise.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !esploraPerfResult.isEmpty {
+                                Text(esploraPerfResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3490,6 +3612,7 @@ struct ContentView: View {
                                 "DNS seed query + Regtest candidate",
                                 "Last height + Seal subscribe",
                                 "Script hash",
+                                "Soft densify + Esplora script + Esplora perf",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

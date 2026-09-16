@@ -1978,6 +1978,83 @@ pub fn script_hash_hex(script_hex: String) -> String {
     rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(&script))
 }
 
+// --- Soft Densify FFI ---
+
+#[uniffi::export]
+pub fn soft_confirm_window_n(rate_blocks_per_s: Option<f64>) -> u32 {
+    rbitcoin_query::soft_confirm_window_n(rate_blocks_per_s)
+}
+
+#[uniffi::export]
+pub fn soft_assign_restricted(depth_bytes: u64) -> bool {
+    rbitcoin_query::soft_assign_restricted(depth_bytes)
+}
+
+#[uniffi::export]
+pub fn soft_assign_stopped(depth_bytes: u64, stop_bytes: u64) -> bool {
+    rbitcoin_query::soft_assign_stopped(depth_bytes, stop_bytes)
+}
+
+#[uniffi::export]
+pub fn bq_assign_stop_bytes() -> u64 {
+    rbitcoin_query::bq_assign_stop_bytes()
+}
+
+// --- Esplora Script Fields FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiEsploraScriptFields {
+    pub hex: String,
+    pub asm: String,
+    pub script_type: String,
+    pub address: Option<String>,
+}
+
+fn bitcoin_network(net: rbitcoin_primitives::Network) -> bitcoin::Network {
+    match net {
+        rbitcoin_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
+        rbitcoin_primitives::Network::Testnet => bitcoin::Network::Testnet,
+        rbitcoin_primitives::Network::Signet => bitcoin::Network::Signet,
+        rbitcoin_primitives::Network::Regtest => bitcoin::Network::Regtest,
+    }
+}
+
+#[uniffi::export]
+pub fn esplora_script_fields(
+    script_hex: String,
+    network: String,
+) -> Result<FfiEsploraScriptFields, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let fields = rbitcoin_esplora::esplora_script_fields(&script, bitcoin_network(net));
+    Ok(FfiEsploraScriptFields {
+        hex: fields.hex,
+        asm: fields.asm,
+        script_type: fields.script_type.to_string(),
+        address: fields.address,
+    })
+}
+
+// --- Esplora Perf FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiEsploraPerfSample {
+    pub requests: u64,
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+}
+
+#[uniffi::export]
+pub fn sample_reset_esplora_perf() -> FfiEsploraPerfSample {
+    let (requests, bytes, elapsed_ms) = rbitcoin_esplora::sample_reset_perf();
+    FfiEsploraPerfSample {
+        requests,
+        bytes,
+        elapsed_ms,
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3067,5 +3144,38 @@ mod tests {
         let hash =
             script_hash_hex("76a914000000000000000000000000000000000000000088ac".to_string());
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn test_soft_densify() {
+        assert_eq!(soft_confirm_window_n(None), 0);
+        assert_eq!(soft_confirm_window_n(Some(1.0)), 60);
+        assert!(!soft_assign_restricted(0));
+        assert!(!soft_assign_stopped(0, u64::MAX));
+        assert!(bq_assign_stop_bytes() > 0);
+    }
+
+    #[test]
+    fn test_esplora_script_fields_p2pkh() {
+        let script_hex = "76a914000000000000000000000000000000000000000088ac";
+        let fields = esplora_script_fields(script_hex.to_string(), "mainnet".to_string()).unwrap();
+        assert_eq!(fields.script_type, "p2pkh");
+        assert!(!fields.asm.is_empty());
+        assert!(!fields.hex.is_empty());
+    }
+
+    #[test]
+    fn test_esplora_script_fields_op_return() {
+        let fields = esplora_script_fields("6a".to_string(), "mainnet".to_string()).unwrap();
+        assert_eq!(fields.script_type, "op_return");
+    }
+
+    #[test]
+    fn test_sample_reset_esplora_perf() {
+        let sample = sample_reset_esplora_perf();
+        // Fresh sample should be zero
+        assert_eq!(sample.requests, 0);
+        assert_eq!(sample.bytes, 0);
+        assert_eq!(sample.elapsed_ms, 0);
     }
 }

@@ -13,4 +13,5 @@ mod server;
 mod tx_json;
 mod ws;
 
+pub use script_fields::{esplora_script_fields, EsploraScriptFields};
 pub use server::{run_esplora, sample_reset_perf, BlockTemplateFn, EsploraConfig, EsploraHandle};

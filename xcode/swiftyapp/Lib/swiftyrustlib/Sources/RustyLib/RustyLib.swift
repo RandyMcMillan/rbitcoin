@@ -3886,6 +3886,12 @@ public func maxServeBlocks() -> UInt32 {
     )
 })
 }
+public func maxV2ContentsLen() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_max_v2_contents_len($0
+    )
+})
+}
 public func medianTimePastTimes(times: [UInt32]) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_median_time_past_times(
@@ -4581,6 +4587,51 @@ public func unsupportedBeforeVerackLog(cmd: String, peer: UInt64) -> String {
     )
 })
 }
+public func v2CipherExpansion() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_cipher_expansion($0
+    )
+})
+}
+public func v2HandshakeTimeoutLog(peer: UInt64) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_handshake_timeout_log(
+        FfiConverterUInt64.lower(peer),$0
+    )
+})
+}
+public func v2InvalidMessageTypeLog() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_invalid_message_type_log($0
+    )
+})
+}
+public func v2MissingGarbageTerminatorLog() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_missing_garbage_terminator_log($0
+    )
+})
+}
+public func v2OtherRecvBytes(contentsLen: UInt32) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_other_recv_bytes(
+        FfiConverterUInt32.lower(contentsLen),$0
+    )
+})
+}
+public func v2PacketDecryptionFailureLog() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_packet_decryption_failure_log($0
+    )
+})
+}
+public func v2PacketTooLargeLog(n: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_v2_packet_too_large_log(
+        FfiConverterUInt32.lower(n),$0
+    )
+})
+}
 public func validateAddress(address: String) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_func_validate_address(
@@ -4948,6 +4999,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_max_serve_blocks() != 25809) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_max_v2_contents_len() != 41933) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_median_time_past_times() != 24970) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5237,6 +5291,27 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_unsupported_before_verack_log() != 8008) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_cipher_expansion() != 3446) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_handshake_timeout_log() != 60366) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_invalid_message_type_log() != 45904) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_missing_garbage_terminator_log() != 26342) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_other_recv_bytes() != 21768) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_packet_decryption_failure_log() != 29156) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_v2_packet_too_large_log() != 55410) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_validate_address() != 11887) {

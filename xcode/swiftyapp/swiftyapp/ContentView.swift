@@ -197,6 +197,7 @@ struct ContentView: View {
     @State private var psbtFeeResult = ""
     @State private var chainConstantsResult = ""
     @State private var chainLogResult = ""
+    @State private var v2ConstantsResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3900,6 +3901,40 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("V2 transport", systemImage: "network.badge.shield.half.filled")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let maxLen = maxV2ContentsLen()
+                                let expansion = v2CipherExpansion()
+                                let recv = v2OtherRecvBytes(contentsLen: 100)
+                                v2ConstantsResult = "maxLen=\(maxLen) expansion=\(expansion) recv=\(recv)"
+                            } label: {
+                                Label("Load V2 constants", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !v2ConstantsResult.isEmpty {
+                                Text(v2ConstantsResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3955,6 +3990,7 @@ struct ContentView: View {
                                 "BIP32 HD Wallet derivation",
                                 "PSBT parse + extract",
                                 "Chain constants + Chain logs",
+                                "V2 transport constants",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

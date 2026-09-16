@@ -73,7 +73,12 @@ pub use seeds::{
 pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
 pub use service::P2PNode;
 pub use tx_relay::{ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample};
-pub use v2::{encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, WireBytes};
+pub use v2::{
+    encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, v2_handshake_timeout_log,
+    v2_invalid_message_type_log, v2_missing_garbage_terminator_log, v2_other_recv_bytes,
+    v2_packet_decryption_failure_log, v2_packet_too_large_log, WireBytes, MAX_V2_CONTENTS_LEN,
+    V2_CIPHER_EXPANSION,
+};
 pub use versionbits_warn::{
     active_unknown_bits, unknown_rules_warning, warn_period_threshold, warning_strings,
 };

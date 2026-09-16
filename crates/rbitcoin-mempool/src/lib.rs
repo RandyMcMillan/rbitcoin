@@ -35,13 +35,14 @@ pub use accept::{
     check_mempool_structural, pure_rbfr_pays, rbf_allows_replacement, rbf_pays_for_replacement,
     AcceptError, AcceptFailureRecord, AcceptResult, AcceptStageUs, ActiveMempool, ChainPrevout,
     ChainTipCtx, Coin, PreparedAdmit, UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT,
-    INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
+    INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, RBFR_RATIO_DEN,
+    RBFR_RATIO_NUM,
 };
 pub use error::MempoolError;
 pub use fee_est::{
     bucket_count, bucket_index, capacity_wu, default_candidate_rates, effective_capacity_wu,
     horizon_secs, min_rate_for_capacity, projected_inflow_wu_above, BLOCK_WEIGHT_WU,
-    FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
+    CAPACITY_SAFETY_DEN, CAPACITY_SAFETY_NUM, FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
 };
 pub use fee_flow::FeeFlowMeter;
 pub use graph::{

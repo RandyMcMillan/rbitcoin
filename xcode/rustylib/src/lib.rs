@@ -2144,6 +2144,80 @@ pub fn block_reject_log_line(hash: String, reason: String) -> String {
     rbitcoin_consensus::block_reject_log_line(&hash, &reason)
 }
 
+// --- Mempool constants FFI ---
+
+#[uniffi::export]
+pub fn mempool_block_weight_wu() -> u64 {
+    rbitcoin_mempool::BLOCK_WEIGHT_WU
+}
+
+#[uniffi::export]
+pub fn mempool_seconds_per_block() -> u64 {
+    rbitcoin_mempool::SECONDS_PER_BLOCK
+}
+
+#[uniffi::export]
+pub fn mempool_capacity_safety_num() -> u64 {
+    rbitcoin_mempool::CAPACITY_SAFETY_NUM
+}
+
+#[uniffi::export]
+pub fn mempool_capacity_safety_den() -> u64 {
+    rbitcoin_mempool::CAPACITY_SAFETY_DEN
+}
+
+#[uniffi::export]
+pub fn mempool_max_package_count() -> u32 {
+    rbitcoin_mempool::MAX_PACKAGE_COUNT as u32
+}
+
+#[uniffi::export]
+pub fn mempool_max_package_weight() -> u64 {
+    rbitcoin_mempool::MAX_PACKAGE_WEIGHT
+}
+
+#[uniffi::export]
+pub fn mempool_rbfr_ratio_num() -> u64 {
+    rbitcoin_mempool::RBFR_RATIO_NUM
+}
+
+#[uniffi::export]
+pub fn mempool_rbfr_ratio_den() -> u64 {
+    rbitcoin_mempool::RBFR_RATIO_DEN
+}
+
+// --- Peer DOS constants FFI ---
+
+#[uniffi::export]
+pub fn peer_default_max_msgs_per_sec() -> u32 {
+    rbitcoin_net::DEFAULT_MAX_MSGS_PER_SEC
+}
+
+#[uniffi::export]
+pub fn peer_default_max_bytes_per_sec() -> u64 {
+    rbitcoin_net::DEFAULT_MAX_BYTES_PER_SEC
+}
+
+#[uniffi::export]
+pub fn peer_rate_limit_ban_score() -> u32 {
+    rbitcoin_net::RATE_LIMIT_BAN_SCORE
+}
+
+#[uniffi::export]
+pub fn peer_oversize_ban_score() -> u32 {
+    rbitcoin_net::OVERSIZE_BAN_SCORE
+}
+
+#[uniffi::export]
+pub fn peer_max_addr_to_send() -> u32 {
+    rbitcoin_net::MAX_ADDR_TO_SEND as u32
+}
+
+#[uniffi::export]
+pub fn peer_max_pct_addr_to_send() -> u32 {
+    rbitcoin_net::MAX_PCT_ADDR_TO_SEND as u32
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3300,5 +3374,27 @@ mod tests {
         assert!(
             !block_reject_log_line("0000…".to_string(), "bad-txns-nonfinal".to_string()).is_empty()
         );
+    }
+
+    #[test]
+    fn test_mempool_more_constants() {
+        assert_eq!(mempool_block_weight_wu(), 4_000_000);
+        assert_eq!(mempool_seconds_per_block(), 600);
+        assert_eq!(mempool_capacity_safety_num(), 95);
+        assert_eq!(mempool_capacity_safety_den(), 100);
+        assert_eq!(mempool_max_package_count(), 25);
+        assert_eq!(mempool_max_package_weight(), 404_000);
+        assert_eq!(mempool_rbfr_ratio_num(), 5);
+        assert_eq!(mempool_rbfr_ratio_den(), 4);
+    }
+
+    #[test]
+    fn test_peer_dos_constants() {
+        assert_eq!(peer_default_max_msgs_per_sec(), 4_000);
+        assert_eq!(peer_default_max_bytes_per_sec(), 16_000_000);
+        assert_eq!(peer_rate_limit_ban_score(), 50);
+        assert_eq!(peer_oversize_ban_score(), 100);
+        assert_eq!(peer_max_addr_to_send(), 1000);
+        assert_eq!(peer_max_pct_addr_to_send(), 23);
     }
 }

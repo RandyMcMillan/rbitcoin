@@ -3767,6 +3767,24 @@ public func meetsMinRelayFeeAt(feeSat: UInt64, weight: UInt64, satKvb: UInt64) -
     )
 })
 }
+public func mempoolBlockWeightWu() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_block_weight_wu($0
+    )
+})
+}
+public func mempoolCapacitySafetyDen() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_capacity_safety_den($0
+    )
+})
+}
+public func mempoolCapacitySafetyNum() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_capacity_safety_num($0
+    )
+})
+}
 public func mempoolDefaultMaxWeight() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_mempool_default_max_weight($0
@@ -3779,9 +3797,39 @@ public func mempoolIncrementalRelayFeeRate() -> UInt64 {
     )
 })
 }
+public func mempoolMaxPackageCount() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_max_package_count($0
+    )
+})
+}
+public func mempoolMaxPackageWeight() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_max_package_weight($0
+    )
+})
+}
 public func mempoolMaxStandardTxWeight() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_mempool_max_standard_tx_weight($0
+    )
+})
+}
+public func mempoolRbfrRatioDen() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_rbfr_ratio_den($0
+    )
+})
+}
+public func mempoolRbfrRatioNum() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_rbfr_ratio_num($0
+    )
+})
+}
+public func mempoolSecondsPerBlock() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_seconds_per_block($0
     )
 })
 }
@@ -3935,6 +3983,42 @@ public func parseV2RegtestNamed(command: String, payloadHex: String)throws  {try
         FfiConverterString.lower(payloadHex),$0
     )
 }
+}
+public func peerDefaultMaxBytesPerSec() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_default_max_bytes_per_sec($0
+    )
+})
+}
+public func peerDefaultMaxMsgsPerSec() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_default_max_msgs_per_sec($0
+    )
+})
+}
+public func peerMaxAddrToSend() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_max_addr_to_send($0
+    )
+})
+}
+public func peerMaxPctAddrToSend() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_max_pct_addr_to_send($0
+    )
+})
+}
+public func peerOversizeBanScore() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_oversize_ban_score($0
+    )
+})
+}
+public func peerRateLimitBanScore() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_rate_limit_ban_score($0
+    )
+})
 }
 public func percentilesByWeight(scores: [Int64], weights: [Int64], totalWeight: Int64)throws  -> [Int64] {
     return try  FfiConverterSequenceInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -4603,13 +4687,37 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_meets_min_relay_fee_at() != 3522) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_mempool_block_weight_wu() != 31617) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_capacity_safety_den() != 48176) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_capacity_safety_num() != 13780) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_mempool_default_max_weight() != 29788) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_mempool_incremental_relay_fee_rate() != 58176) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_mempool_max_package_count() != 21476) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_max_package_weight() != 19838) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_mempool_max_standard_tx_weight() != 34778) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_rbfr_ratio_den() != 47531) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_rbfr_ratio_num() != 17489) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_seconds_per_block() != 16726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_merkle_root_from_txids() != 53109) {
@@ -4673,6 +4781,24 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_v2_regtest_named() != 47237) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_default_max_bytes_per_sec() != 50878) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_default_max_msgs_per_sec() != 40823) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_max_addr_to_send() != 36275) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_max_pct_addr_to_send() != 18318) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_oversize_ban_score() != 58822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_rate_limit_ban_score() != 36707) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_percentiles_by_weight() != 32241) {

@@ -753,9 +753,17 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueStats()  -> FfiBlockQueueStats
     
+    func clearArchivedBody(hashHex: String) throws  -> Bool
+    
+    func expectedNextBits(network: String, height: UInt32, headerTime: UInt32) throws  -> UInt32
+    
     func fenceTipHeight()  -> UInt64?
     
     func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
+    
+    func headerHasClassABody(headerFk: UInt64) throws  -> Bool
+    
+    func isBlockArchived(hashHex: String) throws  -> Bool
     
     func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
     
@@ -859,6 +867,24 @@ open func blockQueueStats() -> FfiBlockQueueStats {
 })
 }
     
+open func clearArchivedBody(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_clear_archived_body(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func expectedNextBits(network: String, height: UInt32, headerTime: UInt32)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_expected_next_bits(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),
+        FfiConverterUInt32.lower(headerTime),$0
+    )
+})
+}
+    
 open func fenceTipHeight() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_fence_tip_height(self.uniffiClonePointer(),$0
@@ -870,6 +896,22 @@ open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
     return try  FfiConverterOptionTypeFfiTxRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_get_tx_by_txid(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func headerHasClassABody(headerFk: UInt64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_header_has_class_a_body(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(headerFk),$0
+    )
+})
+}
+    
+open func isBlockArchived(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_is_block_archived(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
     )
 })
 }
@@ -2027,6 +2069,18 @@ public func blockHashFromHeader(headerHex: String)throws  -> String {
     )
 })
 }
+public func blockHeaderHash(version: Int32, prevHashHex: String, merkleRootHex: String, timestamp: UInt32, bits: UInt32, nonce: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_header_hash(
+        FfiConverterInt32.lower(version),
+        FfiConverterString.lower(prevHashHex),
+        FfiConverterString.lower(merkleRootHex),
+        FfiConverterUInt32.lower(timestamp),
+        FfiConverterUInt32.lower(bits),
+        FfiConverterUInt32.lower(nonce),$0
+    )
+})
+}
 public func blockSubsidy(height: UInt32, network: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_block_subsidy(
@@ -2080,6 +2134,13 @@ public func desirableServiceFlags(offered: UInt64, tipDepthBlocks: Int64) -> UIn
     uniffi_rustylib_fn_func_desirable_service_flags(
         FfiConverterUInt64.lower(offered),
         FfiConverterInt64.lower(tipDepthBlocks),$0
+    )
+})
+}
+public func displayHashHex(bytes: Data)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_display_hash_hex(
+        FfiConverterData.lower(bytes),$0
     )
 })
 }
@@ -2269,6 +2330,15 @@ public func meetsMinRelayFee(feeSat: UInt64, weight: UInt64) -> Bool {
     )
 })
 }
+public func meetsMinRelayFeeAt(feeSat: UInt64, weight: UInt64, satKvb: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_meets_min_relay_fee_at(
+        FfiConverterUInt64.lower(feeSat),
+        FfiConverterUInt64.lower(weight),
+        FfiConverterUInt64.lower(satKvb),$0
+    )
+})
+}
 public func mempoolDefaultMaxWeight() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_mempool_default_max_weight($0
@@ -2359,6 +2429,13 @@ public func p2pFixedSeedHosts(network: String)throws  -> [String] {
 public func p2pTargetPeers() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_p2p_target_peers($0
+    )
+})
+}
+public func parseDisplayHash32(hex: String)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_parse_display_hash32(
+        FfiConverterString.lower(hex),$0
     )
 })
 }
@@ -2582,6 +2659,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_block_hash_from_header() != 48933) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_block_header_hash() != 31514) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_block_subsidy() != 16642) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2604,6 +2684,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_desirable_service_flags() != 42267) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_display_hash_hex() != 20908) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_electrum_default_tweaks_min_dust() != 58605) {
@@ -2684,6 +2767,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_meets_min_relay_fee() != 27158) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_meets_min_relay_fee_at() != 3522) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_mempool_default_max_weight() != 29788) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2724,6 +2810,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_target_peers() != 34559) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_parse_display_hash32() != 60706) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_tx() != 26241) {
@@ -2840,10 +2929,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_stats() != 60518) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_clear_archived_body() != 5629) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_expected_next_bits() != 27901) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_fence_tip_height() != 44726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_get_tx_by_txid() != 24667) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_header_has_class_a_body() != 9458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_is_block_archived() != 53320) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_is_outpoint_spent() != 59128) {

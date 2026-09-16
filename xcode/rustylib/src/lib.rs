@@ -536,6 +536,46 @@ pub fn bip34_height_script(height: u32) -> String {
     rbitcoin_primitives::hex_encode(rbitcoin_consensus::bip34_height_script(height))
 }
 
+#[uniffi::export]
+pub fn meets_min_relay_fee_at(fee_sat: u64, weight: u64, sat_kvb: u64) -> bool {
+    rbitcoin_consensus::policy::meets_min_relay_fee_at(fee_sat, weight, sat_kvb)
+}
+
+// --- Primitives Hash FFI ---
+
+#[uniffi::export]
+pub fn display_hash_hex(bytes: Vec<u8>) -> Result<String, RustyError> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::display_hash_hex(&arr))
+}
+
+#[uniffi::export]
+pub fn parse_display_hash32(hex: String) -> Result<Vec<u8>, RustyError> {
+    rbitcoin_primitives::parse_display_hash32(&hex)
+        .map(|h| h.to_vec())
+        .map_err(|_| RustyError::InvalidInput)
+}
+
+// --- Store Header FFI ---
+
+#[uniffi::export]
+pub fn block_header_hash(
+    version: i32,
+    prev_hash_hex: String,
+    merkle_root_hex: String,
+    timestamp: u32,
+    bits: u32,
+    nonce: u32,
+) -> Result<String, RustyError> {
+    let prev = parse_hash32(&prev_hash_hex)?;
+    let merkle = parse_hash32(&merkle_root_hex)?;
+    let hash = rbitcoin_store::block_header_hash(version, &prev, &merkle, timestamp, bits, nonce);
+    // Bitcoin display hash is byte-reversed
+    let mut rev = hash;
+    rev.reverse();
+    Ok(rbitcoin_primitives::hex_encode(rev))
+}
+
 // --- Network Service Flags FFI ---
 
 #[uniffi::export]
@@ -837,6 +877,43 @@ impl FfiQuery {
 
     pub fn tx_head_occupied(&self) -> u64 {
         self.inner.tx_head_occupied()
+    }
+
+    pub fn is_block_archived(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner
+            .is_block_archived(&hash)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn header_has_class_a_body(&self, header_fk: u64) -> Result<bool, RustyError> {
+        self.inner
+            .header_has_class_a_body(header_fk)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn clear_archived_body(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner
+            .clear_archived_body(&hash)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn expected_next_bits(
+        &self,
+        network: String,
+        height: u32,
+        header_time: u32,
+    ) -> Result<u32, RustyError> {
+        let params = chain_params_for_network(&network)?;
+        let bits = rbitcoin_consensus::expected_next_bits(
+            &self.inner,
+            &params,
+            rbitcoin_primitives::Height(height),
+            header_time,
+        )
+        .map_err(|_| RustyError::ConsensusError)?;
+        Ok(bits.to_consensus())
     }
 }
 
@@ -1401,5 +1478,59 @@ mod tests {
         assert_eq!(query.archived_block_count().unwrap(), 0);
         assert_eq!(query.tx_body_count(), 0);
         assert_eq!(query.tx_head_occupied(), 0);
+    }
+
+    #[test]
+    fn test_meets_min_relay_fee_at() {
+        assert!(meets_min_relay_fee_at(3000, 1000, 100));
+        assert!(!meets_min_relay_fee_at(99, 4000, 100));
+    }
+
+    #[test]
+    fn test_display_hash_hex() {
+        let bytes = vec![0u8; 32];
+        let hash = display_hash_hex(bytes).unwrap();
+        assert_eq!(
+            hash,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn test_parse_display_hash32_roundtrip() {
+        let hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+        let bytes = parse_display_hash32(hex.to_string()).unwrap();
+        let back = display_hash_hex(bytes).unwrap();
+        assert_eq!(back, hex);
+    }
+
+    #[test]
+    fn test_block_header_hash() {
+        let hash = block_header_hash(
+            1,
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b".to_string(),
+            1231006505,
+            0x1d00ffff,
+            2083236893,
+        )
+        .unwrap();
+        assert_eq!(
+            hash,
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
+    }
+
+    #[test]
+    fn test_query_archive_methods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query4").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert!(!query
+            .is_block_archived(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .unwrap());
+        assert!(!query.header_has_class_a_body(1).unwrap());
     }
 }

@@ -71,7 +71,7 @@ pub use seeds::{
     PeerEntry, PeerFlags, MAX_ADDR_MAN,
 };
 pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
-pub use service::P2PNode;
+pub use service::{magic_for_params, P2PNode};
 pub use tx_relay::{ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample};
 pub use v2::{
     encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, v2_handshake_timeout_log,

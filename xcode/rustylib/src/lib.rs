@@ -1492,6 +1492,12 @@ impl FfiStore {
     pub fn flush(&self) -> Result<(), RustyError> {
         self.inner.flush().map_err(|_| RustyError::StoreError)
     }
+
+    pub fn tx_height_get(&self, tx_fk: u64) -> Result<Option<u32>, RustyError> {
+        self.inner
+            .tx_height_get(rbitcoin_primitives::Fk(tx_fk))
+            .map_err(|_| RustyError::StoreError)
+    }
 }
 
 // --- Query FFI ---
@@ -3369,6 +3375,14 @@ mod tests {
         store.rebuild_height_fence().unwrap();
         store.flush_header_archive().unwrap();
         store.flush().unwrap();
+    }
+
+    #[test]
+    fn test_store_tx_height_get_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store3").to_str().unwrap().to_string();
+        let store = FfiStore::open_or_create(path).unwrap();
+        assert_eq!(store.tx_height_get(1).unwrap(), None);
     }
 
     #[test]

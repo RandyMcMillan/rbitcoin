@@ -2055,6 +2055,13 @@ public func bip34HeightScript(height: UInt32) -> String {
     )
 })
 }
+public func bip68ActiveForTx(txHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_bip68_active_for_tx(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
 public func blockHasWitness(blockHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_block_has_witness(
@@ -2292,6 +2299,13 @@ public func isFinalTx(txHex: String, blockHeight: UInt32, lockTimeCutoff: UInt32
         FfiConverterString.lower(txHex),
         FfiConverterUInt32.lower(blockHeight),
         FfiConverterUInt32.lower(lockTimeCutoff),$0
+    )
+})
+}
+public func legacySigopCount(txHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_legacy_sigop_count(
+        FfiConverterString.lower(txHex),$0
     )
 })
 }
@@ -2552,6 +2566,17 @@ public func seedLookupNamesFlat(network: String)throws  -> [String] {
     )
 })
 }
+public func sequenceLocksSatisfied(txHex: String, prevHeights: [UInt32], prevCoinMtps: [UInt32], blockHeight: UInt32, blockPrevMtp: UInt32)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_sequence_locks_satisfied(
+        FfiConverterString.lower(txHex),
+        FfiConverterSequenceUInt32.lower(prevHeights),
+        FfiConverterSequenceUInt32.lower(prevCoinMtps),
+        FfiConverterUInt32.lower(blockHeight),
+        FfiConverterUInt32.lower(blockPrevMtp),$0
+    )
+})
+}
 public func signetMagicHex(challengeHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_signet_magic_hex(
@@ -2562,6 +2587,13 @@ public func signetMagicHex(challengeHex: String)throws  -> String {
 public func takeLogs() -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_take_logs($0
+    )
+})
+}
+public func txGbtSigops(txHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_gbt_sigops(
+        FfiConverterString.lower(txHex),$0
     )
 })
 }
@@ -2624,6 +2656,14 @@ public func warnPeriodThreshold(network: String)throws  -> FfiWarnPeriod {
     )
 })
 }
+public func witnessCommitmentScript(nonCbWtxidsHex: [String], reservedHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_witness_commitment_script(
+        FfiConverterSequenceString.lower(nonCbWtxidsHex),
+        FfiConverterString.lower(reservedHex),$0
+    )
+})
+}
 public func wtxidFromHex(txHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_wtxid_from_hex(
@@ -2651,6 +2691,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_bip34_height_script() != 45998) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_bip68_active_for_tx() != 32558) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_block_has_witness() != 52826) {
@@ -2750,6 +2793,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_is_final_tx() != 32688) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_legacy_sigop_count() != 56184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_local_service_flags_u64() != 62141) {
@@ -2863,10 +2909,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_seed_lookup_names_flat() != 25383) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_sequence_locks_satisfied() != 54468) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_signet_magic_hex() != 22600) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_take_logs() != 10115) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_gbt_sigops() != 40578) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_txid_from_hex() != 27347) {
@@ -2891,6 +2943,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_warn_period_threshold() != 57469) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_witness_commitment_script() != 61954) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_wtxid_from_hex() != 62498) {

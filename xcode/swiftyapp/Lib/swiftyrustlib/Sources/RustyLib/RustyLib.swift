@@ -925,6 +925,10 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func medianTimePast(height: UInt32) throws  -> UInt32
     
+    func noteHeadDrainFk(maxFk: UInt64) 
+    
+    func noteLookupTiponlyStart(hi: UInt32) 
+    
     func onLoadPack() throws 
     
     func pinChainView() throws  -> FfiChainView?
@@ -932,6 +936,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func pinShChainView() throws  -> FfiChainView?
     
     func pointEdgeCount()  -> UInt64
+    
+    func pruneWriteCreateLoc(writtenHi: UInt32) 
     
     func putHeader(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UInt32, nonce: UInt32, merkleRootHex: String, hashHex: String, size: UInt32, weight: UInt32) throws  -> UInt64
     
@@ -1423,6 +1429,20 @@ open func medianTimePast(height: UInt32)throws  -> UInt32 {
 })
 }
     
+open func noteHeadDrainFk(maxFk: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_note_head_drain_fk(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(maxFk),$0
+    )
+}
+}
+    
+open func noteLookupTiponlyStart(hi: UInt32) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_note_lookup_tiponly_start(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(hi),$0
+    )
+}
+}
+    
 open func onLoadPack()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_on_load_pack(self.uniffiClonePointer(),$0
     )
@@ -1448,6 +1468,13 @@ open func pointEdgeCount() -> UInt64 {
     uniffi_rustylib_fn_method_ffiquery_point_edge_count(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func pruneWriteCreateLoc(writtenHi: UInt32) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_prune_write_create_loc(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(writtenHi),$0
+    )
+}
 }
     
 open func putHeader(prevFk: UInt64, version: Int32, timestamp: UInt32, bits: UInt32, nonce: UInt32, merkleRootHex: String, hashHex: String, size: UInt32, weight: UInt32)throws  -> UInt64 {
@@ -6866,6 +6893,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_median_time_past() != 38475) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_note_head_drain_fk() != 33294) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_note_lookup_tiponly_start() != 36709) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_on_load_pack() != 59619) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6876,6 +6909,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_point_edge_count() != 22384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_prune_write_create_loc() != 20758) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_put_header() != 31999) {

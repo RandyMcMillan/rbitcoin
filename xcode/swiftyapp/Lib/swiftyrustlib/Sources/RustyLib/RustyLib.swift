@@ -977,6 +977,14 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func txIndexEnabled()  -> Bool
     
+    func txInput(txidHex: String, i: UInt32) throws  -> FfiInputRecord
+    
+    func txInputAtFk(createFk: UInt64, i: UInt32) throws  -> FfiInputRecord
+    
+    func txOutput(txidHex: String, vout: UInt32) throws  -> FfiOutputRecord
+    
+    func txOutputAtFk(createFk: UInt64, vout: UInt32) throws  -> FfiOutputRecord
+    
     func validateHeader(network: String, height: UInt32, headerHex: String) throws 
     
     func warningStrings(network: String) throws  -> [String]
@@ -1590,6 +1598,42 @@ open func txHeadOccupied() -> UInt64 {
 open func txIndexEnabled() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_tx_index_enabled(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func txInput(txidHex: String, i: UInt32)throws  -> FfiInputRecord {
+    return try  FfiConverterTypeFfiInputRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tx_input(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(i),$0
+    )
+})
+}
+    
+open func txInputAtFk(createFk: UInt64, i: UInt32)throws  -> FfiInputRecord {
+    return try  FfiConverterTypeFfiInputRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tx_input_at_fk(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(createFk),
+        FfiConverterUInt32.lower(i),$0
+    )
+})
+}
+    
+open func txOutput(txidHex: String, vout: UInt32)throws  -> FfiOutputRecord {
+    return try  FfiConverterTypeFfiOutputRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tx_output(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func txOutputAtFk(createFk: UInt64, vout: UInt32)throws  -> FfiOutputRecord {
+    return try  FfiConverterTypeFfiOutputRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_tx_output_at_fk(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(createFk),
+        FfiConverterUInt32.lower(vout),$0
     )
 })
 }
@@ -2588,6 +2632,104 @@ public func FfiConverterTypeFfiInboundEvictCandidate_lower(_ value: FfiInboundEv
 }
 
 
+public struct FfiInputRecord {
+    public var prevTxid: String
+    public var createFk: UInt64
+    public var prevIndex: UInt32
+    public var sequence: UInt32
+    public var scriptSig: Data
+    public var witness: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(prevTxid: String, createFk: UInt64, prevIndex: UInt32, sequence: UInt32, scriptSig: Data, witness: [Data]) {
+        self.prevTxid = prevTxid
+        self.createFk = createFk
+        self.prevIndex = prevIndex
+        self.sequence = sequence
+        self.scriptSig = scriptSig
+        self.witness = witness
+    }
+}
+
+
+
+extension FfiInputRecord: Equatable, Hashable {
+    public static func ==(lhs: FfiInputRecord, rhs: FfiInputRecord) -> Bool {
+        if lhs.prevTxid != rhs.prevTxid {
+            return false
+        }
+        if lhs.createFk != rhs.createFk {
+            return false
+        }
+        if lhs.prevIndex != rhs.prevIndex {
+            return false
+        }
+        if lhs.sequence != rhs.sequence {
+            return false
+        }
+        if lhs.scriptSig != rhs.scriptSig {
+            return false
+        }
+        if lhs.witness != rhs.witness {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(prevTxid)
+        hasher.combine(createFk)
+        hasher.combine(prevIndex)
+        hasher.combine(sequence)
+        hasher.combine(scriptSig)
+        hasher.combine(witness)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiInputRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiInputRecord {
+        return
+            try FfiInputRecord(
+                prevTxid: FfiConverterString.read(from: &buf), 
+                createFk: FfiConverterUInt64.read(from: &buf), 
+                prevIndex: FfiConverterUInt32.read(from: &buf), 
+                sequence: FfiConverterUInt32.read(from: &buf), 
+                scriptSig: FfiConverterData.read(from: &buf), 
+                witness: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiInputRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.prevTxid, into: &buf)
+        FfiConverterUInt64.write(value.createFk, into: &buf)
+        FfiConverterUInt32.write(value.prevIndex, into: &buf)
+        FfiConverterUInt32.write(value.sequence, into: &buf)
+        FfiConverterData.write(value.scriptSig, into: &buf)
+        FfiConverterSequenceData.write(value.witness, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInputRecord_lift(_ buf: RustBuffer) throws -> FfiInputRecord {
+    return try FfiConverterTypeFfiInputRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInputRecord_lower(_ value: FfiInputRecord) -> RustBuffer {
+    return FfiConverterTypeFfiInputRecord.lower(value)
+}
+
+
 public struct FfiKeypair {
     public var privateKeyWif: String
     public var publicKeyHex: String
@@ -2799,6 +2941,88 @@ public func FfiConverterTypeFfiMempoolSlotStats_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeFfiMempoolSlotStats_lower(_ value: FfiMempoolSlotStats) -> RustBuffer {
     return FfiConverterTypeFfiMempoolSlotStats.lower(value)
+}
+
+
+public struct FfiOutputRecord {
+    public var value: Int64
+    public var script: Data
+    public var spenderFk: UInt64
+    public var multiSpender: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(value: Int64, script: Data, spenderFk: UInt64, multiSpender: Bool) {
+        self.value = value
+        self.script = script
+        self.spenderFk = spenderFk
+        self.multiSpender = multiSpender
+    }
+}
+
+
+
+extension FfiOutputRecord: Equatable, Hashable {
+    public static func ==(lhs: FfiOutputRecord, rhs: FfiOutputRecord) -> Bool {
+        if lhs.value != rhs.value {
+            return false
+        }
+        if lhs.script != rhs.script {
+            return false
+        }
+        if lhs.spenderFk != rhs.spenderFk {
+            return false
+        }
+        if lhs.multiSpender != rhs.multiSpender {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(value)
+        hasher.combine(script)
+        hasher.combine(spenderFk)
+        hasher.combine(multiSpender)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiOutputRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiOutputRecord {
+        return
+            try FfiOutputRecord(
+                value: FfiConverterInt64.read(from: &buf), 
+                script: FfiConverterData.read(from: &buf), 
+                spenderFk: FfiConverterUInt64.read(from: &buf), 
+                multiSpender: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiOutputRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.value, into: &buf)
+        FfiConverterData.write(value.script, into: &buf)
+        FfiConverterUInt64.write(value.spenderFk, into: &buf)
+        FfiConverterBool.write(value.multiSpender, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiOutputRecord_lift(_ buf: RustBuffer) throws -> FfiOutputRecord {
+    return try FfiConverterTypeFfiOutputRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiOutputRecord_lower(_ value: FfiOutputRecord) -> RustBuffer {
+    return FfiConverterTypeFfiOutputRecord.lower(value)
 }
 
 
@@ -3926,6 +4150,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
         }
         return seq
     }
@@ -6492,6 +6741,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tx_index_enabled() != 45320) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tx_input() != 64754) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tx_input_at_fk() != 64199) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tx_output() != 1886) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_tx_output_at_fk() != 24851) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_validate_header() != 45565) {

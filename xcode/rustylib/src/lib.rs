@@ -160,6 +160,34 @@ pub fn verify_tx_scripts(prevouts_hex: Vec<String>, tx_hex: String) -> Result<()
 }
 
 #[uniffi::export]
+pub fn verify_tx_scripts_forks(
+    prevouts_hex: Vec<String>,
+    tx_hex: String,
+    bip65_active: bool,
+    bip112_active: bool,
+    bip66_active: bool,
+    bip16_active: bool,
+    taproot_active: bool,
+) -> Result<(), RustyError> {
+    let prevouts: Vec<bitcoin::TxOut> = prevouts_hex
+        .iter()
+        .map(|h| deserialize_hex(h).map_err(|_| RustyError::InvalidInput))
+        .collect::<Result<Vec<_>, _>>()?;
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    rbitcoin_consensus::verify_tx_scripts_detached_forks(
+        prevouts,
+        tx,
+        bip65_active,
+        bip112_active,
+        bip66_active,
+        bip16_active,
+        taproot_active,
+    )
+    .map_err(|_| RustyError::ConsensusError)
+}
+
+#[uniffi::export]
 pub fn virtual_size(weight: u64) -> u64 {
     rbitcoin_consensus::policy::get_virtual_size(weight)
 }

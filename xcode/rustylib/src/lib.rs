@@ -1996,6 +1996,18 @@ impl FfiQuery {
             .map_err(|_| RustyError::StoreError)
     }
 
+    pub fn note_head_drain_fk(&self, max_fk: u64) {
+        self.inner.note_head_drain_fk(max_fk);
+    }
+
+    pub fn note_lookup_tiponly_start(&self, hi: u32) {
+        self.inner.note_lookup_tiponly_start(hi);
+    }
+
+    pub fn prune_write_create_loc(&self, written_hi: u32) {
+        self.inner.prune_write_create_loc(written_hi);
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -3487,6 +3499,10 @@ mod tests {
         assert_eq!(query.class_a_hi(), Some(300));
         query.set_class_a_hi(None);
         assert_eq!(query.class_a_hi(), None);
+        query.note_head_drain_fk(100);
+        assert_eq!(query.head_drain_fk(), 100);
+        query.note_lookup_tiponly_start(50);
+        query.prune_write_create_loc(10);
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
     }

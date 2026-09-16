@@ -25,7 +25,13 @@ mod versionbits_warn;
 
 pub use asmap::{interpret, ip16_for_lookup, sanity_check, AsMap, TWO_PREFIX_ASMAP};
 pub use cache::BlockCache;
-pub use chain::{headers_download_timeout_secs, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
+pub use chain::{
+    accept_block_header_nodos_log, headers_download_timeout_secs, headers_timeout_disconnect_log,
+    headers_timeout_noban_log, ignoring_low_work_chain_log, initial_getheaders_log,
+    received_getdata_wtx_log, received_tx_log, synchronizing_blockheaders_log, AcceptOutcome,
+    ChainHub, ChainTipInfo, TipEvent, DEFAULT_MAX_TIP_AGE_SECS, IBD_FEEFILTER_SAT_KVB,
+    STALE_RELAY_AGE_LIMIT_SECS,
+};
 pub use compact::{
     classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
     CmpctPeerFrame,

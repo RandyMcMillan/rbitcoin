@@ -195,6 +195,8 @@ struct ContentView: View {
     @State private var psbtHex = ""
     @State private var psbtTxResult = ""
     @State private var psbtFeeResult = ""
+    @State private var chainConstantsResult = ""
+    @State private var chainLogResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3846,6 +3848,58 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Chain constants", systemImage: "link.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net + consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let tipAge = defaultMaxTipAgeSecs()
+                                let feefilter = ibdFeefilterSatKvb()
+                                let stale = staleRelayAgeLimitSecs()
+                                let addrMan = maxAddrMan()
+                                let minRelay = minRelayFeeRateSatPerKvb()
+                                chainConstantsResult = "tipAge=\(tipAge)s feefilter=\(feefilter) stale=\(stale)s addrMan=\(addrMan) minRelay=\(minRelay)"
+                            } label: {
+                                Label("Load chain constants", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !chainConstantsResult.isEmpty {
+                                Text(chainConstantsResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+
+                            Button {
+                                let log1 = synchronizingBlockheadersLog(height: 100)
+                                let log2 = receivedTxLog()
+                                chainLogResult = "\(log1.prefix(20))… | \(log2.prefix(20))…"
+                            } label: {
+                                Label("Sample chain logs", systemImage: "doc.text.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !chainLogResult.isEmpty {
+                                Text(chainLogResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3900,6 +3954,7 @@ struct ContentView: View {
                                 "Key & Address generation",
                                 "BIP32 HD Wallet derivation",
                                 "PSBT parse + extract",
+                                "Chain constants + Chain logs",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

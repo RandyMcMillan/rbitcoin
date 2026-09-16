@@ -2367,6 +2367,75 @@ pub fn psbt_fee_sat(hex: String) -> Result<u64, RustyError> {
     Ok(fee.to_sat())
 }
 
+// --- Chain constants & logs FFI ---
+
+#[uniffi::export]
+pub fn default_max_tip_age_secs() -> u64 {
+    rbitcoin_net::DEFAULT_MAX_TIP_AGE_SECS
+}
+
+#[uniffi::export]
+pub fn ibd_feefilter_sat_kvb() -> u64 {
+    rbitcoin_net::IBD_FEEFILTER_SAT_KVB
+}
+
+#[uniffi::export]
+pub fn stale_relay_age_limit_secs() -> u64 {
+    rbitcoin_net::STALE_RELAY_AGE_LIMIT_SECS
+}
+
+#[uniffi::export]
+pub fn max_addr_man() -> u32 {
+    rbitcoin_net::MAX_ADDR_MAN as u32
+}
+
+#[uniffi::export]
+pub fn accept_block_header_nodos_log(hash: String) -> String {
+    rbitcoin_net::accept_block_header_nodos_log(&hash)
+}
+
+#[uniffi::export]
+pub fn ignoring_low_work_chain_log(height: u32) -> String {
+    rbitcoin_net::ignoring_low_work_chain_log(height)
+}
+
+#[uniffi::export]
+pub fn synchronizing_blockheaders_log(height: u32) -> String {
+    rbitcoin_net::synchronizing_blockheaders_log(height)
+}
+
+#[uniffi::export]
+pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
+    rbitcoin_net::initial_getheaders_log(locator_height, peer)
+}
+
+#[uniffi::export]
+pub fn headers_timeout_disconnect_log(peer: u64) -> String {
+    rbitcoin_net::headers_timeout_disconnect_log(peer)
+}
+
+#[uniffi::export]
+pub fn headers_timeout_noban_log(peer: u64) -> String {
+    rbitcoin_net::headers_timeout_noban_log(peer)
+}
+
+#[uniffi::export]
+pub fn received_getdata_wtx_log(wtxid: String, peer: u64) -> String {
+    rbitcoin_net::received_getdata_wtx_log(&wtxid, peer)
+}
+
+#[uniffi::export]
+pub fn received_tx_log() -> String {
+    rbitcoin_net::received_tx_log().to_string()
+}
+
+// --- Consensus policy constants FFI ---
+
+#[uniffi::export]
+pub fn min_relay_fee_rate_sat_per_kvb() -> u64 {
+    rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3622,5 +3691,30 @@ mod tests {
         assert!(!tx_hex.is_empty());
         let fee = psbt_fee_sat(psbt_hex).unwrap();
         assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn test_chain_constants() {
+        assert_eq!(default_max_tip_age_secs(), 24 * 60 * 60);
+        assert_eq!(ibd_feefilter_sat_kvb(), 9_936_506);
+        assert_eq!(stale_relay_age_limit_secs(), 30 * 24 * 60 * 60);
+        assert_eq!(max_addr_man(), 8192);
+    }
+
+    #[test]
+    fn test_chain_logs() {
+        assert!(!accept_block_header_nodos_log("0000…".to_string()).is_empty());
+        assert!(!ignoring_low_work_chain_log(100).is_empty());
+        assert!(!synchronizing_blockheaders_log(100).is_empty());
+        assert!(!initial_getheaders_log(100, 1).is_empty());
+        assert!(!headers_timeout_disconnect_log(1).is_empty());
+        assert!(!headers_timeout_noban_log(1).is_empty());
+        assert!(!received_getdata_wtx_log("0000…".to_string(), 1).is_empty());
+        assert!(!received_tx_log().is_empty());
+    }
+
+    #[test]
+    fn test_min_relay_fee_rate() {
+        assert_eq!(min_relay_fee_rate_sat_per_kvb(), 100);
     }
 }

@@ -1814,6 +1814,8 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func txHeadBits()  -> UInt32
     
+    func txHeightGet(txFk: UInt64) throws  -> UInt32?
+    
 }
 
 open class FfiStore:
@@ -2027,6 +2029,14 @@ open func tipHeight() -> UInt64? {
 open func txHeadBits() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_tx_head_bits(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func txHeightGet(txFk: UInt64)throws  -> UInt32? {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_height_get(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(txFk),$0
     )
 })
 }
@@ -6909,6 +6919,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tx_head_bits() != 27031) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_height_get() != 13849) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {

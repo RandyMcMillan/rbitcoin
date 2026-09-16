@@ -326,7 +326,7 @@ pub fn node_inbound_from_maxconnections(total: u32) -> u32 {
 #[uniffi::export]
 pub fn node_parse_minimum_chain_work(spec: String) -> Result<String, RustyError> {
     rbitcoin_node::parse_minimum_chain_work(&spec)
-        .map(|h| rbitcoin_primitives::hex_encode(h))
+        .map(rbitcoin_primitives::hex_encode)
         .map_err(|_| RustyError::InvalidInput)
 }
 
@@ -347,7 +347,7 @@ pub fn init_log_level(level: String) {
 #[uniffi::export]
 pub fn log_level_enabled(level: String) -> bool {
     rbitcoin_log::Level::parse(&level)
-        .map(|l| rbitcoin_log::enabled(l))
+        .map(rbitcoin_log::enabled)
         .unwrap_or(false)
 }
 
@@ -427,7 +427,8 @@ pub fn default_milestone_height(network: String) -> Result<u32, RustyError> {
 #[uniffi::export]
 pub fn check_genesis_hash(network: String, hash_hex: String) -> Result<bool, RustyError> {
     let params = chain_params_for_network(&network)?;
-    let hash_bytes = rbitcoin_primitives::hex_decode(&hash_hex).map_err(|_| RustyError::InvalidInput)?;
+    let hash_bytes =
+        rbitcoin_primitives::hex_decode(&hash_hex).map_err(|_| RustyError::InvalidInput)?;
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&hash_bytes);
     arr.reverse(); // display hash → internal byte order
@@ -437,7 +438,8 @@ pub fn check_genesis_hash(network: String, hash_hex: String) -> Result<bool, Rus
 
 #[uniffi::export]
 pub fn signet_magic_hex(challenge_hex: String) -> Result<String, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&challenge_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&challenge_hex).map_err(|_| RustyError::InvalidInput)?;
     let script = bitcoin::Script::from_bytes(&bytes);
     let magic = rbitcoin_consensus::signet_magic(script);
     Ok(rbitcoin_primitives::hex_encode(magic))
@@ -449,11 +451,16 @@ pub fn default_signet_challenge_hex() -> String {
 }
 
 #[uniffi::export]
-pub fn validate_signet_block_solution(block_hex: String, challenge_hex: String) -> Result<(), RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
-    let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
-        .map_err(|_| RustyError::InvalidInput)?;
-    let challenge_bytes = rbitcoin_primitives::hex_decode(&challenge_hex).map_err(|_| RustyError::InvalidInput)?;
+pub fn validate_signet_block_solution(
+    block_hex: String,
+    challenge_hex: String,
+) -> Result<(), RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let challenge_bytes =
+        rbitcoin_primitives::hex_decode(&challenge_hex).map_err(|_| RustyError::InvalidInput)?;
     let challenge = bitcoin::Script::from_bytes(&challenge_bytes);
     rbitcoin_consensus::validate_signet_block_solution(&block, challenge)
         .map_err(|_| RustyError::ConsensusError)
@@ -462,8 +469,13 @@ pub fn validate_signet_block_solution(block_hex: String, challenge_hex: String) 
 // --- Regtest Mining FFI ---
 
 #[uniffi::export]
-pub fn mine_empty_regtest(prev_hash_hex: String, time: u32, height: u32) -> Result<String, RustyError> {
-    let prev_bytes = rbitcoin_primitives::hex_decode(&prev_hash_hex).map_err(|_| RustyError::InvalidInput)?;
+pub fn mine_empty_regtest(
+    prev_hash_hex: String,
+    time: u32,
+    height: u32,
+) -> Result<String, RustyError> {
+    let prev_bytes =
+        rbitcoin_primitives::hex_decode(&prev_hash_hex).map_err(|_| RustyError::InvalidInput)?;
     let mut prev_arr = [0u8; 32];
     prev_arr.copy_from_slice(&prev_bytes);
     prev_arr.reverse();
@@ -474,9 +486,10 @@ pub fn mine_empty_regtest(prev_hash_hex: String, time: u32, height: u32) -> Resu
 
 #[uniffi::export]
 pub fn grind_regtest_pow(header_hex: String) -> Result<String, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-    let mut header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
-        .map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut header: bitcoin::block::Header =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     rbitcoin_consensus::grind_regtest_pow(&mut header);
     Ok(bitcoin::consensus::encode::serialize_hex(&header))
 }
@@ -495,23 +508,32 @@ pub fn regtest_block_spacing() -> u32 {
 
 #[uniffi::export]
 pub fn block_has_witness(block_hex: String) -> Result<bool, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
-    let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
-        .map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     Ok(rbitcoin_consensus::block_has_witness(&block))
 }
 
 #[uniffi::export]
-pub fn is_final_tx(tx_hex: String, block_height: u32, lock_time_cutoff: u32) -> Result<bool, RustyError> {
+pub fn is_final_tx(
+    tx_hex: String,
+    block_height: u32,
+    lock_time_cutoff: u32,
+) -> Result<bool, RustyError> {
     let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-    let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes)
-        .map_err(|_| RustyError::InvalidInput)?;
-    Ok(rbitcoin_consensus::is_final_tx(&tx, block_height, lock_time_cutoff))
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_consensus::is_final_tx(
+        &tx,
+        block_height,
+        lock_time_cutoff,
+    ))
 }
 
 #[uniffi::export]
 pub fn bip34_height_script(height: u32) -> String {
-    rbitcoin_primitives::hex_encode(&rbitcoin_consensus::bip34_height_script(height))
+    rbitcoin_primitives::hex_encode(rbitcoin_consensus::bip34_height_script(height))
 }
 
 // --- Network Service Flags FFI ---
@@ -572,7 +594,8 @@ pub fn merkle_root_from_txids(txids_hex: Vec<String>) -> Result<String, RustyErr
 
 #[uniffi::export]
 pub fn block_wire_input_count(block_hex: String) -> Result<u32, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
     Ok(rbitcoin_store::block_wire_input_count(&bytes))
 }
 
@@ -719,8 +742,8 @@ impl FfiStore {
 
     #[uniffi::constructor]
     pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
-        let store = rbitcoin_store::Store::open_or_create(&path)
-            .map_err(|_| RustyError::StoreError)?;
+        let store =
+            rbitcoin_store::Store::open_or_create(&path).map_err(|_| RustyError::StoreError)?;
         Ok(Arc::new(Self { inner: store }))
     }
 
@@ -803,7 +826,9 @@ impl FfiQuery {
     }
 
     pub fn archived_block_count(&self) -> Result<u64, RustyError> {
-        self.inner.archived_block_count().map_err(|_| RustyError::StoreError)
+        self.inner
+            .archived_block_count()
+            .map_err(|_| RustyError::StoreError)
     }
 
     pub fn tx_body_count(&self) -> u64 {
@@ -1190,14 +1215,20 @@ mod tests {
     #[test]
     fn test_genesis_block_hash() {
         let hash = genesis_block_hash("mainnet".to_string()).unwrap();
-        assert_eq!(hash, "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+        assert_eq!(
+            hash,
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
         let regtest = genesis_block_hash("regtest".to_string()).unwrap();
         assert!(!regtest.is_empty());
     }
 
     #[test]
     fn test_default_milestone_height() {
-        assert_eq!(default_milestone_height("mainnet".to_string()).unwrap(), 840_000);
+        assert_eq!(
+            default_milestone_height("mainnet".to_string()).unwrap(),
+            840_000
+        );
         assert_eq!(default_milestone_height("regtest".to_string()).unwrap(), 0);
     }
 

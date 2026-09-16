@@ -1668,6 +1668,162 @@ public func FfiConverterTypeFfiChainView_lower(_ value: FfiChainView) -> RustBuf
 }
 
 
+public struct FfiEsploraPerfSample {
+    public var requests: UInt64
+    public var bytes: UInt64
+    public var elapsedMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(requests: UInt64, bytes: UInt64, elapsedMs: UInt64) {
+        self.requests = requests
+        self.bytes = bytes
+        self.elapsedMs = elapsedMs
+    }
+}
+
+
+
+extension FfiEsploraPerfSample: Equatable, Hashable {
+    public static func ==(lhs: FfiEsploraPerfSample, rhs: FfiEsploraPerfSample) -> Bool {
+        if lhs.requests != rhs.requests {
+            return false
+        }
+        if lhs.bytes != rhs.bytes {
+            return false
+        }
+        if lhs.elapsedMs != rhs.elapsedMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(requests)
+        hasher.combine(bytes)
+        hasher.combine(elapsedMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiEsploraPerfSample: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiEsploraPerfSample {
+        return
+            try FfiEsploraPerfSample(
+                requests: FfiConverterUInt64.read(from: &buf), 
+                bytes: FfiConverterUInt64.read(from: &buf), 
+                elapsedMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiEsploraPerfSample, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.requests, into: &buf)
+        FfiConverterUInt64.write(value.bytes, into: &buf)
+        FfiConverterUInt64.write(value.elapsedMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEsploraPerfSample_lift(_ buf: RustBuffer) throws -> FfiEsploraPerfSample {
+    return try FfiConverterTypeFfiEsploraPerfSample.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEsploraPerfSample_lower(_ value: FfiEsploraPerfSample) -> RustBuffer {
+    return FfiConverterTypeFfiEsploraPerfSample.lower(value)
+}
+
+
+public struct FfiEsploraScriptFields {
+    public var hex: String
+    public var asm: String
+    public var scriptType: String
+    public var address: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hex: String, asm: String, scriptType: String, address: String?) {
+        self.hex = hex
+        self.asm = asm
+        self.scriptType = scriptType
+        self.address = address
+    }
+}
+
+
+
+extension FfiEsploraScriptFields: Equatable, Hashable {
+    public static func ==(lhs: FfiEsploraScriptFields, rhs: FfiEsploraScriptFields) -> Bool {
+        if lhs.hex != rhs.hex {
+            return false
+        }
+        if lhs.asm != rhs.asm {
+            return false
+        }
+        if lhs.scriptType != rhs.scriptType {
+            return false
+        }
+        if lhs.address != rhs.address {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hex)
+        hasher.combine(asm)
+        hasher.combine(scriptType)
+        hasher.combine(address)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiEsploraScriptFields: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiEsploraScriptFields {
+        return
+            try FfiEsploraScriptFields(
+                hex: FfiConverterString.read(from: &buf), 
+                asm: FfiConverterString.read(from: &buf), 
+                scriptType: FfiConverterString.read(from: &buf), 
+                address: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiEsploraScriptFields, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hex, into: &buf)
+        FfiConverterString.write(value.asm, into: &buf)
+        FfiConverterString.write(value.scriptType, into: &buf)
+        FfiConverterOptionString.write(value.address, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEsploraScriptFields_lift(_ buf: RustBuffer) throws -> FfiEsploraScriptFields {
+    return try FfiConverterTypeFfiEsploraScriptFields.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiEsploraScriptFields_lower(_ value: FfiEsploraScriptFields) -> RustBuffer {
+    return FfiConverterTypeFfiEsploraScriptFields.lower(value)
+}
+
+
 public struct FfiHeaderRecord {
     public var prevFk: UInt64
     public var version: Int32
@@ -3172,6 +3328,12 @@ public func blockWireInputCount(blockHex: String)throws  -> UInt32 {
     )
 })
 }
+public func bqAssignStopBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_bq_assign_stop_bytes($0
+    )
+})
+}
 public func captureLogs(on: Bool) {try! rustCall() {
     uniffi_rustylib_fn_func_capture_logs(
         FfiConverterBool.lower(on),$0
@@ -3274,6 +3436,14 @@ public func electrumScripthashHex(scriptHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_electrum_scripthash_hex(
         FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func esploraScriptFields(scriptHex: String, network: String)throws  -> FfiEsploraScriptFields {
+    return try  FfiConverterTypeFfiEsploraScriptFields.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_esplora_script_fields(
+        FfiConverterString.lower(scriptHex),
+        FfiConverterString.lower(network),$0
     )
 })
 }
@@ -3838,6 +4008,12 @@ public func rustHello() -> String {
     )
 })
 }
+public func sampleResetEsploraPerf() -> FfiEsploraPerfSample {
+    return try!  FfiConverterTypeFfiEsploraPerfSample.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_sample_reset_esplora_perf($0
+    )
+})
+}
 public func sampleResetServePerf() -> FfiServePerfSample {
     return try!  FfiConverterTypeFfiServePerfSample.lift(try! rustCall() {
     uniffi_rustylib_fn_func_sample_reset_serve_perf($0
@@ -3897,6 +4073,28 @@ public func signetMagicHex(challengeHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_signet_magic_hex(
         FfiConverterString.lower(challengeHex),$0
+    )
+})
+}
+public func softAssignRestricted(depthBytes: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_soft_assign_restricted(
+        FfiConverterUInt64.lower(depthBytes),$0
+    )
+})
+}
+public func softAssignStopped(depthBytes: UInt64, stopBytes: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_soft_assign_stopped(
+        FfiConverterUInt64.lower(depthBytes),
+        FfiConverterUInt64.lower(stopBytes),$0
+    )
+})
+}
+public func softConfirmWindowN(rateBlocksPerS: Double?) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_soft_confirm_window_n(
+        FfiConverterOptionDouble.lower(rateBlocksPerS),$0
     )
 })
 }
@@ -4105,6 +4303,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_block_wire_input_count() != 6467) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_bq_assign_stop_bytes() != 43857) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_capture_logs() != 24561) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4145,6 +4346,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_electrum_scripthash_hex() != 39984) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_esplora_script_fields() != 56162) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_fee_bucket_count() != 44190) {
@@ -4375,6 +4579,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_rust_hello() != 11814) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_sample_reset_esplora_perf() != 43451) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_sample_reset_serve_perf() != 14009) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4397,6 +4604,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_signet_magic_hex() != 22600) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_soft_assign_restricted() != 28998) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_soft_assign_stopped() != 6856) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_soft_confirm_window_n() != 47869) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_sum_work_hex() != 24879) {

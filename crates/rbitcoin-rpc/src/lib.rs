@@ -8,6 +8,9 @@ mod methods;
 mod server;
 
 pub use auth::RpcAuth;
+pub use blockstats::{
+    is_unspendable, percentiles_by_weight, truncated_median, txout_serialized_size,
+};
 pub use methods::{
     gbt_template, submit_received_block, RpcActive, RpcContext, RpcRegtest, SubmitBlockOutcome,
 };

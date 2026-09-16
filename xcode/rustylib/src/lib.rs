@@ -1834,6 +1834,53 @@ pub fn fee_min_rate_for_capacity_simple(
     )
 }
 
+// --- Node Time FFI ---
+
+#[uniffi::export]
+pub fn tip_too_far_in_future(tip_time: u32, now: u64) -> bool {
+    rbitcoin_node::tip_too_far_in_future(tip_time, now)
+}
+
+#[uniffi::export]
+pub fn max_future_block_time() -> u64 {
+    rbitcoin_node::MAX_FUTURE_BLOCK_TIME
+}
+
+// --- Blockstats FFI ---
+
+#[uniffi::export]
+pub fn is_unspendable(script_hex: String) -> bool {
+    let script = rbitcoin_primitives::hex_decode(&script_hex).unwrap_or_default();
+    rbitcoin_rpc::is_unspendable(&script)
+}
+
+#[uniffi::export]
+pub fn txout_serialized_size(out_hex: String) -> Result<i64, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&out_hex).map_err(|_| RustyError::InvalidInput)?;
+    let out: bitcoin::TxOut =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_rpc::txout_serialized_size(&out))
+}
+
+#[uniffi::export]
+pub fn truncated_median(scores: Vec<i64>) -> i64 {
+    rbitcoin_rpc::truncated_median(scores)
+}
+
+#[uniffi::export]
+pub fn percentiles_by_weight(
+    scores: Vec<i64>,
+    weights: Vec<i64>,
+    total_weight: i64,
+) -> Result<Vec<i64>, RustyError> {
+    if scores.len() != weights.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    let pairs: Vec<(i64, i64)> = scores.into_iter().zip(weights).collect();
+    let result = rbitcoin_rpc::percentiles_by_weight(pairs, total_weight);
+    Ok(result.to_vec())
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -2790,5 +2837,61 @@ mod tests {
         assert_eq!(view, None);
         let sh_view = query.pin_sh_chain_view().unwrap();
         assert_eq!(sh_view, None);
+    }
+
+    #[test]
+    fn test_tip_too_far_in_future() {
+        assert!(!tip_too_far_in_future(1000, 1000));
+        assert!(tip_too_far_in_future(1000 + 7200 + 1, 1000));
+        assert!(!tip_too_far_in_future(1000 + 7200, 1000));
+        assert_eq!(max_future_block_time(), 7200);
+    }
+
+    #[test]
+    fn test_is_unspendable() {
+        assert!(is_unspendable("6a".to_string())); // OP_RETURN
+        assert!(!is_unspendable("76a914".to_string())); // P2PKH start
+                                                        // Script over 10_000 bytes
+        let huge = vec![0x00u8; 10001];
+        assert!(is_unspendable(rbitcoin_primitives::hex_encode(&huge)));
+    }
+
+    #[test]
+    fn test_txout_serialized_size() {
+        // Simple P2PKH output: value(8) + len(1) + script(25) = 34
+        let out_hex = "00f2052a010000001976a914000000000000000000000000000000000000000088ac";
+        let size = txout_serialized_size(out_hex.to_string()).unwrap();
+        assert_eq!(size, 34);
+    }
+
+    #[test]
+    fn test_truncated_median() {
+        assert_eq!(truncated_median(vec![1, 3, 2]), 2);
+        assert_eq!(truncated_median(vec![1, 2, 3, 4]), 2); // (2+3)/2
+        assert_eq!(truncated_median(vec![]), 0);
+        assert_eq!(truncated_median(vec![5]), 5);
+    }
+
+    #[test]
+    fn test_percentiles_by_weight() {
+        let scores = vec![1, 2, 3, 4, 5];
+        let weights = vec![10, 10, 10, 10, 10];
+        let result = percentiles_by_weight(scores, weights, 50).unwrap();
+        assert_eq!(result.len(), 5);
+        // With total_weight=50, cumulative at each point: 10, 20, 30, 40, 50
+        // percentiles: 10% → 5, 25% → 10, 50% → 15, 75% → 20, 90% → 25
+        // Wait, total_weight * percentile / 100:
+        // 50*10/100=5 → first weight 10 >= 5 → result[0]=1
+        // 50*25/100=12.5 → cumulative 20 >= 12.5 → result[1]=2
+        // 50*50/100=25 → cumulative 30 >= 25 → result[2]=3
+        // 50*75/100=37.5 → cumulative 40 >= 37.5 → result[3]=4
+        // 50*90/100=45 → cumulative 50 >= 45 → result[4]=5
+        assert_eq!(result, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_percentiles_by_weight_mismatch() {
+        let result = percentiles_by_weight(vec![1, 2], vec![10], 10);
+        assert!(result.is_err());
     }
 }

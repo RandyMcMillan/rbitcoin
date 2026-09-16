@@ -134,6 +134,18 @@ struct ContentView: View {
     @State private var headerRecordResult = ""
     @State private var evictionResult = ""
     @State private var pinViewResult = ""
+    @State private var tipTimeInput = "1000"
+    @State private var tipNowInput = "1000"
+    @State private var tipFutureResult = ""
+    @State private var unspendableScript = "6a"
+    @State private var unspendableResult = ""
+    @State private var txoutHexInput = "00f2052a010000001976a914000000000000000000000000000000000000000088ac"
+    @State private var txoutSizeResult = ""
+    @State private var medianScores = "1, 3, 2"
+    @State private var medianResult = ""
+    @State private var percentileScores = "1, 2, 3, 4, 5"
+    @State private var percentileWeights = "10, 10, 10, 10, 10"
+    @State private var percentileResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2726,6 +2738,224 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Tip future check", systemImage: "clock.arrow.circlepath")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-node")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Tip time", text: $tipTimeInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 100)
+                                TextField("Now", text: $tipNowInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 100)
+                                Button {
+                                    guard let tip = UInt32(tipTimeInput), let now = UInt64(tipNowInput) else {
+                                        tipFutureResult = "invalid"
+                                        return
+                                    }
+                                    let far = tipTooFarInFuture(tipTime: tip, now: now)
+                                    let max = maxFutureBlockTime()
+                                    tipFutureResult = far ? "too far (>\(max)s)" : "ok"
+                                } label: {
+                                    Label("Check", systemImage: "checkmark.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !tipFutureResult.isEmpty {
+                                Text(tipFutureResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Unspendable script", systemImage: "xmark.shield.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-rpc")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Script hex", text: $unspendableScript)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .onChange(of: unspendableScript) { _ in
+                                        unspendableResult = isUnspendable(scriptHex: unspendableScript) ? "unspendable" : "spendable"
+                                    }
+                                if !unspendableResult.isEmpty {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: unspendableResult == "unspendable" ? "xmark.circle.fill" : "checkmark.circle.fill")
+                                            .foregroundStyle(unspendableResult == "unspendable" ? Color.red : Color.green)
+                                        Text(unspendableResult)
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        unspendableResult = isUnspendable(scriptHex: unspendableScript) ? "unspendable" : "spendable"
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("TxOut size", systemImage: "doc.text.magnifyingglass")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-rpc")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("TxOut hex", text: $txoutHexInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = txoutHexInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        txoutSizeResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let size = try txoutSerializedSize(outHex: hex)
+                                        txoutSizeResult = "\(size) bytes"
+                                    } catch {
+                                        txoutSizeResult = "invalid"
+                                    }
+                                } label: {
+                                    Label("Size", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !txoutSizeResult.isEmpty {
+                                    Text(txoutSizeResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Truncated median", systemImage: "function")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-rpc")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Scores (comma-separated)", text: $medianScores)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let parts = medianScores.split(separator: ",").compactMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+                                    guard !parts.isEmpty else {
+                                        medianResult = ""
+                                        return
+                                    }
+                                    let med = truncatedMedian(scores: parts)
+                                    medianResult = "\(med)"
+                                } label: {
+                                    Label("Median", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !medianResult.isEmpty {
+                                    Text(medianResult)
+                                        .font(.title3.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Percentiles by weight", systemImage: "chart.bar.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-rpc")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Scores (comma-separated)", text: $percentileScores)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Weights (comma-separated)", text: $percentileWeights)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let s = percentileScores.split(separator: ",").compactMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+                                    let w = percentileWeights.split(separator: ",").compactMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+                                    guard s.count == w.count, !s.isEmpty else {
+                                        percentileResult = "mismatch"
+                                        return
+                                    }
+                                    do {
+                                        let p = try percentilesByWeight(scores: s, weights: w, totalWeight: w.reduce(0, +))
+                                        percentileResult = p.map { String($0) }.joined(separator: ", ")
+                                    } catch {
+                                        percentileResult = "error"
+                                    }
+                                } label: {
+                                    Label("Compute", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !percentileResult.isEmpty {
+                                    Text(percentileResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2765,6 +2995,9 @@ struct ContentView: View {
                                 "Script verify forks + Class A commit",
                                 "Header to record + Inbound eviction",
                                 "Pin chain view",
+                                "Tip future check + Unspendable script",
+                                "TxOut size + Truncated median",
+                                "Percentiles by weight",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

@@ -160,6 +160,22 @@ struct ContentView: View {
     @State private var staleResult = ""
     @State private var witnessBlockHex = ""
     @State private var witnessCommitResult = ""
+    @State private var dnsSeedInput = "seed.bitcoin.sipa.be"
+    @State private var dnsSeedServices = "0"
+    @State private var dnsSeedResult = ""
+    @State private var candidateBlockHex = ""
+    @State private var candidatePrevHash = "0000000000000000000000000000000000000000000000000000000000000000"
+    @State private var candidateTime = "1296688602"
+    @State private var candidateResult = ""
+    @State private var lastHeightStart = "0"
+    @State private var lastHeightCount = "10"
+    @State private var lastHeightTip = "5"
+    @State private var lastHeightResult = ""
+    @State private var sealElapsed = "10"
+    @State private var sealBudget = "5"
+    @State private var sealResult = ""
+    @State private var shHashInput = "76a914000000000000000000000000000000000000000088ac"
+    @State private var shHashResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3197,6 +3213,235 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("DNS seed query", systemImage: "globe")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Seed", text: $dnsSeedInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Services", text: $dnsSeedServices)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                Button {
+                                    guard let services = UInt64(dnsSeedServices) else {
+                                        dnsSeedResult = "invalid"
+                                        return
+                                    }
+                                    let host = dnsSeedQueryHost(seed: dnsSeedInput, servicesU64: services)
+                                    dnsSeedResult = host
+                                } label: {
+                                    Label("Query", systemImage: "arrow.right.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !dnsSeedResult.isEmpty {
+                                Text(dnsSeedResult)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Regtest candidate", systemImage: "hammer.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hex", text: $candidateBlockHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Prev hash", text: $candidatePrevHash)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    TextField("Time", text: $candidateTime)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 100)
+                                    Button {
+                                        let hex = candidateBlockHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !hex.isEmpty, let time = UInt32(candidateTime) else {
+                                            candidateResult = "invalid input"
+                                            return
+                                        }
+                                        do {
+                                            let result = try prepareRegtestCandidate(blockHex: hex, prevHashHex: candidatePrevHash, time: time)
+                                            candidateResult = "prepared: \(result.prefix(32))…"
+                                        } catch {
+                                            candidateResult = "invalid"
+                                        }
+                                    } label: {
+                                        Label("Prepare", systemImage: "arrow.right.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !candidateResult.isEmpty {
+                                    Text(candidateResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Last height", systemImage: "number")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-electrum")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Start", text: $lastHeightStart)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 60)
+                                TextField("Count", text: $lastHeightCount)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 60)
+                                TextField("Tip", text: $lastHeightTip)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 60)
+                                Button {
+                                    guard let start = UInt32(lastHeightStart), let count = UInt32(lastHeightCount), let tip = UInt32(lastHeightTip) else {
+                                        lastHeightResult = "invalid"
+                                        return
+                                    }
+                                    let result = lastHeight(start: start, count: count, tip: tip)
+                                    lastHeightResult = result != nil ? "\(result!)" : "none"
+                                } label: {
+                                    Label("Compute", systemImage: "arrow.right.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !lastHeightResult.isEmpty {
+                                Text(lastHeightResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Seal subscribe", systemImage: "lock.shield.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-electrum")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Elapsed", text: $sealElapsed)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                TextField("Budget", text: $sealBudget)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                Button {
+                                    guard let elapsed = UInt64(sealElapsed), let budget = UInt64(sealBudget) else {
+                                        sealResult = "invalid"
+                                        return
+                                    }
+                                    let result = sealSubscribeChunk(elapsedSecs: elapsed, budgetSecs: budget, more: true)
+                                    sealResult = result ? "seal" : "continue"
+                                } label: {
+                                    Label("Check", systemImage: "checkmark.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !sealResult.isEmpty {
+                                Text(sealResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Script hash", systemImage: "number")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-store")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Script hex", text: $shHashInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .onChange(of: shHashInput) { _ in
+                                        shHashResult = scriptHashHex(scriptHex: shHashInput)
+                                    }
+                                if !shHashResult.isEmpty {
+                                    Text(shHashResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+                    .onAppear {
+                        shHashResult = scriptHashHex(scriptHex: shHashInput)
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3242,6 +3487,9 @@ struct ContentView: View {
                                 "Work comparison + Bad prev error",
                                 "Header timeout + Stale follow evict",
                                 "Witness commitment",
+                                "DNS seed query + Regtest candidate",
+                                "Last height + Seal subscribe",
+                                "Script hash",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

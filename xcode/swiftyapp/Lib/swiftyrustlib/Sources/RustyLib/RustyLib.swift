@@ -1816,9 +1816,15 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func tipHeight()  -> UInt64?
     
+    func txBodyRange(fk: UInt64) throws  -> FfiTxRange
+    
     func txHeadBits()  -> UInt32
     
     func txHeightGet(txFk: UInt64) throws  -> UInt32?
+    
+    func txInwitRange(fk: UInt64) throws  -> FfiTxRange
+    
+    func txSpentRange(fk: UInt64) throws  -> FfiTxRange
     
 }
 
@@ -2046,6 +2052,14 @@ open func tipHeight() -> UInt64? {
 })
 }
     
+open func txBodyRange(fk: UInt64)throws  -> FfiTxRange {
+    return try  FfiConverterTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_body_range(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
 open func txHeadBits() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_tx_head_bits(self.uniffiClonePointer(),$0
@@ -2057,6 +2071,22 @@ open func txHeightGet(txFk: UInt64)throws  -> UInt32? {
     return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_tx_height_get(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(txFk),$0
+    )
+})
+}
+    
+open func txInwitRange(fk: UInt64)throws  -> FfiTxRange {
+    return try  FfiConverterTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_inwit_range(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
+open func txSpentRange(fk: UInt64)throws  -> FfiTxRange {
+    return try  FfiConverterTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_spent_range(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
     )
 })
 }
@@ -3587,6 +3617,72 @@ public func FfiConverterTypeFfiTxInfo_lift(_ buf: RustBuffer) throws -> FfiTxInf
 #endif
 public func FfiConverterTypeFfiTxInfo_lower(_ value: FfiTxInfo) -> RustBuffer {
     return FfiConverterTypeFfiTxInfo.lower(value)
+}
+
+
+public struct FfiTxRange {
+    public var offset: UInt64
+    public var len: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(offset: UInt64, len: UInt64) {
+        self.offset = offset
+        self.len = len
+    }
+}
+
+
+
+extension FfiTxRange: Equatable, Hashable {
+    public static func ==(lhs: FfiTxRange, rhs: FfiTxRange) -> Bool {
+        if lhs.offset != rhs.offset {
+            return false
+        }
+        if lhs.len != rhs.len {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(offset)
+        hasher.combine(len)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTxRange: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTxRange {
+        return
+            try FfiTxRange(
+                offset: FfiConverterUInt64.read(from: &buf), 
+                len: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTxRange, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.offset, into: &buf)
+        FfiConverterUInt64.write(value.len, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxRange_lift(_ buf: RustBuffer) throws -> FfiTxRange {
+    return try FfiConverterTypeFfiTxRange.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxRange_lower(_ value: FfiTxRange) -> RustBuffer {
+    return FfiConverterTypeFfiTxRange.lower(value)
 }
 
 
@@ -6944,10 +7040,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_tip_height() != 61582) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_body_range() != 6692) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_tx_head_bits() != 27031) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tx_height_get() != 13849) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_inwit_range() != 1792) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_spent_range() != 35074) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {

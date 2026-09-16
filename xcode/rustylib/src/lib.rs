@@ -1516,6 +1516,36 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)?;
         Ok(fk.map(|f| f.0))
     }
+
+    pub fn tx_body_range(&self, fk: u64) -> Result<FfiTxRange, RustyError> {
+        let (offset, len) = self
+            .inner
+            .tx_body_range(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiTxRange { offset, len })
+    }
+
+    pub fn tx_spent_range(&self, fk: u64) -> Result<FfiTxRange, RustyError> {
+        let (offset, len) = self
+            .inner
+            .tx_spent_range(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiTxRange { offset, len })
+    }
+
+    pub fn tx_inwit_range(&self, fk: u64) -> Result<FfiTxRange, RustyError> {
+        let (offset, len) = self
+            .inner
+            .tx_inwit_range(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiTxRange { offset, len })
+    }
+}
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiTxRange {
+    pub offset: u64,
+    pub len: u64,
 }
 
 // --- Query FFI ---
@@ -3403,6 +3433,9 @@ mod tests {
         assert_eq!(store.tx_height_get(1).unwrap(), None);
         assert_eq!(store.get_fk_by_txid("0".repeat(64)).unwrap(), None);
         assert_eq!(store.get_fk_by_txid_tip("0".repeat(64)).unwrap(), None);
+        assert!(store.tx_body_range(1).is_err());
+        assert!(store.tx_spent_range(1).is_err());
+        assert!(store.tx_inwit_range(1).is_err());
     }
 
     #[test]

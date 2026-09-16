@@ -16,5 +16,5 @@ pub use config::{
     P2pListen, RpcOpts, TorControlOpts, CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
     parse_minimum_chain_work,
 };
-pub use error::NodeError;
+pub use error::{tip_too_far_in_future, NodeError, MAX_FUTURE_BLOCK_TIME};
 pub use run::{run_node, run_p2p, NodeHandle};

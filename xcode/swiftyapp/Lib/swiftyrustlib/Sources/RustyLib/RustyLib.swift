@@ -2956,6 +2956,31 @@ fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
+    typealias SwiftType = [Int64]
+
+    public static func write(_ value: [Int64], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterInt64.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Int64] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Int64]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterInt64.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -3407,6 +3432,13 @@ public func isFinalTx(txHex: String, blockHeight: UInt32, lockTimeCutoff: UInt32
     )
 })
 }
+public func isUnspendable(scriptHex: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_is_unspendable(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
 public func legacySigopCount(txHex: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_legacy_sigop_count(
@@ -3433,6 +3465,12 @@ public func logMessage(level: String, message: String) {try! rustCall() {
         FfiConverterString.lower(message),$0
     )
 }
+}
+public func maxFutureBlockTime() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_max_future_block_time($0
+    )
+})
 }
 public func medianTimePastTimes(times: [UInt32]) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -3604,6 +3642,15 @@ public func parseV2RegtestNamed(command: String, payloadHex: String)throws  {try
         FfiConverterString.lower(payloadHex),$0
     )
 }
+}
+public func percentilesByWeight(scores: [Int64], weights: [Int64], totalWeight: Int64)throws  -> [Int64] {
+    return try  FfiConverterSequenceInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_percentiles_by_weight(
+        FfiConverterSequenceInt64.lower(scores),
+        FfiConverterSequenceInt64.lower(weights),
+        FfiConverterInt64.lower(totalWeight),$0
+    )
+})
 }
 public func pureRbfrPays(newFee: UInt64, newWeight: UInt64, directFee: UInt64, directWeight: UInt64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -3793,6 +3840,21 @@ public func takeLogs() -> [String] {
     )
 })
 }
+public func tipTooFarInFuture(tipTime: UInt32, now: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_tip_too_far_in_future(
+        FfiConverterUInt32.lower(tipTime),
+        FfiConverterUInt64.lower(now),$0
+    )
+})
+}
+public func truncatedMedian(scores: [Int64]) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_truncated_median(
+        FfiConverterSequenceInt64.lower(scores),$0
+    )
+})
+}
 public func tweakFromTx(txHex: String, prevoutsHex: [String])throws  -> FfiTxTweak? {
     return try  FfiConverterOptionTypeFfiTxTweak.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_tweak_from_tx(
@@ -3812,6 +3874,13 @@ public func txidFromHex(txHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_txid_from_hex(
         FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txoutSerializedSize(outHex: String)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_txout_serialized_size(
+        FfiConverterString.lower(outHex),$0
     )
 })
 }
@@ -4060,6 +4129,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_is_final_tx() != 32688) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_is_unspendable() != 34278) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_legacy_sigop_count() != 56184) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4070,6 +4142,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_log_message() != 58414) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_max_future_block_time() != 57579) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_median_time_past_times() != 24970) {
@@ -4142,6 +4217,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_v2_regtest_named() != 47237) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_percentiles_by_weight() != 32241) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_pure_rbfr_pays() != 25186) {
@@ -4219,6 +4297,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_take_logs() != 10115) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_tip_too_far_in_future() != 50408) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_truncated_median() != 15398) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_tweak_from_tx() != 38599) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4226,6 +4310,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_txid_from_hex() != 27347) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_txout_serialized_size() != 9802) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_unknown_rules_warning() != 41802) {

@@ -648,9 +648,13 @@ struct ContentView: View {
                             }
 
                             Button {
-                                let seeds = p2pDnsSeeds(network: "mainnet") ?? []
-                                let port = p2pDefaultPort(network: "mainnet") ?? 0
-                                networkSeedResult = "Port: \(port), Seeds: \(seeds.count)"
+                                do {
+                                    let seeds = try p2pDnsSeeds(network: "mainnet")
+                                    let port = try p2pDefaultPort(network: "mainnet")
+                                    networkSeedResult = "Port: \(port), Seeds: \(seeds.count)"
+                                } catch {
+                                    networkSeedResult = "error"
+                                }
                             } label: {
                                 Label("Load mainnet seeds", systemImage: "arrow.down.circle.fill")
                                     .frame(maxWidth: .infinity)

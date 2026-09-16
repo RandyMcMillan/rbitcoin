@@ -2340,6 +2340,33 @@ pub fn p2wpkh_address_from_xpub(
     Ok(addr.to_string())
 }
 
+// --- PSBT FFI ---
+
+#[uniffi::export]
+pub fn psbt_from_hex(hex: String) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let _ = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(true)
+}
+
+#[uniffi::export]
+pub fn psbt_extract_tx_hex(hex: String) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let tx = psbt.extract_tx_unchecked_fee_rate();
+    Ok(rbitcoin_primitives::hex_encode(
+        bitcoin::consensus::serialize(&tx),
+    ))
+}
+
+#[uniffi::export]
+pub fn psbt_fee_sat(hex: String) -> Result<u64, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let fee = psbt.fee().map_err(|_| RustyError::InvalidInput)?;
+    Ok(fee.to_sat())
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3577,5 +3604,23 @@ mod tests {
             p2wpkh_address_from_xpub(account_xpub, "m/0/0".to_string(), "mainnet".to_string())
                 .unwrap();
         assert!(addr.starts_with("bc1q"));
+    }
+
+    #[test]
+    fn test_psbt_roundtrip() {
+        // Create a minimal unsigned tx and PSBT
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
+            input: vec![],
+            output: vec![],
+        };
+        let psbt = bitcoin::Psbt::from_unsigned_tx(tx).unwrap();
+        let psbt_hex = rbitcoin_primitives::hex_encode(psbt.serialize());
+        assert!(psbt_from_hex(psbt_hex.clone()).unwrap());
+        let tx_hex = psbt_extract_tx_hex(psbt_hex.clone()).unwrap();
+        assert!(!tx_hex.is_empty());
+        let fee = psbt_fee_sat(psbt_hex).unwrap();
+        assert_eq!(fee, 0);
     }
 }

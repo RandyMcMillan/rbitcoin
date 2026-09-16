@@ -4083,7 +4083,9 @@ struct ContentView: View {
                                 let admitHalf = mempoolAdmitHalfLifeSecs()
                                 let warmAfter = mempoolWarmAfterSecs()
                                 let warmAdmits = mempoolWarmAfterAdmits()
-                                moreConstants2Result = "softFree=\(softFree) softConfirm=\(softConfirm) admitHalf=\(admitHalf) warm=\(warmAfter)/\(warmAdmits)"
+                                let bandHi = softDensifyBandHi(pathLo: 0, densifyHi: 100, depthBytes: 0, rateBlocksPerS: 1.0, assignStopBytes: bqAssignStopBytes(), fetchedHi: nil)
+                                let windowCovered = softConfirmWindowCovered(depthN: 100, depthBytes: 200 * 1024 * 1024, rateBlocksPerS: 1.0)
+                                moreConstants2Result = "softFree=\(softFree) softConfirm=\(softConfirm) admitHalf=\(admitHalf) warm=\(warmAfter)/\(warmAdmits) bandHi=\(bandHi) covered=\(windowCovered)"
                             } label: {
                                 Label("Load more constants", systemImage: "info.circle.fill")
                                     .frame(maxWidth: .infinity)

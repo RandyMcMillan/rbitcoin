@@ -4750,10 +4750,31 @@ public func softAssignStopped(depthBytes: UInt64, stopBytes: UInt64) -> Bool {
     )
 })
 }
+public func softConfirmWindowCovered(depthN: UInt32, depthBytes: UInt64, rateBlocksPerS: Double?) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_soft_confirm_window_covered(
+        FfiConverterUInt32.lower(depthN),
+        FfiConverterUInt64.lower(depthBytes),
+        FfiConverterOptionDouble.lower(rateBlocksPerS),$0
+    )
+})
+}
 public func softConfirmWindowN(rateBlocksPerS: Double?) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_soft_confirm_window_n(
         FfiConverterOptionDouble.lower(rateBlocksPerS),$0
+    )
+})
+}
+public func softDensifyBandHi(pathLo: UInt32, densifyHi: UInt32, depthBytes: UInt64, rateBlocksPerS: Double?, assignStopBytes: UInt64, fetchedHi: UInt32?) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_soft_densify_band_hi(
+        FfiConverterUInt32.lower(pathLo),
+        FfiConverterUInt32.lower(densifyHi),
+        FfiConverterUInt64.lower(depthBytes),
+        FfiConverterOptionDouble.lower(rateBlocksPerS),
+        FfiConverterUInt64.lower(assignStopBytes),
+        FfiConverterOptionUInt32.lower(fetchedHi),$0
     )
 })
 }
@@ -5536,7 +5557,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_soft_assign_stopped() != 6856) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_soft_confirm_window_covered() != 58371) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_soft_confirm_window_n() != 47869) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_soft_densify_band_hi() != 1060) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_stale_relay_age_limit_secs() != 44919) {

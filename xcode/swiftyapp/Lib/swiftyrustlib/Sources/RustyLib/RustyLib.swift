@@ -1878,6 +1878,25 @@ public func meetsMinRelayFee(feeSat: UInt64, weight: UInt64) -> Bool {
     )
 })
 }
+public func nodeCoreMaxconnectionsOutboundReserve() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_node_core_maxconnections_outbound_reserve($0
+    )
+})
+}
+public func nodeDefaultMaxInbound() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_node_default_max_inbound($0
+    )
+})
+}
+public func nodeInboundFromMaxconnections(total: UInt32) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_node_inbound_from_maxconnections(
+        FfiConverterUInt32.lower(total),$0
+    )
+})
+}
 public func nodeRpcPath() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_node_rpc_path($0
@@ -2087,6 +2106,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_meets_min_relay_fee() != 27158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_node_core_maxconnections_outbound_reserve() != 34) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_node_default_max_inbound() != 9614) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_node_inbound_from_maxconnections() != 40219) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_node_rpc_path() != 45316) {

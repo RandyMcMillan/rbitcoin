@@ -74,9 +74,11 @@ pub use params::{check_genesis_hash, default_milestone_height, genesis_block, Ch
 pub use policy::PolicyResult;
 pub use regtest_pad::{
     grind_regtest_pow, mine_empty_regtest, mine_regtest_paying, pad_empty_from,
-    prepare_regtest_candidate, REGTEST_BLOCK_SPACING,
+    prepare_regtest_candidate, REGTEST_BLOCK_SPACING, REGTEST_POW_BITS,
 };
-pub use signet::signet_magic;
+pub use signet::{
+    default_signet_challenge, signet_magic, validate_signet_block_solution,
+};
 pub use silent_payments::{
     backfill_sp_tweaks_cancellable, tweak_from_tx, tweaks_for_height, TaprootOut, TxTweak,
 };

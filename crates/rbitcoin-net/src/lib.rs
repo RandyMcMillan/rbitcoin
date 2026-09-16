@@ -39,8 +39,9 @@ pub use ibd::{
 pub use most_work::sum_work;
 pub use netgroup::netgroup;
 pub use peer::{
-    drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,
-    PendingBlocks, V2PlainSession, MAX_SERVE_BLOCKS,
+    desirable_service_flags, drain_pending_now, flush_tx_invs, force_announce_txid,
+    has_all_desirable_service_flags, local_service_flags, run_feeler_timed, PendingBlocks,
+    V2PlainSession, MAX_SERVE_BLOCKS,
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{
@@ -58,7 +59,9 @@ pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample
 pub use service::P2PNode;
 pub use tx_relay::{ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample};
 pub use v2::{encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, WireBytes};
-pub use versionbits_warn::warning_strings;
+pub use versionbits_warn::{
+    unknown_rules_warning, warn_period_threshold, warning_strings,
+};
 
 /// Default number of **live download peers** during IBD (`IbdConfig::target_peers`
 /// and node `--max-outbound` default).

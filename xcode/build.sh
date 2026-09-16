@@ -23,6 +23,14 @@ NEW_HEADER_DIR="out/include"
 targets=("aarch64-apple-ios" "aarch64-apple-ios-sim" "aarch64-apple-darwin" "aarch64-apple-tvos" "aarch64-apple-tvos-sim")
 
 for target in "${targets[@]}"; do
+    if [[ "${target}" == *"ios"* ]]; then
+        export IPHONEOS_DEPLOYMENT_TARGET=17.0
+    elif [[ "${target}" == *"tvos"* ]]; then
+        export TVOS_DEPLOYMENT_TARGET=17.0
+    else
+        unset IPHONEOS_DEPLOYMENT_TARGET
+        unset TVOS_DEPLOYMENT_TARGET
+    fi
     cargo build --target "${target}" --release
     cargo run --bin uniffi-bindgen generate --library target/${target}/release/lib${MY_CRATE}.a --language swift --out-dir out
 done

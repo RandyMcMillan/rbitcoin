@@ -1333,17 +1333,29 @@ public func FfiConverterTypeFfiQuery_lower(_ value: FfiQuery) -> UnsafeMutableRa
 
 public protocol FfiStoreProtocol : AnyObject {
     
+    func archivedBlockCount() throws  -> UInt64
+    
     func datadirBytes()  -> UInt64
     
+    func getHeader(fk: UInt64) throws  -> FfiHeaderRecord
+    
     func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
+    
+    func getTx(fk: UInt64) throws  -> FfiTxRecord
     
     func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
     
     func headerCount()  -> UInt64
     
+    func headerSlots()  -> UInt64
+    
+    func isSplit()  -> Bool
+    
     func path()  -> String
     
     func tipHeight()  -> UInt64?
+    
+    func txHeadBits()  -> UInt32
     
 }
 
@@ -1421,9 +1433,24 @@ public static func openOrCreate(path: String)throws  -> FfiStore {
     
 
     
+open func archivedBlockCount()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_archived_block_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func datadirBytes() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_datadir_bytes(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func getHeader(fk: UInt64)throws  -> FfiHeaderRecord {
+    return try  FfiConverterTypeFfiHeaderRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_header(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
     )
 })
 }
@@ -1432,6 +1459,14 @@ open func getHeaderByHash(hashHex: String)throws  -> FfiHeaderRecord? {
     return try  FfiConverterOptionTypeFfiHeaderRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_get_header_by_hash(self.uniffiClonePointer(),
         FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func getTx(fk: UInt64)throws  -> FfiTxRecord {
+    return try  FfiConverterTypeFfiTxRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_tx(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
     )
 })
 }
@@ -1451,6 +1486,20 @@ open func headerCount() -> UInt64 {
 })
 }
     
+open func headerSlots() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_header_slots(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isSplit() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_is_split(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func path() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_path(self.uniffiClonePointer(),$0
@@ -1461,6 +1510,13 @@ open func path() -> String {
 open func tipHeight() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func txHeadBits() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_tx_head_bits(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -5560,10 +5616,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_warning_strings() != 30486) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_archived_block_count() != 31669) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_datadir_bytes() != 8367) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_get_header() != 23114) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_get_header_by_hash() != 58892) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_tx() != 985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_get_tx_by_txid() != 7572) {
@@ -5572,10 +5637,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_header_count() != 37489) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_header_slots() != 53134) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_is_split() != 47137) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_path() != 6841) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tip_height() != 61582) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_head_bits() != 27031) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {

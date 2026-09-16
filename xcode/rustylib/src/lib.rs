@@ -1308,6 +1308,40 @@ impl FfiStore {
     pub fn path(&self) -> String {
         self.inner.path().to_string_lossy().into_owned()
     }
+
+    pub fn archived_block_count(&self) -> Result<u64, RustyError> {
+        self.inner
+            .archived_block_count()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn header_slots(&self) -> u64 {
+        self.inner.header_slots()
+    }
+
+    pub fn tx_head_bits(&self) -> u32 {
+        self.inner.tx_head_bits()
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.inner.is_split()
+    }
+
+    pub fn get_header(&self, fk: u64) -> Result<FfiHeaderRecord, RustyError> {
+        let rec = self
+            .inner
+            .get_header(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(rec.into())
+    }
+
+    pub fn get_tx(&self, fk: u64) -> Result<FfiTxRecord, RustyError> {
+        let rec = self
+            .inner
+            .get_tx(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(rec.into())
+    }
 }
 
 // --- Query FFI ---
@@ -2780,6 +2814,10 @@ mod tests {
         assert_eq!(store.tip_height(), None);
         assert!(store.datadir_bytes() > 0 || store.datadir_bytes() == 0);
         assert!(!store.path().is_empty());
+        assert_eq!(store.archived_block_count().unwrap(), 0);
+        assert!(store.header_slots() > 0);
+        assert!(store.tx_head_bits() > 0);
+        assert!(!store.is_split());
     }
 
     #[test]

@@ -23,6 +23,10 @@ struct ContentView: View {
     @State private var storePath = ""
     @State private var storeTipHeight = ""
     @State private var storeHeaderCount = ""
+    @State private var storeArchived = ""
+    @State private var storeSlots = ""
+    @State private var storeBits = ""
+    @State private var storeSplit = ""
     @State private var queryPath = ""
     @State private var queryBlockQueue = ""
     @State private var mempoolPath = ""
@@ -525,9 +529,17 @@ struct ContentView: View {
                                         let store = try FfiStore.create(path: storePath)
                                         storeTipHeight = store.tipHeight().map(String.init) ?? "none"
                                         storeHeaderCount = String(store.headerCount())
+                                        storeArchived = String(try store.archivedBlockCount())
+                                        storeSlots = String(store.headerSlots())
+                                        storeBits = String(store.txHeadBits())
+                                        storeSplit = store.isSplit() ? "yes" : "no"
                                     } catch {
                                         storeTipHeight = "error"
                                         storeHeaderCount = ""
+                                        storeArchived = ""
+                                        storeSlots = ""
+                                        storeBits = ""
+                                        storeSplit = ""
                                     }
                                 } label: {
                                     Label("Create", systemImage: "plus.circle.fill")
@@ -539,9 +551,17 @@ struct ContentView: View {
                                         let store = try FfiStore.open(path: storePath)
                                         storeTipHeight = store.tipHeight().map(String.init) ?? "none"
                                         storeHeaderCount = String(store.headerCount())
+                                        storeArchived = String(try store.archivedBlockCount())
+                                        storeSlots = String(store.headerSlots())
+                                        storeBits = String(store.txHeadBits())
+                                        storeSplit = store.isSplit() ? "yes" : "no"
                                     } catch {
                                         storeTipHeight = "error"
                                         storeHeaderCount = ""
+                                        storeArchived = ""
+                                        storeSlots = ""
+                                        storeBits = ""
+                                        storeSplit = ""
                                     }
                                 } label: {
                                     Label("Open", systemImage: "folder.fill")
@@ -564,6 +584,40 @@ struct ContentView: View {
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(primaryText.opacity(0.68))
                                         Text(storeHeaderCount)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                }
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Archived")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeArchived)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Slots")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeSlots)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Bits")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeBits)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Split")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeSplit)
                                             .font(.title3.weight(.semibold))
                                             .foregroundStyle(primaryText)
                                     }

@@ -480,6 +480,18 @@ impl Store {
         self.cold_path.as_deref()
     }
 
+    pub fn header_slots(&self) -> u64 {
+        crate::hashhead::initial_slots_for(self.head_scale)
+    }
+
+    pub fn tx_head_bits(&self) -> u32 {
+        crate::address_head::bits_for_scale(self.head_scale)
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.cold_path.as_ref().is_some_and(|c| c != &self.path)
+    }
+
     /// Sum of regular file lengths under the hot store and, when split, the
     /// cold inwit directory. Used by `getblockchaininfo.size_on_disk`.
     pub fn datadir_bytes(&self) -> u64 {

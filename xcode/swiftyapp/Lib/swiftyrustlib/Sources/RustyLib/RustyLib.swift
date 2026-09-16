@@ -4195,6 +4195,18 @@ public func mineRegtestPaying(prevHashHex: String, time: UInt32, height: UInt32,
     )
 })
 }
+public func netDefaultBlocksInTransitPerPeer() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_net_default_blocks_in_transit_per_peer($0
+    )
+})
+}
+public func netDefaultIbdWindow() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_net_default_ibd_window($0
+    )
+})
+}
 public func netgroup(ip: String, port: UInt16, asmapHex: String?)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_netgroup(
@@ -5246,6 +5258,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_mine_regtest_paying() != 11833) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_net_default_blocks_in_transit_per_peer() != 34807) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_net_default_ibd_window() != 26651) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_netgroup() != 17242) {

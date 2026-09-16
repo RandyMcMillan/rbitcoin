@@ -1538,6 +1538,52 @@ impl FfiQuery {
         self.inner.sample_reset_thin_tweak_body_bytes()
     }
 
+    pub fn lookup_started_hi(&self) -> Option<u64> {
+        self.inner.lookup_started_hi().map(|h| h as u64)
+    }
+
+    pub fn class_a_hi(&self) -> Option<u64> {
+        self.inner.class_a_hi().map(|h| h as u64)
+    }
+
+    pub fn block_queue_soft_pressure(&self) -> bool {
+        self.inner.block_queue_soft_pressure()
+    }
+
+    pub fn block_queue_take_raw_clone_n(&self) -> u64 {
+        self.inner.block_queue_take_raw_clone_n()
+    }
+
+    pub fn block_queue_promoted_count(&self) -> u64 {
+        self.inner.block_queue_promoted_count() as u64
+    }
+
+    pub fn scripthash_entry_count(&self) -> u64 {
+        self.inner.scripthash_entry_count()
+    }
+
+    pub fn point_edge_count(&self) -> u64 {
+        self.inner.point_edge_count()
+    }
+
+    pub fn tip_header_fk(&self) -> Result<Option<u64>, RustyError> {
+        let fk = self
+            .inner
+            .tip_header_fk()
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.map(|f| f.0))
+    }
+
+    pub fn flush_header_archive(&self) -> Result<(), RustyError> {
+        self.inner
+            .flush_header_archive()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn flush(&self) -> Result<(), RustyError> {
+        self.inner.flush().map_err(|_| RustyError::StoreError)
+    }
+
     pub fn tweaks_at_height(
         &self,
         network: String,
@@ -2831,6 +2877,23 @@ mod tests {
         assert_eq!(stats.count, 0);
         assert_eq!(stats.bytes, 0);
         assert!(stats.assign_stop_bytes > 0);
+    }
+
+    #[test]
+    fn test_query_more_read_functions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query3").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.lookup_started_hi(), None);
+        assert_eq!(query.class_a_hi(), None);
+        assert!(!query.block_queue_soft_pressure());
+        assert_eq!(query.block_queue_take_raw_clone_n(), 0);
+        assert_eq!(query.block_queue_promoted_count(), 0);
+        assert_eq!(query.scripthash_entry_count(), 0);
+        assert_eq!(query.point_edge_count(), 0);
+        assert_eq!(query.tip_header_fk().unwrap(), None);
+        query.flush_header_archive().unwrap();
+        query.flush().unwrap();
     }
 
     #[test]

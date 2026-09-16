@@ -25,7 +25,7 @@ mod versionbits_warn;
 
 pub use asmap::{interpret, ip16_for_lookup, sanity_check, AsMap, TWO_PREFIX_ASMAP};
 pub use cache::BlockCache;
-pub use chain::{AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
+pub use chain::{headers_download_timeout_secs, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use compact::{
     classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
     CmpctPeerFrame,
@@ -33,10 +33,10 @@ pub use compact::{
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
 pub use ibd::{
-    format_tip_perf_sizes, read_proc_rss, rehydrate_block_queue_residue, IbdConfig, ProcRss,
-    TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
+    format_tip_perf_sizes, is_bad_prev_err, read_proc_rss, rehydrate_block_queue_residue,
+    IbdConfig, ProcRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
-pub use most_work::sum_work;
+pub use most_work::{sum_work, work_better};
 pub use netgroup::netgroup;
 pub use peer::{
     desirable_service_flags, drain_pending_now, flush_tx_invs, force_announce_txid,

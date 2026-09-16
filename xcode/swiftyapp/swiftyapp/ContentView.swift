@@ -55,6 +55,17 @@ struct ContentView: View {
     @State private var merkleTxids = ""
     @State private var merkleRootResult = ""
     @State private var queryExtendedResult = ""
+    @State private var headerHashVersion = "1"
+    @State private var headerHashPrev = "0000000000000000000000000000000000000000000000000000000000000000"
+    @State private var headerHashMerkle = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+    @State private var headerHashTime = "1231006505"
+    @State private var headerHashBits = "486604799"
+    @State private var headerHashNonce = "2083236893"
+    @State private var computedHeaderHashResult = ""
+    @State private var feeAtRate = "100"
+    @State private var feeAtResult = ""
+    @State private var archiveHashInput = ""
+    @State private var archiveResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -1118,6 +1129,156 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Header hash", systemImage: "number")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-store")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    TextField("Ver", text: $headerHashVersion)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 50)
+                                    TextField("Bits", text: $headerHashBits)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    TextField("Nonce", text: $headerHashNonce)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                }
+                                TextField("Prev hash", text: $headerHashPrev)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Merkle root", text: $headerHashMerkle)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    TextField("Time", text: $headerHashTime)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 100)
+                                    Button {
+                                        guard let version = Int32(headerHashVersion), let time = UInt32(headerHashTime), let bits = UInt32(headerHashBits), let nonce = UInt32(headerHashNonce) else {
+                                            computedHeaderHashResult = "invalid input"
+                                            return
+                                        }
+                                        do {
+                                            let hash = try blockHeaderHash(version: version, prevHashHex: headerHashPrev, merkleRootHex: headerHashMerkle, timestamp: time, bits: bits, nonce: nonce)
+                                            computedHeaderHashResult = hash
+                                        } catch {
+                                            computedHeaderHashResult = "error"
+                                        }
+                                    } label: {
+                                        Label("Hash", systemImage: "arrow.right.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !computedHeaderHashResult.isEmpty {
+                                    Text(computedHeaderHashResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Fee at rate", systemImage: "dollarsign.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Rate sat/kvB", text: $feeAtRate)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 100)
+                                Button {
+                                    guard let rate = UInt64(feeAtRate) else {
+                                        feeAtResult = "invalid"
+                                        return
+                                    }
+                                    let ok = meetsMinRelayFeeAt(feeSat: rate, weight: 4000, satKvb: rate)
+                                    feeAtResult = ok ? "meets min relay" : "below min relay"
+                                } label: {
+                                    Label("Check", systemImage: "checkmark.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !feeAtResult.isEmpty {
+                                Text(feeAtResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Archive probe", systemImage: "archivebox.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hash hex", text: $archiveHashInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    do {
+                                        let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-archive-demo")
+                                        let archived = try query.isBlockArchived(hashHex: archiveHashInput)
+                                        archiveResult = archived ? "archived" : "not archived"
+                                    } catch {
+                                        archiveResult = "error"
+                                    }
+                                } label: {
+                                    Label("Probe", systemImage: "magnifyingglass.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !archiveResult.isEmpty {
+                                    Text(archiveResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -1137,7 +1298,8 @@ struct ContentView: View {
                                 "Seed resolution + Constants",
                                 "Regtest mining + Service flags",
                                 "Versionbits + Merkle root",
-                                "Query stats",
+                                "Query stats + Archive probe",
+                                "Header hash + Fee at rate",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

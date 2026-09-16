@@ -1441,6 +1441,8 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func archivedBlockCount() throws  -> UInt64
     
+    func classCL2ResidentBytes()  -> UInt64
+    
     func datadirBytes()  -> UInt64
     
     func getHeader(fk: UInt64) throws  -> FfiHeaderRecord
@@ -1458,6 +1460,8 @@ public protocol FfiStoreProtocol : AnyObject {
     func isSplit()  -> Bool
     
     func path()  -> String
+    
+    func spenderListCount()  -> UInt64
     
     func tipHeight()  -> UInt64?
     
@@ -1546,6 +1550,13 @@ open func archivedBlockCount()throws  -> UInt64 {
 })
 }
     
+open func classCL2ResidentBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_class_c_l2_resident_bytes(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func datadirBytes() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_datadir_bytes(self.uniffiClonePointer(),$0
@@ -1609,6 +1620,13 @@ open func isSplit() -> Bool {
 open func path() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_path(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func spenderListCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_spender_list_count(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -5800,6 +5818,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_archived_block_count() != 31669) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_class_c_l2_resident_bytes() != 4516) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_datadir_bytes() != 8367) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5825,6 +5846,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_path() != 6841) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_spender_list_count() != 63983) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tip_height() != 61582) {

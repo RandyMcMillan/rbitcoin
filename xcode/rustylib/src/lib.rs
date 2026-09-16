@@ -1357,6 +1357,14 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)?;
         Ok(rec.into())
     }
+
+    pub fn spender_list_count(&self) -> u64 {
+        self.inner.spender_list_count()
+    }
+
+    pub fn class_c_l2_resident_bytes(&self) -> u64 {
+        self.inner.class_c_l2_resident_bytes()
+    }
 }
 
 // --- Query FFI ---
@@ -2889,6 +2897,10 @@ mod tests {
         assert!(rbitcoin_schema_version() > 0);
         assert!(rbitcoin_schema_file_openable(rbitcoin_schema_version()));
         assert!(!rbitcoin_schema_file_openable(0));
+        assert!(!rbitcoin_version().is_empty());
+        let subver = rbitcoin_subversion(vec!["test".to_string()]).unwrap();
+        assert!(subver.contains("rbitcoin"));
+        assert!(rbitcoin_subversion(vec!["bad/char".to_string()]).is_err());
     }
 
     #[test]
@@ -2903,6 +2915,8 @@ mod tests {
         assert!(store.header_slots() > 0);
         assert!(store.tx_head_bits() > 0);
         assert!(!store.is_split());
+        assert_eq!(store.spender_list_count(), 0);
+        assert_eq!(store.class_c_l2_resident_bytes(), 0);
     }
 
     #[test]

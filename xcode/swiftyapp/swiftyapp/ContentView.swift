@@ -27,6 +27,8 @@ struct ContentView: View {
     @State private var storeSlots = ""
     @State private var storeBits = ""
     @State private var storeSplit = ""
+    @State private var storeSpenderCount = ""
+    @State private var storeClassCBytes = ""
     @State private var queryPath = ""
     @State private var queryBlockQueue = ""
     @State private var queryMoreResult = ""
@@ -536,6 +538,8 @@ struct ContentView: View {
                                         storeSlots = String(store.headerSlots())
                                         storeBits = String(store.txHeadBits())
                                         storeSplit = store.isSplit() ? "yes" : "no"
+                                        storeSpenderCount = String(store.spenderListCount())
+                                        storeClassCBytes = String(store.classCL2ResidentBytes())
                                     } catch {
                                         storeTipHeight = "error"
                                         storeHeaderCount = ""
@@ -543,6 +547,8 @@ struct ContentView: View {
                                         storeSlots = ""
                                         storeBits = ""
                                         storeSplit = ""
+                                        storeSpenderCount = ""
+                                        storeClassCBytes = ""
                                     }
                                 } label: {
                                     Label("Create", systemImage: "plus.circle.fill")
@@ -558,6 +564,8 @@ struct ContentView: View {
                                         storeSlots = String(store.headerSlots())
                                         storeBits = String(store.txHeadBits())
                                         storeSplit = store.isSplit() ? "yes" : "no"
+                                        storeSpenderCount = String(store.spenderListCount())
+                                        storeClassCBytes = String(store.classCL2ResidentBytes())
                                     } catch {
                                         storeTipHeight = "error"
                                         storeHeaderCount = ""
@@ -565,6 +573,8 @@ struct ContentView: View {
                                         storeSlots = ""
                                         storeBits = ""
                                         storeSplit = ""
+                                        storeSpenderCount = ""
+                                        storeClassCBytes = ""
                                     }
                                 } label: {
                                     Label("Open", systemImage: "folder.fill")
@@ -621,6 +631,24 @@ struct ContentView: View {
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(primaryText.opacity(0.68))
                                         Text(storeSplit)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                }
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Spenders")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeSpenderCount)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Class C bytes")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeClassCBytes)
                                             .font(.title3.weight(.semibold))
                                             .foregroundStyle(primaryText)
                                     }

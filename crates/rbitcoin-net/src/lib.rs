@@ -23,7 +23,7 @@ mod tx_relay;
 mod v2;
 mod versionbits_warn;
 
-pub use asmap::{AsMap, TWO_PREFIX_ASMAP};
+pub use asmap::{interpret, ip16_for_lookup, sanity_check, AsMap, TWO_PREFIX_ASMAP};
 pub use cache::BlockCache;
 pub use chain::{AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use compact::{

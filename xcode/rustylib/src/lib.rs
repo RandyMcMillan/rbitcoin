@@ -728,6 +728,76 @@ pub fn block_header_hash(
     Ok(rbitcoin_primitives::hex_encode(rev))
 }
 
+// --- Silent Payments FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiTaprootOut {
+    pub vout: u32,
+    pub xonly: String,
+    pub value: u64,
+}
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiTxTweak {
+    pub tweak: String,
+    pub output_pubkeys: Vec<FfiTaprootOut>,
+}
+
+#[uniffi::export]
+pub fn tweak_from_tx(
+    tx_hex: String,
+    prevouts_hex: Vec<String>,
+) -> Result<Option<FfiTxTweak>, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let prevouts: Vec<bitcoin::TxOut> = prevouts_hex
+        .iter()
+        .map(|h| {
+            let b = rbitcoin_primitives::hex_decode(h).map_err(|_| RustyError::InvalidInput)?;
+            bitcoin::consensus::encode::deserialize(&b).map_err(|_| RustyError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match rbitcoin_consensus::tweak_from_tx(&tx, &prevouts) {
+        Some(tt) => Ok(Some(FfiTxTweak {
+            tweak: rbitcoin_primitives::hex_encode(tt.tweak),
+            output_pubkeys: tt
+                .output_pubkeys
+                .into_iter()
+                .map(|o| FfiTaprootOut {
+                    vout: o.vout,
+                    xonly: rbitcoin_primitives::hex_encode(o.xonly),
+                    value: o.value,
+                })
+                .collect(),
+        })),
+        None => Ok(None),
+    }
+}
+
+// --- ASMap FFI ---
+
+#[uniffi::export]
+pub fn ip16_for_lookup(ip_str: String) -> Result<Vec<u8>, RustyError> {
+    let ip: std::net::IpAddr = ip_str.parse().map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::ip16_for_lookup(ip).to_vec())
+}
+
+#[uniffi::export]
+pub fn asmap_sanity_check(asmap_hex: String) -> Result<bool, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&asmap_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::sanity_check(&bytes))
+}
+
+#[uniffi::export]
+pub fn asmap_interpret(asmap_hex: String, ip16: Vec<u8>) -> Result<u32, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&asmap_hex).map_err(|_| RustyError::InvalidInput)?;
+    let arr: [u8; 16] = ip16.try_into().map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::interpret(&bytes, &arr))
+}
+
 // --- Network Service Flags FFI ---
 
 #[uniffi::export]
@@ -1111,6 +1181,35 @@ impl FfiQuery {
     pub fn warning_strings(&self, network: String) -> Result<Vec<String>, RustyError> {
         let net = rbitcoin_network(&network)?;
         Ok(rbitcoin_net::warning_strings(&self.inner, net))
+    }
+
+    pub fn drain_and_fence_hi(&self) -> Option<u64> {
+        self.inner.drain_and_fence_hi().map(|h| h as u64)
+    }
+
+    pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
+        self.inner
+            .block_queue_update_soft_pressure(rate_blocks_per_s)
+    }
+
+    pub fn sh_indexed_through_height(&self) -> Option<u64> {
+        self.inner.sh_indexed_through_height().map(|h| h as u64)
+    }
+
+    pub fn max_sh_creates(&self) -> u32 {
+        self.inner.max_sh_creates()
+    }
+
+    pub fn set_max_sh_creates(&self, n: u32) {
+        self.inner.set_max_sh_creates(n);
+    }
+
+    pub fn sample_reset_reconstruct_archived(&self) -> u64 {
+        self.inner.sample_reset_reconstruct_archived()
+    }
+
+    pub fn sample_reset_thin_tweak_body_bytes(&self) -> u64 {
+        self.inner.sample_reset_thin_tweak_body_bytes()
     }
 }
 
@@ -1876,5 +1975,78 @@ mod tests {
         assert!(bits.is_empty());
         let warnings = query.warning_strings("mainnet".to_string()).unwrap();
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_tweak_from_tx_not_eligible() {
+        // Simple tx with no taproot outputs → not eligible
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+        let result = tweak_from_tx(tx_hex.to_string(), vec![]).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_ip16_for_lookup() {
+        let v4 = ip16_for_lookup("127.0.0.1".to_string()).unwrap();
+        assert_eq!(v4.len(), 16);
+        // IPv4-mapped: ::ffff:127.0.0.1
+        assert_eq!(v4[0..10], vec![0u8; 10]);
+        assert_eq!(v4[10], 255);
+        assert_eq!(v4[11], 255);
+        assert_eq!(v4[12], 127);
+        let v6 = ip16_for_lookup("::1".to_string()).unwrap();
+        assert_eq!(v6.len(), 16);
+        assert_eq!(v6[15], 1);
+    }
+
+    #[test]
+    fn test_asmap_sanity_check_empty() {
+        let ok = asmap_sanity_check("".to_string()).unwrap();
+        assert!(!ok);
+    }
+
+    #[test]
+    fn test_query_drain_and_fence_hi_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_drain").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.drain_and_fence_hi(), None);
+    }
+
+    #[test]
+    fn test_query_sh_indexed_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_sh").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.sh_indexed_through_height(), None);
+    }
+
+    #[test]
+    fn test_query_max_sh_creates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_sh_max")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.max_sh_creates(), 0);
+        query.set_max_sh_creates(100);
+        assert_eq!(query.max_sh_creates(), 100);
+    }
+
+    #[test]
+    fn test_query_sample_resets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_samples")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.sample_reset_reconstruct_archived(), 0);
+        assert_eq!(query.sample_reset_thin_tweak_body_bytes(), 0);
     }
 }

@@ -84,6 +84,14 @@ struct ContentView: View {
     @State private var queryFkResult = ""
     @State private var querySpentResult = ""
     @State private var queryWarningsResult = ""
+    @State private var spTxHex = ""
+    @State private var spPrevoutsHex = ""
+    @State private var spResult = ""
+    @State private var asmapHex = ""
+    @State private var asmapIp = "1.2.0.0"
+    @State private var asmapResult = ""
+    @State private var queryDrainResult = ""
+    @State private var queryShResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -1646,6 +1654,152 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Silent payments", systemImage: "ear.badge.waveform")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Tx hex", text: $spTxHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Prevouts hex (comma-separated)", text: $spPrevoutsHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = spTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        spResult = ""
+                                        return
+                                    }
+                                    let prevouts = spPrevoutsHex.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                    do {
+                                        let tweak = try tweakFromTx(txHex: hex, prevoutsHex: prevouts)
+                                        if let t = tweak {
+                                            spResult = "tweak: \(t.tweak.prefix(16))… outs: \(t.outputPubkeys.count)"
+                                        } else {
+                                            spResult = "not eligible"
+                                        }
+                                    } catch {
+                                        spResult = "invalid input"
+                                    }
+                                } label: {
+                                    Label("Compute tweak", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !spResult.isEmpty {
+                                    Text(spResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("ASMap", systemImage: "map.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("ASMap hex", text: $asmapHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("IP", text: $asmapIp)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 120)
+                                Button {
+                                    do {
+                                        let ip16 = try ip16ForLookup(ipStr: asmapIp)
+                                        let sane = try asmapSanityCheck(asmapHex: asmapHex)
+                                        let asn = try asmapInterpret(asmapHex: asmapHex, ip16: ip16)
+                                        asmapResult = "sane=\(sane) asn=\(asn)"
+                                    } catch {
+                                        asmapResult = "error"
+                                    }
+                                } label: {
+                                    Label("Lookup ASN", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !asmapResult.isEmpty {
+                                    Text(asmapResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query internals", systemImage: "gearshape.2.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-int")
+                                    let drain = query.drainAndFenceHi()
+                                    let sh = query.shIndexedThroughHeight()
+                                    let maxSh = query.maxShCreates()
+                                    let recon = query.sampleResetReconstructArchived()
+                                    let thin = query.sampleResetThinTweakBodyBytes()
+                                    queryDrainResult = "drain=\(drain?.description ?? "none")"
+                                    queryShResult = "sh=\(sh?.description ?? "none") maxSh=\(maxSh) recon=\(recon) thin=\(thin)"
+                                } catch {
+                                    queryDrainResult = "error"
+                                    queryShResult = ""
+                                }
+                            } label: {
+                                Label("Load internals", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryDrainResult.isEmpty {
+                                Text(queryDrainResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                            if !queryShResult.isEmpty {
+                                Text(queryShResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.68))
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -1671,6 +1825,8 @@ struct ContentView: View {
                                 "BIP68 check + Libre policy",
                                 "Regtest pay mining + Seed services",
                                 "Query tx lookup + Warnings",
+                                "Silent payments + ASMap",
+                                "Query internals",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

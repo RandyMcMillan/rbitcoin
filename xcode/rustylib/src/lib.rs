@@ -2429,6 +2429,48 @@ pub fn received_tx_log() -> String {
     rbitcoin_net::received_tx_log().to_string()
 }
 
+// --- V2 transport constants & logs FFI ---
+
+#[uniffi::export]
+pub fn max_v2_contents_len() -> u32 {
+    rbitcoin_net::MAX_V2_CONTENTS_LEN as u32
+}
+
+#[uniffi::export]
+pub fn v2_cipher_expansion() -> u32 {
+    rbitcoin_net::V2_CIPHER_EXPANSION as u32
+}
+
+#[uniffi::export]
+pub fn v2_other_recv_bytes(contents_len: u32) -> u64 {
+    rbitcoin_net::v2_other_recv_bytes(contents_len as usize)
+}
+
+#[uniffi::export]
+pub fn v2_handshake_timeout_log(peer: u64) -> String {
+    rbitcoin_net::v2_handshake_timeout_log(peer)
+}
+
+#[uniffi::export]
+pub fn v2_missing_garbage_terminator_log() -> String {
+    rbitcoin_net::v2_missing_garbage_terminator_log().to_string()
+}
+
+#[uniffi::export]
+pub fn v2_packet_decryption_failure_log() -> String {
+    rbitcoin_net::v2_packet_decryption_failure_log().to_string()
+}
+
+#[uniffi::export]
+pub fn v2_packet_too_large_log(n: u32) -> String {
+    rbitcoin_net::v2_packet_too_large_log(n as usize)
+}
+
+#[uniffi::export]
+pub fn v2_invalid_message_type_log() -> String {
+    rbitcoin_net::v2_invalid_message_type_log().to_string()
+}
+
 // --- Consensus policy constants FFI ---
 
 #[uniffi::export]
@@ -3716,5 +3758,21 @@ mod tests {
     #[test]
     fn test_min_relay_fee_rate() {
         assert_eq!(min_relay_fee_rate_sat_per_kvb(), 100);
+    }
+
+    #[test]
+    fn test_v2_constants() {
+        assert!(max_v2_contents_len() > 0);
+        assert!(v2_cipher_expansion() > 0);
+        assert!(v2_other_recv_bytes(100) > 0);
+    }
+
+    #[test]
+    fn test_v2_logs() {
+        assert!(!v2_handshake_timeout_log(1).is_empty());
+        assert!(!v2_missing_garbage_terminator_log().is_empty());
+        assert!(!v2_packet_decryption_failure_log().is_empty());
+        assert!(!v2_packet_too_large_log(100).is_empty());
+        assert!(!v2_invalid_message_type_log().is_empty());
     }
 }

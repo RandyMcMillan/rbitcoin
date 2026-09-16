@@ -596,6 +596,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol FfiMempoolProtocol : AnyObject {
     
+    func abandonLive() throws  -> UInt32
+    
     func bodyLogicalLen() throws  -> UInt64
     
     func compact() throws  -> String
@@ -606,11 +608,17 @@ public protocol FfiMempoolProtocol : AnyObject {
     
     func generation()  -> UInt64
     
+    func growSlots() throws 
+    
     func hasFreeSlot()  -> Bool
     
     func liveCount()  -> UInt32
     
+    func markSlotDead(slot: UInt32) throws 
+    
     func meta()  -> FfiMempoolMeta
+    
+    func persistIfDirty() throws 
     
     func slotStats()  -> FfiMempoolSlotStats
     
@@ -674,6 +682,13 @@ public static func openOrCreate(path: String)throws  -> FfiMempool {
     
 
     
+open func abandonLive()throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_abandon_live(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func bodyLogicalLen()throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffimempool_body_logical_len(self.uniffiClonePointer(),$0
@@ -708,6 +723,12 @@ open func generation() -> UInt64 {
 })
 }
     
+open func growSlots()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_grow_slots(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func hasFreeSlot() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempool_has_free_slot(self.uniffiClonePointer(),$0
@@ -722,11 +743,24 @@ open func liveCount() -> UInt32 {
 })
 }
     
+open func markSlotDead(slot: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_mark_slot_dead(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(slot),$0
+    )
+}
+}
+    
 open func meta() -> FfiMempoolMeta {
     return try!  FfiConverterTypeFfiMempoolMeta.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempool_meta(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func persistIfDirty()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_persist_if_dirty(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func slotStats() -> FfiMempoolSlotStats {
@@ -6199,6 +6233,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_xpub_from_xpriv() != 63931) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempool_abandon_live() != 47318) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempool_body_logical_len() != 42298) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6214,13 +6251,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffimempool_generation() != 36589) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempool_grow_slots() != 14602) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempool_has_free_slot() != 58456) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_live_count() != 13707) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempool_mark_slot_dead() != 11727) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempool_meta() != 51552) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_persist_if_dirty() != 3684) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_slot_stats() != 60716) {

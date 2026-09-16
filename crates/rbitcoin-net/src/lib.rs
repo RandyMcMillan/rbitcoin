@@ -52,14 +52,17 @@ pub use rbitcoin_mempool::AcceptError;
 pub(crate) use rbitcoin_mempool::MempoolGraphStats;
 pub use reactor::BlockingRegion;
 pub use seeds::{
-    default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
-    resolve_fixed_seeds, seed_lookup_names, AddrMan, PeerEntry, PeerFlags, MAX_ADDR_MAN,
+    default_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts, required_seed_services,
+    resolve_all_seeds, resolve_dns_seeds, resolve_fixed_seeds, seed_lookup_names, AddrMan,
+    PeerEntry, PeerFlags, MAX_ADDR_MAN,
 };
 pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
 pub use service::P2PNode;
 pub use tx_relay::{ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample};
 pub use v2::{encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, WireBytes};
-pub use versionbits_warn::{unknown_rules_warning, warn_period_threshold, warning_strings};
+pub use versionbits_warn::{
+    active_unknown_bits, unknown_rules_warning, warn_period_threshold, warning_strings,
+};
 
 /// Default number of **live download peers** during IBD (`IbdConfig::target_peers`
 /// and node `--max-outbound` default).

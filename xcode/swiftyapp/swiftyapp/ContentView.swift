@@ -73,6 +73,17 @@ struct ContentView: View {
     @State private var sigopsResult = ""
     @State private var bip68TxHex = ""
     @State private var bip68Result = ""
+    @State private var libreTxHex = ""
+    @State private var libreFee = "1000"
+    @State private var libreWeight = "1000"
+    @State private var libreResult = ""
+    @State private var regtestPayScript = "76a914000000000000000000000000000000000000000088ac"
+    @State private var regtestPayResult = ""
+    @State private var seedServicesResult = ""
+    @State private var queryFkTxid = ""
+    @State private var queryFkResult = ""
+    @State private var querySpentResult = ""
+    @State private var queryWarningsResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -1423,6 +1434,218 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Libre policy", systemImage: "doc.badge.gearshape.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Tx hex", text: $libreTxHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    TextField("Fee", text: $libreFee)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    TextField("Weight", text: $libreWeight)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    Button {
+                                        let hex = libreTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !hex.isEmpty, let fee = UInt64(libreFee), let weight = UInt64(libreWeight) else {
+                                            libreResult = "invalid input"
+                                            return
+                                        }
+                                        do {
+                                            let annex = try checkLibreAnnex(txHex: hex)
+                                            let admission = try checkLibreAdmission(txHex: hex, feeSat: fee, weight: weight)
+                                            libreResult = "annex: \(annex), admit: \(admission)"
+                                        } catch {
+                                            libreResult = "invalid tx"
+                                        }
+                                    } label: {
+                                        Label("Check", systemImage: "checkmark.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !libreResult.isEmpty {
+                                    Text(libreResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Regtest pay mining", systemImage: "hammer.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Script pubkey hex", text: $regtestPayScript)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    do {
+                                        let hex = try mineRegtestPaying(prevHashHex: regtestPrevHash, time: 1296688602, height: 0, scriptPubkeyHex: regtestPayScript, extraTxsHex: [])
+                                        regtestPayResult = "block: \(hex.prefix(32))…"
+                                    } catch {
+                                        regtestPayResult = "error"
+                                    }
+                                } label: {
+                                    Label("Mine paying block", systemImage: "hammer.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !regtestPayResult.isEmpty {
+                                    Text(regtestPayResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Seed services", systemImage: "antenna.radiowaves.left.and.right")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let services = requiredSeedServicesU64()
+                                seedServicesResult = "0x\(String(services, radix: 16))"
+                            } label: {
+                                Label("Load required services", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !seedServicesResult.isEmpty {
+                                Text(seedServicesResult)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query tx lookup", systemImage: "magnifyingglass.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Txid hex", text: $queryFkTxid)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    do {
+                                        let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-txfk")
+                                        let fk = try query.txFkByTxid(txidHex: queryFkTxid)
+                                        let spent = try query.isOutpointSpentAt(txidHex: queryFkTxid, vout: 0, tip: nil)
+                                        queryFkResult = fk != nil ? "fk=\(fk!)" : "not found"
+                                        querySpentResult = spent ? "spent" : "unspent"
+                                    } catch {
+                                        queryFkResult = "error"
+                                        querySpentResult = ""
+                                    }
+                                } label: {
+                                    Label("Lookup", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !queryFkResult.isEmpty {
+                                    Text("\(queryFkResult), \(querySpentResult)")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query warnings", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-warn")
+                                    let bits = try query.activeUnknownBits(network: "mainnet")
+                                    let warnings = try query.warningStrings(network: "mainnet")
+                                    queryWarningsResult = "bits: \(bits.count), warnings: \(warnings.count)"
+                                } catch {
+                                    queryWarningsResult = "error"
+                                }
+                            } label: {
+                                Label("Check warnings", systemImage: "bell.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryWarningsResult.isEmpty {
+                                Text(queryWarningsResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -1445,7 +1668,9 @@ struct ContentView: View {
                                 "Query stats + Archive probe",
                                 "Header hash + Fee at rate",
                                 "Witness commitment + Sigops",
-                                "BIP68 check",
+                                "BIP68 check + Libre policy",
+                                "Regtest pay mining + Seed services",
+                                "Query tx lookup + Warnings",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

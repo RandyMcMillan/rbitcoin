@@ -84,9 +84,7 @@ pub use tx_relay::{
     MempoolTxSnapEntry, MempoolTxSnapshot,
 };
 pub use v2::{encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, WireBytes};
-pub use versionbits_warn::{
-    unknown_rules_warning, warn_period_threshold, warning_strings,
-};
+pub use versionbits_warn::{unknown_rules_warning, warn_period_threshold, warning_strings};
 
 /// Default number of **live download peers** during IBD (`IbdConfig::target_peers`
 /// and node `--max-outbound` default).

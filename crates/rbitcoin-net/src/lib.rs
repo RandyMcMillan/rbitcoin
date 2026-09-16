@@ -70,8 +70,8 @@ pub use rbitcoin_mempool::{AcceptError, Selected};
 pub use reactor::BlockingRegion;
 pub use seeds::{
     default_port, default_rpc_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds,
-    resolve_dns_seeds, resolve_fixed_seeds, socks_dns_seed_dests, AddrMan, PeerEntry, PeerFlags,
-    MAX_ADDR_MAN,
+    resolve_dns_seeds, resolve_fixed_seeds, seed_lookup_names, socks_dns_seed_dests, AddrMan,
+    PeerEntry, PeerFlags, MAX_ADDR_MAN,
 };
 pub use serve_perf::{
     format_serve_perf, sample_reset_serve_perf, serve_perf_totals, ServePerfSample,

@@ -14,6 +14,7 @@ pub use cli::cli_main;
 pub use config::{
     inbound_from_maxconnections, ConfApply, DatadirOpts, ListenOpts, MempoolOpts, NodeConfig,
     P2pListen, RpcOpts, TorControlOpts, CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
+    parse_minimum_chain_work,
 };
 pub use error::NodeError;
 pub use run::{run_node, run_p2p, NodeHandle};

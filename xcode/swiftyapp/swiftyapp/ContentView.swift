@@ -112,6 +112,12 @@ struct ContentView: View {
     @State private var v2Result = ""
     @State private var queryModeResult = ""
     @State private var queryBackfillResult = ""
+    @State private var peerAddrInput = "127.0.0.1:8333"
+    @State private var peerAddrResult = ""
+    @State private var connectBlockHex = ""
+    @State private var connectBlockResult = ""
+    @State private var mtpHeight = "0"
+    @State private var mtpResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2227,6 +2233,137 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Peer address", systemImage: "network")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Address", text: $peerAddrInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.body, design: .monospaced))
+                                Button {
+                                    do {
+                                        let addr = try parsePeerAddr(addr: peerAddrInput)
+                                        peerAddrResult = addr
+                                    } catch {
+                                        peerAddrResult = "invalid"
+                                    }
+                                } label: {
+                                    Label("Parse", systemImage: "checkmark.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !peerAddrResult.isEmpty {
+                                Text(peerAddrResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Accept & connect", systemImage: "link")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hex", text: $connectBlockHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = connectBlockHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        connectBlockResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let fk = try acceptAndConnectBlock(queryPath: NSTemporaryDirectory() + "rbitcoin-connect-demo", network: "regtest", height: 1, blockHex: hex, milestoneHeight: 0)
+                                        connectBlockResult = "fk=\(fk)"
+                                    } catch {
+                                        connectBlockResult = "rejected"
+                                    }
+                                } label: {
+                                    Label("Connect", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !connectBlockResult.isEmpty {
+                                    Text(connectBlockResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("MTP", systemImage: "clock")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Height", text: $mtpHeight)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                Button {
+                                    guard let height = UInt32(mtpHeight) else {
+                                        mtpResult = "invalid"
+                                        return
+                                    }
+                                    do {
+                                        let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-mtp-demo")
+                                        let mtp = try query.medianTimePast(height: height)
+                                        mtpResult = "\(mtp)"
+                                    } catch {
+                                        mtpResult = "error"
+                                    }
+                                } label: {
+                                    Label("MTP", systemImage: "arrow.down.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+                            if !mtpResult.isEmpty {
+                                Text(mtpResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2259,6 +2396,8 @@ struct ContentView: View {
                                 "RBF check + Query chain view",
                                 "V2 transport + Query mode",
                                 "SP backfill",
+                                "Peer address + Accept & connect",
+                                "MTP",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

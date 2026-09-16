@@ -2126,6 +2126,72 @@ public func FfiConverterTypeFfiInboundEvictCandidate_lower(_ value: FfiInboundEv
 }
 
 
+public struct FfiKeypair {
+    public var privateKeyWif: String
+    public var publicKeyHex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(privateKeyWif: String, publicKeyHex: String) {
+        self.privateKeyWif = privateKeyWif
+        self.publicKeyHex = publicKeyHex
+    }
+}
+
+
+
+extension FfiKeypair: Equatable, Hashable {
+    public static func ==(lhs: FfiKeypair, rhs: FfiKeypair) -> Bool {
+        if lhs.privateKeyWif != rhs.privateKeyWif {
+            return false
+        }
+        if lhs.publicKeyHex != rhs.publicKeyHex {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(privateKeyWif)
+        hasher.combine(publicKeyHex)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiKeypair: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiKeypair {
+        return
+            try FfiKeypair(
+                privateKeyWif: FfiConverterString.read(from: &buf), 
+                publicKeyHex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiKeypair, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.privateKeyWif, into: &buf)
+        FfiConverterString.write(value.publicKeyHex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiKeypair_lift(_ buf: RustBuffer) throws -> FfiKeypair {
+    return try FfiConverterTypeFfiKeypair.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiKeypair_lower(_ value: FfiKeypair) -> RustBuffer {
+    return FfiConverterTypeFfiKeypair.lower(value)
+}
+
+
 public struct FfiMempoolMeta {
     public var generation: UInt64
     public var slotCap: UInt32
@@ -3586,6 +3652,13 @@ public func formatServePerf(sample: FfiServePerfSample) -> String {
     )
 })
 }
+public func generateKeypair(network: String)throws  -> FfiKeypair {
+    return try  FfiConverterTypeFfiKeypair.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_generate_keypair(
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func genesisBlockHash(network: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_genesis_block_hash(
@@ -3947,6 +4020,22 @@ public func p2pFixedSeedHosts(network: String)throws  -> [String] {
 public func p2pTargetPeers() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_p2p_target_peers($0
+    )
+})
+}
+public func p2trAddressFromPubkey(pubkeyHex: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2tr_address_from_pubkey(
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+public func p2wpkhAddressFromPubkey(pubkeyHex: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2wpkh_address_from_pubkey(
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterString.lower(network),$0
     )
 })
 }
@@ -4612,6 +4701,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_format_serve_perf() != 24386) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_generate_keypair() != 27434) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_genesis_block_hash() != 47359) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4766,6 +4858,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_target_peers() != 34559) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2tr_address_from_pubkey() != 39046) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2wpkh_address_from_pubkey() != 48692) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_display_hash32() != 60706) {

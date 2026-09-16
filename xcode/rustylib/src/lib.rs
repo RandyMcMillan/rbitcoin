@@ -2218,6 +2218,66 @@ pub fn peer_max_pct_addr_to_send() -> u32 {
     rbitcoin_net::MAX_PCT_ADDR_TO_SEND as u32
 }
 
+// --- Key & Address FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiKeypair {
+    pub private_key_wif: String,
+    pub public_key_hex: String,
+}
+
+#[uniffi::export]
+pub fn generate_keypair(network: String) -> Result<FfiKeypair, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let bnet = bitcoin_network(net);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let secret = bitcoin::secp256k1::SecretKey::new(&mut rand::thread_rng());
+    let sk = bitcoin::PrivateKey::new(secret, bnet);
+    let pk = sk.public_key(&secp);
+    Ok(FfiKeypair {
+        private_key_wif: sk.to_wif(),
+        public_key_hex: rbitcoin_primitives::hex_encode(pk.to_bytes()),
+    })
+}
+
+#[uniffi::export]
+pub fn p2wpkh_address_from_pubkey(
+    pubkey_hex: String,
+    network: String,
+) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let pk =
+        bitcoin::CompressedPublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let hrp = known_hrp(net);
+    let addr = bitcoin::Address::p2wpkh(&pk, hrp);
+    Ok(addr.to_string())
+}
+
+#[uniffi::export]
+pub fn p2tr_address_from_pubkey(pubkey_hex: String, network: String) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let xonly =
+        bitcoin::XOnlyPublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let hrp = known_hrp(net);
+    let addr = bitcoin::Address::p2tr(&secp, xonly, None, hrp);
+    Ok(addr.to_string())
+}
+
+fn known_hrp(net: rbitcoin_primitives::Network) -> bitcoin::address::KnownHrp {
+    match net {
+        rbitcoin_primitives::Network::Mainnet => bitcoin::address::KnownHrp::Mainnet,
+        rbitcoin_primitives::Network::Testnet | rbitcoin_primitives::Network::Signet => {
+            bitcoin::address::KnownHrp::Testnets
+        }
+        rbitcoin_primitives::Network::Regtest => bitcoin::address::KnownHrp::Regtest,
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3396,5 +3456,27 @@ mod tests {
         assert_eq!(peer_oversize_ban_score(), 100);
         assert_eq!(peer_max_addr_to_send(), 1000);
         assert_eq!(peer_max_pct_addr_to_send(), 23);
+    }
+
+    #[test]
+    fn test_generate_keypair() {
+        let kp = generate_keypair("mainnet".to_string()).unwrap();
+        assert!(!kp.private_key_wif.is_empty());
+        assert!(!kp.public_key_hex.is_empty());
+        assert_eq!(kp.public_key_hex.len(), 66);
+    }
+
+    #[test]
+    fn test_p2wpkh_address_from_pubkey() {
+        let kp = generate_keypair("mainnet".to_string()).unwrap();
+        let addr = p2wpkh_address_from_pubkey(kp.public_key_hex, "mainnet".to_string()).unwrap();
+        assert!(addr.starts_with("bc1q"));
+    }
+
+    #[test]
+    fn test_p2tr_address_from_pubkey() {
+        // Need x-only pubkey (32 bytes) for P2TR; CompressedPublicKey is 33 bytes.
+        // Just verify the function exists and rejects bad input.
+        assert!(p2tr_address_from_pubkey("00".to_string(), "mainnet".to_string()).is_err());
     }
 }

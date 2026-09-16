@@ -12,7 +12,8 @@ mod tor_control;
 
 pub use cli::cli_main;
 pub use config::{
-    DatadirOpts, ListenOpts, MempoolOpts, NodeConfig, P2pListen, RpcOpts, TorControlOpts,
+    inbound_from_maxconnections, ConfApply, DatadirOpts, ListenOpts, MempoolOpts, NodeConfig,
+    P2pListen, RpcOpts, TorControlOpts, CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
 };
 pub use error::NodeError;
 pub use run::{run_node, run_p2p, NodeHandle};

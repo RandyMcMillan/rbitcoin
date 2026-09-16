@@ -825,6 +825,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func maxShCreates()  -> UInt32
     
+    func medianTimePast(height: UInt32) throws  -> UInt32
+    
     func sampleResetReconstructArchived()  -> UInt64
     
     func sampleResetThinTweakBodyBytes()  -> UInt64
@@ -850,6 +852,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func txHeadOccupied()  -> UInt64
     
     func txIndexEnabled()  -> Bool
+    
+    func validateHeader(network: String, height: UInt32, headerHex: String) throws 
     
     func warningStrings(network: String) throws  -> [String]
     
@@ -1099,6 +1103,14 @@ open func maxShCreates() -> UInt32 {
 })
 }
     
+open func medianTimePast(height: UInt32)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_median_time_past(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
 open func sampleResetReconstructArchived() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_sample_reset_reconstruct_archived(self.uniffiClonePointer(),$0
@@ -1191,6 +1203,15 @@ open func txIndexEnabled() -> Bool {
     uniffi_rustylib_fn_method_ffiquery_tx_index_enabled(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func validateHeader(network: String, height: UInt32, headerHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_validate_header(self.uniffiClonePointer(),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(headerHex),$0
+    )
+}
 }
     
 open func warningStrings(network: String)throws  -> [String] {
@@ -2660,6 +2681,17 @@ fileprivate struct FfiConverterSequenceTypeFfiTaprootOut: FfiConverterRustBuffer
         return seq
     }
 }
+public func acceptAndConnectBlock(queryPath: String, network: String, height: UInt32, blockHex: String, milestoneHeight: UInt32)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_accept_and_connect_block(
+        FfiConverterString.lower(queryPath),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(blockHex),
+        FfiConverterUInt32.lower(milestoneHeight),$0
+    )
+})
+}
 public func addressNetwork(address: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_address_network(
@@ -3140,6 +3172,13 @@ public func parseDisplayHash32(hex: String)throws  -> Data {
     )
 })
 }
+public func parsePeerAddr(addr: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_parse_peer_addr(
+        FfiConverterString.lower(addr),$0
+    )
+})
+}
 public func parseTx(txHex: String)throws  -> FfiTxInfo {
     return try  FfiConverterTypeFfiTxInfo.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_parse_tx(
@@ -3449,6 +3488,9 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_rustylib_checksum_func_accept_and_connect_block() != 62089) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_address_network() != 7866) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3645,6 +3687,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_display_hash32() != 60706) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_parse_peer_addr() != 13537) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_tx() != 26241) {
@@ -3857,6 +3902,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_max_sh_creates() != 35677) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_median_time_past() != 38475) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_sample_reset_reconstruct_archived() != 25053) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3894,6 +3942,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tx_index_enabled() != 45320) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_validate_header() != 45565) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_warning_strings() != 30486) {

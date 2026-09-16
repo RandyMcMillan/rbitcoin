@@ -798,6 +798,37 @@ pub fn asmap_interpret(asmap_hex: String, ip16: Vec<u8>) -> Result<u32, RustyErr
     Ok(rbitcoin_net::interpret(&bytes, &arr))
 }
 
+// --- Accept and Connect Block FFI ---
+
+#[uniffi::export]
+pub fn accept_and_connect_block(
+    query_path: String,
+    network: String,
+    height: u32,
+    block_hex: String,
+    milestone_height: u32,
+) -> Result<u64, RustyError> {
+    let query =
+        rbitcoin_query::Query::open_or_create(&query_path).map_err(|_| RustyError::StoreError)?;
+    let params = chain_params_for_network(&network)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let milestone = rbitcoin_consensus::Milestone {
+        height: milestone_height,
+    };
+    let fk = rbitcoin_consensus::accept_and_connect_block(
+        &query,
+        &params,
+        rbitcoin_primitives::Height(height),
+        &block,
+        milestone,
+    )
+    .map_err(|_| RustyError::ConsensusError)?;
+    Ok(fk.0)
+}
+
 // --- Block Structure FFI ---
 
 #[uniffi::export]
@@ -863,6 +894,14 @@ pub struct FfiHeightTweak {
     pub txid: String,
     pub tweak: String,
     pub output_pubkeys: Vec<FfiTaprootOut>,
+}
+
+// --- Peer Address FFI ---
+
+#[uniffi::export]
+pub fn parse_peer_addr(addr: String) -> Result<String, RustyError> {
+    let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+    Ok(socket.to_string())
 }
 
 // --- V2 Transport FFI ---
@@ -1362,6 +1401,29 @@ impl FfiQuery {
     pub fn backfill_sp_tweaks(&self, network: String) -> Result<u32, RustyError> {
         let params = chain_params_for_network(&network)?;
         rbitcoin_consensus::backfill_sp_tweaks(&self.inner, &params)
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn validate_header(
+        &self,
+        network: String,
+        height: u32,
+        header_hex: String,
+    ) -> Result<(), RustyError> {
+        let params = chain_params_for_network(&network)?;
+        let header: BlockHeader =
+            deserialize_hex(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        rbitcoin_consensus::validate_header(
+            &self.inner,
+            &params,
+            rbitcoin_primitives::Height(height),
+            &header,
+        )
+        .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn median_time_past(&self, height: u32) -> Result<u32, RustyError> {
+        rbitcoin_consensus::median_time_past(&self.inner, rbitcoin_primitives::Height(height))
             .map_err(|_| RustyError::ConsensusError)
     }
 }
@@ -2347,5 +2409,37 @@ mod tests {
         let query = FfiQuery::open_or_create(path).unwrap();
         let count = query.backfill_sp_tweaks("mainnet".to_string()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_parse_peer_addr() {
+        let addr = parse_peer_addr("127.0.0.1:8333".to_string()).unwrap();
+        assert!(addr.contains("127.0.0.1"));
+        assert!(addr.contains("8333"));
+    }
+
+    #[test]
+    fn test_query_median_time_past_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_mtp").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        // Empty chain may error; just ensure it doesn't panic
+        let _ = query.median_time_past(0);
+    }
+
+    #[test]
+    fn test_accept_and_connect_block_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_connect")
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Empty chain: connecting a non-genesis block should fail
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 1).unwrap();
+        let result = accept_and_connect_block(path, "regtest".to_string(), 1, block_hex, 0);
+        assert!(result.is_err());
     }
 }

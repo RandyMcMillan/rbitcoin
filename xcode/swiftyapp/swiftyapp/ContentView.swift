@@ -38,6 +38,14 @@ struct ContentView: View {
     @State private var networkSeedResult = ""
     @State private var scriptHashInput = ""
     @State private var scriptHashResult = ""
+    @State private var logLevelInput = "info"
+    @State private var logLevelResult = ""
+    @State private var capturedLogs = ""
+    @State private var genesisNetwork = "mainnet"
+    @State private var genesisHashResult = ""
+    @State private var milestoneResult = ""
+    @State private var resolvedSeedsResult = ""
+    @State private var constantsResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -703,6 +711,195 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("rbitcoin log", systemImage: "doc.text.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-log")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Log level")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                HStack(spacing: 8) {
+                                    TextField("Level", text: $logLevelInput)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(width: 100)
+                                    Button {
+                                        initLogLevel(level: logLevelInput)
+                                        logLevelResult = logLevelEnabled(level: logLevelInput) ? "enabled" : "disabled"
+                                    } label: {
+                                        Label("Set", systemImage: "slider.horizontal.3")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !logLevelResult.isEmpty {
+                                    Text(logLevelResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+
+                            HStack(spacing: 12) {
+                                Button {
+                                    captureLogs(on: true)
+                                    logMessage(level: "info", message: "SwiftUI capture test")
+                                    let logs = takeLogs()
+                                    capturedLogs = logs.joined(separator: "\n")
+                                    captureLogs(on: false)
+                                } label: {
+                                    Label("Capture", systemImage: "arrow.down.doc.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+
+                                if !capturedLogs.isEmpty {
+                                    Text(capturedLogs)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(2)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Genesis block", systemImage: "globe")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                Picker("Network", selection: $genesisNetwork) {
+                                    Text("mainnet").tag("mainnet")
+                                    Text("testnet").tag("testnet")
+                                    Text("regtest").tag("regtest")
+                                    Text("signet").tag("signet")
+                                }
+                                .pickerStyle(.menu)
+                                .tint(accentText)
+                                Button {
+                                    do {
+                                        let hash = try genesisBlockHash(network: genesisNetwork)
+                                        let milestone = try defaultMilestoneHeight(network: genesisNetwork)
+                                        genesisHashResult = hash
+                                        milestoneResult = "milestone: \(milestone)"
+                                    } catch {
+                                        genesisHashResult = "error"
+                                        milestoneResult = ""
+                                    }
+                                } label: {
+                                    Label("Load", systemImage: "arrow.down.circle.fill")
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                Spacer()
+                            }
+
+                            if !genesisHashResult.isEmpty {
+                                Text(genesisHashResult)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(1)
+                                Text(milestoneResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.68))
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Seed resolution", systemImage: "network.badge.shield.half.filled")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let fixed = try resolveFixedSeeds(network: "mainnet")
+                                    let dns = try resolveDnsSeeds(network: "mainnet")
+                                    let all = try resolveAllSeeds(network: "mainnet")
+                                    resolvedSeedsResult = "fixed: \(fixed.count) dns: \(dns.count) all: \(all.count)"
+                                } catch {
+                                    resolvedSeedsResult = "error"
+                                }
+                            } label: {
+                                Label("Resolve mainnet seeds", systemImage: "arrow.triangle.2.circlepath")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !resolvedSeedsResult.isEmpty {
+                                Text(resolvedSeedsResult)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Constants", systemImage: "number.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let magic = rbitcoinStoreMagic()
+                                let schema = rbitcoinSchemaVersion()
+                                let maxWeight = mempoolDefaultMaxWeight()
+                                let maxTxWeight = mempoolMaxStandardTxWeight()
+                                let dust = electrumDefaultTweaksMinDust()
+                                constantsResult = "magic=\(magic) schema=\(schema) maxWeight=\(maxWeight) maxTx=\(maxTxWeight) dust=\(dust)"
+                            } label: {
+                                Label("Load constants", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !constantsResult.isEmpty {
+                                Text(constantsResult)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -718,6 +915,8 @@ struct ContentView: View {
                                 "Mempool + Fee estimation",
                                 "Tx parsing + Block hash",
                                 "P2P network + Electrum",
+                                "Log control + Genesis",
+                                "Seed resolution + Constants",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

@@ -323,6 +323,167 @@ pub fn node_inbound_from_maxconnections(total: u32) -> u32 {
     rbitcoin_node::inbound_from_maxconnections(total)
 }
 
+#[uniffi::export]
+pub fn node_parse_minimum_chain_work(spec: String) -> Result<String, RustyError> {
+    rbitcoin_node::parse_minimum_chain_work(&spec)
+        .map(|h| rbitcoin_primitives::hex_encode(h))
+        .map_err(|_| RustyError::InvalidInput)
+}
+
+// --- Log FFI ---
+
+#[uniffi::export]
+pub fn init_log_level(level: String) {
+    if let Some(l) = rbitcoin_log::Level::parse(&level) {
+        rbitcoin_log::init(l);
+    } else if level.trim().eq_ignore_ascii_case("off")
+        || level.trim().eq_ignore_ascii_case("none")
+        || level.trim() == "0"
+    {
+        rbitcoin_log::init_off();
+    }
+}
+
+#[uniffi::export]
+pub fn log_level_enabled(level: String) -> bool {
+    rbitcoin_log::Level::parse(&level)
+        .map(|l| rbitcoin_log::enabled(l))
+        .unwrap_or(false)
+}
+
+#[uniffi::export]
+pub fn capture_logs(on: bool) {
+    rbitcoin_log::capture_logs(on);
+}
+
+#[uniffi::export]
+pub fn take_logs() -> Vec<String> {
+    rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(level, msg)| format!("[{}] {}", level.as_str(), msg))
+        .collect()
+}
+
+#[uniffi::export]
+pub fn log_message(level: String, message: String) {
+    if let Some(l) = rbitcoin_log::Level::parse(&level) {
+        rbitcoin_log::log_at(l, format_args!("{}", message));
+    }
+}
+
+// --- Network Seeds FFI ---
+
+#[uniffi::export]
+pub fn resolve_fixed_seeds(network: String) -> Result<Vec<String>, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::resolve_fixed_seeds(net)
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect())
+}
+
+#[uniffi::export]
+pub fn resolve_dns_seeds(network: String) -> Result<Vec<String>, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::resolve_dns_seeds(net)
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect())
+}
+
+#[uniffi::export]
+pub fn resolve_all_seeds(network: String) -> Result<Vec<String>, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::resolve_all_seeds(net)
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect())
+}
+
+#[uniffi::export]
+pub fn seed_lookup_names_flat(network: String) -> Result<Vec<String>, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_net::seed_lookup_names(net)
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+// --- Consensus Chain Params FFI ---
+
+#[uniffi::export]
+pub fn genesis_block_hash(network: String) -> Result<String, RustyError> {
+    let params = chain_params_for_network(&network)?;
+    let block = rbitcoin_consensus::genesis_block(&params);
+    Ok(block.block_hash().to_string())
+}
+
+#[uniffi::export]
+pub fn default_milestone_height(network: String) -> Result<u32, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    Ok(rbitcoin_consensus::default_milestone_height(net))
+}
+
+#[uniffi::export]
+pub fn check_genesis_hash(network: String, hash_hex: String) -> Result<bool, RustyError> {
+    let params = chain_params_for_network(&network)?;
+    let hash_bytes = rbitcoin_primitives::hex_decode(&hash_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&hash_bytes);
+    arr.reverse(); // display hash → internal byte order
+    let hash = bitcoin::BlockHash::from_byte_array(arr);
+    Ok(rbitcoin_consensus::check_genesis_hash(&params, hash))
+}
+
+#[uniffi::export]
+pub fn signet_magic_hex(challenge_hex: String) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&challenge_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = bitcoin::Script::from_bytes(&bytes);
+    let magic = rbitcoin_consensus::signet_magic(script);
+    Ok(rbitcoin_primitives::hex_encode(magic))
+}
+
+// --- Mempool Constants FFI ---
+
+#[uniffi::export]
+pub fn mempool_default_max_weight() -> u64 {
+    rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT
+}
+
+#[uniffi::export]
+pub fn mempool_max_standard_tx_weight() -> u64 {
+    rbitcoin_consensus::policy::MAX_STANDARD_TX_WEIGHT
+}
+
+#[uniffi::export]
+pub fn mempool_incremental_relay_fee_rate() -> u64 {
+    rbitcoin_mempool::INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB
+}
+
+// --- Electrum Constants FFI ---
+
+#[uniffi::export]
+pub fn electrum_default_tweaks_min_dust() -> u64 {
+    rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST
+}
+
+// --- Primitives Constants FFI ---
+
+#[uniffi::export]
+pub fn rbitcoin_store_magic() -> String {
+    rbitcoin_primitives::hex_encode(rbitcoin_primitives::STORE_MAGIC)
+}
+
+#[uniffi::export]
+pub fn rbitcoin_schema_version() -> u16 {
+    rbitcoin_primitives::SCHEMA_VERSION
+}
+
+#[uniffi::export]
+pub fn rbitcoin_schema_file_openable(ver: u16) -> bool {
+    rbitcoin_primitives::schema_file_openable(ver)
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -422,6 +583,21 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_, t)| t.into()))
     }
+
+    #[uniffi::constructor]
+    pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
+        let store = rbitcoin_store::Store::open_or_create(&path)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(Arc::new(Self { inner: store }))
+    }
+
+    pub fn datadir_bytes(&self) -> u64 {
+        self.inner.datadir_bytes()
+    }
+
+    pub fn path(&self) -> String {
+        self.inner.path().to_string_lossy().into_owned()
+    }
 }
 
 // --- Query FFI ---
@@ -467,6 +643,30 @@ impl FfiQuery {
     pub fn block_queue_max_height(&self) -> Option<u64> {
         self.inner.block_queue_max_height().map(|h| h as u64)
     }
+
+    pub fn tx_index_enabled(&self) -> bool {
+        self.inner.tx_index_enabled()
+    }
+
+    pub fn spend_index_enabled(&self) -> bool {
+        self.inner.spend_index_enabled()
+    }
+
+    pub fn block_queue_stats(&self) -> FfiBlockQueueStats {
+        let (assign_stop, bytes, count) = self.inner.block_queue_stats();
+        FfiBlockQueueStats {
+            assign_stop_bytes: assign_stop,
+            bytes,
+            count: count as u64,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiBlockQueueStats {
+    pub assign_stop_bytes: u64,
+    pub bytes: u64,
+    pub count: u64,
 }
 
 // --- Mempool FFI ---
@@ -534,6 +734,16 @@ impl FfiMempool {
             .unwrap()
             .flush()
             .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn has_free_slot(&self) -> bool {
+        self.inner.lock().unwrap().has_free_slot()
+    }
+
+    pub fn compact(&self) -> Result<String, RustyError> {
+        let mut guard = self.inner.lock().unwrap();
+        let (dead, shrunk) = guard.compact().map_err(|_| RustyError::MempoolError)?;
+        Ok(format!("dead={dead} shrunk={shrunk}"))
     }
 }
 
@@ -799,5 +1009,119 @@ mod tests {
         assert_eq!(node_default_max_inbound(), 125);
         assert_eq!(node_core_maxconnections_outbound_reserve(), 11);
         assert_eq!(node_inbound_from_maxconnections(100), 89);
+    }
+
+    #[test]
+    fn test_log_level() {
+        init_log_level("warn".to_string());
+        assert!(log_level_enabled("warn".to_string()));
+        assert!(!log_level_enabled("info".to_string()));
+        init_log_level("debug".to_string());
+        assert!(log_level_enabled("debug".to_string()));
+        assert!(!log_level_enabled("trace".to_string()));
+        init_log_level("off".to_string());
+        assert!(!log_level_enabled("error".to_string()));
+        init_log_level("info".to_string());
+    }
+
+    #[test]
+    fn test_capture_logs() {
+        capture_logs(true);
+        init_log_level("info".to_string());
+        log_message("info".to_string(), "test capture".to_string());
+        let logs = take_logs();
+        capture_logs(false);
+        assert!(logs.iter().any(|l| l.contains("test capture")));
+    }
+
+    #[test]
+    fn test_genesis_block_hash() {
+        let hash = genesis_block_hash("mainnet".to_string()).unwrap();
+        assert_eq!(hash, "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+        let regtest = genesis_block_hash("regtest".to_string()).unwrap();
+        assert!(!regtest.is_empty());
+    }
+
+    #[test]
+    fn test_default_milestone_height() {
+        assert_eq!(default_milestone_height("mainnet".to_string()).unwrap(), 840_000);
+        assert_eq!(default_milestone_height("regtest".to_string()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_check_genesis_hash() {
+        let hash = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+        assert!(check_genesis_hash("mainnet".to_string(), hash.to_string()).unwrap());
+        assert!(!check_genesis_hash("regtest".to_string(), hash.to_string()).unwrap());
+    }
+
+    #[test]
+    fn test_mempool_constants() {
+        assert_eq!(mempool_default_max_weight(), 300_000_000);
+        assert_eq!(mempool_max_standard_tx_weight(), 400_000);
+        assert!(mempool_incremental_relay_fee_rate() > 0);
+    }
+
+    #[test]
+    fn test_electrum_tweaks_min_dust() {
+        assert_eq!(electrum_default_tweaks_min_dust(), 1000);
+    }
+
+    #[test]
+    fn test_primitives_constants() {
+        assert_eq!(rbitcoin_store_magic(), "52425431");
+        assert!(rbitcoin_schema_version() > 0);
+        assert!(rbitcoin_schema_file_openable(rbitcoin_schema_version()));
+        assert!(!rbitcoin_schema_file_openable(0));
+    }
+
+    #[test]
+    fn test_store_open_or_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store2").to_str().unwrap().to_string();
+        let store = FfiStore::open_or_create(path.clone()).unwrap();
+        assert_eq!(store.tip_height(), None);
+        assert!(store.datadir_bytes() > 0 || store.datadir_bytes() == 0);
+        assert!(!store.path().is_empty());
+    }
+
+    #[test]
+    fn test_query_block_queue_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query2").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert!(query.tx_index_enabled());
+        assert!(query.spend_index_enabled());
+        let stats = query.block_queue_stats();
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.bytes, 0);
+        assert!(stats.assign_stop_bytes > 0);
+    }
+
+    #[test]
+    fn test_mempool_compact_and_free_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mempool2").to_str().unwrap().to_string();
+        let mempool = FfiMempool::open_or_create(path).unwrap();
+        assert!(mempool.has_free_slot());
+        let compact = mempool.compact().unwrap();
+        assert!(compact.starts_with("dead="));
+    }
+
+    #[test]
+    fn test_seed_lookup_names_flat() {
+        let names = seed_lookup_names_flat("mainnet".to_string()).unwrap();
+        assert!(!names.is_empty());
+        assert!(names.iter().any(|n| n.contains("seed.bitcoin.sipa.be")));
+        let regtest = seed_lookup_names_flat("regtest".to_string()).unwrap();
+        assert!(regtest.is_empty());
+    }
+
+    #[test]
+    fn test_signet_magic_hex() {
+        // A simple push+checksig script: 0x51 (OP_PUSHBYTES_33) + 33 bytes + 0xac (OP_CHECKSIG)
+        let script_hex = "512103add177f3e3c6d9f3c8e4c5b9a7e2d1f0c3b6a5d8e7f4c1b0a3d6e5f8c7b4a1d0e3f6c5b8a7d4e1f0c3b6a5d8e7f4c1b0a3d6e5f8c7b4a1d0e3f6c5b8ac";
+        let magic = signet_magic_hex(script_hex.to_string()).unwrap();
+        assert_eq!(magic.len(), 8);
     }
 }

@@ -70,7 +70,7 @@ pub use header::{
     expected_next_bits, median_time_past, validate_header, validate_header_on_parent,
 };
 pub use milestone::Milestone;
-pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
+pub use params::{check_genesis_hash, default_milestone_height, genesis_block, ChainParams, Checkpoint};
 pub use policy::PolicyResult;
 pub use regtest_pad::{
     grind_regtest_pow, mine_empty_regtest, mine_regtest_paying, pad_empty_from,

@@ -1221,6 +1221,7 @@ dependencies = [
  "rbitcoin-cli",
  "rbitcoin-consensus",
  "rbitcoin-electrum",
+ "rbitcoin-log",
  "rbitcoin-mempool",
  "rbitcoin-net",
  "rbitcoin-node",

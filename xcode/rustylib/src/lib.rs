@@ -896,6 +896,62 @@ pub struct FfiHeightTweak {
     pub output_pubkeys: Vec<FfiTaprootOut>,
 }
 
+// --- Disconnect Tip FFI ---
+
+#[uniffi::export]
+pub fn format_disconnect_tip_line(
+    height: u32,
+    hash_hex: String,
+    n_tx: u32,
+) -> Result<String, RustyError> {
+    let hash = parse_hash32(&hash_hex)?;
+    Ok(rbitcoin_query::format_disconnect_tip_line(
+        height,
+        &hash,
+        n_tx as usize,
+    ))
+}
+
+// --- Serve Perf FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiServePerfSample {
+    pub n: u64,
+    pub bytes: u64,
+    pub ntx: u64,
+    pub wall_ns: u64,
+    pub max_ns: u64,
+}
+
+impl From<rbitcoin_net::ServePerfSample> for FfiServePerfSample {
+    fn from(s: rbitcoin_net::ServePerfSample) -> Self {
+        Self {
+            n: s.n,
+            bytes: s.bytes,
+            ntx: s.ntx,
+            wall_ns: s.wall_ns,
+            max_ns: s.max_ns,
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn sample_reset_serve_perf() -> FfiServePerfSample {
+    rbitcoin_net::sample_reset_serve_perf().into()
+}
+
+#[uniffi::export]
+pub fn format_serve_perf(sample: FfiServePerfSample) -> String {
+    let s = rbitcoin_net::ServePerfSample {
+        n: sample.n,
+        bytes: sample.bytes,
+        ntx: sample.ntx,
+        wall_ns: sample.wall_ns,
+        max_ns: sample.max_ns,
+    };
+    rbitcoin_net::format_serve_perf(&s)
+}
+
 // --- Peer Address FFI ---
 
 #[uniffi::export]
@@ -1425,6 +1481,20 @@ impl FfiQuery {
     pub fn median_time_past(&self, height: u32) -> Result<u32, RustyError> {
         rbitcoin_consensus::median_time_past(&self.inner, rbitcoin_primitives::Height(height))
             .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn on_load_pack(&self) -> Result<(), RustyError> {
+        self.inner
+            .on_load_pack()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn request_confirm_cancel(&self) {
+        self.inner.request_confirm_cancel();
+    }
+
+    pub fn clear_confirm_cancel(&self) {
+        self.inner.clear_confirm_cancel();
     }
 }
 
@@ -2441,5 +2511,50 @@ mod tests {
         let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 1).unwrap();
         let result = accept_and_connect_block(path, "regtest".to_string(), 1, block_hex, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_disconnect_tip_line() {
+        let line = format_disconnect_tip_line(
+            100,
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            5,
+        )
+        .unwrap();
+        assert!(line.contains("DisconnectTip"));
+        assert!(line.contains("height=100"));
+        assert!(line.contains("tx=5"));
+    }
+
+    #[test]
+    fn test_serve_perf() {
+        let sample = sample_reset_serve_perf();
+        let formatted = format_serve_perf(sample);
+        assert!(!formatted.is_empty());
+    }
+
+    #[test]
+    fn test_query_on_load_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_load").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        query.on_load_pack().unwrap();
+    }
+
+    #[test]
+    fn test_query_confirm_cancel_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_cancel2")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert!(!query.confirm_cancelled());
+        query.request_confirm_cancel();
+        assert!(query.confirm_cancelled());
+        query.clear_confirm_cancel();
+        assert!(!query.confirm_cancelled());
     }
 }

@@ -174,7 +174,7 @@ pub use block_filter::{basic_filter_from_scripts, basic_filter_of};
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;
-pub use connect::{spawn_sh_writebehind, ConfirmPrepared};
+pub use connect::{format_disconnect_tip_line, spawn_sh_writebehind, ConfirmPrepared};
 pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher, TxidMap, TxidSet};
 pub use in_flight::InFlight;
 pub use scripthash::{

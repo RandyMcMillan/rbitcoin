@@ -118,6 +118,12 @@ struct ContentView: View {
     @State private var connectBlockResult = ""
     @State private var mtpHeight = "0"
     @State private var mtpResult = ""
+    @State private var disconnectHeight = "100"
+    @State private var disconnectHash = "0000000000000000000000000000000000000000000000000000000000000000"
+    @State private var disconnectTxCount = "5"
+    @State private var disconnectResult = ""
+    @State private var servePerfResult = ""
+    @State private var queryLoadResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2364,6 +2370,127 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Disconnect tip", systemImage: "arrow.uturn.backward")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            HStack(spacing: 8) {
+                                TextField("Height", text: $disconnectHeight)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                                TextField("Tx count", text: $disconnectTxCount)
+                                    .textFieldStyle(.roundedBorder)
+                                    .keyboardType(.numberPad)
+                                    .frame(width: 80)
+                            }
+                            TextField("Hash", text: $disconnectHash)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.caption, design: .monospaced))
+                            Button {
+                                guard let height = UInt32(disconnectHeight), let nTx = UInt32(disconnectTxCount) else {
+                                    disconnectResult = "invalid input"
+                                    return
+                                }
+                                do {
+                                    let line = try formatDisconnectTipLine(height: height, hashHex: disconnectHash, nTx: nTx)
+                                    disconnectResult = line
+                                } catch {
+                                    disconnectResult = "invalid hash"
+                                }
+                            } label: {
+                                Label("Format", systemImage: "text.quote")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+                            if !disconnectResult.isEmpty {
+                                Text(disconnectResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Serve perf", systemImage: "chart.line.uptrend.xyaxis")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let sample = sampleResetServePerf()
+                                servePerfResult = formatServePerf(sample: sample)
+                            } label: {
+                                Label("Sample perf", systemImage: "arrow.down.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+                            if !servePerfResult.isEmpty {
+                                Text(servePerfResult)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(primaryText.opacity(0.74))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query load pack", systemImage: "arrow.up.doc.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-load")
+                                    try query.onLoadPack()
+                                    queryLoadResult = "ok"
+                                } catch {
+                                    queryLoadResult = "error"
+                                }
+                            } label: {
+                                Label("Load pack", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+                            if !queryLoadResult.isEmpty {
+                                Text(queryLoadResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2398,6 +2525,8 @@ struct ContentView: View {
                                 "SP backfill",
                                 "Peer address + Accept & connect",
                                 "MTP",
+                                "Disconnect tip + Serve perf",
+                                "Query load pack",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

@@ -2062,6 +2062,38 @@ impl FfiMempool {
             .to_string_lossy()
             .into_owned()
     }
+
+    pub fn persist_if_dirty(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .persist_if_dirty()
+            .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn abandon_live(&self) -> Result<u32, RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .abandon_live()
+            .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn mark_slot_dead(&self, slot: u32) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .mark_slot_dead(slot)
+            .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn grow_slots(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .grow_slots()
+            .map_err(|_| RustyError::MempoolError)
+    }
 }
 
 // --- RBF FFI ---
@@ -3237,6 +3269,17 @@ mod tests {
         assert!(compact.starts_with("dead="));
         assert!(mempool.body_logical_len().unwrap() > 0);
         assert!(!mempool.dir().is_empty());
+    }
+
+    #[test]
+    fn test_mempool_persist_abandon_grow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mempool3").to_str().unwrap().to_string();
+        let mempool = FfiMempool::open_or_create(path).unwrap();
+        mempool.persist_if_dirty().unwrap();
+        assert_eq!(mempool.abandon_live().unwrap(), 0);
+        mempool.grow_slots().unwrap();
+        assert!(mempool.has_free_slot());
     }
 
     #[test]

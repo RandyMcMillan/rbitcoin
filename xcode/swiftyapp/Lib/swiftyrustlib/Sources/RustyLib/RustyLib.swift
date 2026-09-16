@@ -1463,6 +1463,14 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func datadirBytes()  -> UInt64
     
+    func fenceMaxConnectedFk()  -> UInt64
+    
+    func fenceTipHeight()  -> UInt64?
+    
+    func flush() throws 
+    
+    func flushHeaderArchive() throws 
+    
     func getHeader(fk: UInt64) throws  -> FfiHeaderRecord
     
     func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
@@ -1475,9 +1483,13 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func headerSlots()  -> UInt64
     
+    func heightFenceRunCount()  -> UInt64
+    
     func isSplit()  -> Bool
     
     func path()  -> String
+    
+    func rebuildHeightFence() throws 
     
     func spenderListCount()  -> UInt64
     
@@ -1582,6 +1594,32 @@ open func datadirBytes() -> UInt64 {
 })
 }
     
+open func fenceMaxConnectedFk() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_fence_max_connected_fk(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func fenceTipHeight() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_fence_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func flush()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_flush(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func flushHeaderArchive()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_flush_header_archive(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func getHeader(fk: UInt64)throws  -> FfiHeaderRecord {
     return try  FfiConverterTypeFfiHeaderRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_get_header(self.uniffiClonePointer(),
@@ -1628,6 +1666,13 @@ open func headerSlots() -> UInt64 {
 })
 }
     
+open func heightFenceRunCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffistore_height_fence_run_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func isSplit() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_is_split(self.uniffiClonePointer(),$0
@@ -1640,6 +1685,12 @@ open func path() -> String {
     uniffi_rustylib_fn_method_ffistore_path(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func rebuildHeightFence()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_rebuild_height_fence(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func spenderListCount() -> UInt64 {
@@ -5875,6 +5926,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_datadir_bytes() != 8367) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_fence_max_connected_fk() != 44203) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_fence_tip_height() != 47281) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_flush() != 22059) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_flush_header_archive() != 19979) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_get_header() != 23114) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5893,10 +5956,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_header_slots() != 53134) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_height_fence_run_count() != 63822) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_is_split() != 47137) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_path() != 6841) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_rebuild_height_fence() != 49611) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_spender_list_count() != 63983) {

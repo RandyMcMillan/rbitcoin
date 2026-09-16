@@ -29,6 +29,9 @@ struct ContentView: View {
     @State private var storeSplit = ""
     @State private var storeSpenderCount = ""
     @State private var storeClassCBytes = ""
+    @State private var storeFenceFk = ""
+    @State private var storeFenceRuns = ""
+    @State private var storeFenceTip = ""
     @State private var queryPath = ""
     @State private var queryBlockQueue = ""
     @State private var queryMoreResult = ""
@@ -540,6 +543,9 @@ struct ContentView: View {
                                         storeSplit = store.isSplit() ? "yes" : "no"
                                         storeSpenderCount = String(store.spenderListCount())
                                         storeClassCBytes = String(store.classCL2ResidentBytes())
+                                        storeFenceFk = String(store.fenceMaxConnectedFk())
+                                        storeFenceRuns = String(store.heightFenceRunCount())
+                                        storeFenceTip = store.fenceTipHeight().map(String.init) ?? "none"
                                     } catch {
                                         storeTipHeight = "error"
                                         storeHeaderCount = ""
@@ -549,6 +555,9 @@ struct ContentView: View {
                                         storeSplit = ""
                                         storeSpenderCount = ""
                                         storeClassCBytes = ""
+                                        storeFenceFk = ""
+                                        storeFenceRuns = ""
+                                        storeFenceTip = ""
                                     }
                                 } label: {
                                     Label("Create", systemImage: "plus.circle.fill")
@@ -566,6 +575,9 @@ struct ContentView: View {
                                         storeSplit = store.isSplit() ? "yes" : "no"
                                         storeSpenderCount = String(store.spenderListCount())
                                         storeClassCBytes = String(store.classCL2ResidentBytes())
+                                        storeFenceFk = String(store.fenceMaxConnectedFk())
+                                        storeFenceRuns = String(store.heightFenceRunCount())
+                                        storeFenceTip = store.fenceTipHeight().map(String.init) ?? "none"
                                     } catch {
                                         storeTipHeight = "error"
                                         storeHeaderCount = ""
@@ -575,6 +587,9 @@ struct ContentView: View {
                                         storeSplit = ""
                                         storeSpenderCount = ""
                                         storeClassCBytes = ""
+                                        storeFenceFk = ""
+                                        storeFenceRuns = ""
+                                        storeFenceTip = ""
                                     }
                                 } label: {
                                     Label("Open", systemImage: "folder.fill")
@@ -649,6 +664,32 @@ struct ContentView: View {
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(primaryText.opacity(0.68))
                                         Text(storeClassCBytes)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                }
+                                HStack(spacing: 16) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Fence FK")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeFenceFk)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Fence runs")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeFenceRuns)
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(primaryText)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Fence tip")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(primaryText.opacity(0.68))
+                                        Text(storeFenceTip)
                                             .font(.title3.weight(.semibold))
                                             .foregroundStyle(primaryText)
                                     }

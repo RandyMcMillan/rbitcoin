@@ -3742,7 +3742,9 @@ struct ContentView: View {
                                 let osBan = peerOversizeBanScore()
                                 let maxAddr = peerMaxAddrToSend()
                                 let maxPct = peerMaxPctAddrToSend()
-                                moreConstantsResult = "bw=\(bw) spb=\(spb) pkg=\(mpc)/\(mpw) rbfr=\(rnum)/\(rden) msgs=\(maxMsgs) bytes=\(maxBytes) rl=\(rlBan) os=\(osBan) addr=\(maxAddr)/\(maxPct)"
+                                let transit = netDefaultBlocksInTransitPerPeer()
+                                let ibdWin = netDefaultIbdWindow()
+                                moreConstantsResult = "bw=\(bw) spb=\(spb) pkg=\(mpc)/\(mpw) rbfr=\(rnum)/\(rden) msgs=\(maxMsgs) bytes=\(maxBytes) rl=\(rlBan) os=\(osBan) addr=\(maxAddr)/\(maxPct) transit=\(transit) ibdWin=\(ibdWin)"
                             } label: {
                                 Label("Load more constants", systemImage: "info.circle.fill")
                                     .frame(maxWidth: .infinity)

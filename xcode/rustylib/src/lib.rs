@@ -281,6 +281,16 @@ pub fn required_seed_services_u64() -> u64 {
     rbitcoin_net::required_seed_services().to_u64()
 }
 
+#[uniffi::export]
+pub fn net_default_blocks_in_transit_per_peer() -> u32 {
+    rbitcoin_net::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER as u32
+}
+
+#[uniffi::export]
+pub fn net_default_ibd_window() -> u32 {
+    rbitcoin_net::DEFAULT_IBD_WINDOW as u32
+}
+
 // --- RPC / Electrum FFI ---
 
 #[uniffi::export]
@@ -3112,6 +3122,12 @@ mod tests {
     }
 
     #[test]
+    fn test_net_ibd_constants() {
+        assert_eq!(net_default_blocks_in_transit_per_peer(), 16);
+        assert_eq!(net_default_ibd_window(), 1024);
+    }
+
+    #[test]
     fn test_mine_regtest_paying() {
         let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
         let script = "76a914000000000000000000000000000000000000000088ac"; // P2PKH
@@ -3772,6 +3788,9 @@ mod tests {
         assert_eq!(mempool_max_package_weight(), 404_000);
         assert_eq!(mempool_rbfr_ratio_num(), 5);
         assert_eq!(mempool_rbfr_ratio_den(), 4);
+        assert_eq!(mempool_admit_half_life_secs(), 150);
+        assert_eq!(mempool_warm_after_admits(), 32);
+        assert_eq!(mempool_warm_after_secs(), 60);
     }
 
     #[test]

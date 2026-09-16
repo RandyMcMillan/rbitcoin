@@ -787,7 +787,11 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
     
+    func headerAtHeight(height: UInt32) throws  -> FfiHeaderRecord?
+    
     func headerHasClassABody(headerFk: UInt64) throws  -> Bool
+    
+    func heightOfHash(hashHex: String) throws  -> UInt64?
     
     func isBlockArchived(hashHex: String) throws  -> Bool
     
@@ -982,10 +986,26 @@ open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
 })
 }
     
+open func headerAtHeight(height: UInt32)throws  -> FfiHeaderRecord? {
+    return try  FfiConverterOptionTypeFfiHeaderRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_header_at_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
 open func headerHasClassABody(headerFk: UInt64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_header_has_class_a_body(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(headerFk),$0
+    )
+})
+}
+    
+open func heightOfHash(hashHex: String)throws  -> UInt64? {
+    return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_height_of_hash(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
     )
 })
 }
@@ -3072,6 +3092,38 @@ public func parseTx(txHex: String)throws  -> FfiTxInfo {
     )
 })
 }
+public func pureRbfrPays(newFee: UInt64, newWeight: UInt64, directFee: UInt64, directWeight: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_pure_rbfr_pays(
+        FfiConverterUInt64.lower(newFee),
+        FfiConverterUInt64.lower(newWeight),
+        FfiConverterUInt64.lower(directFee),
+        FfiConverterUInt64.lower(directWeight),$0
+    )
+})
+}
+public func rbfAllowsReplacement(newFee: UInt64, newWeight: UInt64, conflictFee: UInt64, conflictWeight: UInt64, directFee: UInt64, directWeight: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_rbf_allows_replacement(
+        FfiConverterUInt64.lower(newFee),
+        FfiConverterUInt64.lower(newWeight),
+        FfiConverterUInt64.lower(conflictFee),
+        FfiConverterUInt64.lower(conflictWeight),
+        FfiConverterUInt64.lower(directFee),
+        FfiConverterUInt64.lower(directWeight),$0
+    )
+})
+}
+public func rbfPaysForReplacement(newFee: UInt64, newWeight: UInt64, oldFee: UInt64, oldWeight: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_rbf_pays_for_replacement(
+        FfiConverterUInt64.lower(newFee),
+        FfiConverterUInt64.lower(newWeight),
+        FfiConverterUInt64.lower(oldFee),
+        FfiConverterUInt64.lower(oldWeight),$0
+    )
+})
+}
 public func rbitcoinSchemaFileOpenable(ver: UInt16) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_func_rbitcoin_schema_file_openable(
@@ -3530,6 +3582,15 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_parse_tx() != 26241) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_pure_rbfr_pays() != 25186) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_rbf_allows_replacement() != 14197) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_rbf_pays_for_replacement() != 31273) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_rbitcoin_schema_file_openable() != 48586) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3689,7 +3750,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_get_tx_by_txid() != 24667) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_header_at_height() != 16751) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_header_has_class_a_body() != 9458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_height_of_hash() != 45413) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_is_block_archived() != 53320) {

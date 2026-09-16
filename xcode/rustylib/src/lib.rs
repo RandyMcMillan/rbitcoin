@@ -971,7 +971,7 @@ pub fn rbitcoin_schema_file_openable(ver: u16) -> bool {
 
 // --- Store FFI ---
 
-#[derive(uniffi::Record)]
+#[derive(Debug, PartialEq, uniffi::Record)]
 pub struct FfiHeaderRecord {
     pub prev_fk: u64,
     pub version: i32,
@@ -1000,7 +1000,7 @@ impl From<rbitcoin_store::HeaderRecord> for FfiHeaderRecord {
     }
 }
 
-#[derive(uniffi::Record)]
+#[derive(Debug, PartialEq, uniffi::Record)]
 pub struct FfiTxRecord {
     pub txid: String,
     pub version: i32,
@@ -1308,6 +1308,23 @@ impl FfiQuery {
             })
             .collect())
     }
+
+    pub fn height_of_hash(&self, hash_hex: String) -> Result<Option<u64>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let height = self
+            .inner
+            .height_of_hash(&hash)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(height.map(|h| h.0 as u64))
+    }
+
+    pub fn header_at_height(&self, height: u32) -> Result<Option<FfiHeaderRecord>, RustyError> {
+        let rec = self
+            .inner
+            .header_at_height(rbitcoin_primitives::Height(height))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(rec.map(|(_fk, h)| h.into()))
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -1393,6 +1410,42 @@ impl FfiMempool {
         let (dead, shrunk) = guard.compact().map_err(|_| RustyError::MempoolError)?;
         Ok(format!("dead={dead} shrunk={shrunk}"))
     }
+}
+
+// --- RBF FFI ---
+
+#[uniffi::export]
+pub fn rbf_pays_for_replacement(
+    new_fee: u64,
+    new_weight: u64,
+    old_fee: u64,
+    old_weight: u64,
+) -> bool {
+    rbitcoin_mempool::rbf_pays_for_replacement(new_fee, new_weight, old_fee, old_weight)
+}
+
+#[uniffi::export]
+pub fn pure_rbfr_pays(new_fee: u64, new_weight: u64, direct_fee: u64, direct_weight: u64) -> bool {
+    rbitcoin_mempool::pure_rbfr_pays(new_fee, new_weight, direct_fee, direct_weight)
+}
+
+#[uniffi::export]
+pub fn rbf_allows_replacement(
+    new_fee: u64,
+    new_weight: u64,
+    conflict_fee: u64,
+    conflict_weight: u64,
+    direct_fee: u64,
+    direct_weight: u64,
+) -> bool {
+    rbitcoin_mempool::rbf_allows_replacement(
+        new_fee,
+        new_weight,
+        conflict_fee,
+        conflict_weight,
+        direct_fee,
+        direct_weight,
+    )
 }
 
 // --- Fee Estimation FFI ---
@@ -2175,5 +2228,46 @@ mod tests {
         let query = FfiQuery::open_or_create(path).unwrap();
         let tweaks = query.tweaks_at_height("mainnet".to_string(), 0).unwrap();
         assert!(tweaks.is_empty());
+    }
+
+    #[test]
+    fn test_rbf_pays_for_replacement() {
+        assert!(rbf_pays_for_replacement(2000, 1000, 1000, 1000));
+        assert!(!rbf_pays_for_replacement(1000, 1000, 1000, 1000));
+        assert!(!rbf_pays_for_replacement(500, 1000, 1000, 1000));
+    }
+
+    #[test]
+    fn test_pure_rbfr_pays() {
+        assert!(pure_rbfr_pays(5000, 1000, 1000, 1000));
+        assert!(!pure_rbfr_pays(1000, 1000, 1000, 1000));
+    }
+
+    #[test]
+    fn test_rbf_allows_replacement() {
+        assert!(rbf_allows_replacement(2000, 1000, 1000, 1000, 1000, 1000));
+        assert!(!rbf_allows_replacement(500, 1000, 1000, 1000, 1000, 1000));
+    }
+
+    #[test]
+    fn test_query_height_of_hash_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_hoh").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let height = query
+            .height_of_hash(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            )
+            .unwrap();
+        assert_eq!(height, None);
+    }
+
+    #[test]
+    fn test_query_header_at_height_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_hah").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let header = query.header_at_height(0).unwrap();
+        assert_eq!(header, None);
     }
 }

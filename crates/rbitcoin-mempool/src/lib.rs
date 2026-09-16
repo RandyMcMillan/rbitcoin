@@ -32,10 +32,10 @@ mod orphanage;
 mod store;
 
 pub use accept::{
-    check_mempool_structural, AcceptError, AcceptFailureRecord, AcceptResult, AcceptStageUs,
-    ActiveMempool, ChainPrevout, ChainTipCtx, Coin, PreparedAdmit, UtxoProvider,
-    DEFAULT_MAX_MEMPOOL_WEIGHT, INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB, MAX_PACKAGE_COUNT,
-    MAX_PACKAGE_WEIGHT,
+    check_mempool_structural, pure_rbfr_pays, rbf_allows_replacement, rbf_pays_for_replacement,
+    AcceptError, AcceptFailureRecord, AcceptResult, AcceptStageUs, ActiveMempool, ChainPrevout,
+    ChainTipCtx, Coin, PreparedAdmit, UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT,
+    INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
 };
 pub use error::MempoolError;
 pub use fee_est::{

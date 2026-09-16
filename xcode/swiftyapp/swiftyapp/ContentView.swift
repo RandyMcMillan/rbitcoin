@@ -101,6 +101,13 @@ struct ContentView: View {
     @State private var workResult = ""
     @State private var tweaksHeight = "0"
     @State private var tweaksResult = ""
+    @State private var rbfNewFee = "2000"
+    @State private var rbfNewWeight = "1000"
+    @State private var rbfOldFee = "1000"
+    @State private var rbfOldWeight = "1000"
+    @State private var rbfResult = ""
+    @State private var queryHashInput = ""
+    @State private var queryHeightResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -1994,6 +2001,108 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("RBF check", systemImage: "arrow.triangle.2.circlepath")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-mempool")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    TextField("New fee", text: $rbfNewFee)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    TextField("New weight", text: $rbfNewWeight)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                }
+                                HStack(spacing: 8) {
+                                    TextField("Old fee", text: $rbfOldFee)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                    TextField("Old weight", text: $rbfOldWeight)
+                                        .textFieldStyle(.roundedBorder)
+                                        .keyboardType(.numberPad)
+                                        .frame(width: 80)
+                                }
+                                Button {
+                                    guard let newFee = UInt64(rbfNewFee), let newWeight = UInt64(rbfNewWeight),
+                                          let oldFee = UInt64(rbfOldFee), let oldWeight = UInt64(rbfOldWeight) else {
+                                        rbfResult = "invalid input"
+                                        return
+                                    }
+                                    let pays = rbfPaysForReplacement(newFee: newFee, newWeight: newWeight, oldFee: oldFee, oldWeight: oldWeight)
+                                    let rbfr = pureRbfrPays(newFee: newFee, newWeight: newWeight, directFee: oldFee, directWeight: oldWeight)
+                                    let allows = rbfAllowsReplacement(newFee: newFee, newWeight: newWeight, conflictFee: oldFee, conflictWeight: oldWeight, directFee: oldFee, directWeight: oldWeight)
+                                    rbfResult = "pays=\(pays) rbfr=\(rbfr) allows=\(allows)"
+                                } label: {
+                                    Label("Check RBF", systemImage: "checkmark.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !rbfResult.isEmpty {
+                                    Text(rbfResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query chain view", systemImage: "link")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Block hash hex", text: $queryHashInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    do {
+                                        let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-cv")
+                                        let height = try query.heightOfHash(hashHex: queryHashInput)
+                                        let header = try query.headerAtHeight(height: 0)
+                                        queryHeightResult = "height: \(height?.description ?? "none") header: \(header != nil ? "found" : "none")"
+                                    } catch {
+                                        queryHeightResult = "error"
+                                    }
+                                } label: {
+                                    Label("Lookup", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !queryHeightResult.isEmpty {
+                                    Text(queryHeightResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2023,6 +2132,7 @@ struct ContentView: View {
                                 "Query internals",
                                 "Block structure + Netgroup",
                                 "Work sum + SP tweaks",
+                                "RBF check + Query chain view",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

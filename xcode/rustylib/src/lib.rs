@@ -254,6 +254,14 @@ pub fn p2p_default_port(network: String) -> Result<u16, RustyError> {
 }
 
 #[uniffi::export]
+pub fn network_magic_hex(network: String) -> Result<String, RustyError> {
+    let params = chain_params_for_network(&network)?;
+    let magic = rbitcoin_net::magic_for_params(&params);
+    let bytes = bitcoin::consensus::encode::serialize(&magic);
+    Ok(rbitcoin_primitives::hex_encode(bytes))
+}
+
+#[uniffi::export]
 pub fn p2p_dns_seeds(network: String) -> Result<Vec<String>, RustyError> {
     let net = rbitcoin_network(&network)?;
     Ok(rbitcoin_net::dns_seeds(net)
@@ -3252,6 +3260,18 @@ mod tests {
     fn test_net_ibd_constants() {
         assert_eq!(net_default_blocks_in_transit_per_peer(), 16);
         assert_eq!(net_default_ibd_window(), 1024);
+    }
+
+    #[test]
+    fn test_network_magic_hex() {
+        assert_eq!(
+            network_magic_hex("mainnet".to_string()).unwrap(),
+            "f9beb4d9"
+        );
+        assert_eq!(
+            network_magic_hex("regtest".to_string()).unwrap(),
+            "fabfb5da"
+        );
     }
 
     #[test]

@@ -977,7 +977,8 @@ struct ContentView: View {
                                 do {
                                     let seeds = try p2pDnsSeeds(network: "mainnet")
                                     let port = try p2pDefaultPort(network: "mainnet")
-                                    networkSeedResult = "Port: \(port), Seeds: \(seeds.count)"
+                                    let magic = try networkMagicHex(network: "mainnet")
+                                    networkSeedResult = "Port: \(port), Seeds: \(seeds.count), Magic: \(magic)"
                                 } catch {
                                     networkSeedResult = "error"
                                 }

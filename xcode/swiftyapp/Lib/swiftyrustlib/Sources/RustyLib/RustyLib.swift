@@ -4330,6 +4330,13 @@ public func netgroup(ip: String, port: UInt16, asmapHex: String?)throws  -> UInt
     )
 })
 }
+public func networkMagicHex(network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_network_magic_hex(
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func nodeCoreMaxconnectionsOutboundReserve() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_node_core_maxconnections_outbound_reserve($0
@@ -5411,6 +5418,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_netgroup() != 17242) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_network_magic_hex() != 34972) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_node_core_maxconnections_outbound_reserve() != 34) {

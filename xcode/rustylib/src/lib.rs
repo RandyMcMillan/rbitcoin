@@ -2055,6 +2055,95 @@ pub fn sample_reset_esplora_perf() -> FfiEsploraPerfSample {
     }
 }
 
+// --- Peer constants & logs FFI ---
+
+#[uniffi::export]
+pub fn ban_score_threshold() -> u32 {
+    rbitcoin_net::BAN_SCORE_THRESHOLD
+}
+
+#[uniffi::export]
+pub fn max_serve_blocks() -> u32 {
+    rbitcoin_net::MAX_SERVE_BLOCKS as u32
+}
+
+#[uniffi::export]
+pub fn min_peer_proto_version() -> i32 {
+    rbitcoin_net::MIN_PEER_PROTO_VERSION
+}
+
+#[uniffi::export]
+pub fn handshake_timeout_secs() -> u64 {
+    rbitcoin_net::HANDSHAKE_TIMEOUT.as_secs()
+}
+
+#[uniffi::export]
+pub fn expected_services_disconnect_log(offered: u64, expected: u64) -> String {
+    rbitcoin_net::expected_services_disconnect_log(offered, expected)
+}
+
+#[uniffi::export]
+pub fn feeler_connection_completed_log() -> String {
+    rbitcoin_net::feeler_connection_completed_log().to_string()
+}
+
+#[uniffi::export]
+pub fn version_handshake_timeout_log(peer: u64) -> String {
+    rbitcoin_net::version_handshake_timeout_log(peer)
+}
+
+#[uniffi::export]
+pub fn obsolete_version_log(version: i32, peer: u64) -> String {
+    rbitcoin_net::obsolete_version_log(version, peer)
+}
+
+#[uniffi::export]
+pub fn connected_to_self_log(addr: String) -> String {
+    rbitcoin_net::connected_to_self_log(&addr)
+}
+
+#[uniffi::export]
+pub fn advertising_address_log(addr_port: String, peer: u64) -> String {
+    rbitcoin_net::advertising_address_log(&addr_port, peer)
+}
+
+#[uniffi::export]
+pub fn sendaddrv2_after_verack_log(peer: u64) -> String {
+    rbitcoin_net::sendaddrv2_after_verack_log(peer)
+}
+
+#[uniffi::export]
+pub fn addrv2_message_size_log(n: u32) -> String {
+    rbitcoin_net::addrv2_message_size_log(n as usize)
+}
+
+#[uniffi::export]
+pub fn ping_prior_to_verack_log(peer: u64) -> String {
+    rbitcoin_net::ping_prior_to_verack_log(peer)
+}
+
+#[uniffi::export]
+pub fn unsupported_before_verack_log(cmd: String, peer: u64) -> String {
+    rbitcoin_net::unsupported_before_verack_log(&cmd, peer)
+}
+
+#[uniffi::export]
+pub fn non_version_before_handshake_log(cmd: String, peer: u64) -> String {
+    rbitcoin_net::non_version_before_handshake_log(&cmd, peer)
+}
+
+// --- Consensus error helpers FFI ---
+
+#[uniffi::export]
+pub fn script_flag_paren(token: String) -> String {
+    rbitcoin_consensus::script_flag_paren(&token).to_string()
+}
+
+#[uniffi::export]
+pub fn block_reject_log_line(hash: String, reason: String) -> String {
+    rbitcoin_consensus::block_reject_log_line(&hash, &reason)
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -3177,5 +3266,39 @@ mod tests {
         assert_eq!(sample.requests, 0);
         assert_eq!(sample.bytes, 0);
         assert_eq!(sample.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn test_peer_constants() {
+        assert_eq!(ban_score_threshold(), 100);
+        assert_eq!(max_serve_blocks(), 16);
+        assert_eq!(min_peer_proto_version(), 31800);
+        assert_eq!(handshake_timeout_secs(), 60);
+    }
+
+    #[test]
+    fn test_peer_logs() {
+        assert!(!feeler_connection_completed_log().is_empty());
+        assert!(!version_handshake_timeout_log(1).is_empty());
+        assert!(!obsolete_version_log(70015, 1).is_empty());
+        assert!(!connected_to_self_log("127.0.0.1:8333".to_string()).is_empty());
+        assert!(!advertising_address_log("127.0.0.1:8333".to_string(), 1).is_empty());
+        assert!(!sendaddrv2_after_verack_log(1).is_empty());
+        assert!(!addrv2_message_size_log(10).is_empty());
+        assert!(!ping_prior_to_verack_log(1).is_empty());
+        assert!(!unsupported_before_verack_log("ping".to_string(), 1).is_empty());
+        assert!(!non_version_before_handshake_log("ping".to_string(), 1).is_empty());
+        assert!(!expected_services_disconnect_log(0, 1).is_empty());
+    }
+
+    #[test]
+    fn test_consensus_error_helpers() {
+        assert_eq!(
+            script_flag_paren("CSV".to_string()),
+            "Locktime requirement not satisfied"
+        );
+        assert!(
+            !block_reject_log_line("0000…".to_string(), "bad-txns-nonfinal".to_string()).is_empty()
+        );
     }
 }

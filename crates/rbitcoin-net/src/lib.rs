@@ -39,9 +39,13 @@ pub use ibd::{
 pub use most_work::{sum_work, work_better};
 pub use netgroup::netgroup;
 pub use peer::{
-    desirable_service_flags, drain_pending_now, flush_tx_invs, force_announce_txid,
-    has_all_desirable_service_flags, local_service_flags, run_feeler_timed, PendingBlocks,
-    V2PlainSession, MAX_SERVE_BLOCKS,
+    addrv2_message_size_log, advertising_address_log, connected_to_self_log,
+    desirable_service_flags, drain_pending_now, expected_services_disconnect_log,
+    feeler_connection_completed_log, flush_tx_invs, force_announce_txid,
+    has_all_desirable_service_flags, local_service_flags, non_version_before_handshake_log,
+    obsolete_version_log, ping_prior_to_verack_log, run_feeler_timed, sendaddrv2_after_verack_log,
+    unsupported_before_verack_log, version_handshake_timeout_log, PendingBlocks, V2PlainSession,
+    BAN_SCORE_THRESHOLD, HANDSHAKE_TIMEOUT, MAX_SERVE_BLOCKS, MIN_PEER_PROTO_VERSION,
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{

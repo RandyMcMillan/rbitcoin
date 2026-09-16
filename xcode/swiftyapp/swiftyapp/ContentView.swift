@@ -192,6 +192,9 @@ struct ContentView: View {
     @State private var bip32Xpriv = ""
     @State private var bip32Xpub = ""
     @State private var bip32Address = ""
+    @State private var psbtHex = ""
+    @State private var psbtTxResult = ""
+    @State private var psbtFeeResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3794,6 +3797,55 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("PSBT", systemImage: "doc.plaintext.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("bitcoin crate")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("PSBT hex", text: $psbtHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    do {
+                                        let _ = try psbtFromHex(hex: psbtHex)
+                                        let txHex = try psbtExtractTxHex(hex: psbtHex)
+                                        let fee = try psbtFeeSat(hex: psbtHex)
+                                        psbtTxResult = "tx: \(txHex.prefix(16))…"
+                                        psbtFeeResult = "fee: \(fee) sat"
+                                    } catch {
+                                        psbtTxResult = "invalid psbt"
+                                        psbtFeeResult = ""
+                                    }
+                                } label: {
+                                    Label("Parse PSBT", systemImage: "magnifyingglass.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !psbtTxResult.isEmpty {
+                                    Text(psbtTxResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                                if !psbtFeeResult.isEmpty {
+                                    Text(psbtFeeResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3847,6 +3899,7 @@ struct ContentView: View {
                                 "More constants",
                                 "Key & Address generation",
                                 "BIP32 HD Wallet derivation",
+                                "PSBT parse + extract",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

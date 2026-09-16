@@ -4168,6 +4168,27 @@ public func prepareRegtestCandidate(blockHex: String, prevHashHex: String, time:
     )
 })
 }
+public func psbtExtractTxHex(hex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_extract_tx_hex(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
+public func psbtFeeSat(hex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_fee_sat(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
+public func psbtFromHex(hex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_from_hex(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
 public func pureRbfrPays(newFee: UInt64, newWeight: UInt64, directFee: UInt64, directWeight: UInt64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_func_pure_rbfr_pays(
@@ -4958,6 +4979,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_prepare_regtest_candidate() != 8782) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_psbt_extract_tx_hex() != 1712) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_psbt_fee_sat() != 57908) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_psbt_from_hex() != 24117) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_pure_rbfr_pays() != 25186) {

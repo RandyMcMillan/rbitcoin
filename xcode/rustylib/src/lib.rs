@@ -276,6 +276,11 @@ pub fn p2p_target_peers() -> u32 {
     rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
 }
 
+#[uniffi::export]
+pub fn required_seed_services_u64() -> u64 {
+    rbitcoin_net::required_seed_services().to_u64()
+}
+
 // --- RPC / Electrum FFI ---
 
 #[uniffi::export]
@@ -502,6 +507,85 @@ pub fn regtest_pow_bits() -> u32 {
 #[uniffi::export]
 pub fn regtest_block_spacing() -> u32 {
     rbitcoin_consensus::REGTEST_BLOCK_SPACING
+}
+
+#[uniffi::export]
+pub fn mine_regtest_paying(
+    prev_hash_hex: String,
+    time: u32,
+    height: u32,
+    script_pubkey_hex: String,
+    extra_txs_hex: Vec<String>,
+) -> Result<String, RustyError> {
+    let prev_bytes =
+        rbitcoin_primitives::hex_decode(&prev_hash_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut prev_arr = [0u8; 32];
+    prev_arr.copy_from_slice(&prev_bytes);
+    prev_arr.reverse();
+    let prev = bitcoin::BlockHash::from_byte_array(prev_arr);
+    let script = bitcoin::ScriptBuf::from_bytes(
+        rbitcoin_primitives::hex_decode(&script_pubkey_hex)
+            .map_err(|_| RustyError::InvalidInput)?,
+    );
+    let extra_txs: Vec<bitcoin::Transaction> = extra_txs_hex
+        .iter()
+        .map(|h| deserialize_hex(h).map_err(|_| RustyError::InvalidInput))
+        .collect::<Result<Vec<_>, _>>()?;
+    let block = rbitcoin_consensus::mine_regtest_paying(prev, time, height, script, extra_txs);
+    Ok(bitcoin::consensus::encode::serialize_hex(&block))
+}
+
+#[uniffi::export]
+pub fn check_libre_annex(tx_hex: String) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    match rbitcoin_consensus::policy::check_libre_annex(&tx) {
+        rbitcoin_consensus::policy::PolicyResult::Standard => Ok("standard".to_string()),
+        rbitcoin_consensus::policy::PolicyResult::NonStandard(reason) => {
+            Ok(format!("non-standard: {}", reason))
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn check_libre_admission(
+    tx_hex: String,
+    fee_sat: u64,
+    weight: u64,
+) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    match rbitcoin_consensus::policy::check_libre_admission(&tx, fee_sat, weight) {
+        rbitcoin_consensus::policy::PolicyResult::Standard => Ok("standard".to_string()),
+        rbitcoin_consensus::policy::PolicyResult::NonStandard(reason) => {
+            Ok(format!("non-standard: {}", reason))
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn check_libre_admission_at(
+    tx_hex: String,
+    fee_sat: u64,
+    weight: u64,
+    min_relay_sat_kvb: u64,
+) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    match rbitcoin_consensus::policy::check_libre_admission_at(
+        &tx,
+        fee_sat,
+        weight,
+        min_relay_sat_kvb,
+    ) {
+        rbitcoin_consensus::policy::PolicyResult::Standard => Ok("standard".to_string()),
+        rbitcoin_consensus::policy::PolicyResult::NonStandard(reason) => {
+            Ok(format!("non-standard: {}", reason))
+        }
+    }
 }
 
 // --- Block Helpers FFI ---
@@ -982,6 +1066,51 @@ impl FfiQuery {
         )
         .map_err(|_| RustyError::ConsensusError)?;
         Ok(bits.to_consensus())
+    }
+
+    pub fn tx_fk_by_txid(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let fk = self
+            .inner
+            .tx_fk_by_txid(&txid)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.map(|f| f.0))
+    }
+
+    pub fn is_outpoint_spent_at(
+        &self,
+        txid_hex: String,
+        vout: u32,
+        tip: Option<u32>,
+    ) -> Result<bool, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        self.inner
+            .is_outpoint_spent_at(&txid, vout, tip)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn flush_for_shutdown(&self) -> Result<(), RustyError> {
+        self.inner
+            .flush_for_shutdown()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn confirm_cancelled(&self) -> bool {
+        self.inner.confirm_cancelled()
+    }
+
+    pub fn lookup_taken_hi(&self) -> Option<u64> {
+        self.inner.lookup_taken_hi().map(|h| h as u64)
+    }
+
+    pub fn active_unknown_bits(&self, network: String) -> Result<Vec<i32>, RustyError> {
+        let net = rbitcoin_network(&network)?;
+        Ok(rbitcoin_net::active_unknown_bits(&self.inner, net))
+    }
+
+    pub fn warning_strings(&self, network: String) -> Result<Vec<String>, RustyError> {
+        let net = rbitcoin_network(&network)?;
+        Ok(rbitcoin_net::warning_strings(&self.inner, net))
     }
 }
 
@@ -1634,5 +1763,118 @@ mod tests {
         // Version 1 tx (no sequence locks)
         let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
         assert!(sequence_locks_satisfied(tx_hex.to_string(), vec![], vec![], 100, 100).unwrap());
+    }
+
+    #[test]
+    fn test_required_seed_services() {
+        let services = required_seed_services_u64();
+        assert!(services > 0);
+    }
+
+    #[test]
+    fn test_mine_regtest_paying() {
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let script = "76a914000000000000000000000000000000000000000088ac"; // P2PKH
+        let block_hex = mine_regtest_paying(
+            genesis_hash.to_string(),
+            1296688602,
+            0,
+            script.to_string(),
+            vec![],
+        )
+        .unwrap();
+        assert!(!block_hex.is_empty());
+        let count = block_wire_input_count(block_hex).unwrap();
+        assert_eq!(count, 1); // coinbase only
+    }
+
+    #[test]
+    fn test_check_libre_annex() {
+        // Version 1 tx with no witness
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+        let result = check_libre_annex(tx_hex.to_string()).unwrap();
+        assert_eq!(result, "standard");
+    }
+
+    #[test]
+    fn test_check_libre_admission() {
+        // Coinbase tx should be non-standard for mempool
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+        let result = check_libre_admission(tx_hex.to_string(), 1000, 1000).unwrap();
+        assert!(result.starts_with("non-standard"));
+    }
+
+    #[test]
+    fn test_query_tx_fk_by_txid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_txfk").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        // Empty chain, no tx found
+        let fk = query
+            .tx_fk_by_txid(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            )
+            .unwrap();
+        assert_eq!(fk, None);
+    }
+
+    #[test]
+    fn test_query_is_outpoint_spent_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_spent").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let spent = query
+            .is_outpoint_spent_at(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                0,
+                None,
+            )
+            .unwrap();
+        assert!(!spent);
+    }
+
+    #[test]
+    fn test_query_flush_for_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_flush").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        query.flush_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_query_confirm_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_cancel")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert!(!query.confirm_cancelled());
+    }
+
+    #[test]
+    fn test_query_lookup_taken_hi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_lookup")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert_eq!(query.lookup_taken_hi(), None);
+    }
+
+    #[test]
+    fn test_query_active_unknown_bits_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_bits").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let bits = query.active_unknown_bits("mainnet".to_string()).unwrap();
+        assert!(bits.is_empty());
+        let warnings = query.warning_strings("mainnet".to_string()).unwrap();
+        assert!(warnings.is_empty());
     }
 }

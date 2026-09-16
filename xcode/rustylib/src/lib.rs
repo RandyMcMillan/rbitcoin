@@ -1365,6 +1365,34 @@ impl FfiStore {
     pub fn class_c_l2_resident_bytes(&self) -> u64 {
         self.inner.class_c_l2_resident_bytes()
     }
+
+    pub fn fence_max_connected_fk(&self) -> u64 {
+        self.inner.fence_max_connected_fk()
+    }
+
+    pub fn height_fence_run_count(&self) -> u64 {
+        self.inner.height_fence_run_count() as u64
+    }
+
+    pub fn fence_tip_height(&self) -> Option<u64> {
+        self.inner.fence_tip_height().map(|h| h as u64)
+    }
+
+    pub fn rebuild_height_fence(&self) -> Result<(), RustyError> {
+        self.inner
+            .rebuild_height_fence()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn flush_header_archive(&self) -> Result<(), RustyError> {
+        self.inner
+            .flush_header_archive()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn flush(&self) -> Result<(), RustyError> {
+        self.inner.flush().map_err(|_| RustyError::StoreError)
+    }
 }
 
 // --- Query FFI ---
@@ -2956,6 +2984,12 @@ mod tests {
         assert!(!store.is_split());
         assert_eq!(store.spender_list_count(), 0);
         assert_eq!(store.class_c_l2_resident_bytes(), 0);
+        assert_eq!(store.fence_max_connected_fk(), 0);
+        assert_eq!(store.height_fence_run_count(), 0);
+        assert_eq!(store.fence_tip_height(), None);
+        store.rebuild_height_fence().unwrap();
+        store.flush_header_archive().unwrap();
+        store.flush().unwrap();
     }
 
     #[test]

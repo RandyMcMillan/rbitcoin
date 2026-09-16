@@ -1662,6 +1662,45 @@ impl FfiQuery {
             .map_err(|_| RustyError::StoreError)
     }
 
+    pub fn block_queue_has_hash(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self.inner.block_queue_has_hash(&hash))
+    }
+
+    pub fn block_queue_mark_resolve_complete(&self, height: u32) -> Result<(), RustyError> {
+        self.inner
+            .block_queue_mark_resolve_complete(height)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn block_queue_dequeue_height(&self, height: u32) -> Result<u64, RustyError> {
+        self.inner
+            .block_queue_dequeue_height(height)
+            .map_err(|_| RustyError::StoreError)
+            .map(|n| n as u64)
+    }
+
+    pub fn tx_fk_by_txid_tip(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let fk = self
+            .inner
+            .tx_fk_by_txid_tip(&txid)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.map(|f| f.0))
+    }
+
+    pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
+        self.inner.set_lookup_taken_hi(hi);
+    }
+
+    pub fn set_lookup_started_hi(&self, hi: Option<u32>) {
+        self.inner.set_lookup_started_hi(hi);
+    }
+
+    pub fn set_class_a_hi(&self, hi: Option<u32>) {
+        self.inner.set_class_a_hi(hi);
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -3093,6 +3132,21 @@ mod tests {
         assert!(!query.block_queue_is_resolve_complete(0));
         assert_eq!(query.block_queue_payload(0).unwrap(), None);
         assert_eq!(query.block_queue_raw_payload(0).unwrap(), None);
+        assert!(!query.block_queue_has_hash("0".repeat(64)).unwrap());
+        assert_eq!(query.block_queue_dequeue_height(0).unwrap(), 0);
+        assert_eq!(query.tx_fk_by_txid_tip("0".repeat(64)).unwrap(), None);
+        query.set_lookup_taken_hi(Some(100));
+        assert_eq!(query.lookup_taken_hi(), Some(100));
+        query.set_lookup_taken_hi(None);
+        assert_eq!(query.lookup_taken_hi(), None);
+        query.set_lookup_started_hi(Some(200));
+        assert_eq!(query.lookup_started_hi(), Some(200));
+        query.set_lookup_started_hi(None);
+        assert_eq!(query.lookup_started_hi(), None);
+        query.set_class_a_hi(Some(300));
+        assert_eq!(query.class_a_hi(), Some(300));
+        query.set_class_a_hi(None);
+        assert_eq!(query.class_a_hi(), None);
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
     }

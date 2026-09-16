@@ -44,7 +44,7 @@ pub use fee_est::{
     horizon_secs, min_rate_for_capacity, projected_inflow_wu_above, BLOCK_WEIGHT_WU,
     CAPACITY_SAFETY_DEN, CAPACITY_SAFETY_NUM, FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
 };
-pub use fee_flow::FeeFlowMeter;
+pub use fee_flow::{FeeFlowMeter, ADMIT_HALF_LIFE_SECS, WARM_AFTER_ADMITS, WARM_AFTER_SECS};
 pub use graph::{
     frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, MempoolGraphStats,
     TxEntry, TxGraph,

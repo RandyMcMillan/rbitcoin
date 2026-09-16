@@ -3436,6 +3436,18 @@ public func bqAssignStopBytes() -> UInt64 {
     )
 })
 }
+public func bqSoftConfirmSecs() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_bq_soft_confirm_secs($0
+    )
+})
+}
+public func bqSoftFreeBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_bq_soft_free_bytes($0
+    )
+})
+}
 public func captureLogs(on: Bool) {try! rustCall() {
     uniffi_rustylib_fn_func_capture_logs(
         FfiConverterBool.lower(on),$0
@@ -3916,6 +3928,12 @@ public func meetsMinRelayFeeAt(feeSat: UInt64, weight: UInt64, satKvb: UInt64) -
     )
 })
 }
+public func mempoolAdmitHalfLifeSecs() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_admit_half_life_secs($0
+    )
+})
+}
 public func mempoolBlockWeightWu() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_mempool_block_weight_wu($0
@@ -3979,6 +3997,18 @@ public func mempoolRbfrRatioNum() -> UInt64 {
 public func mempoolSecondsPerBlock() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_mempool_seconds_per_block($0
+    )
+})
+}
+public func mempoolWarmAfterAdmits() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_warm_after_admits($0
+    )
+})
+}
+public func mempoolWarmAfterSecs() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_warm_after_secs($0
     )
 })
 }
@@ -4813,6 +4843,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_bq_assign_stop_bytes() != 43857) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_bq_soft_confirm_secs() != 21918) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_bq_soft_free_bytes() != 2140) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_capture_logs() != 24561) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5011,6 +5047,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_meets_min_relay_fee_at() != 3522) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_mempool_admit_half_life_secs() != 47969) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_mempool_block_weight_wu() != 31617) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5042,6 +5081,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_mempool_seconds_per_block() != 16726) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_warm_after_admits() != 36625) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_mempool_warm_after_secs() != 20005) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_merkle_root_from_txids() != 53109) {

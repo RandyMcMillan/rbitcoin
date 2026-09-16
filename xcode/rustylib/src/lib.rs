@@ -862,6 +862,50 @@ pub fn accept_and_connect_block(
     Ok(fk.0)
 }
 
+// --- Header to Record FFI ---
+
+#[uniffi::export]
+pub fn header_to_record(
+    prev_fk: u64,
+    header_hex: String,
+    hash_hex: String,
+) -> Result<FfiHeaderRecord, RustyError> {
+    let header: BlockHeader = deserialize_hex(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+    let hash = parse_hash32(&hash_hex)?;
+    let rec = rbitcoin_consensus::header_to_record(rbitcoin_primitives::Fk(prev_fk), &header, hash);
+    Ok(rec.into())
+}
+
+// --- Inbound Eviction FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiInboundEvictCandidate {
+    pub id: u64,
+    pub connected_at: u64,
+    pub min_ping: Option<f64>,
+    pub last_block: u64,
+    pub last_tx: u64,
+    pub netgroup: u64,
+    pub noban: bool,
+}
+
+#[uniffi::export]
+pub fn select_inbound_eviction(candidates: Vec<FfiInboundEvictCandidate>) -> Option<u64> {
+    let cands: Vec<rbitcoin_net::InboundEvictCandidate> = candidates
+        .into_iter()
+        .map(|c| rbitcoin_net::InboundEvictCandidate {
+            id: c.id,
+            connected_at: c.connected_at,
+            min_ping: c.min_ping,
+            last_block: c.last_block,
+            last_tx: c.last_tx,
+            netgroup: c.netgroup,
+            noban: c.noban,
+        })
+        .collect();
+    rbitcoin_net::select_inbound_eviction(cands)
+}
+
 // --- Commit Class A Block FFI ---
 
 #[uniffi::export]
@@ -957,6 +1001,13 @@ pub struct FfiHeightTweak {
     pub txid: String,
     pub tweak: String,
     pub output_pubkeys: Vec<FfiTaprootOut>,
+}
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiChainView {
+    pub height: u64,
+    pub hash: String,
+    pub header_fk: u64,
 }
 
 // --- Disconnect Tip FFI ---
@@ -1570,6 +1621,30 @@ impl FfiQuery {
             .get_header_by_hash(&hash)
             .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_fk, h)| h.into()))
+    }
+
+    pub fn pin_chain_view(&self) -> Result<Option<FfiChainView>, RustyError> {
+        let view = self
+            .inner
+            .pin_chain_view()
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(view.map(|v| FfiChainView {
+            height: v.height.0 as u64,
+            hash: rbitcoin_primitives::hex_encode(v.hash),
+            header_fk: v.header_fk.0,
+        }))
+    }
+
+    pub fn pin_sh_chain_view(&self) -> Result<Option<FfiChainView>, RustyError> {
+        let view = self
+            .inner
+            .pin_sh_chain_view()
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(view.map(|v| FfiChainView {
+            height: v.height.0 as u64,
+            hash: rbitcoin_primitives::hex_encode(v.hash),
+            header_fk: v.header_fk.0,
+        }))
     }
 }
 
@@ -2674,5 +2749,46 @@ mod tests {
         let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 1).unwrap();
         // Just ensure it doesn't panic; empty chain behavior may vary
         let _ = commit_class_a_block(path, "regtest".to_string(), 1, block_hex, 0);
+    }
+
+    #[test]
+    fn test_header_to_record() {
+        let header_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+        let hash_hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+        let rec = header_to_record(0, header_hex.to_string(), hash_hex.to_string()).unwrap();
+        assert_eq!(rec.prev_fk, 0);
+        assert_eq!(rec.version, 1);
+        assert_eq!(rec.timestamp, 1231006505);
+    }
+
+    #[test]
+    fn test_select_inbound_eviction() {
+        // More than 20 candidates so at least some remain unprotected
+        // (netgroup=4 + blocks=4 + txs=4 + minping=8 = 20 protected slots)
+        let mut cands = Vec::new();
+        for i in 0..30u64 {
+            cands.push(FfiInboundEvictCandidate {
+                id: i + 1,
+                connected_at: i * 10,
+                min_ping: Some(i as f64),
+                last_block: i,
+                last_tx: i,
+                netgroup: i,
+                noban: false,
+            });
+        }
+        let evicted = select_inbound_eviction(cands);
+        assert!(evicted.is_some());
+    }
+
+    #[test]
+    fn test_query_pin_chain_view_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_pin").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let view = query.pin_chain_view().unwrap();
+        assert_eq!(view, None);
+        let sh_view = query.pin_sh_chain_view().unwrap();
+        assert_eq!(sh_view, None);
     }
 }

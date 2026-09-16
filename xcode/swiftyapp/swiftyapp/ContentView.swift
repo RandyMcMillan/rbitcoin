@@ -129,6 +129,11 @@ struct ContentView: View {
     @State private var classAHeight = "1"
     @State private var classABlockHex = ""
     @State private var classAResult = ""
+    @State private var headerRecordHex = ""
+    @State private var headerRecordHash = ""
+    @State private var headerRecordResult = ""
+    @State private var evictionResult = ""
+    @State private var pinViewResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2592,6 +2597,135 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Header to record", systemImage: "doc.text.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Header hex", text: $headerRecordHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                TextField("Hash hex", text: $headerRecordHash)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = headerRecordHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let hash = headerRecordHash.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty, !hash.isEmpty else {
+                                        headerRecordResult = ""
+                                        return
+                                    }
+                                    do {
+                                        let rec = try headerToRecord(prevFk: 0, headerHex: hex, hashHex: hash)
+                                        headerRecordResult = "ver=\(rec.version) time=\(rec.timestamp) bits=\(rec.bits)"
+                                    } catch {
+                                        headerRecordResult = "invalid"
+                                    }
+                                } label: {
+                                    Label("Convert", systemImage: "arrow.right.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !headerRecordResult.isEmpty {
+                                    Text(headerRecordResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Inbound eviction", systemImage: "person.2.badge.gearshape.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                var cands: [FfiInboundEvictCandidate] = []
+                                for i in 0..<30 {
+                                    cands.append(FfiInboundEvictCandidate(
+                                        id: UInt64(i + 1),
+                                        connectedAt: UInt64(i * 10),
+                                        minPing: Double(i),
+                                        lastBlock: UInt64(i),
+                                        lastTx: UInt64(i),
+                                        netgroup: UInt64(i),
+                                        noban: false
+                                    ))
+                                }
+                                let evicted = selectInboundEviction(candidates: cands)
+                                evictionResult = evicted != nil ? "evicted: \(evicted!)" : "all protected"
+                            } label: {
+                                Label("Evict", systemImage: "arrow.right.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+                            if !evictionResult.isEmpty {
+                                Text(evictionResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Pin chain view", systemImage: "pin.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-pin-demo")
+                                    let view = try query.pinChainView()
+                                    let shView = try query.pinShChainView()
+                                    pinViewResult = "view: \(view != nil ? "pinned" : "none") sh: \(shView != nil ? "pinned" : "none")"
+                                } catch {
+                                    pinViewResult = "error"
+                                }
+                            } label: {
+                                Label("Pin views", systemImage: "pin.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+                            if !pinViewResult.isEmpty {
+                                Text(pinViewResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2629,6 +2763,8 @@ struct ContentView: View {
                                 "Disconnect tip + Serve perf",
                                 "Query load pack",
                                 "Script verify forks + Class A commit",
+                                "Header to record + Inbound eviction",
+                                "Pin chain view",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

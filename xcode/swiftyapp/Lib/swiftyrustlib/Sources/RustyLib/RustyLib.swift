@@ -5774,6 +5774,18 @@ public func verifyTxScriptsDetachedForks(prevoutsHex: [String], txHex: String, b
     )
 }
 }
+public func verifyTxScriptsForks(prevoutsHex: [String], txHex: String, bip65Active: Bool, bip112Active: Bool, bip66Active: Bool, bip16Active: Bool, taprootActive: Bool)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_verify_tx_scripts_forks(
+        FfiConverterSequenceString.lower(prevoutsHex),
+        FfiConverterString.lower(txHex),
+        FfiConverterBool.lower(bip65Active),
+        FfiConverterBool.lower(bip112Active),
+        FfiConverterBool.lower(bip66Active),
+        FfiConverterBool.lower(bip16Active),
+        FfiConverterBool.lower(taprootActive),$0
+    )
+}
+}
 public func versionHandshakeTimeoutLog(peer: UInt64) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_version_handshake_timeout_log(
@@ -6456,6 +6468,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_verify_tx_scripts_detached_forks() != 50917) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_verify_tx_scripts_forks() != 29370) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_version_handshake_timeout_log() != 37418) {

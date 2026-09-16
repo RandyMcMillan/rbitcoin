@@ -187,6 +187,11 @@ struct ContentView: View {
     @State private var keypairNetwork = "mainnet"
     @State private var keypairResult = ""
     @State private var keypairAddress = ""
+    @State private var bip32Seed = "000102030405060708090a0b0c0d0e0f"
+    @State private var bip32Network = "mainnet"
+    @State private var bip32Xpriv = ""
+    @State private var bip32Xpub = ""
+    @State private var bip32Address = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3720,6 +3725,75 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("BIP32 HD Wallet", systemImage: "arrow.branch")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("bitcoin crate")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Seed hex", text: $bip32Seed)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                HStack(spacing: 8) {
+                                    Picker("Network", selection: $bip32Network) {
+                                        Text("mainnet").tag("mainnet")
+                                        Text("testnet").tag("testnet")
+                                        Text("regtest").tag("regtest")
+                                        Text("signet").tag("signet")
+                                    }
+                                    .pickerStyle(.menu)
+                                    .tint(accentText)
+                                    Button {
+                                        do {
+                                            let xpriv = try xprivFromSeed(seedHex: bip32Seed, network: bip32Network)
+                                            let xpub = try xpubFromXpriv(xprivString: xpriv)
+                                            let accountXpriv = try deriveXpriv(xprivString: xpriv, path: "m/44'/0'/0'")
+                                            let accountXpub = try xpubFromXpriv(xprivString: accountXpriv)
+                                            let addr = try p2wpkhAddressFromXpub(xpubString: accountXpub, path: "m/0/0", network: bip32Network)
+                                            bip32Xpriv = xpriv.prefix(16) + "…"
+                                            bip32Xpub = xpub.prefix(16) + "…"
+                                            bip32Address = addr
+                                        } catch {
+                                            bip32Xpriv = "error"
+                                            bip32Xpub = ""
+                                            bip32Address = ""
+                                        }
+                                    } label: {
+                                        Label("Derive", systemImage: "arrow.right.circle.fill")
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    Spacer()
+                                }
+                                if !bip32Xpriv.isEmpty {
+                                    Text("xpriv: \(bip32Xpriv)")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                                if !bip32Xpub.isEmpty {
+                                    Text("xpub: \(bip32Xpub)")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                                if !bip32Address.isEmpty {
+                                    Text(bip32Address)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3772,6 +3846,7 @@ struct ContentView: View {
                                 "Peer constants + Peer logs",
                                 "More constants",
                                 "Key & Address generation",
+                                "BIP32 HD Wallet derivation",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

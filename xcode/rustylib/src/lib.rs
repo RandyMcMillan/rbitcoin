@@ -1581,6 +1581,17 @@ impl FfiQuery {
         self.inner.block_queue_promoted_count() as u64
     }
 
+    pub fn head_drain_fk(&self) -> u64 {
+        self.inner.head_drain_fk()
+    }
+
+    pub fn block_queue_queued_heights(&self) -> Vec<u32> {
+        self.inner
+            .block_queue_queued_heights()
+            .into_iter()
+            .collect()
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -2945,6 +2956,8 @@ mod tests {
         assert_eq!(query.scripthash_entry_count(), 0);
         assert_eq!(query.point_edge_count(), 0);
         assert_eq!(query.tip_header_fk().unwrap(), None);
+        assert_eq!(query.head_drain_fk(), 0);
+        assert!(query.block_queue_queued_heights().is_empty());
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
     }

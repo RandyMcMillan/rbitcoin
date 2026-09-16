@@ -807,6 +807,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueuePromotedCount()  -> UInt64
     
+    func blockQueueQueuedHeights()  -> [UInt32]
+    
     func blockQueueSoftPressure()  -> Bool
     
     func blockQueueStats()  -> FfiBlockQueueStats
@@ -840,6 +842,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func getHeaderByHash(hashHex: String) throws  -> FfiHeaderRecord?
     
     func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
+    
+    func headDrainFk()  -> UInt64
     
     func headerAtHeight(height: UInt32) throws  -> FfiHeaderRecord?
     
@@ -1011,6 +1015,13 @@ open func blockQueuePromotedCount() -> UInt64 {
 })
 }
     
+open func blockQueueQueuedHeights() -> [UInt32] {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_queued_heights(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func blockQueueSoftPressure() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_soft_pressure(self.uniffiClonePointer(),$0
@@ -1131,6 +1142,13 @@ open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
     return try  FfiConverterOptionTypeFfiTxRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_get_tx_by_txid(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func headDrainFk() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_head_drain_fk(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -5665,6 +5683,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_promoted_count() != 34768) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_queued_heights() != 4259) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_soft_pressure() != 43521) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5714,6 +5735,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_get_tx_by_txid() != 24667) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_head_drain_fk() != 14418) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_header_at_height() != 16751) {

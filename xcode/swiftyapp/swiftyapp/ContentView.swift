@@ -31,6 +31,13 @@ struct ContentView: View {
     @State private var feeTargetBlocks = "1"
     @State private var feeStockAbove = "0"
     @State private var feeResult = ""
+    @State private var txHexInput = ""
+    @State private var txParseResult = ""
+    @State private var headerHexInput = ""
+    @State private var headerHashResult = ""
+    @State private var networkSeedResult = ""
+    @State private var scriptHashInput = ""
+    @State private var scriptHashResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -561,6 +568,137 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Transaction parser", systemImage: "doc.text.magnifyingglass")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("bitcoin crate")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Transaction hex")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Paste tx hex", text: $txHexInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .onChange(of: txHexInput) { _ in updateTxParse() }
+                                if !txParseResult.isEmpty {
+                                    Text(txParseResult)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Block header hash", systemImage: "cube.transparent")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("bitcoin crate")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Header hex")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Paste header hex", text: $headerHexInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .onChange(of: headerHexInput) { _ in updateHeaderHash() }
+                                if !headerHashResult.isEmpty {
+                                    Text(headerHashResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("P2P network", systemImage: "network")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let seeds = p2pDnsSeeds(network: "mainnet") ?? []
+                                let port = p2pDefaultPort(network: "mainnet") ?? 0
+                                networkSeedResult = "Port: \(port), Seeds: \(seeds.count)"
+                            } label: {
+                                Label("Load mainnet seeds", systemImage: "arrow.down.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !networkSeedResult.isEmpty {
+                                Text(networkSeedResult)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Electrum scripthash", systemImage: "number")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-electrum")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Script hex")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(primaryText.opacity(0.92))
+                                TextField("Paste script hex", text: $scriptHashInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .onChange(of: scriptHashInput) { _ in updateScriptHash() }
+                                if !scriptHashResult.isEmpty {
+                                    Text(scriptHashResult)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(primaryText.opacity(0.74))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -574,6 +712,8 @@ struct ContentView: View {
                                 "Consensus verification",
                                 "Store + Query FFI",
                                 "Mempool + Fee estimation",
+                                "Tx parsing + Block hash",
+                                "P2P network + Electrum",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")
@@ -715,6 +855,48 @@ struct ContentView: View {
             feeResult = "\(rate) sat/kvB"
         } else {
             feeResult = "no fit"
+        }
+    }
+
+    private func updateTxParse() {
+        let hex = txHexInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hex.isEmpty else {
+            txParseResult = ""
+            return
+        }
+        do {
+            let info = try parseTx(txHex: hex)
+            txParseResult = "txid: \(info.txid.prefix(16))… v\(info.version) \(info.inputCount)in \(info.outputCount)out"
+        } catch {
+            txParseResult = "invalid tx"
+        }
+    }
+
+    private func updateHeaderHash() {
+        let hex = headerHexInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hex.isEmpty else {
+            headerHashResult = ""
+            return
+        }
+        do {
+            let hash = try blockHashFromHeader(headerHex: hex)
+            headerHashResult = hash
+        } catch {
+            headerHashResult = "invalid header"
+        }
+    }
+
+    private func updateScriptHash() {
+        let hex = scriptHashInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !hex.isEmpty else {
+            scriptHashResult = ""
+            return
+        }
+        do {
+            let hash = try electrumScripthashHex(scriptHex: hex)
+            scriptHashResult = hash
+        } catch {
+            scriptHashResult = "invalid script"
         }
     }
 

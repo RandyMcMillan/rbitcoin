@@ -8,6 +8,9 @@ mod regtest_rpc;
 mod run;
 
 pub use cli::cli_main;
-pub use config::{DatadirOpts, ListenOpts, MempoolOpts, NodeConfig, RpcOpts};
+pub use config::{
+    inbound_from_maxconnections, ConfApply, DatadirOpts, ListenOpts, MempoolOpts, NodeConfig,
+    RpcOpts, CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
+};
 pub use error::NodeError;
 pub use run::{run_node, run_p2p, NodeHandle};

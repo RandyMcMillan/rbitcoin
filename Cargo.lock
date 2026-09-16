@@ -1223,6 +1223,7 @@ dependencies = [
  "rbitcoin-electrum",
  "rbitcoin-mempool",
  "rbitcoin-net",
+ "rbitcoin-node",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-rpc",

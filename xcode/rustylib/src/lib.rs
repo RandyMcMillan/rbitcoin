@@ -306,6 +306,23 @@ pub fn rpc_call_json(
     serde_json::to_string(&result).map_err(|_| RustyError::InvalidInput)
 }
 
+// --- Node Config FFI ---
+
+#[uniffi::export]
+pub fn node_default_max_inbound() -> u32 {
+    rbitcoin_node::DEFAULT_MAX_INBOUND
+}
+
+#[uniffi::export]
+pub fn node_core_maxconnections_outbound_reserve() -> u32 {
+    rbitcoin_node::CORE_MAXCONNECTIONS_OUTBOUND_RESERVE
+}
+
+#[uniffi::export]
+pub fn node_inbound_from_maxconnections(total: u32) -> u32 {
+    rbitcoin_node::inbound_from_maxconnections(total)
+}
+
 // --- Store FFI ---
 
 #[derive(uniffi::Record)]
@@ -775,5 +792,12 @@ mod tests {
             "not valid json".to_string(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_node_config() {
+        assert_eq!(node_default_max_inbound(), 125);
+        assert_eq!(node_core_maxconnections_outbound_reserve(), 11);
+        assert_eq!(node_inbound_from_maxconnections(100), 89);
     }
 }

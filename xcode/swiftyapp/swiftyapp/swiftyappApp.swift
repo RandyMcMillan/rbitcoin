@@ -13,14 +13,10 @@ struct swiftyappApp: App {
     init() {
         let logger = Logger(subsystem: "org.gnostr.xcode-rbitcoin", category: "launch")
         logger.info("App launch begin")
-        do {
-            let version = rbitcoinVersion()
-            logger.info("Rust FFI loaded: version=\(version)")
-            let hello = rustHello()
-            logger.info("Rust hello: \(hello)")
-        } catch {
-            logger.error("Rust FFI failed: \(error.localizedDescription)")
-        }
+        let version = rbitcoinVersion()
+        logger.info("Rust FFI loaded: version=\(version)")
+        let hello = rustHello()
+        logger.info("Rust hello: \(hello)")
         logger.info("App launch end")
     }
 

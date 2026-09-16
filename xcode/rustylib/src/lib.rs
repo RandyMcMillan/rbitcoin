@@ -1930,6 +1930,54 @@ pub fn apply_witness_commitment(block_hex: String) -> Result<String, RustyError>
     Ok(bitcoin::consensus::encode::serialize_hex(&block))
 }
 
+// --- DNS Seed Query FFI ---
+
+#[uniffi::export]
+pub fn dns_seed_query_host(seed: String, services_u64: u64) -> String {
+    let services = bitcoin::p2p::ServiceFlags::from(services_u64);
+    rbitcoin_net::dns_seed_query_host(&seed, services)
+}
+
+// --- Regtest Candidate FFI ---
+
+#[uniffi::export]
+pub fn prepare_regtest_candidate(
+    block_hex: String,
+    prev_hash_hex: String,
+    time: u32,
+) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let mut block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let prev = parse_hash32(&prev_hash_hex)?;
+    let prev_hash = bitcoin::BlockHash::from_byte_array(prev);
+    rbitcoin_consensus::prepare_regtest_candidate(&mut block, prev_hash, time);
+    Ok(bitcoin::consensus::encode::serialize_hex(&block))
+}
+
+// --- Electrum Tweaks FFI ---
+
+#[uniffi::export]
+pub fn last_height(start: u32, count: u32, tip: Option<u32>) -> Option<u32> {
+    rbitcoin_electrum::last_height(start, count, tip)
+}
+
+#[uniffi::export]
+pub fn seal_subscribe_chunk(elapsed_secs: u64, budget_secs: u64, more: bool) -> bool {
+    let elapsed = std::time::Duration::from_secs(elapsed_secs);
+    let budget = std::time::Duration::from_secs(budget_secs);
+    rbitcoin_electrum::seal_subscribe_chunk(elapsed, budget, more)
+}
+
+// --- Scripthash FFI ---
+
+#[uniffi::export]
+pub fn script_hash_hex(script_hex: String) -> String {
+    let script = rbitcoin_primitives::hex_decode(&script_hex).unwrap_or_default();
+    rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(&script))
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -2982,5 +3030,42 @@ mod tests {
         let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
         let result = apply_witness_commitment(block_hex).unwrap();
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_dns_seed_query_host() {
+        let host = dns_seed_query_host("seed.bitcoin.sipa.be".to_string(), 0);
+        assert!(!host.is_empty());
+    }
+
+    #[test]
+    fn test_prepare_regtest_candidate() {
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        let result =
+            prepare_regtest_candidate(block_hex, genesis_hash.to_string(), 1296688602).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_last_height() {
+        assert_eq!(last_height(0, 10, Some(5)), Some(5));
+        assert_eq!(last_height(0, 10, Some(100)), Some(9));
+        assert_eq!(last_height(10, 1, Some(5)), None);
+        assert_eq!(last_height(0, 1, None), None);
+    }
+
+    #[test]
+    fn test_seal_subscribe_chunk() {
+        assert!(seal_subscribe_chunk(10, 5, true));
+        assert!(!seal_subscribe_chunk(4, 5, true));
+        assert!(!seal_subscribe_chunk(10, 5, false));
+    }
+
+    #[test]
+    fn test_script_hash_hex() {
+        let hash =
+            script_hash_hex("76a914000000000000000000000000000000000000000088ac".to_string());
+        assert_eq!(hash.len(), 64);
     }
 }

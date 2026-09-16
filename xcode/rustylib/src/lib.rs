@@ -1269,6 +1269,27 @@ impl From<rbitcoin_store::TxRecord> for FfiTxRecord {
     }
 }
 
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiPointRecord {
+    pub out_txid: String,
+    pub out_index: u32,
+    pub spending_tx_fk: u64,
+    pub spending_vin: u32,
+    pub next_fk: u64,
+}
+
+impl From<rbitcoin_store::PointRecord> for FfiPointRecord {
+    fn from(p: rbitcoin_store::PointRecord) -> Self {
+        Self {
+            out_txid: rbitcoin_primitives::hex_encode(p.out_txid),
+            out_index: p.out_index,
+            spending_tx_fk: p.spending_tx_fk.0,
+            spending_vin: p.spending_vin,
+            next_fk: p.next.0,
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct FfiStore {
     inner: rbitcoin_store::Store,
@@ -1699,6 +1720,49 @@ impl FfiQuery {
 
     pub fn set_class_a_hi(&self, hi: Option<u32>) {
         self.inner.set_class_a_hi(hi);
+    }
+
+    pub fn get_header(&self, fk: u64) -> Result<FfiHeaderRecord, RustyError> {
+        let rec = self
+            .inner
+            .get_header(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(rec.into())
+    }
+
+    pub fn get_tx(&self, fk: u64) -> Result<FfiTxRecord, RustyError> {
+        let rec = self
+            .inner
+            .get_tx(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(rec.into())
+    }
+
+    pub fn header_tx_fks(&self, header_fk: u64, hash_hex: Option<String>) -> Result<Option<Vec<u64>>, RustyError> {
+        let hash = hash_hex.as_ref().map(|h| parse_hash32(h)).transpose()?;
+        let fks = self
+            .inner
+            .header_tx_fks(rbitcoin_primitives::Fk(header_fk), hash.as_ref())
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fks.map(|v| v.into_iter().map(|f| f.0).collect()))
+    }
+
+    pub fn spenders(&self, txid_hex: String, vout: u32) -> Result<Vec<FfiPointRecord>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let pts = self
+            .inner
+            .spenders(&txid, vout)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(pts.into_iter().map(|p| p.into()).collect())
+    }
+
+    pub fn spenders_at(&self, txid_hex: String, vout: u32, tip: Option<u32>) -> Result<Vec<FfiPointRecord>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let pts = self
+            .inner
+            .spenders_at(&txid, vout, tip)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(pts.into_iter().map(|p| p.into()).collect())
     }
 
     pub fn scripthash_entry_count(&self) -> u64 {
@@ -3149,6 +3213,18 @@ mod tests {
         assert_eq!(query.class_a_hi(), None);
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
+    }
+
+    #[test]
+    fn test_query_get_header_get_tx_spenders_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query4").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        assert!(query.get_header(1).is_err());
+        assert!(query.get_tx(1).is_err());
+        assert_eq!(query.header_tx_fks(1, None).unwrap(), None);
+        assert!(query.spenders("0".repeat(64), 0).unwrap().is_empty());
+        assert!(query.spenders_at("0".repeat(64), 0, None).unwrap().is_empty());
     }
 
     #[test]

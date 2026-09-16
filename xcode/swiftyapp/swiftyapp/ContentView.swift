@@ -198,6 +198,7 @@ struct ContentView: View {
     @State private var chainConstantsResult = ""
     @State private var chainLogResult = ""
     @State private var v2ConstantsResult = ""
+    @State private var moreConstants2Result = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -3935,6 +3936,42 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("More constants 2", systemImage: "number.circle.fill")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query + mempool")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                let softFree = bqSoftFreeBytes()
+                                let softConfirm = bqSoftConfirmSecs()
+                                let admitHalf = mempoolAdmitHalfLifeSecs()
+                                let warmAfter = mempoolWarmAfterSecs()
+                                let warmAdmits = mempoolWarmAfterAdmits()
+                                moreConstants2Result = "softFree=\(softFree) softConfirm=\(softConfirm) admitHalf=\(admitHalf) warm=\(warmAfter)/\(warmAdmits)"
+                            } label: {
+                                Label("Load more constants", systemImage: "info.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !moreConstants2Result.isEmpty {
+                                Text(moreConstants2Result)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -3991,6 +4028,7 @@ struct ContentView: View {
                                 "PSBT parse + extract",
                                 "Chain constants + Chain logs",
                                 "V2 transport constants",
+                                "More constants 2",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

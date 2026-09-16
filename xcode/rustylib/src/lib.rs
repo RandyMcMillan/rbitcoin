@@ -2000,6 +2000,31 @@ pub fn bq_assign_stop_bytes() -> u64 {
     rbitcoin_query::bq_assign_stop_bytes()
 }
 
+#[uniffi::export]
+pub fn bq_soft_free_bytes() -> u64 {
+    rbitcoin_query::BQ_SOFT_FREE_BYTES
+}
+
+#[uniffi::export]
+pub fn bq_soft_confirm_secs() -> u64 {
+    rbitcoin_query::BQ_SOFT_CONFIRM_SECS as u64
+}
+
+#[uniffi::export]
+pub fn mempool_admit_half_life_secs() -> u64 {
+    rbitcoin_mempool::ADMIT_HALF_LIFE_SECS as u64
+}
+
+#[uniffi::export]
+pub fn mempool_warm_after_secs() -> u64 {
+    rbitcoin_mempool::WARM_AFTER_SECS as u64
+}
+
+#[uniffi::export]
+pub fn mempool_warm_after_admits() -> u64 {
+    rbitcoin_mempool::WARM_AFTER_ADMITS
+}
+
 // --- Esplora Script Fields FFI ---
 
 #[derive(Debug, PartialEq, uniffi::Record)]
@@ -3774,5 +3799,14 @@ mod tests {
         assert!(!v2_packet_decryption_failure_log().is_empty());
         assert!(!v2_packet_too_large_log(100).is_empty());
         assert!(!v2_invalid_message_type_log().is_empty());
+    }
+
+    #[test]
+    fn test_more_constants() {
+        assert_eq!(bq_soft_free_bytes(), 100 * 1024 * 1024);
+        assert_eq!(bq_soft_confirm_secs(), 60);
+        assert_eq!(mempool_admit_half_life_secs(), 150);
+        assert_eq!(mempool_warm_after_secs(), 60);
+        assert_eq!(mempool_warm_after_admits(), 32);
     }
 }

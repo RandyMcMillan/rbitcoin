@@ -865,6 +865,22 @@ pub struct FfiHeightTweak {
     pub output_pubkeys: Vec<FfiTaprootOut>,
 }
 
+// --- V2 Transport FFI ---
+
+#[uniffi::export]
+pub fn parse_v2_regtest(contents_hex: String) -> Result<(), RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&contents_hex).map_err(|_| RustyError::InvalidInput)?;
+    rbitcoin_net::parse_v2_regtest(&bytes).map_err(|_| RustyError::InvalidInput)
+}
+
+#[uniffi::export]
+pub fn parse_v2_regtest_named(command: String, payload_hex: String) -> Result<(), RustyError> {
+    let payload =
+        rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
+    rbitcoin_net::parse_v2_regtest_named(&command, &payload).map_err(|_| RustyError::InvalidInput)
+}
+
 // --- Network Service Flags FFI ---
 
 #[uniffi::export]
@@ -1324,6 +1340,29 @@ impl FfiQuery {
             .header_at_height(rbitcoin_primitives::Height(height))
             .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_fk, h)| h.into()))
+    }
+
+    pub fn confirm_block(&self, height: u32, hash_hex: String) -> Result<u64, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let fk = self
+            .inner
+            .confirm_block(rbitcoin_primitives::Height(height), &hash)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fk.0)
+    }
+
+    pub fn index_mode(&self) -> u8 {
+        self.inner.index_mode() as u8
+    }
+
+    pub fn sh_index_enabled(&self) -> bool {
+        self.inner.sh_index_enabled()
+    }
+
+    pub fn backfill_sp_tweaks(&self, network: String) -> Result<u32, RustyError> {
+        let params = chain_params_for_network(&network)?;
+        rbitcoin_consensus::backfill_sp_tweaks(&self.inner, &params)
+            .map_err(|_| RustyError::ConsensusError)
     }
 }
 
@@ -2269,5 +2308,44 @@ mod tests {
         let query = FfiQuery::open_or_create(path).unwrap();
         let header = query.header_at_height(0).unwrap();
         assert_eq!(header, None);
+    }
+
+    #[test]
+    fn test_parse_v2_regtest() {
+        // Invalid contents should fail
+        let result = parse_v2_regtest("00".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_v2_regtest_named() {
+        // Empty payload for "version" command — parses structurally even if empty
+        let result = parse_v2_regtest_named("version".to_string(), "".to_string());
+        // Just ensure it doesn't panic; empty payload may or may not error
+        let _ = result;
+    }
+
+    #[test]
+    fn test_query_index_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query_mode").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let mode = query.index_mode();
+        assert!(mode == 1 || mode == 2);
+        assert!(query.sh_index_enabled());
+    }
+
+    #[test]
+    fn test_query_backfill_sp_tweaks_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("query_sp_backfill")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let count = query.backfill_sp_tweaks("mainnet".to_string()).unwrap();
+        assert_eq!(count, 0);
     }
 }

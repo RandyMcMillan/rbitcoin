@@ -89,7 +89,8 @@ pub use regtest_pad::{
 };
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
 pub use silent_payments::{
-    taproot_matches_scan, tweak_from_tx, tweaks_for_height, TaprootOut, TxTweak,
+    backfill_sp_tweaks, backfill_sp_tweaks_cancellable, tweak_from_tx, tweaks_for_height,
+    taproot_matches_scan, TaprootOut, TxTweak,
 };
 
 use bitcoin::hashes::Hash;

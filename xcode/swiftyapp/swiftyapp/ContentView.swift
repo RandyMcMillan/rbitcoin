@@ -108,6 +108,10 @@ struct ContentView: View {
     @State private var rbfResult = ""
     @State private var queryHashInput = ""
     @State private var queryHeightResult = ""
+    @State private var v2ContentsHex = ""
+    @State private var v2Result = ""
+    @State private var queryModeResult = ""
+    @State private var queryBackfillResult = ""
 
     private var sum: Int {
         Int(rustAdd(a: UInt32(firstValue), b: UInt32(secondValue)))
@@ -2103,6 +2107,126 @@ struct ContentView: View {
                     }
 
                     glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("V2 transport", systemImage: "network.badge.shield.half.filled")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-net")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField("Contents hex", text: $v2ContentsHex)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(.caption, design: .monospaced))
+                                Button {
+                                    let hex = v2ContentsHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !hex.isEmpty else {
+                                        v2Result = ""
+                                        return
+                                    }
+                                    do {
+                                        try parseV2Regtest(contentsHex: hex)
+                                        v2Result = "valid v2"
+                                    } catch {
+                                        v2Result = "invalid v2"
+                                    }
+                                } label: {
+                                    Label("Parse", systemImage: "checkmark.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PrimaryButtonStyle())
+                                if !v2Result.isEmpty {
+                                    Text(v2Result)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(primaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("Query mode", systemImage: "switch.2")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-query")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-mode")
+                                    let mode = query.indexMode()
+                                    let sh = query.shIndexEnabled()
+                                    queryModeResult = "mode=\(mode) sh=\(sh)"
+                                } catch {
+                                    queryModeResult = "error"
+                                }
+                            } label: {
+                                Label("Load mode", systemImage: "arrow.up.doc.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryModeResult.isEmpty {
+                                Text(queryModeResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack {
+                                Label("SP backfill", systemImage: "ear.badge.waveform")
+                                    .font(.headline)
+                                    .foregroundStyle(accentText)
+                                Spacer()
+                                Text("rbitcoin-consensus")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(accentFill.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                                    .foregroundStyle(accentText)
+                            }
+
+                            Button {
+                                do {
+                                    let query = try FfiQuery.openOrCreate(path: NSTemporaryDirectory() + "rbitcoin-query-backfill")
+                                    let count = try query.backfillSpTweaks(network: "mainnet")
+                                    queryBackfillResult = "backfilled: \(count)"
+                                } catch {
+                                    queryBackfillResult = "error"
+                                }
+                            } label: {
+                                Label("Backfill", systemImage: "arrow.triangle.2.circlepath")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if !queryBackfillResult.isEmpty {
+                                Text(queryBackfillResult)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(primaryText)
+                            }
+                        }
+                    }
+
+                    glassCard {
                         VStack(alignment: .leading, spacing: 10) {
                             Label("What this proves", systemImage: "checkmark.seal.fill")
                                 .font(.headline)
@@ -2133,6 +2257,8 @@ struct ContentView: View {
                                 "Block structure + Netgroup",
                                 "Work sum + SP tweaks",
                                 "RBF check + Query chain view",
+                                "V2 transport + Query mode",
+                                "SP backfill",
                             ], id: \.self) { item in
                                 HStack(spacing: 10) {
                                     Image(systemName: "checkmark.circle.fill")

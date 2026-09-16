@@ -399,6 +399,22 @@ fileprivate class UniffiHandleMap<T> {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -1739,6 +1755,13 @@ public func checkBlockWire(blockHex: String)throws  {try rustCallWithError(FfiCo
     )
 }
 }
+public func electrumScripthashHex(scriptHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_electrum_scripthash_hex(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
 public func feeBucketCount() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_fee_bucket_count($0
@@ -1855,6 +1878,39 @@ public func meetsMinRelayFee(feeSat: UInt64, weight: UInt64) -> Bool {
     )
 })
 }
+public func nodeRpcPath() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_node_rpc_path($0
+    )
+})
+}
+public func p2pDefaultPort(network: String)throws  -> UInt16 {
+    return try  FfiConverterUInt16.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_default_port(
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+public func p2pDnsSeeds(network: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_dns_seeds(
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+public func p2pFixedSeedHosts(network: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_fixed_seed_hosts(
+        FfiConverterString.lower(network),$0
+    )
+})
+}
+public func p2pTargetPeers() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_p2p_target_peers($0
+    )
+})
+}
 public func parseTx(txHex: String)throws  -> FfiTxInfo {
     return try  FfiConverterTypeFfiTxInfo.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_parse_tx(
@@ -1872,6 +1928,18 @@ public func rbitcoinSubversion(comments: [String])throws  -> String {
 public func rbitcoinVersion() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_rbitcoin_version($0
+    )
+})
+}
+public func rpcCallJson(host: String, port: UInt16, user: String, password: String, method: String, paramsJson: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_rpc_call_json(
+        FfiConverterString.lower(host),
+        FfiConverterUInt16.lower(port),
+        FfiConverterString.lower(user),
+        FfiConverterString.lower(password),
+        FfiConverterString.lower(method),
+        FfiConverterString.lower(paramsJson),$0
     )
 })
 }
@@ -1970,6 +2038,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_check_block_wire() != 22734) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_electrum_scripthash_hex() != 39984) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_fee_bucket_count() != 44190) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2018,6 +2089,21 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_meets_min_relay_fee() != 27158) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_node_rpc_path() != 45316) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_default_port() != 6265) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_dns_seeds() != 22311) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_fixed_seed_hosts() != 2698) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_target_peers() != 34559) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_parse_tx() != 26241) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2025,6 +2111,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_rbitcoin_version() != 47205) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_rpc_call_json() != 63144) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_rust_add() != 47653) {

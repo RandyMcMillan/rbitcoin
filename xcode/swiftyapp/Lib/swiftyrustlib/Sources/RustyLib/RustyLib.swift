@@ -873,6 +873,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueStats()  -> FfiBlockQueueStats
     
+    func blockQueueTakeRaw(height: UInt32)  -> FfiTakenRaw?
+    
     func blockQueueTakeRawCloneN()  -> UInt64
     
     func blockQueueUpdateSoftPressure(rateBlocksPerS: Double?)  -> Bool
@@ -1243,6 +1245,14 @@ open func blockQueueSoftPressure() -> Bool {
 open func blockQueueStats() -> FfiBlockQueueStats {
     return try!  FfiConverterTypeFfiBlockQueueStats.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_stats(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueTakeRaw(height: UInt32) -> FfiTakenRaw? {
+    return try!  FfiConverterOptionTypeFfiTakenRaw.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_take_raw(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
     )
 })
 }
@@ -2283,6 +2293,72 @@ public func FfiConverterTypeFfiBlockQueueOffer_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeFfiBlockQueueOffer_lower(_ value: FfiBlockQueueOffer) -> RustBuffer {
     return FfiConverterTypeFfiBlockQueueOffer.lower(value)
+}
+
+
+public struct FfiBlockQueueSoftTargets {
+    public var window: UInt32
+    public var freeMib: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(window: UInt32, freeMib: UInt32) {
+        self.window = window
+        self.freeMib = freeMib
+    }
+}
+
+
+
+extension FfiBlockQueueSoftTargets: Equatable, Hashable {
+    public static func ==(lhs: FfiBlockQueueSoftTargets, rhs: FfiBlockQueueSoftTargets) -> Bool {
+        if lhs.window != rhs.window {
+            return false
+        }
+        if lhs.freeMib != rhs.freeMib {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(window)
+        hasher.combine(freeMib)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiBlockQueueSoftTargets: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiBlockQueueSoftTargets {
+        return
+            try FfiBlockQueueSoftTargets(
+                window: FfiConverterUInt32.read(from: &buf), 
+                freeMib: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiBlockQueueSoftTargets, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.window, into: &buf)
+        FfiConverterUInt32.write(value.freeMib, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlockQueueSoftTargets_lift(_ buf: RustBuffer) throws -> FfiBlockQueueSoftTargets {
+    return try FfiConverterTypeFfiBlockQueueSoftTargets.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlockQueueSoftTargets_lower(_ value: FfiBlockQueueSoftTargets) -> RustBuffer {
+    return FfiConverterTypeFfiBlockQueueSoftTargets.lower(value)
 }
 
 
@@ -3572,6 +3648,80 @@ public func FfiConverterTypeFfiServePerfSample_lower(_ value: FfiServePerfSample
 }
 
 
+public struct FfiTakenRaw {
+    public var hash: String
+    public var headerFk: UInt64
+    public var payload: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hash: String, headerFk: UInt64, payload: Data) {
+        self.hash = hash
+        self.headerFk = headerFk
+        self.payload = payload
+    }
+}
+
+
+
+extension FfiTakenRaw: Equatable, Hashable {
+    public static func ==(lhs: FfiTakenRaw, rhs: FfiTakenRaw) -> Bool {
+        if lhs.hash != rhs.hash {
+            return false
+        }
+        if lhs.headerFk != rhs.headerFk {
+            return false
+        }
+        if lhs.payload != rhs.payload {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hash)
+        hasher.combine(headerFk)
+        hasher.combine(payload)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTakenRaw: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTakenRaw {
+        return
+            try FfiTakenRaw(
+                hash: FfiConverterString.read(from: &buf), 
+                headerFk: FfiConverterUInt64.read(from: &buf), 
+                payload: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTakenRaw, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterUInt64.write(value.headerFk, into: &buf)
+        FfiConverterData.write(value.payload, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTakenRaw_lift(_ buf: RustBuffer) throws -> FfiTakenRaw {
+    return try FfiConverterTypeFfiTakenRaw.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTakenRaw_lower(_ value: FfiTakenRaw) -> RustBuffer {
+    return FfiConverterTypeFfiTakenRaw.lower(value)
+}
+
+
 public struct FfiTaprootOut {
     public var vout: UInt32
     public var xonly: String
@@ -4287,6 +4437,30 @@ fileprivate struct FfiConverterOptionTypeFfiHeaderRecord: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiTakenRaw: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTakenRaw?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiTakenRaw.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiTakenRaw.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiTxRecord: FfiConverterRustBuffer {
     typealias SwiftType = FfiTxRecord?
 
@@ -4735,6 +4909,13 @@ public func blockHeaderHash(version: Int32, prevHashHex: String, merkleRootHex: 
         FfiConverterUInt32.lower(timestamp),
         FfiConverterUInt32.lower(bits),
         FfiConverterUInt32.lower(nonce),$0
+    )
+})
+}
+public func blockQueueSoftTargets(rateBlocksPerS: Double?) -> FfiBlockQueueSoftTargets {
+    return try!  FfiConverterTypeFfiBlockQueueSoftTargets.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_block_queue_soft_targets(
+        FfiConverterOptionDouble.lower(rateBlocksPerS),$0
     )
 })
 }
@@ -6229,6 +6410,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_block_header_hash() != 31514) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_block_queue_soft_targets() != 6234) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_block_reject_log_line() != 42178) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6926,6 +7110,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_stats() != 60518) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_take_raw() != 15459) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_take_raw_clone_n() != 24052) {

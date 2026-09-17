@@ -837,6 +837,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func backfillSpTweaks(network: String) throws  -> UInt32
     
+    func backfillTxIndex() throws  -> UInt64
+    
     func blockQueueCount()  -> UInt64
     
     func blockQueueDequeueHeight(height: UInt32) throws  -> UInt64
@@ -1134,6 +1136,13 @@ open func backfillSpTweaks(network: String)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_backfill_sp_tweaks(self.uniffiClonePointer(),
         FfiConverterString.lower(network),$0
+    )
+})
+}
+    
+open func backfillTxIndex()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_backfill_tx_index(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -5919,9 +5928,20 @@ public func ignoringLowWorkChainLog(height: UInt32) -> String {
     )
 })
 }
+public func initLogFromEnv() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_init_log_from_env($0
+    )
+})
+}
 public func initLogLevel(level: String) {try! rustCall() {
     uniffi_rustylib_fn_func_init_log_level(
         FfiConverterString.lower(level),$0
+    )
+}
+}
+public func initLogOff() {try! rustCall() {
+    uniffi_rustylib_fn_func_init_log_off($0
     )
 }
 }
@@ -7180,7 +7200,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_ignoring_low_work_chain_log() != 1492) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_init_log_from_env() != 51067) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_init_log_level() != 65207) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_init_log_off() != 13448) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_initial_getheaders_log() != 58469) {
@@ -7661,6 +7687,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_backfill_sp_tweaks() != 23196) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_backfill_tx_index() != 57228) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_count() != 45316) {

@@ -2008,6 +2008,10 @@ impl FfiQuery {
         self.inner.prune_write_create_loc(written_hi);
     }
 
+    pub fn lookup_already_taken(&self, height: u32) -> bool {
+        self.inner.lookup_already_taken(height)
+    }
+
     pub fn scripthash_entry_count(&self) -> u64 {
         self.inner.scripthash_entry_count()
     }
@@ -3503,6 +3507,7 @@ mod tests {
         assert_eq!(query.head_drain_fk(), 100);
         query.note_lookup_tiponly_start(50);
         query.prune_write_create_loc(10);
+        assert!(!query.lookup_already_taken(0));
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
     }

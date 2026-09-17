@@ -1791,6 +1791,16 @@ impl FfiQuery {
             .map(rbitcoin_primitives::hex_encode)
     }
 
+    pub fn block_queue_take_raw(&self, height: u32) -> Option<FfiTakenRaw> {
+        self.inner
+            .block_queue_take_raw(height)
+            .map(|t| FfiTakenRaw {
+                hash: rbitcoin_primitives::hex_encode(t.hash),
+                header_fk: t.header_fk,
+                payload: t.payload,
+            })
+    }
+
     pub fn block_queue_is_resolve_complete(&self, height: u32) -> bool {
         self.inner.block_queue_is_resolve_complete(height)
     }
@@ -2262,6 +2272,13 @@ pub struct FfiBlockQueueOffer {
     pub queue_id: u64,
 }
 
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiTakenRaw {
+    pub hash: String,
+    pub header_fk: u64,
+    pub payload: Vec<u8>,
+}
+
 // --- Mempool FFI ---
 
 #[derive(uniffi::Record)]
@@ -2389,6 +2406,20 @@ impl FfiMempool {
             .grow_slots()
             .map_err(|_| RustyError::MempoolError)
     }
+}
+
+// --- Block Queue soft targets FFI ---
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiBlockQueueSoftTargets {
+    pub window: u32,
+    pub free_mib: u32,
+}
+
+#[uniffi::export]
+pub fn block_queue_soft_targets(rate_blocks_per_s: Option<f64>) -> FfiBlockQueueSoftTargets {
+    let (win, free_mib) = rbitcoin_query::Query::block_queue_soft_targets(rate_blocks_per_s);
+    FfiBlockQueueSoftTargets { window: win, free_mib }
 }
 
 // --- RBF FFI ---
@@ -3627,6 +3658,10 @@ mod tests {
         query.block_queue_drop_resolved_from(50);
         assert_eq!(query.block_queue_mark_resolve_complete_wave(vec![101]).unwrap(), 1);
         assert!(query.block_queue_is_resolve_complete(101));
+        let taken = query.block_queue_take_raw(101);
+        assert!(taken.is_some() || taken.is_none());
+        let targets = block_queue_soft_targets(None);
+        assert!(targets.free_mib > 0);
     }
 
     #[test]

@@ -2535,6 +2535,165 @@ pub struct FfiProcessOwnedSizes {
     pub wloc_bytes: u64,
 }
 
+#[derive(uniffi::Record)]
+pub struct FfiPeerEntry {
+    pub addr: String,
+    pub flags: u8,
+}
+
+// --- AddrMan FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiAddrMan {
+    inner: std::sync::Mutex<rbitcoin_net::AddrMan>,
+}
+
+#[uniffi::export]
+impl FfiAddrMan {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(rbitcoin_net::AddrMan::new()),
+        })
+    }
+
+    #[uniffi::constructor]
+    pub fn with_seeds(network: String) -> Result<Arc<Self>, RustyError> {
+        let net = match network.as_str() {
+            "mainnet" => rbitcoin_primitives::Network::Mainnet,
+            "testnet" => rbitcoin_primitives::Network::Testnet,
+            "regtest" => rbitcoin_primitives::Network::Regtest,
+            "signet" => rbitcoin_primitives::Network::Signet,
+            _ => return Err(RustyError::InvalidInput),
+        };
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(rbitcoin_net::AddrMan::with_seeds(net)),
+        }))
+    }
+
+    pub fn add(&self, addr: String) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.lock().unwrap().add(socket);
+        Ok(())
+    }
+
+    pub fn add_with_flags(&self, addr: String, flags: u8) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .lock()
+            .unwrap()
+            .add_with_flags(socket, rbitcoin_net::PeerFlags(flags));
+        Ok(())
+    }
+
+    pub fn note_connected(&self, addr: String) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.lock().unwrap().note_connected(socket);
+        Ok(())
+    }
+
+    pub fn note_attempt(&self, addr: String) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.lock().unwrap().note_attempt(socket);
+        Ok(())
+    }
+
+    pub fn note_connect_failed(&self, addr: String, incompatible: bool) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .lock()
+            .unwrap()
+            .note_connect_failed(socket, incompatible);
+        Ok(())
+    }
+
+    pub fn note_speed(&self, addr: String, latency_ms: u64, bytes_per_sec: u64) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .lock()
+            .unwrap()
+            .note_speed(socket, latency_ms, bytes_per_sec);
+        Ok(())
+    }
+
+    pub fn len(&self) -> u64 {
+        self.inner.lock().unwrap().len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
+
+    pub fn peers(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .peers()
+            .iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    pub fn entries(&self) -> Vec<FfiPeerEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries()
+            .into_iter()
+            .map(|e| FfiPeerEntry {
+                addr: e.addr.to_string(),
+                flags: e.flags.0,
+            })
+            .collect()
+    }
+
+    pub fn flags(&self, addr: String) -> Result<u8, RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.lock().unwrap().flags(&socket).0)
+    }
+
+    pub fn take_outbound(&self, max: u64) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .take_outbound(max as usize)
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    pub fn take_outbound_occupied(&self, max: u64, occupied: Vec<String>) -> Vec<String> {
+        let occ: Vec<std::net::SocketAddr> = occupied
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        self.inner
+            .lock()
+            .unwrap()
+            .take_outbound_occupied(max as usize, &occ)
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    #[uniffi::constructor]
+    pub fn load(path: String) -> Result<Arc<Self>, RustyError> {
+        let am = rbitcoin_net::AddrMan::load(std::path::Path::new(&path))
+            .map_err(|_| RustyError::InvalidInput)?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(am),
+        }))
+    }
+
+    pub fn save(&self, path: String) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .save(std::path::Path::new(&path))
+            .map_err(|_| RustyError::InvalidInput)
+    }
+}
+
 // --- Mempool FFI ---
 
 #[derive(uniffi::Record)]
@@ -4512,6 +4671,45 @@ mod tests {
         let addr = parse_peer_addr("127.0.0.1:8333".to_string()).unwrap();
         assert!(addr.contains("127.0.0.1"));
         assert!(addr.contains("8333"));
+    }
+
+    #[test]
+    fn test_addr_man() {
+        let am = FfiAddrMan::new();
+        assert!(am.is_empty());
+        assert_eq!(am.len(), 0);
+        am.add("127.0.0.1:8333".to_string()).unwrap();
+        assert_eq!(am.len(), 1);
+        assert!(!am.is_empty());
+        assert_eq!(am.peers().len(), 1);
+        assert_eq!(am.flags("127.0.0.1:8333".to_string()).unwrap(), 0);
+        am.note_connected("127.0.0.1:8333".to_string()).unwrap();
+        assert!(am.flags("127.0.0.1:8333".to_string()).unwrap() > 0);
+        let entries = am.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].addr, "127.0.0.1:8333");
+        let out = am.take_outbound(10);
+        assert!(!out.is_empty());
+        let occ = vec!["127.0.0.1:8333".to_string()];
+        let out2 = am.take_outbound_occupied(10, occ);
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn test_addr_man_with_seeds() {
+        let am = FfiAddrMan::with_seeds("mainnet".to_string()).unwrap();
+        assert!(!am.is_empty());
+    }
+
+    #[test]
+    fn test_addr_man_save_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("peers.txt").to_str().unwrap().to_string();
+        let am = FfiAddrMan::new();
+        am.add("127.0.0.1:8333".to_string()).unwrap();
+        am.save(path.clone()).unwrap();
+        let am2 = FfiAddrMan::load(path).unwrap();
+        assert_eq!(am2.len(), 1);
     }
 
     #[test]

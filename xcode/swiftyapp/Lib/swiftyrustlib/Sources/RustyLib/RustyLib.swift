@@ -839,6 +839,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueDequeueHeight(height: UInt32) throws  -> UInt64
     
+    func blockQueueEnqueue(height: UInt32, hashHex: String, headerFk: UInt64, payload: Data) throws  -> UInt64
+    
     func blockQueueHasHash(hashHex: String) throws  -> Bool
     
     func blockQueueHasHeight(height: UInt32)  -> Bool
@@ -852,6 +854,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func blockQueueMarkResolveComplete(height: UInt32) throws 
     
     func blockQueueMaxHeight()  -> UInt64?
+    
+    func blockQueueOffer(height: UInt32, hashHex: String, headerFk: UInt64, payload: Data) throws  -> FfiBlockQueueOffer
     
     func blockQueuePayload(height: UInt32) throws  -> Data?
     
@@ -1105,6 +1109,17 @@ open func blockQueueDequeueHeight(height: UInt32)throws  -> UInt64 {
 })
 }
     
+open func blockQueueEnqueue(height: UInt32, hashHex: String, headerFk: UInt64, payload: Data)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_enqueue(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(hashHex),
+        FfiConverterUInt64.lower(headerFk),
+        FfiConverterData.lower(payload),$0
+    )
+})
+}
+    
 open func blockQueueHasHash(hashHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_block_queue_has_hash(self.uniffiClonePointer(),
@@ -1154,6 +1169,17 @@ open func blockQueueMarkResolveComplete(height: UInt32)throws  {try rustCallWith
 open func blockQueueMaxHeight() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_max_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueOffer(height: UInt32, hashHex: String, headerFk: UInt64, payload: Data)throws  -> FfiBlockQueueOffer {
+    return try  FfiConverterTypeFfiBlockQueueOffer.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_offer(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),
+        FfiConverterString.lower(hashHex),
+        FfiConverterUInt64.lower(headerFk),
+        FfiConverterData.lower(payload),$0
     )
 })
 }
@@ -2180,6 +2206,64 @@ public func FfiConverterTypeFfiStore_lift(_ pointer: UnsafeMutableRawPointer) th
 #endif
 public func FfiConverterTypeFfiStore_lower(_ value: FfiStore) -> UnsafeMutableRawPointer {
     return FfiConverterTypeFfiStore.lower(value)
+}
+
+
+public struct FfiBlockQueueOffer {
+    public var queueId: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(queueId: UInt64) {
+        self.queueId = queueId
+    }
+}
+
+
+
+extension FfiBlockQueueOffer: Equatable, Hashable {
+    public static func ==(lhs: FfiBlockQueueOffer, rhs: FfiBlockQueueOffer) -> Bool {
+        if lhs.queueId != rhs.queueId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(queueId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiBlockQueueOffer: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiBlockQueueOffer {
+        return
+            try FfiBlockQueueOffer(
+                queueId: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiBlockQueueOffer, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.queueId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlockQueueOffer_lift(_ buf: RustBuffer) throws -> FfiBlockQueueOffer {
+    return try FfiConverterTypeFfiBlockQueueOffer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlockQueueOffer_lower(_ value: FfiBlockQueueOffer) -> RustBuffer {
+    return FfiConverterTypeFfiBlockQueueOffer.lower(value)
 }
 
 
@@ -6774,6 +6858,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_dequeue_height() != 48079) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_enqueue() != 2897) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_has_hash() != 56360) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6793,6 +6880,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_max_height() != 61436) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_offer() != 36530) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_payload() != 53504) {

@@ -831,6 +831,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func activeUnknownBits(network: String) throws  -> [Int32]
     
+    func applyShPending() throws 
+    
     func archivedBlockCount() throws  -> UInt64
     
     func backfillSpTweaks(network: String) throws  -> UInt32
@@ -889,7 +891,13 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func confirmCancelled()  -> Bool
     
+    func disconnectTip() throws 
+    
+    func disconnectTipKeepPending() throws 
+    
     func drainAndFenceHi()  -> UInt64?
+    
+    func dropShPendingFrom(height: UInt32) 
     
     func expectedNextBits(network: String, height: UInt32, headerTime: UInt32) throws  -> UInt32
     
@@ -948,6 +956,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func pinShChainView() throws  -> FfiChainView?
     
     func pointEdgeCount()  -> UInt64
+    
+    func processOwnedSizeSnapshot()  -> FfiProcessOwnedSizes
     
     func pruneWriteCreateLoc(writtenHi: UInt32) 
     
@@ -1083,6 +1093,12 @@ open func activeUnknownBits(network: String)throws  -> [Int32] {
         FfiConverterString.lower(network),$0
     )
 })
+}
+    
+open func applyShPending()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_apply_sh_pending(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func archivedBlockCount()throws  -> UInt64 {
@@ -1309,11 +1325,30 @@ open func confirmCancelled() -> Bool {
 })
 }
     
+open func disconnectTip()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_disconnect_tip(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func disconnectTipKeepPending()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_disconnect_tip_keep_pending(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func drainAndFenceHi() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_drain_and_fence_hi(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func dropShPendingFrom(height: UInt32) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_drop_sh_pending_from(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+}
 }
     
 open func expectedNextBits(network: String, height: UInt32, headerTime: UInt32)throws  -> UInt32 {
@@ -1531,6 +1566,13 @@ open func pinShChainView()throws  -> FfiChainView? {
 open func pointEdgeCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_point_edge_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func processOwnedSizeSnapshot() -> FfiProcessOwnedSizes {
+    return try!  FfiConverterTypeFfiProcessOwnedSizes.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_process_owned_size_snapshot(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -2666,6 +2708,152 @@ public func FfiConverterTypeFfiEsploraScriptFields_lower(_ value: FfiEsploraScri
 }
 
 
+public struct FfiHeadResizeSizeSnapshot {
+    public var classAN: UInt64
+    public var primaryBits: UInt32
+    public var primarySlots: UInt64
+    public var primaryEntryB: UInt8
+    public var primaryOccupied: UInt64
+    public var primaryBodyBytes: UInt64
+    public var segmentCount: UInt64
+    public var sealedSegments: UInt64
+    public var fuse8Bytes: UInt64
+    public var mphfGBytes: UInt64
+    public var openKeysBytes: UInt64
+    public var classCL2Bytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(classAN: UInt64, primaryBits: UInt32, primarySlots: UInt64, primaryEntryB: UInt8, primaryOccupied: UInt64, primaryBodyBytes: UInt64, segmentCount: UInt64, sealedSegments: UInt64, fuse8Bytes: UInt64, mphfGBytes: UInt64, openKeysBytes: UInt64, classCL2Bytes: UInt64) {
+        self.classAN = classAN
+        self.primaryBits = primaryBits
+        self.primarySlots = primarySlots
+        self.primaryEntryB = primaryEntryB
+        self.primaryOccupied = primaryOccupied
+        self.primaryBodyBytes = primaryBodyBytes
+        self.segmentCount = segmentCount
+        self.sealedSegments = sealedSegments
+        self.fuse8Bytes = fuse8Bytes
+        self.mphfGBytes = mphfGBytes
+        self.openKeysBytes = openKeysBytes
+        self.classCL2Bytes = classCL2Bytes
+    }
+}
+
+
+
+extension FfiHeadResizeSizeSnapshot: Equatable, Hashable {
+    public static func ==(lhs: FfiHeadResizeSizeSnapshot, rhs: FfiHeadResizeSizeSnapshot) -> Bool {
+        if lhs.classAN != rhs.classAN {
+            return false
+        }
+        if lhs.primaryBits != rhs.primaryBits {
+            return false
+        }
+        if lhs.primarySlots != rhs.primarySlots {
+            return false
+        }
+        if lhs.primaryEntryB != rhs.primaryEntryB {
+            return false
+        }
+        if lhs.primaryOccupied != rhs.primaryOccupied {
+            return false
+        }
+        if lhs.primaryBodyBytes != rhs.primaryBodyBytes {
+            return false
+        }
+        if lhs.segmentCount != rhs.segmentCount {
+            return false
+        }
+        if lhs.sealedSegments != rhs.sealedSegments {
+            return false
+        }
+        if lhs.fuse8Bytes != rhs.fuse8Bytes {
+            return false
+        }
+        if lhs.mphfGBytes != rhs.mphfGBytes {
+            return false
+        }
+        if lhs.openKeysBytes != rhs.openKeysBytes {
+            return false
+        }
+        if lhs.classCL2Bytes != rhs.classCL2Bytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(classAN)
+        hasher.combine(primaryBits)
+        hasher.combine(primarySlots)
+        hasher.combine(primaryEntryB)
+        hasher.combine(primaryOccupied)
+        hasher.combine(primaryBodyBytes)
+        hasher.combine(segmentCount)
+        hasher.combine(sealedSegments)
+        hasher.combine(fuse8Bytes)
+        hasher.combine(mphfGBytes)
+        hasher.combine(openKeysBytes)
+        hasher.combine(classCL2Bytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHeadResizeSizeSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHeadResizeSizeSnapshot {
+        return
+            try FfiHeadResizeSizeSnapshot(
+                classAN: FfiConverterUInt64.read(from: &buf), 
+                primaryBits: FfiConverterUInt32.read(from: &buf), 
+                primarySlots: FfiConverterUInt64.read(from: &buf), 
+                primaryEntryB: FfiConverterUInt8.read(from: &buf), 
+                primaryOccupied: FfiConverterUInt64.read(from: &buf), 
+                primaryBodyBytes: FfiConverterUInt64.read(from: &buf), 
+                segmentCount: FfiConverterUInt64.read(from: &buf), 
+                sealedSegments: FfiConverterUInt64.read(from: &buf), 
+                fuse8Bytes: FfiConverterUInt64.read(from: &buf), 
+                mphfGBytes: FfiConverterUInt64.read(from: &buf), 
+                openKeysBytes: FfiConverterUInt64.read(from: &buf), 
+                classCL2Bytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiHeadResizeSizeSnapshot, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.classAN, into: &buf)
+        FfiConverterUInt32.write(value.primaryBits, into: &buf)
+        FfiConverterUInt64.write(value.primarySlots, into: &buf)
+        FfiConverterUInt8.write(value.primaryEntryB, into: &buf)
+        FfiConverterUInt64.write(value.primaryOccupied, into: &buf)
+        FfiConverterUInt64.write(value.primaryBodyBytes, into: &buf)
+        FfiConverterUInt64.write(value.segmentCount, into: &buf)
+        FfiConverterUInt64.write(value.sealedSegments, into: &buf)
+        FfiConverterUInt64.write(value.fuse8Bytes, into: &buf)
+        FfiConverterUInt64.write(value.mphfGBytes, into: &buf)
+        FfiConverterUInt64.write(value.openKeysBytes, into: &buf)
+        FfiConverterUInt64.write(value.classCL2Bytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeadResizeSizeSnapshot_lift(_ buf: RustBuffer) throws -> FfiHeadResizeSizeSnapshot {
+    return try FfiConverterTypeFfiHeadResizeSizeSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeadResizeSizeSnapshot_lower(_ value: FfiHeadResizeSizeSnapshot) -> RustBuffer {
+    return FfiConverterTypeFfiHeadResizeSizeSnapshot.lower(value)
+}
+
+
 public struct FfiHeaderRecord {
     public var prevFk: UInt64
     public var version: Int32
@@ -3449,6 +3637,160 @@ public func FfiConverterTypeFfiPointRecord_lift(_ buf: RustBuffer) throws -> Ffi
 #endif
 public func FfiConverterTypeFfiPointRecord_lower(_ value: FfiPointRecord) -> RustBuffer {
     return FfiConverterTypeFfiPointRecord.lower(value)
+}
+
+
+public struct FfiProcessOwnedSizes {
+    public var confPlans: UInt64
+    public var shRuns: UInt64
+    public var shHeads: UInt64
+    public var head: FfiHeadResizeSizeSnapshot
+    public var inflightLayers: UInt64
+    public var inflightPins: UInt64
+    public var inflightBytes: UInt64
+    public var h2hKeys: UInt64
+    public var fenceRuns: UInt64
+    public var bqPromoted: UInt64
+    public var wlocPacks: UInt64
+    public var wlocPairs: UInt64
+    public var wlocBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(confPlans: UInt64, shRuns: UInt64, shHeads: UInt64, head: FfiHeadResizeSizeSnapshot, inflightLayers: UInt64, inflightPins: UInt64, inflightBytes: UInt64, h2hKeys: UInt64, fenceRuns: UInt64, bqPromoted: UInt64, wlocPacks: UInt64, wlocPairs: UInt64, wlocBytes: UInt64) {
+        self.confPlans = confPlans
+        self.shRuns = shRuns
+        self.shHeads = shHeads
+        self.head = head
+        self.inflightLayers = inflightLayers
+        self.inflightPins = inflightPins
+        self.inflightBytes = inflightBytes
+        self.h2hKeys = h2hKeys
+        self.fenceRuns = fenceRuns
+        self.bqPromoted = bqPromoted
+        self.wlocPacks = wlocPacks
+        self.wlocPairs = wlocPairs
+        self.wlocBytes = wlocBytes
+    }
+}
+
+
+
+extension FfiProcessOwnedSizes: Equatable, Hashable {
+    public static func ==(lhs: FfiProcessOwnedSizes, rhs: FfiProcessOwnedSizes) -> Bool {
+        if lhs.confPlans != rhs.confPlans {
+            return false
+        }
+        if lhs.shRuns != rhs.shRuns {
+            return false
+        }
+        if lhs.shHeads != rhs.shHeads {
+            return false
+        }
+        if lhs.head != rhs.head {
+            return false
+        }
+        if lhs.inflightLayers != rhs.inflightLayers {
+            return false
+        }
+        if lhs.inflightPins != rhs.inflightPins {
+            return false
+        }
+        if lhs.inflightBytes != rhs.inflightBytes {
+            return false
+        }
+        if lhs.h2hKeys != rhs.h2hKeys {
+            return false
+        }
+        if lhs.fenceRuns != rhs.fenceRuns {
+            return false
+        }
+        if lhs.bqPromoted != rhs.bqPromoted {
+            return false
+        }
+        if lhs.wlocPacks != rhs.wlocPacks {
+            return false
+        }
+        if lhs.wlocPairs != rhs.wlocPairs {
+            return false
+        }
+        if lhs.wlocBytes != rhs.wlocBytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(confPlans)
+        hasher.combine(shRuns)
+        hasher.combine(shHeads)
+        hasher.combine(head)
+        hasher.combine(inflightLayers)
+        hasher.combine(inflightPins)
+        hasher.combine(inflightBytes)
+        hasher.combine(h2hKeys)
+        hasher.combine(fenceRuns)
+        hasher.combine(bqPromoted)
+        hasher.combine(wlocPacks)
+        hasher.combine(wlocPairs)
+        hasher.combine(wlocBytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiProcessOwnedSizes: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiProcessOwnedSizes {
+        return
+            try FfiProcessOwnedSizes(
+                confPlans: FfiConverterUInt64.read(from: &buf), 
+                shRuns: FfiConverterUInt64.read(from: &buf), 
+                shHeads: FfiConverterUInt64.read(from: &buf), 
+                head: FfiConverterTypeFfiHeadResizeSizeSnapshot.read(from: &buf), 
+                inflightLayers: FfiConverterUInt64.read(from: &buf), 
+                inflightPins: FfiConverterUInt64.read(from: &buf), 
+                inflightBytes: FfiConverterUInt64.read(from: &buf), 
+                h2hKeys: FfiConverterUInt64.read(from: &buf), 
+                fenceRuns: FfiConverterUInt64.read(from: &buf), 
+                bqPromoted: FfiConverterUInt64.read(from: &buf), 
+                wlocPacks: FfiConverterUInt64.read(from: &buf), 
+                wlocPairs: FfiConverterUInt64.read(from: &buf), 
+                wlocBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiProcessOwnedSizes, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.confPlans, into: &buf)
+        FfiConverterUInt64.write(value.shRuns, into: &buf)
+        FfiConverterUInt64.write(value.shHeads, into: &buf)
+        FfiConverterTypeFfiHeadResizeSizeSnapshot.write(value.head, into: &buf)
+        FfiConverterUInt64.write(value.inflightLayers, into: &buf)
+        FfiConverterUInt64.write(value.inflightPins, into: &buf)
+        FfiConverterUInt64.write(value.inflightBytes, into: &buf)
+        FfiConverterUInt64.write(value.h2hKeys, into: &buf)
+        FfiConverterUInt64.write(value.fenceRuns, into: &buf)
+        FfiConverterUInt64.write(value.bqPromoted, into: &buf)
+        FfiConverterUInt64.write(value.wlocPacks, into: &buf)
+        FfiConverterUInt64.write(value.wlocPairs, into: &buf)
+        FfiConverterUInt64.write(value.wlocBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProcessOwnedSizes_lift(_ buf: RustBuffer) throws -> FfiProcessOwnedSizes {
+    return try FfiConverterTypeFfiProcessOwnedSizes.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProcessOwnedSizes_lower(_ value: FfiProcessOwnedSizes) -> RustBuffer {
+    return FfiConverterTypeFfiProcessOwnedSizes.lower(value)
 }
 
 
@@ -7049,6 +7391,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_active_unknown_bits() != 626) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_apply_sh_pending() != 46832) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_archived_block_count() != 52553) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7136,7 +7481,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_confirm_cancelled() != 34129) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_disconnect_tip() != 57205) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_disconnect_tip_keep_pending() != 29148) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_drain_and_fence_hi() != 57925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_drop_sh_pending_from() != 39842) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_expected_next_bits() != 27901) {
@@ -7224,6 +7578,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_point_edge_count() != 22384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_process_owned_size_snapshot() != 17010) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_prune_write_create_loc() != 20758) {

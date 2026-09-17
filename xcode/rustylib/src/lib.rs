@@ -2346,6 +2346,39 @@ impl FfiQuery {
         .map_err(|_| RustyError::ConsensusError)
     }
 
+    pub fn locator_hashes(&self) -> Result<Vec<String>, RustyError> {
+        let hashes = self
+            .inner
+            .locator_hashes()
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(hashes.into_iter().map(rbitcoin_primitives::hex_encode).collect())
+    }
+
+    pub fn headers_after_locator(
+        &self,
+        locator_hashes_hex: Vec<String>,
+        stop_hash_hex: String,
+        limit: u64,
+    ) -> Result<Vec<String>, RustyError> {
+        let locator: Vec<bitcoin::BlockHash> = locator_hashes_hex
+            .into_iter()
+            .map(|h| parse_hash32(&h).map(bitcoin::BlockHash::from_byte_array))
+            .collect::<Result<_, _>>()?;
+        let stop = parse_hash32(&stop_hash_hex)?;
+        let headers = self
+            .inner
+            .headers_after_locator(&locator, bitcoin::BlockHash::from_byte_array(stop), limit as usize)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(headers
+            .into_iter()
+            .map(|h| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&h)))
+            .collect())
+    }
+
+    pub fn invalidate_height_by_hash_index(&self) {
+        self.inner.invalidate_height_by_hash_index();
+    }
+
     pub fn median_time_past(&self, height: u32) -> Result<u32, RustyError> {
         rbitcoin_consensus::median_time_past(&self.inner, rbitcoin_primitives::Height(height))
             .map_err(|_| RustyError::ConsensusError)
@@ -4864,6 +4897,14 @@ mod tests {
         assert_eq!(view, None);
         let sh_view = query.pin_sh_chain_view().unwrap();
         assert_eq!(sh_view, None);
+        let loc = query.locator_hashes().unwrap();
+        assert_eq!(loc.len(), 1);
+        assert_eq!(loc[0], "0".repeat(64));
+        let headers = query
+            .headers_after_locator(vec!["0".repeat(64)], "0".repeat(64), 2000)
+            .unwrap();
+        assert!(headers.is_empty());
+        query.invalidate_height_by_hash_index();
     }
 
     #[test]

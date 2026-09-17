@@ -1207,15 +1207,21 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func headerTxFks(headerFk: UInt64, hashHex: String?) throws  -> [UInt64]?
     
+    func headersAfterLocator(locatorHashesHex: [String], stopHashHex: String, limit: UInt64) throws  -> [String]
+    
     func heightOfHash(hashHex: String) throws  -> UInt64?
     
     func indexMode()  -> UInt8
+    
+    func invalidateHeightByHashIndex() 
     
     func isBlockArchived(hashHex: String) throws  -> Bool
     
     func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
     
     func isOutpointSpentAt(txidHex: String, vout: UInt32, tip: UInt32?) throws  -> Bool
+    
+    func locatorHashes() throws  -> [String]
     
     func lookupAlreadyTaken(height: UInt32)  -> Bool
     
@@ -1793,6 +1799,16 @@ open func headerTxFks(headerFk: UInt64, hashHex: String?)throws  -> [UInt64]? {
 })
 }
     
+open func headersAfterLocator(locatorHashesHex: [String], stopHashHex: String, limit: UInt64)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_headers_after_locator(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(locatorHashesHex),
+        FfiConverterString.lower(stopHashHex),
+        FfiConverterUInt64.lower(limit),$0
+    )
+})
+}
+    
 open func heightOfHash(hashHex: String)throws  -> UInt64? {
     return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_height_of_hash(self.uniffiClonePointer(),
@@ -1806,6 +1822,12 @@ open func indexMode() -> UInt8 {
     uniffi_rustylib_fn_method_ffiquery_index_mode(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func invalidateHeightByHashIndex() {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_invalidate_height_by_hash_index(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func isBlockArchived(hashHex: String)throws  -> Bool {
@@ -1831,6 +1853,13 @@ open func isOutpointSpentAt(txidHex: String, vout: UInt32, tip: UInt32?)throws  
         FfiConverterString.lower(txidHex),
         FfiConverterUInt32.lower(vout),
         FfiConverterOptionUInt32.lower(tip),$0
+    )
+})
+}
+    
+open func locatorHashes()throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_locator_hashes(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -8243,10 +8272,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_header_tx_fks() != 53889) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_headers_after_locator() != 25950) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_height_of_hash() != 45413) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_index_mode() != 16153) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_invalidate_height_by_hash_index() != 39838) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_is_block_archived() != 53320) {
@@ -8256,6 +8291,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_is_outpoint_spent_at() != 60926) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_locator_hashes() != 32840) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_lookup_already_taken() != 45510) {

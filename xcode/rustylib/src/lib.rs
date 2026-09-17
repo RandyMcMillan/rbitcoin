@@ -1857,6 +1857,17 @@ impl FfiQuery {
         Ok(id)
     }
 
+    pub fn block_queue_drop_resolved_from(&self, height: u32) {
+        self.inner.block_queue_drop_resolved_from(height);
+    }
+
+    pub fn block_queue_mark_resolve_complete_wave(&self, heights: Vec<u32>) -> Result<u64, RustyError> {
+        self.inner
+            .block_queue_mark_resolve_complete_wave(&heights)
+            .map_err(|_| RustyError::StoreError)
+            .map(|n| n as u64)
+    }
+
     pub fn tx_fk_by_txid_tip(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
         let fk = self
@@ -3613,6 +3624,9 @@ mod tests {
         let dequeued = query.block_queue_dequeue_height(100).unwrap();
         assert_eq!(dequeued, 1);
         assert!(!query.block_queue_has_height(100));
+        query.block_queue_drop_resolved_from(50);
+        assert_eq!(query.block_queue_mark_resolve_complete_wave(vec![101]).unwrap(), 1);
+        assert!(query.block_queue_is_resolve_complete(101));
     }
 
     #[test]

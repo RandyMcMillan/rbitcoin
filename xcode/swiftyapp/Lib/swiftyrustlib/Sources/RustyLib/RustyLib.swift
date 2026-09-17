@@ -839,6 +839,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueueDequeueHeight(height: UInt32) throws  -> UInt64
     
+    func blockQueueDropResolvedFrom(height: UInt32) 
+    
     func blockQueueEnqueue(height: UInt32, hashHex: String, headerFk: UInt64, payload: Data) throws  -> UInt64
     
     func blockQueueHasHash(hashHex: String) throws  -> Bool
@@ -852,6 +854,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func blockQueueListMeta()  -> [FfiQueuedBlockMeta]
     
     func blockQueueMarkResolveComplete(height: UInt32) throws 
+    
+    func blockQueueMarkResolveCompleteWave(heights: [UInt32]) throws  -> UInt64
     
     func blockQueueMaxHeight()  -> UInt64?
     
@@ -1109,6 +1113,13 @@ open func blockQueueDequeueHeight(height: UInt32)throws  -> UInt64 {
 })
 }
     
+open func blockQueueDropResolvedFrom(height: UInt32) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_drop_resolved_from(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+}
+}
+    
 open func blockQueueEnqueue(height: UInt32, hashHex: String, headerFk: UInt64, payload: Data)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiquery_block_queue_enqueue(self.uniffiClonePointer(),
@@ -1164,6 +1175,14 @@ open func blockQueueMarkResolveComplete(height: UInt32)throws  {try rustCallWith
         FfiConverterUInt32.lower(height),$0
     )
 }
+}
+    
+open func blockQueueMarkResolveCompleteWave(heights: [UInt32])throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_mark_resolve_complete_wave(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt32.lower(heights),$0
+    )
+})
 }
     
 open func blockQueueMaxHeight() -> UInt64? {
@@ -6858,6 +6877,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_dequeue_height() != 48079) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_drop_resolved_from() != 37852) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_enqueue() != 2897) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6877,6 +6899,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_mark_resolve_complete() != 29201) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_mark_resolve_complete_wave() != 63864) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_max_height() != 61436) {

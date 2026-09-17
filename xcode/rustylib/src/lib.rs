@@ -1825,6 +1825,38 @@ impl FfiQuery {
             .map(|n| n as u64)
     }
 
+    pub fn block_queue_offer(
+        &self,
+        height: u32,
+        hash_hex: String,
+        header_fk: u64,
+        payload: Vec<u8>,
+    ) -> Result<FfiBlockQueueOffer, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let offer = self
+            .inner
+            .block_queue_offer(height, hash, header_fk, &payload)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiBlockQueueOffer {
+            queue_id: offer.queue_id,
+        })
+    }
+
+    pub fn block_queue_enqueue(
+        &self,
+        height: u32,
+        hash_hex: String,
+        header_fk: u64,
+        payload: Vec<u8>,
+    ) -> Result<u64, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let id = self
+            .inner
+            .block_queue_enqueue(height, hash, header_fk, &payload)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(id)
+    }
+
     pub fn tx_fk_by_txid_tip(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
         let fk = self
@@ -2212,6 +2244,11 @@ impl From<rbitcoin_store::QueuedBlockMeta> for FfiQueuedBlockMeta {
             resolve_complete: m.resolve_complete,
         }
     }
+}
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiBlockQueueOffer {
+    pub queue_id: u64,
 }
 
 // --- Mempool FFI ---
@@ -3558,6 +3595,24 @@ mod tests {
         query.set_spend_index(false);
         assert!(!query.spend_index_enabled());
         assert!(query.unspent_create_vouts(1, vec![0, 1]).is_err());
+    }
+
+    #[test]
+    fn test_query_block_queue_offer_enqueue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query7").to_str().unwrap().to_string();
+        let query = FfiQuery::open_or_create(path).unwrap();
+        let hash = "0".repeat(64);
+        let offer = query.block_queue_offer(100, hash.clone(), 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(offer.queue_id, 1);
+        let id = query.block_queue_enqueue(101, hash.clone(), 2, vec![4, 5, 6]).unwrap();
+        assert_eq!(id, 2);
+        assert!(query.block_queue_has_height(100));
+        assert!(query.block_queue_has_height(101));
+        assert_eq!(query.block_queue_count(), 2);
+        let dequeued = query.block_queue_dequeue_height(100).unwrap();
+        assert_eq!(dequeued, 1);
+        assert!(!query.block_queue_has_height(100));
     }
 
     #[test]

@@ -1770,6 +1770,32 @@ impl FfiQuery {
         self.inner.block_queue_soft_pressure()
     }
 
+    pub fn take_disconnect(&self, seen_gen: u64) -> Option<u32> {
+        let mut gen = seen_gen;
+        self.inner.take_disconnect(&mut gen)
+    }
+
+    pub fn block_queue_unresolved_heights(
+        &self,
+        path_lo: u32,
+        skip: Vec<u32>,
+        cap: u64,
+    ) -> Vec<u32> {
+        let skip_set: std::collections::HashSet<u32> = skip.into_iter().collect();
+        self.inner
+            .block_queue_unresolved_heights(path_lo, &skip_set, cap as usize)
+    }
+
+    pub fn block_queue_payload_by_hash(
+        &self,
+        hash_hex: String,
+    ) -> Result<Option<Vec<u8>>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner
+            .block_queue_payload_by_hash(&hash)
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn block_queue_take_raw_clone_n(&self) -> u64 {
         self.inner.block_queue_take_raw_clone_n()
     }
@@ -3739,6 +3765,12 @@ mod tests {
         assert!(!query.block_queue_has_hash("0".repeat(64)).unwrap());
         assert_eq!(query.block_queue_dequeue_height(0).unwrap(), 0);
         assert_eq!(query.tx_fk_by_txid_tip("0".repeat(64)).unwrap(), None);
+        assert_eq!(query.take_disconnect(0), None);
+        assert!(query.block_queue_unresolved_heights(0, vec![], 100).is_empty());
+        assert_eq!(
+            query.block_queue_payload_by_hash("0".repeat(64)).unwrap(),
+            None
+        );
         query.set_lookup_taken_hi(Some(100));
         assert_eq!(query.lookup_taken_hi(), Some(100));
         query.set_lookup_taken_hi(None);

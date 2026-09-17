@@ -865,6 +865,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func blockQueuePayload(height: UInt32) throws  -> Data?
     
+    func blockQueuePayloadByHash(hashHex: String) throws  -> Data?
+    
     func blockQueuePromotedCount()  -> UInt64
     
     func blockQueueQueuedHeights()  -> [UInt32]
@@ -878,6 +880,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func blockQueueTakeRaw(height: UInt32)  -> FfiTakenRaw?
     
     func blockQueueTakeRawCloneN()  -> UInt64
+    
+    func blockQueueUnresolvedHeights(pathLo: UInt32, skip: [UInt32], cap: UInt64)  -> [UInt32]
     
     func blockQueueUpdateSoftPressure(rateBlocksPerS: Double?)  -> Bool
     
@@ -1012,6 +1016,8 @@ public protocol FfiQueryProtocol : AnyObject {
     func spendersAt(txidHex: String, vout: UInt32, tip: UInt32?) throws  -> [FfiPointRecord]
     
     func syncShSealFromIncludeHwm() throws 
+    
+    func takeDisconnect(seenGen: UInt64)  -> UInt32?
     
     func tipHeaderFk() throws  -> UInt64?
     
@@ -1245,6 +1251,14 @@ open func blockQueuePayload(height: UInt32)throws  -> Data? {
 })
 }
     
+open func blockQueuePayloadByHash(hashHex: String)throws  -> Data? {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_payload_by_hash(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
 open func blockQueuePromotedCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_promoted_count(self.uniffiClonePointer(),$0
@@ -1292,6 +1306,16 @@ open func blockQueueTakeRaw(height: UInt32) -> FfiTakenRaw? {
 open func blockQueueTakeRawCloneN() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiquery_block_queue_take_raw_clone_n(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueUnresolvedHeights(pathLo: UInt32, skip: [UInt32], cap: UInt64) -> [UInt32] {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_block_queue_unresolved_heights(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(pathLo),
+        FfiConverterSequenceUInt32.lower(skip),
+        FfiConverterUInt64.lower(cap),$0
     )
 })
 }
@@ -1796,6 +1820,14 @@ open func syncShSealFromIncludeHwm()throws  {try rustCallWithError(FfiConverterT
     uniffi_rustylib_fn_method_ffiquery_sync_sh_seal_from_include_hwm(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+open func takeDisconnect(seenGen: UInt64) -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_take_disconnect(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(seenGen),$0
+    )
+})
 }
     
 open func tipHeaderFk()throws  -> UInt64? {
@@ -7534,6 +7566,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_payload() != 53504) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_payload_by_hash() != 16297) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_promoted_count() != 34768) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7553,6 +7588,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_take_raw_clone_n() != 24052) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_block_queue_unresolved_heights() != 1336) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_block_queue_update_soft_pressure() != 59654) {
@@ -7754,6 +7792,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_sync_sh_seal_from_include_hwm() != 38492) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_take_disconnect() != 36538) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_tip_header_fk() != 41103) {

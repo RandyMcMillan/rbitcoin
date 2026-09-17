@@ -2155,6 +2155,68 @@ impl FfiQuery {
         self.inner.sh_index_enabled()
     }
 
+    pub fn enter_direct_index_mode(&self) -> Result<(), RustyError> {
+        self.inner
+            .enter_direct_index_mode()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn enter_direct_index_mode_sh(&self, shindex: bool) -> Result<(), RustyError> {
+        self.inner
+            .enter_direct_index_mode_sh(shindex)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn enter_tip_index_mode(&self) {
+        self.inner.enter_tip_index_mode();
+    }
+
+    pub fn sync_sh_seal_from_include_hwm(&self) -> Result<(), RustyError> {
+        self.inner
+            .sync_sh_seal_from_include_hwm()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn finalize_sh_runs(&self) -> Result<u64, RustyError> {
+        self.inner.finalize_sh_runs().map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn sh_lag_heights(&self) -> u32 {
+        self.inner.sh_lag_heights()
+    }
+
+    pub fn pin_chain_view_at(
+        &self,
+        hash_hex: String,
+    ) -> Result<Option<FfiChainView>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let view = self
+            .inner
+            .pin_chain_view_at(&hash)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(view.map(|v| FfiChainView {
+            height: v.height.0 as u64,
+            hash: rbitcoin_primitives::hex_encode(v.hash),
+            header_fk: v.header_fk.0,
+        }))
+    }
+
+    pub fn pin_sh_chain_view_at(
+        &self,
+        hash_hex: String,
+    ) -> Result<Option<FfiChainView>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let view = self
+            .inner
+            .pin_sh_chain_view_at(&hash)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(view.map(|v| FfiChainView {
+            height: v.height.0 as u64,
+            hash: rbitcoin_primitives::hex_encode(v.hash),
+            header_fk: v.header_fk.0,
+        }))
+    }
+
     pub fn backfill_sp_tweaks(&self, network: String) -> Result<u32, RustyError> {
         let params = chain_params_for_network(&network)?;
         rbitcoin_consensus::backfill_sp_tweaks(&self.inner, &params)
@@ -3683,6 +3745,17 @@ mod tests {
         assert_eq!(sizes.h2h_keys, 0);
         query.apply_sh_pending().unwrap();
         query.drop_sh_pending_from(0);
+        query.enter_tip_index_mode();
+        assert_eq!(query.index_mode(), 2);
+        query.enter_direct_index_mode().unwrap();
+        assert_eq!(query.index_mode(), 1);
+        query.enter_direct_index_mode_sh(false).unwrap();
+        assert!(!query.sh_index_enabled());
+        assert_eq!(query.sh_lag_heights(), 0);
+        assert_eq!(query.pin_chain_view_at("0".repeat(64)).unwrap(), None);
+        assert_eq!(query.pin_sh_chain_view_at("0".repeat(64)).unwrap(), None);
+        query.sync_sh_seal_from_include_hwm().unwrap();
+        assert_eq!(query.finalize_sh_runs().unwrap(), 0);
     }
 
     #[test]

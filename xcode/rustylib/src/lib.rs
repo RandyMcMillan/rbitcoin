@@ -1465,6 +1465,22 @@ impl FfiStore {
         self.inner.class_c_l2_resident_bytes()
     }
 
+    pub fn is_confirmed_strong(&self, tx_fk: u64) -> Result<bool, RustyError> {
+        self.inner
+            .is_confirmed_strong(rbitcoin_primitives::Fk(tx_fk))
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn is_confirmed_strong_at(
+        &self,
+        tx_fk: u64,
+        tip: Option<u32>,
+    ) -> Result<bool, RustyError> {
+        self.inner
+            .is_confirmed_strong_at(rbitcoin_primitives::Fk(tx_fk), tip)
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn fence_max_connected_fk(&self) -> u64 {
         self.inner.fence_max_connected_fk()
     }
@@ -3433,6 +3449,8 @@ mod tests {
         {
             let store = FfiStore::open(path).unwrap();
             assert_eq!(store.tip_height(), None);
+            assert!(!store.is_confirmed_strong(1).unwrap());
+            assert!(!store.is_confirmed_strong_at(1, None).unwrap());
         }
     }
 

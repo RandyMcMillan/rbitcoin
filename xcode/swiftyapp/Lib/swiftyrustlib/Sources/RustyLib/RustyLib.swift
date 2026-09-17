@@ -2011,6 +2011,10 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func heightFenceRunCount()  -> UInt64
     
+    func isConfirmedStrong(txFk: UInt64) throws  -> Bool
+    
+    func isConfirmedStrongAt(txFk: UInt64, tip: UInt32?) throws  -> Bool
+    
     func isSplit()  -> Bool
     
     func path()  -> String
@@ -2219,6 +2223,23 @@ open func headerSlots() -> UInt64 {
 open func heightFenceRunCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_height_fence_run_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isConfirmedStrong(txFk: UInt64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_is_confirmed_strong(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(txFk),$0
+    )
+})
+}
+    
+open func isConfirmedStrongAt(txFk: UInt64, tip: UInt32?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_is_confirmed_strong_at(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(txFk),
+        FfiConverterOptionUInt32.lower(tip),$0
     )
 })
 }
@@ -7826,6 +7847,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_height_fence_run_count() != 63822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_is_confirmed_strong() != 8849) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_is_confirmed_strong_at() != 26581) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_is_split() != 47137) {

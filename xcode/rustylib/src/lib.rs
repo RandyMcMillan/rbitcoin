@@ -422,6 +422,16 @@ pub fn log_message(level: String, message: String) {
     }
 }
 
+#[uniffi::export]
+pub fn init_log_from_env() -> bool {
+    rbitcoin_log::init_from_env()
+}
+
+#[uniffi::export]
+pub fn init_log_off() {
+    rbitcoin_log::init_off();
+}
+
 // --- Network Seeds FFI ---
 
 #[uniffi::export]
@@ -2162,6 +2172,12 @@ impl FfiQuery {
         self.inner.point_edge_count()
     }
 
+    pub fn backfill_tx_index(&self) -> Result<u64, RustyError> {
+        self.inner
+            .backfill_tx_index(|_done, _total, _rate| {})
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn tip_header_fk(&self) -> Result<Option<u64>, RustyError> {
         let fk = self
             .inner
@@ -3693,6 +3709,9 @@ mod tests {
         init_log_level("off".to_string());
         assert!(!log_level_enabled("error".to_string()));
         init_log_level("info".to_string());
+        init_log_off();
+        assert!(!log_level_enabled("info".to_string()));
+        init_log_from_env();
     }
 
     #[test]
@@ -3869,6 +3888,7 @@ mod tests {
         assert_eq!(query.pin_sh_chain_view_at("0".repeat(64)).unwrap(), None);
         query.sync_sh_seal_from_include_hwm().unwrap();
         assert_eq!(query.finalize_sh_runs().unwrap(), 0);
+        assert_eq!(query.backfill_tx_index().unwrap(), 0);
     }
 
     #[test]

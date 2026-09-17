@@ -2198,6 +2198,43 @@ impl FfiQuery {
         self.inner.clear_confirm_cancel();
     }
 
+    pub fn disconnect_tip(&self) -> Result<(), RustyError> {
+        self.inner.disconnect_tip().map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn disconnect_tip_keep_pending(&self) -> Result<(), RustyError> {
+        self.inner
+            .disconnect_tip_keep_pending()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn apply_sh_pending(&self) -> Result<(), RustyError> {
+        self.inner.apply_sh_pending().map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn drop_sh_pending_from(&self, height: u32) {
+        self.inner.drop_sh_pending_from(rbitcoin_primitives::Height(height));
+    }
+
+    pub fn process_owned_size_snapshot(&self) -> FfiProcessOwnedSizes {
+        let s = self.inner.process_owned_size_snapshot();
+        FfiProcessOwnedSizes {
+            conf_plans: s.conf_plans as u64,
+            sh_runs: s.sh_runs as u64,
+            sh_heads: s.sh_heads as u64,
+            head: s.head.into(),
+            inflight_layers: s.inflight_layers as u64,
+            inflight_pins: s.inflight_pins as u64,
+            inflight_bytes: s.inflight_bytes,
+            h2h_keys: s.h2h_keys as u64,
+            fence_runs: s.fence_runs as u64,
+            bq_promoted: s.bq_promoted as u64,
+            wloc_packs: s.wloc_packs as u64,
+            wloc_pairs: s.wloc_pairs as u64,
+            wloc_bytes: s.wloc_bytes,
+        }
+    }
+
     pub fn get_header_by_hash(
         &self,
         hash_hex: String,
@@ -2277,6 +2314,58 @@ pub struct FfiTakenRaw {
     pub hash: String,
     pub header_fk: u64,
     pub payload: Vec<u8>,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiHeadResizeSizeSnapshot {
+    pub class_a_n: u64,
+    pub primary_bits: u32,
+    pub primary_slots: u64,
+    pub primary_entry_b: u8,
+    pub primary_occupied: u64,
+    pub primary_body_bytes: u64,
+    pub segment_count: u64,
+    pub sealed_segments: u64,
+    pub fuse8_bytes: u64,
+    pub mphf_g_bytes: u64,
+    pub open_keys_bytes: u64,
+    pub class_c_l2_bytes: u64,
+}
+
+impl From<rbitcoin_store::HeadResizeSizeSnapshot> for FfiHeadResizeSizeSnapshot {
+    fn from(h: rbitcoin_store::HeadResizeSizeSnapshot) -> Self {
+        Self {
+            class_a_n: h.class_a_n,
+            primary_bits: h.primary_bits,
+            primary_slots: h.primary_slots,
+            primary_entry_b: h.primary_entry_b,
+            primary_occupied: h.primary_occupied,
+            primary_body_bytes: h.primary_body_bytes,
+            segment_count: h.segment_count,
+            sealed_segments: h.sealed_segments,
+            fuse8_bytes: h.fuse8_bytes,
+            mphf_g_bytes: h.mphf_g_bytes,
+            open_keys_bytes: h.open_keys_bytes,
+            class_c_l2_bytes: h.class_c_l2_bytes,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiProcessOwnedSizes {
+    pub conf_plans: u64,
+    pub sh_runs: u64,
+    pub sh_heads: u64,
+    pub head: FfiHeadResizeSizeSnapshot,
+    pub inflight_layers: u64,
+    pub inflight_pins: u64,
+    pub inflight_bytes: u64,
+    pub h2h_keys: u64,
+    pub fence_runs: u64,
+    pub bq_promoted: u64,
+    pub wloc_packs: u64,
+    pub wloc_pairs: u64,
+    pub wloc_bytes: u64,
 }
 
 // --- Mempool FFI ---
@@ -3589,6 +3678,11 @@ mod tests {
         assert!(!query.lookup_already_taken(0));
         query.flush_header_archive().unwrap();
         query.flush().unwrap();
+        let sizes = query.process_owned_size_snapshot();
+        assert_eq!(sizes.conf_plans, 0);
+        assert_eq!(sizes.h2h_keys, 0);
+        query.apply_sh_pending().unwrap();
+        query.drop_sh_pending_from(0);
     }
 
     #[test]

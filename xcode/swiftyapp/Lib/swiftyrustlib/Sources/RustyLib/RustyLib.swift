@@ -2059,13 +2059,21 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func txBodyRange(fk: UInt64) throws  -> FfiTxRange
     
+    func txBodyRangeBatch(fks: [UInt64]) throws  -> [FfiTxRange?]
+    
     func txHeadBits()  -> UInt32
     
     func txHeightGet(txFk: UInt64) throws  -> UInt32?
     
+    func txHeightGetBatch(fks: [UInt64]) throws  -> [UInt32?]
+    
     func txInwitRange(fk: UInt64) throws  -> FfiTxRange
     
     func txSpentRange(fk: UInt64) throws  -> FfiTxRange
+    
+    func txSpentRangeBatch(fks: [UInt64]) throws  -> [FfiTxRange?]
+    
+    func txidsGetMany(fks: [UInt64]) throws  -> [String?]
     
 }
 
@@ -2318,6 +2326,14 @@ open func txBodyRange(fk: UInt64)throws  -> FfiTxRange {
 })
 }
     
+open func txBodyRangeBatch(fks: [UInt64])throws  -> [FfiTxRange?] {
+    return try  FfiConverterSequenceOptionTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_body_range_batch(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt64.lower(fks),$0
+    )
+})
+}
+    
 open func txHeadBits() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_tx_head_bits(self.uniffiClonePointer(),$0
@@ -2329,6 +2345,14 @@ open func txHeightGet(txFk: UInt64)throws  -> UInt32? {
     return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_tx_height_get(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(txFk),$0
+    )
+})
+}
+    
+open func txHeightGetBatch(fks: [UInt64])throws  -> [UInt32?] {
+    return try  FfiConverterSequenceOptionUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_height_get_batch(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt64.lower(fks),$0
     )
 })
 }
@@ -2345,6 +2369,22 @@ open func txSpentRange(fk: UInt64)throws  -> FfiTxRange {
     return try  FfiConverterTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_tx_spent_range(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
+open func txSpentRangeBatch(fks: [UInt64])throws  -> [FfiTxRange?] {
+    return try  FfiConverterSequenceOptionTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_spent_range_batch(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt64.lower(fks),$0
+    )
+})
+}
+    
+open func txidsGetMany(fks: [UInt64])throws  -> [String?] {
+    return try  FfiConverterSequenceOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_txids_get_many(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt64.lower(fks),$0
     )
 })
 }
@@ -4927,6 +4967,30 @@ fileprivate struct FfiConverterOptionTypeFfiTakenRaw: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiTxRange: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTxRange?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiTxRange.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiTxRange.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiTxRecord: FfiConverterRustBuffer {
     typealias SwiftType = FfiTxRecord?
 
@@ -5266,6 +5330,81 @@ fileprivate struct FfiConverterSequenceTypeFfiTaprootOut: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiTaprootOut.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32?]
+
+    public static func write(_ value: [UInt32?], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterOptionUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32?] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32?]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterOptionUInt32.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = [String?]
+
+    public static func write(_ value: [String?], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterOptionString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String?] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String?]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterOptionString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceOptionTypeFfiTxRange: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTxRange?]
+
+    public static func write(_ value: [FfiTxRange?], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterOptionTypeFfiTxRange.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTxRange?] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTxRange?]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterOptionTypeFfiTxRange.read(from: &buf))
         }
         return seq
     }
@@ -7914,16 +8053,28 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_tx_body_range() != 6692) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_body_range_batch() != 16122) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_tx_head_bits() != 27031) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tx_height_get() != 13849) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_height_get_batch() != 60118) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_tx_inwit_range() != 1792) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tx_spent_range() != 35074) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_spent_range_batch() != 11787) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_txids_get_many() != 34257) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {

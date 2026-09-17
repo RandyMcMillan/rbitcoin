@@ -1515,6 +1515,53 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)
     }
 
+    pub fn tx_height_get_batch(&self, fks: Vec<u64>) -> Result<Vec<Option<u32>>, RustyError> {
+        let fks: Vec<rbitcoin_primitives::Fk> =
+            fks.into_iter().map(rbitcoin_primitives::Fk).collect();
+        self.inner
+            .tx_height_get_batch(&fks)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn txids_get_many(&self, fks: Vec<u64>) -> Result<Vec<Option<String>>, RustyError> {
+        let fks: Vec<rbitcoin_primitives::Fk> =
+            fks.into_iter().map(rbitcoin_primitives::Fk).collect();
+        let txids = self.inner.txids_get_many(&fks).map_err(|_| RustyError::StoreError)?;
+        Ok(txids.into_iter().map(|t| t.map(rbitcoin_primitives::hex_encode)).collect())
+    }
+
+    pub fn tx_body_range_batch(
+        &self,
+        fks: Vec<u64>,
+    ) -> Result<Vec<Option<FfiTxRange>>, RustyError> {
+        let fks: Vec<rbitcoin_primitives::Fk> =
+            fks.into_iter().map(rbitcoin_primitives::Fk).collect();
+        let ranges = self
+            .inner
+            .tx_body_range_batch(&fks)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(ranges
+            .into_iter()
+            .map(|r| r.map(|(offset, len)| FfiTxRange { offset, len }))
+            .collect())
+    }
+
+    pub fn tx_spent_range_batch(
+        &self,
+        fks: Vec<u64>,
+    ) -> Result<Vec<Option<FfiTxRange>>, RustyError> {
+        let fks: Vec<rbitcoin_primitives::Fk> =
+            fks.into_iter().map(rbitcoin_primitives::Fk).collect();
+        let ranges = self
+            .inner
+            .tx_spent_range_batch(&fks)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(ranges
+            .into_iter()
+            .map(|r| r.map(|(offset, len)| FfiTxRange { offset, len }))
+            .collect())
+    }
+
     pub fn get_fk_by_txid(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
         let fk = self
@@ -3477,6 +3524,22 @@ mod tests {
             assert_eq!(store.tip_height(), None);
             assert!(!store.is_confirmed_strong(1).unwrap());
             assert!(!store.is_confirmed_strong_at(1, None).unwrap());
+            assert_eq!(
+                store.tx_height_get_batch(vec![1, 2]).unwrap(),
+                vec![None, None]
+            );
+            assert_eq!(
+                store.txids_get_many(vec![1, 2]).unwrap(),
+                vec![None, None]
+            );
+            assert_eq!(
+                store.tx_body_range_batch(vec![1, 2]).unwrap(),
+                vec![None, None]
+            );
+            assert_eq!(
+                store.tx_spent_range_batch(vec![1, 2]).unwrap(),
+                vec![None, None]
+            );
         }
     }
 

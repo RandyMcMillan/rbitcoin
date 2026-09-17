@@ -917,6 +917,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func isOutpointSpentAt(txidHex: String, vout: UInt32, tip: UInt32?) throws  -> Bool
     
+    func lookupAlreadyTaken(height: UInt32)  -> Bool
+    
     func lookupStartedHi()  -> UInt64?
     
     func lookupTakenHi()  -> UInt64?
@@ -1396,6 +1398,14 @@ open func isOutpointSpentAt(txidHex: String, vout: UInt32, tip: UInt32?)throws  
         FfiConverterString.lower(txidHex),
         FfiConverterUInt32.lower(vout),
         FfiConverterOptionUInt32.lower(tip),$0
+    )
+})
+}
+    
+open func lookupAlreadyTaken(height: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_lookup_already_taken(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
     )
 })
 }
@@ -6879,6 +6889,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_is_outpoint_spent_at() != 60926) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_lookup_already_taken() != 45510) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_lookup_started_hi() != 12161) {

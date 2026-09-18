@@ -4352,6 +4352,223 @@ impl FfiBlockCache {
     }
 }
 
+// --- ChainHub FFI ---
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiAcceptOutcome {
+    Accepted { height: u32 },
+    AlreadyHave,
+    IgnoredWeaker,
+}
+
+impl From<rbitcoin_net::AcceptOutcome> for FfiAcceptOutcome {
+    fn from(o: rbitcoin_net::AcceptOutcome) -> Self {
+        match o {
+            rbitcoin_net::AcceptOutcome::Accepted { height } => Self::Accepted { height },
+            rbitcoin_net::AcceptOutcome::AlreadyHave => Self::AlreadyHave,
+            rbitcoin_net::AcceptOutcome::IgnoredWeaker => Self::IgnoredWeaker,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiChainTipInfo {
+    pub height: u32,
+    pub hash: String,
+    pub branchlen: u32,
+    pub status: String,
+}
+
+#[derive(uniffi::Object)]
+pub struct FfiChainHub {
+    inner: rbitcoin_net::ChainHub,
+}
+
+#[uniffi::export]
+impl FfiChainHub {
+    #[uniffi::constructor]
+    pub fn open(
+        query_path: String,
+        network: String,
+        milestone_height: u32,
+    ) -> Result<Arc<Self>, RustyError> {
+        let query =
+            rbitcoin_query::Query::open_or_create(&query_path).map_err(|_| RustyError::StoreError)?;
+        let params = chain_params_for_network(&network)?;
+        let milestone = rbitcoin_consensus::Milestone {
+            height: milestone_height,
+        };
+        Ok(Arc::new(Self {
+            inner: rbitcoin_net::ChainHub::new(query, params, milestone),
+        }))
+    }
+
+    pub fn ensure_genesis(&self) -> Result<(), RustyError> {
+        self.inner.ensure_genesis().map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn tip_height(&self) -> Option<u32> {
+        self.inner.tip_height()
+    }
+
+    pub fn tip_hash(&self) -> Option<String> {
+        self.inner.tip_hash().map(|h| h.to_string())
+    }
+
+    pub fn tip_header(&self) -> Option<String> {
+        self.inner
+            .tip_header()
+            .map(|h| bitcoin::consensus::encode::serialize_hex(&h))
+    }
+
+    pub fn has_block(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self.inner.has_block(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn is_connected(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self.inner.is_connected(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn is_block_invalid(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self.inner.is_block_invalid(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn in_ibd(&self) -> bool {
+        self.inner.in_ibd()
+    }
+
+    pub fn tip_is_stale_for_ibd(&self) -> bool {
+        self.inner.tip_is_stale_for_ibd()
+    }
+
+    pub fn gbt_assembled(&self) -> bool {
+        self.inner.gbt_assembled()
+    }
+
+    pub fn max_tip_age_secs(&self) -> u64 {
+        self.inner.max_tip_age_secs()
+    }
+
+    pub fn prefill_compact(&self) -> bool {
+        self.inner.prefill_compact()
+    }
+
+    pub fn block_min_tx_fee_sat_kvb(&self) -> u64 {
+        self.inner.block_min_tx_fee_sat_kvb()
+    }
+
+    pub fn gbt_block_version(&self) -> i32 {
+        self.inner.gbt_block_version()
+    }
+
+    pub fn feefilter_sat_kvb(&self) -> u64 {
+        self.inner.feefilter_sat_kvb()
+    }
+
+    pub fn note_asked_block(&self, hash_hex: String) -> Result<(), RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner.note_asked_block(bitcoin::BlockHash::from_byte_array(hash));
+        Ok(())
+    }
+
+    pub fn forget_asked_block(&self, hash_hex: String) -> Result<(), RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner.forget_asked_block(&bitcoin::BlockHash::from_byte_array(hash));
+        Ok(())
+    }
+
+    pub fn already_have_or_asked_block(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self
+            .inner
+            .already_have_or_asked_block(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn note_gbt_assembled(&self) {
+        self.inner.note_gbt_assembled();
+    }
+
+    pub fn set_max_tip_age_secs(&self, secs: u64) {
+        self.inner.set_max_tip_age_secs(secs);
+    }
+
+    pub fn set_prefill_compact(&self, on: bool) {
+        self.inner.set_prefill_compact(on);
+    }
+
+    pub fn set_block_min_tx_fee_sat_kvb(&self, sat_kvb: u64) {
+        self.inner.set_block_min_tx_fee_sat_kvb(sat_kvb);
+    }
+
+    pub fn set_block_version(&self, v: i32) {
+        self.inner.set_block_version(v);
+    }
+
+    pub fn accept_block(&self, block_hex: String) -> Result<FfiAcceptOutcome, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.accept_block(block).map_err(|_| RustyError::ConsensusError)?.into())
+    }
+
+    pub fn accept_received_block(
+        &self,
+        block_hex: String,
+    ) -> Result<FfiAcceptOutcome, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self
+            .inner
+            .accept_received_block(block)
+            .map_err(|_| RustyError::ConsensusError)?
+            .into())
+    }
+
+    pub fn hold_unconnected_body(&self, block_hex: String) -> Result<(), RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.hold_unconnected_body(block);
+        Ok(())
+    }
+
+    pub fn held_body(&self, hash_hex: String) -> Result<Option<String>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self
+            .inner
+            .held_body(&bitcoin::BlockHash::from_byte_array(hash))
+            .map(|b| bitcoin::consensus::encode::serialize_hex(&b)))
+    }
+
+    pub fn cache_body_count(&self) -> u64 {
+        self.inner.cache_body_count() as u64
+    }
+
+    pub fn held_body_count(&self) -> u64 {
+        self.inner.held_body_count() as u64
+    }
+
+    pub fn chaintips(&self) -> Vec<FfiChainTipInfo> {
+        self.inner
+            .chaintips()
+            .into_iter()
+            .map(|t| FfiChainTipInfo {
+                height: t.height,
+                hash: t.hash.to_string(),
+                branchlen: t.branchlen,
+                status: t.status.to_string(),
+            })
+            .collect()
+    }
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -7499,6 +7716,52 @@ mod tests {
         let inc = FfiPeerFlags::new(8);
         assert!(inc.is_incompatible());
         assert_eq!(inc.dial_tier(), 2);
+    }
+
+    #[test]
+    fn test_chain_hub_regtest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let hub = FfiChainHub::open(path, "regtest".to_string(), 0).unwrap();
+        assert_eq!(hub.tip_height(), None);
+        assert_eq!(hub.tip_hash(), None);
+        assert!(hub.in_ibd());
+        hub.ensure_genesis().unwrap();
+        assert_eq!(hub.tip_height(), Some(0));
+        assert!(hub.tip_hash().is_some());
+        let tip = hub.tip_hash().unwrap();
+        assert!(hub.has_block(tip.clone()).unwrap());
+        assert!(hub.is_connected(tip.clone()).unwrap());
+        assert!(!hub.is_block_invalid(tip.clone()).unwrap());
+        assert_eq!(hub.cache_body_count(), 1);
+        assert_eq!(hub.held_body_count(), 0);
+        assert!(!hub.chaintips().is_empty());
+        hub.set_max_tip_age_secs(3600);
+        assert_eq!(hub.max_tip_age_secs(), 3600);
+        hub.set_prefill_compact(true);
+        assert!(hub.prefill_compact());
+        hub.set_block_min_tx_fee_sat_kvb(1000);
+        assert_eq!(hub.block_min_tx_fee_sat_kvb(), 1000);
+        hub.set_block_version(0x20000004);
+        assert_eq!(hub.gbt_block_version(), 0x20000004);
+        hub.note_gbt_assembled();
+        assert!(hub.gbt_assembled());
+    }
+
+    #[test]
+    fn test_chain_hub_accept_regtest_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let hub = FfiChainHub::open(path, "regtest".to_string(), 0).unwrap();
+        hub.ensure_genesis().unwrap();
+        let genesis_hash = hub.tip_hash().unwrap();
+        let block_hex = mine_empty_regtest(genesis_hash, 1296688603, 1).unwrap();
+        let outcome = hub.accept_block(block_hex.clone()).unwrap();
+        assert!(matches!(outcome, FfiAcceptOutcome::Accepted { height: 1 }));
+        assert_eq!(hub.tip_height(), Some(1));
+        // AlreadyHave on duplicate
+        let outcome2 = hub.accept_received_block(block_hex).unwrap();
+        assert!(matches!(outcome2, FfiAcceptOutcome::AlreadyHave));
     }
 
 }

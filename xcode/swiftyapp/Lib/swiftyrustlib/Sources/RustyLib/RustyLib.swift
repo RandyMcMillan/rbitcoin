@@ -1634,6 +1634,402 @@ public func FfiConverterTypeFfiBlockCache_lower(_ value: FfiBlockCache) -> Unsaf
 
 
 
+public protocol FfiChainHubProtocol : AnyObject {
+    
+    func acceptBlock(blockHex: String) throws  -> FfiAcceptOutcome
+    
+    func acceptReceivedBlock(blockHex: String) throws  -> FfiAcceptOutcome
+    
+    func alreadyHaveOrAskedBlock(hashHex: String) throws  -> Bool
+    
+    func blockMinTxFeeSatKvb()  -> UInt64
+    
+    func cacheBodyCount()  -> UInt64
+    
+    func chaintips()  -> [FfiChainTipInfo]
+    
+    func ensureGenesis() throws 
+    
+    func feefilterSatKvb()  -> UInt64
+    
+    func forgetAskedBlock(hashHex: String) throws 
+    
+    func gbtAssembled()  -> Bool
+    
+    func gbtBlockVersion()  -> Int32
+    
+    func hasBlock(hashHex: String) throws  -> Bool
+    
+    func heldBody(hashHex: String) throws  -> String?
+    
+    func heldBodyCount()  -> UInt64
+    
+    func holdUnconnectedBody(blockHex: String) throws 
+    
+    func inIbd()  -> Bool
+    
+    func isBlockInvalid(hashHex: String) throws  -> Bool
+    
+    func isConnected(hashHex: String) throws  -> Bool
+    
+    func maxTipAgeSecs()  -> UInt64
+    
+    func noteAskedBlock(hashHex: String) throws 
+    
+    func noteGbtAssembled() 
+    
+    func prefillCompact()  -> Bool
+    
+    func setBlockMinTxFeeSatKvb(satKvb: UInt64) 
+    
+    func setBlockVersion(v: Int32) 
+    
+    func setMaxTipAgeSecs(secs: UInt64) 
+    
+    func setPrefillCompact(on: Bool) 
+    
+    func tipHash()  -> String?
+    
+    func tipHeader()  -> String?
+    
+    func tipHeight()  -> UInt32?
+    
+    func tipIsStaleForIbd()  -> Bool
+    
+}
+
+open class FfiChainHub:
+    FfiChainHubProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffichainhub(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffichainhub(pointer, $0) }
+    }
+
+    
+public static func `open`(queryPath: String, network: String, milestoneHeight: UInt32)throws  -> FfiChainHub {
+    return try  FfiConverterTypeFfiChainHub.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffichainhub_open(
+        FfiConverterString.lower(queryPath),
+        FfiConverterString.lower(network),
+        FfiConverterUInt32.lower(milestoneHeight),$0
+    )
+})
+}
+    
+
+    
+open func acceptBlock(blockHex: String)throws  -> FfiAcceptOutcome {
+    return try  FfiConverterTypeFfiAcceptOutcome.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_accept_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
+    
+open func acceptReceivedBlock(blockHex: String)throws  -> FfiAcceptOutcome {
+    return try  FfiConverterTypeFfiAcceptOutcome.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_accept_received_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
+    
+open func alreadyHaveOrAskedBlock(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_already_have_or_asked_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func blockMinTxFeeSatKvb() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_block_min_tx_fee_sat_kvb(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func cacheBodyCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_cache_body_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func chaintips() -> [FfiChainTipInfo] {
+    return try!  FfiConverterSequenceTypeFfiChainTipInfo.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_chaintips(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func ensureGenesis()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_ensure_genesis(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func feefilterSatKvb() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_feefilter_sat_kvb(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func forgetAskedBlock(hashHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_forget_asked_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+}
+}
+    
+open func gbtAssembled() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_gbt_assembled(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func gbtBlockVersion() -> Int32 {
+    return try!  FfiConverterInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_gbt_block_version(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func hasBlock(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_has_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func heldBody(hashHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_held_body(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func heldBodyCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_held_body_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func holdUnconnectedBody(blockHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_hold_unconnected_body(self.uniffiClonePointer(),
+        FfiConverterString.lower(blockHex),$0
+    )
+}
+}
+    
+open func inIbd() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_in_ibd(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isBlockInvalid(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_is_block_invalid(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func isConnected(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_is_connected(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func maxTipAgeSecs() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_max_tip_age_secs(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func noteAskedBlock(hashHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_note_asked_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+}
+}
+    
+open func noteGbtAssembled() {try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_note_gbt_assembled(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func prefillCompact() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_prefill_compact(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func setBlockMinTxFeeSatKvb(satKvb: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_set_block_min_tx_fee_sat_kvb(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(satKvb),$0
+    )
+}
+}
+    
+open func setBlockVersion(v: Int32) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_set_block_version(self.uniffiClonePointer(),
+        FfiConverterInt32.lower(v),$0
+    )
+}
+}
+    
+open func setMaxTipAgeSecs(secs: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_set_max_tip_age_secs(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(secs),$0
+    )
+}
+}
+    
+open func setPrefillCompact(on: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_set_prefill_compact(self.uniffiClonePointer(),
+        FfiConverterBool.lower(on),$0
+    )
+}
+}
+    
+open func tipHash() -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_tip_hash(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tipHeader() -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_tip_header(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tipHeight() -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tipIsStaleForIbd() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_tip_is_stale_for_ibd(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiChainHub: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiChainHub
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiChainHub {
+        return FfiChainHub(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiChainHub) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiChainHub {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiChainHub, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiChainHub_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiChainHub {
+    return try FfiConverterTypeFfiChainHub.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiChainHub_lower(_ value: FfiChainHub) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiChainHub.lower(value)
+}
+
+
+
+
 public protocol FfiFeeFlowMeterProtocol : AnyObject {
     
     func admitEvents()  -> UInt64
@@ -4935,6 +5331,88 @@ public func FfiConverterTypeFfiBlockQueueStats_lower(_ value: FfiBlockQueueStats
 }
 
 
+public struct FfiChainTipInfo {
+    public var height: UInt32
+    public var hash: String
+    public var branchlen: UInt32
+    public var status: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(height: UInt32, hash: String, branchlen: UInt32, status: String) {
+        self.height = height
+        self.hash = hash
+        self.branchlen = branchlen
+        self.status = status
+    }
+}
+
+
+
+extension FfiChainTipInfo: Equatable, Hashable {
+    public static func ==(lhs: FfiChainTipInfo, rhs: FfiChainTipInfo) -> Bool {
+        if lhs.height != rhs.height {
+            return false
+        }
+        if lhs.hash != rhs.hash {
+            return false
+        }
+        if lhs.branchlen != rhs.branchlen {
+            return false
+        }
+        if lhs.status != rhs.status {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(height)
+        hasher.combine(hash)
+        hasher.combine(branchlen)
+        hasher.combine(status)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiChainTipInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiChainTipInfo {
+        return
+            try FfiChainTipInfo(
+                height: FfiConverterUInt32.read(from: &buf), 
+                hash: FfiConverterString.read(from: &buf), 
+                branchlen: FfiConverterUInt32.read(from: &buf), 
+                status: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiChainTipInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.height, into: &buf)
+        FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterUInt32.write(value.branchlen, into: &buf)
+        FfiConverterString.write(value.status, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiChainTipInfo_lift(_ buf: RustBuffer) throws -> FfiChainTipInfo {
+    return try FfiConverterTypeFfiChainTipInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiChainTipInfo_lower(_ value: FfiChainTipInfo) -> RustBuffer {
+    return FfiConverterTypeFfiChainTipInfo.lower(value)
+}
+
+
 public struct FfiChainView {
     public var height: UInt64
     public var hash: String
@@ -7942,6 +8420,80 @@ public func FfiConverterTypeFfiWarnPeriod_lower(_ value: FfiWarnPeriod) -> RustB
     return FfiConverterTypeFfiWarnPeriod.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiAcceptOutcome {
+    
+    case accepted(height: UInt32
+    )
+    case alreadyHave
+    case ignoredWeaker
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAcceptOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAcceptOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAcceptOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .accepted(height: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 2: return .alreadyHave
+        
+        case 3: return .ignoredWeaker
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAcceptOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .accepted(height):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt32.write(height, into: &buf)
+            
+        
+        case .alreadyHave:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .ignoredWeaker:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAcceptOutcome_lift(_ buf: RustBuffer) throws -> FfiAcceptOutcome {
+    return try FfiConverterTypeFfiAcceptOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAcceptOutcome_lower(_ value: FfiAcceptOutcome) -> RustBuffer {
+    return FfiConverterTypeFfiAcceptOutcome.lower(value)
+}
+
+
+
+extension FfiAcceptOutcome: Equatable, Hashable {}
+
+
+
 
 public enum RustyError {
 
@@ -8540,6 +9092,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiChainTipInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiChainTipInfo]
+
+    public static func write(_ value: [FfiChainTipInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiChainTipInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiChainTipInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiChainTipInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiChainTipInfo.read(from: &buf))
         }
         return seq
     }
@@ -11570,6 +12147,96 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiblockcache_truncate_to_height() != 33558) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_accept_block() != 48760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_accept_received_block() != 848) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_already_have_or_asked_block() != 58998) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_block_min_tx_fee_sat_kvb() != 37457) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_cache_body_count() != 4451) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_chaintips() != 6790) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_ensure_genesis() != 47083) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_feefilter_sat_kvb() != 12326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_forget_asked_block() != 37604) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_gbt_assembled() != 51140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_gbt_block_version() != 35221) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_has_block() != 44410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_held_body() != 36801) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_held_body_count() != 26635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_hold_unconnected_body() != 24102) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_in_ibd() != 3056) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_is_block_invalid() != 6619) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_is_connected() != 51167) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_max_tip_age_secs() != 55299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_note_asked_block() != 43480) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_note_gbt_assembled() != 20500) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_prefill_compact() != 33757) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_set_block_min_tx_fee_sat_kvb() != 49667) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_set_block_version() != 38436) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_set_max_tip_age_secs() != 26917) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_set_prefill_compact() != 18556) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_tip_hash() != 54076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_tip_header() != 62200) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_tip_height() != 505) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_tip_is_stale_for_ibd() != 51746) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffifeeflowmeter_admit_events() != 26057) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12255,6 +12922,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiblockcache_with_body_depth() != 49665) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffichainhub_open() != 50519) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffifeeflowmeter_new() != 62794) {

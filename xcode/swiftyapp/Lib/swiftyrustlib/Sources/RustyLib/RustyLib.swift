@@ -12585,6 +12585,14 @@ public func acceptBlockHeaderNodosLog(hash: String) -> String {
     )
 })
 }
+public func addressFromScriptPubkey(scriptHex: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_address_from_script_pubkey(
+        FfiConverterString.lower(scriptHex),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func addressNetwork(address: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_address_network(
@@ -14117,6 +14125,14 @@ public func scriptLen(scriptHex: String)throws  -> UInt64 {
     )
 })
 }
+public func scriptPubkeyFromAddress(address: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_pubkey_from_address(
+        FfiConverterString.lower(address),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func scriptSigops(scriptHex: String, accurate: Bool)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_script_sigops(
@@ -14561,6 +14577,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_accept_block_header_nodos_log() != 20443) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_address_from_script_pubkey() != 37031) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_address_network() != 7866) {
@@ -15206,6 +15225,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_script_len() != 23903) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_pubkey_from_address() != 64788) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_script_sigops() != 10909) {

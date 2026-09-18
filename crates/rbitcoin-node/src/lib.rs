@@ -13,4 +13,4 @@ pub use config::{
     MempoolOpts, NodeConfig, RpcOpts, CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
 };
 pub use error::{tip_too_far_in_future, NodeError, MAX_FUTURE_BLOCK_TIME};
-pub use run::{run_node, run_p2p, NodeHandle};
+pub use run::{run_node, run_p2p, run_p2p_with_shutdown, NodeHandle, Shutdown};

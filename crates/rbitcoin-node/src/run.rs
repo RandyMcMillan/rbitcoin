@@ -166,6 +166,14 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// hold the process).
 #[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
+    run_p2p_with_shutdown(config, None).await
+}
+
+#[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
+pub async fn run_p2p_with_shutdown(
+    config: NodeConfig,
+    external_shutdown: Option<Arc<Shutdown>>,
+) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     let params = config.chain_params()?;
     let milestone = config.milestone();
@@ -313,7 +321,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.network.as_str()
     );
 
-    let shutdown = Shutdown::new();
+    let shutdown = external_shutdown.unwrap_or_else(Shutdown::new);
     spawn_signal_handler(shutdown.clone());
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {

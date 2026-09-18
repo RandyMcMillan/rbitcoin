@@ -4687,6 +4687,82 @@ impl FfiChainHub {
             .attach_mempool(Arc::clone(&mp.inner))
             .map_err(|_| RustyError::MempoolError)
     }
+
+    pub fn ensure_header(&self, header_hex: String) -> Result<(), RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .ensure_header(&header)
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn accept_branch(&self, block_hexes: Vec<String>) -> Result<FfiAcceptOutcome, RustyError> {
+        let blocks: Vec<bitcoin::Block> = block_hexes
+            .into_iter()
+            .map(|hex| {
+                let bytes = rbitcoin_primitives::hex_decode(&hex)
+                    .map_err(|_| RustyError::InvalidInput)?;
+                bitcoin::consensus::encode::deserialize(&bytes)
+                    .map_err(|_| RustyError::InvalidInput)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(self
+            .inner
+            .accept_branch(&blocks)
+            .map_err(|_| RustyError::ConsensusError)?
+            .into())
+    }
+
+    pub fn assemble_block_to_script(
+        &self,
+        script_pubkey_hex: String,
+        extra_tx_hexes: Vec<String>,
+    ) -> Result<String, RustyError> {
+        let script = rbitcoin_primitives::hex_decode(&script_pubkey_hex)
+            .map_err(|_| RustyError::InvalidInput)?;
+        let script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
+        let extra_txs: Vec<bitcoin::Transaction> = extra_tx_hexes
+            .into_iter()
+            .map(|hex| {
+                let bytes = rbitcoin_primitives::hex_decode(&hex)
+                    .map_err(|_| RustyError::InvalidInput)?;
+                bitcoin::consensus::encode::deserialize(&bytes)
+                    .map_err(|_| RustyError::InvalidInput)
+            })
+            .collect::<Result<_, _>>()?;
+        let block = self
+            .inner
+            .assemble_block_to_script(script_pubkey, extra_txs)
+            .map_err(|_| RustyError::ConsensusError)?;
+        Ok(bitcoin::consensus::encode::serialize_hex(&block))
+    }
+
+    pub fn generate_to_script(
+        &self,
+        nblocks: u32,
+        script_pubkey_hex: String,
+        extra_tx_hexes: Vec<String>,
+    ) -> Result<Vec<String>, RustyError> {
+        let script = rbitcoin_primitives::hex_decode(&script_pubkey_hex)
+            .map_err(|_| RustyError::InvalidInput)?;
+        let script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
+        let extra_txs: Vec<bitcoin::Transaction> = extra_tx_hexes
+            .into_iter()
+            .map(|hex| {
+                let bytes = rbitcoin_primitives::hex_decode(&hex)
+                    .map_err(|_| RustyError::InvalidInput)?;
+                bitcoin::consensus::encode::deserialize(&bytes)
+                    .map_err(|_| RustyError::InvalidInput)
+            })
+            .collect::<Result<_, _>>()?;
+        let hashes = self
+            .inner
+            .generate_to_script(nblocks, script_pubkey, extra_txs)
+            .map_err(|_| RustyError::ConsensusError)?;
+        Ok(hashes.into_iter().map(|h| h.to_string()).collect())
+    }
 }
 
 // --- MempoolHub FFI ---
@@ -8578,6 +8654,42 @@ mod tests {
     fn test_classify_v2_cmpct_peer_empty() {
         let result = classify_v2_cmpct_peer("".to_string()).unwrap();
         assert!(matches!(result, FfiCmpctPeerFrame::Other));
+    }
+
+    #[test]
+    fn test_chain_hub_generate_to_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let hub = FfiChainHub::open(path, "regtest".to_string(), 0).unwrap();
+        hub.ensure_genesis().unwrap();
+        // P2PKH script: 76a914 + 20 bytes + 88ac
+        let script_hex = "76a914000000000000000000000000000000000000000088ac".to_string();
+        let hashes = hub.generate_to_script(3, script_hex.clone(), vec![]).unwrap();
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hub.tip_height(), Some(3));
+        // Assemble one more block without accepting
+        let block_hex = hub.assemble_block_to_script(script_hex, vec![]).unwrap();
+        assert!(!block_hex.is_empty());
+        // Accept branch with the assembled block
+        let outcome = hub.accept_branch(vec![block_hex]).unwrap();
+        assert!(matches!(outcome, FfiAcceptOutcome::Accepted { height: 4 }));
+        assert_eq!(hub.tip_height(), Some(4));
+    }
+
+    #[test]
+    fn test_chain_hub_ensure_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let hub = FfiChainHub::open(path, "regtest".to_string(), 0).unwrap();
+        hub.ensure_genesis().unwrap();
+        let genesis_hash = hub.tip_hash().unwrap();
+        let block_hex = mine_empty_regtest(genesis_hash, 1296688603, 1).unwrap();
+        let bytes = rbitcoin_primitives::hex_decode(&block_hex).unwrap();
+        let block: bitcoin::Block =
+            bitcoin::consensus::encode::deserialize(&bytes).unwrap();
+        let header_hex = bitcoin::consensus::encode::serialize_hex(&block.header);
+        hub.ensure_header(header_hex).unwrap();
+        assert!(hub.knows_header(block.block_hash().to_string()).unwrap());
     }
 
 }

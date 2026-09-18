@@ -4057,6 +4057,39 @@ impl FfiFeeFlowMeter {
     }
 }
 
+// --- Node Clock FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiNodeClock {
+    inner: Arc<rbitcoin_consensus::NodeClock>,
+}
+
+#[uniffi::export]
+impl FfiNodeClock {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: rbitcoin_consensus::NodeClock::new(),
+        })
+    }
+
+    pub fn now_secs(&self) -> u64 {
+        self.inner.now_secs()
+    }
+
+    pub fn set_mock(&self, t: i64) {
+        self.inner.set_mock(t);
+    }
+}
+
+#[uniffi::export]
+pub fn wall_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_secs()
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -6899,5 +6932,23 @@ mod tests {
             meter.note_admit(10_000, 1_000, i);
         }
         assert!(meter.is_warm(70));
+    }
+
+    #[test]
+    fn test_node_clock() {
+        let clock = FfiNodeClock::new();
+        let wall = clock.now_secs();
+        assert!(wall > 1_600_000_000);
+        clock.set_mock(1_700_000_000);
+        assert_eq!(clock.now_secs(), 1_700_000_000);
+        clock.set_mock(0);
+        let wall2 = clock.now_secs();
+        assert!(wall2 >= wall);
+    }
+
+    #[test]
+    fn test_wall_now() {
+        let now = wall_now();
+        assert!(now > 1_600_000_000);
     }
 }

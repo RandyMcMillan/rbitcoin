@@ -203,6 +203,40 @@ pub fn hash256(bytes: Vec<u8>) -> String {
     hash.to_string()
 }
 
+#[uniffi::export]
+pub fn sha256_hex(bytes: Vec<u8>) -> String {
+    use bitcoin::hashes::{sha256, Hash};
+    let hash = sha256::Hash::hash(&bytes);
+    hash.to_string()
+}
+
+#[uniffi::export]
+pub fn hash160_hex(bytes: Vec<u8>) -> String {
+    use bitcoin::hashes::{ripemd160, sha256, Hash};
+    let sha = sha256::Hash::hash(&bytes);
+    let hash = ripemd160::Hash::hash(sha.as_byte_array());
+    rbitcoin_primitives::hex_encode(hash)
+}
+
+#[uniffi::export]
+pub fn varint_encode(value: u64) -> String {
+    use bitcoin::consensus::Encodable;
+    let mut buf = Vec::new();
+    bitcoin::consensus::encode::VarInt(value)
+        .consensus_encode(&mut buf)
+        .unwrap();
+    rbitcoin_primitives::hex_encode(&buf)
+}
+
+#[uniffi::export]
+pub fn varint_decode(hex: String) -> Result<u64, RustyError> {
+    use bitcoin::consensus::encode::Decodable;
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let varint = bitcoin::consensus::encode::VarInt::consensus_decode(&mut &bytes[..])
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(varint.0)
+}
+
 // --- Key / Address FFI ---
 
 #[uniffi::export]
@@ -7131,6 +7165,24 @@ mod tests {
     fn test_hash256() {
         let result = hash256(b"hello".to_vec());
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_hash160_and_sha256() {
+        let sha = sha256_hex(b"hello".to_vec());
+        assert_eq!(sha.len(), 64);
+        let h160 = hash160_hex(b"hello".to_vec());
+        assert_eq!(h160.len(), 40);
+    }
+
+    #[test]
+    fn test_varint_roundtrip() {
+        let cases: Vec<u64> = vec![0, 1, 252, 253, 65535, 65536, u64::MAX];
+        for val in cases {
+            let encoded = varint_encode(val);
+            let decoded = varint_decode(encoded).unwrap();
+            assert_eq!(decoded, val);
+        }
     }
 
     #[test]

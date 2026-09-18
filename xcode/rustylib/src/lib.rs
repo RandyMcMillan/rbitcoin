@@ -6403,6 +6403,37 @@ impl FfiNodeHandle {
     pub fn set_max_sh_creates(&self, n: u32) {
         self.inner.lock().unwrap().query.set_max_sh_creates(n);
     }
+
+    pub fn block_queue_max_height(&self) -> Option<u64> {
+        self.inner.lock().unwrap().query.block_queue_max_height().map(|h| h as u64)
+    }
+
+    pub fn block_queue_soft_pressure(&self) -> bool {
+        self.inner.lock().unwrap().query.block_queue_soft_pressure()
+    }
+
+    pub fn block_queue_queued_heights(&self) -> Vec<u32> {
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .block_queue_queued_heights()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn block_queue_has_height(&self, height: u32) -> bool {
+        self.inner.lock().unwrap().query.block_queue_has_height(height)
+    }
+
+    pub fn block_queue_hash_at_height(&self, height: u32) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .block_queue_hash_at_height(height)
+            .map(rbitcoin_primitives::hex_encode)
+    }
 }
 
 #[uniffi::export]
@@ -9188,6 +9219,19 @@ mod tests {
         assert_eq!(node.max_sh_creates(), 0);
         node.set_max_sh_creates(100);
         assert_eq!(node.max_sh_creates(), 100);
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_handle_block_queue_methods() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        assert_eq!(node.block_queue_max_height(), None);
+        assert!(!node.block_queue_soft_pressure());
+        assert!(node.block_queue_queued_heights().is_empty());
+        assert!(!node.block_queue_has_height(0));
+        assert_eq!(node.block_queue_hash_at_height(0), None);
         node.shutdown().unwrap();
     }
 

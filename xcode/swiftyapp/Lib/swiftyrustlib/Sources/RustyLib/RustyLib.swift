@@ -598,6 +598,8 @@ public protocol FfiAddrManProtocol : AnyObject {
     
     func add(addr: String) throws 
     
+    func addLearned(addr: String, cap: UInt64) throws  -> Bool
+    
     func addWithFlags(addr: String, flags: UInt8) throws 
     
     func applyIbdDeadSpeed(addr: String, latencyMs: UInt64, bps: UInt64?, ibdOutlier: Bool) throws 
@@ -606,9 +608,13 @@ public protocol FfiAddrManProtocol : AnyObject {
     
     func flags(addr: String) throws  -> UInt8
     
+    func inject(addrs: [String]) 
+    
     func isEmpty()  -> Bool
     
     func len()  -> UInt64
+    
+    func mergeFrom(other: FfiAddrMan) 
     
     func noteAttempt(addr: String) throws 
     
@@ -624,9 +630,15 @@ public protocol FfiAddrManProtocol : AnyObject {
     
     func save(path: String) throws 
     
+    func takeDialCandidates(max: UInt64, exclude: [String], occupied: [String])  -> [String]
+    
     func takeOutbound(max: UInt64)  -> [String]
     
     func takeOutboundOccupied(max: UInt64, occupied: [String])  -> [String]
+    
+    func takeOutboundOffset(max: UInt64, offset: UInt64)  -> [String]
+    
+    func takeOutboundOffsetOccupied(max: UInt64, offset: UInt64, occupied: [String])  -> [String]
     
 }
 
@@ -710,6 +722,15 @@ open func add(addr: String)throws  {try rustCallWithError(FfiConverterTypeRustyE
 }
 }
     
+open func addLearned(addr: String, cap: UInt64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiaddrman_add_learned(self.uniffiClonePointer(),
+        FfiConverterString.lower(addr),
+        FfiConverterUInt64.lower(cap),$0
+    )
+})
+}
+    
 open func addWithFlags(addr: String, flags: UInt8)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiaddrman_add_with_flags(self.uniffiClonePointer(),
         FfiConverterString.lower(addr),
@@ -743,6 +764,13 @@ open func flags(addr: String)throws  -> UInt8 {
 })
 }
     
+open func inject(addrs: [String]) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiaddrman_inject(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(addrs),$0
+    )
+}
+}
+    
 open func isEmpty() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiaddrman_is_empty(self.uniffiClonePointer(),$0
@@ -755,6 +783,13 @@ open func len() -> UInt64 {
     uniffi_rustylib_fn_method_ffiaddrman_len(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func mergeFrom(other: FfiAddrMan) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiaddrman_merge_from(self.uniffiClonePointer(),
+        FfiConverterTypeFfiAddrMan.lower(other),$0
+    )
+}
 }
     
 open func noteAttempt(addr: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -809,6 +844,16 @@ open func save(path: String)throws  {try rustCallWithError(FfiConverterTypeRusty
 }
 }
     
+open func takeDialCandidates(max: UInt64, exclude: [String], occupied: [String]) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiaddrman_take_dial_candidates(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(max),
+        FfiConverterSequenceString.lower(exclude),
+        FfiConverterSequenceString.lower(occupied),$0
+    )
+})
+}
+    
 open func takeOutbound(max: UInt64) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiaddrman_take_outbound(self.uniffiClonePointer(),
@@ -821,6 +866,25 @@ open func takeOutboundOccupied(max: UInt64, occupied: [String]) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiaddrman_take_outbound_occupied(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(max),
+        FfiConverterSequenceString.lower(occupied),$0
+    )
+})
+}
+    
+open func takeOutboundOffset(max: UInt64, offset: UInt64) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiaddrman_take_outbound_offset(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(max),
+        FfiConverterUInt64.lower(offset),$0
+    )
+})
+}
+    
+open func takeOutboundOffsetOccupied(max: UInt64, offset: UInt64, occupied: [String]) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiaddrman_take_outbound_offset_occupied(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(max),
+        FfiConverterUInt64.lower(offset),
         FfiConverterSequenceString.lower(occupied),$0
     )
 })
@@ -8875,6 +8939,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiaddrman_add() != 26692) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_add_learned() != 26942) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiaddrman_add_with_flags() != 34006) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8887,10 +8954,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiaddrman_flags() != 34492) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_inject() != 7362) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiaddrman_is_empty() != 60438) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiaddrman_len() != 33222) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_merge_from() != 5766) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiaddrman_note_attempt() != 62041) {
@@ -8914,10 +8987,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiaddrman_save() != 18076) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_take_dial_candidates() != 3238) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiaddrman_take_outbound() != 48082) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiaddrman_take_outbound_occupied() != 1168) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_take_outbound_offset() != 2381) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_take_outbound_offset_occupied() != 33783) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_abandon_live() != 47318) {

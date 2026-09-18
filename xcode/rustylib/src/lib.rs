@@ -2974,6 +2974,76 @@ impl FfiAddrMan {
             .save(std::path::Path::new(&path))
             .map_err(|_| RustyError::InvalidInput)
     }
+
+    pub fn inject(&self, addrs: Vec<String>) {
+        let sockets: Vec<std::net::SocketAddr> = addrs
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        self.inner.lock().unwrap().inject(sockets);
+    }
+
+    pub fn add_learned(&self, addr: String, cap: u64) -> Result<bool, RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.lock().unwrap().add_learned(socket, cap as usize))
+    }
+
+    pub fn merge_from(&self, other: Arc<FfiAddrMan>) {
+        let other_guard = other.inner.lock().unwrap();
+        self.inner.lock().unwrap().merge_from(&other_guard);
+    }
+
+    pub fn take_dial_candidates(
+        &self,
+        max: u64,
+        exclude: Vec<String>,
+        occupied: Vec<String>,
+    ) -> Vec<String> {
+        let exclude_set: std::collections::HashSet<std::net::SocketAddr> = exclude
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let occ: Vec<std::net::SocketAddr> = occupied
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        self.inner
+            .lock()
+            .unwrap()
+            .take_dial_candidates(max as usize, &exclude_set, &occ)
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    pub fn take_outbound_offset(&self, max: u64, offset: u64) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .take_outbound_offset(max as usize, offset as usize)
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    pub fn take_outbound_offset_occupied(
+        &self,
+        max: u64,
+        offset: u64,
+        occupied: Vec<String>,
+    ) -> Vec<String> {
+        let occ: Vec<std::net::SocketAddr> = occupied
+            .into_iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        self.inner
+            .lock()
+            .unwrap()
+            .take_outbound_offset_occupied(max as usize, offset as usize, &occ)
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
 }
 
 // --- Mempool FFI ---
@@ -5652,5 +5722,47 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         assert!(store.get_tx_meta_and_prevouts(0).is_err());
+    }
+
+    #[test]
+    fn test_addrman_take_dial_candidates() {
+        let am = FfiAddrMan::new();
+        am.add("127.0.0.1:8333".to_string()).unwrap();
+        let candidates = am.take_dial_candidates(10, vec![], vec![]);
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_addrman_take_outbound_offset() {
+        let am = FfiAddrMan::new();
+        am.add("127.0.0.1:8333".to_string()).unwrap();
+        am.add("127.0.0.1:8334".to_string()).unwrap();
+        let out = am.take_outbound_offset(1, 0);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_addrman_add_learned() {
+        let am = FfiAddrMan::new();
+        let added = am.add_learned("127.0.0.1:8333".to_string(), 10);
+        assert!(added.is_ok());
+        assert!(added.unwrap());
+        assert_eq!(am.len(), 1);
+    }
+
+    #[test]
+    fn test_addrman_merge_from() {
+        let am1 = FfiAddrMan::new();
+        let am2 = FfiAddrMan::new();
+        am2.add("127.0.0.1:8333".to_string()).unwrap();
+        am1.merge_from(am2);
+        assert_eq!(am1.len(), 1);
+    }
+
+    #[test]
+    fn test_addrman_inject() {
+        let am = FfiAddrMan::new();
+        am.inject(vec!["127.0.0.1:8333".to_string(), "127.0.0.1:8334".to_string()]);
+        assert_eq!(am.len(), 2);
     }
 }

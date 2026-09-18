@@ -723,6 +723,16 @@ public static func openOrCreateWithLimit(path: String, maxWeight: UInt64)throws 
 })
 }
     
+public static func openWithLimitPersist(path: String, maxWeight: UInt64, persist: Bool)throws  -> FfiActiveMempool {
+    return try  FfiConverterTypeFfiActiveMempool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffiactivemempool_open_with_limit_persist(
+        FfiConverterString.lower(path),
+        FfiConverterUInt64.lower(maxWeight),
+        FfiConverterBool.lower(persist),$0
+    )
+})
+}
+    
 
     
 open func acceptPackage(query: FfiQuery, txsHex: [String])throws  -> String {
@@ -2938,6 +2948,10 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func getTxMetaAndPrevouts(fk: UInt64) throws  -> FfiTxMetaAndPrevouts
     
+    func hasConfirmedStrongSpenderCreate(createTxFk: UInt64, outIndex: UInt32, bodyRange: FfiTxRange?) throws  -> Bool
+    
+    func hasConfirmedStrongSpenderCreateAt(createTxFk: UInt64, outIndex: UInt32, bodyRange: FfiTxRange?, tip: UInt32?) throws  -> Bool
+    
     func headerCount()  -> UInt64
     
     func headerSlots()  -> UInt64
@@ -3198,6 +3212,27 @@ open func getTxMetaAndPrevouts(fk: UInt64)throws  -> FfiTxMetaAndPrevouts {
     return try  FfiConverterTypeFfiTxMetaAndPrevouts.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_get_tx_meta_and_prevouts(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
+open func hasConfirmedStrongSpenderCreate(createTxFk: UInt64, outIndex: UInt32, bodyRange: FfiTxRange?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_has_confirmed_strong_spender_create(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(createTxFk),
+        FfiConverterUInt32.lower(outIndex),
+        FfiConverterOptionTypeFfiTxRange.lower(bodyRange),$0
+    )
+})
+}
+    
+open func hasConfirmedStrongSpenderCreateAt(createTxFk: UInt64, outIndex: UInt32, bodyRange: FfiTxRange?, tip: UInt32?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_has_confirmed_strong_spender_create_at(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(createTxFk),
+        FfiConverterUInt32.lower(outIndex),
+        FfiConverterOptionTypeFfiTxRange.lower(bodyRange),
+        FfiConverterOptionUInt32.lower(tip),$0
     )
 })
 }
@@ -10517,6 +10552,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_get_tx_meta_and_prevouts() != 43593) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_has_confirmed_strong_spender_create() != 49065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_has_confirmed_strong_spender_create_at() != 29095) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_header_count() != 37489) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10623,6 +10664,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiactivemempool_open_or_create_with_limit() != 7894) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffiactivemempool_open_with_limit_persist() != 14790) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiaddrman_load() != 32799) {

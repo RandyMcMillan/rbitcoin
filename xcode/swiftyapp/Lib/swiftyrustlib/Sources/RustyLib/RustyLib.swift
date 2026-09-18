@@ -12686,6 +12686,13 @@ public func addressNetwork(address: String)throws  -> String {
     )
 })
 }
+public func addressType(address: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_address_type(
+        FfiConverterString.lower(address),$0
+    )
+})
+}
 public func addrv2MessageSizeLog(n: UInt32) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_addrv2_message_size_log(
@@ -13117,6 +13124,15 @@ public func ecdsaSignHash(wif: String, hashHex: String)throws  -> String {
     uniffi_rustylib_fn_func_ecdsa_sign_hash(
         FfiConverterString.lower(wif),
         FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+public func ecdsaVerify(pubkeyHex: String, hashHex: String, signatureHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_ecdsa_verify(
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterString.lower(hashHex),
+        FfiConverterString.lower(signatureHex),$0
     )
 })
 }
@@ -14350,6 +14366,22 @@ public func schnorrSignHash(privateKeyHex: String, hashHex: String)throws  -> St
     )
 })
 }
+public func schnorrVerify(xonlyPubkeyHex: String, hashHex: String, signatureHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_schnorr_verify(
+        FfiConverterString.lower(xonlyPubkeyHex),
+        FfiConverterString.lower(hashHex),
+        FfiConverterString.lower(signatureHex),$0
+    )
+})
+}
+public func scriptDecodeHex(scriptHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_decode_hex(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
 public func scriptFlagParen(token: String) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_script_flag_paren(
@@ -15113,6 +15145,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_address_network() != 7866) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_address_type() != 29316) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_addrv2_message_size_log() != 4916) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15288,6 +15323,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_ecdsa_sign_hash() != 59267) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_ecdsa_verify() != 37894) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_electrum_default_tweaks_min_dust() != 58605) {
@@ -15804,6 +15842,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_schnorr_sign_hash() != 23751) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_schnorr_verify() != 9428) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_decode_hex() != 52350) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_script_flag_paren() != 39331) {

@@ -13020,6 +13020,13 @@ public func generateKeypair(network: String)throws  -> FfiKeypair {
     )
 })
 }
+public func generatePrivateKey(network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_generate_private_key(
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func genesisBlockHash(network: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_genesis_block_hash(
@@ -13540,6 +13547,14 @@ public func p2pTargetPeers() -> UInt32 {
     )
 })
 }
+public func p2pkhAddressFromPubkey(pubkeyHex: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2pkh_address_from_pubkey(
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func p2trAddressFromPubkey(pubkeyHex: String, network: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_p2tr_address_from_pubkey(
@@ -13702,6 +13717,13 @@ public func prepareRegtestCandidate(blockHex: String, prevHashHex: String, time:
         FfiConverterString.lower(blockHex),
         FfiConverterString.lower(prevHashHex),
         FfiConverterUInt32.lower(time),$0
+    )
+})
+}
+public func privateKeyToPubkeyHex(wif: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_private_key_to_pubkey_hex(
+        FfiConverterString.lower(wif),$0
     )
 })
 }
@@ -14489,6 +14511,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_generate_keypair() != 27434) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_generate_private_key() != 36100) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_genesis_block_hash() != 47359) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14717,6 +14742,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_p2p_target_peers() != 34559) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_p2pkh_address_from_pubkey() != 2711) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_p2tr_address_from_pubkey() != 39046) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14784,6 +14812,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_prepare_regtest_candidate() != 8782) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_private_key_to_pubkey_hex() != 21700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_psbt_extract_tx_hex() != 1712) {

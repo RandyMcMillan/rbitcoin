@@ -218,6 +218,14 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// hold the process).
 #[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
+    run_p2p_with_shutdown(config, None).await
+}
+
+#[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
+pub async fn run_p2p_with_shutdown(
+    config: NodeConfig,
+    external_shutdown: Option<Arc<Shutdown>>,
+) -> Result<(), NodeError> {
     let status = NodeStatus::new(config.network, config.shindex);
     let _health = match config.listen.health {
         Some(addr) => Some(
@@ -438,7 +446,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    let shutdown = Shutdown::new();
+    let shutdown = external_shutdown.unwrap_or_else(Shutdown::new);
     spawn_signal_handler(shutdown.clone());
     let mut tor_ctl = crate::tor_control::TorControl::connect_if_configured(
         config.tor.control,

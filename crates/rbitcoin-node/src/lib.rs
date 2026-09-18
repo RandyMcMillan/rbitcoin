@@ -17,4 +17,4 @@ pub use config::{
     parse_minimum_chain_work,
 };
 pub use error::{tip_too_far_in_future, NodeError, MAX_FUTURE_BLOCK_TIME};
-pub use run::{run_node, run_p2p, NodeHandle};
+pub use run::{run_node, run_p2p, run_p2p_with_shutdown, NodeHandle, Shutdown};

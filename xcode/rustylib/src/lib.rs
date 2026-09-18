@@ -284,6 +284,50 @@ pub fn fee_rate_sat_per_kvb(fee_sat: u64, weight: u64) -> u64 {
     rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee_sat, weight)
 }
 
+// --- Transaction inspection FFI ---
+
+#[uniffi::export]
+pub fn tx_weight(tx_hex: String) -> Result<u64, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.weight().to_wu())
+}
+
+#[uniffi::export]
+pub fn tx_vsize(tx_hex: String) -> Result<u64, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.vsize() as u64)
+}
+
+#[uniffi::export]
+pub fn tx_input_count(tx_hex: String) -> Result<u64, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.input.len() as u64)
+}
+
+#[uniffi::export]
+pub fn tx_output_count(tx_hex: String) -> Result<u64, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.output.len() as u64)
+}
+
+#[uniffi::export]
+pub fn tx_lock_time(tx_hex: String) -> Result<u32, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.lock_time.to_consensus_u32())
+}
+
+#[uniffi::export]
+pub fn tx_version(tx_hex: String) -> Result<i32, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.version.0)
+}
+
 #[uniffi::export]
 pub fn is_annex_standard(annex_hex: String) -> Result<bool, RustyError> {
     let annex =
@@ -8296,6 +8340,23 @@ mod tests {
         assert_eq!(psbt_input_count(psbt_hex.clone()).unwrap(), 0);
         assert_eq!(psbt_output_count(psbt_hex.clone()).unwrap(), 0);
         assert!(psbt_is_finalized(psbt_hex).unwrap());
+    }
+
+    #[test]
+    fn test_tx_inspection() {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(100).unwrap(),
+            input: vec![],
+            output: vec![],
+        };
+        let tx_hex = bitcoin::consensus::encode::serialize_hex(&tx);
+        assert_eq!(tx_weight(tx_hex.clone()).unwrap(), tx.weight().to_wu());
+        assert_eq!(tx_vsize(tx_hex.clone()).unwrap(), tx.vsize() as u64);
+        assert_eq!(tx_input_count(tx_hex.clone()).unwrap(), 0);
+        assert_eq!(tx_output_count(tx_hex.clone()).unwrap(), 0);
+        assert_eq!(tx_lock_time(tx_hex.clone()).unwrap(), 100);
+        assert_eq!(tx_version(tx_hex).unwrap(), 2);
     }
 
     #[test]

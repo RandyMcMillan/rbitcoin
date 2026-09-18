@@ -600,6 +600,8 @@ public protocol FfiAddrManProtocol : AnyObject {
     
     func addWithFlags(addr: String, flags: UInt8) throws 
     
+    func applyIbdDeadSpeed(addr: String, latencyMs: UInt64, bps: UInt64?, ibdOutlier: Bool) throws 
+    
     func entries()  -> [FfiPeerEntry]
     
     func flags(addr: String) throws  -> UInt8
@@ -613,6 +615,8 @@ public protocol FfiAddrManProtocol : AnyObject {
     func noteConnectFailed(addr: String, incompatible: Bool) throws 
     
     func noteConnected(addr: String) throws 
+    
+    func noteIbdSlow(addr: String) throws 
     
     func noteSpeed(addr: String, latencyMs: UInt64, bytesPerSec: UInt64) throws 
     
@@ -714,6 +718,16 @@ open func addWithFlags(addr: String, flags: UInt8)throws  {try rustCallWithError
 }
 }
     
+open func applyIbdDeadSpeed(addr: String, latencyMs: UInt64, bps: UInt64?, ibdOutlier: Bool)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiaddrman_apply_ibd_dead_speed(self.uniffiClonePointer(),
+        FfiConverterString.lower(addr),
+        FfiConverterUInt64.lower(latencyMs),
+        FfiConverterOptionUInt64.lower(bps),
+        FfiConverterBool.lower(ibdOutlier),$0
+    )
+}
+}
+    
 open func entries() -> [FfiPeerEntry] {
     return try!  FfiConverterSequenceTypeFfiPeerEntry.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiaddrman_entries(self.uniffiClonePointer(),$0
@@ -760,6 +774,13 @@ open func noteConnectFailed(addr: String, incompatible: Bool)throws  {try rustCa
     
 open func noteConnected(addr: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiaddrman_note_connected(self.uniffiClonePointer(),
+        FfiConverterString.lower(addr),$0
+    )
+}
+}
+    
+open func noteIbdSlow(addr: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiaddrman_note_ibd_slow(self.uniffiClonePointer(),
         FfiConverterString.lower(addr),$0
     )
 }
@@ -8043,6 +8064,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiaddrman_add_with_flags() != 34006) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_apply_ibd_dead_speed() != 60207) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiaddrman_entries() != 60049) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8062,6 +8086,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiaddrman_note_connected() != 1933) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiaddrman_note_ibd_slow() != 2490) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiaddrman_note_speed() != 2665) {

@@ -3595,6 +3595,33 @@ impl FfiActiveMempool {
         self.inner.lock().unwrap().promote_orphans_of(txid, &provider, tip_ctx);
         Ok(())
     }
+
+    pub fn reorg_disconnect_reaccept(
+        &self,
+        query: Arc<FfiQuery>,
+        txs_hex: Vec<String>,
+    ) -> Result<Vec<String>, RustyError> {
+        let txs: Vec<bitcoin::Transaction> = txs_hex
+            .into_iter()
+            .map(|h| deserialize_hex(&h).map_err(|_| RustyError::InvalidInput))
+            .collect::<Result<_, _>>()?;
+        let provider = FfiUtxoProvider {
+            query: Arc::clone(&query.inner),
+        };
+        let tip_height = query.inner.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if tip_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
+                .unwrap_or(0)
+        };
+        let tip_ctx = rbitcoin_mempool::ChainTipCtx {
+            height: tip_height,
+            mtp,
+        };
+        let results = self.inner.lock().unwrap().reorg_disconnect_reaccept(&txs, &provider, tip_ctx);
+        Ok(results.into_iter().map(|r| format!("{r:?}")).collect())
+    }
 }
 
 struct FfiUtxoProvider {
@@ -6460,5 +6487,16 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_active_mempool_reorg_disconnect_reaccept_empty() {
+        let tmp_query = tempfile::tempdir().unwrap();
+        let tmp_mempool = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let result = am.reorg_disconnect_reaccept(query, vec![]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }

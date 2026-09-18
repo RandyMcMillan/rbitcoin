@@ -3544,6 +3544,57 @@ impl FfiActiveMempool {
         let result = self.inner.lock().unwrap().accept_tx(&tx, &provider, tip_ctx);
         Ok(format!("{result:?}"))
     }
+
+    pub fn accept_package(
+        &self,
+        query: Arc<FfiQuery>,
+        txs_hex: Vec<String>,
+    ) -> Result<String, RustyError> {
+        let txs: Vec<bitcoin::Transaction> = txs_hex
+            .into_iter()
+            .map(|h| deserialize_hex(&h).map_err(|_| RustyError::InvalidInput))
+            .collect::<Result<_, _>>()?;
+        let provider = FfiUtxoProvider {
+            query: Arc::clone(&query.inner),
+        };
+        let tip_height = query.inner.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if tip_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
+                .unwrap_or(0)
+        };
+        let tip_ctx = rbitcoin_mempool::ChainTipCtx {
+            height: tip_height,
+            mtp,
+        };
+        let result = self.inner.lock().unwrap().accept_package(&txs, &provider, tip_ctx);
+        Ok(format!("{result:?}"))
+    }
+
+    pub fn promote_orphans_of(
+        &self,
+        query: Arc<FfiQuery>,
+        txid_hex: String,
+    ) -> Result<(), RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let provider = FfiUtxoProvider {
+            query: Arc::clone(&query.inner),
+        };
+        let tip_height = query.inner.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if tip_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
+                .unwrap_or(0)
+        };
+        let tip_ctx = rbitcoin_mempool::ChainTipCtx {
+            height: tip_height,
+            mtp,
+        };
+        self.inner.lock().unwrap().promote_orphans_of(txid, &provider, tip_ctx);
+        Ok(())
+    }
 }
 
 struct FfiUtxoProvider {
@@ -6384,5 +6435,30 @@ mod tests {
         assert!(result.is_ok());
         let result_str = result.unwrap();
         assert!(result_str.contains("Err") || result_str.contains("MissingPrevout"));
+    }
+
+    #[test]
+    fn test_active_mempool_accept_package_empty() {
+        let tmp_query = tempfile::tempdir().unwrap();
+        let tmp_mempool = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let result = am.accept_package(query, vec![]);
+        assert!(result.is_ok());
+        let result_str = result.unwrap();
+        assert!(result_str.contains("Err") || result_str.contains("PackageEmpty"));
+    }
+
+    #[test]
+    fn test_active_mempool_promote_orphans_of_missing() {
+        let tmp_query = tempfile::tempdir().unwrap();
+        let tmp_mempool = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let result = am.promote_orphans_of(
+            query,
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        );
+        assert!(result.is_ok());
     }
 }

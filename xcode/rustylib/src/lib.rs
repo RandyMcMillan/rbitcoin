@@ -3317,6 +3317,178 @@ impl FfiTxGraph {
     }
 }
 
+#[derive(uniffi::Object)]
+pub struct FfiActiveMempool {
+    inner: std::sync::Mutex<rbitcoin_mempool::ActiveMempool>,
+}
+
+#[uniffi::export]
+impl FfiActiveMempool {
+    #[uniffi::constructor]
+    pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
+        let mempool = rbitcoin_mempool::ActiveMempool::open_or_create(&path)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(mempool),
+        }))
+    }
+
+    #[uniffi::constructor]
+    pub fn open_or_create_with_limit(path: String, max_weight: u64) -> Result<Arc<Self>, RustyError> {
+        let mempool = rbitcoin_mempool::ActiveMempool::open_or_create_with_limit(&path, max_weight)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(mempool),
+        }))
+    }
+
+    pub fn live_count(&self) -> u64 {
+        self.inner.lock().unwrap().live_count() as u64
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().generation()
+    }
+
+    pub fn orphan_count(&self) -> u64 {
+        self.inner.lock().unwrap().orphan_count() as u64
+    }
+
+    pub fn min_relay_sat_kvb(&self) -> u64 {
+        self.inner.lock().unwrap().min_relay_sat_kvb()
+    }
+
+    pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
+        self.inner.lock().unwrap().set_min_relay_sat_kvb(sat_kvb);
+    }
+
+    pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
+        self.inner.lock().unwrap().set_cluster_limits(count, size_kvb);
+    }
+
+    pub fn get_tx(&self, txid_hex: String) -> Result<Option<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let guard = self.inner.lock().unwrap();
+        let tx = guard.get_tx(&txid);
+        let hex = tx.map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(t)));
+        drop(guard);
+        Ok(hex)
+    }
+
+    pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .select_block_txs(max_weight_wu)
+            .into_iter()
+            .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
+            .collect()
+    }
+
+    pub fn remove_txid(&self, txid_hex: String) -> Result<(), RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .lock()
+            .unwrap()
+            .remove_txid(&txid)
+            .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn remove_txid_tree(&self, txid_hex: String) -> Result<Vec<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let removed = self.inner.lock().unwrap().remove_txid_tree(&txid);
+        Ok(removed.into_iter().map(|t| t.to_string()).collect())
+    }
+
+    pub fn remove_for_block(&self, txids_hex: Vec<String>) -> Result<u64, RustyError> {
+        let txids: Vec<bitcoin::Txid> = txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h))
+            .collect::<Result<_, _>>()
+            .map_err(|_| RustyError::InvalidInput)?;
+        let n = self
+            .inner
+            .lock()
+            .unwrap()
+            .remove_for_block(&txids)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(n as u64)
+    }
+
+    pub fn remove_live_txids(&self, txids_hex: Vec<String>) -> Result<u64, RustyError> {
+        let txids: Vec<bitcoin::Txid> = txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h))
+            .collect::<Result<_, _>>()
+            .map_err(|_| RustyError::InvalidInput)?;
+        let n = self
+            .inner
+            .lock()
+            .unwrap()
+            .remove_live_txids(&txids)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(n as u64)
+    }
+
+    pub fn evict_conflicts_with(&self, txids_hex: Vec<String>, vouts: Vec<u32>) -> Result<Vec<String>, RustyError> {
+        if txids_hex.len() != vouts.len() {
+            return Err(RustyError::InvalidInput);
+        }
+        let ops: Vec<bitcoin::OutPoint> = txids_hex
+            .into_iter()
+            .zip(vouts)
+            .map(|(h, v)| {
+                let txid = bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput)?;
+                Ok(bitcoin::OutPoint::new(txid, v))
+            })
+            .collect::<Result<_, _>>()?;
+        let evicted = self.inner.lock().unwrap().evict_conflicts_with(&ops);
+        Ok(evicted.into_iter().map(|t| t.to_string()).collect())
+    }
+
+    pub fn evict_to_budget(&self, protect_txid_hex: Option<String>) -> Result<u64, RustyError> {
+        let protect = protect_txid_hex
+            .map(|h| bitcoin::Txid::from_str(&h))
+            .transpose()
+            .map_err(|_| RustyError::InvalidInput)?;
+        let n = self
+            .inner
+            .lock()
+            .unwrap()
+            .evict_to_budget(protect)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(n as u64)
+    }
+
+    pub fn flush(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .flush()
+            .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn persist_if_dirty(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .persist_if_dirty()
+            .map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn compact(&self) -> Result<String, RustyError> {
+        let mut guard = self.inner.lock().unwrap();
+        let (dead, shrunk) = guard.compact().map_err(|_| RustyError::MempoolError)?;
+        Ok(format!("dead={dead} shrunk={shrunk}"))
+    }
+
+    pub fn maybe_compact(&self) -> Result<Option<String>, RustyError> {
+        let mut guard = self.inner.lock().unwrap();
+        let result = guard.maybe_compact().map_err(|_| RustyError::MempoolError)?;
+        Ok(result.map(|(dead, shrunk)| format!("dead={dead} shrunk={shrunk}")))
+    }
+}
+
 // --- Block Queue soft targets FFI ---
 
 #[derive(Debug, PartialEq, uniffi::Record)]
@@ -5952,5 +6124,79 @@ mod tests {
         let result = fks.unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].is_none());
+    }
+
+    #[test]
+    fn test_active_mempool_open_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string());
+        assert!(am.is_ok());
+        let am = am.unwrap();
+        assert_eq!(am.live_count(), 0);
+        assert_eq!(am.orphan_count(), 0);
+        assert_eq!(am.generation(), 0);
+    }
+
+    #[test]
+    fn test_active_mempool_open_with_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create_with_limit(
+            tmp.path().to_str().unwrap().to_string(),
+            1_000_000,
+        );
+        assert!(am.is_ok());
+    }
+
+    #[test]
+    fn test_active_mempool_relay_fee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert_eq!(am.min_relay_sat_kvb(), 100);
+        am.set_min_relay_sat_kvb(200);
+        assert_eq!(am.min_relay_sat_kvb(), 200);
+    }
+
+    #[test]
+    fn test_active_mempool_cluster_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        am.set_cluster_limits(Some(50), Some(200));
+    }
+
+    #[test]
+    fn test_active_mempool_get_tx_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let tx = am.get_tx(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        );
+        assert!(tx.is_ok());
+        assert!(tx.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_active_mempool_select_block_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let txs = am.select_block_txs(4_000_000);
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn test_active_mempool_remove_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let result = am.remove_txid(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_active_mempool_compact_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let result = am.compact();
+        assert!(result.is_ok());
     }
 }

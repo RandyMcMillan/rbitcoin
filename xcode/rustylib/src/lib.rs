@@ -3487,6 +3487,39 @@ impl FfiActiveMempool {
         let result = guard.maybe_compact().map_err(|_| RustyError::MempoolError)?;
         Ok(result.map(|(dead, shrunk)| format!("dead={dead} shrunk={shrunk}")))
     }
+
+    pub fn park_orphan(&self, tx_hex: String, missing_txids_hex: Vec<String>) -> Result<String, RustyError> {
+        let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        let missing: std::collections::BTreeSet<bitcoin::Txid> = missing_txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h))
+            .collect::<Result<_, _>>()
+            .map_err(|_| RustyError::InvalidInput)?;
+        let err = self.inner.lock().unwrap().park_orphan(&tx, missing);
+        Ok(format!("{err:?}"))
+    }
+
+    pub fn take_orphan_children(&self, parent_txid_hex: String) -> Result<Vec<String>, RustyError> {
+        let parent = bitcoin::Txid::from_str(&parent_txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let children = self.inner.lock().unwrap().take_orphan_children(parent);
+        Ok(children.into_iter().map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t))).collect())
+    }
+
+    pub fn erase_orphans_for_block(&self, block_txids_hex: Vec<String>) -> Result<(), RustyError> {
+        let txids: Vec<bitcoin::Txid> = block_txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h))
+            .collect::<Result<_, _>>()
+            .map_err(|_| RustyError::InvalidInput)?;
+        self.inner.lock().unwrap().erase_orphans_for_block(&txids);
+        Ok(())
+    }
+
+    pub fn remember_extra_compact(&self, tx_hex: String) -> Result<(), RustyError> {
+        let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.lock().unwrap().remember_extra_compact(&tx);
+        Ok(())
+    }
 }
 
 // --- Block Queue soft targets FFI ---
@@ -6198,5 +6231,32 @@ mod tests {
         let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         let result = am.compact();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_active_mempool_park_orphan_bad_tx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence(0),
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        let tx_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&tx));
+        let result = am.park_orphan(tx_hex, vec![]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_active_mempool_erase_orphans_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        am.erase_orphans_for_block(vec![]).unwrap();
     }
 }

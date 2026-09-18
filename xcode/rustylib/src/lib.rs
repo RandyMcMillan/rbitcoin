@@ -2657,6 +2657,27 @@ impl FfiAddrMan {
         Ok(())
     }
 
+    pub fn note_ibd_slow(&self, addr: String) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.lock().unwrap().note_ibd_slow(socket);
+        Ok(())
+    }
+
+    pub fn apply_ibd_dead_speed(
+        &self,
+        addr: String,
+        latency_ms: u64,
+        bps: Option<u64>,
+        ibd_outlier: bool,
+    ) -> Result<(), RustyError> {
+        let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .lock()
+            .unwrap()
+            .apply_ibd_dead_speed(socket, latency_ms, bps, ibd_outlier);
+        Ok(())
+    }
+
     pub fn len(&self) -> u64 {
         self.inner.lock().unwrap().len() as u64
     }
@@ -4735,6 +4756,9 @@ mod tests {
         let occ = vec!["127.0.0.1:8333".to_string()];
         let out2 = am.take_outbound_occupied(10, occ);
         assert!(out2.is_empty());
+        am.note_ibd_slow("127.0.0.1:8333".to_string()).unwrap();
+        am.apply_ibd_dead_speed("127.0.0.1:8333".to_string(), 500, Some(1000), true)
+            .unwrap();
     }
 
     #[test]

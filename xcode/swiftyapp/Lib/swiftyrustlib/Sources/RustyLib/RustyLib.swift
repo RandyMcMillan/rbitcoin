@@ -887,6 +887,8 @@ public protocol FfiMempoolProtocol : AnyObject {
     
     func abandonLive() throws  -> UInt32
     
+    func appendLiveTx(txHex: String, feeSat: UInt64, weight: UInt64) throws  -> UInt32
+    
     func bodyLogicalLen() throws  -> UInt64
     
     func compact() throws  -> String
@@ -974,6 +976,16 @@ public static func openOrCreate(path: String)throws  -> FfiMempool {
 open func abandonLive()throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffimempool_abandon_live(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func appendLiveTx(txHex: String, feeSat: UInt64, weight: UInt64)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempool_append_live_tx(self.uniffiClonePointer(),
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt64.lower(feeSat),
+        FfiConverterUInt64.lower(weight),$0
     )
 })
 }
@@ -8107,6 +8119,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_abandon_live() != 47318) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempool_append_live_tx() != 20353) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_body_logical_len() != 42298) {

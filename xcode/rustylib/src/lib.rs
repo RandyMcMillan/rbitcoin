@@ -2883,6 +2883,23 @@ impl FfiMempool {
             .grow_slots()
             .map_err(|_| RustyError::MempoolError)
     }
+
+    pub fn append_live_tx(
+        &self,
+        tx_hex: String,
+        fee_sat: u64,
+        weight: u64,
+    ) -> Result<u32, RustyError> {
+        let tx: bitcoin::Transaction =
+            deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        let txid = tx.compute_txid();
+        let raw = bitcoin::consensus::encode::serialize(&tx);
+        self.inner
+            .lock()
+            .unwrap()
+            .append_live_tx(&raw, &txid, fee_sat, weight)
+            .map_err(|_| RustyError::MempoolError)
+    }
 }
 
 // --- Block Queue soft targets FFI ---
@@ -4196,6 +4213,17 @@ mod tests {
         assert!(compact.starts_with("dead="));
         assert!(mempool.body_logical_len().unwrap() > 0);
         assert!(!mempool.dir().is_empty());
+    }
+
+    #[test]
+    fn test_mempool_append_live_tx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mempool_append").to_str().unwrap().to_string();
+        let mempool = FfiMempool::open_or_create(path).unwrap();
+        let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff025101ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
+        let slot = mempool.append_live_tx(tx_hex.to_string(), 0, 484).unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(mempool.live_count(), 1);
     }
 
     #[test]

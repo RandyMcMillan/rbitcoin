@@ -1286,6 +1286,23 @@ impl From<rbitcoin_store::HeaderRecord> for FfiHeaderRecord {
     }
 }
 
+impl TryFrom<FfiHeaderRecord> for rbitcoin_store::HeaderRecord {
+    type Error = RustyError;
+    fn try_from(h: FfiHeaderRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            prev_fk: rbitcoin_primitives::Fk(h.prev_fk),
+            version: h.version,
+            timestamp: h.timestamp,
+            bits: h.bits,
+            nonce: h.nonce,
+            merkle_root: parse_hash32(&h.merkle_root)?,
+            hash: parse_hash32(&h.hash)?,
+            size: h.size,
+            weight: h.weight,
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, uniffi::Record)]
 pub struct FfiTxRecord {
     pub txid: String,
@@ -2249,6 +2266,24 @@ impl FfiQuery {
             .header_at_height(rbitcoin_primitives::Height(height))
             .map_err(|_| RustyError::StoreError)?;
         Ok(rec.map(|(_fk, h)| h.into()))
+    }
+
+    pub fn ensure_header(&self, header: FfiHeaderRecord) -> Result<u64, RustyError> {
+        let rec: rbitcoin_store::HeaderRecord = header.try_into()?;
+        let fk = self.inner.ensure_header(&rec).map_err(|_| RustyError::StoreError)?;
+        Ok(fk.0)
+    }
+
+    pub fn ensure_headers(&self, headers: Vec<FfiHeaderRecord>) -> Result<Vec<u64>, RustyError> {
+        let recs: Vec<rbitcoin_store::HeaderRecord> = headers
+            .into_iter()
+            .map(|h| h.try_into())
+            .collect::<Result<_, _>>()?;
+        let fks = self
+            .inner
+            .ensure_headers(&recs)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fks.into_iter().map(|f| f.0).collect())
     }
 
     pub fn confirm_block(&self, height: u32, hash_hex: String) -> Result<u64, RustyError> {
@@ -4128,6 +4163,21 @@ mod tests {
         query.sync_sh_seal_from_include_hwm().unwrap();
         assert_eq!(query.finalize_sh_runs().unwrap(), 0);
         assert_eq!(query.backfill_tx_index().unwrap(), 0);
+        let rec = FfiHeaderRecord {
+            prev_fk: 0,
+            version: 0,
+            timestamp: 0,
+            bits: 0,
+            nonce: 0,
+            merkle_root: "0".repeat(64),
+            hash: "0".repeat(64),
+            size: 0,
+            weight: 0,
+        };
+        let fk = query.ensure_header(rec).unwrap();
+        assert_eq!(fk, 1);
+        let fks = query.ensure_headers(vec![]).unwrap();
+        assert!(fks.is_empty());
     }
 
     #[test]

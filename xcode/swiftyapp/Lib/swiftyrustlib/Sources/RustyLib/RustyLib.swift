@@ -12837,6 +12837,13 @@ public func blockHeaderTime(blockHex: String)throws  -> UInt32 {
     )
 })
 }
+public func blockHeaderVersion(blockHex: String)throws  -> Int32 {
+    return try  FfiConverterInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_header_version(
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
 public func blockQueueSoftTargets(rateBlocksPerS: Double?) -> FfiBlockQueueSoftTargets {
     return try!  FfiConverterTypeFfiBlockQueueSoftTargets.lift(try! rustCall() {
     uniffi_rustylib_fn_func_block_queue_soft_targets(
@@ -14525,6 +14532,13 @@ public func txAddOutput(txHex: String, valueSat: UInt64, scriptPubkeyHex: String
     )
 })
 }
+public func txCoinbaseHeight(txHex: String)throws  -> UInt32? {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_coinbase_height(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
 public func txCreateEmpty(version: Int32, lockTime: UInt32)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_tx_create_empty(
@@ -14540,9 +14554,23 @@ public func txGbtSigops(txHex: String)throws  -> UInt64 {
     )
 })
 }
+public func txHasWitness(txHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_has_witness(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
 public func txInputCount(txHex: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_tx_input_count(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txIsCoinbase(txHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_is_coinbase(
         FfiConverterString.lower(txHex),$0
     )
 })
@@ -14915,6 +14943,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_block_header_time() != 55648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_block_header_version() != 46460) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_block_queue_soft_targets() != 6234) {
@@ -15616,13 +15647,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_tx_add_output() != 41815) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_tx_coinbase_height() != 42844) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_tx_create_empty() != 44079) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_gbt_sigops() != 40578) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_tx_has_witness() != 35408) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_tx_input_count() != 27325) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_is_coinbase() != 56862) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_lock_time() != 41885) {

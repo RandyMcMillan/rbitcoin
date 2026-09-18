@@ -456,6 +456,48 @@ pub fn tx_version(tx_hex: String) -> Result<i32, RustyError> {
 }
 
 #[uniffi::export]
+pub fn tx_has_witness(tx_hex: String) -> Result<bool, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.input.iter().any(|i| !i.witness.is_empty()))
+}
+
+#[uniffi::export]
+pub fn tx_is_coinbase(tx_hex: String) -> Result<bool, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(tx.input.len() == 1 && tx.input[0].previous_output.is_null())
+}
+
+#[uniffi::export]
+pub fn tx_coinbase_height(tx_hex: String) -> Result<Option<u32>, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    if tx.input.len() != 1 || !tx.input[0].previous_output.is_null() {
+        return Ok(None);
+    }
+    let script = tx.input[0].script_sig.as_bytes();
+    if script.is_empty() {
+        return Ok(None);
+    }
+    let len = script[0] as usize;
+    if script.len() < 1 + len {
+        return Ok(None);
+    }
+    let num_bytes = &script[1..1 + len];
+    if num_bytes.len() > 4 {
+        return Ok(None);
+    }
+    let mut arr = [0u8; 4];
+    arr[..num_bytes.len()].copy_from_slice(num_bytes);
+    let val = i32::from_le_bytes(arr);
+    if val < 0 {
+        return Ok(None);
+    }
+    Ok(Some(val as u32))
+}
+
+#[uniffi::export]
 pub fn tx_create_empty(version: i32, lock_time: u32) -> Result<String, RustyError> {
     let tx = bitcoin::Transaction {
         version: bitcoin::transaction::Version(version),
@@ -990,6 +1032,15 @@ pub fn block_compute_merkle_root(block_hex: String) -> Result<String, RustyError
         Some(root) => Ok(rbitcoin_primitives::hex_encode(root.as_byte_array())),
         None => Err(RustyError::InvalidInput),
     }
+}
+
+#[uniffi::export]
+pub fn block_header_version(block_hex: String) -> Result<i32, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.header.version.to_consensus())
 }
 
 #[uniffi::export]
@@ -7844,6 +7895,25 @@ mod tests {
         // A simple final tx (no locktime, sequence max)
         let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
         assert!(is_final_tx(tx_hex.to_string(), 100, 100).unwrap());
+    }
+
+    #[test]
+    fn test_tx_more_inspection() {
+        let tx_hex = tx_create_empty(2, 0).unwrap();
+        assert!(!tx_has_witness(tx_hex.clone()).unwrap());
+        assert!(!tx_is_coinbase(tx_hex.clone()).unwrap());
+        assert_eq!(tx_coinbase_height(tx_hex.clone()).unwrap(), None);
+
+        // Add a coinbase-like input
+        let coinbase = tx_add_input(
+            tx_hex,
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            0xffffffff,
+            0xffffffff,
+        )
+        .unwrap();
+        assert!(tx_is_coinbase(coinbase.clone()).unwrap());
+        assert_eq!(tx_coinbase_height(coinbase).unwrap(), None);
     }
 
     #[test]

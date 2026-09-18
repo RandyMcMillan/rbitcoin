@@ -1148,6 +1148,16 @@ pub struct FfiChainView {
     pub header_fk: u64,
 }
 
+impl From<rbitcoin_query::ChainView> for FfiChainView {
+    fn from(v: rbitcoin_query::ChainView) -> Self {
+        Self {
+            height: v.height.0 as u64,
+            hash: rbitcoin_primitives::hex_encode(v.hash),
+            header_fk: v.header_fk.0,
+        }
+    }
+}
+
 // --- Disconnect Tip FFI ---
 
 #[uniffi::export]
@@ -6248,6 +6258,46 @@ impl FfiNodeHandle {
         handle.query.flush().map_err(|_| RustyError::StoreError)?;
         Ok(())
     }
+
+    pub fn pin_chain_view(&self) -> Result<Option<FfiChainView>, RustyError> {
+        let inner = self.inner.lock().unwrap();
+        let view = inner
+            .query
+            .pin_chain_view()
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(view.map(Into::into))
+    }
+
+    pub fn tx_fk_by_txid(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let inner = self.inner.lock().unwrap();
+        inner
+            .query
+            .tx_fk_by_txid(&txid)
+            .map_err(|_| RustyError::StoreError)
+            .map(|o| o.map(|fk| fk.0))
+    }
+
+    pub fn is_outpoint_spent(&self, txid_hex: String, vout: u32) -> Result<bool, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let inner = self.inner.lock().unwrap();
+        inner
+            .query
+            .is_outpoint_spent(&txid, vout)
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn block_queue_count(&self) -> u64 {
+        self.inner.lock().unwrap().query.block_queue_count() as u64
+    }
+
+    pub fn tx_index_enabled(&self) -> bool {
+        self.inner.lock().unwrap().query.tx_index_enabled()
+    }
+
+    pub fn spend_index_enabled(&self) -> bool {
+        self.inner.lock().unwrap().query.spend_index_enabled()
+    }
 }
 
 // --- Tests ---
@@ -8888,6 +8938,25 @@ mod tests {
         // Tip is None before genesis
         assert_eq!(node.tip_height(), None);
         assert_eq!(node.tip_hash(), None);
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_handle_chain_view_and_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        // No chain view before genesis
+        assert!(node.pin_chain_view().unwrap().is_none());
+        assert_eq!(node.block_queue_count(), 0);
+        // Both default to true on a fresh store
+        assert!(node.tx_index_enabled());
+        assert!(node.spend_index_enabled());
+        // Unknown txid → None
+        assert!(node
+            .tx_fk_by_txid("0000000000000000000000000000000000000000000000000000000000000001".to_string())
+            .unwrap()
+            .is_none());
         node.shutdown().unwrap();
     }
 

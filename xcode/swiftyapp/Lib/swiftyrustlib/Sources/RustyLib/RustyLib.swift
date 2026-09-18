@@ -596,6 +596,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol FfiActiveMempoolProtocol : AnyObject {
     
+    func acceptTx(query: FfiQuery, txHex: String) throws  -> String
+    
     func compact() throws  -> String
     
     func eraseOrphansForBlock(blockTxidsHex: [String]) throws 
@@ -708,6 +710,15 @@ public static func openOrCreateWithLimit(path: String, maxWeight: UInt64)throws 
 }
     
 
+    
+open func acceptTx(query: FfiQuery, txHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_accept_tx(self.uniffiClonePointer(),
+        FfiConverterTypeFfiQuery.lower(query),
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
     
 open func compact()throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -9670,6 +9681,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_xpub_from_xpriv() != 63931) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_accept_tx() != 57074) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_compact() != 27579) {

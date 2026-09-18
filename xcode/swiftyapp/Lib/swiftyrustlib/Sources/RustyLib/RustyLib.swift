@@ -1206,6 +1206,10 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func dropShPendingFrom(height: UInt32) 
     
+    func ensureHeader(header: FfiHeaderRecord) throws  -> UInt64
+    
+    func ensureHeaders(headers: [FfiHeaderRecord]) throws  -> [UInt64]
+    
     func enterDirectIndexMode() throws 
     
     func enterDirectIndexModeSh(shindex: Bool) throws 
@@ -1705,6 +1709,22 @@ open func dropShPendingFrom(height: UInt32) {try! rustCall() {
         FfiConverterUInt32.lower(height),$0
     )
 }
+}
+    
+open func ensureHeader(header: FfiHeaderRecord)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_ensure_header(self.uniffiClonePointer(),
+        FfiConverterTypeFfiHeaderRecord.lower(header),$0
+    )
+})
+}
+    
+open func ensureHeaders(headers: [FfiHeaderRecord])throws  -> [UInt64] {
+    return try  FfiConverterSequenceUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_ensure_headers(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeFfiHeaderRecord.lower(headers),$0
+    )
+})
 }
     
 open func enterDirectIndexMode()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -5629,6 +5649,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiHeaderRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiHeaderRecord]
+
+    public static func write(_ value: [FfiHeaderRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiHeaderRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiHeaderRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiHeaderRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiHeaderRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiHeightTweak: FfiConverterRustBuffer {
     typealias SwiftType = [FfiHeightTweak]
 
@@ -8272,6 +8317,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_drop_sh_pending_from() != 39842) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_ensure_header() != 33186) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_ensure_headers() != 17009) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_enter_direct_index_mode() != 34744) {

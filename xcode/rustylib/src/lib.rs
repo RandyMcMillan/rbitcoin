@@ -420,25 +420,8 @@ pub fn address_type(address: String) -> Result<String, RustyError> {
 pub fn script_decode_hex(script_hex: String) -> Result<String, RustyError> {
     let bytes =
         rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
-    let script = bitcoin::Script::from_bytes(&bytes);
-    let mut out = String::new();
-    for (i, inst) in script.instructions().enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        match inst {
-            Ok(bitcoin::script::Instruction::Op(op)) => {
-                out.push_str(&format!("{:?}", op));
-            }
-            Ok(bitcoin::script::Instruction::PushBytes(bytes)) => {
-                out.push_str(&format!("PUSHBYTES({})", bytes.len()));
-            }
-            Err(_) => {
-                out.push_str("INVALID");
-            }
-        }
-    }
-    Ok(out)
+    let script = bitcoin::ScriptBuf::from_bytes(bytes);
+    Ok(script.to_string())
 }
 
 // --- BIP32 FFI ---

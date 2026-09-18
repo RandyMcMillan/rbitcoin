@@ -6552,6 +6552,37 @@ pub fn p2tr_address_from_pubkey(pubkey_hex: String, network: String) -> Result<S
     Ok(addr.to_string())
 }
 
+#[uniffi::export]
+pub fn xonly_pubkey_from_pubkey_hex(pubkey_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey =
+        bitcoin::PublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let xonly = pubkey.inner.x_only_public_key().0;
+    Ok(rbitcoin_primitives::hex_encode(xonly.serialize()))
+}
+
+#[uniffi::export]
+pub fn taproot_tweak_pubkey_hex(pubkey_hex: String, tweak_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let xonly =
+        bitcoin::XOnlyPublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let tweak =
+        rbitcoin_primitives::hex_decode(&tweak_hex).map_err(|_| RustyError::InvalidInput)?;
+    if tweak.len() != 32 {
+        return Err(RustyError::InvalidInput);
+    }
+    let mut tweak_arr = [0u8; 32];
+    tweak_arr.copy_from_slice(&tweak);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(tweak_arr)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let tweaked = xonly.add_tweak(&secp, &scalar)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(tweaked.0.serialize()))
+}
+
 fn known_hrp(net: rbitcoin_primitives::Network) -> bitcoin::address::KnownHrp {
     match net {
         rbitcoin_primitives::Network::Mainnet => bitcoin::address::KnownHrp::Mainnet,
@@ -8894,6 +8925,20 @@ mod tests {
         // Need x-only pubkey (32 bytes) for P2TR; CompressedPublicKey is 33 bytes.
         // Just verify the function exists and rejects bad input.
         assert!(p2tr_address_from_pubkey("00".to_string(), "mainnet".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_xonly_and_tweak() {
+        let kp = generate_keypair("mainnet".to_string()).unwrap();
+        let xonly = xonly_pubkey_from_pubkey_hex(kp.public_key_hex).unwrap();
+        assert_eq!(xonly.len(), 64);
+
+        let p2tr = p2tr_address_from_pubkey(xonly.clone(), "mainnet".to_string()).unwrap();
+        assert!(p2tr.starts_with("bc1p"));
+
+        // Tweak with zeros
+        let tweaked = taproot_tweak_pubkey_hex(xonly, "0000000000000000000000000000000000000000000000000000000000000000".to_string()).unwrap();
+        assert_eq!(tweaked.len(), 64);
     }
 
     #[test]

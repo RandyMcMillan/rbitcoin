@@ -858,6 +858,61 @@ pub fn block_has_witness(block_hex: String) -> Result<bool, RustyError> {
 }
 
 #[uniffi::export]
+pub fn block_tx_count(block_hex: String) -> Result<u64, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.txdata.len() as u64)
+}
+
+#[uniffi::export]
+pub fn block_header_time(block_hex: String) -> Result<u32, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.header.time)
+}
+
+#[uniffi::export]
+pub fn block_header_bits(block_hex: String) -> Result<u32, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.header.bits.to_consensus())
+}
+
+#[uniffi::export]
+pub fn block_header_nonce(block_hex: String) -> Result<u32, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.header.nonce)
+}
+
+#[uniffi::export]
+pub fn block_coinbase_tx_hex(block_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let coinbase = block.txdata.first().ok_or(RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(bitcoin::consensus::serialize(coinbase)))
+}
+
+#[uniffi::export]
+pub fn block_size(block_hex: String) -> Result<u64, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::consensus::serialize(&block).len() as u64)
+}
+
+#[uniffi::export]
 pub fn is_final_tx(
     tx_hex: String,
     block_height: u32,
@@ -7374,6 +7429,22 @@ mod tests {
         let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
         let count = block_wire_input_count(block_hex).unwrap();
         assert_eq!(count, 1); // coinbase only
+    }
+
+    #[test]
+    fn test_block_inspection() {
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+
+        assert_eq!(block_tx_count(block_hex.clone()).unwrap(), 1);
+        assert_eq!(block_header_time(block_hex.clone()).unwrap(), 1296688602);
+        assert_eq!(block_header_bits(block_hex.clone()).unwrap(), 0x207fffff);
+        // nonce is ground to find valid PoW; just check it exists
+        let _nonce = block_header_nonce(block_hex.clone()).unwrap();
+        let coinbase = block_coinbase_tx_hex(block_hex.clone()).unwrap();
+        assert!(!coinbase.is_empty());
+        assert!(block_size(block_hex.clone()).unwrap() > 0);
+        assert!(!block_has_witness(block_hex).unwrap());
     }
 
     #[test]

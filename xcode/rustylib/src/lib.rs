@@ -1508,6 +1508,40 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)
     }
 
+    pub fn has_confirmed_strong_spender_create(
+        &self,
+        create_tx_fk: u64,
+        out_index: u32,
+        body_range: Option<FfiTxRange>,
+    ) -> Result<bool, RustyError> {
+        let range = body_range.map(|r| (r.offset, r.len));
+        self.inner
+            .has_confirmed_strong_spender_create(
+                rbitcoin_primitives::Fk(create_tx_fk),
+                out_index,
+                range,
+            )
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn has_confirmed_strong_spender_create_at(
+        &self,
+        create_tx_fk: u64,
+        out_index: u32,
+        body_range: Option<FfiTxRange>,
+        tip: Option<u32>,
+    ) -> Result<bool, RustyError> {
+        let range = body_range.map(|r| (r.offset, r.len));
+        self.inner
+            .has_confirmed_strong_spender_create_at(
+                rbitcoin_primitives::Fk(create_tx_fk),
+                out_index,
+                range,
+                tip,
+            )
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn fence_max_connected_fk(&self) -> u64 {
         self.inner.fence_max_connected_fk()
     }
@@ -3357,6 +3391,15 @@ impl FfiActiveMempool {
     #[uniffi::constructor]
     pub fn open_or_create_with_limit(path: String, max_weight: u64) -> Result<Arc<Self>, RustyError> {
         let mempool = rbitcoin_mempool::ActiveMempool::open_or_create_with_limit(&path, max_weight)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(mempool),
+        }))
+    }
+
+    #[uniffi::constructor]
+    pub fn open_with_limit_persist(path: String, max_weight: u64, persist: bool) -> Result<Arc<Self>, RustyError> {
+        let mempool = rbitcoin_mempool::ActiveMempool::open_with_limit_persist(&path, max_weight, persist)
             .map_err(|_| RustyError::MempoolError)?;
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(mempool),
@@ -6721,5 +6764,25 @@ mod tests {
         let tx_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&tx));
         let result = check_package_shape(vec![tx_hex.clone(), tx_hex]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_store_has_confirmed_strong_spender_create_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let result = store.has_confirmed_strong_spender_create(1, 0, None);
+        assert!(result.is_err() || !result.unwrap());
+        let result2 = store.has_confirmed_strong_spender_create_at(1, 0, None, None);
+        assert!(result2.is_err() || !result2.unwrap());
+    }
+
+    #[test]
+    fn test_active_mempool_open_with_limit_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let am = FfiActiveMempool::open_with_limit_persist(path.clone(), 100_000_000, true).unwrap();
+        assert_eq!(am.live_count(), 0);
+        let am2 = FfiActiveMempool::open_with_limit_persist(path, 100_000_000, false).unwrap();
+        assert_eq!(am2.live_count(), 0);
     }
 }

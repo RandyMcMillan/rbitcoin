@@ -6418,6 +6418,39 @@ pub fn expected_services_disconnect_log(offered: u64, expected: u64) -> String {
 }
 
 #[uniffi::export]
+pub fn service_flags_from_u64(flags: u64) -> Vec<String> {
+    let sf = bitcoin::p2p::ServiceFlags::from(flags);
+    let mut out = Vec::new();
+    if sf.has(bitcoin::p2p::ServiceFlags::NETWORK) {
+        out.push("NETWORK".to_string());
+    }
+    if sf.has(bitcoin::p2p::ServiceFlags::GETUTXO) {
+        out.push("GETUTXO".to_string());
+    }
+    if sf.has(bitcoin::p2p::ServiceFlags::BLOOM) {
+        out.push("BLOOM".to_string());
+    }
+    if sf.has(bitcoin::p2p::ServiceFlags::WITNESS) {
+        out.push("WITNESS".to_string());
+    }
+    if sf.has(bitcoin::p2p::ServiceFlags::COMPACT_FILTERS) {
+        out.push("COMPACT_FILTERS".to_string());
+    }
+    if sf.has(bitcoin::p2p::ServiceFlags::NETWORK_LIMITED) {
+        out.push("NETWORK_LIMITED".to_string());
+    }
+    out
+}
+
+#[uniffi::export]
+pub fn network_time_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[uniffi::export]
 pub fn feeler_connection_completed_log() -> String {
     rbitcoin_net::feeler_connection_completed_log().to_string()
 }

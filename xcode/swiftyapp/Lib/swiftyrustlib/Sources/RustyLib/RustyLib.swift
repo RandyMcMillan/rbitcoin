@@ -13681,6 +13681,12 @@ public func networkMagicHex(network: String)throws  -> String {
     )
 })
 }
+public func networkTimeNow() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_network_time_now($0
+    )
+})
+}
 public func nodeCoreMaxconnectionsOutboundReserve() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_node_core_maxconnections_outbound_reserve($0
@@ -14356,6 +14362,13 @@ public func sequenceLocksSatisfied(txHex: String, prevHeights: [UInt32], prevCoi
         FfiConverterSequenceUInt32.lower(prevCoinMtps),
         FfiConverterUInt32.lower(blockHeight),
         FfiConverterUInt32.lower(blockPrevMtp),$0
+    )
+})
+}
+public func serviceFlagsFromU64(flags: UInt64) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_service_flags_from_u64(
+        FfiConverterUInt64.lower(flags),$0
     )
 })
 }
@@ -15305,6 +15318,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_network_magic_hex() != 34972) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_network_time_now() != 43298) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_node_core_maxconnections_outbound_reserve() != 34) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15582,6 +15598,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_sequence_locks_satisfied() != 54468) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_service_flags_from_u64() != 4687) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_sha256_hex() != 61878) {

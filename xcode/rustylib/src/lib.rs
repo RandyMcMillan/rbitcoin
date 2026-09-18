@@ -9011,4 +9011,37 @@ mod tests {
         node.flush_for_shutdown().unwrap();
     }
 
+    #[test]
+    fn test_block_cache_roundtrip() {
+        let cache = FfiBlockCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.tip_height(), None);
+        // Mine and push a regtest block
+        let genesis_hex = genesis_block_hash("regtest".to_string()).unwrap();
+        let block_hex = mine_empty_regtest(genesis_hex.clone(), 1296688602, 0).unwrap();
+        cache.push_best(block_hex.clone()).unwrap();
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.tip_height(), Some(0));
+        assert_eq!(cache.body_count(), 1);
+        // Get block back
+        let tip_hash = cache.tip_hash().unwrap();
+        let retrieved = cache.get_block(tip_hash.clone()).unwrap().unwrap();
+        assert_eq!(retrieved, block_hex);
+        // Get header back
+        let header = cache.get_header(tip_hash.clone()).unwrap().unwrap();
+        assert!(!header.is_empty());
+        // Hash at height
+        assert_eq!(cache.hash_at_height(0).unwrap(), tip_hash);
+        // Locator
+        let locator = cache.locator();
+        assert!(!locator.is_empty());
+        // Truncate
+        cache.truncate_to_height(0);
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
 }

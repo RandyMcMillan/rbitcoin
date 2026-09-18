@@ -7318,6 +7318,100 @@ pub fn tokio_runtime_test() -> Result<String, RustyError> {
     Ok(result)
 }
 
+// --- P2P async bridge ---
+
+use std::thread::JoinHandle;
+
+struct P2PState {
+    shutdown: Arc<rbitcoin_node::Shutdown>,
+    handle: Option<JoinHandle<Result<(), String>>>,
+}
+
+static P2P_STATE: std::sync::OnceLock<std::sync::Mutex<P2PState>> = std::sync::OnceLock::new();
+
+#[uniffi::export]
+pub fn p2p_start(datadir: String, network: String, max_run_secs: u64) -> Result<String, RustyError> {
+    let state = P2P_STATE.get_or_init(|| {
+        std::sync::Mutex::new(P2PState {
+            shutdown: rbitcoin_node::Shutdown::new(),
+            handle: None,
+        })
+    });
+
+    let mut guard = state.lock().map_err(|_| RustyError::InvalidInput)?;
+
+    if guard.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+        return Ok("already-running".to_string());
+    }
+
+    // Reset shutdown flag for a fresh start
+    guard.shutdown = rbitcoin_node::Shutdown::new();
+    let shutdown = Arc::clone(&guard.shutdown);
+
+    let net = rbitcoin_primitives::Network::parse(&network)
+        .map_err(|_| RustyError::InvalidInput)?;
+
+    let mut config = rbitcoin_node::NodeConfig::default()
+        .with_datadir(std::path::PathBuf::from(&datadir))
+        .with_network(net);
+
+    if max_run_secs > 0 {
+        config.max_run_secs = Some(max_run_secs);
+    }
+    config.head_scale = rbitcoin_store::HeadScale::Tiny;
+
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        rt.block_on(async {
+            // Signal handler spawn is inside run_p2p; on iOS it logs a warning and returns.
+            rbitcoin_node::run_p2p_with_shutdown(config, Some(shutdown)).await
+        }).map_err(|e| format!("run_p2p: {e}"))
+    });
+
+    guard.handle = Some(handle);
+    Ok("started".to_string())
+}
+
+#[uniffi::export]
+pub fn p2p_stop() -> Result<String, RustyError> {
+    let state = P2P_STATE.get_or_init(|| {
+        std::sync::Mutex::new(P2PState {
+            shutdown: rbitcoin_node::Shutdown::new(),
+            handle: None,
+        })
+    });
+
+    let mut guard = state.lock().map_err(|_| RustyError::InvalidInput)?;
+    guard.shutdown.request();
+
+    if let Some(handle) = guard.handle.take() {
+        let _ = handle.join();
+    }
+
+    Ok("stopped".to_string())
+}
+
+#[uniffi::export]
+pub fn p2p_is_running() -> bool {
+    let state = P2P_STATE.get_or_init(|| {
+        std::sync::Mutex::new(P2PState {
+            shutdown: rbitcoin_node::Shutdown::new(),
+            handle: None,
+        })
+    });
+
+    let guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    match &guard.handle {
+        Some(h) => !h.is_finished(),
+        None => false,
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -10387,6 +10481,27 @@ mod tests {
         let script_hex = "76a914000000000000000000000000000000000000000088ac".to_string();
         let addr = p2sh_address_from_script(script_hex, "mainnet".to_string()).unwrap();
         assert!(addr.starts_with('3'));
+    }
+
+    #[test]
+    fn test_p2p_bridge_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let datadir = tmp.path().to_str().unwrap().to_string();
+
+        assert!(!p2p_is_running());
+
+        // Start with max_run_secs=1 so it exits quickly on its own
+        let result = p2p_start(datadir.clone(), "regtest".to_string(), 1);
+        assert_eq!(result.unwrap(), "started");
+        assert!(p2p_is_running());
+
+        // Stop should succeed even if it already timed out
+        let stop = p2p_stop();
+        assert_eq!(stop.unwrap(), "stopped");
+
+        // Wait for thread to finish
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!p2p_is_running());
     }
 
 }

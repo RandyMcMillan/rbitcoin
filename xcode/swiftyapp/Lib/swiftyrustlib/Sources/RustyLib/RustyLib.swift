@@ -13781,10 +13781,31 @@ public func p2pFixedSeedHosts(network: String)throws  -> [String] {
     )
 })
 }
+public func p2pIsRunning() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_p2p_is_running($0
+    )
+})
+}
 public func p2pMessageChecksum(payloadHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_p2p_message_checksum(
         FfiConverterString.lower(payloadHex),$0
+    )
+})
+}
+public func p2pStart(datadir: String, network: String, maxRunSecs: UInt64)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_start(
+        FfiConverterString.lower(datadir),
+        FfiConverterString.lower(network),
+        FfiConverterUInt64.lower(maxRunSecs),$0
+    )
+})
+}
+public func p2pStop()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_stop($0
     )
 })
 }
@@ -15366,7 +15387,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_p2p_fixed_seed_hosts() != 2698) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_p2p_is_running() != 9784) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_p2p_message_checksum() != 60360) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_start() != 63850) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_stop() != 5934) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_target_peers() != 34559) {

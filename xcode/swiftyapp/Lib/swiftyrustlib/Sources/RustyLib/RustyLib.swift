@@ -14414,6 +14414,33 @@ public func tweakFromTx(txHex: String, prevoutsHex: [String])throws  -> FfiTxTwe
     )
 })
 }
+public func txAddInput(txHex: String, prevoutTxidHex: String, vout: UInt32, sequence: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_add_input(
+        FfiConverterString.lower(txHex),
+        FfiConverterString.lower(prevoutTxidHex),
+        FfiConverterUInt32.lower(vout),
+        FfiConverterUInt32.lower(sequence),$0
+    )
+})
+}
+public func txAddOutput(txHex: String, valueSat: UInt64, scriptPubkeyHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_add_output(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt64.lower(valueSat),
+        FfiConverterString.lower(scriptPubkeyHex),$0
+    )
+})
+}
+public func txCreateEmpty(version: Int32, lockTime: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_create_empty(
+        FfiConverterInt32.lower(version),
+        FfiConverterUInt32.lower(lockTime),$0
+    )
+})
+}
 public func txGbtSigops(txHex: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_tx_gbt_sigops(
@@ -14438,6 +14465,13 @@ public func txLockTime(txHex: String)throws  -> UInt32 {
 public func txOutputCount(txHex: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_tx_output_count(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txToHex(txHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_to_hex(
         FfiConverterString.lower(txHex),$0
     )
 })
@@ -15436,6 +15470,15 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_tweak_from_tx() != 38599) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_tx_add_input() != 52085) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_add_output() != 41815) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_create_empty() != 44079) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_tx_gbt_sigops() != 40578) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15446,6 +15489,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_output_count() != 50673) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_to_hex() != 8562) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_version() != 51219) {

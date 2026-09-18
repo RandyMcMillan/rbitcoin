@@ -422,6 +422,65 @@ pub fn tx_version(tx_hex: String) -> Result<i32, RustyError> {
 }
 
 #[uniffi::export]
+pub fn tx_create_empty(version: i32, lock_time: u32) -> Result<String, RustyError> {
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version(version),
+        lock_time: bitcoin::locktime::absolute::LockTime::from_consensus(lock_time),
+        input: vec![],
+        output: vec![],
+    };
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_add_input(
+    tx_hex: String,
+    prevout_txid_hex: String,
+    vout: u32,
+    sequence: u32,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let txid_bytes = parse_hash32(&prevout_txid_hex)?;
+    let mut txid_arr = [0u8; 32];
+    txid_arr.copy_from_slice(&txid_bytes);
+    tx.input.push(bitcoin::TxIn {
+        previous_output: bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(txid_arr),
+            vout,
+        },
+        script_sig: bitcoin::ScriptBuf::new(),
+        sequence: bitcoin::Sequence(sequence),
+        witness: bitcoin::Witness::new(),
+    });
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_add_output(
+    tx_hex: String,
+    value_sat: u64,
+    script_pubkey_hex: String,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&script_pubkey_hex)
+        .map_err(|_| RustyError::InvalidInput)?;
+    tx.output.push(bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(value_sat),
+        script_pubkey: bitcoin::ScriptBuf::from_bytes(script),
+    });
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_to_hex(tx_hex: String) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
 pub fn is_annex_standard(annex_hex: String) -> Result<bool, RustyError> {
     let annex =
         rbitcoin_primitives::hex_decode(&annex_hex).map_err(|_| RustyError::InvalidInput)?;
@@ -8720,6 +8779,31 @@ mod tests {
         assert_eq!(tx_output_count(tx_hex.clone()).unwrap(), 0);
         assert_eq!(tx_lock_time(tx_hex.clone()).unwrap(), 100);
         assert_eq!(tx_version(tx_hex).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_tx_building() {
+        let empty = tx_create_empty(2, 0).unwrap();
+        assert_eq!(tx_input_count(empty.clone()).unwrap(), 0);
+        assert_eq!(tx_output_count(empty.clone()).unwrap(), 0);
+
+        let with_input = tx_add_input(
+            empty,
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            0,
+            0xffffffff,
+        )
+        .unwrap();
+        assert_eq!(tx_input_count(with_input.clone()).unwrap(), 1);
+
+        let p2wpkh = "00140000000000000000000000000000000000000000";
+        let with_output = tx_add_output(with_input, 10000, p2wpkh.to_string()).unwrap();
+        assert_eq!(tx_output_count(with_output.clone()).unwrap(), 1);
+        assert!(tx_weight(with_output.clone()).unwrap() > 0);
+
+        // tx_to_hex is idempotent for a valid tx
+        let hex_out = tx_to_hex(with_output.clone()).unwrap();
+        assert_eq!(hex_out, with_output);
     }
 
     #[test]

@@ -1673,6 +1673,30 @@ impl FfiStore {
         Ok(FfiTxRange { offset, len })
     }
 
+    pub fn tx_create_loc_range_batch(
+        &self,
+        fks: Vec<u64>,
+    ) -> Result<Vec<Option<FfiCreateLocPair>>, RustyError> {
+        let fks: Vec<rbitcoin_primitives::Fk> =
+            fks.into_iter().map(rbitcoin_primitives::Fk).collect();
+        let results = self
+            .inner
+            .tx_create_loc_range_batch(&fks)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(results
+            .into_iter()
+            .map(|opt| {
+                opt.map(|p| FfiCreateLocPair {
+                    txout_offset: p.txout.0,
+                    txout_len: p.txout.1,
+                    spent_offset: p.spent.0,
+                    spent_len: p.spent.1,
+                    n_out: p.n_out,
+                })
+            })
+            .collect())
+    }
+
     pub fn mtp_times_at(&self, height: u32) -> Option<FfiMtpTimes> {
         self.inner
             .mtp_times_at(rbitcoin_primitives::Height(height))
@@ -1792,6 +1816,15 @@ impl FfiStore {
 pub struct FfiTxRange {
     pub offset: u64,
     pub len: u64,
+}
+
+#[derive(Debug, PartialEq, uniffi::Record)]
+pub struct FfiCreateLocPair {
+    pub txout_offset: u64,
+    pub txout_len: u64,
+    pub spent_offset: u64,
+    pub spent_len: u64,
+    pub n_out: u32,
 }
 
 #[derive(uniffi::Record)]
@@ -2194,6 +2227,16 @@ impl FfiQuery {
             .tx_fk_by_txid_tip(&txid)
             .map_err(|_| RustyError::StoreError)?;
         Ok(fk.map(|f| f.0))
+    }
+
+    pub fn write_create_loc(&self, fk: u64) -> Option<FfiCreateLocPair> {
+        self.inner.write_create_loc(rbitcoin_primitives::Fk(fk)).map(|p| FfiCreateLocPair {
+            txout_offset: p.txout.0,
+            txout_len: p.txout.1,
+            spent_offset: p.spent.0,
+            spent_len: p.spent.1,
+            n_out: p.n_out,
+        })
     }
 
     pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
@@ -6784,5 +6827,20 @@ mod tests {
         assert_eq!(am.live_count(), 0);
         let am2 = FfiActiveMempool::open_with_limit_persist(path, 100_000_000, false).unwrap();
         assert_eq!(am2.live_count(), 0);
+    }
+
+    #[test]
+    fn test_store_tx_create_loc_range_batch_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let result = store.tx_create_loc_range_batch(vec![1, 2]).unwrap();
+        assert_eq!(result, vec![None, None]);
+    }
+
+    #[test]
+    fn test_query_write_create_loc_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert_eq!(query.write_create_loc(1), None);
     }
 }

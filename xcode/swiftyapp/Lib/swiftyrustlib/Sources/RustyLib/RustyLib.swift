@@ -1864,6 +1864,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func warningStrings(network: String) throws  -> [String]
     
+    func writeCreateLoc(fk: UInt64)  -> FfiCreateLocPair?
+    
 }
 
 open class FfiQuery:
@@ -2851,6 +2853,14 @@ open func warningStrings(network: String)throws  -> [String] {
 })
 }
     
+open func writeCreateLoc(fk: UInt64) -> FfiCreateLocPair? {
+    return try!  FfiConverterOptionTypeFfiCreateLocPair.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiquery_write_create_loc(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
 
 }
 
@@ -2981,6 +2991,8 @@ public protocol FfiStoreProtocol : AnyObject {
     func txBodyRange(fk: UInt64) throws  -> FfiTxRange
     
     func txBodyRangeBatch(fks: [UInt64]) throws  -> [FfiTxRange?]
+    
+    func txCreateLocRangeBatch(fks: [UInt64]) throws  -> [FfiCreateLocPair?]
     
     func txHeadBits()  -> UInt32
     
@@ -3346,6 +3358,14 @@ open func txBodyRange(fk: UInt64)throws  -> FfiTxRange {
 open func txBodyRangeBatch(fks: [UInt64])throws  -> [FfiTxRange?] {
     return try  FfiConverterSequenceOptionTypeFfiTxRange.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_tx_body_range_batch(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt64.lower(fks),$0
+    )
+})
+}
+    
+open func txCreateLocRangeBatch(fks: [UInt64])throws  -> [FfiCreateLocPair?] {
+    return try  FfiConverterSequenceOptionTypeFfiCreateLocPair.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_tx_create_loc_range_batch(self.uniffiClonePointer(),
         FfiConverterSequenceUInt64.lower(fks),$0
     )
 })
@@ -4028,6 +4048,96 @@ public func FfiConverterTypeFfiCoinbaseAtHeight_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeFfiCoinbaseAtHeight_lower(_ value: FfiCoinbaseAtHeight) -> RustBuffer {
     return FfiConverterTypeFfiCoinbaseAtHeight.lower(value)
+}
+
+
+public struct FfiCreateLocPair {
+    public var txoutOffset: UInt64
+    public var txoutLen: UInt64
+    public var spentOffset: UInt64
+    public var spentLen: UInt64
+    public var nOut: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txoutOffset: UInt64, txoutLen: UInt64, spentOffset: UInt64, spentLen: UInt64, nOut: UInt32) {
+        self.txoutOffset = txoutOffset
+        self.txoutLen = txoutLen
+        self.spentOffset = spentOffset
+        self.spentLen = spentLen
+        self.nOut = nOut
+    }
+}
+
+
+
+extension FfiCreateLocPair: Equatable, Hashable {
+    public static func ==(lhs: FfiCreateLocPair, rhs: FfiCreateLocPair) -> Bool {
+        if lhs.txoutOffset != rhs.txoutOffset {
+            return false
+        }
+        if lhs.txoutLen != rhs.txoutLen {
+            return false
+        }
+        if lhs.spentOffset != rhs.spentOffset {
+            return false
+        }
+        if lhs.spentLen != rhs.spentLen {
+            return false
+        }
+        if lhs.nOut != rhs.nOut {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txoutOffset)
+        hasher.combine(txoutLen)
+        hasher.combine(spentOffset)
+        hasher.combine(spentLen)
+        hasher.combine(nOut)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCreateLocPair: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCreateLocPair {
+        return
+            try FfiCreateLocPair(
+                txoutOffset: FfiConverterUInt64.read(from: &buf), 
+                txoutLen: FfiConverterUInt64.read(from: &buf), 
+                spentOffset: FfiConverterUInt64.read(from: &buf), 
+                spentLen: FfiConverterUInt64.read(from: &buf), 
+                nOut: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCreateLocPair, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.txoutOffset, into: &buf)
+        FfiConverterUInt64.write(value.txoutLen, into: &buf)
+        FfiConverterUInt64.write(value.spentOffset, into: &buf)
+        FfiConverterUInt64.write(value.spentLen, into: &buf)
+        FfiConverterUInt32.write(value.nOut, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCreateLocPair_lift(_ buf: RustBuffer) throws -> FfiCreateLocPair {
+    return try FfiConverterTypeFfiCreateLocPair.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCreateLocPair_lower(_ value: FfiCreateLocPair) -> RustBuffer {
+    return FfiConverterTypeFfiCreateLocPair.lower(value)
 }
 
 
@@ -6884,6 +6994,30 @@ fileprivate struct FfiConverterOptionTypeFfiChainView: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiCreateLocPair: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCreateLocPair?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiCreateLocPair.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiCreateLocPair.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiHeaderRecord: FfiConverterRustBuffer {
     typealias SwiftType = FfiHeaderRecord?
 
@@ -7643,6 +7777,31 @@ fileprivate struct FfiConverterSequenceOptionString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterOptionString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceOptionTypeFfiCreateLocPair: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiCreateLocPair?]
+
+    public static func write(_ value: [FfiCreateLocPair?], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterOptionTypeFfiCreateLocPair.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiCreateLocPair?] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiCreateLocPair?]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterOptionTypeFfiCreateLocPair.read(from: &buf))
         }
         return seq
     }
@@ -10495,6 +10654,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiquery_warning_strings() != 30486) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiquery_write_create_loc() != 42163) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_archived_block_count() != 31669) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10601,6 +10763,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tx_body_range_batch() != 16122) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_tx_create_loc_range_batch() != 30148) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tx_head_bits() != 27031) {

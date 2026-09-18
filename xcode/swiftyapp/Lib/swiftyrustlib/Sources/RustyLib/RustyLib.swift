@@ -1780,6 +1780,142 @@ public func FfiConverterTypeFfiMempool_lower(_ value: FfiMempool) -> UnsafeMutab
 
 
 
+public protocol FfiNodeClockProtocol : AnyObject {
+    
+    func nowSecs()  -> UInt64
+    
+    func setMock(t: Int64) 
+    
+}
+
+open class FfiNodeClock:
+    FfiNodeClockProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffinodeclock(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffinodeclock_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffinodeclock(pointer, $0) }
+    }
+
+    
+
+    
+open func nowSecs() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodeclock_now_secs(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func setMock(t: Int64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodeclock_set_mock(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(t),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiNodeClock: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiNodeClock
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiNodeClock {
+        return FfiNodeClock(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiNodeClock) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNodeClock {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiNodeClock, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNodeClock_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiNodeClock {
+    return try FfiConverterTypeFfiNodeClock.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNodeClock_lower(_ value: FfiNodeClock) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiNodeClock.lower(value)
+}
+
+
+
+
 public protocol FfiQueryProtocol : AnyObject {
     
     func activeUnknownBits(network: String) throws  -> [Int32]
@@ -9542,6 +9678,12 @@ public func virtualSize(weight: UInt64) -> UInt64 {
     )
 })
 }
+public func wallNow() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_wall_now($0
+    )
+})
+}
 public func warnPeriodThreshold(network: String)throws  -> FfiWarnPeriod {
     return try  FfiConverterTypeFfiWarnPeriod.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_warn_period_threshold(
@@ -10236,6 +10378,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_virtual_size() != 6608) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_wall_now() != 42212) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_warn_period_threshold() != 57469) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10462,6 +10607,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempool_slot_stats() != 60716) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodeclock_now_secs() != 50083) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodeclock_set_mock() != 16327) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_active_unknown_bits() != 626) {
@@ -11017,6 +11168,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffinodeclock_new() != 28177) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiquery_open_or_create() != 65007) {

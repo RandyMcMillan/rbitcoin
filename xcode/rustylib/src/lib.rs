@@ -327,6 +327,82 @@ pub fn net_default_ibd_window() -> u32 {
     rbitcoin_net::DEFAULT_IBD_WINDOW as u32
 }
 
+#[uniffi::export]
+pub fn pick_seed_results(x_ips: Vec<String>, plain_ips: Vec<String>) -> Vec<String> {
+    let x: Vec<std::net::SocketAddr> = x_ips.into_iter().filter_map(|s| s.parse().ok()).collect();
+    let plain: Vec<std::net::SocketAddr> =
+        plain_ips.into_iter().filter_map(|s| s.parse().ok()).collect();
+    rbitcoin_net::pick_seed_results(&x, &plain)
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect()
+}
+
+// --- PeerFlags FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiPeerFlags {
+    bits: u8,
+}
+
+#[uniffi::export]
+impl FfiPeerFlags {
+    #[uniffi::constructor]
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self { bits: 0 })
+    }
+
+    #[uniffi::constructor]
+    pub fn new(bits: u8) -> Arc<Self> {
+        Arc::new(Self { bits })
+    }
+
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+
+    pub fn has_connected(&self) -> bool {
+        self.bits & 1 != 0
+    }
+
+    pub fn is_fast(&self) -> bool {
+        self.bits & 2 != 0
+    }
+
+    pub fn is_slow(&self) -> bool {
+        self.bits & 4 != 0
+    }
+
+    pub fn is_incompatible(&self) -> bool {
+        self.bits & 8 != 0
+    }
+
+    pub fn failed_last_connect(&self) -> bool {
+        self.bits & 16 != 0
+    }
+
+    pub fn is_untried(&self) -> bool {
+        self.bits == 0
+    }
+
+    pub fn dial_tier(&self) -> u8 {
+        let pf = rbitcoin_net::PeerFlags(self.bits);
+        pf.dial_tier()
+    }
+
+    pub fn with_bit(&self, bit: u8) -> Arc<Self> {
+        Arc::new(Self {
+            bits: self.bits | bit,
+        })
+    }
+
+    pub fn without_bit(&self, bit: u8) -> Arc<Self> {
+        Arc::new(Self {
+            bits: self.bits & !bit,
+        })
+    }
+}
+
 // --- RPC / Electrum FFI ---
 
 #[uniffi::export]
@@ -960,6 +1036,12 @@ pub fn select_inbound_eviction(candidates: Vec<FfiInboundEvictCandidate>) -> Opt
         })
         .collect();
     rbitcoin_net::select_inbound_eviction(cands)
+}
+
+#[uniffi::export]
+pub fn eviction_netgroup(addr: String) -> Result<u64, RustyError> {
+    let socket: std::net::SocketAddr = addr.parse().map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::eviction_netgroup(socket))
 }
 
 // --- Commit Class A Block FFI ---
@@ -4389,6 +4471,47 @@ pub fn work_better(new_work_hex: String, old_work_hex: String) -> Result<bool, R
     ))
 }
 
+// --- InvalidHashSet FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiInvalidHashSet {
+    inner: std::sync::Mutex<rbitcoin_net::InvalidHashSet>,
+}
+
+#[uniffi::export]
+impl FfiInvalidHashSet {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(rbitcoin_net::InvalidHashSet::default()),
+        })
+    }
+
+    pub fn mark(&self, hash_hex: String) -> Result<(), RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner.lock().unwrap().mark(hash);
+        Ok(())
+    }
+
+    pub fn contains(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self.inner.lock().unwrap().contains(hash))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
+
+    pub fn hashes(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .map(rbitcoin_primitives::hex_encode)
+            .collect()
+    }
+}
+
 // --- Reorg / Bad Prev FFI ---
 
 #[uniffi::export]
@@ -7314,6 +7437,68 @@ mod tests {
         assert_eq!(cache.len(), 3);
         // With depth=2, only 2 most recent bodies kept
         assert_eq!(cache.body_count(), 2);
+    }
+
+    #[test]
+    fn test_invalid_hash_set() {
+        let set = FfiInvalidHashSet::new();
+        assert!(set.is_empty());
+        let h = "abcd000000000000000000000000000000000000000000000000000000000000";
+        assert!(!set.contains(h.to_string()).unwrap());
+        set.mark(h.to_string()).unwrap();
+        assert!(set.contains(h.to_string()).unwrap());
+        assert!(!set.is_empty());
+        let hashes = set.hashes();
+        assert_eq!(hashes.len(), 1);
+        // parse_hash32 parses display format; hex_encode returns raw bytes
+        assert_eq!(hashes[0], "000000000000000000000000000000000000000000000000000000000000cdab");
+    }
+
+    #[test]
+    fn test_eviction_netgroup() {
+        let a = "1.2.3.4:8333".to_string();
+        let b = "1.2.9.9:8333".to_string();
+        let c = "1.3.0.1:8333".to_string();
+        assert_eq!(
+            eviction_netgroup(a).unwrap(),
+            eviction_netgroup(b.clone()).unwrap()
+        );
+        assert_ne!(
+            eviction_netgroup(b).unwrap(),
+            eviction_netgroup(c).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pick_seed_results() {
+        let x = vec!["1.2.3.4:8333".to_string()];
+        let plain = vec!["5.6.7.8:8333".to_string()];
+        let r = pick_seed_results(x.clone(), vec![]);
+        assert_eq!(r, x);
+        let r2 = pick_seed_results(vec![], plain.clone());
+        assert_eq!(r2, plain);
+        let r3 = pick_seed_results(vec![], vec![]);
+        assert!(r3.is_empty());
+    }
+
+    #[test]
+    fn test_peer_flags() {
+        let f = FfiPeerFlags::empty();
+        assert!(f.is_untried());
+        assert_eq!(f.dial_tier(), 0);
+        let f2 = FfiPeerFlags::new(1);
+        assert!(f2.has_connected());
+        assert!(!f2.is_fast());
+        let f3 = f2.with_bit(4);
+        assert!(f3.is_slow());
+        let f4 = f3.without_bit(4);
+        assert!(!f4.is_slow());
+        let bad = FfiPeerFlags::new(16);
+        assert!(bad.failed_last_connect());
+        assert_eq!(bad.dial_tier(), 2);
+        let inc = FfiPeerFlags::new(8);
+        assert!(inc.is_incompatible());
+        assert_eq!(inc.dial_tier(), 2);
     }
 
 }

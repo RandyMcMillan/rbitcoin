@@ -1792,6 +1792,161 @@ public func FfiConverterTypeFfiFeeFlowMeter_lower(_ value: FfiFeeFlowMeter) -> U
 
 
 
+public protocol FfiInvalidHashSetProtocol : AnyObject {
+    
+    func contains(hashHex: String) throws  -> Bool
+    
+    func hashes()  -> [String]
+    
+    func isEmpty()  -> Bool
+    
+    func mark(hashHex: String) throws 
+    
+}
+
+open class FfiInvalidHashSet:
+    FfiInvalidHashSetProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffiinvalidhashset(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffiinvalidhashset_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffiinvalidhashset(pointer, $0) }
+    }
+
+    
+
+    
+open func contains(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiinvalidhashset_contains(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func hashes() -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiinvalidhashset_hashes(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isEmpty() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiinvalidhashset_is_empty(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func mark(hashHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiinvalidhashset_mark(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiInvalidHashSet: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiInvalidHashSet
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiInvalidHashSet {
+        return FfiInvalidHashSet(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiInvalidHashSet) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiInvalidHashSet {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiInvalidHashSet, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInvalidHashSet_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiInvalidHashSet {
+    return try FfiConverterTypeFfiInvalidHashSet.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInvalidHashSet_lower(_ value: FfiInvalidHashSet) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiInvalidHashSet.lower(value)
+}
+
+
+
+
 public protocol FfiMempoolProtocol : AnyObject {
     
     func abandonLive() throws  -> UInt32
@@ -2168,6 +2323,224 @@ public func FfiConverterTypeFfiNodeClock_lift(_ pointer: UnsafeMutableRawPointer
 #endif
 public func FfiConverterTypeFfiNodeClock_lower(_ value: FfiNodeClock) -> UnsafeMutableRawPointer {
     return FfiConverterTypeFfiNodeClock.lower(value)
+}
+
+
+
+
+public protocol FfiPeerFlagsProtocol : AnyObject {
+    
+    func bits()  -> UInt8
+    
+    func dialTier()  -> UInt8
+    
+    func failedLastConnect()  -> Bool
+    
+    func hasConnected()  -> Bool
+    
+    func isFast()  -> Bool
+    
+    func isIncompatible()  -> Bool
+    
+    func isSlow()  -> Bool
+    
+    func isUntried()  -> Bool
+    
+    func withBit(bit: UInt8)  -> FfiPeerFlags
+    
+    func withoutBit(bit: UInt8)  -> FfiPeerFlags
+    
+}
+
+open class FfiPeerFlags:
+    FfiPeerFlagsProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffipeerflags(self.pointer, $0) }
+    }
+public convenience init(bits: UInt8) {
+    let pointer =
+        try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffipeerflags_new(
+        FfiConverterUInt8.lower(bits),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffipeerflags(pointer, $0) }
+    }
+
+    
+public static func empty() -> FfiPeerFlags {
+    return try!  FfiConverterTypeFfiPeerFlags.lift(try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffipeerflags_empty($0
+    )
+})
+}
+    
+
+    
+open func bits() -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_bits(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func dialTier() -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_dial_tier(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func failedLastConnect() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_failed_last_connect(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func hasConnected() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_has_connected(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isFast() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_is_fast(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isIncompatible() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_is_incompatible(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isSlow() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_is_slow(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isUntried() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_is_untried(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func withBit(bit: UInt8) -> FfiPeerFlags {
+    return try!  FfiConverterTypeFfiPeerFlags.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_with_bit(self.uniffiClonePointer(),
+        FfiConverterUInt8.lower(bit),$0
+    )
+})
+}
+    
+open func withoutBit(bit: UInt8) -> FfiPeerFlags {
+    return try!  FfiConverterTypeFfiPeerFlags.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffipeerflags_without_bit(self.uniffiClonePointer(),
+        FfiConverterUInt8.lower(bit),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPeerFlags: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiPeerFlags
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiPeerFlags {
+        return FfiPeerFlags(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiPeerFlags) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPeerFlags {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiPeerFlags, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPeerFlags_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiPeerFlags {
+    return try FfiConverterTypeFfiPeerFlags.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPeerFlags_lower(_ value: FfiPeerFlags) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiPeerFlags.lower(value)
 }
 
 
@@ -9009,6 +9382,13 @@ public func esploraScriptFields(scriptHex: String, network: String)throws  -> Ff
     )
 })
 }
+public func evictionNetgroup(addr: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_eviction_netgroup(
+        FfiConverterString.lower(addr),$0
+    )
+})
+}
 public func expectedServicesDisconnectLog(offered: UInt64, expected: UInt64) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_expected_services_disconnect_log(
@@ -9700,6 +10080,14 @@ public func percentilesByWeight(scores: [Int64], weights: [Int64], totalWeight: 
         FfiConverterSequenceInt64.lower(scores),
         FfiConverterSequenceInt64.lower(weights),
         FfiConverterInt64.lower(totalWeight),$0
+    )
+})
+}
+public func pickSeedResults(xIps: [String], plainIps: [String]) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_pick_seed_results(
+        FfiConverterSequenceString.lower(xIps),
+        FfiConverterSequenceString.lower(plainIps),$0
     )
 })
 }
@@ -10441,6 +10829,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_esplora_script_fields() != 56162) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_eviction_netgroup() != 32984) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_expected_services_disconnect_log() != 60387) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10739,6 +11130,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_percentiles_by_weight() != 32241) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_pick_seed_results() != 32757) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_pick_stale_follow_evict() != 20442) {
@@ -11188,6 +11582,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffifeeflowmeter_note_admit() != 6691) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiinvalidhashset_contains() != 64112) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiinvalidhashset_hashes() != 773) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiinvalidhashset_is_empty() != 44288) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiinvalidhashset_mark() != 5697) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempool_abandon_live() != 47318) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11234,6 +11640,36 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodeclock_set_mock() != 16327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_bits() != 64480) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_dial_tier() != 61769) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_failed_last_connect() != 39337) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_has_connected() != 31524) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_is_fast() != 52589) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_is_incompatible() != 57426) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_is_slow() != 35927) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_is_untried() != 44661) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_with_bit() != 40774) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffipeerflags_without_bit() != 62662) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_active_unknown_bits() != 626) {
@@ -11824,10 +12260,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_constructor_ffifeeflowmeter_new() != 62794) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_constructor_ffiinvalidhashset_new() != 43631) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffinodeclock_new() != 28177) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffipeerflags_empty() != 50393) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffipeerflags_new() != 6164) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiquery_open_or_create() != 65007) {

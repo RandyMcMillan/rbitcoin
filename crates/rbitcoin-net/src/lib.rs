@@ -37,12 +37,12 @@ pub use compact::{
     CmpctPeerFrame,
 };
 pub use error::NetError;
-pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
+pub use eviction::{eviction_netgroup, select_inbound_eviction, InboundEvictCandidate};
 pub use ibd::{
     format_tip_perf_sizes, is_bad_prev_err, read_proc_rss, rehydrate_block_queue_residue,
     IbdConfig, ProcRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
-pub use most_work::{sum_work, work_better};
+pub use most_work::{sum_work, work_better, InvalidHashSet};
 pub use netgroup::netgroup;
 pub use peer::{
     addrv2_message_size_log, advertising_address_log, connected_to_self_log,
@@ -66,9 +66,9 @@ pub use rbitcoin_mempool::AcceptError;
 pub(crate) use rbitcoin_mempool::MempoolGraphStats;
 pub use reactor::BlockingRegion;
 pub use seeds::{
-    default_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts, required_seed_services,
-    resolve_all_seeds, resolve_dns_seeds, resolve_fixed_seeds, seed_lookup_names, AddrMan,
-    PeerEntry, PeerFlags, MAX_ADDR_MAN,
+    default_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts, pick_seed_results,
+    required_seed_services, resolve_all_seeds, resolve_dns_seeds, resolve_fixed_seeds,
+    seed_lookup_names, AddrMan, PeerEntry, PeerFlags, MAX_ADDR_MAN,
 };
 pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
 pub use service::{magic_for_params, P2PNode};

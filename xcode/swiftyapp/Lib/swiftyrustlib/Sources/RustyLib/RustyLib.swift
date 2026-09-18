@@ -1638,9 +1638,13 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func acceptBlock(blockHex: String) throws  -> FfiAcceptOutcome
     
+    func acceptBranch(blockHexes: [String]) throws  -> FfiAcceptOutcome
+    
     func acceptReceivedBlock(blockHex: String) throws  -> FfiAcceptOutcome
     
     func alreadyHaveOrAskedBlock(hashHex: String) throws  -> Bool
+    
+    func assembleBlockToScript(scriptPubkeyHex: String, extraTxHexes: [String]) throws  -> String
     
     func attachMempool(mp: FfiMempoolHub) throws 
     
@@ -1654,6 +1658,8 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func ensureGenesis() throws 
     
+    func ensureHeader(headerHex: String) throws 
+    
     func feefilterSatKvb()  -> UInt64
     
     func forgetAskedBlock(hashHex: String) throws 
@@ -1661,6 +1667,8 @@ public protocol FfiChainHubProtocol : AnyObject {
     func gbtAssembled()  -> Bool
     
     func gbtBlockVersion()  -> Int32
+    
+    func generateToScript(nblocks: UInt32, scriptPubkeyHex: String, extraTxHexes: [String]) throws  -> [String]
     
     func hasBlock(hashHex: String) throws  -> Bool
     
@@ -1800,6 +1808,14 @@ open func acceptBlock(blockHex: String)throws  -> FfiAcceptOutcome {
 })
 }
     
+open func acceptBranch(blockHexes: [String])throws  -> FfiAcceptOutcome {
+    return try  FfiConverterTypeFfiAcceptOutcome.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_accept_branch(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(blockHexes),$0
+    )
+})
+}
+    
 open func acceptReceivedBlock(blockHex: String)throws  -> FfiAcceptOutcome {
     return try  FfiConverterTypeFfiAcceptOutcome.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffichainhub_accept_received_block(self.uniffiClonePointer(),
@@ -1812,6 +1828,15 @@ open func alreadyHaveOrAskedBlock(hashHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffichainhub_already_have_or_asked_block(self.uniffiClonePointer(),
         FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func assembleBlockToScript(scriptPubkeyHex: String, extraTxHexes: [String])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_assemble_block_to_script(self.uniffiClonePointer(),
+        FfiConverterString.lower(scriptPubkeyHex),
+        FfiConverterSequenceString.lower(extraTxHexes),$0
     )
 })
 }
@@ -1857,6 +1882,13 @@ open func ensureGenesis()throws  {try rustCallWithError(FfiConverterTypeRustyErr
 }
 }
     
+open func ensureHeader(headerHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_ensure_header(self.uniffiClonePointer(),
+        FfiConverterString.lower(headerHex),$0
+    )
+}
+}
+    
 open func feefilterSatKvb() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_feefilter_sat_kvb(self.uniffiClonePointer(),$0
@@ -1881,6 +1913,16 @@ open func gbtAssembled() -> Bool {
 open func gbtBlockVersion() -> Int32 {
     return try!  FfiConverterInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_gbt_block_version(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func generateToScript(nblocks: UInt32, scriptPubkeyHex: String, extraTxHexes: [String])throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_generate_to_script(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(nblocks),
+        FfiConverterString.lower(scriptPubkeyHex),
+        FfiConverterSequenceString.lower(extraTxHexes),$0
     )
 })
 }
@@ -14110,10 +14152,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_accept_block() != 48760) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_accept_branch() != 55017) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_accept_received_block() != 848) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_already_have_or_asked_block() != 58998) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_assemble_block_to_script() != 22074) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_attach_mempool() != 10715) {
@@ -14134,6 +14182,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_ensure_genesis() != 47083) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_ensure_header() != 23630) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_feefilter_sat_kvb() != 12326) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14144,6 +14195,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_gbt_block_version() != 35221) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_generate_to_script() != 29831) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_has_block() != 44410) {

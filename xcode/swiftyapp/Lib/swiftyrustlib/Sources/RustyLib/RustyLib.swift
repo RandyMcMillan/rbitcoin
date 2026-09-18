@@ -13839,6 +13839,24 @@ public func p2pStart(datadir: String, network: String, maxRunSecs: UInt64)throws
     )
 })
 }
+public func p2pStartWithConfig(datadir: String, network: String, maxRunSecs: UInt64, p2pListen: String?, electrumListen: String?, esploraListen: String?, rpcListen: String?, rpcUser: String?, rpcPassword: String?, shindex: Bool, sptweaks: Bool, maxShCreates: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_start_with_config(
+        FfiConverterString.lower(datadir),
+        FfiConverterString.lower(network),
+        FfiConverterUInt64.lower(maxRunSecs),
+        FfiConverterOptionString.lower(p2pListen),
+        FfiConverterOptionString.lower(electrumListen),
+        FfiConverterOptionString.lower(esploraListen),
+        FfiConverterOptionString.lower(rpcListen),
+        FfiConverterOptionString.lower(rpcUser),
+        FfiConverterOptionString.lower(rpcPassword),
+        FfiConverterBool.lower(shindex),
+        FfiConverterBool.lower(sptweaks),
+        FfiConverterUInt32.lower(maxShCreates),$0
+    )
+})
+}
 public func p2pStop()throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_p2p_stop($0
@@ -15499,6 +15517,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_start() != 63850) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_start_with_config() != 18135) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_stop() != 5934) {

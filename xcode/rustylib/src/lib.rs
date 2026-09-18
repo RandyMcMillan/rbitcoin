@@ -5115,6 +5115,114 @@ pub fn mempool_relay_fee_btc_per_kb() -> f64 {
     rbitcoin_net::MempoolHub::relay_fee_btc_per_kb()
 }
 
+// --- Compact Block FFI ---
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCmpctReconstructStats {
+    pub hash: String,
+    pub ntx: u64,
+    pub getdata: bool,
+    pub missing_n: u64,
+    pub prefill_n: u64,
+    pub prefill_bytes: u64,
+    pub mempool_n: u64,
+    pub mempool_bytes: u64,
+    pub extra_n: u64,
+    pub extra_bytes: u64,
+    pub orphan_n: u64,
+    pub orphan_bytes: u64,
+    pub redundant_prefill_n: u64,
+    pub redundant_prefill_bytes: u64,
+    pub fetched_n: u64,
+    pub fetched_bytes: u64,
+}
+
+impl From<rbitcoin_net::CmpctReconstructStats> for FfiCmpctReconstructStats {
+    fn from(s: rbitcoin_net::CmpctReconstructStats) -> Self {
+        Self {
+            hash: s.hash.to_string(),
+            ntx: s.ntx as u64,
+            getdata: s.getdata,
+            missing_n: s.missing_n as u64,
+            prefill_n: s.prefill_n as u64,
+            prefill_bytes: s.prefill_bytes as u64,
+            mempool_n: s.mempool_n as u64,
+            mempool_bytes: s.mempool_bytes as u64,
+            extra_n: s.extra_n as u64,
+            extra_bytes: s.extra_bytes as u64,
+            orphan_n: s.orphan_n as u64,
+            orphan_bytes: s.orphan_bytes as u64,
+            redundant_prefill_n: s.redundant_prefill_n as u64,
+            redundant_prefill_bytes: s.redundant_prefill_bytes as u64,
+            fetched_n: s.fetched_n as u64,
+            fetched_bytes: s.fetched_bytes as u64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiCmpctPeerFrame {
+    GetBlockTxn { indexes: Vec<u64> },
+    Ping { nonce: u64 },
+    Pong { nonce: u64 },
+    Other,
+}
+
+#[uniffi::export]
+pub fn classify_v2_cmpct_peer(contents_hex: String) -> Result<FfiCmpctPeerFrame, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&contents_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(match rbitcoin_net::classify_v2_cmpct_peer(&bytes) {
+        rbitcoin_net::CmpctPeerFrame::GetBlockTxn(idxs) => FfiCmpctPeerFrame::GetBlockTxn {
+            indexes: idxs,
+        },
+        rbitcoin_net::CmpctPeerFrame::Ping(n) => FfiCmpctPeerFrame::Ping { nonce: n },
+        rbitcoin_net::CmpctPeerFrame::Pong(n) => FfiCmpctPeerFrame::Pong { nonce: n },
+        rbitcoin_net::CmpctPeerFrame::Other => FfiCmpctPeerFrame::Other,
+    })
+}
+
+#[uniffi::export]
+pub fn prefilled_indexes_ok(hsi_hex: String) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hsi_hex).map_err(|_| RustyError::InvalidInput)?;
+    let hsi: bitcoin::bip152::HeaderAndShortIds =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::prefilled_indexes_ok(&hsi))
+}
+
+#[uniffi::export]
+pub fn cmpct_send_line(hash_hex: String, ntx: u32, hsi_hex: String) -> Result<String, RustyError> {
+    let hash = parse_hash32(&hash_hex)?;
+    let bytes = rbitcoin_primitives::hex_decode(&hsi_hex).map_err(|_| RustyError::InvalidInput)?;
+    let hsi: bitcoin::bip152::HeaderAndShortIds =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_net::cmpct_send_line(
+        bitcoin::BlockHash::from_byte_array(hash),
+        ntx as usize,
+        &hsi,
+    ))
+}
+
+#[uniffi::export]
+pub fn reconstruct_getdata_stats(
+    hash_hex: String,
+    missing_n: u64,
+) -> Result<FfiCmpctReconstructStats, RustyError> {
+    let hash = parse_hash32(&hash_hex)?;
+    Ok(rbitcoin_net::reconstruct_getdata_stats(
+        bitcoin::BlockHash::from_byte_array(hash),
+        missing_n as usize,
+    )
+    .into())
+}
+
+#[uniffi::export]
+pub fn missing_request(block_hash_hex: String, missing: Vec<u64>) -> Result<String, RustyError> {
+    let hash = parse_hash32(&block_hash_hex)?;
+    let req = rbitcoin_net::missing_request(bitcoin::BlockHash::from_byte_array(hash), &missing);
+    Ok(bitcoin::consensus::encode::serialize_hex(&req))
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -8435,6 +8543,41 @@ mod tests {
         let txid = "0000000000000000000000000000000000000000000000000000000000000001";
         assert!(hub.graph_stats(txid.to_string()).unwrap().is_none());
         assert!(hub.graph_fees_modified(txid.to_string()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cmpct_getdata_stats() {
+        let hash = "0000000000000000000000000000000000000000000000000000000000000001";
+        let stats = reconstruct_getdata_stats(hash.to_string(), 3).unwrap();
+        assert!(stats.getdata);
+        assert_eq!(stats.missing_n, 3);
+        assert_eq!(stats.hash, hash);
+    }
+
+    #[test]
+    fn test_missing_request() {
+        let hash = "0000000000000000000000000000000000000000000000000000000000000001";
+        let req = missing_request(hash.to_string(), vec![1, 3, 5]).unwrap();
+        assert!(!req.is_empty());
+    }
+
+    #[test]
+    fn test_cmpct_send_line_bad_hsi() {
+        let hash = "0000000000000000000000000000000000000000000000000000000000000001";
+        // Invalid hsi hex → error
+        assert!(cmpct_send_line(hash.to_string(), 2, "bad".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_prefilled_indexes_ok_bad() {
+        // Invalid hsi hex → error
+        assert!(prefilled_indexes_ok("bad".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_classify_v2_cmpct_peer_empty() {
+        let result = classify_v2_cmpct_peer("".to_string()).unwrap();
+        assert!(matches!(result, FfiCmpctPeerFrame::Other));
     }
 
 }

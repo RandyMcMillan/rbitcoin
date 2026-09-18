@@ -33,8 +33,9 @@ pub use chain::{
     STALE_RELAY_AGE_LIMIT_SECS,
 };
 pub use compact::{
-    classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
-    CmpctPeerFrame,
+    classify_v2_cmpct_peer, cmpct_send_line, missing_request, prefilled_indexes_ok,
+    reconstruct_getdata_stats, shortid_map_from_txs, try_reconstruct, CmpctPeerFrame,
+    CmpctReconstructStats,
 };
 pub use error::NetError;
 pub use eviction::{eviction_netgroup, select_inbound_eviction, InboundEvictCandidate};

@@ -5299,6 +5299,97 @@ pub fn missing_request(block_hash_hex: String, missing: Vec<u64>) -> Result<Stri
     Ok(bitcoin::consensus::encode::serialize_hex(&req))
 }
 
+// --- IBD / Perf FFI ---
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiProcRss {
+    pub rss_kb: u64,
+    pub anon_kb: u64,
+    pub file_kb: u64,
+    pub hwm_kb: u64,
+    pub locked_kb: u64,
+}
+
+impl From<rbitcoin_net::ProcRss> for FfiProcRss {
+    fn from(r: rbitcoin_net::ProcRss) -> Self {
+        Self {
+            rss_kb: r.rss_kb,
+            anon_kb: r.anon_kb,
+            file_kb: r.file_kb,
+            hwm_kb: r.hwm_kb,
+            locked_kb: r.locked_kb,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTipPerfSizes {
+    pub rss: FfiProcRss,
+    pub cache_bodies: u64,
+    pub held_bodies: u64,
+    pub sh_heads: u64,
+    pub mp_live: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiIbdConfig {
+    pub window: u64,
+    pub per_peer: u64,
+    pub target_peers: u64,
+    pub headers_batch: u64,
+    pub stall_secs: u64,
+    pub connect_timeout_secs: u64,
+}
+
+#[uniffi::export]
+pub fn read_proc_rss() -> FfiProcRss {
+    rbitcoin_net::read_proc_rss().into()
+}
+
+#[uniffi::export]
+pub fn format_tip_perf_sizes(sizes: FfiTipPerfSizes) -> String {
+    let native = rbitcoin_net::TipPerfSizes {
+        rss: rbitcoin_net::ProcRss {
+            rss_kb: sizes.rss.rss_kb,
+            anon_kb: sizes.rss.anon_kb,
+            file_kb: sizes.rss.file_kb,
+            hwm_kb: sizes.rss.hwm_kb,
+            locked_kb: sizes.rss.locked_kb,
+        },
+        cache_bodies: sizes.cache_bodies as usize,
+        held_bodies: sizes.held_bodies as usize,
+        sh_heads: sizes.sh_heads as usize,
+        mp_live: sizes.mp_live as usize,
+    };
+    rbitcoin_net::format_tip_perf_sizes(&native)
+}
+
+#[uniffi::export]
+pub fn ibd_config_default() -> FfiIbdConfig {
+    let c = rbitcoin_net::IbdConfig::default();
+    FfiIbdConfig {
+        window: c.window as u64,
+        per_peer: c.per_peer as u64,
+        target_peers: c.target_peers as u64,
+        headers_batch: c.headers_batch as u64,
+        stall_secs: c.stall.as_secs(),
+        connect_timeout_secs: c.connect_timeout.as_secs(),
+    }
+}
+
+#[uniffi::export]
+pub fn ibd_config_for_test() -> FfiIbdConfig {
+    let c = rbitcoin_net::IbdConfig::for_test();
+    FfiIbdConfig {
+        window: c.window as u64,
+        per_peer: c.per_peer as u64,
+        target_peers: c.target_peers as u64,
+        headers_batch: c.headers_batch as u64,
+        stall_secs: c.stall.as_secs(),
+        connect_timeout_secs: c.connect_timeout.as_secs(),
+    }
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -8690,6 +8781,34 @@ mod tests {
         let header_hex = bitcoin::consensus::encode::serialize_hex(&block.header);
         hub.ensure_header(header_hex).unwrap();
         assert!(hub.knows_header(block.block_hash().to_string()).unwrap());
+    }
+
+    #[test]
+    fn test_ibd_config() {
+        let default_cfg = ibd_config_default();
+        assert!(default_cfg.window > 0);
+        assert!(default_cfg.per_peer > 0);
+        assert!(default_cfg.target_peers > 0);
+        assert!(default_cfg.headers_batch > 0);
+        let test_cfg = ibd_config_for_test();
+        assert!(test_cfg.window > 0);
+    }
+
+    #[test]
+    fn test_proc_rss_and_tip_perf() {
+        let rss = read_proc_rss();
+        // On non-Linux this returns zeros; on Linux it should have rss_kb > 0
+        // Just verify it doesn't panic.
+        let sizes = FfiTipPerfSizes {
+            rss,
+            cache_bodies: 0,
+            held_bodies: 0,
+            sh_heads: 0,
+            mp_live: 0,
+        };
+        let line = format_tip_perf_sizes(sizes);
+        assert!(!line.is_empty());
+        assert!(line.starts_with("rss="));
     }
 
 }

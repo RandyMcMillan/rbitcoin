@@ -11174,6 +11174,98 @@ extension FfiIndexMode: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiPeerConnType {
+    
+    case inbound
+    case outboundFullRelay
+    case manual
+    case blockRelay
+    case addrFetch
+    case feeler
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPeerConnType: FfiConverterRustBuffer {
+    typealias SwiftType = FfiPeerConnType
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPeerConnType {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .inbound
+        
+        case 2: return .outboundFullRelay
+        
+        case 3: return .manual
+        
+        case 4: return .blockRelay
+        
+        case 5: return .addrFetch
+        
+        case 6: return .feeler
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiPeerConnType, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .inbound:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .outboundFullRelay:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .manual:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .blockRelay:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .addrFetch:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .feeler:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPeerConnType_lift(_ buf: RustBuffer) throws -> FfiPeerConnType {
+    return try FfiConverterTypeFfiPeerConnType.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPeerConnType_lower(_ value: FfiPeerConnType) -> RustBuffer {
+    return FfiConverterTypeFfiPeerConnType.lower(value)
+}
+
+
+
+extension FfiPeerConnType: Equatable, Hashable {}
+
+
+
 
 public enum RustyError {
 
@@ -13145,9 +13237,21 @@ public func maxAddrMan() -> UInt32 {
     )
 })
 }
+public func maxAddrToSend() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_max_addr_to_send($0
+    )
+})
+}
 public func maxFutureBlockTime() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_max_future_block_time($0
+    )
+})
+}
+public func maxPctAddrToSend() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_max_pct_addr_to_send($0
     )
 })
 }
@@ -13501,6 +13605,20 @@ public func parseV2RegtestNamed(command: String, payloadHex: String)throws  {try
         FfiConverterString.lower(payloadHex),$0
     )
 }
+}
+public func peerConnTypeAsStr(connType: FfiPeerConnType) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_peer_conn_type_as_str(
+        FfiConverterTypeFfiPeerConnType.lower(connType),$0
+    )
+})
+}
+public func peerConnTypeFromStr(s: String)throws  -> FfiPeerConnType {
+    return try  FfiConverterTypeFfiPeerConnType.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_peer_conn_type_from_str(
+        FfiConverterString.lower(s),$0
+    )
+})
 }
 public func peerDefaultMaxBytesPerSec() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
@@ -14464,7 +14582,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_max_addr_man() != 57290) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_max_addr_to_send() != 18505) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_max_future_block_time() != 57579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_max_pct_addr_to_send() != 58611) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_max_serve_blocks() != 25809) {
@@ -14618,6 +14742,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_parse_v2_regtest_named() != 47237) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_conn_type_as_str() != 59109) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_peer_conn_type_from_str() != 4909) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_peer_default_max_bytes_per_sec() != 50878) {

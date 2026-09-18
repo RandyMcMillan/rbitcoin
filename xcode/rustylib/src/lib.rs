@@ -6509,6 +6509,61 @@ pub fn node_handle_open_with_scale(
     }))
 }
 
+// --- PeerConnType FFI ---
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiPeerConnType {
+    Inbound,
+    OutboundFullRelay,
+    Manual,
+    BlockRelay,
+    AddrFetch,
+    Feeler,
+}
+
+impl From<rbitcoin_net::PeerConnType> for FfiPeerConnType {
+    fn from(t: rbitcoin_net::PeerConnType) -> Self {
+        match t {
+            rbitcoin_net::PeerConnType::Inbound => Self::Inbound,
+            rbitcoin_net::PeerConnType::OutboundFullRelay => Self::OutboundFullRelay,
+            rbitcoin_net::PeerConnType::Manual => Self::Manual,
+            rbitcoin_net::PeerConnType::BlockRelay => Self::BlockRelay,
+            rbitcoin_net::PeerConnType::AddrFetch => Self::AddrFetch,
+            rbitcoin_net::PeerConnType::Feeler => Self::Feeler,
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn peer_conn_type_from_str(s: String) -> Result<FfiPeerConnType, RustyError> {
+    rbitcoin_net::PeerConnType::parse(&s)
+        .map(Into::into)
+        .map_err(|_| RustyError::InvalidInput)
+}
+
+#[uniffi::export]
+pub fn peer_conn_type_as_str(conn_type: FfiPeerConnType) -> String {
+    let native = match conn_type {
+        FfiPeerConnType::Inbound => rbitcoin_net::PeerConnType::Inbound,
+        FfiPeerConnType::OutboundFullRelay => rbitcoin_net::PeerConnType::OutboundFullRelay,
+        FfiPeerConnType::Manual => rbitcoin_net::PeerConnType::Manual,
+        FfiPeerConnType::BlockRelay => rbitcoin_net::PeerConnType::BlockRelay,
+        FfiPeerConnType::AddrFetch => rbitcoin_net::PeerConnType::AddrFetch,
+        FfiPeerConnType::Feeler => rbitcoin_net::PeerConnType::Feeler,
+    };
+    native.as_str().to_string()
+}
+
+#[uniffi::export]
+pub fn max_addr_to_send() -> u32 {
+    rbitcoin_net::MAX_ADDR_TO_SEND as u32
+}
+
+#[uniffi::export]
+pub fn max_pct_addr_to_send() -> u32 {
+    rbitcoin_net::MAX_PCT_ADDR_TO_SEND as u32
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -9295,6 +9350,33 @@ mod tests {
         assert_eq!(node.sample_reset_reconstruct_archived(), 0);
         assert_eq!(node.sample_reset_thin_tweak_body_bytes(), 0);
         node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_peer_conn_type_roundtrip() {
+        let ct = peer_conn_type_from_str("outbound-full-relay".to_string()).unwrap();
+        assert!(matches!(ct, FfiPeerConnType::OutboundFullRelay));
+        assert_eq!(peer_conn_type_as_str(ct), "outbound-full-relay");
+
+        let ct = peer_conn_type_from_str("block-relay-only".to_string()).unwrap();
+        assert!(matches!(ct, FfiPeerConnType::BlockRelay));
+
+        let ct = peer_conn_type_from_str("feeler".to_string()).unwrap();
+        assert!(matches!(ct, FfiPeerConnType::Feeler));
+
+        let ct = peer_conn_type_from_str("inbound".to_string()).unwrap();
+        assert!(matches!(ct, FfiPeerConnType::Inbound));
+
+        let ct = peer_conn_type_from_str("manual".to_string()).unwrap();
+        assert!(matches!(ct, FfiPeerConnType::Manual));
+
+        let ct = peer_conn_type_from_str("addr-fetch".to_string()).unwrap();
+        assert!(matches!(ct, FfiPeerConnType::AddrFetch));
+
+        assert!(peer_conn_type_from_str("unknown".to_string()).is_err());
+
+        assert!(max_addr_to_send() > 0);
+        assert!(max_pct_addr_to_send() > 0);
     }
 
 }

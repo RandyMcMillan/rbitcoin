@@ -13240,6 +13240,13 @@ public func hasAllDesirableServiceFlags(offered: UInt64, tipDepthBlocks: Int64) 
     )
 })
 }
+public func hash160Hex(bytes: Data) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_hash160_hex(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 public func hash256(bytes: Data) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_hash256(
@@ -14333,6 +14340,13 @@ public func sequenceLocksSatisfied(txHex: String, prevHeights: [UInt32], prevCoi
     )
 })
 }
+public func sha256Hex(bytes: Data) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_sha256_hex(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
 public func signMessage(wif: String, message: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_sign_message(
@@ -14629,6 +14643,20 @@ public func validateSignetBlockSolution(blockHex: String, challengeHex: String)t
         FfiConverterString.lower(challengeHex),$0
     )
 }
+}
+public func varintDecode(hex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_varint_decode(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
+public func varintEncode(value: UInt64) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_varint_encode(
+        FfiConverterUInt64.lower(value),$0
+    )
+})
 }
 public func verifyMessage(pubkeyHex: String, message: String, signatureHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -14999,6 +15027,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_has_all_desirable_service_flags() != 8203) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_hash160_hex() != 58910) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_hash256() != 5458) {
@@ -15463,6 +15494,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_sequence_locks_satisfied() != 54468) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_sha256_hex() != 61878) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_sign_message() != 42839) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15581,6 +15615,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_validate_signet_block_solution() != 27703) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_varint_decode() != 63338) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_varint_encode() != 32135) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_verify_message() != 17315) {

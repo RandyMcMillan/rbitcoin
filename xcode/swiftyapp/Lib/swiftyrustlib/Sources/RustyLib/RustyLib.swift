@@ -2361,6 +2361,8 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func spenderListCount()  -> UInt64
     
+    func spendersCreate(createFk: UInt64, outIndex: UInt32) throws  -> [UInt64]
+    
     func tipHeight()  -> UInt64?
     
     func txBodyRange(fk: UInt64) throws  -> FfiTxRange
@@ -2613,6 +2615,15 @@ open func rebuildHeightFence()throws  {try rustCallWithError(FfiConverterTypeRus
 open func spenderListCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffistore_spender_list_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func spendersCreate(createFk: UInt64, outIndex: UInt32)throws  -> [UInt64] {
+    return try  FfiConverterSequenceUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_spenders_create(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(createFk),
+        FfiConverterUInt32.lower(outIndex),$0
     )
 })
 }
@@ -8513,6 +8524,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_spender_list_count() != 63983) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_spenders_create() != 15154) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_tip_height() != 61582) {

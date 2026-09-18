@@ -1572,6 +1572,14 @@ impl FfiStore {
             .collect())
     }
 
+    pub fn spenders_create(&self, create_fk: u64, out_index: u32) -> Result<Vec<u64>, RustyError> {
+        let fks = self
+            .inner
+            .spenders_create(rbitcoin_primitives::Fk(create_fk), out_index)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(fks.into_iter().map(|f| f.0).collect())
+    }
+
     pub fn get_fk_by_txid(&self, txid_hex: String) -> Result<Option<u64>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
         let fk = self
@@ -3981,6 +3989,7 @@ mod tests {
         assert!(!store.is_split());
         assert_eq!(store.spender_list_count(), 0);
         assert_eq!(store.class_c_l2_resident_bytes(), 0);
+        assert!(store.spenders_create(1, 0).unwrap().is_empty());
         assert_eq!(store.fence_max_connected_fk(), 0);
         assert_eq!(store.height_fence_run_count(), 0);
         assert_eq!(store.fence_tip_height(), None);

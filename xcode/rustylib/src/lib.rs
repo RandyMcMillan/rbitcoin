@@ -937,6 +937,58 @@ pub fn validate_signet_block_solution(
         .map_err(|_| RustyError::ConsensusError)
 }
 
+#[uniffi::export]
+pub fn block_check_merkle_root(block_hex: String) -> Result<bool, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.check_merkle_root())
+}
+
+#[uniffi::export]
+pub fn block_compute_merkle_root(block_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    match block.compute_merkle_root() {
+        Some(root) => Ok(rbitcoin_primitives::hex_encode(root.as_byte_array())),
+        None => Err(RustyError::InvalidInput),
+    }
+}
+
+#[uniffi::export]
+pub fn block_header_construct(
+    version: i32,
+    prev_hash_hex: String,
+    merkle_root_hex: String,
+    time: u32,
+    bits: u32,
+    nonce: u32,
+) -> Result<String, RustyError> {
+    let prev_bytes = parse_hash32(&prev_hash_hex)?;
+    let mut prev_arr = [0u8; 32];
+    prev_arr.copy_from_slice(&prev_bytes);
+    prev_arr.reverse();
+    let prev = bitcoin::BlockHash::from_byte_array(prev_arr);
+
+    let merkle_bytes = parse_hash32(&merkle_root_hex)?;
+    let mut merkle_arr = [0u8; 32];
+    merkle_arr.copy_from_slice(&merkle_bytes);
+    let merkle = bitcoin::TxMerkleNode::from_byte_array(merkle_arr);
+
+    let header = bitcoin::block::Header {
+        version: bitcoin::block::Version::from_consensus(version),
+        prev_blockhash: prev,
+        merkle_root: merkle,
+        time,
+        bits: bitcoin::CompactTarget::from_consensus(bits),
+        nonce,
+    };
+    Ok(bitcoin::consensus::encode::serialize_hex(&header))
+}
+
 // --- Regtest Mining FFI ---
 
 #[uniffi::export]
@@ -7713,6 +7765,26 @@ mod tests {
         // Extract just the header (80 bytes = 160 hex chars)
         let header_hex = &block_hex[..160];
         assert!(header_validate_pow(header_hex.to_string()).unwrap());
+    }
+
+    #[test]
+    fn test_merkle_and_header() {
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        assert!(block_check_merkle_root(block_hex.clone()).unwrap());
+        let merkle = block_compute_merkle_root(block_hex.clone()).unwrap();
+        assert_eq!(merkle.len(), 64);
+
+        let header = block_header_construct(
+            0x20000000,
+            genesis_hash.to_string(),
+            merkle,
+            1296688602,
+            0x207fffff,
+            0,
+        )
+        .unwrap();
+        assert_eq!(header.len(), 160);
     }
 
     #[test]

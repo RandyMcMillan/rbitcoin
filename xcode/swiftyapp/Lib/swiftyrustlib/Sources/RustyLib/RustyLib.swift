@@ -2434,6 +2434,14 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func getTxByTxid(txidHex: String) throws  -> FfiTxRecord?
     
+    func getTxFull(fk: UInt64) throws  -> FfiTxFull
+    
+    func getTxFullSpan(first: UInt64, last: UInt64) throws  -> [FfiTxFull]
+    
+    func getTxMetaAndOutputs(fk: UInt64) throws  -> FfiTxMetaAndOutputs
+    
+    func getTxMetaAndPrevouts(fk: UInt64) throws  -> FfiTxMetaAndPrevouts
+    
     func headerCount()  -> UInt64
     
     func headerSlots()  -> UInt64
@@ -2651,6 +2659,39 @@ open func getTxByTxid(txidHex: String)throws  -> FfiTxRecord? {
     return try  FfiConverterOptionTypeFfiTxRecord.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_get_tx_by_txid(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func getTxFull(fk: UInt64)throws  -> FfiTxFull {
+    return try  FfiConverterTypeFfiTxFull.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_tx_full(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
+open func getTxFullSpan(first: UInt64, last: UInt64)throws  -> [FfiTxFull] {
+    return try  FfiConverterSequenceTypeFfiTxFull.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_tx_full_span(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(first),
+        FfiConverterUInt64.lower(last),$0
+    )
+})
+}
+    
+open func getTxMetaAndOutputs(fk: UInt64)throws  -> FfiTxMetaAndOutputs {
+    return try  FfiConverterTypeFfiTxMetaAndOutputs.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_tx_meta_and_outputs(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
+    )
+})
+}
+    
+open func getTxMetaAndPrevouts(fk: UInt64)throws  -> FfiTxMetaAndPrevouts {
+    return try  FfiConverterTypeFfiTxMetaAndPrevouts.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_tx_meta_and_prevouts(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(fk),$0
     )
 })
 }
@@ -4428,6 +4469,72 @@ public func FfiConverterTypeFfiPointRecord_lower(_ value: FfiPointRecord) -> Rus
 }
 
 
+public struct FfiPrevoutRef {
+    public var createFk: UInt64
+    public var vout: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(createFk: UInt64, vout: UInt32) {
+        self.createFk = createFk
+        self.vout = vout
+    }
+}
+
+
+
+extension FfiPrevoutRef: Equatable, Hashable {
+    public static func ==(lhs: FfiPrevoutRef, rhs: FfiPrevoutRef) -> Bool {
+        if lhs.createFk != rhs.createFk {
+            return false
+        }
+        if lhs.vout != rhs.vout {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(createFk)
+        hasher.combine(vout)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPrevoutRef: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPrevoutRef {
+        return
+            try FfiPrevoutRef(
+                createFk: FfiConverterUInt64.read(from: &buf), 
+                vout: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiPrevoutRef, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.createFk, into: &buf)
+        FfiConverterUInt32.write(value.vout, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPrevoutRef_lift(_ buf: RustBuffer) throws -> FfiPrevoutRef {
+    return try FfiConverterTypeFfiPrevoutRef.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPrevoutRef_lower(_ value: FfiPrevoutRef) -> RustBuffer {
+    return FfiConverterTypeFfiPrevoutRef.lower(value)
+}
+
+
 public struct FfiProcessOwnedSizes {
     public var confPlans: UInt64
     public var shRuns: UInt64
@@ -5008,6 +5115,80 @@ public func FfiConverterTypeFfiTaprootOut_lower(_ value: FfiTaprootOut) -> RustB
 }
 
 
+public struct FfiTxFull {
+    public var tx: FfiTxRecord
+    public var inputs: [FfiInputRecord]
+    public var outputs: [FfiOutputRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(tx: FfiTxRecord, inputs: [FfiInputRecord], outputs: [FfiOutputRecord]) {
+        self.tx = tx
+        self.inputs = inputs
+        self.outputs = outputs
+    }
+}
+
+
+
+extension FfiTxFull: Equatable, Hashable {
+    public static func ==(lhs: FfiTxFull, rhs: FfiTxFull) -> Bool {
+        if lhs.tx != rhs.tx {
+            return false
+        }
+        if lhs.inputs != rhs.inputs {
+            return false
+        }
+        if lhs.outputs != rhs.outputs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tx)
+        hasher.combine(inputs)
+        hasher.combine(outputs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTxFull: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTxFull {
+        return
+            try FfiTxFull(
+                tx: FfiConverterTypeFfiTxRecord.read(from: &buf), 
+                inputs: FfiConverterSequenceTypeFfiInputRecord.read(from: &buf), 
+                outputs: FfiConverterSequenceTypeFfiOutputRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTxFull, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiTxRecord.write(value.tx, into: &buf)
+        FfiConverterSequenceTypeFfiInputRecord.write(value.inputs, into: &buf)
+        FfiConverterSequenceTypeFfiOutputRecord.write(value.outputs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxFull_lift(_ buf: RustBuffer) throws -> FfiTxFull {
+    return try FfiConverterTypeFfiTxFull.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxFull_lower(_ value: FfiTxFull) -> RustBuffer {
+    return FfiConverterTypeFfiTxFull.lower(value)
+}
+
+
 public struct FfiTxInfo {
     public var txid: String
     public var wtxid: String
@@ -5119,6 +5300,138 @@ public func FfiConverterTypeFfiTxInfo_lift(_ buf: RustBuffer) throws -> FfiTxInf
 #endif
 public func FfiConverterTypeFfiTxInfo_lower(_ value: FfiTxInfo) -> RustBuffer {
     return FfiConverterTypeFfiTxInfo.lower(value)
+}
+
+
+public struct FfiTxMetaAndOutputs {
+    public var tx: FfiTxRecord
+    public var outputs: [FfiOutputRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(tx: FfiTxRecord, outputs: [FfiOutputRecord]) {
+        self.tx = tx
+        self.outputs = outputs
+    }
+}
+
+
+
+extension FfiTxMetaAndOutputs: Equatable, Hashable {
+    public static func ==(lhs: FfiTxMetaAndOutputs, rhs: FfiTxMetaAndOutputs) -> Bool {
+        if lhs.tx != rhs.tx {
+            return false
+        }
+        if lhs.outputs != rhs.outputs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tx)
+        hasher.combine(outputs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTxMetaAndOutputs: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTxMetaAndOutputs {
+        return
+            try FfiTxMetaAndOutputs(
+                tx: FfiConverterTypeFfiTxRecord.read(from: &buf), 
+                outputs: FfiConverterSequenceTypeFfiOutputRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTxMetaAndOutputs, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiTxRecord.write(value.tx, into: &buf)
+        FfiConverterSequenceTypeFfiOutputRecord.write(value.outputs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxMetaAndOutputs_lift(_ buf: RustBuffer) throws -> FfiTxMetaAndOutputs {
+    return try FfiConverterTypeFfiTxMetaAndOutputs.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxMetaAndOutputs_lower(_ value: FfiTxMetaAndOutputs) -> RustBuffer {
+    return FfiConverterTypeFfiTxMetaAndOutputs.lower(value)
+}
+
+
+public struct FfiTxMetaAndPrevouts {
+    public var tx: FfiTxRecord
+    public var prevouts: [FfiPrevoutRef]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(tx: FfiTxRecord, prevouts: [FfiPrevoutRef]) {
+        self.tx = tx
+        self.prevouts = prevouts
+    }
+}
+
+
+
+extension FfiTxMetaAndPrevouts: Equatable, Hashable {
+    public static func ==(lhs: FfiTxMetaAndPrevouts, rhs: FfiTxMetaAndPrevouts) -> Bool {
+        if lhs.tx != rhs.tx {
+            return false
+        }
+        if lhs.prevouts != rhs.prevouts {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tx)
+        hasher.combine(prevouts)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTxMetaAndPrevouts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTxMetaAndPrevouts {
+        return
+            try FfiTxMetaAndPrevouts(
+                tx: FfiConverterTypeFfiTxRecord.read(from: &buf), 
+                prevouts: FfiConverterSequenceTypeFfiPrevoutRef.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTxMetaAndPrevouts, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiTxRecord.write(value.tx, into: &buf)
+        FfiConverterSequenceTypeFfiPrevoutRef.write(value.prevouts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxMetaAndPrevouts_lift(_ buf: RustBuffer) throws -> FfiTxMetaAndPrevouts {
+    return try FfiConverterTypeFfiTxMetaAndPrevouts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxMetaAndPrevouts_lower(_ value: FfiTxMetaAndPrevouts) -> RustBuffer {
+    return FfiConverterTypeFfiTxMetaAndPrevouts.lower(value)
 }
 
 
@@ -6043,6 +6356,56 @@ fileprivate struct FfiConverterSequenceTypeFfiInboundEvictCandidate: FfiConverte
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiInputRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiInputRecord]
+
+    public static func write(_ value: [FfiInputRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiInputRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiInputRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiInputRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiInputRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiOutputRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiOutputRecord]
+
+    public static func write(_ value: [FfiOutputRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiOutputRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiOutputRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiOutputRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiOutputRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiPeerEntry: FfiConverterRustBuffer {
     typealias SwiftType = [FfiPeerEntry]
 
@@ -6085,6 +6448,31 @@ fileprivate struct FfiConverterSequenceTypeFfiPointRecord: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiPointRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiPrevoutRef: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiPrevoutRef]
+
+    public static func write(_ value: [FfiPrevoutRef], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiPrevoutRef.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiPrevoutRef] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiPrevoutRef]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiPrevoutRef.read(from: &buf))
         }
         return seq
     }
@@ -6160,6 +6548,31 @@ fileprivate struct FfiConverterSequenceTypeFfiTaprootOut: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiTaprootOut.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiTxFull: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTxFull]
+
+    public static func write(_ value: [FfiTxFull], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiTxFull.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTxFull] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTxFull]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiTxFull.read(from: &buf))
         }
         return seq
     }
@@ -8946,6 +9359,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_get_tx_by_txid() != 7572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_tx_full() != 50991) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_tx_full_span() != 29450) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_tx_meta_and_outputs() != 20165) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_get_tx_meta_and_prevouts() != 43593) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_header_count() != 37489) {

@@ -346,6 +346,101 @@ pub fn verify_message(
     Ok(recovered == pubkey)
 }
 
+#[uniffi::export]
+pub fn ecdsa_verify(
+    pubkey_hex: String,
+    hash_hex: String,
+    signature_hex: String,
+) -> Result<bool, RustyError> {
+    let pubkey_bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey =
+        bitcoin::PublicKey::from_slice(&pubkey_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let hash_bytes = parse_hash32(&hash_hex)?;
+    let msg = bitcoin::secp256k1::Message::from_digest(hash_bytes);
+    let sig_bytes =
+        rbitcoin_primitives::hex_decode(&signature_hex).map_err(|_| RustyError::InvalidInput)?;
+    let sig = bitcoin::secp256k1::ecdsa::Signature::from_der(&sig_bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    Ok(secp.verify_ecdsa(&msg, &sig, &pubkey.inner).is_ok())
+}
+
+#[uniffi::export]
+pub fn schnorr_verify(
+    xonly_pubkey_hex: String,
+    hash_hex: String,
+    signature_hex: String,
+) -> Result<bool, RustyError> {
+    let pk_bytes =
+        rbitcoin_primitives::hex_decode(&xonly_pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    if pk_bytes.len() != 32 {
+        return Err(RustyError::InvalidInput);
+    }
+    let pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&pk_bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let hash_bytes = parse_hash32(&hash_hex)?;
+    let msg = bitcoin::secp256k1::Message::from_digest(hash_bytes);
+    let sig_bytes =
+        rbitcoin_primitives::hex_decode(&signature_hex).map_err(|_| RustyError::InvalidInput)?;
+    if sig_bytes.len() != 64 {
+        return Err(RustyError::InvalidInput);
+    }
+    let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&sig_bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    Ok(secp.verify_schnorr(&sig, &msg, &pubkey).is_ok())
+}
+
+#[uniffi::export]
+pub fn address_type(address: String) -> Result<String, RustyError> {
+    let addr = address
+        .parse::<bitcoin::Address<_>>()
+        .map_err(|_| RustyError::InvalidInput)?;
+    let script = addr.assume_checked_ref().script_pubkey();
+    let ty = if script.is_p2pkh() {
+        "p2pkh"
+    } else if script.is_p2sh() {
+        "p2sh"
+    } else if script.is_p2wpkh() {
+        "p2wpkh"
+    } else if script.is_p2wsh() {
+        "p2wsh"
+    } else if script.is_p2tr() {
+        "p2tr"
+    } else if script.is_op_return() {
+        "op_return"
+    } else {
+        "other"
+    };
+    Ok(ty.to_string())
+}
+
+#[uniffi::export]
+pub fn script_decode_hex(script_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = bitcoin::Script::from_bytes(&bytes);
+    let mut out = String::new();
+    for (i, inst) in script.instructions().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match inst {
+            Ok(bitcoin::script::Instruction::Op(op)) => {
+                out.push_str(&format!("{:?}", op));
+            }
+            Ok(bitcoin::script::Instruction::PushBytes(bytes)) => {
+                out.push_str(&format!("PUSHBYTES({})", bytes.len()));
+            }
+            Err(_) => {
+                out.push_str("INVALID");
+            }
+        }
+    }
+    Ok(out)
+}
+
 // --- BIP32 FFI ---
 
 #[uniffi::export]

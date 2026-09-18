@@ -6375,6 +6375,34 @@ impl FfiNodeHandle {
     pub fn set_spend_index(&self, enabled: bool) {
         self.inner.lock().unwrap().query.set_spend_index(enabled);
     }
+
+    pub fn warning_strings(&self, network: String) -> Result<Vec<String>, RustyError> {
+        let net = rbitcoin_primitives::Network::parse(&network)
+            .map_err(|_| RustyError::InvalidInput)?;
+        Ok(rbitcoin_net::warning_strings(&self.inner.lock().unwrap().query, net))
+    }
+
+    pub fn active_unknown_bits(&self, network: String) -> Result<Vec<i32>, RustyError> {
+        let net = rbitcoin_primitives::Network::parse(&network)
+            .map_err(|_| RustyError::InvalidInput)?;
+        Ok(rbitcoin_net::active_unknown_bits(&self.inner.lock().unwrap().query, net))
+    }
+
+    pub fn drain_and_fence_hi(&self) -> Option<u64> {
+        self.inner.lock().unwrap().query.drain_and_fence_hi().map(|h| h as u64)
+    }
+
+    pub fn sh_indexed_through_height(&self) -> Option<u64> {
+        self.inner.lock().unwrap().query.sh_indexed_through_height().map(|h| h as u64)
+    }
+
+    pub fn max_sh_creates(&self) -> u32 {
+        self.inner.lock().unwrap().query.max_sh_creates()
+    }
+
+    pub fn set_max_sh_creates(&self, n: u32) {
+        self.inner.lock().unwrap().query.set_max_sh_creates(n);
+    }
 }
 
 #[uniffi::export]
@@ -9143,6 +9171,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(node.network_name(), "regtest");
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_handle_warning_and_sh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        let warnings = node.warning_strings("regtest".to_string()).unwrap();
+        assert!(warnings.is_empty());
+        let bits = node.active_unknown_bits("regtest".to_string()).unwrap();
+        assert!(bits.is_empty());
+        assert_eq!(node.drain_and_fence_hi(), None);
+        assert_eq!(node.sh_indexed_through_height(), None);
+        assert_eq!(node.max_sh_creates(), 0);
+        node.set_max_sh_creates(100);
+        assert_eq!(node.max_sh_creates(), 100);
         node.shutdown().unwrap();
     }
 

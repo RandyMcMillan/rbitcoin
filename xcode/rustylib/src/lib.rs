@@ -3387,6 +3387,10 @@ impl FfiActiveMempool {
         self.inner.lock().unwrap().set_cluster_limits(count, size_kvb);
     }
 
+    pub fn max_weight(&self) -> u64 {
+        self.inner.lock().unwrap().max_weight
+    }
+
     pub fn get_tx(&self, txid_hex: String) -> Result<Option<String>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let guard = self.inner.lock().unwrap();
@@ -3404,6 +3408,34 @@ impl FfiActiveMempool {
             .into_iter()
             .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
             .collect()
+    }
+
+    pub fn select_block_txs_delta(
+        &self,
+        max_weight_wu: u64,
+        delta_txids_hex: Vec<String>,
+        deltas: Vec<i64>,
+    ) -> Result<Vec<String>, RustyError> {
+        if delta_txids_hex.len() != deltas.len() {
+            return Err(RustyError::InvalidInput);
+        }
+        let map: std::collections::HashMap<bitcoin::Txid, i64> = delta_txids_hex
+            .into_iter()
+            .zip(deltas)
+            .map(|(h, d)| {
+                let txid = bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput)?;
+                Ok((txid, d))
+            })
+            .collect::<Result<_, _>>()?;
+        let txs = self
+            .inner
+            .lock()
+            .unwrap()
+            .select_block_txs_delta(max_weight_wu, |id| map.get(&id).copied().unwrap_or(0));
+        Ok(txs
+            .into_iter()
+            .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
+            .collect())
     }
 
     pub fn remove_txid(&self, txid_hex: String) -> Result<(), RustyError> {
@@ -3432,6 +3464,42 @@ impl FfiActiveMempool {
             .lock()
             .unwrap()
             .remove_for_block(&txids)
+            .map_err(|_| RustyError::MempoolError)?;
+        Ok(n as u64)
+    }
+
+    pub fn remove_for_block_with_utxo(
+        &self,
+        query: Arc<FfiQuery>,
+        txids_hex: Vec<String>,
+    ) -> Result<u64, RustyError> {
+        let txids: Vec<bitcoin::Txid> = txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h))
+            .collect::<Result<_, _>>()
+            .map_err(|_| RustyError::InvalidInput)?;
+        let provider = FfiUtxoProvider {
+            query: Arc::clone(&query.inner),
+        };
+        let tip_height = query.inner.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if tip_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(
+                &query.inner,
+                rbitcoin_primitives::Height(tip_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
+        };
+        let tip_ctx = rbitcoin_mempool::ChainTipCtx {
+            height: tip_height,
+            mtp,
+        };
+        let n = self
+            .inner
+            .lock()
+            .unwrap()
+            .remove_for_block_with_utxo(&txids, &provider, tip_ctx)
             .map_err(|_| RustyError::MempoolError)?;
         Ok(n as u64)
     }
@@ -3643,6 +3711,25 @@ impl FfiActiveMempool {
         let results = self.inner.lock().unwrap().reorg_disconnect_reaccept(&txs, &provider, tip_ctx);
         Ok(results.into_iter().map(|r| format!("{r:?}")).collect())
     }
+
+    pub fn evict_nonfinal(&self, query: Arc<FfiQuery>) -> Result<(), RustyError> {
+        let provider = FfiUtxoProvider {
+            query: Arc::clone(&query.inner),
+        };
+        let tip_height = query.inner.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if tip_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
+                .unwrap_or(0)
+        };
+        let tip_ctx = rbitcoin_mempool::ChainTipCtx {
+            height: tip_height,
+            mtp,
+        };
+        self.inner.lock().unwrap().evict_nonfinal(&provider, tip_ctx);
+        Ok(())
+    }
 }
 
 struct FfiUtxoProvider {
@@ -3768,6 +3855,16 @@ pub fn rbf_allows_replacement(
         direct_fee,
         direct_weight,
     )
+}
+
+#[uniffi::export]
+pub fn check_package_shape(txs_hex: Vec<String>) -> Result<(), RustyError> {
+    let txs: Vec<bitcoin::Transaction> = txs_hex
+        .into_iter()
+        .map(|h| deserialize_hex(&h).map_err(|_| RustyError::InvalidInput))
+        .collect::<Result<_, _>>()?;
+    rbitcoin_mempool::ActiveMempool::check_package_shape(&txs)
+        .map_err(|_| RustyError::MempoolError)
 }
 
 // --- Fee Estimation FFI ---
@@ -6536,5 +6633,93 @@ mod tests {
         assert!(lookup_taken_covers(0, Some(0)));
         assert!(lookup_taken_covers(5, Some(10)));
         assert!(!lookup_taken_covers(15, Some(10)));
+    }
+
+    #[test]
+    fn test_active_mempool_max_weight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert!(am.max_weight() > 0);
+    }
+
+    #[test]
+    fn test_active_mempool_evict_nonfinal_empty() {
+        let tmp_query = tempfile::tempdir().unwrap();
+        let tmp_mempool = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        am.evict_nonfinal(query).unwrap();
+    }
+
+    #[test]
+    fn test_active_mempool_select_block_txs_delta_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let txs = am.select_block_txs_delta(4_000_000, vec![], vec![]).unwrap();
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn test_active_mempool_remove_for_block_with_utxo_empty() {
+        let tmp_query = tempfile::tempdir().unwrap();
+        let tmp_mempool = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let n = am.remove_for_block_with_utxo(query, vec![]).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_check_package_shape_empty() {
+        let result = check_package_shape(vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_package_shape_valid() {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
+                    0,
+                ),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence(0),
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let tx_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&tx));
+        let result = check_package_shape(vec![tx_hex]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_package_shape_duplicate() {
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
+                    0,
+                ),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence(0),
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let tx_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&tx));
+        let result = check_package_shape(vec![tx_hex.clone(), tx_hex]);
+        assert!(result.is_err());
     }
 }

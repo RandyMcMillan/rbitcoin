@@ -1023,6 +1023,68 @@ pub fn block_header_construct(
     Ok(bitcoin::consensus::encode::serialize_hex(&header))
 }
 
+#[uniffi::export]
+pub fn sighash_legacy(
+    tx_hex: String,
+    input_index: u32,
+    script_hex: String,
+    hash_type: u32,
+) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let cache = bitcoin::sighash::SighashCache::new(&tx);
+    let sighash = cache
+        .legacy_signature_hash(input_index as usize, bitcoin::Script::from_bytes(&script), hash_type)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(sighash.to_string())
+}
+
+#[uniffi::export]
+pub fn sighash_p2wpkh(
+    tx_hex: String,
+    input_index: u32,
+    script_pubkey_hex: String,
+    value_sat: u64,
+    hash_type: u32,
+) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script =
+        rbitcoin_primitives::hex_decode(&script_pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let spk = bitcoin::Script::from_bytes(&script);
+    let amount = bitcoin::Amount::from_sat(value_sat);
+    let ty = bitcoin::sighash::EcdsaSighashType::from_consensus(hash_type);
+    let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+    let sighash = cache
+        .p2wpkh_signature_hash(input_index as usize, spk, amount, ty)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(sighash.to_string())
+}
+
+#[uniffi::export]
+pub fn sighash_p2wsh(
+    tx_hex: String,
+    input_index: u32,
+    witness_script_hex: String,
+    value_sat: u64,
+    hash_type: u32,
+) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script =
+        rbitcoin_primitives::hex_decode(&witness_script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let wscript = bitcoin::Script::from_bytes(&script);
+    let amount = bitcoin::Amount::from_sat(value_sat);
+    let ty = bitcoin::sighash::EcdsaSighashType::from_consensus(hash_type);
+    let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+    let sighash = cache
+        .p2wsh_signature_hash(input_index as usize, wscript, amount, ty)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(sighash.to_string())
+}
+
 // --- Regtest Mining FFI ---
 
 #[uniffi::export]
@@ -7737,6 +7799,22 @@ mod tests {
         // A simple final tx (no locktime, sequence max)
         let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
         assert!(is_final_tx(tx_hex.to_string(), 100, 100).unwrap());
+    }
+
+    #[test]
+    fn test_sighash_legacy() {
+        // A simple tx with one input
+        let tx_hex = tx_create_empty(1, 0).unwrap();
+        let tx_hex = tx_add_input(
+            tx_hex,
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            0,
+            0xffffffff,
+        )
+        .unwrap();
+        let script_hex = "76a914000000000000000000000000000000000000000088ac";
+        let sighash = sighash_legacy(tx_hex, 0, script_hex.to_string(), 1).unwrap();
+        assert_eq!(sighash.len(), 64);
     }
 
     #[test]

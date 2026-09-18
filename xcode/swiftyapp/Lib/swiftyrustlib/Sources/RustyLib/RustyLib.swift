@@ -12635,6 +12635,20 @@ public func banScoreThreshold() -> UInt32 {
     )
 })
 }
+public func bip32XprivToWif(xprivStr: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_bip32_xpriv_to_wif(
+        FfiConverterString.lower(xprivStr),$0
+    )
+})
+}
+public func bip32XpubToPubkeyHex(xpubStr: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_bip32_xpub_to_pubkey_hex(
+        FfiConverterString.lower(xpubStr),$0
+    )
+})
+}
 public func bip34HeightScript(height: UInt32) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_bip34_height_script(
@@ -14378,6 +14392,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_ban_score_threshold() != 33963) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_bip32_xpriv_to_wif() != 23853) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_bip32_xpub_to_pubkey_hex() != 51033) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_bip34_height_script() != 45998) {

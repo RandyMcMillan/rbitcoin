@@ -178,6 +178,20 @@ pub fn verify_message(
     Ok(recovered == pubkey)
 }
 
+// --- BIP32 FFI ---
+
+#[uniffi::export]
+pub fn bip32_xpriv_to_wif(xpriv_str: String) -> Result<String, RustyError> {
+    let xpriv = bitcoin::bip32::Xpriv::from_str(&xpriv_str).map_err(|_| RustyError::InvalidInput)?;
+    Ok(xpriv.to_priv().to_wif())
+}
+
+#[uniffi::export]
+pub fn bip32_xpub_to_pubkey_hex(xpub_str: String) -> Result<String, RustyError> {
+    let xpub = bitcoin::bip32::Xpub::from_str(&xpub_str).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(xpub.to_pub().to_bytes()))
+}
+
 // --- Consensus FFI ---
 
 #[uniffi::export]

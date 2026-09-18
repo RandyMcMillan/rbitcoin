@@ -1642,6 +1642,8 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func alreadyHaveOrAskedBlock(hashHex: String) throws  -> Bool
     
+    func attachMempool(mp: FfiMempoolHub) throws 
+    
     func blockMinTxFeeSatKvb()  -> UInt64
     
     func cacheBodyCount()  -> UInt64
@@ -1812,6 +1814,13 @@ open func alreadyHaveOrAskedBlock(hashHex: String)throws  -> Bool {
         FfiConverterString.lower(hashHex),$0
     )
 })
+}
+    
+open func attachMempool(mp: FfiMempoolHub)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_attach_mempool(self.uniffiClonePointer(),
+        FfiConverterTypeFfiMempoolHub.lower(mp),$0
+    )
+}
 }
     
 open func blockMinTxFeeSatKvb() -> UInt64 {
@@ -2750,6 +2759,8 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     
     func containsWtxid(wtxidHex: String) throws  -> Bool
     
+    func evictLiveTxids(txidsHex: [String]) throws  -> UInt64
+    
     func expiryHours()  -> UInt64
     
     func feeDelta(txidHex: String) throws  -> Int64
@@ -2776,15 +2787,25 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     
     func orphanCount()  -> UInt64
     
+    func prioritiseTx(txidHex: String, feeDelta: Int64) throws 
+    
     func recentAccepts()  -> [FfiRecentAccept]
     
     func relayEnabled()  -> Bool
     
+    func removeForBlock(txidsHex: [String]) throws  -> UInt64
+    
     func sampleResetPerf()  -> FfiMempoolPerfSample
+    
+    func selectBlockTxs()  -> [String]
+    
+    func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
     
     func setExpiryHours(hours: UInt64) 
     
     func setImmediateRelay(on: Bool) 
+    
+    func setMinRelaySatKvb(satKvb: UInt64) 
     
     func setRelayEnabled(on: Bool) 
     
@@ -2886,6 +2907,14 @@ open func containsWtxid(wtxidHex: String)throws  -> Bool {
 })
 }
     
+open func evictLiveTxids(txidsHex: [String])throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_evict_live_txids(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(txidsHex),$0
+    )
+})
+}
+    
 open func expiryHours() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_expiry_hours(self.uniffiClonePointer(),$0
@@ -2979,6 +3008,14 @@ open func orphanCount() -> UInt64 {
 })
 }
     
+open func prioritiseTx(txidHex: String, feeDelta: Int64)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_prioritise_tx(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterInt64.lower(feeDelta),$0
+    )
+}
+}
+    
 open func recentAccepts() -> [FfiRecentAccept] {
     return try!  FfiConverterSequenceTypeFfiRecentAccept.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_recent_accepts(self.uniffiClonePointer(),$0
@@ -2993,11 +3030,34 @@ open func relayEnabled() -> Bool {
 })
 }
     
+open func removeForBlock(txidsHex: [String])throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_remove_for_block(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(txidsHex),$0
+    )
+})
+}
+    
 open func sampleResetPerf() -> FfiMempoolPerfSample {
     return try!  FfiConverterTypeFfiMempoolPerfSample.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_sample_reset_perf(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func selectBlockTxs() -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_select_block_txs(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_set_cluster_limits(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(count),
+        FfiConverterOptionUInt32.lower(sizeKvb),$0
+    )
+}
 }
     
 open func setExpiryHours(hours: UInt64) {try! rustCall() {
@@ -3010,6 +3070,13 @@ open func setExpiryHours(hours: UInt64) {try! rustCall() {
 open func setImmediateRelay(on: Bool) {try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_set_immediate_relay(self.uniffiClonePointer(),
         FfiConverterBool.lower(on),$0
+    )
+}
+}
+    
+open func setMinRelaySatKvb(satKvb: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_set_min_relay_sat_kvb(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(satKvb),$0
     )
 }
 }
@@ -13249,6 +13316,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_already_have_or_asked_block() != 58998) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_attach_mempool() != 10715) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_block_min_tx_fee_sat_kvb() != 37457) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13456,6 +13526,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffimempoolhub_contains_wtxid() != 44668) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_evict_live_txids() != 17453) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_expiry_hours() != 27251) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13495,19 +13568,34 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffimempoolhub_orphan_count() != 31037) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_prioritise_tx() != 57065) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_recent_accepts() != 54306) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_relay_enabled() != 57909) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_remove_for_block() != 5136) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_sample_reset_perf() != 38694) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_select_block_txs() != 11433) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_set_cluster_limits() != 47730) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_set_expiry_hours() != 17027) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_set_immediate_relay() != 57912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_set_min_relay_sat_kvb() != 32025) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_set_relay_enabled() != 987) {

@@ -4681,6 +4681,12 @@ impl FfiChainHub {
             bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
         Ok(self.inner.header_below_minwork(&header))
     }
+
+    pub fn attach_mempool(&self, mp: Arc<FfiMempoolHub>) -> Result<(), RustyError> {
+        self.inner
+            .attach_mempool(Arc::clone(&mp.inner))
+            .map_err(|_| RustyError::MempoolError)
+    }
 }
 
 // --- MempoolHub FFI ---
@@ -4957,6 +4963,44 @@ impl FfiMempoolHub {
 
     pub fn note_getdata_tx(&self, n: u64) {
         self.inner.note_getdata_tx(n);
+    }
+
+    pub fn remove_for_block(&self, txids_hex: Vec<String>) -> Result<u64, RustyError> {
+        let txids: Vec<bitcoin::Txid> = txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput))
+            .collect::<Result<_, _>>()?;
+        Ok(self.inner.remove_for_block(&txids) as u64)
+    }
+
+    pub fn evict_live_txids(&self, txids_hex: Vec<String>) -> Result<u64, RustyError> {
+        let txids: Vec<bitcoin::Txid> = txids_hex
+            .into_iter()
+            .map(|h| bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput))
+            .collect::<Result<_, _>>()?;
+        Ok(self.inner.evict_live_txids(&txids) as u64)
+    }
+
+    pub fn prioritise_tx(&self, txid_hex: String, fee_delta: i64) -> Result<(), RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.prioritise_tx(txid, fee_delta);
+        Ok(())
+    }
+
+    pub fn select_block_txs(&self) -> Vec<String> {
+        self.inner
+            .select_block_txs()
+            .into_iter()
+            .map(|tx| bitcoin::consensus::encode::serialize_hex(&tx))
+            .collect()
+    }
+
+    pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
+        self.inner.set_cluster_limits(count, size_kvb);
+    }
+
+    pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
+        self.inner.set_min_relay_sat_kvb(sat_kvb);
     }
 }
 
@@ -8224,6 +8268,42 @@ mod tests {
         assert_eq!(perf.rejects, 0);
         assert!(hub.recent_accepts().is_empty());
         assert_eq!(hub.template_updates(), 0);
+    }
+
+    #[test]
+    fn test_chain_hub_attach_mempool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query_path = tmp.path().join("query").to_str().unwrap().to_string();
+        let mp_path = tmp.path().join("mp").to_str().unwrap().to_string();
+        let chain = FfiChainHub::open(query_path.clone(), "regtest".to_string(), 0).unwrap();
+        chain.ensure_genesis().unwrap();
+        let mp = FfiMempoolHub::open(query_path, mp_path, 300_000_000, false).unwrap();
+        chain.attach_mempool(mp).unwrap();
+        // Double attach fails
+        let mp2 = FfiMempoolHub::open(
+            tmp.path().join("q2").to_str().unwrap().to_string(),
+            tmp.path().join("m2").to_str().unwrap().to_string(),
+            300_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(chain.attach_mempool(mp2).is_err());
+    }
+
+    #[test]
+    fn test_mempool_hub_prioritise_and_select() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query_path = tmp.path().join("query").to_str().unwrap().to_string();
+        let mp_path = tmp.path().join("mp").to_str().unwrap().to_string();
+        let hub = FfiMempoolHub::open(query_path, mp_path, 300_000_000, false).unwrap();
+        hub.set_cluster_limits(Some(100), Some(1000));
+        hub.set_min_relay_sat_kvb(1000);
+        // Empty mempool selects nothing
+        assert!(hub.select_block_txs().is_empty());
+        // Prioritise a non-existent txid (no crash)
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        hub.prioritise_tx(txid.to_string(), 1000).unwrap();
+        assert_eq!(hub.fee_delta(txid.to_string()).unwrap(), 1000);
     }
 
 }

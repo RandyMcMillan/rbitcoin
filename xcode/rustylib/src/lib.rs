@@ -84,6 +84,69 @@ pub fn script_sigops(script_hex: String, accurate: bool) -> Result<u64, RustyErr
 }
 
 #[uniffi::export]
+pub fn script_is_p2pkh(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_p2pkh())
+}
+
+#[uniffi::export]
+pub fn script_is_p2sh(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_p2sh())
+}
+
+#[uniffi::export]
+pub fn script_is_p2wpkh(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_p2wpkh())
+}
+
+#[uniffi::export]
+pub fn script_is_p2wsh(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_p2wsh())
+}
+
+#[uniffi::export]
+pub fn script_is_p2tr(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_p2tr())
+}
+
+#[uniffi::export]
+pub fn script_is_op_return(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_op_return())
+}
+
+#[uniffi::export]
+pub fn script_is_push_only(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_push_only())
+}
+
+#[uniffi::export]
+pub fn script_is_witness_program(script_hex: String) -> Result<bool, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::Script::from_bytes(&script).is_witness_program())
+}
+
+#[uniffi::export]
+pub fn script_len(script_hex: String) -> Result<u64, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(script.len() as u64)
+}
+
+#[uniffi::export]
 pub fn validate_address(address: String) -> bool {
     Address::from_str(&address).is_ok()
 }
@@ -8255,6 +8318,36 @@ mod tests {
         let hash =
             script_hash_hex("76a914000000000000000000000000000000000000000088ac".to_string());
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn test_script_type_detection() {
+        let p2pkh = "76a914000000000000000000000000000000000000000088ac";
+        assert!(script_is_p2pkh(p2pkh.to_string()).unwrap());
+        assert!(!script_is_p2sh(p2pkh.to_string()).unwrap());
+        assert!(!script_is_p2wpkh(p2pkh.to_string()).unwrap());
+        assert!(!script_is_op_return(p2pkh.to_string()).unwrap());
+
+        let p2sh = "a914000000000000000000000000000000000000000087";
+        assert!(script_is_p2sh(p2sh.to_string()).unwrap());
+        assert!(!script_is_p2pkh(p2sh.to_string()).unwrap());
+
+        let p2wpkh = "00140000000000000000000000000000000000000000";
+        assert!(script_is_p2wpkh(p2wpkh.to_string()).unwrap());
+        assert!(script_is_witness_program(p2wpkh.to_string()).unwrap());
+
+        let p2wsh = "00200000000000000000000000000000000000000000000000000000000000000000";
+        assert!(script_is_p2wsh(p2wsh.to_string()).unwrap());
+        assert!(script_is_witness_program(p2wsh.to_string()).unwrap());
+
+        let p2tr = "51200000000000000000000000000000000000000000000000000000000000000000";
+        assert!(script_is_p2tr(p2tr.to_string()).unwrap());
+        assert!(script_is_witness_program(p2tr.to_string()).unwrap());
+
+        let opret = "6a00";
+        assert!(script_is_op_return(opret.to_string()).unwrap());
+
+        assert_eq!(script_len(p2pkh.to_string()).unwrap(), 25);
     }
 
     #[test]

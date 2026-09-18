@@ -46,14 +46,14 @@ pub use compact::{
 };
 pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
-pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
+pub use eviction::{eviction_netgroup, select_inbound_eviction, InboundEvictCandidate};
 pub use i2p_sam::I2Psam;
 pub use ibd::{
     connect_timeout_for, format_tip_perf_sizes, read_platform_rss, rehydrate_block_queue_residue,
     IbdConfig, ProcessRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
     is_bad_prev_err, read_platform_rss as read_proc_rss, ProcessRss as ProcRss,
 };
-pub use most_work::{sum_work, work_better, WorkOverflow};
+pub use most_work::{sum_work, work_better, InvalidHashSet, WorkOverflow};
 pub use net_permissions::{
     apply_implicit, parse_whitebind, parse_whitelist, NetPermTable, NetPermissionFlags,
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
@@ -86,8 +86,9 @@ pub use rbitcoin_mempool::{AcceptError, Selected};
 pub use reactor::BlockingRegion;
 pub use seeds::{
     default_port, default_rpc_port, dns_seed_query_host, dns_seeds, fixed_seed_hosts,
-    required_seed_services, resolve_all_seeds, resolve_dns_seeds, resolve_fixed_seeds,
-    seed_lookup_names, socks_dns_seed_dests, AddrMan, PeerEntry, PeerFlags, MAX_ADDR_MAN,
+    pick_seed_results, required_seed_services, resolve_all_seeds, resolve_dns_seeds,
+    resolve_fixed_seeds, seed_lookup_names, socks_dns_seed_dests, AddrMan, PeerEntry, PeerFlags,
+    MAX_ADDR_MAN,
 };
 pub use serve_perf::{
     format_serve_perf, sample_reset_serve_perf, serve_perf_totals, ServePerfSample,

@@ -3427,6 +3427,12 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     
     func blockQueueCount()  -> UInt64
     
+    func blockQueueStats()  -> FfiBlockQueueStats
+    
+    func flushForShutdown() throws 
+    
+    func indexMode()  -> FfiIndexMode
+    
     func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
     
     func mempoolPath()  -> String
@@ -3514,6 +3520,26 @@ public static func `open`(datadir: String, network: String, tinyHeads: Bool)thro
 open func blockQueueCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffinodehandle_block_queue_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueStats() -> FfiBlockQueueStats {
+    return try!  FfiConverterTypeFfiBlockQueueStats.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_block_queue_stats(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func flushForShutdown()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffinodehandle_flush_for_shutdown(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func indexMode() -> FfiIndexMode {
+    return try!  FfiConverterTypeFfiIndexMode.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_index_mode(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -10793,6 +10819,70 @@ extension FfiCmpctPeerFrame: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiIndexMode {
+    
+    case direct
+    case tip
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiIndexMode: FfiConverterRustBuffer {
+    typealias SwiftType = FfiIndexMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiIndexMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .direct
+        
+        case 2: return .tip
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiIndexMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .direct:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .tip:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiIndexMode_lift(_ buf: RustBuffer) throws -> FfiIndexMode {
+    return try FfiConverterTypeFfiIndexMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiIndexMode_lower(_ value: FfiIndexMode) -> RustBuffer {
+    return FfiConverterTypeFfiIndexMode.lower(value)
+}
+
+
+
+extension FfiIndexMode: Equatable, Hashable {}
+
+
+
 
 public enum RustyError {
 
@@ -15041,6 +15131,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_count() != 36432) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_stats() != 12722) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_flush_for_shutdown() != 31591) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_index_mode() != 62366) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_is_outpoint_spent() != 36164) {

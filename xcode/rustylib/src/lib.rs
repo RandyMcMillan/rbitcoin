@@ -6194,6 +6194,23 @@ pub fn min_relay_fee_rate_sat_per_kvb() -> u64 {
     rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB
 }
 
+// --- IndexMode FFI ---
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiIndexMode {
+    Direct,
+    Tip,
+}
+
+impl From<rbitcoin_query::IndexMode> for FfiIndexMode {
+    fn from(m: rbitcoin_query::IndexMode) -> Self {
+        match m {
+            rbitcoin_query::IndexMode::Direct => Self::Direct,
+            rbitcoin_query::IndexMode::Tip => Self::Tip,
+        }
+    }
+}
+
 // --- NodeHandle FFI ---
 
 #[derive(uniffi::Object)]
@@ -6297,6 +6314,28 @@ impl FfiNodeHandle {
 
     pub fn spend_index_enabled(&self) -> bool {
         self.inner.lock().unwrap().query.spend_index_enabled()
+    }
+
+    pub fn index_mode(&self) -> FfiIndexMode {
+        self.inner.lock().unwrap().query.index_mode().into()
+    }
+
+    pub fn block_queue_stats(&self) -> FfiBlockQueueStats {
+        let (assign_stop, bytes, count) = self.inner.lock().unwrap().query.block_queue_stats();
+        FfiBlockQueueStats {
+            assign_stop_bytes: assign_stop,
+            bytes,
+            count: count as u64,
+        }
+    }
+
+    pub fn flush_for_shutdown(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .flush_for_shutdown()
+            .map_err(|_| RustyError::StoreError)
     }
 }
 
@@ -8958,6 +8997,18 @@ mod tests {
             .unwrap()
             .is_none());
         node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_handle_index_mode_and_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        // Fresh store defaults to Tip mode
+        assert!(matches!(node.index_mode(), FfiIndexMode::Tip));
+        let stats = node.block_queue_stats();
+        assert_eq!(stats.count, 0);
+        node.flush_for_shutdown().unwrap();
     }
 
 }

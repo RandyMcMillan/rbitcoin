@@ -1801,7 +1801,7 @@ pub struct FfiCoinbaseAtHeight {
 
 #[derive(uniffi::Object)]
 pub struct FfiQuery {
-    inner: rbitcoin_query::Query,
+    inner: Arc<rbitcoin_query::Query>,
 }
 
 #[uniffi::export]
@@ -1810,7 +1810,7 @@ impl FfiQuery {
     pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
         let query =
             rbitcoin_query::Query::open_or_create(&path).map_err(|_| RustyError::StoreError)?;
-        Ok(Arc::new(Self { inner: query }))
+        Ok(Arc::new(Self { inner: Arc::new(query) }))
     }
 
     pub fn tip_height(&self) -> Option<u64> {
@@ -3519,6 +3519,105 @@ impl FfiActiveMempool {
         let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
         self.inner.lock().unwrap().remember_extra_compact(&tx);
         Ok(())
+    }
+
+    pub fn accept_tx(
+        &self,
+        query: Arc<FfiQuery>,
+        tx_hex: String,
+    ) -> Result<String, RustyError> {
+        let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        let provider = FfiUtxoProvider {
+            query: Arc::clone(&query.inner),
+        };
+        let tip_height = query.inner.tip_height().map(|h| h.0).unwrap_or(0);
+        let mtp = if tip_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
+                .unwrap_or(0)
+        };
+        let tip_ctx = rbitcoin_mempool::ChainTipCtx {
+            height: tip_height,
+            mtp,
+        };
+        let result = self.inner.lock().unwrap().accept_tx(&tx, &provider, tip_ctx);
+        Ok(format!("{result:?}"))
+    }
+}
+
+struct FfiUtxoProvider {
+    query: Arc<rbitcoin_query::Query>,
+}
+
+impl rbitcoin_mempool::UtxoProvider for FfiUtxoProvider {
+    fn get_coin(&self, op: &bitcoin::OutPoint) -> Option<rbitcoin_mempool::Coin> {
+        match self.chain_prevout(op) {
+            rbitcoin_mempool::ChainPrevout::Unspent(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    fn chain_prevout(&self, op: &bitcoin::OutPoint) -> rbitcoin_mempool::ChainPrevout {
+        let tid = op.txid.to_byte_array();
+        let Some((fk, rec)) = self.query.get_tx_by_txid(&tid).ok().flatten() else {
+            return rbitcoin_mempool::ChainPrevout::Unknown;
+        };
+        let Some(create_height) = self.query.store().tx_height_get(fk).ok().flatten() else {
+            return rbitcoin_mempool::ChainPrevout::Unknown;
+        };
+        let Some(tip) = self.query.tip_height().map(|h| h.0) else {
+            return rbitcoin_mempool::ChainPrevout::Unknown;
+        };
+        if create_height > tip {
+            return rbitcoin_mempool::ChainPrevout::Unknown;
+        }
+        match self.query.is_outpoint_spent(&tid, op.vout) {
+            Ok(true) => return rbitcoin_mempool::ChainPrevout::KnownUnavailable,
+            Ok(false) => {}
+            Err(_) => return rbitcoin_mempool::ChainPrevout::KnownUnavailable,
+        }
+        let out = self
+            .query
+            .tx_output_at_fk(fk, op.vout)
+            .ok()
+            .or_else(|| self.query.tx_output(&rec, op.vout).ok());
+        let Some(out) = out else {
+            return rbitcoin_mempool::ChainPrevout::KnownUnavailable;
+        };
+        let value = if out.value < 0 {
+            bitcoin::Amount::ZERO
+        } else {
+            bitcoin::Amount::from_sat(out.value as u64)
+        };
+        let is_coinbase = match self.query.tx_input_at_fk(fk, &rec, 0) {
+            Ok(i) => i.is_coinbase() || i.prev_index == u32::MAX,
+            Err(_) => {
+                create_height > 0
+                    && self
+                        .query
+                        .header_tx_fks(rbitcoin_primitives::Fk(create_height as u64), None)
+                        .ok()
+                        .flatten()
+                        .and_then(|fks| fks.first().copied())
+                        == Some(fk)
+            }
+        };
+        let create_mtp = if create_height == 0 {
+            0
+        } else {
+            rbitcoin_consensus::median_time_past(&self.query, rbitcoin_primitives::Height(create_height.saturating_sub(1)))
+                .unwrap_or(0)
+        };
+        rbitcoin_mempool::ChainPrevout::Unspent(rbitcoin_mempool::Coin {
+            txout: bitcoin::TxOut {
+                value,
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(out.script),
+            },
+            create_height,
+            create_mtp,
+            is_coinbase,
+        })
     }
 }
 
@@ -6258,5 +6357,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         am.erase_orphans_for_block(vec![]).unwrap();
+    }
+
+    #[test]
+    fn test_active_mempool_accept_tx_empty() {
+        let tmp_query = tempfile::tempdir().unwrap();
+        let tmp_mempool = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence(0),
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let tx_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&tx));
+        let result = am.accept_tx(query, tx_hex);
+        assert!(result.is_ok());
+        let result_str = result.unwrap();
+        assert!(result_str.contains("Err") || result_str.contains("MissingPrevout"));
     }
 }

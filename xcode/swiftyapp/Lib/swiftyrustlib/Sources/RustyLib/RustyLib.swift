@@ -1377,6 +1377,164 @@ public func FfiConverterTypeFfiAddrMan_lower(_ value: FfiAddrMan) -> UnsafeMutab
 
 
 
+public protocol FfiFeeFlowMeterProtocol : AnyObject {
+    
+    func admitEvents()  -> UInt64
+    
+    func admitRatesWuS(elapsedSecs: UInt64)  -> [UInt64]
+    
+    func isWarm(elapsedSecs: UInt64)  -> Bool
+    
+    func noteAdmit(weightWu: UInt64, rateSatPerKvb: UInt64, elapsedSecs: UInt64) 
+    
+}
+
+open class FfiFeeFlowMeter:
+    FfiFeeFlowMeterProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffifeeflowmeter(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffifeeflowmeter_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffifeeflowmeter(pointer, $0) }
+    }
+
+    
+
+    
+open func admitEvents() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffifeeflowmeter_admit_events(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func admitRatesWuS(elapsedSecs: UInt64) -> [UInt64] {
+    return try!  FfiConverterSequenceUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffifeeflowmeter_admit_rates_wu_s(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(elapsedSecs),$0
+    )
+})
+}
+    
+open func isWarm(elapsedSecs: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffifeeflowmeter_is_warm(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(elapsedSecs),$0
+    )
+})
+}
+    
+open func noteAdmit(weightWu: UInt64, rateSatPerKvb: UInt64, elapsedSecs: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffifeeflowmeter_note_admit(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(weightWu),
+        FfiConverterUInt64.lower(rateSatPerKvb),
+        FfiConverterUInt64.lower(elapsedSecs),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFeeFlowMeter: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiFeeFlowMeter
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiFeeFlowMeter {
+        return FfiFeeFlowMeter(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiFeeFlowMeter) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFeeFlowMeter {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiFeeFlowMeter, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeFlowMeter_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiFeeFlowMeter {
+    return try FfiConverterTypeFfiFeeFlowMeter.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeFlowMeter_lower(_ value: FfiFeeFlowMeter) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiFeeFlowMeter.lower(value)
+}
+
+
+
+
 public protocol FfiMempoolProtocol : AnyObject {
     
     func abandonLive() throws  -> UInt32
@@ -10252,6 +10410,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiaddrman_take_outbound_offset_occupied() != 33783) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffifeeflowmeter_admit_events() != 26057) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffifeeflowmeter_admit_rates_wu_s() != 32353) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffifeeflowmeter_is_warm() != 38749) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffifeeflowmeter_note_admit() != 6691) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempool_abandon_live() != 47318) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10841,6 +11011,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiaddrman_with_seeds() != 6353) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffifeeflowmeter_new() != 62794) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {

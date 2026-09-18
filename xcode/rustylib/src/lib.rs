@@ -4018,6 +4018,45 @@ pub fn fee_min_rate_for_capacity_simple(
     )
 }
 
+// --- Fee Flow Meter FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiFeeFlowMeter {
+    inner: std::sync::Mutex<rbitcoin_mempool::FeeFlowMeter>,
+    start: std::time::Instant,
+}
+
+#[uniffi::export]
+impl FfiFeeFlowMeter {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        let start = std::time::Instant::now();
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(rbitcoin_mempool::FeeFlowMeter::new(start)),
+            start,
+        })
+    }
+
+    pub fn is_warm(&self, elapsed_secs: u64) -> bool {
+        let now = self.start + std::time::Duration::from_secs(elapsed_secs);
+        self.inner.lock().unwrap().is_warm(now)
+    }
+
+    pub fn admit_events(&self) -> u64 {
+        self.inner.lock().unwrap().admit_events()
+    }
+
+    pub fn admit_rates_wu_s(&self, elapsed_secs: u64) -> Vec<u64> {
+        let now = self.start + std::time::Duration::from_secs(elapsed_secs);
+        self.inner.lock().unwrap().admit_rates_wu_s(now)
+    }
+
+    pub fn note_admit(&self, weight_wu: u64, rate_sat_per_kvb: u64, elapsed_secs: u64) {
+        let now = self.start + std::time::Duration::from_secs(elapsed_secs);
+        self.inner.lock().unwrap().note_admit(weight_wu, rate_sat_per_kvb, now);
+    }
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -6842,5 +6881,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let query = FfiQuery::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         assert_eq!(query.write_create_loc(1), None);
+    }
+
+    #[test]
+    fn test_fee_flow_meter() {
+        let meter = FfiFeeFlowMeter::new();
+        assert!(!meter.is_warm(0));
+        assert_eq!(meter.admit_events(), 0);
+        let rates = meter.admit_rates_wu_s(0);
+        assert_eq!(rates.len(), fee_bucket_count() as usize);
+        assert!(rates.iter().all(|&r| r == 0));
+        meter.note_admit(10_000, 1_000, 1);
+        assert_eq!(meter.admit_events(), 1);
+        let rates = meter.admit_rates_wu_s(2);
+        assert!(rates[fee_bucket_index(1_000) as usize] > 0);
+        for i in 2..40 {
+            meter.note_admit(10_000, 1_000, i);
+        }
+        assert!(meter.is_warm(70));
     }
 }

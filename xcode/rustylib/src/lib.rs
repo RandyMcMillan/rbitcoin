@@ -1638,12 +1638,47 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)?;
         Ok(FfiTxRange { offset, len })
     }
+
+    pub fn mtp_times_at(&self, height: u32) -> Option<FfiMtpTimes> {
+        self.inner
+            .mtp_times_at(rbitcoin_primitives::Height(height))
+            .map(|(count, window)| FfiMtpTimes {
+                count,
+                window: window.to_vec(),
+            })
+    }
+
+    pub fn coinbase_fk_at_heights(&self, heights: Vec<u32>) -> Result<Vec<FfiCoinbaseAtHeight>, RustyError> {
+        let map = self
+            .inner
+            .coinbase_fk_at_heights(&heights)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(map
+            .into_iter()
+            .map(|(height, fk)| FfiCoinbaseAtHeight {
+                height,
+                coinbase_fk: fk.0,
+            })
+            .collect())
+    }
 }
 
 #[derive(Debug, PartialEq, uniffi::Record)]
 pub struct FfiTxRange {
     pub offset: u64,
     pub len: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiMtpTimes {
+    pub count: u8,
+    pub window: Vec<u32>,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiCoinbaseAtHeight {
+    pub height: u32,
+    pub coinbase_fk: u64,
 }
 
 // --- Query FFI ---
@@ -2513,6 +2548,68 @@ impl FfiQuery {
             header_fk: v.header_fk.0,
         }))
     }
+
+    pub fn spenders_raw(
+        &self,
+        txid_hex: String,
+        vout: u32,
+    ) -> Result<Vec<FfiPointRecord>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let pts = self
+            .inner
+            .spenders_raw(&txid, vout)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(pts.into_iter().map(|p| p.into()).collect())
+    }
+
+    pub fn resume_work_path_after_tip(
+        &self,
+        tip_hash_hex: String,
+        tip_height: u32,
+        max: u64,
+    ) -> Result<Vec<FfiResumeWorkEntry>, RustyError> {
+        let tip_hash = parse_hash32(&tip_hash_hex)?;
+        let entries = self
+            .inner
+            .resume_work_path_after_tip(tip_hash, tip_height, max as usize)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| FfiResumeWorkEntry {
+                height: e.height,
+                hash: rbitcoin_primitives::hex_encode(e.hash),
+                header_fk: e.header_fk.0,
+                has_body: e.has_body,
+            })
+            .collect())
+    }
+
+    pub fn resume_work_path_after_tip_excluding(
+        &self,
+        tip_hash_hex: String,
+        tip_height: u32,
+        max: u64,
+        exclude_hashes_hex: Vec<String>,
+    ) -> Result<Vec<FfiResumeWorkEntry>, RustyError> {
+        let tip_hash = parse_hash32(&tip_hash_hex)?;
+        let exclude: Vec<[u8; 32]> = exclude_hashes_hex
+            .into_iter()
+            .map(|h| parse_hash32(&h))
+            .collect::<Result<_, _>>()?;
+        let entries = self
+            .inner
+            .resume_work_path_after_tip_excluding(tip_hash, tip_height, max as usize, &exclude)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(entries
+            .into_iter()
+            .map(|e| FfiResumeWorkEntry {
+                height: e.height,
+                hash: rbitcoin_primitives::hex_encode(e.hash),
+                header_fk: e.header_fk.0,
+                has_body: e.has_body,
+            })
+            .collect())
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -2520,6 +2617,14 @@ pub struct FfiBlockQueueStats {
     pub assign_stop_bytes: u64,
     pub bytes: u64,
     pub count: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiResumeWorkEntry {
+    pub height: u32,
+    pub hash: String,
+    pub header_fk: u64,
+    pub has_body: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -5383,5 +5488,61 @@ mod tests {
         assert_eq!(mempool_admit_half_life_secs(), 150);
         assert_eq!(mempool_warm_after_secs(), 60);
         assert_eq!(mempool_warm_after_admits(), 32);
+    }
+
+    #[test]
+    fn test_query_spenders_raw_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let pts = query.spenders_raw(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            0,
+        );
+        assert!(pts.is_ok());
+        assert!(pts.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_query_resume_work_path_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let entries = query.resume_work_path_after_tip(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            0,
+            10,
+        );
+        assert!(entries.is_ok());
+        assert!(entries.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_query_resume_work_path_excluding_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let entries = query.resume_work_path_after_tip_excluding(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            0,
+            10,
+            vec![],
+        );
+        assert!(entries.is_ok());
+        assert!(entries.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_store_mtp_times_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let mtp = store.mtp_times_at(0);
+        assert!(mtp.is_none());
+    }
+
+    #[test]
+    fn test_store_coinbase_fk_at_heights_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let coins = store.coinbase_fk_at_heights(vec![0, 1, 2]);
+        assert!(coins.is_ok());
+        assert!(coins.unwrap().is_empty());
     }
 }

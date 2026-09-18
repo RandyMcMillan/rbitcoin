@@ -1646,6 +1646,8 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func cacheBodyCount()  -> UInt64
     
+    func chainWork() throws  -> String
+    
     func chaintips()  -> [FfiChainTipInfo]
     
     func ensureGenesis() throws 
@@ -1660,6 +1662,10 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func hasBlock(hashHex: String) throws  -> Bool
     
+    func headerBelowMinwork(headerHex: String) throws  -> Bool
+    
+    func headerHeight(hashHex: String) throws  -> UInt32?
+    
     func heldBody(hashHex: String) throws  -> String?
     
     func heldBodyCount()  -> UInt64
@@ -1668,17 +1674,33 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func inIbd()  -> Bool
     
+    func invalidateBlock(hashHex: String) throws 
+    
     func isBlockInvalid(hashHex: String) throws  -> Bool
     
     func isConnected(hashHex: String) throws  -> Bool
     
+    func knowsHeader(hashHex: String) throws  -> Bool
+    
     func maxTipAgeSecs()  -> UInt64
+    
+    func meetsMinimumChainWork()  -> Bool
+    
+    func minChainWorkFloor()  -> String?
     
     func noteAskedBlock(hashHex: String) throws 
     
     func noteGbtAssembled() 
     
+    func preciousBlock(hashHex: String) throws 
+    
     func prefillCompact()  -> Bool
+    
+    func processSubmittedHeader(headerHex: String) throws 
+    
+    func reconsiderBlock(hashHex: String) throws 
+    
+    func rewindToHeight(keepHeight: UInt32) throws 
     
     func setBlockMinTxFeeSatKvb(satKvb: UInt64) 
     
@@ -1688,6 +1710,8 @@ public protocol FfiChainHubProtocol : AnyObject {
     
     func setPrefillCompact(on: Bool) 
     
+    func staleRelayAllowed(hashHex: String) throws  -> Bool
+    
     func tipHash()  -> String?
     
     func tipHeader()  -> String?
@@ -1695,6 +1719,14 @@ public protocol FfiChainHubProtocol : AnyObject {
     func tipHeight()  -> UInt32?
     
     func tipIsStaleForIbd()  -> Bool
+    
+    func unrequestedTooFarAhead(headerHex: String) throws  -> Bool
+    
+    func unrequestedWeakerThanTip(headerHex: String) throws  -> Bool
+    
+    func workThroughHeight(height: UInt32) throws  -> String
+    
+    func workWithHeader(headerHex: String) throws  -> String
     
 }
 
@@ -1796,6 +1828,13 @@ open func cacheBodyCount() -> UInt64 {
 })
 }
     
+open func chainWork()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_chain_work(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func chaintips() -> [FfiChainTipInfo] {
     return try!  FfiConverterSequenceTypeFfiChainTipInfo.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_chaintips(self.uniffiClonePointer(),$0
@@ -1845,6 +1884,22 @@ open func hasBlock(hashHex: String)throws  -> Bool {
 })
 }
     
+open func headerBelowMinwork(headerHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_header_below_minwork(self.uniffiClonePointer(),
+        FfiConverterString.lower(headerHex),$0
+    )
+})
+}
+    
+open func headerHeight(hashHex: String)throws  -> UInt32? {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_header_height(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
 open func heldBody(hashHex: String)throws  -> String? {
     return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffichainhub_held_body(self.uniffiClonePointer(),
@@ -1874,6 +1929,13 @@ open func inIbd() -> Bool {
 })
 }
     
+open func invalidateBlock(hashHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_invalidate_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+}
+}
+    
 open func isBlockInvalid(hashHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffichainhub_is_block_invalid(self.uniffiClonePointer(),
@@ -1890,9 +1952,31 @@ open func isConnected(hashHex: String)throws  -> Bool {
 })
 }
     
+open func knowsHeader(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_knows_header(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
 open func maxTipAgeSecs() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_max_tip_age_secs(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func meetsMinimumChainWork() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_meets_minimum_chain_work(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func minChainWorkFloor() -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffichainhub_min_chain_work_floor(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1910,11 +1994,39 @@ open func noteGbtAssembled() {try! rustCall() {
 }
 }
     
+open func preciousBlock(hashHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_precious_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+}
+}
+    
 open func prefillCompact() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_prefill_compact(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func processSubmittedHeader(headerHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_process_submitted_header(self.uniffiClonePointer(),
+        FfiConverterString.lower(headerHex),$0
+    )
+}
+}
+    
+open func reconsiderBlock(hashHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_reconsider_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+}
+}
+    
+open func rewindToHeight(keepHeight: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_rewind_to_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(keepHeight),$0
+    )
+}
 }
     
 open func setBlockMinTxFeeSatKvb(satKvb: UInt64) {try! rustCall() {
@@ -1945,6 +2057,14 @@ open func setPrefillCompact(on: Bool) {try! rustCall() {
 }
 }
     
+open func staleRelayAllowed(hashHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_stale_relay_allowed(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
 open func tipHash() -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_tip_hash(self.uniffiClonePointer(),$0
@@ -1969,6 +2089,38 @@ open func tipHeight() -> UInt32? {
 open func tipIsStaleForIbd() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffichainhub_tip_is_stale_for_ibd(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func unrequestedTooFarAhead(headerHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_unrequested_too_far_ahead(self.uniffiClonePointer(),
+        FfiConverterString.lower(headerHex),$0
+    )
+})
+}
+    
+open func unrequestedWeakerThanTip(headerHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_unrequested_weaker_than_tip(self.uniffiClonePointer(),
+        FfiConverterString.lower(headerHex),$0
+    )
+})
+}
+    
+open func workThroughHeight(height: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_work_through_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func workWithHeader(headerHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffichainhub_work_with_header(self.uniffiClonePointer(),
+        FfiConverterString.lower(headerHex),$0
     )
 })
 }
@@ -12162,6 +12314,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_cache_body_count() != 4451) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_chain_work() != 25362) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_chaintips() != 6790) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12183,6 +12338,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_has_block() != 44410) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_header_below_minwork() != 44849) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_header_height() != 10415) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_held_body() != 36801) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12195,13 +12356,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_in_ibd() != 3056) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_invalidate_block() != 14310) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_is_block_invalid() != 6619) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_is_connected() != 51167) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_knows_header() != 26780) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_max_tip_age_secs() != 55299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_meets_minimum_chain_work() != 58847) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_min_chain_work_floor() != 37604) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_note_asked_block() != 43480) {
@@ -12210,7 +12383,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_note_gbt_assembled() != 20500) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_precious_block() != 11095) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_prefill_compact() != 33757) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_process_submitted_header() != 3276) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_reconsider_block() != 44182) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_rewind_to_height() != 2758) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_set_block_min_tx_fee_sat_kvb() != 49667) {
@@ -12225,6 +12410,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffichainhub_set_prefill_compact() != 18556) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffichainhub_stale_relay_allowed() != 23640) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffichainhub_tip_hash() != 54076) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12235,6 +12423,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffichainhub_tip_is_stale_for_ibd() != 51746) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_unrequested_too_far_ahead() != 30075) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_unrequested_weaker_than_tip() != 20681) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_work_through_height() != 40015) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffichainhub_work_with_header() != 62342) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffifeeflowmeter_admit_events() != 26057) {

@@ -4567,6 +4567,120 @@ impl FfiChainHub {
             })
             .collect()
     }
+
+    pub fn invalidate_block(&self, hash_hex: String) -> Result<(), RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner
+            .invalidate_block(bitcoin::BlockHash::from_byte_array(hash))
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn reconsider_block(&self, hash_hex: String) -> Result<(), RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner
+            .reconsider_block(bitcoin::BlockHash::from_byte_array(hash))
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn precious_block(&self, hash_hex: String) -> Result<(), RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        self.inner
+            .precious_block(bitcoin::BlockHash::from_byte_array(hash))
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn rewind_to_height(&self, keep_height: u32) -> Result<(), RustyError> {
+        self.inner
+            .rewind_to_height(keep_height)
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn chain_work(&self) -> Result<String, RustyError> {
+        let work = self.inner.chain_work().map_err(|_| RustyError::ConsensusError)?;
+        Ok(rbitcoin_primitives::hex_encode(work.to_be_bytes()))
+    }
+
+    pub fn work_through_height(&self, height: u32) -> Result<String, RustyError> {
+        let work = self
+            .inner
+            .work_through_height(height)
+            .map_err(|_| RustyError::ConsensusError)?;
+        Ok(rbitcoin_primitives::hex_encode(work.to_be_bytes()))
+    }
+
+    pub fn work_with_header(&self, header_hex: String) -> Result<String, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let work = self.inner.work_with_header(&header);
+        Ok(rbitcoin_primitives::hex_encode(work.to_be_bytes()))
+    }
+
+    pub fn header_height(&self, hash_hex: String) -> Result<Option<u32>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self
+            .inner
+            .header_height(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn knows_header(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self
+            .inner
+            .knows_header(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn meets_minimum_chain_work(&self) -> bool {
+        self.inner.meets_minimum_chain_work()
+    }
+
+    pub fn min_chain_work_floor(&self) -> Option<String> {
+        self.inner
+            .min_chain_work_floor()
+            .map(rbitcoin_primitives::hex_encode)
+    }
+
+    pub fn stale_relay_allowed(&self, hash_hex: String) -> Result<bool, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        Ok(self
+            .inner
+            .stale_relay_allowed(&bitcoin::BlockHash::from_byte_array(hash)))
+    }
+
+    pub fn process_submitted_header(&self, header_hex: String) -> Result<(), RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .process_submitted_header(&header)
+            .map_err(|_| RustyError::ConsensusError)
+    }
+
+    pub fn unrequested_too_far_ahead(&self, header_hex: String) -> Result<bool, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.unrequested_too_far_ahead(&header))
+    }
+
+    pub fn unrequested_weaker_than_tip(&self, header_hex: String) -> Result<bool, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.unrequested_weaker_than_tip(&header))
+    }
+
+    pub fn header_below_minwork(&self, header_hex: String) -> Result<bool, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.header_below_minwork(&header))
+    }
 }
 
 // --- Node Time FFI ---
@@ -7755,13 +7869,58 @@ mod tests {
         let hub = FfiChainHub::open(path, "regtest".to_string(), 0).unwrap();
         hub.ensure_genesis().unwrap();
         let genesis_hash = hub.tip_hash().unwrap();
-        let block_hex = mine_empty_regtest(genesis_hash, 1296688603, 1).unwrap();
+        let block_hex = mine_empty_regtest(genesis_hash.clone(), 1296688603, 1).unwrap();
         let outcome = hub.accept_block(block_hex.clone()).unwrap();
         assert!(matches!(outcome, FfiAcceptOutcome::Accepted { height: 1 }));
         assert_eq!(hub.tip_height(), Some(1));
         // AlreadyHave on duplicate
         let outcome2 = hub.accept_received_block(block_hex).unwrap();
         assert!(matches!(outcome2, FfiAcceptOutcome::AlreadyHave));
+        // header_height and knows_header
+        assert_eq!(
+            hub.header_height(genesis_hash.clone()).unwrap(),
+            Some(0)
+        );
+        assert!(hub.knows_header(genesis_hash.clone()).unwrap());
+        // Work queries
+        let cw = hub.chain_work().unwrap();
+        assert!(!cw.is_empty());
+        let w0 = hub.work_through_height(0).unwrap();
+        assert!(!w0.is_empty());
+        // meets_minimum_chain_work (no floor set)
+        assert!(hub.meets_minimum_chain_work());
+        assert_eq!(hub.min_chain_work_floor(), None);
+        // stale_relay_allowed on genesis
+        assert!(hub.stale_relay_allowed(genesis_hash).unwrap());
+        // precious_block
+        hub.precious_block(hub.tip_hash().unwrap()).unwrap();
+        // rewind
+        hub.rewind_to_height(0).unwrap();
+        assert_eq!(hub.tip_height(), Some(0));
+    }
+
+    #[test]
+    fn test_chain_hub_header_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let hub = FfiChainHub::open(path, "regtest".to_string(), 0).unwrap();
+        hub.ensure_genesis().unwrap();
+        let genesis_hash = hub.tip_hash().unwrap();
+        let block_hex = mine_empty_regtest(genesis_hash, 1296688603, 1).unwrap();
+        let bytes = rbitcoin_primitives::hex_decode(&block_hex).unwrap();
+        let block: bitcoin::Block =
+            bitcoin::consensus::encode::deserialize(&bytes).unwrap();
+        let header_hex = bitcoin::consensus::encode::serialize_hex(&block.header);
+        // unrequested checks
+        assert!(!hub.unrequested_too_far_ahead(header_hex.clone()).unwrap());
+        assert!(!hub.unrequested_weaker_than_tip(header_hex.clone()).unwrap());
+        assert!(!hub.header_below_minwork(header_hex.clone()).unwrap());
+        // process_submitted_header
+        hub.process_submitted_header(header_hex).unwrap();
+        // knows_header after submission
+        let block_hash = block.block_hash().to_string();
+        assert!(hub.knows_header(block_hash.clone()).unwrap());
+        assert_eq!(hub.header_height(block_hash).unwrap(), Some(1));
     }
 
 }

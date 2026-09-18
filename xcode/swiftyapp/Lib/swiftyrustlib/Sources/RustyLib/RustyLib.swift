@@ -14463,6 +14463,14 @@ public func takeLogs() -> [String] {
     )
 })
 }
+public func taprootTweakPubkeyHex(pubkeyHex: String, tweakHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_taproot_tweak_pubkey_hex(
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterString.lower(tweakHex),$0
+    )
+})
+}
 public func tipTooFarInFuture(tipTime: UInt32, now: UInt64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_func_tip_too_far_in_future(
@@ -14784,6 +14792,13 @@ public func wtxidFromHex(txHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_wtxid_from_hex(
         FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func xonlyPubkeyFromPubkeyHex(pubkeyHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_xonly_pubkey_from_pubkey_hex(
+        FfiConverterString.lower(pubkeyHex),$0
     )
 })
 }
@@ -15571,6 +15586,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_take_logs() != 10115) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_taproot_tweak_pubkey_hex() != 17877) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_tip_too_far_in_future() != 50408) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15698,6 +15716,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_wtxid_from_hex() != 62498) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_xonly_pubkey_from_pubkey_hex() != 4202) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_xpriv_from_seed() != 44710) {

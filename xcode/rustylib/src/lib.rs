@@ -6211,6 +6211,23 @@ impl From<rbitcoin_query::IndexMode> for FfiIndexMode {
     }
 }
 
+// --- HeadScale FFI ---
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiHeadScale {
+    Tiny,
+    Mainnet,
+}
+
+impl From<rbitcoin_store::HeadScale> for FfiHeadScale {
+    fn from(s: rbitcoin_store::HeadScale) -> Self {
+        match s {
+            rbitcoin_store::HeadScale::Tiny => Self::Tiny,
+            rbitcoin_store::HeadScale::Mainnet => Self::Mainnet,
+        }
+    }
+}
+
 // --- NodeHandle FFI ---
 
 #[derive(uniffi::Object)]
@@ -6337,6 +6354,56 @@ impl FfiNodeHandle {
             .flush_for_shutdown()
             .map_err(|_| RustyError::StoreError)
     }
+
+    pub fn enter_direct_index_mode(&self) -> Result<(), RustyError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .enter_direct_index_mode()
+            .map_err(|_| RustyError::StoreError)
+    }
+
+    pub fn enter_tip_index_mode(&self) {
+        self.inner.lock().unwrap().query.enter_tip_index_mode();
+    }
+
+    pub fn set_tx_index(&self, enabled: bool) {
+        self.inner.lock().unwrap().query.set_tx_index(enabled);
+    }
+
+    pub fn set_spend_index(&self, enabled: bool) {
+        self.inner.lock().unwrap().query.set_spend_index(enabled);
+    }
+}
+
+#[uniffi::export]
+pub fn node_handle_open_with_scale(
+    datadir: String,
+    network: String,
+    scale: FfiHeadScale,
+) -> Result<Arc<FfiNodeHandle>, RustyError> {
+    let net = rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
+    let head_scale = match scale {
+        FfiHeadScale::Tiny => rbitcoin_store::HeadScale::Tiny,
+        FfiHeadScale::Mainnet => rbitcoin_store::HeadScale::Mainnet,
+    };
+    let mut config = rbitcoin_node::NodeConfig::default()
+        .with_datadir(std::path::PathBuf::from(&datadir))
+        .with_network(net);
+    config.head_scale = head_scale;
+    let handle = rbitcoin_node::run_node(config).map_err(|e| match e {
+        rbitcoin_node::NodeError::Config(_) | rbitcoin_node::NodeError::Network(_) => {
+            RustyError::InvalidInput
+        }
+        rbitcoin_node::NodeError::FutureTip => RustyError::ConsensusError,
+        rbitcoin_node::NodeError::Datadir { .. } | rbitcoin_node::NodeError::Store(_) => {
+            RustyError::StoreError
+        }
+    })?;
+    Ok(Arc::new(FfiNodeHandle {
+        inner: std::sync::Mutex::new(handle),
+    }))
 }
 
 // --- Tests ---
@@ -9042,6 +9109,41 @@ mod tests {
         assert_eq!(cache.len(), 1);
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_node_handle_index_mode_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        assert!(matches!(node.index_mode(), FfiIndexMode::Tip));
+        node.enter_direct_index_mode().unwrap();
+        assert!(matches!(node.index_mode(), FfiIndexMode::Direct));
+        node.enter_tip_index_mode();
+        assert!(matches!(node.index_mode(), FfiIndexMode::Tip));
+        node.set_tx_index(false);
+        assert!(!node.tx_index_enabled());
+        node.set_tx_index(true);
+        assert!(node.tx_index_enabled());
+        node.set_spend_index(false);
+        assert!(!node.spend_index_enabled());
+        node.set_spend_index(true);
+        assert!(node.spend_index_enabled());
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_handle_open_with_scale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = node_handle_open_with_scale(
+            path.clone(),
+            "regtest".to_string(),
+            FfiHeadScale::Tiny,
+        )
+        .unwrap();
+        assert_eq!(node.network_name(), "regtest");
+        node.shutdown().unwrap();
     }
 
 }

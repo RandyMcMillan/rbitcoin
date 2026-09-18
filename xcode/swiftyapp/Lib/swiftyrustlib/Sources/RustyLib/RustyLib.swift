@@ -3429,6 +3429,10 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     
     func blockQueueStats()  -> FfiBlockQueueStats
     
+    func enterDirectIndexMode() throws 
+    
+    func enterTipIndexMode() 
+    
     func flushForShutdown() throws 
     
     func indexMode()  -> FfiIndexMode
@@ -3440,6 +3444,10 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     func networkName()  -> String
     
     func pinChainView() throws  -> FfiChainView?
+    
+    func setSpendIndex(enabled: Bool) 
+    
+    func setTxIndex(enabled: Bool) 
     
     func shutdown() throws 
     
@@ -3531,6 +3539,18 @@ open func blockQueueStats() -> FfiBlockQueueStats {
 })
 }
     
+open func enterDirectIndexMode()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffinodehandle_enter_direct_index_mode(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func enterTipIndexMode() {try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_enter_tip_index_mode(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func flushForShutdown()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffinodehandle_flush_for_shutdown(self.uniffiClonePointer(),$0
     )
@@ -3572,6 +3592,20 @@ open func pinChainView()throws  -> FfiChainView? {
     uniffi_rustylib_fn_method_ffinodehandle_pin_chain_view(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+open func setSpendIndex(enabled: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_set_spend_index(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+    
+open func setTxIndex(enabled: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_set_tx_index(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
 }
     
 open func shutdown()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -10822,6 +10856,70 @@ extension FfiCmpctPeerFrame: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum FfiHeadScale {
+    
+    case tiny
+    case mainnet
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiHeadScale: FfiConverterRustBuffer {
+    typealias SwiftType = FfiHeadScale
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiHeadScale {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .tiny
+        
+        case 2: return .mainnet
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiHeadScale, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .tiny:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .mainnet:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeadScale_lift(_ buf: RustBuffer) throws -> FfiHeadScale {
+    return try FfiConverterTypeFfiHeadScale.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiHeadScale_lower(_ value: FfiHeadScale) -> RustBuffer {
+    return FfiConverterTypeFfiHeadScale.lower(value)
+}
+
+
+
+extension FfiHeadScale: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum FfiIndexMode {
     
     case direct
@@ -13073,6 +13171,15 @@ public func nodeDefaultMaxInbound() -> UInt32 {
     )
 })
 }
+public func nodeHandleOpenWithScale(datadir: String, network: String, scale: FfiHeadScale)throws  -> FfiNodeHandle {
+    return try  FfiConverterTypeFfiNodeHandle.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_node_handle_open_with_scale(
+        FfiConverterString.lower(datadir),
+        FfiConverterString.lower(network),
+        FfiConverterTypeFfiHeadScale.lower(scale),$0
+    )
+})
+}
 public func nodeInboundFromMaxconnections(total: UInt32) -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_node_inbound_from_maxconnections(
@@ -14263,6 +14370,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_node_default_max_inbound() != 9614) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_node_handle_open_with_scale() != 46481) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_node_inbound_from_maxconnections() != 40219) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15136,6 +15246,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_stats() != 12722) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_enter_direct_index_mode() != 9093) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_enter_tip_index_mode() != 44203) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffinodehandle_flush_for_shutdown() != 31591) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15152,6 +15268,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_pin_chain_view() != 64871) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_set_spend_index() != 35698) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_set_tx_index() != 44677) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_shutdown() != 63734) {

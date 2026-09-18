@@ -1716,6 +1716,42 @@ impl FfiStore {
                 .collect(),
         })
     }
+
+    pub fn resolve_txid(&self, txid_hex: String, tip_then_any: bool) -> Result<Option<u64>, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        if let Some(fk) = self
+            .inner
+            .get_fk_by_txid_tip(&txid)
+            .map_err(|_| RustyError::StoreError)?
+        {
+            return Ok(Some(fk.0));
+        }
+        if tip_then_any {
+            if let Some(fk) = self
+                .inner
+                .get_fk_by_txid(&txid)
+                .map_err(|_| RustyError::StoreError)?
+            {
+                return Ok(Some(fk.0));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_fk_by_txid_batch(&self, txids_hex: Vec<String>) -> Result<Vec<Option<u64>>, RustyError> {
+        let txids: Vec<[u8; 32]> = txids_hex
+            .into_iter()
+            .map(|h| parse_hash32(&h))
+            .collect::<Result<_, _>>()?;
+        let results = self
+            .inner
+            .get_fk_by_txid_batch(&txids)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(results
+            .into_iter()
+            .map(|(_txid, opt)| opt.map(|(fk, _)| fk.0))
+            .collect())
+    }
 }
 
 #[derive(Debug, PartialEq, uniffi::Record)]
@@ -5891,5 +5927,30 @@ mod tests {
     fn test_tx_graph_select_block_empty() {
         let g = FfiTxGraph::new();
         assert!(g.select_block_txids(4_000_000).is_empty());
+    }
+
+    #[test]
+    fn test_store_resolve_txid_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let fk = store.resolve_txid(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            false,
+        );
+        assert!(fk.is_ok());
+        assert!(fk.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_store_get_fk_by_txid_batch_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let fks = store.get_fk_by_txid_batch(vec![
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ]);
+        assert!(fks.is_ok());
+        let result = fks.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_none());
     }
 }

@@ -2488,6 +2488,8 @@ public protocol FfiStoreProtocol : AnyObject {
     
     func getFkByTxid(txidHex: String) throws  -> UInt64?
     
+    func getFkByTxidBatch(txidsHex: [String]) throws  -> [UInt64?]
+    
     func getFkByTxidTip(txidHex: String) throws  -> UInt64?
     
     func getHeader(fk: UInt64) throws  -> FfiHeaderRecord
@@ -2523,6 +2525,8 @@ public protocol FfiStoreProtocol : AnyObject {
     func path()  -> String
     
     func rebuildHeightFence() throws 
+    
+    func resolveTxid(txidHex: String, tipThenAny: Bool) throws  -> UInt64?
     
     func spenderListCount()  -> UInt64
     
@@ -2687,6 +2691,14 @@ open func getFkByTxid(txidHex: String)throws  -> UInt64? {
 })
 }
     
+open func getFkByTxidBatch(txidsHex: [String])throws  -> [UInt64?] {
+    return try  FfiConverterSequenceOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_get_fk_by_txid_batch(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(txidsHex),$0
+    )
+})
+}
+    
 open func getFkByTxidTip(txidHex: String)throws  -> UInt64? {
     return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffistore_get_fk_by_txid_tip(self.uniffiClonePointer(),
@@ -2824,6 +2836,15 @@ open func rebuildHeightFence()throws  {try rustCallWithError(FfiConverterTypeRus
     uniffi_rustylib_fn_method_ffistore_rebuild_height_fence(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+open func resolveTxid(txidHex: String, tipThenAny: Bool)throws  -> UInt64? {
+    return try  FfiConverterOptionUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffistore_resolve_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterBool.lower(tipThenAny),$0
+    )
+})
 }
     
 open func spenderListCount() -> UInt64 {
@@ -7024,6 +7045,31 @@ fileprivate struct FfiConverterSequenceOptionUInt32: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt64?]
+
+    public static func write(_ value: [UInt64?], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterOptionUInt64.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt64?] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt64?]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterOptionUInt64.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceOptionString: FfiConverterRustBuffer {
     typealias SwiftType = [String?]
 
@@ -9782,6 +9828,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_get_fk_by_txid() != 13218) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffistore_get_fk_by_txid_batch() != 25273) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffistore_get_fk_by_txid_tip() != 3315) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9834,6 +9883,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_rebuild_height_fence() != 49611) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffistore_resolve_txid() != 22236) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffistore_spender_list_count() != 63983) {

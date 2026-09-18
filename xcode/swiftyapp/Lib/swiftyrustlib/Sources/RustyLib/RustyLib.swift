@@ -596,6 +596,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol FfiActiveMempoolProtocol : AnyObject {
     
+    func acceptPackage(query: FfiQuery, txsHex: [String]) throws  -> String
+    
     func acceptTx(query: FfiQuery, txHex: String) throws  -> String
     
     func compact() throws  -> String
@@ -623,6 +625,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     func parkOrphan(txHex: String, missingTxidsHex: [String]) throws  -> String
     
     func persistIfDirty() throws 
+    
+    func promoteOrphansOf(query: FfiQuery, txidHex: String) throws 
     
     func rememberExtraCompact(txHex: String) throws 
     
@@ -710,6 +714,15 @@ public static func openOrCreateWithLimit(path: String, maxWeight: UInt64)throws 
 }
     
 
+    
+open func acceptPackage(query: FfiQuery, txsHex: [String])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_accept_package(self.uniffiClonePointer(),
+        FfiConverterTypeFfiQuery.lower(query),
+        FfiConverterSequenceString.lower(txsHex),$0
+    )
+})
+}
     
 open func acceptTx(query: FfiQuery, txHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
@@ -811,6 +824,14 @@ open func parkOrphan(txHex: String, missingTxidsHex: [String])throws  -> String 
     
 open func persistIfDirty()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiactivemempool_persist_if_dirty(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func promoteOrphansOf(query: FfiQuery, txidHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_promote_orphans_of(self.uniffiClonePointer(),
+        FfiConverterTypeFfiQuery.lower(query),
+        FfiConverterString.lower(txidHex),$0
     )
 }
 }
@@ -9683,6 +9704,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_xpub_from_xpriv() != 63931) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_accept_package() != 31944) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_accept_tx() != 57074) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9723,6 +9747,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_persist_if_dirty() != 58263) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_promote_orphans_of() != 54034) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_remember_extra_compact() != 50605) {

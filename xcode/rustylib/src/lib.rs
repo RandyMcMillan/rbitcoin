@@ -6184,6 +6184,72 @@ pub fn min_relay_fee_rate_sat_per_kvb() -> u64 {
     rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB
 }
 
+// --- NodeHandle FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiNodeHandle {
+    inner: std::sync::Mutex<rbitcoin_node::NodeHandle>,
+}
+
+#[uniffi::export]
+impl FfiNodeHandle {
+    #[uniffi::constructor]
+    pub fn open(
+        datadir: String,
+        network: String,
+        tiny_heads: bool,
+    ) -> Result<Arc<Self>, RustyError> {
+        let net = rbitcoin_primitives::Network::parse(&network)
+            .map_err(|_| RustyError::InvalidInput)?;
+        let mut config = rbitcoin_node::NodeConfig::default()
+            .with_datadir(std::path::PathBuf::from(&datadir))
+            .with_network(net);
+        if tiny_heads {
+            config = config.with_tiny_heads();
+        }
+        let handle = rbitcoin_node::run_node(config).map_err(|e| match e {
+            rbitcoin_node::NodeError::Config(_) | rbitcoin_node::NodeError::Network(_) => {
+                RustyError::InvalidInput
+            }
+            rbitcoin_node::NodeError::FutureTip => RustyError::ConsensusError,
+            rbitcoin_node::NodeError::Datadir { .. } | rbitcoin_node::NodeError::Store(_) => {
+                RustyError::StoreError
+            }
+        })?;
+        Ok(Arc::new(Self {
+            inner: std::sync::Mutex::new(handle),
+        }))
+    }
+
+    pub fn network_name(&self) -> String {
+        self.inner.lock().unwrap().network_name().to_string()
+    }
+
+    pub fn tip_height(&self) -> Option<u64> {
+        self.inner.lock().unwrap().query.tip_height().map(|h| h.0 as u64)
+    }
+
+    pub fn tip_hash(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        let fk = inner.query.tip_header_fk().ok()??;
+        inner.query.get_header(fk).ok().map(|h| rbitcoin_primitives::hex_encode(h.hash))
+    }
+
+    pub fn store_path(&self) -> String {
+        self.inner.lock().unwrap().config.store_path().to_string_lossy().to_string()
+    }
+
+    pub fn mempool_path(&self) -> String {
+        self.inner.lock().unwrap().config.mempool_path().to_string_lossy().to_string()
+    }
+
+    pub fn shutdown(&self) -> Result<(), RustyError> {
+        let handle = self.inner.lock().unwrap();
+        handle.query.flush().map_err(|_| RustyError::StoreError)?;
+        Ok(())
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -8809,6 +8875,20 @@ mod tests {
         let line = format_tip_perf_sizes(sizes);
         assert!(!line.is_empty());
         assert!(line.starts_with("rss="));
+    }
+
+    #[test]
+    fn test_node_handle_open_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        assert_eq!(node.network_name(), "regtest");
+        assert!(node.store_path().contains("store"));
+        assert!(node.mempool_path().contains("mempool"));
+        // Tip is None before genesis
+        assert_eq!(node.tip_height(), None);
+        assert_eq!(node.tip_hash(), None);
+        node.shutdown().unwrap();
     }
 
 }

@@ -12843,6 +12843,13 @@ public func blockWireInputCount(blockHex: String)throws  -> UInt32 {
     )
 })
 }
+public func blockWork(bits: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_work(
+        FfiConverterUInt32.lower(bits),$0
+    )
+})
+}
 public func bqAssignStopBytes() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_bq_assign_stop_bytes($0
@@ -12938,6 +12945,20 @@ public func commitClassABlock(queryPath: String, network: String, height: UInt32
         FfiConverterUInt32.lower(milestoneHeight),$0
     )
 }
+}
+public func compactTargetToDifficulty(bits: UInt32)throws  -> Double {
+    return try  FfiConverterDouble.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_compact_target_to_difficulty(
+        FfiConverterUInt32.lower(bits),$0
+    )
+})
+}
+public func compactTargetToTargetHex(bits: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_compact_target_to_target_hex(
+        FfiConverterUInt32.lower(bits),$0
+    )
+})
 }
 public func connectedToSelfLog(addr: String) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -13206,6 +13227,13 @@ public func headerToRecord(prevFk: UInt64, headerHex: String, hashHex: String)th
         FfiConverterUInt64.lower(prevFk),
         FfiConverterString.lower(headerHex),
         FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+public func headerValidatePow(headerHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_header_validate_pow(
+        FfiConverterString.lower(headerHex),$0
     )
 })
 }
@@ -14751,6 +14779,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_block_wire_input_count() != 6467) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_block_work() != 23402) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_bq_assign_stop_bytes() != 43857) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14788,6 +14819,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_commit_class_a_block() != 27043) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_compact_target_to_difficulty() != 46123) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_compact_target_to_target_hex() != 31909) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_connected_to_self_log() != 52020) {
@@ -14899,6 +14936,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_header_to_record() != 53901) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_header_validate_pow() != 38528) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_headers_download_timeout_secs() != 42111) {

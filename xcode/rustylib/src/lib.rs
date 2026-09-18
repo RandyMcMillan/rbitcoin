@@ -943,6 +943,37 @@ pub fn mine_regtest_paying(
 }
 
 #[uniffi::export]
+pub fn compact_target_to_difficulty(bits: u32) -> Result<f64, RustyError> {
+    let ct = bitcoin::CompactTarget::from_consensus(bits);
+    let target = bitcoin::Target::from_compact(ct);
+    Ok(target.difficulty_float())
+}
+
+#[uniffi::export]
+pub fn compact_target_to_target_hex(bits: u32) -> Result<String, RustyError> {
+    let ct = bitcoin::CompactTarget::from_consensus(bits);
+    let target = bitcoin::Target::from_compact(ct);
+    Ok(rbitcoin_primitives::hex_encode(target.to_le_bytes()))
+}
+
+#[uniffi::export]
+pub fn block_work(bits: u32) -> Result<String, RustyError> {
+    let ct = bitcoin::CompactTarget::from_consensus(bits);
+    let target = bitcoin::Target::from_compact(ct);
+    let work = target.to_work();
+    Ok(rbitcoin_primitives::hex_encode(work.to_le_bytes()))
+}
+
+#[uniffi::export]
+pub fn header_validate_pow(header_hex: String) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+    let header: bitcoin::block::Header =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let target = bitcoin::Target::from_compact(header.bits);
+    Ok(header.validate_pow(target).is_ok())
+}
+
+#[uniffi::export]
 pub fn check_libre_annex(tx_hex: String) -> Result<String, RustyError> {
     let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
     let tx: bitcoin::Transaction =
@@ -7607,6 +7638,22 @@ mod tests {
         assert!(!coinbase.is_empty());
         assert!(block_size(block_hex.clone()).unwrap() > 0);
         assert!(!block_has_witness(block_hex).unwrap());
+    }
+
+    #[test]
+    fn test_difficulty_calcs() {
+        let diff = compact_target_to_difficulty(0x1d00ffff).unwrap();
+        assert!(diff > 0.0);
+        let target_hex = compact_target_to_target_hex(0x1d00ffff).unwrap();
+        assert_eq!(target_hex.len(), 64);
+        let work_hex = block_work(0x1d00ffff).unwrap();
+        assert_eq!(work_hex.len(), 64);
+
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        // Extract just the header (80 bytes = 160 hex chars)
+        let header_hex = &block_hex[..160];
+        assert!(header_validate_pow(header_hex.to_string()).unwrap());
     }
 
     #[test]

@@ -6434,6 +6434,50 @@ impl FfiNodeHandle {
             .block_queue_hash_at_height(height)
             .map(rbitcoin_primitives::hex_encode)
     }
+
+    pub fn confirm_cancelled(&self) -> bool {
+        self.inner.lock().unwrap().query.confirm_cancelled()
+    }
+
+    pub fn head_drain_fk(&self) -> u64 {
+        self.inner.lock().unwrap().query.head_drain_fk()
+    }
+
+    pub fn class_a_hi(&self) -> Option<u32> {
+        self.inner.lock().unwrap().query.class_a_hi()
+    }
+
+    pub fn lookup_taken_hi(&self) -> Option<u32> {
+        self.inner.lock().unwrap().query.lookup_taken_hi()
+    }
+
+    pub fn lookup_started_hi(&self) -> Option<u32> {
+        self.inner.lock().unwrap().query.lookup_started_hi()
+    }
+
+    pub fn fence_tip_height(&self) -> Option<u32> {
+        self.inner.lock().unwrap().query.fence_tip_height()
+    }
+
+    pub fn fence_max_connected_fk(&self) -> u64 {
+        self.inner.lock().unwrap().query.store().fence_max_connected_fk()
+    }
+
+    pub fn height_fence_run_count(&self) -> u64 {
+        self.inner.lock().unwrap().query.store().height_fence_run_count() as u64
+    }
+
+    pub fn sample_reset_reconstruct_archived(&self) -> u64 {
+        self.inner.lock().unwrap().query.sample_reset_reconstruct_archived()
+    }
+
+    pub fn sample_reset_thin_tweak_body_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .sample_reset_thin_tweak_body_bytes()
+    }
 }
 
 #[uniffi::export]
@@ -9232,6 +9276,24 @@ mod tests {
         assert!(node.block_queue_queued_heights().is_empty());
         assert!(!node.block_queue_has_height(0));
         assert_eq!(node.block_queue_hash_at_height(0), None);
+        node.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_node_handle_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let node = FfiNodeHandle::open(path.clone(), "regtest".to_string(), true).unwrap();
+        assert!(!node.confirm_cancelled());
+        assert_eq!(node.head_drain_fk(), 0);
+        assert_eq!(node.class_a_hi(), None);
+        assert_eq!(node.lookup_taken_hi(), None);
+        assert_eq!(node.lookup_started_hi(), None);
+        assert_eq!(node.fence_tip_height(), None);
+        assert_eq!(node.fence_max_connected_fk(), 0);
+        assert_eq!(node.height_fence_run_count(), 0);
+        assert_eq!(node.sample_reset_reconstruct_archived(), 0);
+        assert_eq!(node.sample_reset_thin_tweak_body_bytes(), 0);
         node.shutdown().unwrap();
     }
 

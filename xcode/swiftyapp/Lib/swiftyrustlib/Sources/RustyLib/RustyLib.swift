@@ -3441,17 +3441,33 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     
     func blockQueueStats()  -> FfiBlockQueueStats
     
+    func classAHi()  -> UInt32?
+    
+    func confirmCancelled()  -> Bool
+    
     func drainAndFenceHi()  -> UInt64?
     
     func enterDirectIndexMode() throws 
     
     func enterTipIndexMode() 
     
+    func fenceMaxConnectedFk()  -> UInt64
+    
+    func fenceTipHeight()  -> UInt32?
+    
     func flushForShutdown() throws 
+    
+    func headDrainFk()  -> UInt64
+    
+    func heightFenceRunCount()  -> UInt64
     
     func indexMode()  -> FfiIndexMode
     
     func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
+    
+    func lookupStartedHi()  -> UInt32?
+    
+    func lookupTakenHi()  -> UInt32?
     
     func maxShCreates()  -> UInt32
     
@@ -3460,6 +3476,10 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     func networkName()  -> String
     
     func pinChainView() throws  -> FfiChainView?
+    
+    func sampleResetReconstructArchived()  -> UInt64
+    
+    func sampleResetThinTweakBodyBytes()  -> UInt64
     
     func setMaxShCreates(n: UInt32) 
     
@@ -3606,6 +3626,20 @@ open func blockQueueStats() -> FfiBlockQueueStats {
 })
 }
     
+open func classAHi() -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_class_a_hi(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func confirmCancelled() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_confirm_cancelled(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func drainAndFenceHi() -> UInt64? {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffinodehandle_drain_and_fence_hi(self.uniffiClonePointer(),$0
@@ -3625,10 +3659,38 @@ open func enterTipIndexMode() {try! rustCall() {
 }
 }
     
+open func fenceMaxConnectedFk() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_fence_max_connected_fk(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func fenceTipHeight() -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_fence_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func flushForShutdown()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffinodehandle_flush_for_shutdown(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+open func headDrainFk() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_head_drain_fk(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func heightFenceRunCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_height_fence_run_count(self.uniffiClonePointer(),$0
+    )
+})
 }
     
 open func indexMode() -> FfiIndexMode {
@@ -3643,6 +3705,20 @@ open func isOutpointSpent(txidHex: String, vout: UInt32)throws  -> Bool {
     uniffi_rustylib_fn_method_ffinodehandle_is_outpoint_spent(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),
         FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func lookupStartedHi() -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_lookup_started_hi(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func lookupTakenHi() -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_lookup_taken_hi(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3671,6 +3747,20 @@ open func networkName() -> String {
 open func pinChainView()throws  -> FfiChainView? {
     return try  FfiConverterOptionTypeFfiChainView.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffinodehandle_pin_chain_view(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func sampleResetReconstructArchived() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_sample_reset_reconstruct_archived(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func sampleResetThinTweakBodyBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_sample_reset_thin_tweak_body_bytes(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -15367,6 +15457,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_stats() != 12722) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_class_a_hi() != 53130) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_confirm_cancelled() != 40905) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffinodehandle_drain_and_fence_hi() != 58526) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15376,13 +15472,31 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffinodehandle_enter_tip_index_mode() != 44203) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_fence_max_connected_fk() != 20696) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_fence_tip_height() != 29933) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffinodehandle_flush_for_shutdown() != 31591) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_head_drain_fk() != 52983) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_height_fence_run_count() != 49418) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_index_mode() != 62366) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_is_outpoint_spent() != 36164) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_lookup_started_hi() != 40995) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_lookup_taken_hi() != 31781) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_max_sh_creates() != 13404) {
@@ -15395,6 +15509,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_pin_chain_view() != 64871) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_sample_reset_reconstruct_archived() != 28442) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_sample_reset_thin_tweak_body_bytes() != 17579) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_set_max_sh_creates() != 23090) {

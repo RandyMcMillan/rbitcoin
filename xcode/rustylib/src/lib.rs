@@ -7496,6 +7496,95 @@ pub fn p2p_start(datadir: String, network: String, max_run_secs: u64) -> Result<
 }
 
 #[uniffi::export]
+pub fn p2p_start_with_config(
+    datadir: String,
+    network: String,
+    max_run_secs: u64,
+    p2p_listen: Option<String>,
+    electrum_listen: Option<String>,
+    esplora_listen: Option<String>,
+    rpc_listen: Option<String>,
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
+    shindex: bool,
+    sptweaks: bool,
+    max_sh_creates: u32,
+) -> Result<String, RustyError> {
+    let state = P2P_STATE.get_or_init(|| {
+        std::sync::Mutex::new(P2PState {
+            shutdown: rbitcoin_node::Shutdown::new(),
+            handle: None,
+        })
+    });
+
+    let mut guard = state.lock().map_err(|_| RustyError::InvalidInput)?;
+
+    if guard.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+        return Ok("already-running".to_string());
+    }
+
+    guard.shutdown = rbitcoin_node::Shutdown::new();
+    let shutdown = Arc::clone(&guard.shutdown);
+
+    let net = rbitcoin_primitives::Network::parse(&network)
+        .map_err(|_| RustyError::InvalidInput)?;
+
+    let mut config = rbitcoin_node::NodeConfig::default()
+        .with_datadir(std::path::PathBuf::from(&datadir))
+        .with_network(net);
+
+    if max_run_secs > 0 {
+        config.max_run_secs = Some(max_run_secs);
+    }
+    config.head_scale = rbitcoin_store::HeadScale::Tiny;
+    config.shindex = shindex;
+    config.sptweaks = sptweaks;
+    config.max_sh_creates = max_sh_creates;
+
+    if let Some(addr) = p2p_listen {
+        config.listen.p2p = Some(
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|_| RustyError::InvalidInput)?,
+        );
+    }
+    if let Some(addr) = electrum_listen {
+        config.listen.electrum = Some(
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|_| RustyError::InvalidInput)?,
+        );
+    }
+    if let Some(addr) = esplora_listen {
+        config.listen.esplora = Some(
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|_| RustyError::InvalidInput)?,
+        );
+    }
+    if let Some(addr) = rpc_listen {
+        config.rpc.listen = Some(
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|_| RustyError::InvalidInput)?,
+        );
+    }
+    if let Some(user) = rpc_user {
+        config.rpc.user = Some(user);
+    }
+    if let Some(pass) = rpc_password {
+        config.rpc.password = Some(pass);
+    }
+
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        rt.block_on(async {
+            rbitcoin_node::run_p2p_with_shutdown(config, Some(shutdown)).await
+        }).map_err(|e| format!("run_p2p: {e}"))
+    });
+
+    guard.handle = Some(handle);
+    Ok("started".to_string())
+}
+
+#[uniffi::export]
 pub fn p2p_stop() -> Result<String, RustyError> {
     let state = P2P_STATE.get_or_init(|| {
         std::sync::Mutex::new(P2PState {
@@ -7749,6 +7838,28 @@ mod tests {
         let hosts = p2p_fixed_seed_hosts("mainnet".to_string()).unwrap();
         assert!(!hosts.is_empty());
         assert_eq!(p2p_target_peers(), 16);
+    }
+
+    #[test]
+    fn test_p2p_start_with_config_invalid_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        // Invalid network should fail immediately
+        let result = p2p_start_with_config(
+            path,
+            "notanetwork".to_string(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            0,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

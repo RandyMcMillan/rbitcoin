@@ -7,6 +7,17 @@
 
 import SwiftUI
 
+extension View {
+    @ViewBuilder
+    func appTextFieldStyle() -> some View {
+        #if os(tvOS)
+        self
+        #else
+        self.textFieldStyle(.roundedBorder)
+        #endif
+    }
+}
+
 struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var firstValue = 10
@@ -389,7 +400,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Enter address", text: $addressInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.body, design: .monospaced))
                                     .onChange(of: addressInput) { _ in updateAddressResult() }
                             }
@@ -419,7 +430,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Enter text to hash", text: $hashInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .onChange(of: hashInput) { _ in updateHashResult() }
                                 if !hashResult.isEmpty {
                                     Text(hashResult)
@@ -456,7 +467,7 @@ struct ContentView: View {
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 HStack(spacing: 8) {
                                     TextField("Height", text: $subsidyHeight)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 100)
                                     Picker("Network", selection: $subsidyNetwork) {
@@ -486,7 +497,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Paste block hex", text: $blockHexInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                     .onChange(of: blockHexInput) { _ in updateBlockValidation() }
                                 if !blockValidationResult.isEmpty {
@@ -524,7 +535,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Documents subdirectory", text: $storePath)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.body, design: .monospaced))
                                     .onAppear {
                                         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -719,7 +730,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Documents subdirectory", text: $queryPath)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.body, design: .monospaced))
                                     .onAppear {
                                         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -823,7 +834,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Documents subdirectory", text: $mempoolPath)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.body, design: .monospaced))
                                     .onAppear {
                                         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -893,14 +904,14 @@ struct ContentView: View {
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 HStack(spacing: 8) {
                                     TextField("Blocks", text: $feeTargetBlocks)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     Text("stock above (WU)")
                                         .font(.caption)
                                         .foregroundStyle(primaryText.opacity(0.68))
                                     TextField("WU", text: $feeStockAbove)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 100)
                                     Spacer()
@@ -939,7 +950,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Paste tx hex", text: $txHexInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                     .onChange(of: txHexInput) { _ in updateTxParse() }
                                 if !txParseResult.isEmpty {
@@ -971,7 +982,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Paste header hex", text: $headerHexInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                     .onChange(of: headerHexInput) { _ in updateHeaderHash() }
                                 if !headerHashResult.isEmpty {
@@ -1042,7 +1053,7 @@ struct ContentView: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 TextField("Paste script hex", text: $scriptHashInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                     .onChange(of: scriptHashInput) { _ in updateScriptHash() }
                                 if !scriptHashResult.isEmpty {
@@ -1076,7 +1087,7 @@ struct ContentView: View {
                                     .foregroundStyle(primaryText.opacity(0.92))
                                 HStack(spacing: 8) {
                                     TextField("Level", text: $logLevelInput)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .frame(width: 100)
                                     Button {
                                         initLogLevel(level: logLevelInput)
@@ -1262,14 +1273,14 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack(spacing: 8) {
                                     TextField("Prev hash", text: $regtestPrevHash)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .font(.system(.caption, design: .monospaced))
                                     TextField("Time", text: $regtestTime)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 100)
                                     TextField("Height", text: $regtestHeight)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 60)
                                 }
@@ -1388,7 +1399,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Txids (comma-separated)", text: $merkleTxids)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let txids = merkleTxids.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -1471,27 +1482,27 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack(spacing: 8) {
                                     TextField("Ver", text: $headerHashVersion)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 50)
                                     TextField("Bits", text: $headerHashBits)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     TextField("Nonce", text: $headerHashNonce)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                 }
                                 TextField("Prev hash", text: $headerHashPrev)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Merkle root", text: $headerHashMerkle)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     TextField("Time", text: $headerHashTime)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 100)
                                     Button {
@@ -1538,7 +1549,7 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Rate sat/kvB", text: $feeAtRate)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 100)
                                 Button {
@@ -1579,7 +1590,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hash hex", text: $archiveHashInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     do {
@@ -1620,10 +1631,10 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Wtxids (comma-separated)", text: $witnessWtxids)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Reserved", text: $witnessReserved)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let wtxids = witnessWtxids.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -1665,7 +1676,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Tx hex", text: $sigopsTxHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = sigopsTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1711,7 +1722,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Tx hex", text: $bip68TxHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = bip68TxHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1757,15 +1768,15 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Tx hex", text: $libreTxHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     TextField("Fee", text: $libreFee)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     TextField("Weight", text: $libreWeight)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     Button {
@@ -1813,7 +1824,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Script pubkey hex", text: $regtestPayScript)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     do {
@@ -1887,7 +1898,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Txid hex", text: $queryFkTxid)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     do {
@@ -1969,10 +1980,10 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Tx hex", text: $spTxHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Prevouts hex (comma-separated)", text: $spPrevoutsHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = spTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2022,10 +2033,10 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("ASMap hex", text: $asmapHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("IP", text: $asmapIp)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .frame(width: 120)
                                 Button {
                                     do {
@@ -2115,7 +2126,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hex", text: $blockStructHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = blockStructHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2160,10 +2171,10 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("IP", text: $netgroupIp)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .frame(width: 120)
                                 TextField("Port", text: $netgroupPort)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 Button {
@@ -2208,7 +2219,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Work hexes (comma-separated)", text: $workHexes)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hexes = workHexes.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -2254,7 +2265,7 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Height", text: $tweaksHeight)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 Button {
@@ -2301,21 +2312,21 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack(spacing: 8) {
                                     TextField("New fee", text: $rbfNewFee)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     TextField("New weight", text: $rbfNewWeight)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                 }
                                 HStack(spacing: 8) {
                                     TextField("Old fee", text: $rbfOldFee)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     TextField("Old weight", text: $rbfOldWeight)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                 }
@@ -2360,7 +2371,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hash hex", text: $queryHashInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     do {
@@ -2402,7 +2413,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Contents hex", text: $v2ContentsHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = v2ContentsHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2522,7 +2533,7 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Address", text: $peerAddrInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.body, design: .monospaced))
                                 Button {
                                     do {
@@ -2562,7 +2573,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hex", text: $connectBlockHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = connectBlockHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2607,7 +2618,7 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Height", text: $mtpHeight)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 Button {
@@ -2653,16 +2664,16 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Height", text: $disconnectHeight)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 TextField("Tx count", text: $disconnectTxCount)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                             }
                             TextField("Hash", text: $disconnectHash)
-                                .textFieldStyle(.roundedBorder)
+                                .appTextFieldStyle()
                                 .font(.system(.caption, design: .monospaced))
                             Button {
                                 guard let height = UInt32(disconnectHeight), let nTx = UInt32(disconnectTxCount) else {
@@ -2774,7 +2785,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Tx hex", text: $scriptForksTxHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = scriptForksTxHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2819,11 +2830,11 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hex", text: $classABlockHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     TextField("Height", text: $classAHeight)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     Button {
@@ -2870,10 +2881,10 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Header hex", text: $headerRecordHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Hash hex", text: $headerRecordHash)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = headerRecordHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2999,11 +3010,11 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Tip time", text: $tipTimeInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 100)
                                 TextField("Now", text: $tipNowInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 100)
                                 Button {
@@ -3045,7 +3056,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Script hex", text: $unspendableScript)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                     .onChange(of: unspendableScript) { _ in
                                         unspendableResult = isUnspendable(scriptHex: unspendableScript) ? "unspendable" : "spendable"
@@ -3082,7 +3093,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("TxOut hex", text: $txoutHexInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = txoutHexInput.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3127,7 +3138,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Scores (comma-separated)", text: $medianScores)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let parts = medianScores.split(separator: ",").compactMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
@@ -3168,10 +3179,10 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Scores (comma-separated)", text: $percentileScores)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Weights (comma-separated)", text: $percentileWeights)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let s = percentileScores.split(separator: ",").compactMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
@@ -3217,10 +3228,10 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("New work hex", text: $workNewHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Old work hex", text: $workOldHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let new = workNewHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3266,7 +3277,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Error text", text: $badPrevErr)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .onChange(of: badPrevErr) { _ in
                                         badPrevResult = isBadPrevErr(err: badPrevErr) ? "bad prev" : "other"
                                     }
@@ -3302,11 +3313,11 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Now", text: $timeoutNow)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 100)
                                 TextField("Best header", text: $timeoutBest)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 100)
                                 Button {
@@ -3347,14 +3358,14 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("IDs (comma-separated)", text: $staleIds)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Groups (comma-separated)", text: $staleGroups)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     TextField("Salt", text: $staleSalt)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 80)
                                     Button {
@@ -3398,7 +3409,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hex", text: $witnessBlockHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     let hex = witnessBlockHex.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3444,10 +3455,10 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Seed", text: $dnsSeedInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Services", text: $dnsSeedServices)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 Button {
@@ -3489,14 +3500,14 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Block hex", text: $candidateBlockHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 TextField("Prev hash", text: $candidatePrevHash)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     TextField("Time", text: $candidateTime)
-                                        .textFieldStyle(.roundedBorder)
+                                        .appTextFieldStyle()
                                         .keyboardType(.numberPad)
                                         .frame(width: 100)
                                     Button {
@@ -3544,15 +3555,15 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Start", text: $lastHeightStart)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 60)
                                 TextField("Count", text: $lastHeightCount)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 60)
                                 TextField("Tip", text: $lastHeightTip)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 60)
                                 Button {
@@ -3593,11 +3604,11 @@ struct ContentView: View {
 
                             HStack(spacing: 8) {
                                 TextField("Elapsed", text: $sealElapsed)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 TextField("Budget", text: $sealBudget)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .keyboardType(.numberPad)
                                     .frame(width: 80)
                                 Button {
@@ -3638,7 +3649,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Script hex", text: $shHashInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                     .onChange(of: shHashInput) { _ in
                                         shHashResult = scriptHashHex(scriptHex: shHashInput)
@@ -3708,7 +3719,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Script hex", text: $esploraScriptInput)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     Picker("Network", selection: $esploraScriptNetwork) {
@@ -3943,7 +3954,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("Seed hex", text: $bip32Seed)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 HStack(spacing: 8) {
                                     Picker("Network", selection: $bip32Network) {
@@ -4012,7 +4023,7 @@ struct ContentView: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 TextField("PSBT hex", text: $psbtHex)
-                                    .textFieldStyle(.roundedBorder)
+                                    .appTextFieldStyle()
                                     .font(.system(.caption, design: .monospaced))
                                 Button {
                                     do {
@@ -4425,6 +4436,37 @@ struct ContentView: View {
 
             Spacer()
 
+            #if os(tvOS)
+            HStack(spacing: 12) {
+                Button {
+                    if value.wrappedValue > range.lowerBound {
+                        value.wrappedValue -= 1
+                    }
+                } label: {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.title2)
+                }
+                .buttonStyle(.plain)
+                .tint(accentFill)
+
+                Text("\(value.wrappedValue)")
+                    .font(.title3.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(primaryText)
+                    .frame(minWidth: 44, alignment: .trailing)
+
+                Button {
+                    if value.wrappedValue < range.upperBound {
+                        value.wrappedValue += 1
+                    }
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title2)
+                }
+                .buttonStyle(.plain)
+                .tint(accentFill)
+            }
+            #else
             Stepper(value: value, in: range) {
                 Text("\(value.wrappedValue)")
                     .font(.title3.weight(.semibold))
@@ -4434,6 +4476,7 @@ struct ContentView: View {
             }
             .labelsHidden()
             .tint(accentFill)
+            #endif
         }
     }
 

@@ -14153,6 +14153,48 @@ public func txGbtSigops(txHex: String)throws  -> UInt64 {
     )
 })
 }
+public func txInputCount(txHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_input_count(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txLockTime(txHex: String)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_lock_time(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txOutputCount(txHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_output_count(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txVersion(txHex: String)throws  -> Int32 {
+    return try  FfiConverterInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_version(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txVsize(txHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_vsize(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txWeight(txHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_weight(
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
 public func txidFromHex(txHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_txid_from_hex(
@@ -15046,6 +15088,24 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_gbt_sigops() != 40578) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_input_count() != 27325) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_lock_time() != 41885) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_output_count() != 50673) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_version() != 51219) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_vsize() != 8099) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_weight() != 61465) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_txid_from_hex() != 27347) {

@@ -606,6 +606,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     
     func evictConflictsWith(txidsHex: [String], vouts: [UInt32]) throws  -> [String]
     
+    func evictNonfinal(query: FfiQuery) throws 
+    
     func evictToBudget(protectTxidHex: String?) throws  -> UInt64
     
     func flush() throws 
@@ -615,6 +617,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     func getTx(txidHex: String) throws  -> String?
     
     func liveCount()  -> UInt64
+    
+    func maxWeight()  -> UInt64
     
     func maybeCompact() throws  -> String?
     
@@ -632,6 +636,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     
     func removeForBlock(txidsHex: [String]) throws  -> UInt64
     
+    func removeForBlockWithUtxo(query: FfiQuery, txidsHex: [String]) throws  -> UInt64
+    
     func removeLiveTxids(txidsHex: [String]) throws  -> UInt64
     
     func removeTxid(txidHex: String) throws 
@@ -641,6 +647,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     func reorgDisconnectReaccept(query: FfiQuery, txsHex: [String]) throws  -> [String]
     
     func selectBlockTxs(maxWeightWu: UInt64)  -> [String]
+    
+    func selectBlockTxsDelta(maxWeightWu: UInt64, deltaTxidsHex: [String], deltas: [Int64]) throws  -> [String]
     
     func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
     
@@ -758,6 +766,13 @@ open func evictConflictsWith(txidsHex: [String], vouts: [UInt32])throws  -> [Str
 })
 }
     
+open func evictNonfinal(query: FfiQuery)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_evict_nonfinal(self.uniffiClonePointer(),
+        FfiConverterTypeFfiQuery.lower(query),$0
+    )
+}
+}
+    
 open func evictToBudget(protectTxidHex: String?)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiactivemempool_evict_to_budget(self.uniffiClonePointer(),
@@ -790,6 +805,13 @@ open func getTx(txidHex: String)throws  -> String? {
 open func liveCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiactivemempool_live_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func maxWeight() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_max_weight(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -853,6 +875,15 @@ open func removeForBlock(txidsHex: [String])throws  -> UInt64 {
 })
 }
     
+open func removeForBlockWithUtxo(query: FfiQuery, txidsHex: [String])throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_remove_for_block_with_utxo(self.uniffiClonePointer(),
+        FfiConverterTypeFfiQuery.lower(query),
+        FfiConverterSequenceString.lower(txidsHex),$0
+    )
+})
+}
+    
 open func removeLiveTxids(txidsHex: [String])throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiactivemempool_remove_live_txids(self.uniffiClonePointer(),
@@ -889,6 +920,16 @@ open func selectBlockTxs(maxWeightWu: UInt64) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffiactivemempool_select_block_txs(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(maxWeightWu),$0
+    )
+})
+}
+    
+open func selectBlockTxsDelta(maxWeightWu: UInt64, deltaTxidsHex: [String], deltas: [Int64])throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_select_block_txs_delta(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(maxWeightWu),
+        FfiConverterSequenceString.lower(deltaTxidsHex),
+        FfiConverterSequenceInt64.lower(deltas),$0
     )
 })
 }
@@ -7823,6 +7864,12 @@ public func checkLibreAnnex(txHex: String)throws  -> String {
     )
 })
 }
+public func checkPackageShape(txsHex: [String])throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_check_package_shape(
+        FfiConverterSequenceString.lower(txsHex),$0
+    )
+}
+}
 public func commitClassABlock(queryPath: String, network: String, height: UInt32, blockHex: String, milestoneHeight: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_commit_class_a_block(
         FfiConverterString.lower(queryPath),
@@ -9285,6 +9332,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_check_libre_annex() != 29787) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_check_package_shape() != 53547) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_commit_class_a_block() != 27043) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9867,6 +9917,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiactivemempool_evict_conflicts_with() != 4887) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_evict_nonfinal() != 17145) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_evict_to_budget() != 17024) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9880,6 +9933,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_live_count() != 31658) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_max_weight() != 43301) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_maybe_compact() != 16637) {
@@ -9906,6 +9962,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_for_block() != 59077) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_for_block_with_utxo() != 54555) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_live_txids() != 37088) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9919,6 +9978,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_select_block_txs() != 6456) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_select_block_txs_delta() != 65328) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_set_cluster_limits() != 42242) {

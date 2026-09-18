@@ -140,6 +140,44 @@ pub fn p2pkh_address_from_pubkey(pubkey_hex: String, network: String) -> Result<
     Ok(address.to_string())
 }
 
+#[uniffi::export]
+pub fn p2sh_address_from_script(script_hex: String, network: String) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let bnet = bitcoin_network(net);
+    let bytes = rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = bitcoin::ScriptBuf::from_bytes(bytes);
+    let address = bitcoin::Address::p2sh(&script, bnet).map_err(|_| RustyError::InvalidInput)?;
+    Ok(address.to_string())
+}
+
+#[uniffi::export]
+pub fn sign_message(wif: String, message: String) -> Result<String, RustyError> {
+    let pk = bitcoin::PrivateKey::from_str(&wif).map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let msg_hash = bitcoin::sign_message::signed_msg_hash(&message);
+    let msg = bitcoin::secp256k1::Message::from_digest(msg_hash.to_byte_array());
+    let sig = secp.sign_ecdsa_recoverable(&msg, &pk.inner);
+    let ms = bitcoin::sign_message::MessageSignature::new(sig, pk.compressed);
+    Ok(rbitcoin_primitives::hex_encode(ms.serialize()))
+}
+
+#[uniffi::export]
+pub fn verify_message(
+    pubkey_hex: String,
+    message: String,
+    signature_hex: String,
+) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&signature_hex).map_err(|_| RustyError::InvalidInput)?;
+    let sig = bitcoin::sign_message::MessageSignature::from_slice(&bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let msg_hash = bitcoin::sign_message::signed_msg_hash(&message);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let pubkey_bytes = rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey = bitcoin::PublicKey::from_slice(&pubkey_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let recovered = sig.recover_pubkey(&secp, msg_hash).map_err(|_| RustyError::InvalidInput)?;
+    Ok(recovered == pubkey)
+}
+
 // --- Consensus FFI ---
 
 #[uniffi::export]
@@ -9407,6 +9445,23 @@ mod tests {
 
         assert!(max_addr_to_send() > 0);
         assert!(max_pct_addr_to_send() > 0);
+    }
+
+    #[test]
+    fn test_message_sign_and_verify() {
+        let wif = generate_private_key("regtest".to_string()).unwrap();
+        let pubkey_hex = private_key_to_pubkey_hex(wif.clone()).unwrap();
+        let message = "Hello, Bitcoin!";
+        let sig_hex = sign_message(wif, message.to_string()).unwrap();
+        assert_eq!(sig_hex.len(), 130); // 65 bytes hex-encoded
+        assert!(verify_message(pubkey_hex, message.to_string(), sig_hex).unwrap());
+    }
+
+    #[test]
+    fn test_p2sh_address_from_script() {
+        let script_hex = "76a914000000000000000000000000000000000000000088ac".to_string();
+        let addr = p2sh_address_from_script(script_hex, "mainnet".to_string()).unwrap();
+        assert!(addr.starts_with('3'));
     }
 
 }

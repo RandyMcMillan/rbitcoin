@@ -13555,6 +13555,14 @@ public func p2pkhAddressFromPubkey(pubkeyHex: String, network: String)throws  ->
     )
 })
 }
+public func p2shAddressFromScript(scriptHex: String, network: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2sh_address_from_script(
+        FfiConverterString.lower(scriptHex),
+        FfiConverterString.lower(network),$0
+    )
+})
+}
 public func p2trAddressFromPubkey(pubkeyHex: String, network: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_p2tr_address_from_pubkey(
@@ -13996,6 +14004,14 @@ public func sequenceLocksSatisfied(txHex: String, prevHeights: [UInt32], prevCoi
     )
 })
 }
+public func signMessage(wif: String, message: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_sign_message(
+        FfiConverterString.lower(wif),
+        FfiConverterString.lower(message),$0
+    )
+})
+}
 public func signetMagicHex(challengeHex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_signet_magic_hex(
@@ -14208,6 +14224,15 @@ public func validateSignetBlockSolution(blockHex: String, challengeHex: String)t
         FfiConverterString.lower(challengeHex),$0
     )
 }
+}
+public func verifyMessage(pubkeyHex: String, message: String, signatureHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_verify_message(
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterString.lower(message),
+        FfiConverterString.lower(signatureHex),$0
+    )
+})
 }
 public func verifyTxScripts(prevoutsHex: [String], txHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_verify_tx_scripts(
@@ -14745,6 +14770,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_p2pkh_address_from_pubkey() != 2711) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_p2sh_address_from_script() != 48417) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_p2tr_address_from_pubkey() != 39046) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14925,6 +14953,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_sequence_locks_satisfied() != 54468) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_sign_message() != 42839) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_signet_magic_hex() != 22600) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15010,6 +15041,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_validate_signet_block_solution() != 27703) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_verify_message() != 17315) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_verify_tx_scripts() != 58820) {

@@ -598,6 +598,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     
     func compact() throws  -> String
     
+    func eraseOrphansForBlock(blockTxidsHex: [String]) throws 
+    
     func evictConflictsWith(txidsHex: [String], vouts: [UInt32]) throws  -> [String]
     
     func evictToBudget(protectTxidHex: String?) throws  -> UInt64
@@ -616,7 +618,11 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     
     func orphanCount()  -> UInt64
     
+    func parkOrphan(txHex: String, missingTxidsHex: [String]) throws  -> String
+    
     func persistIfDirty() throws 
+    
+    func rememberExtraCompact(txHex: String) throws 
     
     func removeForBlock(txidsHex: [String]) throws  -> UInt64
     
@@ -631,6 +637,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
     
     func setMinRelaySatKvb(satKvb: UInt64) 
+    
+    func takeOrphanChildren(parentTxidHex: String) throws  -> [String]
     
 }
 
@@ -708,6 +716,13 @@ open func compact()throws  -> String {
 })
 }
     
+open func eraseOrphansForBlock(blockTxidsHex: [String])throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_erase_orphans_for_block(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(blockTxidsHex),$0
+    )
+}
+}
+    
 open func evictConflictsWith(txidsHex: [String], vouts: [UInt32])throws  -> [String] {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiactivemempool_evict_conflicts_with(self.uniffiClonePointer(),
@@ -774,8 +789,24 @@ open func orphanCount() -> UInt64 {
 })
 }
     
+open func parkOrphan(txHex: String, missingTxidsHex: [String])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_park_orphan(self.uniffiClonePointer(),
+        FfiConverterString.lower(txHex),
+        FfiConverterSequenceString.lower(missingTxidsHex),$0
+    )
+})
+}
+    
 open func persistIfDirty()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiactivemempool_persist_if_dirty(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func rememberExtraCompact(txHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_remember_extra_compact(self.uniffiClonePointer(),
+        FfiConverterString.lower(txHex),$0
     )
 }
 }
@@ -832,6 +863,14 @@ open func setMinRelaySatKvb(satKvb: UInt64) {try! rustCall() {
         FfiConverterUInt64.lower(satKvb),$0
     )
 }
+}
+    
+open func takeOrphanChildren(parentTxidHex: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_take_orphan_children(self.uniffiClonePointer(),
+        FfiConverterString.lower(parentTxidHex),$0
+    )
+})
 }
     
 
@@ -9636,6 +9675,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiactivemempool_compact() != 27579) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_erase_orphans_for_block() != 61743) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_evict_conflicts_with() != 4887) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9663,7 +9705,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiactivemempool_orphan_count() != 40480) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_park_orphan() != 32183) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_persist_if_dirty() != 58263) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_remember_extra_compact() != 50605) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_for_block() != 59077) {
@@ -9685,6 +9733,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_set_min_relay_sat_kvb() != 5705) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_take_orphan_children() != 34860) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiaddrman_add() != 26692) {

@@ -3336,6 +3336,13 @@ pub struct FfiMempoolGraphStats {
     pub descendantfees: u64,
 }
 
+#[derive(uniffi::Record)]
+pub struct FfiChunk {
+    pub txids: Vec<String>,
+    pub fee_sat: u64,
+    pub weight: u64,
+}
+
 #[derive(uniffi::Object)]
 pub struct FfiTxGraph {
     inner: std::sync::Mutex<rbitcoin_mempool::TxGraph>,
@@ -3396,6 +3403,72 @@ impl FfiTxGraph {
     pub fn contains(&self, txid_hex: String) -> Result<bool, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         Ok(self.inner.lock().unwrap().contains(&txid))
+    }
+
+    pub fn contains_wtxid(&self, wtxid_hex: String) -> Result<bool, RustyError> {
+        let wtxid = bitcoin::Wtxid::from_str(&wtxid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.lock().unwrap().contains_wtxid(&wtxid))
+    }
+
+    pub fn txid_for_wtxid(&self, wtxid_hex: String) -> Result<Option<String>, RustyError> {
+        let wtxid = bitcoin::Wtxid::from_str(&wtxid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.lock().unwrap().txid_for_wtxid(&wtxid).map(|t| t.to_string()))
+    }
+
+    pub fn mempool_utxo(&self, txid_hex: String, vout: u32) -> Result<bool, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let op = bitcoin::OutPoint::new(txid, vout);
+        Ok(self.inner.lock().unwrap().mempool_utxo(&op))
+    }
+
+    pub fn creator(&self, txid_hex: String, vout: u32) -> Result<Option<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let op = bitcoin::OutPoint::new(txid, vout);
+        Ok(self.inner.lock().unwrap().creator(&op).map(|t| t.to_string()))
+    }
+
+    pub fn conflict_txid(&self, txid_hex: String, vout: u32) -> Result<Option<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let op = bitcoin::OutPoint::new(txid, vout);
+        Ok(self.inner.lock().unwrap().conflict_txid(&op).map(|t| t.to_string()))
+    }
+
+    pub fn ancestor_set(&self, txid_hex: String) -> Result<Vec<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let set = self.inner.lock().unwrap().ancestor_set(&txid);
+        Ok(set.map(|s| s.into_iter().map(|t| t.to_string()).collect()).unwrap_or_default())
+    }
+
+    pub fn descendant_set(&self, txid_hex: String) -> Result<Vec<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let set = self.inner.lock().unwrap().descendant_set(&txid);
+        Ok(set.map(|s| s.into_iter().map(|t| t.to_string()).collect()).unwrap_or_default())
+    }
+
+    pub fn worst_chunk(&self) -> Option<FfiChunk> {
+        self.inner.lock().unwrap().worst_chunk().map(|(_, ch)| FfiChunk {
+            txids: ch.txids.into_iter().map(|t| t.to_string()).collect(),
+            fee_sat: ch.fee_sat,
+            weight: ch.weight,
+        })
+    }
+
+    pub fn mining_chunks_best_first(&self) -> Vec<FfiChunk> {
+        self.inner
+            .lock()
+            .unwrap()
+            .mining_chunks_best_first()
+            .into_iter()
+            .map(|ch| FfiChunk {
+                txids: ch.txids.into_iter().map(|t| t.to_string()).collect(),
+                fee_sat: ch.fee_sat,
+                weight: ch.weight,
+            })
+            .collect()
+    }
+
+    pub fn template_tx_weight(&self) -> u64 {
+        rbitcoin_mempool::TxGraph::template_tx_weight()
     }
 
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
@@ -6692,6 +6765,45 @@ mod tests {
     fn test_tx_graph_select_block_empty() {
         let g = FfiTxGraph::new();
         assert!(g.select_block_txids(4_000_000).is_empty());
+    }
+
+    #[test]
+    fn test_tx_graph_wtxid_and_utxo_empty() {
+        let g = FfiTxGraph::new();
+        assert!(!g.contains_wtxid(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        ).unwrap());
+        assert_eq!(g.txid_for_wtxid(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        ).unwrap(), None);
+        assert!(!g.mempool_utxo(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), 0
+        ).unwrap());
+        assert_eq!(g.creator(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), 0
+        ).unwrap(), None);
+        assert_eq!(g.conflict_txid(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), 0
+        ).unwrap(), None);
+    }
+
+    #[test]
+    fn test_tx_graph_ancestor_descendant_empty() {
+        let g = FfiTxGraph::new();
+        assert!(g.ancestor_set(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        ).unwrap().is_empty());
+        assert!(g.descendant_set(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        ).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tx_graph_chunks_empty() {
+        let g = FfiTxGraph::new();
+        assert!(g.worst_chunk().is_none());
+        assert!(g.mining_chunks_best_first().is_empty());
+        assert_eq!(g.template_tx_weight(), 3_992_000);
     }
 
     #[test]

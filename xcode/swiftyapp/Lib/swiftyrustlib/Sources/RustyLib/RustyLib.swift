@@ -4036,13 +4036,23 @@ public func FfiConverterTypeFfiStore_lower(_ value: FfiStore) -> UnsafeMutableRa
 
 public protocol FfiTxGraphProtocol : AnyObject {
     
+    func ancestorSet(txidHex: String) throws  -> [String]
+    
     func clusterCountLimit()  -> UInt64
     
     func clusterVsizeLimit()  -> UInt64
     
     func clusterWeightLimit()  -> UInt64
     
+    func conflictTxid(txidHex: String, vout: UInt32) throws  -> String?
+    
     func contains(txidHex: String) throws  -> Bool
+    
+    func containsWtxid(wtxidHex: String) throws  -> Bool
+    
+    func creator(txidHex: String, vout: UInt32) throws  -> String?
+    
+    func descendantSet(txidHex: String) throws  -> [String]
     
     func frontierFeerateSatPerKvb(targetWu: UInt64)  -> UInt64?
     
@@ -4052,13 +4062,23 @@ public protocol FfiTxGraphProtocol : AnyObject {
     
     func len()  -> UInt64
     
+    func mempoolUtxo(txidHex: String, vout: UInt32) throws  -> Bool
+    
+    func miningChunksBestFirst()  -> [FfiChunk]
+    
     func selectBlockTxids(maxWeightWu: UInt64)  -> [String]
     
     func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
     
+    func templateTxWeight()  -> UInt64
+    
     func totalWeight()  -> UInt64
     
+    func txidForWtxid(wtxidHex: String) throws  -> String?
+    
     func weightAboveFeerate(rateSatPerKvb: UInt64)  -> UInt64
+    
+    func worstChunk()  -> FfiChunk?
     
 }
 
@@ -4119,6 +4139,14 @@ public convenience init() {
     
 
     
+open func ancestorSet(txidHex: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_ancestor_set(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
 open func clusterCountLimit() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffitxgraph_cluster_count_limit(self.uniffiClonePointer(),$0
@@ -4140,9 +4168,43 @@ open func clusterWeightLimit() -> UInt64 {
 })
 }
     
+open func conflictTxid(txidHex: String, vout: UInt32)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_conflict_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
 open func contains(txidHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffitxgraph_contains(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func containsWtxid(wtxidHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_contains_wtxid(self.uniffiClonePointer(),
+        FfiConverterString.lower(wtxidHex),$0
+    )
+})
+}
+    
+open func creator(txidHex: String, vout: UInt32)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_creator(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func descendantSet(txidHex: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_descendant_set(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
     )
 })
@@ -4178,6 +4240,22 @@ open func len() -> UInt64 {
 })
 }
     
+open func mempoolUtxo(txidHex: String, vout: UInt32)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_mempool_utxo(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func miningChunksBestFirst() -> [FfiChunk] {
+    return try!  FfiConverterSequenceTypeFfiChunk.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_mining_chunks_best_first(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func selectBlockTxids(maxWeightWu: UInt64) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffitxgraph_select_block_txids(self.uniffiClonePointer(),
@@ -4194,9 +4272,24 @@ open func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) {try! rustCall() {
 }
 }
     
+open func templateTxWeight() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_template_tx_weight(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func totalWeight() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffitxgraph_total_weight(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func txidForWtxid(wtxidHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_txid_for_wtxid(self.uniffiClonePointer(),
+        FfiConverterString.lower(wtxidHex),$0
     )
 })
 }
@@ -4205,6 +4298,13 @@ open func weightAboveFeerate(rateSatPerKvb: UInt64) -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffitxgraph_weight_above_feerate(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(rateSatPerKvb),$0
+    )
+})
+}
+    
+open func worstChunk() -> FfiChunk? {
+    return try!  FfiConverterOptionTypeFfiChunk.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_worst_chunk(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -4533,6 +4633,80 @@ public func FfiConverterTypeFfiChainView_lift(_ buf: RustBuffer) throws -> FfiCh
 #endif
 public func FfiConverterTypeFfiChainView_lower(_ value: FfiChainView) -> RustBuffer {
     return FfiConverterTypeFfiChainView.lower(value)
+}
+
+
+public struct FfiChunk {
+    public var txids: [String]
+    public var feeSat: UInt64
+    public var weight: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txids: [String], feeSat: UInt64, weight: UInt64) {
+        self.txids = txids
+        self.feeSat = feeSat
+        self.weight = weight
+    }
+}
+
+
+
+extension FfiChunk: Equatable, Hashable {
+    public static func ==(lhs: FfiChunk, rhs: FfiChunk) -> Bool {
+        if lhs.txids != rhs.txids {
+            return false
+        }
+        if lhs.feeSat != rhs.feeSat {
+            return false
+        }
+        if lhs.weight != rhs.weight {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txids)
+        hasher.combine(feeSat)
+        hasher.combine(weight)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiChunk: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiChunk {
+        return
+            try FfiChunk(
+                txids: FfiConverterSequenceString.read(from: &buf), 
+                feeSat: FfiConverterUInt64.read(from: &buf), 
+                weight: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiChunk, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.txids, into: &buf)
+        FfiConverterUInt64.write(value.feeSat, into: &buf)
+        FfiConverterUInt64.write(value.weight, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiChunk_lift(_ buf: RustBuffer) throws -> FfiChunk {
+    return try FfiConverterTypeFfiChunk.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiChunk_lower(_ value: FfiChunk) -> RustBuffer {
+    return FfiConverterTypeFfiChunk.lower(value)
 }
 
 
@@ -7545,6 +7719,30 @@ fileprivate struct FfiConverterOptionTypeFfiChainView: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiChunk: FfiConverterRustBuffer {
+    typealias SwiftType = FfiChunk?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiChunk.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiChunk.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiCreateLocPair: FfiConverterRustBuffer {
     typealias SwiftType = FfiCreateLocPair?
 
@@ -7903,6 +8101,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiChunk: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiChunk]
+
+    public static func write(_ value: [FfiChunk], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiChunk.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiChunk] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiChunk]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiChunk.read(from: &buf))
         }
         return seq
     }
@@ -11409,6 +11632,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_txids_get_many() != 34257) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_ancestor_set() != 19193) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffitxgraph_cluster_count_limit() != 38841) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11418,7 +11644,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffitxgraph_cluster_weight_limit() != 62485) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_conflict_txid() != 40932) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffitxgraph_contains() != 63969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_contains_wtxid() != 24228) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_creator() != 49949) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_descendant_set() != 1724) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffitxgraph_frontier_feerate_sat_per_kvb() != 16909) {
@@ -11433,16 +11671,31 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffitxgraph_len() != 51963) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_mempool_utxo() != 51960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_mining_chunks_best_first() != 6449) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffitxgraph_select_block_txids() != 22158) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffitxgraph_set_cluster_limits() != 65140) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_template_tx_weight() != 63901) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffitxgraph_total_weight() != 12730) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_txid_for_wtxid() != 44314) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffitxgraph_weight_above_feerate() != 17389) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_worst_chunk() != 41529) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiactivemempool_open_or_create() != 46448) {

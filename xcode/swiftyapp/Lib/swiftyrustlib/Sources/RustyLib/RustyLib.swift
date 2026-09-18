@@ -3429,6 +3429,16 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     
     func blockQueueCount()  -> UInt64
     
+    func blockQueueHasHeight(height: UInt32)  -> Bool
+    
+    func blockQueueHashAtHeight(height: UInt32)  -> String?
+    
+    func blockQueueMaxHeight()  -> UInt64?
+    
+    func blockQueueQueuedHeights()  -> [UInt32]
+    
+    func blockQueueSoftPressure()  -> Bool
+    
     func blockQueueStats()  -> FfiBlockQueueStats
     
     func drainAndFenceHi()  -> UInt64?
@@ -3548,6 +3558,43 @@ open func activeUnknownBits(network: String)throws  -> [Int32] {
 open func blockQueueCount() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffinodehandle_block_queue_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueHasHeight(height: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_block_queue_has_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func blockQueueHashAtHeight(height: UInt32) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_block_queue_hash_at_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func blockQueueMaxHeight() -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_block_queue_max_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueQueuedHeights() -> [UInt32] {
+    return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_block_queue_queued_heights(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func blockQueueSoftPressure() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffinodehandle_block_queue_soft_pressure(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -15300,6 +15347,21 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_count() != 36432) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_has_height() != 7659) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_hash_at_height() != 32758) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_max_height() != 27383) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_queued_heights() != 12602) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_soft_pressure() != 15700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_block_queue_stats() != 12722) {

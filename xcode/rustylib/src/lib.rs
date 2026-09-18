@@ -6230,6 +6230,32 @@ pub fn psbt_is_finalized(hex: String) -> Result<bool, RustyError> {
     Ok(psbt.inputs.iter().all(|i| i.final_script_sig.is_some() || i.final_script_witness.is_some()))
 }
 
+#[uniffi::export]
+pub fn psbt_to_hex(hex: String) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(psbt.serialize()))
+}
+
+#[uniffi::export]
+pub fn psbt_from_tx_hex(tx_hex: String) -> Result<String, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::from_unsigned_tx(tx).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(psbt.serialize()))
+}
+
+#[uniffi::export]
+pub fn psbt_combine(hex_a: String, hex_b: String) -> Result<String, RustyError> {
+    let bytes_a = rbitcoin_primitives::hex_decode(&hex_a).map_err(|_| RustyError::InvalidInput)?;
+    let mut psbt_a = bitcoin::Psbt::deserialize(&bytes_a).map_err(|_| RustyError::InvalidInput)?;
+    let bytes_b = rbitcoin_primitives::hex_decode(&hex_b).map_err(|_| RustyError::InvalidInput)?;
+    let psbt_b = bitcoin::Psbt::deserialize(&bytes_b).map_err(|_| RustyError::InvalidInput)?;
+    psbt_a.combine(psbt_b).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(psbt_a.serialize()))
+}
+
 // --- Chain constants & logs FFI ---
 
 #[uniffi::export]
@@ -8339,7 +8365,19 @@ mod tests {
         assert_eq!(fee, 0);
         assert_eq!(psbt_input_count(psbt_hex.clone()).unwrap(), 0);
         assert_eq!(psbt_output_count(psbt_hex.clone()).unwrap(), 0);
-        assert!(psbt_is_finalized(psbt_hex).unwrap());
+        assert!(psbt_is_finalized(psbt_hex.clone()).unwrap());
+
+        // Test psbt_to_hex roundtrip
+        let hex_out = psbt_to_hex(psbt_hex.clone()).unwrap();
+        assert!(!hex_out.is_empty());
+
+        // Test psbt_from_tx_hex
+        let psbt_hex2 = psbt_from_tx_hex(tx_hex.clone()).unwrap();
+        assert!(!psbt_hex2.is_empty());
+
+        // Test psbt_combine
+        let combined = psbt_combine(psbt_hex.clone(), psbt_hex2.clone()).unwrap();
+        assert!(!combined.is_empty());
     }
 
     #[test]

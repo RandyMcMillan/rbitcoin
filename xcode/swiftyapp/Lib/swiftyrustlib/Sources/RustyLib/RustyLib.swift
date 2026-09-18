@@ -14511,6 +14511,12 @@ public func tipTooFarInFuture(tipTime: UInt32, now: UInt64) -> Bool {
     )
 })
 }
+public func tokioRuntimeTest()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tokio_runtime_test($0
+    )
+})
+}
 public func truncatedMedian(scores: [Int64]) -> Int64 {
     return try!  FfiConverterInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_truncated_median(
@@ -15652,6 +15658,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tip_too_far_in_future() != 50408) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tokio_runtime_test() != 44735) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_truncated_median() != 15398) {

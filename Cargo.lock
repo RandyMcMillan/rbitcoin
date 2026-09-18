@@ -1233,6 +1233,7 @@ dependencies = [
  "rbitcoin-store",
  "serde_json",
  "tempfile",
+ "tokio",
  "uniffi",
 ]
 

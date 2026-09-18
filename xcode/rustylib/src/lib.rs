@@ -7308,6 +7308,16 @@ pub fn max_pct_addr_to_send() -> u32 {
     rbitcoin_net::MAX_PCT_ADDR_TO_SEND as u32
 }
 
+#[uniffi::export]
+pub fn tokio_runtime_test() -> Result<String, RustyError> {
+    let rt = tokio::runtime::Runtime::new().map_err(|_| RustyError::InvalidInput)?;
+    let result = rt.block_on(async {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        "tokio-ok".to_string()
+    });
+    Ok(result)
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -7317,6 +7327,11 @@ mod tests {
     #[test]
     fn test_rust_add() {
         assert_eq!(rust_add(2, 3), 5);
+    }
+
+    #[test]
+    fn test_tokio_runtime() {
+        assert_eq!(tokio_runtime_test().unwrap(), "tokio-ok");
     }
 
     #[test]

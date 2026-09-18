@@ -846,8 +846,8 @@ pub fn tx_output_set_script_pubkey(
     if idx >= tx.output.len() {
         return Err(RustyError::InvalidInput);
     }
-    let script =
-        rbitcoin_primitives::hex_decode(&script_pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&script_pubkey_hex)
+        .map_err(|_| RustyError::InvalidInput)?;
     tx.output[idx].script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
     Ok(bitcoin::consensus::encode::serialize_hex(&tx))
 }
@@ -863,7 +863,7 @@ pub fn tx_input_witness(tx_hex: String, input_index: u32) -> Result<Vec<String>,
     let items: Vec<String> = tx.input[idx]
         .witness
         .iter()
-        .map(|b| rbitcoin_primitives::hex_encode(b))
+        .map(rbitcoin_primitives::hex_encode)
         .collect();
     Ok(items)
 }
@@ -7413,8 +7413,8 @@ pub fn psbt_extract_tx_fee_limited(
         rbitcoin_primitives::hex_decode(&psbt_hex).map_err(|_| RustyError::InvalidInput)?;
     let psbt =
         bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|_| RustyError::InvalidInput)?;
-    let fee_rate = bitcoin::FeeRate::from_sat_per_vb(max_fee_rate_sat_vb)
-        .ok_or(RustyError::InvalidInput)?;
+    let fee_rate =
+        bitcoin::FeeRate::from_sat_per_vb(max_fee_rate_sat_vb).ok_or(RustyError::InvalidInput)?;
     let tx = psbt
         .extract_tx_with_fee_rate_limit(fee_rate)
         .map_err(|_| RustyError::InvalidInput)?;
@@ -8056,6 +8056,7 @@ pub fn p2p_start(
 }
 
 #[uniffi::export]
+#[allow(clippy::too_many_arguments)]
 pub fn p2p_start_with_config(
     datadir: String,
     network: String,
@@ -8397,11 +8398,21 @@ mod tests {
         let tx = tx_set_sequence(tx.clone(), 0, 0x12345678).unwrap();
         assert_eq!(tx_input_count(tx.clone()).unwrap(), 1);
 
-        let tx = tx_add_output(tx.clone(), 50000, "76a914000000000000000000000000000000000000000088ac".to_string()).unwrap();
+        let tx = tx_add_output(
+            tx.clone(),
+            50000,
+            "76a914000000000000000000000000000000000000000088ac".to_string(),
+        )
+        .unwrap();
         assert_eq!(tx_output_count(tx.clone()).unwrap(), 1);
 
         let tx = tx_output_set_value(tx.clone(), 0, 100000).unwrap();
-        let tx = tx_output_set_script_pubkey(tx.clone(), 0, "00140000000000000000000000000000000000000000".to_string()).unwrap();
+        let tx = tx_output_set_script_pubkey(
+            tx.clone(),
+            0,
+            "00140000000000000000000000000000000000000000".to_string(),
+        )
+        .unwrap();
         assert_eq!(tx_output_count(tx.clone()).unwrap(), 1);
     }
 

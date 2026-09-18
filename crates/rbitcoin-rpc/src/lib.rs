@@ -7,7 +7,7 @@ mod blockstats;
 mod methods;
 mod server;
 
-pub use auth::RpcAuth;
+pub use auth::{parse_basic_auth, resolve_rpc_auth, write_cookie_file, RpcAuth};
 pub use blockstats::{
     is_unspendable, percentiles_by_weight, truncated_median, txout_serialized_size,
     PER_UTXO_OVERHEAD,

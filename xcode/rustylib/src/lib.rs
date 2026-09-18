@@ -692,6 +692,88 @@ pub fn tx_set_script_sig(
 }
 
 #[uniffi::export]
+pub fn tx_set_lock_time(tx_hex: String, lock_time: u32) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    tx.lock_time = bitcoin::locktime::absolute::LockTime::from_consensus(lock_time);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_set_version(tx_hex: String, version: i32) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    tx.version = bitcoin::transaction::Version(version);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_set_sequence(
+    tx_hex: String,
+    input_index: u32,
+    sequence: u32,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let idx = input_index as usize;
+    if idx >= tx.input.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    tx.input[idx].sequence = bitcoin::Sequence(sequence);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_output_set_value(
+    tx_hex: String,
+    output_index: u32,
+    value_sat: u64,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let idx = output_index as usize;
+    if idx >= tx.output.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    tx.output[idx].value = bitcoin::Amount::from_sat(value_sat);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_output_set_script_pubkey(
+    tx_hex: String,
+    output_index: u32,
+    script_pubkey_hex: String,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let idx = output_index as usize;
+    if idx >= tx.output.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    let script =
+        rbitcoin_primitives::hex_decode(&script_pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    tx.output[idx].script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_input_witness(tx_hex: String, input_index: u32) -> Result<Vec<String>, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let idx = input_index as usize;
+    if idx >= tx.input.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    let items: Vec<String> = tx.input[idx]
+        .witness
+        .iter()
+        .map(|b| rbitcoin_primitives::hex_encode(b))
+        .collect();
+    Ok(items)
+}
+
+#[uniffi::export]
 pub fn tx_sighash_legacy(
     tx_hex: String,
     input_index: u32,
@@ -1516,6 +1598,24 @@ pub fn block_header_nonce(block_hex: String) -> Result<u32, RustyError> {
     let block: bitcoin::Block =
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     Ok(block.header.nonce)
+}
+
+#[uniffi::export]
+pub fn block_header_prev_blockhash(block_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.header.prev_blockhash.to_string())
+}
+
+#[uniffi::export]
+pub fn block_header_merkle_root(block_hex: String) -> Result<String, RustyError> {
+    let bytes =
+        rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+    let block: bitcoin::Block =
+        bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(block.header.merkle_root.to_string())
 }
 
 #[uniffi::export]
@@ -7209,6 +7309,32 @@ pub fn psbt_combine(hex_a: String, hex_b: String) -> Result<String, RustyError> 
     Ok(rbitcoin_primitives::hex_encode(psbt_a.serialize()))
 }
 
+#[uniffi::export]
+pub fn psbt_extract_tx_fee_limited(
+    psbt_hex: String,
+    max_fee_rate_sat_vb: u64,
+) -> Result<String, RustyError> {
+    let psbt_bytes =
+        rbitcoin_primitives::hex_decode(&psbt_hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt =
+        bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let fee_rate = bitcoin::FeeRate::from_sat_per_vb(max_fee_rate_sat_vb)
+        .ok_or(RustyError::InvalidInput)?;
+    let tx = psbt
+        .extract_tx_with_fee_rate_limit(fee_rate)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn psbt_clone(psbt_hex: String) -> Result<String, RustyError> {
+    let psbt_bytes =
+        rbitcoin_primitives::hex_decode(&psbt_hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt =
+        bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(psbt.serialize()))
+}
+
 // --- Chain constants & logs FFI ---
 
 #[uniffi::export]
@@ -8150,6 +8276,38 @@ mod tests {
         assert_eq!(info.version, 1);
         assert_eq!(info.input_count, 1);
         assert_eq!(info.output_count, 1);
+    }
+
+    #[test]
+    fn test_tx_modification_helpers() {
+        let tx = tx_create_empty(2, 100).unwrap();
+        assert_eq!(tx_version(tx.clone()).unwrap(), 2);
+        assert_eq!(tx_lock_time(tx.clone()).unwrap(), 100);
+
+        let tx = tx_set_version(tx.clone(), 1).unwrap();
+        assert_eq!(tx_version(tx.clone()).unwrap(), 1);
+
+        let tx = tx_set_lock_time(tx.clone(), 500).unwrap();
+        assert_eq!(tx_lock_time(tx.clone()).unwrap(), 500);
+
+        let tx = tx_add_input(
+            tx,
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            0,
+            0xfffffffe,
+        )
+        .unwrap();
+        assert_eq!(tx_input_count(tx.clone()).unwrap(), 1);
+
+        let tx = tx_set_sequence(tx.clone(), 0, 0x12345678).unwrap();
+        assert_eq!(tx_input_count(tx.clone()).unwrap(), 1);
+
+        let tx = tx_add_output(tx.clone(), 50000, "76a914000000000000000000000000000000000000000088ac".to_string()).unwrap();
+        assert_eq!(tx_output_count(tx.clone()).unwrap(), 1);
+
+        let tx = tx_output_set_value(tx.clone(), 0, 100000).unwrap();
+        let tx = tx_output_set_script_pubkey(tx.clone(), 0, "00140000000000000000000000000000000000000000".to_string()).unwrap();
+        assert_eq!(tx_output_count(tx.clone()).unwrap(), 1);
     }
 
     #[test]

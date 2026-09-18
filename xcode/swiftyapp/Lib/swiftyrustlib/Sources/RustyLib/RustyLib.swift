@@ -14347,6 +14347,38 @@ public func sha256Hex(bytes: Data) -> String {
     )
 })
 }
+public func sighashLegacy(txHex: String, inputIndex: UInt32, scriptHex: String, hashType: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_sighash_legacy(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterString.lower(scriptHex),
+        FfiConverterUInt32.lower(hashType),$0
+    )
+})
+}
+public func sighashP2wpkh(txHex: String, inputIndex: UInt32, scriptPubkeyHex: String, valueSat: UInt64, hashType: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_sighash_p2wpkh(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterString.lower(scriptPubkeyHex),
+        FfiConverterUInt64.lower(valueSat),
+        FfiConverterUInt32.lower(hashType),$0
+    )
+})
+}
+public func sighashP2wsh(txHex: String, inputIndex: UInt32, witnessScriptHex: String, valueSat: UInt64, hashType: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_sighash_p2wsh(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterString.lower(witnessScriptHex),
+        FfiConverterUInt64.lower(valueSat),
+        FfiConverterUInt32.lower(hashType),$0
+    )
+})
+}
 public func signMessage(wif: String, message: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_sign_message(
@@ -15495,6 +15527,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_sha256_hex() != 61878) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_sighash_legacy() != 25283) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_sighash_p2wpkh() != 12942) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_sighash_p2wsh() != 38559) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_sign_message() != 42839) {

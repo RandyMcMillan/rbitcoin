@@ -9082,6 +9082,80 @@ public func FfiConverterTypeFfiOutputRecord_lower(_ value: FfiOutputRecord) -> R
 }
 
 
+public struct FfiP2pFrame {
+    public var magicHex: String
+    public var command: String
+    public var payloadHex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(magicHex: String, command: String, payloadHex: String) {
+        self.magicHex = magicHex
+        self.command = command
+        self.payloadHex = payloadHex
+    }
+}
+
+
+
+extension FfiP2pFrame: Equatable, Hashable {
+    public static func ==(lhs: FfiP2pFrame, rhs: FfiP2pFrame) -> Bool {
+        if lhs.magicHex != rhs.magicHex {
+            return false
+        }
+        if lhs.command != rhs.command {
+            return false
+        }
+        if lhs.payloadHex != rhs.payloadHex {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(magicHex)
+        hasher.combine(command)
+        hasher.combine(payloadHex)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiP2pFrame: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiP2pFrame {
+        return
+            try FfiP2pFrame(
+                magicHex: FfiConverterString.read(from: &buf), 
+                command: FfiConverterString.read(from: &buf), 
+                payloadHex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiP2pFrame, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.magicHex, into: &buf)
+        FfiConverterString.write(value.command, into: &buf)
+        FfiConverterString.write(value.payloadHex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiP2pFrame_lift(_ buf: RustBuffer) throws -> FfiP2pFrame {
+    return try FfiConverterTypeFfiP2pFrame.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiP2pFrame_lower(_ value: FfiP2pFrame) -> RustBuffer {
+    return FfiConverterTypeFfiP2pFrame.lower(value)
+}
+
+
 public struct FfiPeerEntry {
     public var addr: String
     public var flags: UInt8
@@ -13584,6 +13658,13 @@ public func obsoleteVersionLog(version: Int32, peer: UInt64) -> String {
     )
 })
 }
+public func p2pDecodeFrame(frameHex: String)throws  -> FfiP2pFrame {
+    return try  FfiConverterTypeFfiP2pFrame.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_decode_frame(
+        FfiConverterString.lower(frameHex),$0
+    )
+})
+}
 public func p2pDefaultPort(network: String)throws  -> UInt16 {
     return try  FfiConverterUInt16.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_p2p_default_port(
@@ -13598,10 +13679,26 @@ public func p2pDnsSeeds(network: String)throws  -> [String] {
     )
 })
 }
+public func p2pEncodeFrame(magicHex: String, command: String, payloadHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_encode_frame(
+        FfiConverterString.lower(magicHex),
+        FfiConverterString.lower(command),
+        FfiConverterString.lower(payloadHex),$0
+    )
+})
+}
 public func p2pFixedSeedHosts(network: String)throws  -> [String] {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_p2p_fixed_seed_hosts(
         FfiConverterString.lower(network),$0
+    )
+})
+}
+public func p2pMessageChecksum(payloadHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_p2p_message_checksum(
+        FfiConverterString.lower(payloadHex),$0
     )
 })
 }
@@ -15002,13 +15099,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_obsolete_version_log() != 64802) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_p2p_decode_frame() != 41838) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_p2p_default_port() != 6265) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_dns_seeds() != 22311) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_p2p_encode_frame() != 4511) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_p2p_fixed_seed_hosts() != 2698) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_p2p_message_checksum() != 60360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_p2p_target_peers() != 34559) {

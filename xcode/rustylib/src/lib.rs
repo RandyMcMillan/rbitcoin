@@ -557,6 +557,62 @@ pub fn pick_seed_results(x_ips: Vec<String>, plain_ips: Vec<String>) -> Vec<Stri
         .collect()
 }
 
+#[derive(uniffi::Record)]
+pub struct FfiP2pFrame {
+    pub magic_hex: String,
+    pub command: String,
+    pub payload_hex: String,
+}
+
+#[uniffi::export]
+pub fn p2p_message_checksum(payload_hex: String) -> Result<String, RustyError> {
+    let payload = rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
+    let hash = sha256d::Hash::hash(&payload);
+    Ok(rbitcoin_primitives::hex_encode(&hash[..4]))
+}
+
+#[uniffi::export]
+pub fn p2p_encode_frame(magic_hex: String, command: String, payload_hex: String) -> Result<String, RustyError> {
+    let magic = rbitcoin_primitives::hex_decode(&magic_hex).map_err(|_| RustyError::InvalidInput)?;
+    if magic.len() != 4 {
+        return Err(RustyError::InvalidInput);
+    }
+    let payload = rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
+    let len = payload.len() as u32;
+    let hash = sha256d::Hash::hash(&payload);
+    let checksum = &hash[..4];
+
+    let mut cmd = [0u8; 12];
+    let cmd_bytes = command.as_bytes();
+    let n = cmd_bytes.len().min(12);
+    cmd[..n].copy_from_slice(&cmd_bytes[..n]);
+
+    let mut out = Vec::with_capacity(24 + payload.len());
+    out.extend_from_slice(&magic);
+    out.extend_from_slice(&cmd);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(checksum);
+    out.extend_from_slice(&payload);
+    Ok(rbitcoin_primitives::hex_encode(&out))
+}
+
+#[uniffi::export]
+pub fn p2p_decode_frame(frame_hex: String) -> Result<FfiP2pFrame, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&frame_hex).map_err(|_| RustyError::InvalidInput)?;
+    if bytes.len() < 24 {
+        return Err(RustyError::InvalidInput);
+    }
+    let magic_hex = rbitcoin_primitives::hex_encode(&bytes[0..4]);
+    let cmd_raw = &bytes[4..16];
+    let command = String::from_utf8_lossy(cmd_raw).trim_end_matches('\0').to_string();
+    let len = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+    if bytes.len() < 24 + len {
+        return Err(RustyError::InvalidInput);
+    }
+    let payload_hex = rbitcoin_primitives::hex_encode(&bytes[24..24 + len]);
+    Ok(FfiP2pFrame { magic_hex, command, payload_hex })
+}
+
 // --- PeerFlags FFI ---
 
 #[derive(uniffi::Object)]
@@ -8493,6 +8549,21 @@ mod tests {
         assert_eq!(peer_oversize_ban_score(), 100);
         assert_eq!(peer_max_addr_to_send(), 1000);
         assert_eq!(peer_max_pct_addr_to_send(), 23);
+    }
+
+    #[test]
+    fn test_p2p_frame_encode_decode() {
+        let magic_hex = "0b110907"; // mainnet magic
+        let command = "ping";
+        let payload_hex = "0102030405060708";
+        let checksum = p2p_message_checksum(payload_hex.to_string()).unwrap();
+        assert_eq!(checksum.len(), 8); // 4 bytes = 8 hex chars
+
+        let frame_hex = p2p_encode_frame(magic_hex.to_string(), command.to_string(), payload_hex.to_string()).unwrap();
+        let frame = p2p_decode_frame(frame_hex).unwrap();
+        assert_eq!(frame.magic_hex, magic_hex);
+        assert_eq!(frame.command, command);
+        assert_eq!(frame.payload_hex, payload_hex);
     }
 
     #[test]

@@ -77,6 +77,30 @@ pub fn hex_decode(hex: String) -> Result<Vec<u8>, RustyError> {
 }
 
 #[uniffi::export]
+pub fn base58_encode(data_hex: String) -> Result<String, RustyError> {
+    let data = rbitcoin_primitives::hex_decode(&data_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::base58::encode(&data))
+}
+
+#[uniffi::export]
+pub fn base58_encode_check(data_hex: String) -> Result<String, RustyError> {
+    let data = rbitcoin_primitives::hex_decode(&data_hex).map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::base58::encode_check(&data))
+}
+
+#[uniffi::export]
+pub fn base58_decode(base58_str: String) -> Result<String, RustyError> {
+    let data = bitcoin::base58::decode(&base58_str).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(&data))
+}
+
+#[uniffi::export]
+pub fn base58_decode_check(base58_str: String) -> Result<String, RustyError> {
+    let data = bitcoin::base58::decode_check(&base58_str).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(&data))
+}
+
+#[uniffi::export]
 pub fn script_sigops(script_hex: String, accurate: bool) -> Result<u64, RustyError> {
     let script =
         rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
@@ -10600,6 +10624,33 @@ mod tests {
         // Wait for thread to finish
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!p2p_is_running());
+    }
+
+    #[test]
+    fn test_base58_roundtrip() {
+        let data = "00010966776006953d5567439e5e39f86a0d273beed61967f6".to_string();
+        let encoded = base58_encode(data.clone()).unwrap();
+        assert!(!encoded.is_empty());
+        let decoded = base58_decode(encoded).unwrap();
+        assert_eq!(decoded.to_ascii_lowercase(), data.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn test_base58_check_roundtrip() {
+        let data = "00010966776006953d5567439e5e39f86a0d273beed61967f6".to_string();
+        let encoded = base58_encode_check(data.clone()).unwrap();
+        assert!(!encoded.is_empty());
+        let decoded = base58_decode_check(encoded).unwrap();
+        assert_eq!(decoded.to_ascii_lowercase(), data.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn test_tx_set_witness_and_script_sig() {
+        let tx = tx_create_empty(2, 0).unwrap();
+        let tx = tx_add_input(tx, "0000000000000000000000000000000000000000000000000000000000000001".to_string(), 0, 0xffffffff).unwrap();
+        let tx = tx_set_script_sig(tx.clone(), 0, "76a914000000000000000000000000000000000000000088ac".to_string()).unwrap();
+        let tx = tx_set_witness(tx, 0, vec!["deadbeef".to_string(), "cafebabe".to_string()]).unwrap();
+        assert!(tx.contains("deadbeef"));
     }
 
 }

@@ -168,6 +168,36 @@ pub fn address_network(address: String) -> Result<String, RustyError> {
 }
 
 #[uniffi::export]
+pub fn address_from_script_pubkey(script_hex: String, network: String) -> Result<String, RustyError> {
+    let script =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let network = match network.as_str() {
+        "mainnet" => Network::Bitcoin,
+        "testnet" => Network::Testnet,
+        "signet" => Network::Signet,
+        "regtest" => Network::Regtest,
+        _ => return Err(RustyError::InvalidInput),
+    };
+    let addr = Address::from_script(bitcoin::Script::from_bytes(&script), network)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(addr.to_string())
+}
+
+#[uniffi::export]
+pub fn script_pubkey_from_address(address: String, network: String) -> Result<String, RustyError> {
+    let network = match network.as_str() {
+        "mainnet" => Network::Bitcoin,
+        "testnet" => Network::Testnet,
+        "signet" => Network::Signet,
+        "regtest" => Network::Regtest,
+        _ => return Err(RustyError::InvalidInput),
+    };
+    let unchecked = Address::from_str(&address).map_err(|_| RustyError::InvalidInput)?;
+    let addr = unchecked.require_network(network).map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(addr.script_pubkey().as_bytes()))
+}
+
+#[uniffi::export]
 pub fn hash256(bytes: Vec<u8>) -> String {
     let hash = sha256d::Hash::hash(&bytes);
     hash.to_string()
@@ -6884,6 +6914,19 @@ mod tests {
             address_network("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string()).unwrap(),
             "mainnet"
         );
+    }
+
+    #[test]
+    fn test_address_script_pubkey_roundtrip() {
+        let p2wpkh_hex = "00140000000000000000000000000000000000000000";
+        let addr = address_from_script_pubkey(p2wpkh_hex.to_string(), "mainnet".to_string()).unwrap();
+        assert!(addr.starts_with("bc1q"));
+        let back = script_pubkey_from_address(addr, "mainnet".to_string()).unwrap();
+        assert_eq!(back.to_lowercase(), p2wpkh_hex);
+
+        let p2tr_hex = "51200000000000000000000000000000000000000000000000000000000000000000";
+        let addr2 = address_from_script_pubkey(p2tr_hex.to_string(), "mainnet".to_string()).unwrap();
+        assert!(addr2.starts_with("bc1p"));
     }
 
     #[test]

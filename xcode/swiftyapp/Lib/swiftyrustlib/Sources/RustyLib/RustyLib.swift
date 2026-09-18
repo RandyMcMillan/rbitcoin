@@ -6316,6 +6316,184 @@ public func FfiConverterTypeFfiChunk_lower(_ value: FfiChunk) -> RustBuffer {
 }
 
 
+public struct FfiCmpctReconstructStats {
+    public var hash: String
+    public var ntx: UInt64
+    public var getdata: Bool
+    public var missingN: UInt64
+    public var prefillN: UInt64
+    public var prefillBytes: UInt64
+    public var mempoolN: UInt64
+    public var mempoolBytes: UInt64
+    public var extraN: UInt64
+    public var extraBytes: UInt64
+    public var orphanN: UInt64
+    public var orphanBytes: UInt64
+    public var redundantPrefillN: UInt64
+    public var redundantPrefillBytes: UInt64
+    public var fetchedN: UInt64
+    public var fetchedBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hash: String, ntx: UInt64, getdata: Bool, missingN: UInt64, prefillN: UInt64, prefillBytes: UInt64, mempoolN: UInt64, mempoolBytes: UInt64, extraN: UInt64, extraBytes: UInt64, orphanN: UInt64, orphanBytes: UInt64, redundantPrefillN: UInt64, redundantPrefillBytes: UInt64, fetchedN: UInt64, fetchedBytes: UInt64) {
+        self.hash = hash
+        self.ntx = ntx
+        self.getdata = getdata
+        self.missingN = missingN
+        self.prefillN = prefillN
+        self.prefillBytes = prefillBytes
+        self.mempoolN = mempoolN
+        self.mempoolBytes = mempoolBytes
+        self.extraN = extraN
+        self.extraBytes = extraBytes
+        self.orphanN = orphanN
+        self.orphanBytes = orphanBytes
+        self.redundantPrefillN = redundantPrefillN
+        self.redundantPrefillBytes = redundantPrefillBytes
+        self.fetchedN = fetchedN
+        self.fetchedBytes = fetchedBytes
+    }
+}
+
+
+
+extension FfiCmpctReconstructStats: Equatable, Hashable {
+    public static func ==(lhs: FfiCmpctReconstructStats, rhs: FfiCmpctReconstructStats) -> Bool {
+        if lhs.hash != rhs.hash {
+            return false
+        }
+        if lhs.ntx != rhs.ntx {
+            return false
+        }
+        if lhs.getdata != rhs.getdata {
+            return false
+        }
+        if lhs.missingN != rhs.missingN {
+            return false
+        }
+        if lhs.prefillN != rhs.prefillN {
+            return false
+        }
+        if lhs.prefillBytes != rhs.prefillBytes {
+            return false
+        }
+        if lhs.mempoolN != rhs.mempoolN {
+            return false
+        }
+        if lhs.mempoolBytes != rhs.mempoolBytes {
+            return false
+        }
+        if lhs.extraN != rhs.extraN {
+            return false
+        }
+        if lhs.extraBytes != rhs.extraBytes {
+            return false
+        }
+        if lhs.orphanN != rhs.orphanN {
+            return false
+        }
+        if lhs.orphanBytes != rhs.orphanBytes {
+            return false
+        }
+        if lhs.redundantPrefillN != rhs.redundantPrefillN {
+            return false
+        }
+        if lhs.redundantPrefillBytes != rhs.redundantPrefillBytes {
+            return false
+        }
+        if lhs.fetchedN != rhs.fetchedN {
+            return false
+        }
+        if lhs.fetchedBytes != rhs.fetchedBytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hash)
+        hasher.combine(ntx)
+        hasher.combine(getdata)
+        hasher.combine(missingN)
+        hasher.combine(prefillN)
+        hasher.combine(prefillBytes)
+        hasher.combine(mempoolN)
+        hasher.combine(mempoolBytes)
+        hasher.combine(extraN)
+        hasher.combine(extraBytes)
+        hasher.combine(orphanN)
+        hasher.combine(orphanBytes)
+        hasher.combine(redundantPrefillN)
+        hasher.combine(redundantPrefillBytes)
+        hasher.combine(fetchedN)
+        hasher.combine(fetchedBytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCmpctReconstructStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCmpctReconstructStats {
+        return
+            try FfiCmpctReconstructStats(
+                hash: FfiConverterString.read(from: &buf), 
+                ntx: FfiConverterUInt64.read(from: &buf), 
+                getdata: FfiConverterBool.read(from: &buf), 
+                missingN: FfiConverterUInt64.read(from: &buf), 
+                prefillN: FfiConverterUInt64.read(from: &buf), 
+                prefillBytes: FfiConverterUInt64.read(from: &buf), 
+                mempoolN: FfiConverterUInt64.read(from: &buf), 
+                mempoolBytes: FfiConverterUInt64.read(from: &buf), 
+                extraN: FfiConverterUInt64.read(from: &buf), 
+                extraBytes: FfiConverterUInt64.read(from: &buf), 
+                orphanN: FfiConverterUInt64.read(from: &buf), 
+                orphanBytes: FfiConverterUInt64.read(from: &buf), 
+                redundantPrefillN: FfiConverterUInt64.read(from: &buf), 
+                redundantPrefillBytes: FfiConverterUInt64.read(from: &buf), 
+                fetchedN: FfiConverterUInt64.read(from: &buf), 
+                fetchedBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCmpctReconstructStats, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterUInt64.write(value.ntx, into: &buf)
+        FfiConverterBool.write(value.getdata, into: &buf)
+        FfiConverterUInt64.write(value.missingN, into: &buf)
+        FfiConverterUInt64.write(value.prefillN, into: &buf)
+        FfiConverterUInt64.write(value.prefillBytes, into: &buf)
+        FfiConverterUInt64.write(value.mempoolN, into: &buf)
+        FfiConverterUInt64.write(value.mempoolBytes, into: &buf)
+        FfiConverterUInt64.write(value.extraN, into: &buf)
+        FfiConverterUInt64.write(value.extraBytes, into: &buf)
+        FfiConverterUInt64.write(value.orphanN, into: &buf)
+        FfiConverterUInt64.write(value.orphanBytes, into: &buf)
+        FfiConverterUInt64.write(value.redundantPrefillN, into: &buf)
+        FfiConverterUInt64.write(value.redundantPrefillBytes, into: &buf)
+        FfiConverterUInt64.write(value.fetchedN, into: &buf)
+        FfiConverterUInt64.write(value.fetchedBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCmpctReconstructStats_lift(_ buf: RustBuffer) throws -> FfiCmpctReconstructStats {
+    return try FfiConverterTypeFfiCmpctReconstructStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCmpctReconstructStats_lower(_ value: FfiCmpctReconstructStats) -> RustBuffer {
+    return FfiConverterTypeFfiCmpctReconstructStats.lower(value)
+}
+
+
 public struct FfiCoinbaseAtHeight {
     public var height: UInt32
     public var coinbaseFk: UInt64
@@ -9977,6 +10155,93 @@ extension FfiAcceptOutcome: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FfiCmpctPeerFrame {
+    
+    case getBlockTxn(indexes: [UInt64]
+    )
+    case ping(nonce: UInt64
+    )
+    case pong(nonce: UInt64
+    )
+    case other
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCmpctPeerFrame: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCmpctPeerFrame
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCmpctPeerFrame {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .getBlockTxn(indexes: try FfiConverterSequenceUInt64.read(from: &buf)
+        )
+        
+        case 2: return .ping(nonce: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 3: return .pong(nonce: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 4: return .other
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCmpctPeerFrame, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .getBlockTxn(indexes):
+            writeInt(&buf, Int32(1))
+            FfiConverterSequenceUInt64.write(indexes, into: &buf)
+            
+        
+        case let .ping(nonce):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(nonce, into: &buf)
+            
+        
+        case let .pong(nonce):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt64.write(nonce, into: &buf)
+            
+        
+        case .other:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCmpctPeerFrame_lift(_ buf: RustBuffer) throws -> FfiCmpctPeerFrame {
+    return try FfiConverterTypeFfiCmpctPeerFrame.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCmpctPeerFrame_lower(_ value: FfiCmpctPeerFrame) -> RustBuffer {
+    return FfiConverterTypeFfiCmpctPeerFrame.lower(value)
+}
+
+
+
+extension FfiCmpctPeerFrame: Equatable, Hashable {}
+
+
+
 
 public enum RustyError {
 
@@ -11486,6 +11751,22 @@ public func checkPackageShape(txsHex: [String])throws  {try rustCallWithError(Ff
     )
 }
 }
+public func classifyV2CmpctPeer(contentsHex: String)throws  -> FfiCmpctPeerFrame {
+    return try  FfiConverterTypeFfiCmpctPeerFrame.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_classify_v2_cmpct_peer(
+        FfiConverterString.lower(contentsHex),$0
+    )
+})
+}
+public func cmpctSendLine(hashHex: String, ntx: UInt32, hsiHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_cmpct_send_line(
+        FfiConverterString.lower(hashHex),
+        FfiConverterUInt32.lower(ntx),
+        FfiConverterString.lower(hsiHex),$0
+    )
+})
+}
 public func commitClassABlock(queryPath: String, network: String, height: UInt32, blockHex: String, milestoneHeight: UInt32)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_commit_class_a_block(
         FfiConverterString.lower(queryPath),
@@ -12084,6 +12365,14 @@ public func mineRegtestPaying(prevHashHex: String, time: UInt32, height: UInt32,
     )
 })
 }
+public func missingRequest(blockHashHex: String, missing: [UInt64])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_missing_request(
+        FfiConverterString.lower(blockHashHex),
+        FfiConverterSequenceUInt64.lower(missing),$0
+    )
+})
+}
 public func netDefaultBlocksInTransitPerPeer() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_rustylib_fn_func_net_default_blocks_in_transit_per_peer($0
@@ -12322,6 +12611,13 @@ public func pingPriorToVerackLog(peer: UInt64) -> String {
     )
 })
 }
+public func prefilledIndexesOk(hsiHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_prefilled_indexes_ok(
+        FfiConverterString.lower(hsiHex),$0
+    )
+})
+}
 public func prepareRegtestCandidate(blockHex: String, prevHashHex: String, time: UInt32)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_prepare_regtest_candidate(
@@ -12427,6 +12723,14 @@ public func receivedGetdataWtxLog(wtxid: String, peer: UInt64) -> String {
 public func receivedTxLog() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_received_tx_log($0
+    )
+})
+}
+public func reconstructGetdataStats(hashHex: String, missingN: UInt64)throws  -> FfiCmpctReconstructStats {
+    return try  FfiConverterTypeFfiCmpctReconstructStats.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_reconstruct_getdata_stats(
+        FfiConverterString.lower(hashHex),
+        FfiConverterUInt64.lower(missingN),$0
     )
 })
 }
@@ -13002,6 +13306,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_check_package_shape() != 53547) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_classify_v2_cmpct_peer() != 54069) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_cmpct_send_line() != 24878) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_commit_class_a_block() != 27043) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13257,6 +13567,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_mine_regtest_paying() != 11833) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_missing_request() != 59662) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_net_default_blocks_in_transit_per_peer() != 34807) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13359,6 +13672,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_ping_prior_to_verack_log() != 45819) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_prefilled_indexes_ok() != 61775) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_prepare_regtest_candidate() != 8782) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13399,6 +13715,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_received_tx_log() != 9820) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_reconstruct_getdata_stats() != 42841) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_regtest_block_spacing() != 41024) {

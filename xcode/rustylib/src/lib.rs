@@ -2324,6 +2324,16 @@ impl FfiQuery {
             .map_err(|_| RustyError::StoreError)
     }
 
+    pub fn unspent_create_vouts_batch(&self, items: Vec<FfiUnspentCreateVoutItem>) -> Result<Vec<Vec<u32>>, RustyError> {
+        let items_inner: Vec<(rbitcoin_primitives::Fk, Vec<u32>)> = items
+            .into_iter()
+            .map(|i| (rbitcoin_primitives::Fk(i.create_fk), i.vouts))
+            .collect();
+        self.inner
+            .unspent_create_vouts_batch(&items_inner)
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn note_head_drain_fk(&self, max_fk: u64) {
         self.inner.note_head_drain_fk(max_fk);
     }
@@ -2744,6 +2754,12 @@ pub struct FfiResumeWorkEntry {
 }
 
 #[derive(uniffi::Record)]
+pub struct FfiUnspentCreateVoutItem {
+    pub create_fk: u64,
+    pub vouts: Vec<u32>,
+}
+
+#[derive(uniffi::Record)]
 pub struct FfiQueuedBlockMeta {
     pub id: u64,
     pub height: u32,
@@ -2778,6 +2794,11 @@ pub struct FfiTakenRaw {
     pub hash: String,
     pub header_fk: u64,
     pub payload: Vec<u8>,
+}
+
+#[uniffi::export]
+pub fn lookup_taken_covers(height: u32, taken_hi: Option<u32>) -> bool {
+    rbitcoin_query::Query::lookup_taken_covers(height, taken_hi)
 }
 
 #[derive(uniffi::Record)]
@@ -6498,5 +6519,22 @@ mod tests {
         let result = am.reorg_disconnect_reaccept(query, vec![]);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_query_unspent_create_vouts_batch_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query = FfiQuery::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let result = query.unspent_create_vouts_batch(vec![]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_lookup_taken_covers() {
+        assert!(!lookup_taken_covers(0, None));
+        assert!(lookup_taken_covers(0, Some(0)));
+        assert!(lookup_taken_covers(5, Some(10)));
+        assert!(!lookup_taken_covers(15, Some(10)));
     }
 }

@@ -1807,6 +1807,8 @@ public protocol FfiQueryProtocol : AnyObject {
     
     func unspentCreateVouts(createFk: UInt64, vouts: [UInt32]) throws  -> [UInt32]
     
+    func unspentCreateVoutsBatch(items: [FfiUnspentCreateVoutItem]) throws  -> [[UInt32]]
+    
     func validateHeader(network: String, height: UInt32, headerHex: String) throws 
     
     func warningStrings(network: String) throws  -> [String]
@@ -2769,6 +2771,14 @@ open func unspentCreateVouts(createFk: UInt64, vouts: [UInt32])throws  -> [UInt3
     uniffi_rustylib_fn_method_ffiquery_unspent_create_vouts(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(createFk),
         FfiConverterSequenceUInt32.lower(vouts),$0
+    )
+})
+}
+    
+open func unspentCreateVoutsBatch(items: [FfiUnspentCreateVoutItem])throws  -> [[UInt32]] {
+    return try  FfiConverterSequenceSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiquery_unspent_create_vouts_batch(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeFfiUnspentCreateVoutItem.lower(items),$0
     )
 })
 }
@@ -6451,6 +6461,72 @@ public func FfiConverterTypeFfiTxTweak_lower(_ value: FfiTxTweak) -> RustBuffer 
 }
 
 
+public struct FfiUnspentCreateVoutItem {
+    public var createFk: UInt64
+    public var vouts: [UInt32]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(createFk: UInt64, vouts: [UInt32]) {
+        self.createFk = createFk
+        self.vouts = vouts
+    }
+}
+
+
+
+extension FfiUnspentCreateVoutItem: Equatable, Hashable {
+    public static func ==(lhs: FfiUnspentCreateVoutItem, rhs: FfiUnspentCreateVoutItem) -> Bool {
+        if lhs.createFk != rhs.createFk {
+            return false
+        }
+        if lhs.vouts != rhs.vouts {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(createFk)
+        hasher.combine(vouts)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiUnspentCreateVoutItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiUnspentCreateVoutItem {
+        return
+            try FfiUnspentCreateVoutItem(
+                createFk: FfiConverterUInt64.read(from: &buf), 
+                vouts: FfiConverterSequenceUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiUnspentCreateVoutItem, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.createFk, into: &buf)
+        FfiConverterSequenceUInt32.write(value.vouts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiUnspentCreateVoutItem_lift(_ buf: RustBuffer) throws -> FfiUnspentCreateVoutItem {
+    return try FfiConverterTypeFfiUnspentCreateVoutItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiUnspentCreateVoutItem_lower(_ value: FfiUnspentCreateVoutItem) -> RustBuffer {
+    return FfiConverterTypeFfiUnspentCreateVoutItem.lower(value)
+}
+
+
 public struct FfiWarnPeriod {
     public var start: UInt32
     public var end: UInt32
@@ -7399,6 +7475,31 @@ fileprivate struct FfiConverterSequenceTypeFfiTxFull: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiUnspentCreateVoutItem: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiUnspentCreateVoutItem]
+
+    public static func write(_ value: [FfiUnspentCreateVoutItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiUnspentCreateVoutItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiUnspentCreateVoutItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiUnspentCreateVoutItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiUnspentCreateVoutItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceOptionUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32?]
 
@@ -7491,6 +7592,31 @@ fileprivate struct FfiConverterSequenceOptionTypeFfiTxRange: FfiConverterRustBuf
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterOptionTypeFfiTxRange.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [[UInt32]]
+
+    public static func write(_ value: [[UInt32]], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterSequenceUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [[UInt32]] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [[UInt32]]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterSequenceUInt32.read(from: &buf))
         }
         return seq
     }
@@ -8102,6 +8228,14 @@ public func logMessage(level: String, message: String) {try! rustCall() {
         FfiConverterString.lower(message),$0
     )
 }
+}
+public func lookupTakenCovers(height: UInt32, takenHi: UInt32?) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_lookup_taken_covers(
+        FfiConverterUInt32.lower(height),
+        FfiConverterOptionUInt32.lower(takenHi),$0
+    )
+})
 }
 public func maxAddrMan() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -9319,6 +9453,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_log_message() != 58414) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_lookup_taken_covers() != 24131) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_max_addr_man() != 57290) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10250,6 +10387,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_unspent_create_vouts() != 53168) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiquery_unspent_create_vouts_batch() != 2720) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiquery_validate_header() != 45565) {

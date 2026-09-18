@@ -14054,6 +14054,69 @@ public func scriptHashHex(scriptHex: String) -> String {
     )
 })
 }
+public func scriptIsOpReturn(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_op_return(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsP2pkh(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_p2pkh(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsP2sh(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_p2sh(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsP2tr(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_p2tr(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsP2wpkh(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_p2wpkh(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsP2wsh(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_p2wsh(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsPushOnly(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_push_only(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptIsWitnessProgram(scriptHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_is_witness_program(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
+public func scriptLen(scriptHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_script_len(
+        FfiConverterString.lower(scriptHex),$0
+    )
+})
+}
 public func scriptSigops(scriptHex: String, accurate: Bool)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_script_sigops(
@@ -15116,6 +15179,33 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_script_hash_hex() != 57390) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_op_return() != 30207) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_p2pkh() != 20019) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_p2sh() != 12554) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_p2tr() != 6756) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_p2wpkh() != 2131) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_p2wsh() != 49762) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_push_only() != 55153) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_is_witness_program() != 57800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_script_len() != 23903) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_script_sigops() != 10909) {

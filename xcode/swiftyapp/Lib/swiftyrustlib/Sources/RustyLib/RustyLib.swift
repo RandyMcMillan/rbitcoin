@@ -3465,6 +3465,8 @@ public protocol FfiNodeHandleProtocol : AnyObject {
     
     func isOutpointSpent(txidHex: String, vout: UInt32) throws  -> Bool
     
+    func isOutpointSpentAt(txidHex: String, vout: UInt32, atHeight: UInt32) throws  -> Bool
+    
     func lookupStartedHi()  -> UInt32?
     
     func lookupTakenHi()  -> UInt32?
@@ -3705,6 +3707,16 @@ open func isOutpointSpent(txidHex: String, vout: UInt32)throws  -> Bool {
     uniffi_rustylib_fn_method_ffinodehandle_is_outpoint_spent(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),
         FfiConverterUInt32.lower(vout),$0
+    )
+})
+}
+    
+open func isOutpointSpentAt(txidHex: String, vout: UInt32, atHeight: UInt32)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffinodehandle_is_outpoint_spent_at(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),
+        FfiConverterUInt32.lower(vout),
+        FfiConverterUInt32.lower(atHeight),$0
     )
 })
 }
@@ -16328,6 +16340,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_is_outpoint_spent() != 36164) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffinodehandle_is_outpoint_spent_at() != 22295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodehandle_lookup_started_hi() != 40995) {

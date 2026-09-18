@@ -6967,6 +6967,20 @@ impl FfiNodeHandle {
             .map_err(|_| RustyError::StoreError)
     }
 
+    pub fn is_outpoint_spent_at(
+        &self,
+        txid_hex: String,
+        vout: u32,
+        at_height: u32,
+    ) -> Result<bool, RustyError> {
+        let txid = parse_hash32(&txid_hex)?;
+        let inner = self.inner.lock().unwrap();
+        inner
+            .query
+            .is_outpoint_spent_at(&txid, vout, Some(at_height))
+            .map_err(|_| RustyError::StoreError)
+    }
+
     pub fn block_queue_count(&self) -> u64 {
         self.inner.lock().unwrap().query.block_queue_count() as u64
     }

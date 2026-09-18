@@ -4683,6 +4683,283 @@ impl FfiChainHub {
     }
 }
 
+// --- MempoolHub FFI ---
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMempoolPerfSample {
+    pub accepts: u64,
+    pub rejects: u64,
+    pub accept_us: u64,
+    pub accept_max_us: u64,
+    pub accept_lock_us: u64,
+    pub accept_utxo_us: u64,
+    pub accept_script_us: u64,
+    pub accept_durable_us: u64,
+    pub inv_tx: u64,
+    pub getdata_tx: u64,
+    pub announce: u64,
+    pub delta_prevouts: u64,
+    pub spent_body_loads: u64,
+    pub list_live: u64,
+    pub list_live_meta: u64,
+    pub list_live_wtxids: u64,
+    pub age_scan: u64,
+    pub expire_full_scans: u64,
+    pub tip_mtp: u64,
+    pub get_coin: u64,
+    pub get_coin_block_tx_fks: u64,
+    pub get_coin_create_mtp: u64,
+}
+
+impl From<rbitcoin_net::MempoolPerfSample> for FfiMempoolPerfSample {
+    fn from(s: rbitcoin_net::MempoolPerfSample) -> Self {
+        Self {
+            accepts: s.accepts,
+            rejects: s.rejects,
+            accept_us: s.accept_us,
+            accept_max_us: s.accept_max_us,
+            accept_lock_us: s.accept_lock_us,
+            accept_utxo_us: s.accept_utxo_us,
+            accept_script_us: s.accept_script_us,
+            accept_durable_us: s.accept_durable_us,
+            inv_tx: s.inv_tx,
+            getdata_tx: s.getdata_tx,
+            announce: s.announce,
+            delta_prevouts: s.delta_prevouts,
+            spent_body_loads: s.spent_body_loads,
+            list_live: s.list_live,
+            list_live_meta: s.list_live_meta,
+            list_live_wtxids: s.list_live_wtxids,
+            age_scan: s.age_scan,
+            expire_full_scans: s.expire_full_scans,
+            tip_mtp: s.tip_mtp,
+            get_coin: s.get_coin,
+            get_coin_block_tx_fks: s.get_coin_block_tx_fks,
+            get_coin_create_mtp: s.get_coin_create_mtp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRecentAccept {
+    pub txid: String,
+    pub fee_sat: u64,
+    pub weight: u64,
+    pub value_sat: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcceptResult {
+    pub txid: String,
+    pub fee_sat: u64,
+    pub weight: u64,
+    pub slot: u32,
+    pub replaced: Vec<String>,
+    pub replaced_scripthashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiLiveWtxid {
+    pub txid: String,
+    pub wtxid: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompactResult {
+    pub n_txs: u32,
+    pub bytes: u64,
+}
+
+#[derive(uniffi::Object)]
+pub struct FfiMempoolHub {
+    inner: Arc<rbitcoin_net::MempoolHub>,
+}
+
+#[uniffi::export]
+impl FfiMempoolHub {
+    #[uniffi::constructor]
+    pub fn open(
+        query_path: String,
+        dir: String,
+        weight_limit: u64,
+        persist: bool,
+    ) -> Result<Arc<Self>, RustyError> {
+        let query =
+            rbitcoin_query::Query::open_or_create(&query_path).map_err(|_| RustyError::StoreError)?;
+        let hub = rbitcoin_net::MempoolHub::open_with_weight_persist(
+            &dir,
+            Arc::new(query),
+            weight_limit,
+            persist,
+        )
+        .map_err(|_| RustyError::MempoolError)?;
+        Ok(Arc::new(Self { inner: hub }))
+    }
+
+    pub fn live_count(&self) -> u64 {
+        self.inner.live_count() as u64
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+
+    pub fn orphan_count(&self) -> u64 {
+        self.inner.orphan_count() as u64
+    }
+
+    pub fn max_weight(&self) -> u64 {
+        self.inner.max_weight()
+    }
+
+    pub fn template_updates(&self) -> u64 {
+        self.inner.template_updates()
+    }
+
+    pub fn relay_enabled(&self) -> bool {
+        self.inner.relay_enabled()
+    }
+
+    pub fn immediate_relay(&self) -> bool {
+        self.inner.immediate_relay()
+    }
+
+    pub fn expiry_hours(&self) -> u64 {
+        self.inner.expiry_hours()
+    }
+
+    pub fn set_relay_enabled(&self, on: bool) {
+        self.inner.set_relay_enabled(on);
+    }
+
+    pub fn set_immediate_relay(&self, on: bool) {
+        self.inner.set_immediate_relay(on);
+    }
+
+    pub fn set_expiry_hours(&self, hours: u64) {
+        self.inner.set_expiry_hours(hours);
+    }
+
+    pub fn sample_reset_perf(&self) -> FfiMempoolPerfSample {
+        self.inner.sample_reset_perf().into()
+    }
+
+    pub fn recent_accepts(&self) -> Vec<FfiRecentAccept> {
+        self.inner
+            .recent_accepts()
+            .into_iter()
+            .map(|a| FfiRecentAccept {
+                txid: a.txid.to_string(),
+                fee_sat: a.fee_sat,
+                weight: a.weight,
+                value_sat: a.value_sat,
+            })
+            .collect()
+    }
+
+    pub fn contains(&self, txid_hex: String) -> Result<bool, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.contains(&txid))
+    }
+
+    pub fn contains_wtxid(&self, wtxid_hex: String) -> Result<bool, RustyError> {
+        let wtxid = bitcoin::Wtxid::from_str(&wtxid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.contains_wtxid(&wtxid))
+    }
+
+    pub fn get_tx(&self, txid_hex: String) -> Result<Option<String>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self
+            .inner
+            .get_tx(&txid)
+            .map(|tx| bitcoin::consensus::encode::serialize_hex(&tx)))
+    }
+
+    pub fn get_tx_by_wtxid(&self, wtxid_hex: String) -> Result<Option<String>, RustyError> {
+        let wtxid = bitcoin::Wtxid::from_str(&wtxid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self
+            .inner
+            .get_tx_by_wtxid(&wtxid)
+            .map(|tx| bitcoin::consensus::encode::serialize_hex(&tx)))
+    }
+
+    pub fn accept_tx(&self, tx_hex: String) -> Result<FfiAcceptResult, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let result = self.inner.accept_tx(&tx).map_err(|_| RustyError::MempoolError)?;
+        Ok(FfiAcceptResult {
+            txid: result.txid.to_string(),
+            fee_sat: result.fee_sat,
+            weight: result.weight,
+            slot: result.slot,
+            replaced: result.replaced.iter().map(|t| t.to_string()).collect(),
+            replaced_scripthashes: result
+                .replaced_scripthashes
+                .iter()
+                .map(|h| rbitcoin_primitives::hex_encode(*h))
+                .collect(),
+        })
+    }
+
+    pub fn test_accept(&self, tx_hex: String) -> Result<FfiAcceptResult, RustyError> {
+        let bytes =
+            rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let result = self.inner.test_accept(&tx).map_err(|_| RustyError::MempoolError)?;
+        Ok(FfiAcceptResult {
+            txid: result.txid.to_string(),
+            fee_sat: result.fee_sat,
+            weight: result.weight,
+            slot: result.slot,
+            replaced: result.replaced.iter().map(|t| t.to_string()).collect(),
+            replaced_scripthashes: result
+                .replaced_scripthashes
+                .iter()
+                .map(|h| rbitcoin_primitives::hex_encode(*h))
+                .collect(),
+        })
+    }
+
+    pub fn fee_delta(&self, txid_hex: String) -> Result<i64, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.fee_delta(&txid))
+    }
+
+    pub fn list_live_wtxids(&self) -> Vec<FfiLiveWtxid> {
+        self.inner
+            .list_live_wtxids()
+            .into_iter()
+            .map(|(t, w)| FfiLiveWtxid {
+                txid: t.to_string(),
+                wtxid: w.to_string(),
+            })
+            .collect()
+    }
+
+    pub fn compact(&self) -> Result<FfiCompactResult, RustyError> {
+        let (n, bytes) = self.inner.compact().map_err(|_| RustyError::MempoolError)?;
+        Ok(FfiCompactResult {
+            n_txs: n,
+            bytes: bytes as u64,
+        })
+    }
+
+    pub fn flush(&self) -> Result<(), RustyError> {
+        self.inner.flush().map_err(|_| RustyError::MempoolError)
+    }
+
+    pub fn note_inv_tx(&self, n: u64) {
+        self.inner.note_inv_tx(n);
+    }
+
+    pub fn note_getdata_tx(&self, n: u64) {
+        self.inner.note_getdata_tx(n);
+    }
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -7921,6 +8198,32 @@ mod tests {
         let block_hash = block.block_hash().to_string();
         assert!(hub.knows_header(block_hash.clone()).unwrap());
         assert_eq!(hub.header_height(block_hash).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn test_mempool_hub_open_and_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query_path = tmp.path().join("query").to_str().unwrap().to_string();
+        let mp_path = tmp.path().join("mp").to_str().unwrap().to_string();
+        let hub = FfiMempoolHub::open(query_path, mp_path, 300_000_000, false).unwrap();
+        assert_eq!(hub.live_count(), 0);
+        assert_eq!(hub.orphan_count(), 0);
+        assert_eq!(hub.generation(), 0);
+        assert!(!hub.relay_enabled());
+        assert!(!hub.immediate_relay());
+        assert_eq!(hub.expiry_hours(), 336);
+        assert_eq!(hub.max_weight(), 300_000_000);
+        hub.set_relay_enabled(true);
+        assert!(hub.relay_enabled());
+        hub.set_immediate_relay(true);
+        assert!(hub.immediate_relay());
+        hub.set_expiry_hours(72);
+        assert_eq!(hub.expiry_hours(), 72);
+        let perf = hub.sample_reset_perf();
+        assert_eq!(perf.accepts, 0);
+        assert_eq!(perf.rejects, 0);
+        assert!(hub.recent_accepts().is_empty());
+        assert_eq!(hub.template_updates(), 0);
     }
 
 }

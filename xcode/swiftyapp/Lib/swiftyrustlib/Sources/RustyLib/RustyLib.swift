@@ -594,6 +594,303 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 
+public protocol FfiActiveMempoolProtocol : AnyObject {
+    
+    func compact() throws  -> String
+    
+    func evictConflictsWith(txidsHex: [String], vouts: [UInt32]) throws  -> [String]
+    
+    func evictToBudget(protectTxidHex: String?) throws  -> UInt64
+    
+    func flush() throws 
+    
+    func generation()  -> UInt64
+    
+    func getTx(txidHex: String) throws  -> String?
+    
+    func liveCount()  -> UInt64
+    
+    func maybeCompact() throws  -> String?
+    
+    func minRelaySatKvb()  -> UInt64
+    
+    func orphanCount()  -> UInt64
+    
+    func persistIfDirty() throws 
+    
+    func removeForBlock(txidsHex: [String]) throws  -> UInt64
+    
+    func removeLiveTxids(txidsHex: [String]) throws  -> UInt64
+    
+    func removeTxid(txidHex: String) throws 
+    
+    func removeTxidTree(txidHex: String) throws  -> [String]
+    
+    func selectBlockTxs(maxWeightWu: UInt64)  -> [String]
+    
+    func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
+    
+    func setMinRelaySatKvb(satKvb: UInt64) 
+    
+}
+
+open class FfiActiveMempool:
+    FfiActiveMempoolProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffiactivemempool(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffiactivemempool(pointer, $0) }
+    }
+
+    
+public static func openOrCreate(path: String)throws  -> FfiActiveMempool {
+    return try  FfiConverterTypeFfiActiveMempool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffiactivemempool_open_or_create(
+        FfiConverterString.lower(path),$0
+    )
+})
+}
+    
+public static func openOrCreateWithLimit(path: String, maxWeight: UInt64)throws  -> FfiActiveMempool {
+    return try  FfiConverterTypeFfiActiveMempool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffiactivemempool_open_or_create_with_limit(
+        FfiConverterString.lower(path),
+        FfiConverterUInt64.lower(maxWeight),$0
+    )
+})
+}
+    
+
+    
+open func compact()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_compact(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func evictConflictsWith(txidsHex: [String], vouts: [UInt32])throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_evict_conflicts_with(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(txidsHex),
+        FfiConverterSequenceUInt32.lower(vouts),$0
+    )
+})
+}
+    
+open func evictToBudget(protectTxidHex: String?)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_evict_to_budget(self.uniffiClonePointer(),
+        FfiConverterOptionString.lower(protectTxidHex),$0
+    )
+})
+}
+    
+open func flush()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_flush(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func generation() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_generation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func getTx(txidHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_get_tx(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func liveCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_live_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func maybeCompact()throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_maybe_compact(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func minRelaySatKvb() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_min_relay_sat_kvb(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func orphanCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_orphan_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func persistIfDirty()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_persist_if_dirty(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func removeForBlock(txidsHex: [String])throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_remove_for_block(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(txidsHex),$0
+    )
+})
+}
+    
+open func removeLiveTxids(txidsHex: [String])throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_remove_live_txids(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(txidsHex),$0
+    )
+})
+}
+    
+open func removeTxid(txidHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_remove_txid(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+}
+}
+    
+open func removeTxidTree(txidHex: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_remove_txid_tree(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func selectBlockTxs(maxWeightWu: UInt64) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_select_block_txs(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(maxWeightWu),$0
+    )
+})
+}
+    
+open func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_set_cluster_limits(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(count),
+        FfiConverterOptionUInt32.lower(sizeKvb),$0
+    )
+}
+}
+    
+open func setMinRelaySatKvb(satKvb: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiactivemempool_set_min_relay_sat_kvb(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(satKvb),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiActiveMempool: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiActiveMempool
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiActiveMempool {
+        return FfiActiveMempool(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiActiveMempool) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiActiveMempool {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiActiveMempool, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiActiveMempool_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiActiveMempool {
+    return try FfiConverterTypeFfiActiveMempool.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiActiveMempool_lower(_ value: FfiActiveMempool) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiActiveMempool.lower(value)
+}
+
+
+
+
 public protocol FfiAddrManProtocol : AnyObject {
     
     func add(addr: String) throws 
@@ -9336,6 +9633,60 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_xpub_from_xpriv() != 63931) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_compact() != 27579) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_evict_conflicts_with() != 4887) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_evict_to_budget() != 17024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_flush() != 63046) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_generation() != 20642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_get_tx() != 256) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_live_count() != 31658) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_maybe_compact() != 16637) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_min_relay_sat_kvb() != 35880) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_orphan_count() != 40480) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_persist_if_dirty() != 58263) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_for_block() != 59077) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_live_txids() != 37088) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_txid() != 5033) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_txid_tree() != 38135) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_select_block_txs() != 6456) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_set_cluster_limits() != 42242) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_set_min_relay_sat_kvb() != 5705) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffiaddrman_add() != 26692) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9958,6 +10309,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffitxgraph_weight_above_feerate() != 17389) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffiactivemempool_open_or_create() != 46448) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffiactivemempool_open_or_create_with_limit() != 7894) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiaddrman_load() != 32799) {

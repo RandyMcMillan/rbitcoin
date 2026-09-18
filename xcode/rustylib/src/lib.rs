@@ -1661,12 +1661,92 @@ impl FfiStore {
             })
             .collect())
     }
+
+    pub fn get_tx_full(&self, fk: u64) -> Result<FfiTxFull, RustyError> {
+        let (tx, inputs, outputs) = self
+            .inner
+            .get_tx_full(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiTxFull {
+            tx: tx.into(),
+            inputs: inputs.into_iter().map(|i| i.into()).collect(),
+            outputs: outputs.into_iter().map(|o| o.into()).collect(),
+        })
+    }
+
+    pub fn get_tx_full_span(&self, first: u64, last: u64) -> Result<Vec<FfiTxFull>, RustyError> {
+        let txs = self
+            .inner
+            .get_tx_full_span(first, last)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(txs
+            .into_iter()
+            .map(|(tx, inputs, outputs)| FfiTxFull {
+                tx: tx.into(),
+                inputs: inputs.into_iter().map(|i| i.into()).collect(),
+                outputs: outputs.into_iter().map(|o| o.into()).collect(),
+            })
+            .collect())
+    }
+
+    pub fn get_tx_meta_and_outputs(&self, fk: u64) -> Result<FfiTxMetaAndOutputs, RustyError> {
+        let (tx, outputs) = self
+            .inner
+            .get_tx_meta_and_outputs(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiTxMetaAndOutputs {
+            tx: tx.into(),
+            outputs: outputs.into_iter().map(|o| o.into()).collect(),
+        })
+    }
+
+    pub fn get_tx_meta_and_prevouts(&self, fk: u64) -> Result<FfiTxMetaAndPrevouts, RustyError> {
+        let (tx, prevouts) = self
+            .inner
+            .get_tx_meta_and_prevouts(rbitcoin_primitives::Fk(fk))
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(FfiTxMetaAndPrevouts {
+            tx: tx.into(),
+            prevouts: prevouts
+                .into_iter()
+                .map(|(fk, vout)| FfiPrevoutRef {
+                    create_fk: fk.0,
+                    vout,
+                })
+                .collect(),
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, uniffi::Record)]
 pub struct FfiTxRange {
     pub offset: u64,
     pub len: u64,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiTxFull {
+    pub tx: FfiTxRecord,
+    pub inputs: Vec<FfiInputRecord>,
+    pub outputs: Vec<FfiOutputRecord>,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiTxMetaAndOutputs {
+    pub tx: FfiTxRecord,
+    pub outputs: Vec<FfiOutputRecord>,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiPrevoutRef {
+    pub create_fk: u64,
+    pub vout: u32,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiTxMetaAndPrevouts {
+    pub tx: FfiTxRecord,
+    pub prevouts: Vec<FfiPrevoutRef>,
 }
 
 #[derive(uniffi::Record)]
@@ -5544,5 +5624,33 @@ mod tests {
         let coins = store.coinbase_fk_at_heights(vec![0, 1, 2]);
         assert!(coins.is_ok());
         assert!(coins.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_store_get_tx_full_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert!(store.get_tx_full(0).is_err());
+    }
+
+    #[test]
+    fn test_store_get_tx_full_span_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert!(store.get_tx_full_span(0, 0).is_err());
+    }
+
+    #[test]
+    fn test_store_get_tx_meta_and_outputs_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert!(store.get_tx_meta_and_outputs(0).is_err());
+    }
+
+    #[test]
+    fn test_store_get_tx_meta_and_prevouts_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FfiStore::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        assert!(store.get_tx_meta_and_prevouts(0).is_err());
     }
 }

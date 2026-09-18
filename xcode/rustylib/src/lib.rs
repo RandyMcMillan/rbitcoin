@@ -110,6 +110,36 @@ pub fn hash256(bytes: Vec<u8>) -> String {
     hash.to_string()
 }
 
+// --- Key / Address FFI ---
+
+#[uniffi::export]
+pub fn generate_private_key(network: String) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let bnet = bitcoin_network(net);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (sk, _pk) = secp.generate_keypair(&mut rand::thread_rng());
+    let pk = bitcoin::PrivateKey::new(sk, bnet);
+    Ok(pk.to_wif())
+}
+
+#[uniffi::export]
+pub fn private_key_to_pubkey_hex(wif: String) -> Result<String, RustyError> {
+    let pk = bitcoin::PrivateKey::from_str(&wif).map_err(|_| RustyError::InvalidInput)?;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let pubkey = pk.public_key(&secp);
+    Ok(rbitcoin_primitives::hex_encode(pubkey.to_bytes()))
+}
+
+#[uniffi::export]
+pub fn p2pkh_address_from_pubkey(pubkey_hex: String, network: String) -> Result<String, RustyError> {
+    let net = rbitcoin_network(&network)?;
+    let bnet = bitcoin_network(net);
+    let bytes = rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey = bitcoin::PublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let address = bitcoin::Address::p2pkh(pubkey, bnet);
+    Ok(address.to_string())
+}
+
 // --- Consensus FFI ---
 
 #[uniffi::export]

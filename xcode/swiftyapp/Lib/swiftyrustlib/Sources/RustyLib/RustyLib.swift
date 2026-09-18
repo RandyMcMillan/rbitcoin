@@ -12729,6 +12729,34 @@ public func banScoreThreshold() -> UInt32 {
     )
 })
 }
+public func base58Decode(base58Str: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_base58_decode(
+        FfiConverterString.lower(base58Str),$0
+    )
+})
+}
+public func base58DecodeCheck(base58Str: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_base58_decode_check(
+        FfiConverterString.lower(base58Str),$0
+    )
+})
+}
+public func base58Encode(dataHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_base58_encode(
+        FfiConverterString.lower(dataHex),$0
+    )
+})
+}
+public func base58EncodeCheck(dataHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_base58_encode_check(
+        FfiConverterString.lower(dataHex),$0
+    )
+})
+}
 public func bip32XprivToWif(xprivStr: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_bip32_xpriv_to_wif(
@@ -15003,6 +15031,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_ban_score_threshold() != 33963) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_base58_decode() != 25654) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_base58_decode_check() != 25413) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_base58_encode() != 21858) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_base58_encode_check() != 59263) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_bip32_xpriv_to_wif() != 23853) {

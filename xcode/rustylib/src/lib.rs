@@ -612,6 +612,104 @@ pub fn parse_tx(tx_hex: String) -> Result<FfiTxInfo, RustyError> {
 }
 
 #[uniffi::export]
+pub fn tx_set_witness(tx_hex: String, input_index: u32, witness_hexes: Vec<String>) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let idx = input_index as usize;
+    if idx >= tx.input.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    let witness_items: Vec<Vec<u8>> = witness_hexes
+        .iter()
+        .map(|h| rbitcoin_primitives::hex_decode(h).map_err(|_| RustyError::InvalidInput))
+        .collect::<Result<Vec<_>, _>>()?;
+    tx.input[idx].witness = bitcoin::Witness::from(witness_items);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_set_script_sig(tx_hex: String, input_index: u32, script_sig_hex: String) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let idx = input_index as usize;
+    if idx >= tx.input.len() {
+        return Err(RustyError::InvalidInput);
+    }
+    let script = rbitcoin_primitives::hex_decode(&script_sig_hex).map_err(|_| RustyError::InvalidInput)?;
+    tx.input[idx].script_sig = bitcoin::ScriptBuf::from_bytes(script);
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
+pub fn tx_sighash_legacy(tx_hex: String, input_index: u32, prevout_script_hex: String, sighash_type: u32) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&prevout_script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script_code = bitcoin::ScriptBuf::from_bytes(script);
+    let sh_type = bitcoin::sighash::EcdsaSighashType::from_consensus(sighash_type);
+    let cache = bitcoin::sighash::SighashCache::new(&tx);
+    let hash = cache
+        .legacy_signature_hash(input_index as usize, &script_code, sh_type.to_u32())
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(hash.to_string())
+}
+
+#[uniffi::export]
+pub fn tx_sighash_segwitv0(
+    tx_hex: String,
+    input_index: u32,
+    prevout_script_hex: String,
+    value_sat: u64,
+    sighash_type: u32,
+) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&prevout_script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
+    let sh_type = bitcoin::sighash::EcdsaSighashType::from_consensus(sighash_type);
+    let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+    let hash = cache
+        .p2wpkh_signature_hash(
+            input_index as usize,
+            &script_pubkey,
+            bitcoin::Amount::from_sat(value_sat),
+            sh_type,
+        )
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(hash.to_string())
+}
+
+#[uniffi::export]
+pub fn ecdsa_sign_hash(wif: String, hash_hex: String) -> Result<String, RustyError> {
+    let secret = bitcoin::PrivateKey::from_wif(&wif).map_err(|_| RustyError::InvalidInput)?;
+    let hash_bytes = parse_hash32(&hash_hex)?;
+    let msg = bitcoin::secp256k1::Message::from_digest(hash_bytes);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sig = secp.sign_ecdsa(&msg, &secret.inner);
+    Ok(rbitcoin_primitives::hex_encode(sig.serialize_der().as_ref()))
+}
+
+#[uniffi::export]
+pub fn schnorr_sign_hash(private_key_hex: String, hash_hex: String) -> Result<String, RustyError> {
+    let sk_bytes = rbitcoin_primitives::hex_decode(&private_key_hex).map_err(|_| RustyError::InvalidInput)?;
+    if sk_bytes.len() != 32 {
+        return Err(RustyError::InvalidInput);
+    }
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let secp_inner = bitcoin::secp256k1::Secp256k1::new();
+    let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp_inner, &sk);
+    let hash_bytes = parse_hash32(&hash_hex)?;
+    let msg = bitcoin::secp256k1::Message::from_digest(hash_bytes);
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+    Ok(rbitcoin_primitives::hex_encode(sig.as_ref()))
+}
+
+#[uniffi::export]
+pub fn psbt_extract_tx(psbt_hex: String) -> Result<String, RustyError> {
+    let psbt_bytes = rbitcoin_primitives::hex_decode(&psbt_hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let tx = psbt.extract_tx().map_err(|_| RustyError::InvalidInput)?;
+    Ok(bitcoin::consensus::encode::serialize_hex(&tx))
+}
+
+#[uniffi::export]
 pub fn block_hash_from_header(header_hex: String) -> Result<String, RustyError> {
     let header: BlockHeader = deserialize_hex(&header_hex).map_err(|_| RustyError::InvalidInput)?;
     Ok(header.block_hash().to_string())

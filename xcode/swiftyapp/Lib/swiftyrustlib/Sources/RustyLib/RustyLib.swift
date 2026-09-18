@@ -13070,6 +13070,14 @@ public func dnsSeedQueryHost(seed: String, servicesU64: UInt64) -> String {
     )
 })
 }
+public func ecdsaSignHash(wif: String, hashHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_ecdsa_sign_hash(
+        FfiConverterString.lower(wif),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
 public func electrumDefaultTweaksMinDust() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_electrum_default_tweaks_min_dust($0
@@ -14011,6 +14019,13 @@ public func psbtCombine(hexA: String, hexB: String)throws  -> String {
     )
 })
 }
+public func psbtExtractTx(psbtHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_extract_tx(
+        FfiConverterString.lower(psbtHex),$0
+    )
+})
+}
 public func psbtExtractTxHex(hex: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_psbt_extract_tx_hex(
@@ -14249,6 +14264,14 @@ public func sampleResetEsploraPerf() -> FfiEsploraPerfSample {
 public func sampleResetServePerf() -> FfiServePerfSample {
     return try!  FfiConverterTypeFfiServePerfSample.lift(try! rustCall() {
     uniffi_rustylib_fn_func_sample_reset_serve_perf($0
+    )
+})
+}
+public func schnorrSignHash(privateKeyHex: String, hashHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_schnorr_sign_hash(
+        FfiConverterString.lower(privateKeyHex),
+        FfiConverterString.lower(hashHex),$0
     )
 })
 }
@@ -14626,6 +14649,45 @@ public func txOutputCount(txHex: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_tx_output_count(
         FfiConverterString.lower(txHex),$0
+    )
+})
+}
+public func txSetScriptSig(txHex: String, inputIndex: UInt32, scriptSigHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_set_script_sig(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterString.lower(scriptSigHex),$0
+    )
+})
+}
+public func txSetWitness(txHex: String, inputIndex: UInt32, witnessHexes: [String])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_set_witness(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterSequenceString.lower(witnessHexes),$0
+    )
+})
+}
+public func txSighashLegacy(txHex: String, inputIndex: UInt32, prevoutScriptHex: String, sighashType: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_sighash_legacy(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterString.lower(prevoutScriptHex),
+        FfiConverterUInt32.lower(sighashType),$0
+    )
+})
+}
+public func txSighashSegwitv0(txHex: String, inputIndex: UInt32, prevoutScriptHex: String, valueSat: UInt64, sighashType: UInt32)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_tx_sighash_segwitv0(
+        FfiConverterString.lower(txHex),
+        FfiConverterUInt32.lower(inputIndex),
+        FfiConverterString.lower(prevoutScriptHex),
+        FfiConverterUInt64.lower(valueSat),
+        FfiConverterUInt32.lower(sighashType),$0
     )
 })
 }
@@ -15081,6 +15143,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_dns_seed_query_host() != 13575) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_ecdsa_sign_hash() != 59267) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_electrum_default_tweaks_min_dust() != 58605) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15483,6 +15548,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_psbt_combine() != 12897) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_psbt_extract_tx() != 48828) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_psbt_extract_tx_hex() != 1712) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15580,6 +15648,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_sample_reset_serve_perf() != 14009) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_schnorr_sign_hash() != 23751) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_script_flag_paren() != 39331) {
@@ -15727,6 +15798,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_output_count() != 50673) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_set_script_sig() != 33429) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_set_witness() != 41915) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_sighash_legacy() != 26527) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_tx_sighash_segwitv0() != 57014) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_tx_to_hex() != 8562) {

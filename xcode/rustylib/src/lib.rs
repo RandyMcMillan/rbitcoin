@@ -192,7 +192,10 @@ pub fn address_network(address: String) -> Result<String, RustyError> {
 }
 
 #[uniffi::export]
-pub fn address_from_script_pubkey(script_hex: String, network: String) -> Result<String, RustyError> {
+pub fn address_from_script_pubkey(
+    script_hex: String,
+    network: String,
+) -> Result<String, RustyError> {
     let script =
         rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
     let network = match network.as_str() {
@@ -217,8 +220,12 @@ pub fn script_pubkey_from_address(address: String, network: String) -> Result<St
         _ => return Err(RustyError::InvalidInput),
     };
     let unchecked = Address::from_str(&address).map_err(|_| RustyError::InvalidInput)?;
-    let addr = unchecked.require_network(network).map_err(|_| RustyError::InvalidInput)?;
-    Ok(rbitcoin_primitives::hex_encode(addr.script_pubkey().as_bytes()))
+    let addr = unchecked
+        .require_network(network)
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(rbitcoin_primitives::hex_encode(
+        addr.script_pubkey().as_bytes(),
+    ))
 }
 
 #[uniffi::export]
@@ -282,10 +289,14 @@ pub fn private_key_to_pubkey_hex(wif: String) -> Result<String, RustyError> {
 }
 
 #[uniffi::export]
-pub fn p2pkh_address_from_pubkey(pubkey_hex: String, network: String) -> Result<String, RustyError> {
+pub fn p2pkh_address_from_pubkey(
+    pubkey_hex: String,
+    network: String,
+) -> Result<String, RustyError> {
     let net = rbitcoin_network(&network)?;
     let bnet = bitcoin_network(net);
-    let bytes = rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
     let pubkey = bitcoin::PublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let address = bitcoin::Address::p2pkh(pubkey, bnet);
     Ok(address.to_string())
@@ -295,7 +306,8 @@ pub fn p2pkh_address_from_pubkey(pubkey_hex: String, network: String) -> Result<
 pub fn p2sh_address_from_script(script_hex: String, network: String) -> Result<String, RustyError> {
     let net = rbitcoin_network(&network)?;
     let bnet = bitcoin_network(net);
-    let bytes = rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
     let script = bitcoin::ScriptBuf::from_bytes(bytes);
     let address = bitcoin::Address::p2sh(&script, bnet).map_err(|_| RustyError::InvalidInput)?;
     Ok(address.to_string())
@@ -318,14 +330,19 @@ pub fn verify_message(
     message: String,
     signature_hex: String,
 ) -> Result<bool, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&signature_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&signature_hex).map_err(|_| RustyError::InvalidInput)?;
     let sig = bitcoin::sign_message::MessageSignature::from_slice(&bytes)
         .map_err(|_| RustyError::InvalidInput)?;
     let msg_hash = bitcoin::sign_message::signed_msg_hash(&message);
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let pubkey_bytes = rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
-    let pubkey = bitcoin::PublicKey::from_slice(&pubkey_bytes).map_err(|_| RustyError::InvalidInput)?;
-    let recovered = sig.recover_pubkey(&secp, msg_hash).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey_bytes =
+        rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey =
+        bitcoin::PublicKey::from_slice(&pubkey_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let recovered = sig
+        .recover_pubkey(&secp, msg_hash)
+        .map_err(|_| RustyError::InvalidInput)?;
     Ok(recovered == pubkey)
 }
 
@@ -333,7 +350,8 @@ pub fn verify_message(
 
 #[uniffi::export]
 pub fn bip32_xpriv_to_wif(xpriv_str: String) -> Result<String, RustyError> {
-    let xpriv = bitcoin::bip32::Xpriv::from_str(&xpriv_str).map_err(|_| RustyError::InvalidInput)?;
+    let xpriv =
+        bitcoin::bip32::Xpriv::from_str(&xpriv_str).map_err(|_| RustyError::InvalidInput)?;
     Ok(xpriv.to_priv().to_wif())
 }
 
@@ -636,8 +654,13 @@ pub fn parse_tx(tx_hex: String) -> Result<FfiTxInfo, RustyError> {
 }
 
 #[uniffi::export]
-pub fn tx_set_witness(tx_hex: String, input_index: u32, witness_hexes: Vec<String>) -> Result<String, RustyError> {
-    let mut tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+pub fn tx_set_witness(
+    tx_hex: String,
+    input_index: u32,
+    witness_hexes: Vec<String>,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
     let idx = input_index as usize;
     if idx >= tx.input.len() {
         return Err(RustyError::InvalidInput);
@@ -651,21 +674,34 @@ pub fn tx_set_witness(tx_hex: String, input_index: u32, witness_hexes: Vec<Strin
 }
 
 #[uniffi::export]
-pub fn tx_set_script_sig(tx_hex: String, input_index: u32, script_sig_hex: String) -> Result<String, RustyError> {
-    let mut tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+pub fn tx_set_script_sig(
+    tx_hex: String,
+    input_index: u32,
+    script_sig_hex: String,
+) -> Result<String, RustyError> {
+    let mut tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
     let idx = input_index as usize;
     if idx >= tx.input.len() {
         return Err(RustyError::InvalidInput);
     }
-    let script = rbitcoin_primitives::hex_decode(&script_sig_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script =
+        rbitcoin_primitives::hex_decode(&script_sig_hex).map_err(|_| RustyError::InvalidInput)?;
     tx.input[idx].script_sig = bitcoin::ScriptBuf::from_bytes(script);
     Ok(bitcoin::consensus::encode::serialize_hex(&tx))
 }
 
 #[uniffi::export]
-pub fn tx_sighash_legacy(tx_hex: String, input_index: u32, prevout_script_hex: String, sighash_type: u32) -> Result<String, RustyError> {
-    let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-    let script = rbitcoin_primitives::hex_decode(&prevout_script_hex).map_err(|_| RustyError::InvalidInput)?;
+pub fn tx_sighash_legacy(
+    tx_hex: String,
+    input_index: u32,
+    prevout_script_hex: String,
+    sighash_type: u32,
+) -> Result<String, RustyError> {
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&prevout_script_hex)
+        .map_err(|_| RustyError::InvalidInput)?;
     let script_code = bitcoin::ScriptBuf::from_bytes(script);
     let sh_type = bitcoin::sighash::EcdsaSighashType::from_consensus(sighash_type);
     let cache = bitcoin::sighash::SighashCache::new(&tx);
@@ -683,8 +719,10 @@ pub fn tx_sighash_segwitv0(
     value_sat: u64,
     sighash_type: u32,
 ) -> Result<String, RustyError> {
-    let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-    let script = rbitcoin_primitives::hex_decode(&prevout_script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let tx: bitcoin::Transaction =
+        deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&prevout_script_hex)
+        .map_err(|_| RustyError::InvalidInput)?;
     let script_pubkey = bitcoin::ScriptBuf::from_bytes(script);
     let sh_type = bitcoin::sighash::EcdsaSighashType::from_consensus(sighash_type);
     let mut cache = bitcoin::sighash::SighashCache::new(&tx);
@@ -706,16 +744,20 @@ pub fn ecdsa_sign_hash(wif: String, hash_hex: String) -> Result<String, RustyErr
     let msg = bitcoin::secp256k1::Message::from_digest(hash_bytes);
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let sig = secp.sign_ecdsa(&msg, &secret.inner);
-    Ok(rbitcoin_primitives::hex_encode(sig.serialize_der().as_ref()))
+    Ok(rbitcoin_primitives::hex_encode(
+        sig.serialize_der().as_ref(),
+    ))
 }
 
 #[uniffi::export]
 pub fn schnorr_sign_hash(private_key_hex: String, hash_hex: String) -> Result<String, RustyError> {
-    let sk_bytes = rbitcoin_primitives::hex_decode(&private_key_hex).map_err(|_| RustyError::InvalidInput)?;
+    let sk_bytes =
+        rbitcoin_primitives::hex_decode(&private_key_hex).map_err(|_| RustyError::InvalidInput)?;
     if sk_bytes.len() != 32 {
         return Err(RustyError::InvalidInput);
     }
-    let sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&sk_bytes)
+        .map_err(|_| RustyError::InvalidInput)?;
     let secp_inner = bitcoin::secp256k1::Secp256k1::new();
     let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp_inner, &sk);
     let hash_bytes = parse_hash32(&hash_hex)?;
@@ -727,8 +769,10 @@ pub fn schnorr_sign_hash(private_key_hex: String, hash_hex: String) -> Result<St
 
 #[uniffi::export]
 pub fn psbt_extract_tx(psbt_hex: String) -> Result<String, RustyError> {
-    let psbt_bytes = rbitcoin_primitives::hex_decode(&psbt_hex).map_err(|_| RustyError::InvalidInput)?;
-    let psbt = bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|_| RustyError::InvalidInput)?;
+    let psbt_bytes =
+        rbitcoin_primitives::hex_decode(&psbt_hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt =
+        bitcoin::psbt::Psbt::deserialize(&psbt_bytes).map_err(|_| RustyError::InvalidInput)?;
     let tx = psbt.extract_tx().map_err(|_| RustyError::InvalidInput)?;
     Ok(bitcoin::consensus::encode::serialize_hex(&tx))
 }
@@ -806,8 +850,10 @@ pub fn net_default_ibd_window() -> u32 {
 #[uniffi::export]
 pub fn pick_seed_results(x_ips: Vec<String>, plain_ips: Vec<String>) -> Vec<String> {
     let x: Vec<std::net::SocketAddr> = x_ips.into_iter().filter_map(|s| s.parse().ok()).collect();
-    let plain: Vec<std::net::SocketAddr> =
-        plain_ips.into_iter().filter_map(|s| s.parse().ok()).collect();
+    let plain: Vec<std::net::SocketAddr> = plain_ips
+        .into_iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     rbitcoin_net::pick_seed_results(&x, &plain)
         .into_iter()
         .map(|a| a.to_string())
@@ -823,18 +869,25 @@ pub struct FfiP2pFrame {
 
 #[uniffi::export]
 pub fn p2p_message_checksum(payload_hex: String) -> Result<String, RustyError> {
-    let payload = rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
+    let payload =
+        rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
     let hash = sha256d::Hash::hash(&payload);
     Ok(rbitcoin_primitives::hex_encode(&hash[..4]))
 }
 
 #[uniffi::export]
-pub fn p2p_encode_frame(magic_hex: String, command: String, payload_hex: String) -> Result<String, RustyError> {
-    let magic = rbitcoin_primitives::hex_decode(&magic_hex).map_err(|_| RustyError::InvalidInput)?;
+pub fn p2p_encode_frame(
+    magic_hex: String,
+    command: String,
+    payload_hex: String,
+) -> Result<String, RustyError> {
+    let magic =
+        rbitcoin_primitives::hex_decode(&magic_hex).map_err(|_| RustyError::InvalidInput)?;
     if magic.len() != 4 {
         return Err(RustyError::InvalidInput);
     }
-    let payload = rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
+    let payload =
+        rbitcoin_primitives::hex_decode(&payload_hex).map_err(|_| RustyError::InvalidInput)?;
     let len = payload.len() as u32;
     let hash = sha256d::Hash::hash(&payload);
     let checksum = &hash[..4];
@@ -855,19 +908,26 @@ pub fn p2p_encode_frame(magic_hex: String, command: String, payload_hex: String)
 
 #[uniffi::export]
 pub fn p2p_decode_frame(frame_hex: String) -> Result<FfiP2pFrame, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&frame_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&frame_hex).map_err(|_| RustyError::InvalidInput)?;
     if bytes.len() < 24 {
         return Err(RustyError::InvalidInput);
     }
     let magic_hex = rbitcoin_primitives::hex_encode(&bytes[0..4]);
     let cmd_raw = &bytes[4..16];
-    let command = String::from_utf8_lossy(cmd_raw).trim_end_matches('\0').to_string();
+    let command = String::from_utf8_lossy(cmd_raw)
+        .trim_end_matches('\0')
+        .to_string();
     let len = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
     if bytes.len() < 24 + len {
         return Err(RustyError::InvalidInput);
     }
     let payload_hex = rbitcoin_primitives::hex_encode(&bytes[24..24 + len]);
-    Ok(FfiP2pFrame { magic_hex, command, payload_hex })
+    Ok(FfiP2pFrame {
+        magic_hex,
+        command,
+        payload_hex,
+    })
 }
 
 // --- PeerFlags FFI ---
@@ -1209,7 +1269,11 @@ pub fn sighash_legacy(
         rbitcoin_primitives::hex_decode(&script_hex).map_err(|_| RustyError::InvalidInput)?;
     let cache = bitcoin::sighash::SighashCache::new(&tx);
     let sighash = cache
-        .legacy_signature_hash(input_index as usize, bitcoin::Script::from_bytes(&script), hash_type)
+        .legacy_signature_hash(
+            input_index as usize,
+            bitcoin::Script::from_bytes(&script),
+            hash_type,
+        )
         .map_err(|_| RustyError::InvalidInput)?;
     Ok(sighash.to_string())
 }
@@ -1224,8 +1288,8 @@ pub fn sighash_p2wpkh(
 ) -> Result<String, RustyError> {
     let tx: bitcoin::Transaction =
         deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-    let script =
-        rbitcoin_primitives::hex_decode(&script_pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&script_pubkey_hex)
+        .map_err(|_| RustyError::InvalidInput)?;
     let spk = bitcoin::Script::from_bytes(&script);
     let amount = bitcoin::Amount::from_sat(value_sat);
     let ty = bitcoin::sighash::EcdsaSighashType::from_consensus(hash_type);
@@ -1246,8 +1310,8 @@ pub fn sighash_p2wsh(
 ) -> Result<String, RustyError> {
     let tx: bitcoin::Transaction =
         deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-    let script =
-        rbitcoin_primitives::hex_decode(&witness_script_hex).map_err(|_| RustyError::InvalidInput)?;
+    let script = rbitcoin_primitives::hex_decode(&witness_script_hex)
+        .map_err(|_| RustyError::InvalidInput)?;
     let wscript = bitcoin::Script::from_bytes(&script);
     let amount = bitcoin::Amount::from_sat(value_sat);
     let ty = bitcoin::sighash::EcdsaSighashType::from_consensus(hash_type);
@@ -1346,7 +1410,8 @@ pub fn block_work(bits: u32) -> Result<String, RustyError> {
 
 #[uniffi::export]
 pub fn header_validate_pow(header_hex: String) -> Result<bool, RustyError> {
-    let bytes = rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
+    let bytes =
+        rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
     let header: bitcoin::block::Header =
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let target = bitcoin::Target::from_compact(header.bits);
@@ -1460,7 +1525,9 @@ pub fn block_coinbase_tx_hex(block_hex: String) -> Result<String, RustyError> {
     let block: bitcoin::Block =
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let coinbase = block.txdata.first().ok_or(RustyError::InvalidInput)?;
-    Ok(rbitcoin_primitives::hex_encode(bitcoin::consensus::serialize(coinbase)))
+    Ok(rbitcoin_primitives::hex_encode(
+        bitcoin::consensus::serialize(coinbase),
+    ))
 }
 
 #[uniffi::export]
@@ -2331,11 +2398,7 @@ impl FfiStore {
             .map_err(|_| RustyError::StoreError)
     }
 
-    pub fn is_confirmed_strong_at(
-        &self,
-        tx_fk: u64,
-        tip: Option<u32>,
-    ) -> Result<bool, RustyError> {
+    pub fn is_confirmed_strong_at(&self, tx_fk: u64, tip: Option<u32>) -> Result<bool, RustyError> {
         self.inner
             .is_confirmed_strong_at(rbitcoin_primitives::Fk(tx_fk), tip)
             .map_err(|_| RustyError::StoreError)
@@ -2420,8 +2483,14 @@ impl FfiStore {
     pub fn txids_get_many(&self, fks: Vec<u64>) -> Result<Vec<Option<String>>, RustyError> {
         let fks: Vec<rbitcoin_primitives::Fk> =
             fks.into_iter().map(rbitcoin_primitives::Fk).collect();
-        let txids = self.inner.txids_get_many(&fks).map_err(|_| RustyError::StoreError)?;
-        Ok(txids.into_iter().map(|t| t.map(rbitcoin_primitives::hex_encode)).collect())
+        let txids = self
+            .inner
+            .txids_get_many(&fks)
+            .map_err(|_| RustyError::StoreError)?;
+        Ok(txids
+            .into_iter()
+            .map(|t| t.map(rbitcoin_primitives::hex_encode))
+            .collect())
     }
 
     pub fn tx_body_range_batch(
@@ -2539,7 +2608,10 @@ impl FfiStore {
             })
     }
 
-    pub fn coinbase_fk_at_heights(&self, heights: Vec<u32>) -> Result<Vec<FfiCoinbaseAtHeight>, RustyError> {
+    pub fn coinbase_fk_at_heights(
+        &self,
+        heights: Vec<u32>,
+    ) -> Result<Vec<FfiCoinbaseAtHeight>, RustyError> {
         let map = self
             .inner
             .coinbase_fk_at_heights(&heights)
@@ -2608,7 +2680,11 @@ impl FfiStore {
         })
     }
 
-    pub fn resolve_txid(&self, txid_hex: String, tip_then_any: bool) -> Result<Option<u64>, RustyError> {
+    pub fn resolve_txid(
+        &self,
+        txid_hex: String,
+        tip_then_any: bool,
+    ) -> Result<Option<u64>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
         if let Some(fk) = self
             .inner
@@ -2629,7 +2705,10 @@ impl FfiStore {
         Ok(None)
     }
 
-    pub fn get_fk_by_txid_batch(&self, txids_hex: Vec<String>) -> Result<Vec<Option<u64>>, RustyError> {
+    pub fn get_fk_by_txid_batch(
+        &self,
+        txids_hex: Vec<String>,
+    ) -> Result<Vec<Option<u64>>, RustyError> {
         let txids: Vec<[u8; 32]> = txids_hex
             .into_iter()
             .map(|h| parse_hash32(&h))
@@ -2710,7 +2789,9 @@ impl FfiQuery {
     pub fn open_or_create(path: String) -> Result<Arc<Self>, RustyError> {
         let query =
             rbitcoin_query::Query::open_or_create(&path).map_err(|_| RustyError::StoreError)?;
-        Ok(Arc::new(Self { inner: Arc::new(query) }))
+        Ok(Arc::new(Self {
+            inner: Arc::new(query),
+        }))
     }
 
     pub fn tip_height(&self) -> Option<u64> {
@@ -3046,7 +3127,10 @@ impl FfiQuery {
         self.inner.block_queue_drop_resolved_from(height);
     }
 
-    pub fn block_queue_mark_resolve_complete_wave(&self, heights: Vec<u32>) -> Result<u64, RustyError> {
+    pub fn block_queue_mark_resolve_complete_wave(
+        &self,
+        heights: Vec<u32>,
+    ) -> Result<u64, RustyError> {
         self.inner
             .block_queue_mark_resolve_complete_wave(&heights)
             .map_err(|_| RustyError::StoreError)
@@ -3063,13 +3147,15 @@ impl FfiQuery {
     }
 
     pub fn write_create_loc(&self, fk: u64) -> Option<FfiCreateLocPair> {
-        self.inner.write_create_loc(rbitcoin_primitives::Fk(fk)).map(|p| FfiCreateLocPair {
-            txout_offset: p.txout.0,
-            txout_len: p.txout.1,
-            spent_offset: p.spent.0,
-            spent_len: p.spent.1,
-            n_out: p.n_out,
-        })
+        self.inner
+            .write_create_loc(rbitcoin_primitives::Fk(fk))
+            .map(|p| FfiCreateLocPair {
+                txout_offset: p.txout.0,
+                txout_len: p.txout.1,
+                spent_offset: p.spent.0,
+                spent_len: p.spent.1,
+                n_out: p.n_out,
+            })
     }
 
     pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
@@ -3100,7 +3186,11 @@ impl FfiQuery {
         Ok(rec.into())
     }
 
-    pub fn header_tx_fks(&self, header_fk: u64, hash_hex: Option<String>) -> Result<Option<Vec<u64>>, RustyError> {
+    pub fn header_tx_fks(
+        &self,
+        header_fk: u64,
+        hash_hex: Option<String>,
+    ) -> Result<Option<Vec<u64>>, RustyError> {
         let hash = hash_hex.as_ref().map(|h| parse_hash32(h)).transpose()?;
         let fks = self
             .inner
@@ -3118,7 +3208,12 @@ impl FfiQuery {
         Ok(pts.into_iter().map(|p| p.into()).collect())
     }
 
-    pub fn spenders_at(&self, txid_hex: String, vout: u32, tip: Option<u32>) -> Result<Vec<FfiPointRecord>, RustyError> {
+    pub fn spenders_at(
+        &self,
+        txid_hex: String,
+        vout: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<FfiPointRecord>, RustyError> {
         let txid = parse_hash32(&txid_hex)?;
         let pts = self
             .inner
@@ -3167,7 +3262,11 @@ impl FfiQuery {
         Ok(input.into())
     }
 
-    pub fn tx_output_at_fk(&self, create_fk: u64, vout: u32) -> Result<FfiOutputRecord, RustyError> {
+    pub fn tx_output_at_fk(
+        &self,
+        create_fk: u64,
+        vout: u32,
+    ) -> Result<FfiOutputRecord, RustyError> {
         let output = self
             .inner
             .tx_output_at_fk(rbitcoin_primitives::Fk(create_fk), vout)
@@ -3201,7 +3300,10 @@ impl FfiQuery {
             size,
             weight,
         };
-        let fk = self.inner.put_header(&rec).map_err(|_| RustyError::StoreError)?;
+        let fk = self
+            .inner
+            .put_header(&rec)
+            .map_err(|_| RustyError::StoreError)?;
         Ok(fk.0)
     }
 
@@ -3215,7 +3317,12 @@ impl FfiQuery {
         let out_txid = parse_hash32(&out_txid_hex)?;
         let fk = self
             .inner
-            .put_spend(&out_txid, out_index, rbitcoin_primitives::Fk(spending_tx_fk), spending_vin)
+            .put_spend(
+                &out_txid,
+                out_index,
+                rbitcoin_primitives::Fk(spending_tx_fk),
+                spending_vin,
+            )
             .map_err(|_| RustyError::StoreError)?;
         Ok(fk.0)
     }
@@ -3228,13 +3335,20 @@ impl FfiQuery {
         self.inner.set_spend_index(enabled);
     }
 
-    pub fn unspent_create_vouts(&self, create_fk: u64, vouts: Vec<u32>) -> Result<Vec<u32>, RustyError> {
+    pub fn unspent_create_vouts(
+        &self,
+        create_fk: u64,
+        vouts: Vec<u32>,
+    ) -> Result<Vec<u32>, RustyError> {
         self.inner
             .unspent_create_vouts(rbitcoin_primitives::Fk(create_fk), &vouts)
             .map_err(|_| RustyError::StoreError)
     }
 
-    pub fn unspent_create_vouts_batch(&self, items: Vec<FfiUnspentCreateVoutItem>) -> Result<Vec<Vec<u32>>, RustyError> {
+    pub fn unspent_create_vouts_batch(
+        &self,
+        items: Vec<FfiUnspentCreateVoutItem>,
+    ) -> Result<Vec<Vec<u32>>, RustyError> {
         let items_inner: Vec<(rbitcoin_primitives::Fk, Vec<u32>)> = items
             .into_iter()
             .map(|i| (rbitcoin_primitives::Fk(i.create_fk), i.vouts))
@@ -3341,7 +3455,10 @@ impl FfiQuery {
 
     pub fn ensure_header(&self, header: FfiHeaderRecord) -> Result<u64, RustyError> {
         let rec: rbitcoin_store::HeaderRecord = header.try_into()?;
-        let fk = self.inner.ensure_header(&rec).map_err(|_| RustyError::StoreError)?;
+        let fk = self
+            .inner
+            .ensure_header(&rec)
+            .map_err(|_| RustyError::StoreError)?;
         Ok(fk.0)
     }
 
@@ -3397,17 +3514,16 @@ impl FfiQuery {
     }
 
     pub fn finalize_sh_runs(&self) -> Result<u64, RustyError> {
-        self.inner.finalize_sh_runs().map_err(|_| RustyError::StoreError)
+        self.inner
+            .finalize_sh_runs()
+            .map_err(|_| RustyError::StoreError)
     }
 
     pub fn sh_lag_heights(&self) -> u32 {
         self.inner.sh_lag_heights()
     }
 
-    pub fn pin_chain_view_at(
-        &self,
-        hash_hex: String,
-    ) -> Result<Option<FfiChainView>, RustyError> {
+    pub fn pin_chain_view_at(&self, hash_hex: String) -> Result<Option<FfiChainView>, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
         let view = self
             .inner
@@ -3465,7 +3581,10 @@ impl FfiQuery {
             .inner
             .locator_hashes()
             .map_err(|_| RustyError::StoreError)?;
-        Ok(hashes.into_iter().map(rbitcoin_primitives::hex_encode).collect())
+        Ok(hashes
+            .into_iter()
+            .map(rbitcoin_primitives::hex_encode)
+            .collect())
     }
 
     pub fn headers_after_locator(
@@ -3481,7 +3600,11 @@ impl FfiQuery {
         let stop = parse_hash32(&stop_hash_hex)?;
         let headers = self
             .inner
-            .headers_after_locator(&locator, bitcoin::BlockHash::from_byte_array(stop), limit as usize)
+            .headers_after_locator(
+                &locator,
+                bitcoin::BlockHash::from_byte_array(stop),
+                limit as usize,
+            )
             .map_err(|_| RustyError::StoreError)?;
         Ok(headers
             .into_iter()
@@ -3513,7 +3636,9 @@ impl FfiQuery {
     }
 
     pub fn disconnect_tip(&self) -> Result<(), RustyError> {
-        self.inner.disconnect_tip().map_err(|_| RustyError::StoreError)
+        self.inner
+            .disconnect_tip()
+            .map_err(|_| RustyError::StoreError)
     }
 
     pub fn disconnect_tip_keep_pending(&self) -> Result<(), RustyError> {
@@ -3523,11 +3648,14 @@ impl FfiQuery {
     }
 
     pub fn apply_sh_pending(&self) -> Result<(), RustyError> {
-        self.inner.apply_sh_pending().map_err(|_| RustyError::StoreError)
+        self.inner
+            .apply_sh_pending()
+            .map_err(|_| RustyError::StoreError)
     }
 
     pub fn drop_sh_pending_from(&self, height: u32) {
-        self.inner.drop_sh_pending_from(rbitcoin_primitives::Height(height));
+        self.inner
+            .drop_sh_pending_from(rbitcoin_primitives::Height(height));
     }
 
     pub fn process_owned_size_snapshot(&self) -> FfiProcessOwnedSizes {
@@ -3835,7 +3963,12 @@ impl FfiAddrMan {
         Ok(())
     }
 
-    pub fn note_speed(&self, addr: String, latency_ms: u64, bytes_per_sec: u64) -> Result<(), RustyError> {
+    pub fn note_speed(
+        &self,
+        addr: String,
+        latency_ms: u64,
+        bytes_per_sec: u64,
+    ) -> Result<(), RustyError> {
         let socket = rbitcoin_net::parse_peer_addr(&addr).map_err(|_| RustyError::InvalidInput)?;
         self.inner
             .lock()
@@ -3943,10 +4076,8 @@ impl FfiAddrMan {
     }
 
     pub fn inject(&self, addrs: Vec<String>) {
-        let sockets: Vec<std::net::SocketAddr> = addrs
-            .into_iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let sockets: Vec<std::net::SocketAddr> =
+            addrs.into_iter().filter_map(|s| s.parse().ok()).collect();
         self.inner.lock().unwrap().inject(sockets);
     }
 
@@ -3966,10 +4097,8 @@ impl FfiAddrMan {
         exclude: Vec<String>,
         occupied: Vec<String>,
     ) -> Vec<String> {
-        let exclude_set: std::collections::HashSet<std::net::SocketAddr> = exclude
-            .into_iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let exclude_set: std::collections::HashSet<std::net::SocketAddr> =
+            exclude.into_iter().filter_map(|s| s.parse().ok()).collect();
         let occ: Vec<std::net::SocketAddr> = occupied
             .into_iter()
             .filter_map(|s| s.parse().ok())
@@ -4202,7 +4331,10 @@ impl FfiTxGraph {
         self.inner.lock().unwrap().total_weight()
     }
 
-    pub fn graph_stats(&self, txid_hex: String) -> Result<Option<FfiMempoolGraphStats>, RustyError> {
+    pub fn graph_stats(
+        &self,
+        txid_hex: String,
+    ) -> Result<Option<FfiMempoolGraphStats>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let stats = self.inner.lock().unwrap().graph_stats(&txid);
         Ok(stats.map(|s| FfiMempoolGraphStats {
@@ -4216,11 +4348,17 @@ impl FfiTxGraph {
     }
 
     pub fn frontier_feerate_sat_per_kvb(&self, target_wu: u64) -> Option<u64> {
-        self.inner.lock().unwrap().frontier_feerate_sat_per_kvb(target_wu)
+        self.inner
+            .lock()
+            .unwrap()
+            .frontier_feerate_sat_per_kvb(target_wu)
     }
 
     pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
-        self.inner.lock().unwrap().weight_above_feerate(rate_sat_per_kvb)
+        self.inner
+            .lock()
+            .unwrap()
+            .weight_above_feerate(rate_sat_per_kvb)
     }
 
     pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<String> {
@@ -4245,7 +4383,12 @@ impl FfiTxGraph {
 
     pub fn txid_for_wtxid(&self, wtxid_hex: String) -> Result<Option<String>, RustyError> {
         let wtxid = bitcoin::Wtxid::from_str(&wtxid_hex).map_err(|_| RustyError::InvalidInput)?;
-        Ok(self.inner.lock().unwrap().txid_for_wtxid(&wtxid).map(|t| t.to_string()))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .txid_for_wtxid(&wtxid)
+            .map(|t| t.to_string()))
     }
 
     pub fn mempool_utxo(&self, txid_hex: String, vout: u32) -> Result<bool, RustyError> {
@@ -4257,33 +4400,51 @@ impl FfiTxGraph {
     pub fn creator(&self, txid_hex: String, vout: u32) -> Result<Option<String>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let op = bitcoin::OutPoint::new(txid, vout);
-        Ok(self.inner.lock().unwrap().creator(&op).map(|t| t.to_string()))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .creator(&op)
+            .map(|t| t.to_string()))
     }
 
     pub fn conflict_txid(&self, txid_hex: String, vout: u32) -> Result<Option<String>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let op = bitcoin::OutPoint::new(txid, vout);
-        Ok(self.inner.lock().unwrap().conflict_txid(&op).map(|t| t.to_string()))
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .conflict_txid(&op)
+            .map(|t| t.to_string()))
     }
 
     pub fn ancestor_set(&self, txid_hex: String) -> Result<Vec<String>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let set = self.inner.lock().unwrap().ancestor_set(&txid);
-        Ok(set.map(|s| s.into_iter().map(|t| t.to_string()).collect()).unwrap_or_default())
+        Ok(set
+            .map(|s| s.into_iter().map(|t| t.to_string()).collect())
+            .unwrap_or_default())
     }
 
     pub fn descendant_set(&self, txid_hex: String) -> Result<Vec<String>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let set = self.inner.lock().unwrap().descendant_set(&txid);
-        Ok(set.map(|s| s.into_iter().map(|t| t.to_string()).collect()).unwrap_or_default())
+        Ok(set
+            .map(|s| s.into_iter().map(|t| t.to_string()).collect())
+            .unwrap_or_default())
     }
 
     pub fn worst_chunk(&self) -> Option<FfiChunk> {
-        self.inner.lock().unwrap().worst_chunk().map(|(_, ch)| FfiChunk {
-            txids: ch.txids.into_iter().map(|t| t.to_string()).collect(),
-            fee_sat: ch.fee_sat,
-            weight: ch.weight,
-        })
+        self.inner
+            .lock()
+            .unwrap()
+            .worst_chunk()
+            .map(|(_, ch)| FfiChunk {
+                txids: ch.txids.into_iter().map(|t| t.to_string()).collect(),
+                fee_sat: ch.fee_sat,
+                weight: ch.weight,
+            })
     }
 
     pub fn mining_chunks_best_first(&self) -> Vec<FfiChunk> {
@@ -4305,7 +4466,10 @@ impl FfiTxGraph {
     }
 
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
-        self.inner.lock().unwrap().set_cluster_limits(count, size_kvb);
+        self.inner
+            .lock()
+            .unwrap()
+            .set_cluster_limits(count, size_kvb);
     }
 
     pub fn cluster_count_limit(&self) -> u64 {
@@ -4338,7 +4502,10 @@ impl FfiActiveMempool {
     }
 
     #[uniffi::constructor]
-    pub fn open_or_create_with_limit(path: String, max_weight: u64) -> Result<Arc<Self>, RustyError> {
+    pub fn open_or_create_with_limit(
+        path: String,
+        max_weight: u64,
+    ) -> Result<Arc<Self>, RustyError> {
         let mempool = rbitcoin_mempool::ActiveMempool::open_or_create_with_limit(&path, max_weight)
             .map_err(|_| RustyError::MempoolError)?;
         Ok(Arc::new(Self {
@@ -4347,9 +4514,14 @@ impl FfiActiveMempool {
     }
 
     #[uniffi::constructor]
-    pub fn open_with_limit_persist(path: String, max_weight: u64, persist: bool) -> Result<Arc<Self>, RustyError> {
-        let mempool = rbitcoin_mempool::ActiveMempool::open_with_limit_persist(&path, max_weight, persist)
-            .map_err(|_| RustyError::MempoolError)?;
+    pub fn open_with_limit_persist(
+        path: String,
+        max_weight: u64,
+        persist: bool,
+    ) -> Result<Arc<Self>, RustyError> {
+        let mempool =
+            rbitcoin_mempool::ActiveMempool::open_with_limit_persist(&path, max_weight, persist)
+                .map_err(|_| RustyError::MempoolError)?;
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(mempool),
         }))
@@ -4376,7 +4548,10 @@ impl FfiActiveMempool {
     }
 
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
-        self.inner.lock().unwrap().set_cluster_limits(count, size_kvb);
+        self.inner
+            .lock()
+            .unwrap()
+            .set_cluster_limits(count, size_kvb);
     }
 
     pub fn max_weight(&self) -> u64 {
@@ -4387,7 +4562,8 @@ impl FfiActiveMempool {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let guard = self.inner.lock().unwrap();
         let tx = guard.get_tx(&txid);
-        let hex = tx.map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(t)));
+        let hex =
+            tx.map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(t)));
         drop(guard);
         Ok(hex)
     }
@@ -4511,7 +4687,11 @@ impl FfiActiveMempool {
         Ok(n as u64)
     }
 
-    pub fn evict_conflicts_with(&self, txids_hex: Vec<String>, vouts: Vec<u32>) -> Result<Vec<String>, RustyError> {
+    pub fn evict_conflicts_with(
+        &self,
+        txids_hex: Vec<String>,
+        vouts: Vec<u32>,
+    ) -> Result<Vec<String>, RustyError> {
         if txids_hex.len() != vouts.len() {
             return Err(RustyError::InvalidInput);
         }
@@ -4565,12 +4745,19 @@ impl FfiActiveMempool {
 
     pub fn maybe_compact(&self) -> Result<Option<String>, RustyError> {
         let mut guard = self.inner.lock().unwrap();
-        let result = guard.maybe_compact().map_err(|_| RustyError::MempoolError)?;
+        let result = guard
+            .maybe_compact()
+            .map_err(|_| RustyError::MempoolError)?;
         Ok(result.map(|(dead, shrunk)| format!("dead={dead} shrunk={shrunk}")))
     }
 
-    pub fn park_orphan(&self, tx_hex: String, missing_txids_hex: Vec<String>) -> Result<String, RustyError> {
-        let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    pub fn park_orphan(
+        &self,
+        tx_hex: String,
+        missing_txids_hex: Vec<String>,
+    ) -> Result<String, RustyError> {
+        let tx: bitcoin::Transaction =
+            deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
         let missing: std::collections::BTreeSet<bitcoin::Txid> = missing_txids_hex
             .into_iter()
             .map(|h| bitcoin::Txid::from_str(&h))
@@ -4581,9 +4768,13 @@ impl FfiActiveMempool {
     }
 
     pub fn take_orphan_children(&self, parent_txid_hex: String) -> Result<Vec<String>, RustyError> {
-        let parent = bitcoin::Txid::from_str(&parent_txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let parent =
+            bitcoin::Txid::from_str(&parent_txid_hex).map_err(|_| RustyError::InvalidInput)?;
         let children = self.inner.lock().unwrap().take_orphan_children(parent);
-        Ok(children.into_iter().map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t))).collect())
+        Ok(children
+            .into_iter()
+            .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
+            .collect())
     }
 
     pub fn erase_orphans_for_block(&self, block_txids_hex: Vec<String>) -> Result<(), RustyError> {
@@ -4597,17 +4788,15 @@ impl FfiActiveMempool {
     }
 
     pub fn remember_extra_compact(&self, tx_hex: String) -> Result<(), RustyError> {
-        let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+        let tx: bitcoin::Transaction =
+            deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
         self.inner.lock().unwrap().remember_extra_compact(&tx);
         Ok(())
     }
 
-    pub fn accept_tx(
-        &self,
-        query: Arc<FfiQuery>,
-        tx_hex: String,
-    ) -> Result<String, RustyError> {
-        let tx: bitcoin::Transaction = deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
+    pub fn accept_tx(&self, query: Arc<FfiQuery>, tx_hex: String) -> Result<String, RustyError> {
+        let tx: bitcoin::Transaction =
+            deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
         let provider = FfiUtxoProvider {
             query: Arc::clone(&query.inner),
         };
@@ -4615,14 +4804,21 @@ impl FfiActiveMempool {
         let mtp = if tip_height == 0 {
             0
         } else {
-            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
-                .unwrap_or(0)
+            rbitcoin_consensus::median_time_past(
+                &query.inner,
+                rbitcoin_primitives::Height(tip_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
         };
         let tip_ctx = rbitcoin_mempool::ChainTipCtx {
             height: tip_height,
             mtp,
         };
-        let result = self.inner.lock().unwrap().accept_tx(&tx, &provider, tip_ctx);
+        let result = self
+            .inner
+            .lock()
+            .unwrap()
+            .accept_tx(&tx, &provider, tip_ctx);
         Ok(format!("{result:?}"))
     }
 
@@ -4642,14 +4838,21 @@ impl FfiActiveMempool {
         let mtp = if tip_height == 0 {
             0
         } else {
-            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
-                .unwrap_or(0)
+            rbitcoin_consensus::median_time_past(
+                &query.inner,
+                rbitcoin_primitives::Height(tip_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
         };
         let tip_ctx = rbitcoin_mempool::ChainTipCtx {
             height: tip_height,
             mtp,
         };
-        let result = self.inner.lock().unwrap().accept_package(&txs, &provider, tip_ctx);
+        let result = self
+            .inner
+            .lock()
+            .unwrap()
+            .accept_package(&txs, &provider, tip_ctx);
         Ok(format!("{result:?}"))
     }
 
@@ -4666,14 +4869,20 @@ impl FfiActiveMempool {
         let mtp = if tip_height == 0 {
             0
         } else {
-            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
-                .unwrap_or(0)
+            rbitcoin_consensus::median_time_past(
+                &query.inner,
+                rbitcoin_primitives::Height(tip_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
         };
         let tip_ctx = rbitcoin_mempool::ChainTipCtx {
             height: tip_height,
             mtp,
         };
-        self.inner.lock().unwrap().promote_orphans_of(txid, &provider, tip_ctx);
+        self.inner
+            .lock()
+            .unwrap()
+            .promote_orphans_of(txid, &provider, tip_ctx);
         Ok(())
     }
 
@@ -4693,14 +4902,21 @@ impl FfiActiveMempool {
         let mtp = if tip_height == 0 {
             0
         } else {
-            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
-                .unwrap_or(0)
+            rbitcoin_consensus::median_time_past(
+                &query.inner,
+                rbitcoin_primitives::Height(tip_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
         };
         let tip_ctx = rbitcoin_mempool::ChainTipCtx {
             height: tip_height,
             mtp,
         };
-        let results = self.inner.lock().unwrap().reorg_disconnect_reaccept(&txs, &provider, tip_ctx);
+        let results = self
+            .inner
+            .lock()
+            .unwrap()
+            .reorg_disconnect_reaccept(&txs, &provider, tip_ctx);
         Ok(results.into_iter().map(|r| format!("{r:?}")).collect())
     }
 
@@ -4712,14 +4928,20 @@ impl FfiActiveMempool {
         let mtp = if tip_height == 0 {
             0
         } else {
-            rbitcoin_consensus::median_time_past(&query.inner, rbitcoin_primitives::Height(tip_height.saturating_sub(1)))
-                .unwrap_or(0)
+            rbitcoin_consensus::median_time_past(
+                &query.inner,
+                rbitcoin_primitives::Height(tip_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
         };
         let tip_ctx = rbitcoin_mempool::ChainTipCtx {
             height: tip_height,
             mtp,
         };
-        self.inner.lock().unwrap().evict_nonfinal(&provider, tip_ctx);
+        self.inner
+            .lock()
+            .unwrap()
+            .evict_nonfinal(&provider, tip_ctx);
         Ok(())
     }
 }
@@ -4784,8 +5006,11 @@ impl rbitcoin_mempool::UtxoProvider for FfiUtxoProvider {
         let create_mtp = if create_height == 0 {
             0
         } else {
-            rbitcoin_consensus::median_time_past(&self.query, rbitcoin_primitives::Height(create_height.saturating_sub(1)))
-                .unwrap_or(0)
+            rbitcoin_consensus::median_time_past(
+                &self.query,
+                rbitcoin_primitives::Height(create_height.saturating_sub(1)),
+            )
+            .unwrap_or(0)
         };
         rbitcoin_mempool::ChainPrevout::Unspent(rbitcoin_mempool::Coin {
             txout: bitcoin::TxOut {
@@ -4810,7 +5035,10 @@ pub struct FfiBlockQueueSoftTargets {
 #[uniffi::export]
 pub fn block_queue_soft_targets(rate_blocks_per_s: Option<f64>) -> FfiBlockQueueSoftTargets {
     let (win, free_mib) = rbitcoin_query::Query::block_queue_soft_targets(rate_blocks_per_s);
-    FfiBlockQueueSoftTargets { window: win, free_mib }
+    FfiBlockQueueSoftTargets {
+        window: win,
+        free_mib,
+    }
 }
 
 // --- RBF FFI ---
@@ -4855,8 +5083,7 @@ pub fn check_package_shape(txs_hex: Vec<String>) -> Result<(), RustyError> {
         .into_iter()
         .map(|h| deserialize_hex(&h).map_err(|_| RustyError::InvalidInput))
         .collect::<Result<_, _>>()?;
-    rbitcoin_mempool::ActiveMempool::check_package_shape(&txs)
-        .map_err(|_| RustyError::MempoolError)
+    rbitcoin_mempool::ActiveMempool::check_package_shape(&txs).map_err(|_| RustyError::MempoolError)
 }
 
 // --- Fee Estimation FFI ---
@@ -4959,7 +5186,10 @@ impl FfiFeeFlowMeter {
 
     pub fn note_admit(&self, weight_wu: u64, rate_sat_per_kvb: u64, elapsed_secs: u64) {
         let now = self.start + std::time::Duration::from_secs(elapsed_secs);
-        self.inner.lock().unwrap().note_admit(weight_wu, rate_sat_per_kvb, now);
+        self.inner
+            .lock()
+            .unwrap()
+            .note_admit(weight_wu, rate_sat_per_kvb, now);
     }
 }
 
@@ -5041,13 +5271,17 @@ impl FfiBlockCache {
 
     pub fn get_block(&self, hash_hex: String) -> Result<Option<String>, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        let block = self.inner.get_block(&bitcoin::BlockHash::from_byte_array(hash));
+        let block = self
+            .inner
+            .get_block(&bitcoin::BlockHash::from_byte_array(hash));
         Ok(block.map(|b| bitcoin::consensus::encode::serialize_hex(&b)))
     }
 
     pub fn get_header(&self, hash_hex: String) -> Result<Option<String>, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        let header = self.inner.get_header(&bitcoin::BlockHash::from_byte_array(hash));
+        let header = self
+            .inner
+            .get_header(&bitcoin::BlockHash::from_byte_array(hash));
         Ok(header.map(|h| bitcoin::consensus::encode::serialize_hex(&h)))
     }
 
@@ -5069,10 +5303,13 @@ impl FfiBlockCache {
     }
 
     pub fn push_best(&self, block_hex: String) -> Result<(), RustyError> {
-        let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
-        let block: bitcoin::Block =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
-        self.inner.push_best(block).map_err(|_| RustyError::InvalidInput)
+        let bytes =
+            rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
+        self.inner
+            .push_best(block)
+            .map_err(|_| RustyError::InvalidInput)
     }
 
     pub fn locator(&self) -> Vec<String> {
@@ -5143,8 +5380,8 @@ impl FfiChainHub {
         network: String,
         milestone_height: u32,
     ) -> Result<Arc<Self>, RustyError> {
-        let query =
-            rbitcoin_query::Query::open_or_create(&query_path).map_err(|_| RustyError::StoreError)?;
+        let query = rbitcoin_query::Query::open_or_create(&query_path)
+            .map_err(|_| RustyError::StoreError)?;
         let params = chain_params_for_network(&network)?;
         let milestone = rbitcoin_consensus::Milestone {
             height: milestone_height,
@@ -5155,7 +5392,9 @@ impl FfiChainHub {
     }
 
     pub fn ensure_genesis(&self) -> Result<(), RustyError> {
-        self.inner.ensure_genesis().map_err(|_| RustyError::ConsensusError)
+        self.inner
+            .ensure_genesis()
+            .map_err(|_| RustyError::ConsensusError)
     }
 
     pub fn tip_height(&self) -> Option<u32> {
@@ -5174,17 +5413,23 @@ impl FfiChainHub {
 
     pub fn has_block(&self, hash_hex: String) -> Result<bool, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        Ok(self.inner.has_block(&bitcoin::BlockHash::from_byte_array(hash)))
+        Ok(self
+            .inner
+            .has_block(&bitcoin::BlockHash::from_byte_array(hash)))
     }
 
     pub fn is_connected(&self, hash_hex: String) -> Result<bool, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        Ok(self.inner.is_connected(&bitcoin::BlockHash::from_byte_array(hash)))
+        Ok(self
+            .inner
+            .is_connected(&bitcoin::BlockHash::from_byte_array(hash)))
     }
 
     pub fn is_block_invalid(&self, hash_hex: String) -> Result<bool, RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        Ok(self.inner.is_block_invalid(&bitcoin::BlockHash::from_byte_array(hash)))
+        Ok(self
+            .inner
+            .is_block_invalid(&bitcoin::BlockHash::from_byte_array(hash)))
     }
 
     pub fn in_ibd(&self) -> bool {
@@ -5221,13 +5466,15 @@ impl FfiChainHub {
 
     pub fn note_asked_block(&self, hash_hex: String) -> Result<(), RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        self.inner.note_asked_block(bitcoin::BlockHash::from_byte_array(hash));
+        self.inner
+            .note_asked_block(bitcoin::BlockHash::from_byte_array(hash));
         Ok(())
     }
 
     pub fn forget_asked_block(&self, hash_hex: String) -> Result<(), RustyError> {
         let hash = parse_hash32(&hash_hex)?;
-        self.inner.forget_asked_block(&bitcoin::BlockHash::from_byte_array(hash));
+        self.inner
+            .forget_asked_block(&bitcoin::BlockHash::from_byte_array(hash));
         Ok(())
     }
 
@@ -5261,19 +5508,20 @@ impl FfiChainHub {
     pub fn accept_block(&self, block_hex: String) -> Result<FfiAcceptOutcome, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
-        let block: bitcoin::Block =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
-        Ok(self.inner.accept_block(block).map_err(|_| RustyError::ConsensusError)?.into())
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
+        Ok(self
+            .inner
+            .accept_block(block)
+            .map_err(|_| RustyError::ConsensusError)?
+            .into())
     }
 
-    pub fn accept_received_block(
-        &self,
-        block_hex: String,
-    ) -> Result<FfiAcceptOutcome, RustyError> {
+    pub fn accept_received_block(&self, block_hex: String) -> Result<FfiAcceptOutcome, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
-        let block: bitcoin::Block =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         Ok(self
             .inner
             .accept_received_block(block)
@@ -5284,8 +5532,8 @@ impl FfiChainHub {
     pub fn hold_unconnected_body(&self, block_hex: String) -> Result<(), RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
-        let block: bitcoin::Block =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         self.inner.hold_unconnected_body(block);
         Ok(())
     }
@@ -5347,7 +5595,10 @@ impl FfiChainHub {
     }
 
     pub fn chain_work(&self) -> Result<String, RustyError> {
-        let work = self.inner.chain_work().map_err(|_| RustyError::ConsensusError)?;
+        let work = self
+            .inner
+            .chain_work()
+            .map_err(|_| RustyError::ConsensusError)?;
         Ok(rbitcoin_primitives::hex_encode(work.to_be_bytes()))
     }
 
@@ -5362,8 +5613,8 @@ impl FfiChainHub {
     pub fn work_with_header(&self, header_hex: String) -> Result<String, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-        let header: bitcoin::block::Header =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         let work = self.inner.work_with_header(&header);
         Ok(rbitcoin_primitives::hex_encode(work.to_be_bytes()))
     }
@@ -5402,8 +5653,8 @@ impl FfiChainHub {
     pub fn process_submitted_header(&self, header_hex: String) -> Result<(), RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-        let header: bitcoin::block::Header =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         self.inner
             .process_submitted_header(&header)
             .map_err(|_| RustyError::ConsensusError)
@@ -5412,24 +5663,24 @@ impl FfiChainHub {
     pub fn unrequested_too_far_ahead(&self, header_hex: String) -> Result<bool, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-        let header: bitcoin::block::Header =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         Ok(self.inner.unrequested_too_far_ahead(&header))
     }
 
     pub fn unrequested_weaker_than_tip(&self, header_hex: String) -> Result<bool, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-        let header: bitcoin::block::Header =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         Ok(self.inner.unrequested_weaker_than_tip(&header))
     }
 
     pub fn header_below_minwork(&self, header_hex: String) -> Result<bool, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-        let header: bitcoin::block::Header =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         Ok(self.inner.header_below_minwork(&header))
     }
 
@@ -5442,8 +5693,8 @@ impl FfiChainHub {
     pub fn ensure_header(&self, header_hex: String) -> Result<(), RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
-        let header: bitcoin::block::Header =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
         self.inner
             .ensure_header(&header)
             .map_err(|_| RustyError::ConsensusError)
@@ -5453,8 +5704,8 @@ impl FfiChainHub {
         let blocks: Vec<bitcoin::Block> = block_hexes
             .into_iter()
             .map(|hex| {
-                let bytes = rbitcoin_primitives::hex_decode(&hex)
-                    .map_err(|_| RustyError::InvalidInput)?;
+                let bytes =
+                    rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
                 bitcoin::consensus::encode::deserialize(&bytes)
                     .map_err(|_| RustyError::InvalidInput)
             })
@@ -5477,8 +5728,8 @@ impl FfiChainHub {
         let extra_txs: Vec<bitcoin::Transaction> = extra_tx_hexes
             .into_iter()
             .map(|hex| {
-                let bytes = rbitcoin_primitives::hex_decode(&hex)
-                    .map_err(|_| RustyError::InvalidInput)?;
+                let bytes =
+                    rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
                 bitcoin::consensus::encode::deserialize(&bytes)
                     .map_err(|_| RustyError::InvalidInput)
             })
@@ -5502,8 +5753,8 @@ impl FfiChainHub {
         let extra_txs: Vec<bitcoin::Transaction> = extra_tx_hexes
             .into_iter()
             .map(|hex| {
-                let bytes = rbitcoin_primitives::hex_decode(&hex)
-                    .map_err(|_| RustyError::InvalidInput)?;
+                let bytes =
+                    rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
                 bitcoin::consensus::encode::deserialize(&bytes)
                     .map_err(|_| RustyError::InvalidInput)
             })
@@ -5644,8 +5895,8 @@ impl FfiMempoolHub {
         weight_limit: u64,
         persist: bool,
     ) -> Result<Arc<Self>, RustyError> {
-        let query =
-            rbitcoin_query::Query::open_or_create(&query_path).map_err(|_| RustyError::StoreError)?;
+        let query = rbitcoin_query::Query::open_or_create(&query_path)
+            .map_err(|_| RustyError::StoreError)?;
         let hub = rbitcoin_net::MempoolHub::open_with_weight_persist(
             &dir,
             Arc::new(query),
@@ -5746,9 +5997,12 @@ impl FfiMempoolHub {
     pub fn accept_tx(&self, tx_hex: String) -> Result<FfiAcceptResult, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-        let tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
-        let result = self.inner.accept_tx(&tx).map_err(|_| RustyError::MempoolError)?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
+        let result = self
+            .inner
+            .accept_tx(&tx)
+            .map_err(|_| RustyError::MempoolError)?;
         Ok(FfiAcceptResult {
             txid: result.txid.to_string(),
             fee_sat: result.fee_sat,
@@ -5766,9 +6020,12 @@ impl FfiMempoolHub {
     pub fn test_accept(&self, tx_hex: String) -> Result<FfiAcceptResult, RustyError> {
         let bytes =
             rbitcoin_primitives::hex_decode(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
-        let tx: bitcoin::Transaction =
-            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
-        let result = self.inner.test_accept(&tx).map_err(|_| RustyError::MempoolError)?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&bytes)
+            .map_err(|_| RustyError::InvalidInput)?;
+        let result = self
+            .inner
+            .test_accept(&tx)
+            .map_err(|_| RustyError::MempoolError)?;
         Ok(FfiAcceptResult {
             txid: result.txid.to_string(),
             fee_sat: result.fee_sat,
@@ -5861,7 +6118,10 @@ impl FfiMempoolHub {
         self.inner.min_relay_sat_kvb()
     }
 
-    pub fn graph_stats(&self, txid_hex: String) -> Result<Option<FfiMempoolGraphStats>, RustyError> {
+    pub fn graph_stats(
+        &self,
+        txid_hex: String,
+    ) -> Result<Option<FfiMempoolGraphStats>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
         Ok(self.inner.graph_stats(&txid).map(|s| FfiMempoolGraphStats {
             ancestorcount: s.ancestorcount,
@@ -5878,20 +6138,23 @@ impl FfiMempoolHub {
         txid_hex: String,
     ) -> Result<Option<FfiGraphFeesModified>, RustyError> {
         let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
-        Ok(self.inner.graph_fees_modified(&txid).map(|(s, a, d, cf, cw)| FfiGraphFeesModified {
-            stats: FfiMempoolGraphStats {
-                ancestorcount: s.ancestorcount,
-                ancestorsize: s.ancestorsize,
-                ancestorfees: s.ancestorfees,
-                descendantcount: s.descendantcount,
-                descendantsize: s.descendantsize,
-                descendantfees: s.descendantfees,
-            },
-            ancestor_fee_mod: a,
-            descendant_fee_mod: d,
-            chunk_fee: cf,
-            chunk_weight: cw,
-        }))
+        Ok(self
+            .inner
+            .graph_fees_modified(&txid)
+            .map(|(s, a, d, cf, cw)| FfiGraphFeesModified {
+                stats: FfiMempoolGraphStats {
+                    ancestorcount: s.ancestorcount,
+                    ancestorsize: s.ancestorsize,
+                    ancestorfees: s.ancestorfees,
+                    descendantcount: s.descendantcount,
+                    descendantsize: s.descendantsize,
+                    descendantfees: s.descendantfees,
+                },
+                ancestor_fee_mod: a,
+                descendant_fee_mod: d,
+                chunk_fee: cf,
+                chunk_weight: cw,
+            }))
     }
 
     pub fn feerate_diagram(&self) -> Vec<FfiFeeratePoint> {
@@ -5909,7 +6172,10 @@ impl FfiMempoolHub {
         self.inner
             .fee_histogram()
             .into_iter()
-            .map(|(r, w)| FfiFeeHistogramEntry { feerate: r, weight: w })
+            .map(|(r, w)| FfiFeeHistogramEntry {
+                feerate: r,
+                weight: w,
+            })
             .collect()
     }
 
@@ -6000,9 +6266,9 @@ pub fn classify_v2_cmpct_peer(contents_hex: String) -> Result<FfiCmpctPeerFrame,
     let bytes =
         rbitcoin_primitives::hex_decode(&contents_hex).map_err(|_| RustyError::InvalidInput)?;
     Ok(match rbitcoin_net::classify_v2_cmpct_peer(&bytes) {
-        rbitcoin_net::CmpctPeerFrame::GetBlockTxn(idxs) => FfiCmpctPeerFrame::GetBlockTxn {
-            indexes: idxs,
-        },
+        rbitcoin_net::CmpctPeerFrame::GetBlockTxn(idxs) => {
+            FfiCmpctPeerFrame::GetBlockTxn { indexes: idxs }
+        }
         rbitcoin_net::CmpctPeerFrame::Ping(n) => FfiCmpctPeerFrame::Ping { nonce: n },
         rbitcoin_net::CmpctPeerFrame::Pong(n) => FfiCmpctPeerFrame::Pong { nonce: n },
         rbitcoin_net::CmpctPeerFrame::Other => FfiCmpctPeerFrame::Other,
@@ -6762,14 +7028,16 @@ pub fn p2tr_address_from_pubkey(pubkey_hex: String, network: String) -> Result<S
 pub fn xonly_pubkey_from_pubkey_hex(pubkey_hex: String) -> Result<String, RustyError> {
     let bytes =
         rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
-    let pubkey =
-        bitcoin::PublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    let pubkey = bitcoin::PublicKey::from_slice(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let xonly = pubkey.inner.x_only_public_key().0;
     Ok(rbitcoin_primitives::hex_encode(xonly.serialize()))
 }
 
 #[uniffi::export]
-pub fn taproot_tweak_pubkey_hex(pubkey_hex: String, tweak_hex: String) -> Result<String, RustyError> {
+pub fn taproot_tweak_pubkey_hex(
+    pubkey_hex: String,
+    tweak_hex: String,
+) -> Result<String, RustyError> {
     let bytes =
         rbitcoin_primitives::hex_decode(&pubkey_hex).map_err(|_| RustyError::InvalidInput)?;
     let xonly =
@@ -6784,7 +7052,8 @@ pub fn taproot_tweak_pubkey_hex(pubkey_hex: String, tweak_hex: String) -> Result
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let scalar = bitcoin::secp256k1::Scalar::from_be_bytes(tweak_arr)
         .map_err(|_| RustyError::InvalidInput)?;
-    let tweaked = xonly.add_tweak(&secp, &scalar)
+    let tweaked = xonly
+        .add_tweak(&secp, &scalar)
         .map_err(|_| RustyError::InvalidInput)?;
     Ok(rbitcoin_primitives::hex_encode(tweaked.0.serialize()))
 }
@@ -6906,7 +7175,10 @@ pub fn psbt_output_count(hex: String) -> Result<u64, RustyError> {
 pub fn psbt_is_finalized(hex: String) -> Result<bool, RustyError> {
     let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
     let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
-    Ok(psbt.inputs.iter().all(|i| i.final_script_sig.is_some() || i.final_script_witness.is_some()))
+    Ok(psbt
+        .inputs
+        .iter()
+        .all(|i| i.final_script_sig.is_some() || i.final_script_witness.is_some()))
 }
 
 #[uniffi::export]
@@ -6931,7 +7203,9 @@ pub fn psbt_combine(hex_a: String, hex_b: String) -> Result<String, RustyError> 
     let mut psbt_a = bitcoin::Psbt::deserialize(&bytes_a).map_err(|_| RustyError::InvalidInput)?;
     let bytes_b = rbitcoin_primitives::hex_decode(&hex_b).map_err(|_| RustyError::InvalidInput)?;
     let psbt_b = bitcoin::Psbt::deserialize(&bytes_b).map_err(|_| RustyError::InvalidInput)?;
-    psbt_a.combine(psbt_b).map_err(|_| RustyError::InvalidInput)?;
+    psbt_a
+        .combine(psbt_b)
+        .map_err(|_| RustyError::InvalidInput)?;
     Ok(rbitcoin_primitives::hex_encode(psbt_a.serialize()))
 }
 
@@ -7095,8 +7369,8 @@ impl FfiNodeHandle {
         network: String,
         tiny_heads: bool,
     ) -> Result<Arc<Self>, RustyError> {
-        let net = rbitcoin_primitives::Network::parse(&network)
-            .map_err(|_| RustyError::InvalidInput)?;
+        let net =
+            rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
         let mut config = rbitcoin_node::NodeConfig::default()
             .with_datadir(std::path::PathBuf::from(&datadir))
             .with_network(net);
@@ -7122,21 +7396,42 @@ impl FfiNodeHandle {
     }
 
     pub fn tip_height(&self) -> Option<u64> {
-        self.inner.lock().unwrap().query.tip_height().map(|h| h.0 as u64)
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .tip_height()
+            .map(|h| h.0 as u64)
     }
 
     pub fn tip_hash(&self) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         let fk = inner.query.tip_header_fk().ok()??;
-        inner.query.get_header(fk).ok().map(|h| rbitcoin_primitives::hex_encode(h.hash))
+        inner
+            .query
+            .get_header(fk)
+            .ok()
+            .map(|h| rbitcoin_primitives::hex_encode(h.hash))
     }
 
     pub fn store_path(&self) -> String {
-        self.inner.lock().unwrap().config.store_path().to_string_lossy().to_string()
+        self.inner
+            .lock()
+            .unwrap()
+            .config
+            .store_path()
+            .to_string_lossy()
+            .to_string()
     }
 
     pub fn mempool_path(&self) -> String {
-        self.inner.lock().unwrap().config.mempool_path().to_string_lossy().to_string()
+        self.inner
+            .lock()
+            .unwrap()
+            .config
+            .mempool_path()
+            .to_string_lossy()
+            .to_string()
     }
 
     pub fn shutdown(&self) -> Result<(), RustyError> {
@@ -7243,23 +7538,39 @@ impl FfiNodeHandle {
     }
 
     pub fn warning_strings(&self, network: String) -> Result<Vec<String>, RustyError> {
-        let net = rbitcoin_primitives::Network::parse(&network)
-            .map_err(|_| RustyError::InvalidInput)?;
-        Ok(rbitcoin_net::warning_strings(&self.inner.lock().unwrap().query, net))
+        let net =
+            rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
+        Ok(rbitcoin_net::warning_strings(
+            &self.inner.lock().unwrap().query,
+            net,
+        ))
     }
 
     pub fn active_unknown_bits(&self, network: String) -> Result<Vec<i32>, RustyError> {
-        let net = rbitcoin_primitives::Network::parse(&network)
-            .map_err(|_| RustyError::InvalidInput)?;
-        Ok(rbitcoin_net::active_unknown_bits(&self.inner.lock().unwrap().query, net))
+        let net =
+            rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
+        Ok(rbitcoin_net::active_unknown_bits(
+            &self.inner.lock().unwrap().query,
+            net,
+        ))
     }
 
     pub fn drain_and_fence_hi(&self) -> Option<u64> {
-        self.inner.lock().unwrap().query.drain_and_fence_hi().map(|h| h as u64)
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .drain_and_fence_hi()
+            .map(|h| h as u64)
     }
 
     pub fn sh_indexed_through_height(&self) -> Option<u64> {
-        self.inner.lock().unwrap().query.sh_indexed_through_height().map(|h| h as u64)
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .sh_indexed_through_height()
+            .map(|h| h as u64)
     }
 
     pub fn max_sh_creates(&self) -> u32 {
@@ -7271,7 +7582,12 @@ impl FfiNodeHandle {
     }
 
     pub fn block_queue_max_height(&self) -> Option<u64> {
-        self.inner.lock().unwrap().query.block_queue_max_height().map(|h| h as u64)
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .block_queue_max_height()
+            .map(|h| h as u64)
     }
 
     pub fn block_queue_soft_pressure(&self) -> bool {
@@ -7289,7 +7605,11 @@ impl FfiNodeHandle {
     }
 
     pub fn block_queue_has_height(&self, height: u32) -> bool {
-        self.inner.lock().unwrap().query.block_queue_has_height(height)
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .block_queue_has_height(height)
     }
 
     pub fn block_queue_hash_at_height(&self, height: u32) -> Option<String> {
@@ -7326,15 +7646,29 @@ impl FfiNodeHandle {
     }
 
     pub fn fence_max_connected_fk(&self) -> u64 {
-        self.inner.lock().unwrap().query.store().fence_max_connected_fk()
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .store()
+            .fence_max_connected_fk()
     }
 
     pub fn height_fence_run_count(&self) -> u64 {
-        self.inner.lock().unwrap().query.store().height_fence_run_count() as u64
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .store()
+            .height_fence_run_count() as u64
     }
 
     pub fn sample_reset_reconstruct_archived(&self) -> u64 {
-        self.inner.lock().unwrap().query.sample_reset_reconstruct_archived()
+        self.inner
+            .lock()
+            .unwrap()
+            .query
+            .sample_reset_reconstruct_archived()
     }
 
     pub fn sample_reset_thin_tweak_body_bytes(&self) -> u64 {
@@ -7352,7 +7686,8 @@ pub fn node_handle_open_with_scale(
     network: String,
     scale: FfiHeadScale,
 ) -> Result<Arc<FfiNodeHandle>, RustyError> {
-    let net = rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
+    let net =
+        rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
     let head_scale = match scale {
         FfiHeadScale::Tiny => rbitcoin_store::HeadScale::Tiny,
         FfiHeadScale::Mainnet => rbitcoin_store::HeadScale::Mainnet,
@@ -7452,7 +7787,11 @@ struct P2PState {
 static P2P_STATE: std::sync::OnceLock<std::sync::Mutex<P2PState>> = std::sync::OnceLock::new();
 
 #[uniffi::export]
-pub fn p2p_start(datadir: String, network: String, max_run_secs: u64) -> Result<String, RustyError> {
+pub fn p2p_start(
+    datadir: String,
+    network: String,
+    max_run_secs: u64,
+) -> Result<String, RustyError> {
     let state = P2P_STATE.get_or_init(|| {
         std::sync::Mutex::new(P2PState {
             shutdown: rbitcoin_node::Shutdown::new(),
@@ -7470,8 +7809,8 @@ pub fn p2p_start(datadir: String, network: String, max_run_secs: u64) -> Result<
     guard.shutdown = rbitcoin_node::Shutdown::new();
     let shutdown = Arc::clone(&guard.shutdown);
 
-    let net = rbitcoin_primitives::Network::parse(&network)
-        .map_err(|_| RustyError::InvalidInput)?;
+    let net =
+        rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
 
     let mut config = rbitcoin_node::NodeConfig::default()
         .with_datadir(std::path::PathBuf::from(&datadir))
@@ -7483,12 +7822,12 @@ pub fn p2p_start(datadir: String, network: String, max_run_secs: u64) -> Result<
     config.head_scale = rbitcoin_store::HeadScale::Tiny;
 
     let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("tokio runtime: {e}"))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
         rt.block_on(async {
             // Signal handler spawn is inside run_p2p; on iOS it logs a warning and returns.
             rbitcoin_node::run_p2p_with_shutdown(config, Some(shutdown)).await
-        }).map_err(|e| format!("run_p2p: {e}"))
+        })
+        .map_err(|e| format!("run_p2p: {e}"))
     });
 
     guard.handle = Some(handle);
@@ -7526,8 +7865,8 @@ pub fn p2p_start_with_config(
     guard.shutdown = rbitcoin_node::Shutdown::new();
     let shutdown = Arc::clone(&guard.shutdown);
 
-    let net = rbitcoin_primitives::Network::parse(&network)
-        .map_err(|_| RustyError::InvalidInput)?;
+    let net =
+        rbitcoin_primitives::Network::parse(&network).map_err(|_| RustyError::InvalidInput)?;
 
     let mut config = rbitcoin_node::NodeConfig::default()
         .with_datadir(std::path::PathBuf::from(&datadir))
@@ -7573,11 +7912,9 @@ pub fn p2p_start_with_config(
     }
 
     let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("tokio runtime: {e}"))?;
-        rt.block_on(async {
-            rbitcoin_node::run_p2p_with_shutdown(config, Some(shutdown)).await
-        }).map_err(|e| format!("run_p2p: {e}"))
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
+        rt.block_on(async { rbitcoin_node::run_p2p_with_shutdown(config, Some(shutdown)).await })
+            .map_err(|e| format!("run_p2p: {e}"))
     });
 
     guard.handle = Some(handle);
@@ -7662,13 +7999,15 @@ mod tests {
     #[test]
     fn test_address_script_pubkey_roundtrip() {
         let p2wpkh_hex = "00140000000000000000000000000000000000000000";
-        let addr = address_from_script_pubkey(p2wpkh_hex.to_string(), "mainnet".to_string()).unwrap();
+        let addr =
+            address_from_script_pubkey(p2wpkh_hex.to_string(), "mainnet".to_string()).unwrap();
         assert!(addr.starts_with("bc1q"));
         let back = script_pubkey_from_address(addr, "mainnet".to_string()).unwrap();
         assert_eq!(back.to_lowercase(), p2wpkh_hex);
 
         let p2tr_hex = "51200000000000000000000000000000000000000000000000000000000000000000";
-        let addr2 = address_from_script_pubkey(p2tr_hex.to_string(), "mainnet".to_string()).unwrap();
+        let addr2 =
+            address_from_script_pubkey(p2tr_hex.to_string(), "mainnet".to_string()).unwrap();
         assert!(addr2.starts_with("bc1p"));
     }
 
@@ -7722,10 +8061,7 @@ mod tests {
                 store.tx_height_get_batch(vec![1, 2]).unwrap(),
                 vec![None, None]
             );
-            assert_eq!(
-                store.txids_get_many(vec![1, 2]).unwrap(),
-                vec![None, None]
-            );
+            assert_eq!(store.txids_get_many(vec![1, 2]).unwrap(), vec![None, None]);
             assert_eq!(
                 store.tx_body_range_batch(vec![1, 2]).unwrap(),
                 vec![None, None]
@@ -8049,7 +8385,9 @@ mod tests {
         assert_eq!(query.block_queue_dequeue_height(0).unwrap(), 0);
         assert_eq!(query.tx_fk_by_txid_tip("0".repeat(64)).unwrap(), None);
         assert_eq!(query.take_disconnect(0), None);
-        assert!(query.block_queue_unresolved_heights(0, vec![], 100).is_empty());
+        assert!(query
+            .block_queue_unresolved_heights(0, vec![], 100)
+            .is_empty());
         assert_eq!(
             query.block_queue_payload_by_hash("0".repeat(64)).unwrap(),
             None
@@ -8116,7 +8454,10 @@ mod tests {
         assert!(query.get_tx(1).is_err());
         assert_eq!(query.header_tx_fks(1, None).unwrap(), None);
         assert!(query.spenders("0".repeat(64), 0).unwrap().is_empty());
-        assert!(query.spenders_at("0".repeat(64), 0, None).unwrap().is_empty());
+        assert!(query
+            .spenders_at("0".repeat(64), 0, None)
+            .unwrap()
+            .is_empty());
         assert!(query.tx_input("0".repeat(64), 0).is_err());
         assert!(query.tx_output("0".repeat(64), 0).is_err());
         assert!(query.tx_input_at_fk(1, 0).is_err());
@@ -8130,7 +8471,17 @@ mod tests {
         let query = FfiQuery::open_or_create(path).unwrap();
         let zero_hash = "0".repeat(64);
         let fk = query
-            .put_header(0, 0x20000000, 1231006505, 0x1d00ffff, 2083236893, zero_hash.clone(), zero_hash.clone(), 80, 320)
+            .put_header(
+                0,
+                0x20000000,
+                1231006505,
+                0x1d00ffff,
+                2083236893,
+                zero_hash.clone(),
+                zero_hash.clone(),
+                80,
+                320,
+            )
             .unwrap();
         assert!(fk > 0);
         let header = query.get_header(fk).unwrap();
@@ -8161,9 +8512,13 @@ mod tests {
         let path = tmp.path().join("query7").to_str().unwrap().to_string();
         let query = FfiQuery::open_or_create(path).unwrap();
         let hash = "0".repeat(64);
-        let offer = query.block_queue_offer(100, hash.clone(), 1, vec![1, 2, 3]).unwrap();
+        let offer = query
+            .block_queue_offer(100, hash.clone(), 1, vec![1, 2, 3])
+            .unwrap();
         assert_eq!(offer.queue_id, 1);
-        let id = query.block_queue_enqueue(101, hash.clone(), 2, vec![4, 5, 6]).unwrap();
+        let id = query
+            .block_queue_enqueue(101, hash.clone(), 2, vec![4, 5, 6])
+            .unwrap();
         assert_eq!(id, 2);
         assert!(query.block_queue_has_height(100));
         assert!(query.block_queue_has_height(101));
@@ -8172,7 +8527,12 @@ mod tests {
         assert_eq!(dequeued, 1);
         assert!(!query.block_queue_has_height(100));
         query.block_queue_drop_resolved_from(50);
-        assert_eq!(query.block_queue_mark_resolve_complete_wave(vec![101]).unwrap(), 1);
+        assert_eq!(
+            query
+                .block_queue_mark_resolve_complete_wave(vec![101])
+                .unwrap(),
+            1
+        );
         assert!(query.block_queue_is_resolve_complete(101));
         let taken = query.block_queue_take_raw(101);
         assert!(taken.is_some() || taken.is_none());
@@ -8195,7 +8555,12 @@ mod tests {
     #[test]
     fn test_mempool_append_live_tx() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("mempool_append").to_str().unwrap().to_string();
+        let path = tmp
+            .path()
+            .join("mempool_append")
+            .to_str()
+            .unwrap()
+            .to_string();
         let mempool = FfiMempool::open_or_create(path).unwrap();
         let tx_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff025101ffffffff0100f2052a010000001976a914000000000000000000000000000000000000000088ac00000000";
         let slot = mempool.append_live_tx(tx_hex.to_string(), 0, 484).unwrap();
@@ -9100,7 +9465,9 @@ mod tests {
         let auth = write_cookie_file(path.clone()).unwrap();
         assert_eq!(auth.user, "__cookie__");
         assert_eq!(auth.password.len(), 64);
-        assert!(std::fs::read_to_string(&path).unwrap().contains(&auth.password));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(&auth.password));
     }
 
     #[test]
@@ -9129,13 +9496,8 @@ mod tests {
     #[test]
     fn test_resolve_rpc_auth_cookie() {
         let tmp = tempfile::tempdir().unwrap();
-        let auth = resolve_rpc_auth(
-            tmp.path().to_str().unwrap().to_string(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let auth =
+            resolve_rpc_auth(tmp.path().to_str().unwrap().to_string(), None, None, None).unwrap();
         assert_eq!(auth.user, "__cookie__");
         assert_eq!(auth.password.len(), 64);
     }
@@ -9357,7 +9719,12 @@ mod tests {
         let checksum = p2p_message_checksum(payload_hex.to_string()).unwrap();
         assert_eq!(checksum.len(), 8); // 4 bytes = 8 hex chars
 
-        let frame_hex = p2p_encode_frame(magic_hex.to_string(), command.to_string(), payload_hex.to_string()).unwrap();
+        let frame_hex = p2p_encode_frame(
+            magic_hex.to_string(),
+            command.to_string(),
+            payload_hex.to_string(),
+        )
+        .unwrap();
         let frame = p2p_decode_frame(frame_hex).unwrap();
         assert_eq!(frame.magic_hex, magic_hex);
         assert_eq!(frame.command, command);
@@ -9396,7 +9763,11 @@ mod tests {
         assert!(p2tr.starts_with("bc1p"));
 
         // Tweak with zeros
-        let tweaked = taproot_tweak_pubkey_hex(xonly, "0000000000000000000000000000000000000000000000000000000000000000".to_string()).unwrap();
+        let tweaked = taproot_tweak_pubkey_hex(
+            xonly,
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        )
+        .unwrap();
         assert_eq!(tweaked.len(), 64);
     }
 
@@ -9684,7 +10055,10 @@ mod tests {
     #[test]
     fn test_addrman_inject() {
         let am = FfiAddrMan::new();
-        am.inject(vec!["127.0.0.1:8333".to_string(), "127.0.0.1:8334".to_string()]);
+        am.inject(vec![
+            "127.0.0.1:8333".to_string(),
+            "127.0.0.1:8334".to_string(),
+        ]);
         assert_eq!(am.len(), 2);
     }
 
@@ -9708,9 +10082,11 @@ mod tests {
     #[test]
     fn test_tx_graph_contains_missing() {
         let g = FfiTxGraph::new();
-        assert!(!g.contains(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        ).unwrap());
+        assert!(!g
+            .contains(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .unwrap());
     }
 
     #[test]
@@ -9729,32 +10105,57 @@ mod tests {
     #[test]
     fn test_tx_graph_wtxid_and_utxo_empty() {
         let g = FfiTxGraph::new();
-        assert!(!g.contains_wtxid(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        ).unwrap());
-        assert_eq!(g.txid_for_wtxid(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        ).unwrap(), None);
-        assert!(!g.mempool_utxo(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), 0
-        ).unwrap());
-        assert_eq!(g.creator(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), 0
-        ).unwrap(), None);
-        assert_eq!(g.conflict_txid(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), 0
-        ).unwrap(), None);
+        assert!(!g
+            .contains_wtxid(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .unwrap());
+        assert_eq!(
+            g.txid_for_wtxid(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .unwrap(),
+            None
+        );
+        assert!(!g
+            .mempool_utxo(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                0
+            )
+            .unwrap());
+        assert_eq!(
+            g.creator(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                0
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            g.conflict_txid(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                0
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn test_tx_graph_ancestor_descendant_empty() {
         let g = FfiTxGraph::new();
-        assert!(g.ancestor_set(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        ).unwrap().is_empty());
-        assert!(g.descendant_set(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        ).unwrap().is_empty());
+        assert!(g
+            .ancestor_set(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .unwrap()
+            .is_empty());
+        assert!(g
+            .descendant_set(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -9814,7 +10215,8 @@ mod tests {
     #[test]
     fn test_active_mempool_relay_fee() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         assert_eq!(am.min_relay_sat_kvb(), 100);
         am.set_min_relay_sat_kvb(200);
         assert_eq!(am.min_relay_sat_kvb(), 200);
@@ -9823,17 +10225,18 @@ mod tests {
     #[test]
     fn test_active_mempool_cluster_limits() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         am.set_cluster_limits(Some(50), Some(200));
     }
 
     #[test]
     fn test_active_mempool_get_tx_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
-        let tx = am.get_tx(
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        );
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let tx = am
+            .get_tx("0000000000000000000000000000000000000000000000000000000000000000".to_string());
         assert!(tx.is_ok());
         assert!(tx.unwrap().is_none());
     }
@@ -9841,7 +10244,8 @@ mod tests {
     #[test]
     fn test_active_mempool_select_block_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         let txs = am.select_block_txs(4_000_000);
         assert!(txs.is_empty());
     }
@@ -9849,7 +10253,8 @@ mod tests {
     #[test]
     fn test_active_mempool_remove_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         let result = am.remove_txid(
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         );
@@ -9859,7 +10264,8 @@ mod tests {
     #[test]
     fn test_active_mempool_compact_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         let result = am.compact();
         assert!(result.is_ok());
     }
@@ -9867,7 +10273,8 @@ mod tests {
     #[test]
     fn test_active_mempool_park_orphan_bad_tx() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         let tx = bitcoin::Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
@@ -9887,7 +10294,8 @@ mod tests {
     #[test]
     fn test_active_mempool_erase_orphans_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         am.erase_orphans_for_block(vec![]).unwrap();
     }
 
@@ -9895,8 +10303,10 @@ mod tests {
     fn test_active_mempool_accept_tx_empty() {
         let tmp_query = tempfile::tempdir().unwrap();
         let tmp_mempool = tempfile::tempdir().unwrap();
-        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let query =
+            FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string())
+            .unwrap();
         let tx = bitcoin::Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
@@ -9922,8 +10332,10 @@ mod tests {
     fn test_active_mempool_accept_package_empty() {
         let tmp_query = tempfile::tempdir().unwrap();
         let tmp_mempool = tempfile::tempdir().unwrap();
-        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let query =
+            FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string())
+            .unwrap();
         let result = am.accept_package(query, vec![]);
         assert!(result.is_ok());
         let result_str = result.unwrap();
@@ -9934,8 +10346,10 @@ mod tests {
     fn test_active_mempool_promote_orphans_of_missing() {
         let tmp_query = tempfile::tempdir().unwrap();
         let tmp_mempool = tempfile::tempdir().unwrap();
-        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let query =
+            FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string())
+            .unwrap();
         let result = am.promote_orphans_of(
             query,
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
@@ -9947,8 +10361,10 @@ mod tests {
     fn test_active_mempool_reorg_disconnect_reaccept_empty() {
         let tmp_query = tempfile::tempdir().unwrap();
         let tmp_mempool = tempfile::tempdir().unwrap();
-        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let query =
+            FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string())
+            .unwrap();
         let result = am.reorg_disconnect_reaccept(query, vec![]);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
@@ -9974,7 +10390,8 @@ mod tests {
     #[test]
     fn test_active_mempool_max_weight() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
         assert!(am.max_weight() > 0);
     }
 
@@ -9982,16 +10399,21 @@ mod tests {
     fn test_active_mempool_evict_nonfinal_empty() {
         let tmp_query = tempfile::tempdir().unwrap();
         let tmp_mempool = tempfile::tempdir().unwrap();
-        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let query =
+            FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string())
+            .unwrap();
         am.evict_nonfinal(query).unwrap();
     }
 
     #[test]
     fn test_active_mempool_select_block_txs_delta_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
-        let txs = am.select_block_txs_delta(4_000_000, vec![], vec![]).unwrap();
+        let am =
+            FfiActiveMempool::open_or_create(tmp.path().to_str().unwrap().to_string()).unwrap();
+        let txs = am
+            .select_block_txs_delta(4_000_000, vec![], vec![])
+            .unwrap();
         assert!(txs.is_empty());
     }
 
@@ -9999,8 +10421,10 @@ mod tests {
     fn test_active_mempool_remove_for_block_with_utxo_empty() {
         let tmp_query = tempfile::tempdir().unwrap();
         let tmp_mempool = tempfile::tempdir().unwrap();
-        let query = FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
-        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string()).unwrap();
+        let query =
+            FfiQuery::open_or_create(tmp_query.path().to_str().unwrap().to_string()).unwrap();
+        let am = FfiActiveMempool::open_or_create(tmp_mempool.path().to_str().unwrap().to_string())
+            .unwrap();
         let n = am.remove_for_block_with_utxo(query, vec![]).unwrap();
         assert_eq!(n, 0);
     }
@@ -10018,7 +10442,10 @@ mod tests {
             lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
             input: vec![bitcoin::TxIn {
                 previous_output: bitcoin::OutPoint::new(
-                    bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
+                    bitcoin::Txid::from_str(
+                        "0000000000000000000000000000000000000000000000000000000000000001",
+                    )
+                    .unwrap(),
                     0,
                 ),
                 script_sig: bitcoin::ScriptBuf::new(),
@@ -10042,7 +10469,10 @@ mod tests {
             lock_time: bitcoin::locktime::absolute::LockTime::from_height(0).unwrap(),
             input: vec![bitcoin::TxIn {
                 previous_output: bitcoin::OutPoint::new(
-                    bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
+                    bitcoin::Txid::from_str(
+                        "0000000000000000000000000000000000000000000000000000000000000001",
+                    )
+                    .unwrap(),
                     0,
                 ),
                 script_sig: bitcoin::ScriptBuf::new(),
@@ -10073,7 +10503,8 @@ mod tests {
     fn test_active_mempool_open_with_limit_persist() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
-        let am = FfiActiveMempool::open_with_limit_persist(path.clone(), 100_000_000, true).unwrap();
+        let am =
+            FfiActiveMempool::open_with_limit_persist(path.clone(), 100_000_000, true).unwrap();
         assert_eq!(am.live_count(), 0);
         let am2 = FfiActiveMempool::open_with_limit_persist(path, 100_000_000, false).unwrap();
         assert_eq!(am2.live_count(), 0);
@@ -10154,7 +10585,9 @@ mod tests {
         let locator = cache.locator();
         assert!(!locator.is_empty());
         // Empty locator resolves to genesis → returns headers from start
-        let headers = cache.headers_after_locator(vec![], genesis_hash.to_string()).unwrap();
+        let headers = cache
+            .headers_after_locator(vec![], genesis_hash.to_string())
+            .unwrap();
         assert_eq!(headers.len(), 1);
         cache.truncate_to_height(0);
         assert_eq!(cache.len(), 1);
@@ -10189,7 +10622,10 @@ mod tests {
         let hashes = set.hashes();
         assert_eq!(hashes.len(), 1);
         // parse_hash32 parses display format; hex_encode returns raw bytes
-        assert_eq!(hashes[0], "000000000000000000000000000000000000000000000000000000000000cdab");
+        assert_eq!(
+            hashes[0],
+            "000000000000000000000000000000000000000000000000000000000000cdab"
+        );
     }
 
     #[test]
@@ -10201,10 +10637,7 @@ mod tests {
             eviction_netgroup(a).unwrap(),
             eviction_netgroup(b.clone()).unwrap()
         );
-        assert_ne!(
-            eviction_netgroup(b).unwrap(),
-            eviction_netgroup(c).unwrap()
-        );
+        assert_ne!(eviction_netgroup(b).unwrap(), eviction_netgroup(c).unwrap());
     }
 
     #[test]
@@ -10284,10 +10717,7 @@ mod tests {
         let outcome2 = hub.accept_received_block(block_hex).unwrap();
         assert!(matches!(outcome2, FfiAcceptOutcome::AlreadyHave));
         // header_height and knows_header
-        assert_eq!(
-            hub.header_height(genesis_hash.clone()).unwrap(),
-            Some(0)
-        );
+        assert_eq!(hub.header_height(genesis_hash.clone()).unwrap(), Some(0));
         assert!(hub.knows_header(genesis_hash.clone()).unwrap());
         // Work queries
         let cw = hub.chain_work().unwrap();
@@ -10315,8 +10745,7 @@ mod tests {
         let genesis_hash = hub.tip_hash().unwrap();
         let block_hex = mine_empty_regtest(genesis_hash, 1296688603, 1).unwrap();
         let bytes = rbitcoin_primitives::hex_decode(&block_hex).unwrap();
-        let block: bitcoin::Block =
-            bitcoin::consensus::encode::deserialize(&bytes).unwrap();
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes).unwrap();
         let header_hex = bitcoin::consensus::encode::serialize_hex(&block.header);
         // unrequested checks
         assert!(!hub.unrequested_too_far_ahead(header_hex.clone()).unwrap());
@@ -10405,7 +10834,10 @@ mod tests {
         assert_eq!(hub.estimate_fee_btc_per_kb(6), -1.0);
         assert_eq!(hub.weight_above_feerate(1000), 0);
         assert!(mempool_relay_fee_btc_per_kb() > 0.0);
-        assert_eq!(hub.min_relay_sat_kvb(), rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB);
+        assert_eq!(
+            hub.min_relay_sat_kvb(),
+            rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB
+        );
         // graph_stats on empty mempool
         let txid = "0000000000000000000000000000000000000000000000000000000000000001";
         assert!(hub.graph_stats(txid.to_string()).unwrap().is_none());
@@ -10455,7 +10887,9 @@ mod tests {
         hub.ensure_genesis().unwrap();
         // P2PKH script: 76a914 + 20 bytes + 88ac
         let script_hex = "76a914000000000000000000000000000000000000000088ac".to_string();
-        let hashes = hub.generate_to_script(3, script_hex.clone(), vec![]).unwrap();
+        let hashes = hub
+            .generate_to_script(3, script_hex.clone(), vec![])
+            .unwrap();
         assert_eq!(hashes.len(), 3);
         assert_eq!(hub.tip_height(), Some(3));
         // Assemble one more block without accepting
@@ -10476,8 +10910,7 @@ mod tests {
         let genesis_hash = hub.tip_hash().unwrap();
         let block_hex = mine_empty_regtest(genesis_hash, 1296688603, 1).unwrap();
         let bytes = rbitcoin_primitives::hex_decode(&block_hex).unwrap();
-        let block: bitcoin::Block =
-            bitcoin::consensus::encode::deserialize(&bytes).unwrap();
+        let block: bitcoin::Block = bitcoin::consensus::encode::deserialize(&bytes).unwrap();
         let header_hex = bitcoin::consensus::encode::serialize_hex(&block.header);
         hub.ensure_header(header_hex).unwrap();
         assert!(hub.knows_header(block.block_hash().to_string()).unwrap());
@@ -10538,7 +10971,9 @@ mod tests {
         assert!(node.spend_index_enabled());
         // Unknown txid → None
         assert!(node
-            .tx_fk_by_txid("0000000000000000000000000000000000000000000000000000000000000001".to_string())
+            .tx_fk_by_txid(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string()
+            )
             .unwrap()
             .is_none());
         node.shutdown().unwrap();
@@ -10614,12 +11049,9 @@ mod tests {
     fn test_node_handle_open_with_scale() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
-        let node = node_handle_open_with_scale(
-            path.clone(),
-            "regtest".to_string(),
-            FfiHeadScale::Tiny,
-        )
-        .unwrap();
+        let node =
+            node_handle_open_with_scale(path.clone(), "regtest".to_string(), FfiHeadScale::Tiny)
+                .unwrap();
         assert_eq!(node.network_name(), "regtest");
         node.shutdown().unwrap();
     }
@@ -10758,10 +11190,21 @@ mod tests {
     #[test]
     fn test_tx_set_witness_and_script_sig() {
         let tx = tx_create_empty(2, 0).unwrap();
-        let tx = tx_add_input(tx, "0000000000000000000000000000000000000000000000000000000000000001".to_string(), 0, 0xffffffff).unwrap();
-        let tx = tx_set_script_sig(tx.clone(), 0, "76a914000000000000000000000000000000000000000088ac".to_string()).unwrap();
-        let tx = tx_set_witness(tx, 0, vec!["deadbeef".to_string(), "cafebabe".to_string()]).unwrap();
+        let tx = tx_add_input(
+            tx,
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            0,
+            0xffffffff,
+        )
+        .unwrap();
+        let tx = tx_set_script_sig(
+            tx.clone(),
+            0,
+            "76a914000000000000000000000000000000000000000088ac".to_string(),
+        )
+        .unwrap();
+        let tx =
+            tx_set_witness(tx, 0, vec!["deadbeef".to_string(), "cafebabe".to_string()]).unwrap();
         assert!(tx.contains("deadbeef"));
     }
-
 }

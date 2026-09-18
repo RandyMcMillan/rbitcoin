@@ -12663,6 +12663,13 @@ public func bip68ActiveForTx(txHex: String)throws  -> Bool {
     )
 })
 }
+public func blockCoinbaseTxHex(blockHex: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_coinbase_tx_hex(
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
 public func blockHasWitness(blockHex: String)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_block_has_witness(
@@ -12677,6 +12684,13 @@ public func blockHashFromHeader(headerHex: String)throws  -> String {
     )
 })
 }
+public func blockHeaderBits(blockHex: String)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_header_bits(
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
 public func blockHeaderHash(version: Int32, prevHashHex: String, merkleRootHex: String, timestamp: UInt32, bits: UInt32, nonce: UInt32)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_block_header_hash(
@@ -12686,6 +12700,20 @@ public func blockHeaderHash(version: Int32, prevHashHex: String, merkleRootHex: 
         FfiConverterUInt32.lower(timestamp),
         FfiConverterUInt32.lower(bits),
         FfiConverterUInt32.lower(nonce),$0
+    )
+})
+}
+public func blockHeaderNonce(blockHex: String)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_header_nonce(
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
+public func blockHeaderTime(blockHex: String)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_header_time(
+        FfiConverterString.lower(blockHex),$0
     )
 })
 }
@@ -12704,11 +12732,25 @@ public func blockRejectLogLine(hash: String, reason: String) -> String {
     )
 })
 }
+public func blockSize(blockHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_size(
+        FfiConverterString.lower(blockHex),$0
+    )
+})
+}
 public func blockSubsidy(height: UInt32, network: String)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_block_subsidy(
         FfiConverterUInt32.lower(height),
         FfiConverterString.lower(network),$0
+    )
+})
+}
+public func blockTxCount(blockHex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_block_tx_count(
+        FfiConverterString.lower(blockHex),$0
     )
 })
 }
@@ -14491,13 +14533,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_bip68_active_for_tx() != 32558) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_block_coinbase_tx_hex() != 7281) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_block_has_witness() != 52826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_block_hash_from_header() != 48933) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_block_header_bits() != 65476) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_block_header_hash() != 31514) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_block_header_nonce() != 52289) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_block_header_time() != 55648) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_block_queue_soft_targets() != 6234) {
@@ -14506,7 +14560,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_block_reject_log_line() != 42178) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_block_size() != 24378) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_block_subsidy() != 16642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_block_tx_count() != 40397) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_block_wire_input_count() != 6467) {

@@ -4090,6 +4090,113 @@ pub fn wall_now() -> u64 {
         .as_secs()
 }
 
+// --- Block Cache FFI ---
+
+#[derive(uniffi::Object)]
+pub struct FfiBlockCache {
+    inner: rbitcoin_net::BlockCache,
+}
+
+#[uniffi::export]
+impl FfiBlockCache {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: rbitcoin_net::BlockCache::new(),
+        })
+    }
+
+    #[uniffi::constructor]
+    pub fn with_body_depth(depth: u32) -> Arc<Self> {
+        Arc::new(Self {
+            inner: rbitcoin_net::BlockCache::with_body_depth(depth as usize),
+        })
+    }
+
+    pub fn tip_height(&self) -> Option<u32> {
+        self.inner.tip_height()
+    }
+
+    pub fn tip_hash(&self) -> Option<String> {
+        self.inner.tip_hash().map(|h| h.to_string())
+    }
+
+    pub fn len(&self) -> u32 {
+        self.inner.len() as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn body_count(&self) -> u32 {
+        self.inner.body_count() as u32
+    }
+
+    pub fn get_block(&self, hash_hex: String) -> Result<Option<String>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let block = self.inner.get_block(&bitcoin::BlockHash::from_byte_array(hash));
+        Ok(block.map(|b| bitcoin::consensus::encode::serialize_hex(&b)))
+    }
+
+    pub fn get_header(&self, hash_hex: String) -> Result<Option<String>, RustyError> {
+        let hash = parse_hash32(&hash_hex)?;
+        let header = self.inner.get_header(&bitcoin::BlockHash::from_byte_array(hash));
+        Ok(header.map(|h| bitcoin::consensus::encode::serialize_hex(&h)))
+    }
+
+    pub fn hash_at_height(&self, height: u32) -> Option<String> {
+        self.inner.hash_at_height(height).map(|h| h.to_string())
+    }
+
+    pub fn header_at_height(&self, height: u32) -> Result<Option<String>, RustyError> {
+        let header = self.inner.header_at_height(height);
+        Ok(header.map(|h| bitcoin::consensus::encode::serialize_hex(&h)))
+    }
+
+    pub fn truncate_to_height(&self, height: u32) {
+        self.inner.truncate_to_height(height);
+    }
+
+    pub fn clear(&self) {
+        self.inner.clear();
+    }
+
+    pub fn push_best(&self, block_hex: String) -> Result<(), RustyError> {
+        let bytes = rbitcoin_primitives::hex_decode(&block_hex).map_err(|_| RustyError::InvalidInput)?;
+        let block: bitcoin::Block =
+            bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+        self.inner.push_best(block).map_err(|_| RustyError::InvalidInput)
+    }
+
+    pub fn locator(&self) -> Vec<String> {
+        self.inner
+            .locator()
+            .into_iter()
+            .map(|h| h.to_string())
+            .collect()
+    }
+
+    pub fn headers_after_locator(
+        &self,
+        locator_hashes_hex: Vec<String>,
+        stop_hash_hex: String,
+    ) -> Result<Vec<String>, RustyError> {
+        let locator: Vec<bitcoin::BlockHash> = locator_hashes_hex
+            .into_iter()
+            .map(|h| parse_hash32(&h).map(bitcoin::BlockHash::from_byte_array))
+            .collect::<Result<_, _>>()?;
+        let stop = parse_hash32(&stop_hash_hex)?;
+        let headers = self
+            .inner
+            .headers_after_locator(&locator, bitcoin::BlockHash::from_byte_array(stop));
+        Ok(headers
+            .into_iter()
+            .map(|h| bitcoin::consensus::encode::serialize_hex(&h))
+            .collect())
+    }
+}
+
 // --- Node Time FFI ---
 
 #[uniffi::export]
@@ -6951,4 +7058,52 @@ mod tests {
         let now = wall_now();
         assert!(now > 1_600_000_000);
     }
+
+    #[test]
+    fn test_block_cache() {
+        let cache = FfiBlockCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.tip_height(), None);
+        assert_eq!(cache.tip_hash(), None);
+        assert_eq!(cache.body_count(), 0);
+        // Push genesis block
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let block_hex = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        cache.push_best(block_hex.clone()).unwrap();
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.tip_height(), Some(0));
+        assert!(cache.tip_hash().is_some());
+        assert_eq!(cache.body_count(), 1);
+        let header = cache.header_at_height(0).unwrap();
+        assert!(header.is_some());
+        let block = cache.get_block(cache.tip_hash().unwrap()).unwrap();
+        assert!(block.is_some());
+        let locator = cache.locator();
+        assert!(!locator.is_empty());
+        // Empty locator resolves to genesis → returns headers from start
+        let headers = cache.headers_after_locator(vec![], genesis_hash.to_string()).unwrap();
+        assert_eq!(headers.len(), 1);
+        cache.truncate_to_height(0);
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_block_cache_with_body_depth() {
+        let cache = FfiBlockCache::with_body_depth(2);
+        let genesis_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let b0 = mine_empty_regtest(genesis_hash.to_string(), 1296688602, 0).unwrap();
+        cache.push_best(b0).unwrap();
+        let b1 = mine_empty_regtest(cache.tip_hash().unwrap(), 1296688603, 1).unwrap();
+        cache.push_best(b1).unwrap();
+        let b2 = mine_empty_regtest(cache.tip_hash().unwrap(), 1296688604, 2).unwrap();
+        cache.push_best(b2).unwrap();
+        assert_eq!(cache.len(), 3);
+        // With depth=2, only 2 most recent bodies kept
+        assert_eq!(cache.body_count(), 2);
+    }
+
 }

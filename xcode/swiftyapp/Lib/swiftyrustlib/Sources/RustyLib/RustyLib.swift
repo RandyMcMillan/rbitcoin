@@ -1377,6 +1377,263 @@ public func FfiConverterTypeFfiAddrMan_lower(_ value: FfiAddrMan) -> UnsafeMutab
 
 
 
+public protocol FfiBlockCacheProtocol : AnyObject {
+    
+    func bodyCount()  -> UInt32
+    
+    func clear() 
+    
+    func getBlock(hashHex: String) throws  -> String?
+    
+    func getHeader(hashHex: String) throws  -> String?
+    
+    func hashAtHeight(height: UInt32)  -> String?
+    
+    func headerAtHeight(height: UInt32) throws  -> String?
+    
+    func headersAfterLocator(locatorHashesHex: [String], stopHashHex: String) throws  -> [String]
+    
+    func isEmpty()  -> Bool
+    
+    func len()  -> UInt32
+    
+    func locator()  -> [String]
+    
+    func pushBest(blockHex: String) throws 
+    
+    func tipHash()  -> String?
+    
+    func tipHeight()  -> UInt32?
+    
+    func truncateToHeight(height: UInt32) 
+    
+}
+
+open class FfiBlockCache:
+    FfiBlockCacheProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffiblockcache(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffiblockcache_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffiblockcache(pointer, $0) }
+    }
+
+    
+public static func withBodyDepth(depth: UInt32) -> FfiBlockCache {
+    return try!  FfiConverterTypeFfiBlockCache.lift(try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffiblockcache_with_body_depth(
+        FfiConverterUInt32.lower(depth),$0
+    )
+})
+}
+    
+
+    
+open func bodyCount() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_body_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func clear() {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_clear(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func getBlock(hashHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiblockcache_get_block(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func getHeader(hashHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiblockcache_get_header(self.uniffiClonePointer(),
+        FfiConverterString.lower(hashHex),$0
+    )
+})
+}
+    
+open func hashAtHeight(height: UInt32) -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_hash_at_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func headerAtHeight(height: UInt32)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiblockcache_header_at_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+})
+}
+    
+open func headersAfterLocator(locatorHashesHex: [String], stopHashHex: String)throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiblockcache_headers_after_locator(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(locatorHashesHex),
+        FfiConverterString.lower(stopHashHex),$0
+    )
+})
+}
+    
+open func isEmpty() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_is_empty(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func len() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_len(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func locator() -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_locator(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func pushBest(blockHex: String)throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiblockcache_push_best(self.uniffiClonePointer(),
+        FfiConverterString.lower(blockHex),$0
+    )
+}
+}
+    
+open func tipHash() -> String? {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_tip_hash(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tipHeight() -> UInt32? {
+    return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_tip_height(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func truncateToHeight(height: UInt32) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffiblockcache_truncate_to_height(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(height),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiBlockCache: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiBlockCache
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiBlockCache {
+        return FfiBlockCache(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiBlockCache) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiBlockCache {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiBlockCache, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlockCache_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiBlockCache {
+    return try FfiConverterTypeFfiBlockCache.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlockCache_lower(_ value: FfiBlockCache) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiBlockCache.lower(value)
+}
+
+
+
+
 public protocol FfiFeeFlowMeterProtocol : AnyObject {
     
     func admitEvents()  -> UInt64
@@ -10555,6 +10812,48 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffiaddrman_take_outbound_offset_occupied() != 33783) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_body_count() != 63346) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_clear() != 1155) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_get_block() != 4072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_get_header() != 52471) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_hash_at_height() != 46973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_header_at_height() != 50484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_headers_after_locator() != 56846) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_is_empty() != 5873) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_len() != 31430) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_locator() != 56148) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_push_best() != 33568) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_tip_hash() != 23385) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_tip_height() != 12174) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiblockcache_truncate_to_height() != 33558) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffifeeflowmeter_admit_events() != 26057) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11162,6 +11461,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffiaddrman_with_seeds() != 6353) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffiblockcache_new() != 40288) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffiblockcache_with_body_depth() != 49665) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffifeeflowmeter_new() != 62794) {

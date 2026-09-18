@@ -2975,6 +2975,238 @@ public func FfiConverterTypeFfiStore_lower(_ value: FfiStore) -> UnsafeMutableRa
 }
 
 
+
+
+public protocol FfiTxGraphProtocol : AnyObject {
+    
+    func clusterCountLimit()  -> UInt64
+    
+    func clusterVsizeLimit()  -> UInt64
+    
+    func clusterWeightLimit()  -> UInt64
+    
+    func contains(txidHex: String) throws  -> Bool
+    
+    func frontierFeerateSatPerKvb(targetWu: UInt64)  -> UInt64?
+    
+    func graphStats(txidHex: String) throws  -> FfiMempoolGraphStats?
+    
+    func isEmpty()  -> Bool
+    
+    func len()  -> UInt64
+    
+    func selectBlockTxids(maxWeightWu: UInt64)  -> [String]
+    
+    func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
+    
+    func totalWeight()  -> UInt64
+    
+    func weightAboveFeerate(rateSatPerKvb: UInt64)  -> UInt64
+    
+}
+
+open class FfiTxGraph:
+    FfiTxGraphProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffitxgraph(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_rustylib_fn_constructor_ffitxgraph_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffitxgraph(pointer, $0) }
+    }
+
+    
+
+    
+open func clusterCountLimit() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_cluster_count_limit(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func clusterVsizeLimit() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_cluster_vsize_limit(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func clusterWeightLimit() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_cluster_weight_limit(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func contains(txidHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_contains(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func frontierFeerateSatPerKvb(targetWu: UInt64) -> UInt64? {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_frontier_feerate_sat_per_kvb(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(targetWu),$0
+    )
+})
+}
+    
+open func graphStats(txidHex: String)throws  -> FfiMempoolGraphStats? {
+    return try  FfiConverterOptionTypeFfiMempoolGraphStats.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffitxgraph_graph_stats(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func isEmpty() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_is_empty(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func len() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_len(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func selectBlockTxids(maxWeightWu: UInt64) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_select_block_txids(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(maxWeightWu),$0
+    )
+})
+}
+    
+open func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_set_cluster_limits(self.uniffiClonePointer(),
+        FfiConverterOptionUInt32.lower(count),
+        FfiConverterOptionUInt32.lower(sizeKvb),$0
+    )
+}
+}
+    
+open func totalWeight() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_total_weight(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func weightAboveFeerate(rateSatPerKvb: UInt64) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffitxgraph_weight_above_feerate(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(rateSatPerKvb),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTxGraph: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiTxGraph
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiTxGraph {
+        return FfiTxGraph(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiTxGraph) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTxGraph {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiTxGraph, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxGraph_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiTxGraph {
+    return try FfiConverterTypeFfiTxGraph.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTxGraph_lower(_ value: FfiTxGraph) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiTxGraph.lower(value)
+}
+
+
 public struct FfiBlockQueueOffer {
     public var queueId: UInt64
 
@@ -4078,6 +4310,104 @@ public func FfiConverterTypeFfiKeypair_lift(_ buf: RustBuffer) throws -> FfiKeyp
 #endif
 public func FfiConverterTypeFfiKeypair_lower(_ value: FfiKeypair) -> RustBuffer {
     return FfiConverterTypeFfiKeypair.lower(value)
+}
+
+
+public struct FfiMempoolGraphStats {
+    public var ancestorcount: UInt64
+    public var ancestorsize: UInt64
+    public var ancestorfees: UInt64
+    public var descendantcount: UInt64
+    public var descendantsize: UInt64
+    public var descendantfees: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ancestorcount: UInt64, ancestorsize: UInt64, ancestorfees: UInt64, descendantcount: UInt64, descendantsize: UInt64, descendantfees: UInt64) {
+        self.ancestorcount = ancestorcount
+        self.ancestorsize = ancestorsize
+        self.ancestorfees = ancestorfees
+        self.descendantcount = descendantcount
+        self.descendantsize = descendantsize
+        self.descendantfees = descendantfees
+    }
+}
+
+
+
+extension FfiMempoolGraphStats: Equatable, Hashable {
+    public static func ==(lhs: FfiMempoolGraphStats, rhs: FfiMempoolGraphStats) -> Bool {
+        if lhs.ancestorcount != rhs.ancestorcount {
+            return false
+        }
+        if lhs.ancestorsize != rhs.ancestorsize {
+            return false
+        }
+        if lhs.ancestorfees != rhs.ancestorfees {
+            return false
+        }
+        if lhs.descendantcount != rhs.descendantcount {
+            return false
+        }
+        if lhs.descendantsize != rhs.descendantsize {
+            return false
+        }
+        if lhs.descendantfees != rhs.descendantfees {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ancestorcount)
+        hasher.combine(ancestorsize)
+        hasher.combine(ancestorfees)
+        hasher.combine(descendantcount)
+        hasher.combine(descendantsize)
+        hasher.combine(descendantfees)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMempoolGraphStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMempoolGraphStats {
+        return
+            try FfiMempoolGraphStats(
+                ancestorcount: FfiConverterUInt64.read(from: &buf), 
+                ancestorsize: FfiConverterUInt64.read(from: &buf), 
+                ancestorfees: FfiConverterUInt64.read(from: &buf), 
+                descendantcount: FfiConverterUInt64.read(from: &buf), 
+                descendantsize: FfiConverterUInt64.read(from: &buf), 
+                descendantfees: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiMempoolGraphStats, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.ancestorcount, into: &buf)
+        FfiConverterUInt64.write(value.ancestorsize, into: &buf)
+        FfiConverterUInt64.write(value.ancestorfees, into: &buf)
+        FfiConverterUInt64.write(value.descendantcount, into: &buf)
+        FfiConverterUInt64.write(value.descendantsize, into: &buf)
+        FfiConverterUInt64.write(value.descendantfees, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolGraphStats_lift(_ buf: RustBuffer) throws -> FfiMempoolGraphStats {
+    return try FfiConverterTypeFfiMempoolGraphStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolGraphStats_lower(_ value: FfiMempoolGraphStats) -> RustBuffer {
+    return FfiConverterTypeFfiMempoolGraphStats.lower(value)
 }
 
 
@@ -6018,6 +6348,30 @@ fileprivate struct FfiConverterOptionTypeFfiHeaderRecord: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiHeaderRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiMempoolGraphStats: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMempoolGraphStats?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiMempoolGraphStats.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiMempoolGraphStats.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -9518,6 +9872,42 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffistore_txids_get_many() != 34257) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_cluster_count_limit() != 38841) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_cluster_vsize_limit() != 63064) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_cluster_weight_limit() != 62485) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_contains() != 63969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_frontier_feerate_sat_per_kvb() != 16909) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_graph_stats() != 60712) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_is_empty() != 19766) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_len() != 51963) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_select_block_txids() != 22158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_set_cluster_limits() != 65140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_total_weight() != 12730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffitxgraph_weight_above_feerate() != 17389) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_constructor_ffiaddrman_load() != 32799) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9540,6 +9930,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffistore_open_or_create() != 63598) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffitxgraph_new() != 40240) {
         return InitializationResult.apiChecksumMismatch
     }
 

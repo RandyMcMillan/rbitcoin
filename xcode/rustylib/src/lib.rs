@@ -3192,6 +3192,95 @@ impl FfiMempool {
     }
 }
 
+#[derive(uniffi::Record)]
+pub struct FfiMempoolGraphStats {
+    pub ancestorcount: u64,
+    pub ancestorsize: u64,
+    pub ancestorfees: u64,
+    pub descendantcount: u64,
+    pub descendantsize: u64,
+    pub descendantfees: u64,
+}
+
+#[derive(uniffi::Object)]
+pub struct FfiTxGraph {
+    inner: std::sync::Mutex<rbitcoin_mempool::TxGraph>,
+}
+
+#[uniffi::export]
+impl FfiTxGraph {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(rbitcoin_mempool::TxGraph::new()),
+        })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.inner.lock().unwrap().len() as u64
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
+
+    pub fn total_weight(&self) -> u64 {
+        self.inner.lock().unwrap().total_weight()
+    }
+
+    pub fn graph_stats(&self, txid_hex: String) -> Result<Option<FfiMempoolGraphStats>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        let stats = self.inner.lock().unwrap().graph_stats(&txid);
+        Ok(stats.map(|s| FfiMempoolGraphStats {
+            ancestorcount: s.ancestorcount,
+            ancestorsize: s.ancestorsize,
+            ancestorfees: s.ancestorfees,
+            descendantcount: s.descendantcount,
+            descendantsize: s.descendantsize,
+            descendantfees: s.descendantfees,
+        }))
+    }
+
+    pub fn frontier_feerate_sat_per_kvb(&self, target_wu: u64) -> Option<u64> {
+        self.inner.lock().unwrap().frontier_feerate_sat_per_kvb(target_wu)
+    }
+
+    pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
+        self.inner.lock().unwrap().weight_above_feerate(rate_sat_per_kvb)
+    }
+
+    pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .select_block_txids(max_weight_wu)
+            .into_iter()
+            .map(|t| t.to_string())
+            .collect()
+    }
+
+    pub fn contains(&self, txid_hex: String) -> Result<bool, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.lock().unwrap().contains(&txid))
+    }
+
+    pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
+        self.inner.lock().unwrap().set_cluster_limits(count, size_kvb);
+    }
+
+    pub fn cluster_count_limit(&self) -> u64 {
+        self.inner.lock().unwrap().cluster_count_limit() as u64
+    }
+
+    pub fn cluster_vsize_limit(&self) -> u64 {
+        self.inner.lock().unwrap().cluster_vsize_limit()
+    }
+
+    pub fn cluster_weight_limit(&self) -> u64 {
+        self.inner.lock().unwrap().cluster_weight_limit()
+    }
+}
+
 // --- Block Queue soft targets FFI ---
 
 #[derive(Debug, PartialEq, uniffi::Record)]
@@ -5764,5 +5853,43 @@ mod tests {
         let am = FfiAddrMan::new();
         am.inject(vec!["127.0.0.1:8333".to_string(), "127.0.0.1:8334".to_string()]);
         assert_eq!(am.len(), 2);
+    }
+
+    #[test]
+    fn test_tx_graph_new() {
+        let g = FfiTxGraph::new();
+        assert!(g.is_empty());
+        assert_eq!(g.len(), 0);
+        assert_eq!(g.total_weight(), 0);
+    }
+
+    #[test]
+    fn test_tx_graph_cluster_limits() {
+        let g = FfiTxGraph::new();
+        g.set_cluster_limits(Some(100), Some(500));
+        assert_eq!(g.cluster_count_limit(), 100);
+        assert_eq!(g.cluster_vsize_limit(), 500_000);
+        assert_eq!(g.cluster_weight_limit(), 2_000_000);
+    }
+
+    #[test]
+    fn test_tx_graph_contains_missing() {
+        let g = FfiTxGraph::new();
+        assert!(!g.contains(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        ).unwrap());
+    }
+
+    #[test]
+    fn test_tx_graph_frontier_empty() {
+        let g = FfiTxGraph::new();
+        assert!(g.frontier_feerate_sat_per_kvb(1000).is_none());
+        assert_eq!(g.weight_above_feerate(1000), 0);
+    }
+
+    #[test]
+    fn test_tx_graph_select_block_empty() {
+        let g = FfiTxGraph::new();
+        assert!(g.select_block_txids(4_000_000).is_empty());
     }
 }

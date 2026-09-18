@@ -7544,6 +7544,104 @@ public func FfiConverterTypeFfiHeightTweak_lower(_ value: FfiHeightTweak) -> Rus
 }
 
 
+public struct FfiIbdConfig {
+    public var window: UInt64
+    public var perPeer: UInt64
+    public var targetPeers: UInt64
+    public var headersBatch: UInt64
+    public var stallSecs: UInt64
+    public var connectTimeoutSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(window: UInt64, perPeer: UInt64, targetPeers: UInt64, headersBatch: UInt64, stallSecs: UInt64, connectTimeoutSecs: UInt64) {
+        self.window = window
+        self.perPeer = perPeer
+        self.targetPeers = targetPeers
+        self.headersBatch = headersBatch
+        self.stallSecs = stallSecs
+        self.connectTimeoutSecs = connectTimeoutSecs
+    }
+}
+
+
+
+extension FfiIbdConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiIbdConfig, rhs: FfiIbdConfig) -> Bool {
+        if lhs.window != rhs.window {
+            return false
+        }
+        if lhs.perPeer != rhs.perPeer {
+            return false
+        }
+        if lhs.targetPeers != rhs.targetPeers {
+            return false
+        }
+        if lhs.headersBatch != rhs.headersBatch {
+            return false
+        }
+        if lhs.stallSecs != rhs.stallSecs {
+            return false
+        }
+        if lhs.connectTimeoutSecs != rhs.connectTimeoutSecs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(window)
+        hasher.combine(perPeer)
+        hasher.combine(targetPeers)
+        hasher.combine(headersBatch)
+        hasher.combine(stallSecs)
+        hasher.combine(connectTimeoutSecs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiIbdConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiIbdConfig {
+        return
+            try FfiIbdConfig(
+                window: FfiConverterUInt64.read(from: &buf), 
+                perPeer: FfiConverterUInt64.read(from: &buf), 
+                targetPeers: FfiConverterUInt64.read(from: &buf), 
+                headersBatch: FfiConverterUInt64.read(from: &buf), 
+                stallSecs: FfiConverterUInt64.read(from: &buf), 
+                connectTimeoutSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiIbdConfig, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.window, into: &buf)
+        FfiConverterUInt64.write(value.perPeer, into: &buf)
+        FfiConverterUInt64.write(value.targetPeers, into: &buf)
+        FfiConverterUInt64.write(value.headersBatch, into: &buf)
+        FfiConverterUInt64.write(value.stallSecs, into: &buf)
+        FfiConverterUInt64.write(value.connectTimeoutSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiIbdConfig_lift(_ buf: RustBuffer) throws -> FfiIbdConfig {
+    return try FfiConverterTypeFfiIbdConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiIbdConfig_lower(_ value: FfiIbdConfig) -> RustBuffer {
+    return FfiConverterTypeFfiIbdConfig.lower(value)
+}
+
+
 public struct FfiInboundEvictCandidate {
     public var id: UInt64
     public var connectedAt: UInt64
@@ -8722,6 +8820,96 @@ public func FfiConverterTypeFfiPrevoutRef_lower(_ value: FfiPrevoutRef) -> RustB
 }
 
 
+public struct FfiProcRss {
+    public var rssKb: UInt64
+    public var anonKb: UInt64
+    public var fileKb: UInt64
+    public var hwmKb: UInt64
+    public var lockedKb: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(rssKb: UInt64, anonKb: UInt64, fileKb: UInt64, hwmKb: UInt64, lockedKb: UInt64) {
+        self.rssKb = rssKb
+        self.anonKb = anonKb
+        self.fileKb = fileKb
+        self.hwmKb = hwmKb
+        self.lockedKb = lockedKb
+    }
+}
+
+
+
+extension FfiProcRss: Equatable, Hashable {
+    public static func ==(lhs: FfiProcRss, rhs: FfiProcRss) -> Bool {
+        if lhs.rssKb != rhs.rssKb {
+            return false
+        }
+        if lhs.anonKb != rhs.anonKb {
+            return false
+        }
+        if lhs.fileKb != rhs.fileKb {
+            return false
+        }
+        if lhs.hwmKb != rhs.hwmKb {
+            return false
+        }
+        if lhs.lockedKb != rhs.lockedKb {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rssKb)
+        hasher.combine(anonKb)
+        hasher.combine(fileKb)
+        hasher.combine(hwmKb)
+        hasher.combine(lockedKb)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiProcRss: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiProcRss {
+        return
+            try FfiProcRss(
+                rssKb: FfiConverterUInt64.read(from: &buf), 
+                anonKb: FfiConverterUInt64.read(from: &buf), 
+                fileKb: FfiConverterUInt64.read(from: &buf), 
+                hwmKb: FfiConverterUInt64.read(from: &buf), 
+                lockedKb: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiProcRss, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.rssKb, into: &buf)
+        FfiConverterUInt64.write(value.anonKb, into: &buf)
+        FfiConverterUInt64.write(value.fileKb, into: &buf)
+        FfiConverterUInt64.write(value.hwmKb, into: &buf)
+        FfiConverterUInt64.write(value.lockedKb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProcRss_lift(_ buf: RustBuffer) throws -> FfiProcRss {
+    return try FfiConverterTypeFfiProcRss.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProcRss_lower(_ value: FfiProcRss) -> RustBuffer {
+    return FfiConverterTypeFfiProcRss.lower(value)
+}
+
+
 public struct FfiProcessOwnedSizes {
     public var confPlans: UInt64
     public var shRuns: UInt64
@@ -9447,6 +9635,96 @@ public func FfiConverterTypeFfiTaprootOut_lift(_ buf: RustBuffer) throws -> FfiT
 #endif
 public func FfiConverterTypeFfiTaprootOut_lower(_ value: FfiTaprootOut) -> RustBuffer {
     return FfiConverterTypeFfiTaprootOut.lower(value)
+}
+
+
+public struct FfiTipPerfSizes {
+    public var rss: FfiProcRss
+    public var cacheBodies: UInt64
+    public var heldBodies: UInt64
+    public var shHeads: UInt64
+    public var mpLive: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(rss: FfiProcRss, cacheBodies: UInt64, heldBodies: UInt64, shHeads: UInt64, mpLive: UInt64) {
+        self.rss = rss
+        self.cacheBodies = cacheBodies
+        self.heldBodies = heldBodies
+        self.shHeads = shHeads
+        self.mpLive = mpLive
+    }
+}
+
+
+
+extension FfiTipPerfSizes: Equatable, Hashable {
+    public static func ==(lhs: FfiTipPerfSizes, rhs: FfiTipPerfSizes) -> Bool {
+        if lhs.rss != rhs.rss {
+            return false
+        }
+        if lhs.cacheBodies != rhs.cacheBodies {
+            return false
+        }
+        if lhs.heldBodies != rhs.heldBodies {
+            return false
+        }
+        if lhs.shHeads != rhs.shHeads {
+            return false
+        }
+        if lhs.mpLive != rhs.mpLive {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rss)
+        hasher.combine(cacheBodies)
+        hasher.combine(heldBodies)
+        hasher.combine(shHeads)
+        hasher.combine(mpLive)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTipPerfSizes: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTipPerfSizes {
+        return
+            try FfiTipPerfSizes(
+                rss: FfiConverterTypeFfiProcRss.read(from: &buf), 
+                cacheBodies: FfiConverterUInt64.read(from: &buf), 
+                heldBodies: FfiConverterUInt64.read(from: &buf), 
+                shHeads: FfiConverterUInt64.read(from: &buf), 
+                mpLive: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTipPerfSizes, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiProcRss.write(value.rss, into: &buf)
+        FfiConverterUInt64.write(value.cacheBodies, into: &buf)
+        FfiConverterUInt64.write(value.heldBodies, into: &buf)
+        FfiConverterUInt64.write(value.shHeads, into: &buf)
+        FfiConverterUInt64.write(value.mpLive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTipPerfSizes_lift(_ buf: RustBuffer) throws -> FfiTipPerfSizes {
+    return try FfiConverterTypeFfiTipPerfSizes.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTipPerfSizes_lower(_ value: FfiTipPerfSizes) -> RustBuffer {
+    return FfiConverterTypeFfiTipPerfSizes.lower(value)
 }
 
 
@@ -12024,6 +12302,13 @@ public func formatServePerf(sample: FfiServePerfSample) -> String {
     )
 })
 }
+public func formatTipPerfSizes(sizes: FfiTipPerfSizes) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_format_tip_perf_sizes(
+        FfiConverterTypeFfiTipPerfSizes.lower(sizes),$0
+    )
+})
+}
 public func generateKeypair(network: String)throws  -> FfiKeypair {
     return try  FfiConverterTypeFfiKeypair.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_generate_keypair(
@@ -12108,6 +12393,18 @@ public func hexEncode(bytes: Data) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_hex_encode(
         FfiConverterData.lower(bytes),$0
+    )
+})
+}
+public func ibdConfigDefault() -> FfiIbdConfig {
+    return try!  FfiConverterTypeFfiIbdConfig.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_ibd_config_default($0
+    )
+})
+}
+public func ibdConfigForTest() -> FfiIbdConfig {
+    return try!  FfiConverterTypeFfiIbdConfig.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_ibd_config_for_test($0
     )
 })
 }
@@ -12751,6 +13048,12 @@ public func rbitcoinSubversion(comments: [String])throws  -> String {
 public func rbitcoinVersion() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_rustylib_fn_func_rbitcoin_version($0
+    )
+})
+}
+public func readProcRss() -> FfiProcRss {
+    return try!  FfiConverterTypeFfiProcRss.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_read_proc_rss($0
     )
 })
 }
@@ -13441,6 +13744,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_format_serve_perf() != 24386) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_format_tip_perf_sizes() != 63069) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_generate_keypair() != 27434) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13475,6 +13781,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_hex_encode() != 31720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_ibd_config_default() != 49268) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_ibd_config_for_test() != 35885) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_ibd_feefilter_sat_kvb() != 13242) {
@@ -13751,6 +14063,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_rbitcoin_version() != 47205) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_read_proc_rss() != 43329) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_received_getdata_wtx_log() != 10321) {

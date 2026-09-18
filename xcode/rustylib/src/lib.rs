@@ -4322,6 +4322,57 @@ pub fn rpc_per_utxo_overhead() -> i64 {
     rbitcoin_rpc::PER_UTXO_OVERHEAD
 }
 
+// --- RPC Auth FFI ---
+
+#[derive(uniffi::Record)]
+pub struct FfiRpcAuth {
+    pub user: String,
+    pub password: String,
+}
+
+impl From<rbitcoin_rpc::RpcAuth> for FfiRpcAuth {
+    fn from(a: rbitcoin_rpc::RpcAuth) -> Self {
+        Self {
+            user: a.user,
+            password: a.password,
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn write_cookie_file(path: String) -> Result<FfiRpcAuth, RustyError> {
+    let auth = rbitcoin_rpc::write_cookie_file(std::path::Path::new(&path))
+        .map_err(|_| RustyError::InvalidInput)?;
+    Ok(auth.into())
+}
+
+#[uniffi::export]
+pub fn parse_basic_auth(header: String) -> Result<FfiRpcAuth, RustyError> {
+    let auth = rbitcoin_rpc::parse_basic_auth(&header).ok_or(RustyError::InvalidInput)?;
+    Ok(FfiRpcAuth {
+        user: auth.0,
+        password: auth.1,
+    })
+}
+
+#[uniffi::export]
+pub fn resolve_rpc_auth(
+    datadir: String,
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
+    cookie_path: Option<String>,
+) -> Result<FfiRpcAuth, RustyError> {
+    let cp = cookie_path.as_deref().map(std::path::Path::new);
+    let (auth, _) = rbitcoin_rpc::resolve_rpc_auth(
+        std::path::Path::new(&datadir),
+        rpc_user.as_deref(),
+        rpc_password.as_deref(),
+        cp,
+    )
+    .map_err(|_| RustyError::InvalidInput)?;
+    Ok(auth.into())
+}
+
 // --- Work Comparison FFI ---
 
 #[uniffi::export]
@@ -6295,6 +6346,53 @@ mod tests {
     #[test]
     fn test_rpc_per_utxo_overhead() {
         assert_eq!(rpc_per_utxo_overhead(), 41);
+    }
+
+    #[test]
+    fn test_write_cookie_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".cookie").to_str().unwrap().to_string();
+        let auth = write_cookie_file(path.clone()).unwrap();
+        assert_eq!(auth.user, "__cookie__");
+        assert_eq!(auth.password.len(), 64);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&auth.password));
+    }
+
+    #[test]
+    fn test_parse_basic_auth() {
+        // base64 of "alice:s3cret" = "YWxpY2U6czNjcmV0"
+        let auth = parse_basic_auth("Basic YWxpY2U6czNjcmV0".to_string()).unwrap();
+        assert_eq!(auth.user, "alice");
+        assert_eq!(auth.password, "s3cret");
+        assert!(parse_basic_auth("Bearer x".to_string()).is_err());
+    }
+
+    #[test]
+    fn test_resolve_rpc_auth_user_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = resolve_rpc_auth(
+            tmp.path().to_str().unwrap().to_string(),
+            Some("user".to_string()),
+            Some("pass".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(auth.user, "user");
+        assert_eq!(auth.password, "pass");
+    }
+
+    #[test]
+    fn test_resolve_rpc_auth_cookie() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth = resolve_rpc_auth(
+            tmp.path().to_str().unwrap().to_string(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(auth.user, "__cookie__");
+        assert_eq!(auth.password.len(), 64);
     }
 
     #[test]

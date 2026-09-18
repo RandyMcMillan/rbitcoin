@@ -6592,6 +6592,72 @@ public func FfiConverterTypeFfiResumeWorkEntry_lower(_ value: FfiResumeWorkEntry
 }
 
 
+public struct FfiRpcAuth {
+    public var user: String
+    public var password: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(user: String, password: String) {
+        self.user = user
+        self.password = password
+    }
+}
+
+
+
+extension FfiRpcAuth: Equatable, Hashable {
+    public static func ==(lhs: FfiRpcAuth, rhs: FfiRpcAuth) -> Bool {
+        if lhs.user != rhs.user {
+            return false
+        }
+        if lhs.password != rhs.password {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(user)
+        hasher.combine(password)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiRpcAuth: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRpcAuth {
+        return
+            try FfiRpcAuth(
+                user: FfiConverterString.read(from: &buf), 
+                password: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiRpcAuth, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.user, into: &buf)
+        FfiConverterString.write(value.password, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRpcAuth_lift(_ buf: RustBuffer) throws -> FfiRpcAuth {
+    return try FfiConverterTypeFfiRpcAuth.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRpcAuth_lower(_ value: FfiRpcAuth) -> RustBuffer {
+    return FfiConverterTypeFfiRpcAuth.lower(value)
+}
+
+
 public struct FfiServePerfSample {
     public var n: UInt64
     public var bytes: UInt64
@@ -9551,6 +9617,13 @@ public func p2wpkhAddressFromXpub(xpubString: String, path: String, network: Str
     )
 })
 }
+public func parseBasicAuth(header: String)throws  -> FfiRpcAuth {
+    return try  FfiConverterTypeFfiRpcAuth.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_parse_basic_auth(
+        FfiConverterString.lower(header),$0
+    )
+})
+}
 public func parseDisplayHash32(hex: String)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_parse_display_hash32(
@@ -9790,6 +9863,16 @@ public func resolveFixedSeeds(network: String)throws  -> [String] {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_func_resolve_fixed_seeds(
         FfiConverterString.lower(network),$0
+    )
+})
+}
+public func resolveRpcAuth(datadir: String, rpcUser: String?, rpcPassword: String?, cookiePath: String?)throws  -> FfiRpcAuth {
+    return try  FfiConverterTypeFfiRpcAuth.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_resolve_rpc_auth(
+        FfiConverterString.lower(datadir),
+        FfiConverterOptionString.lower(rpcUser),
+        FfiConverterOptionString.lower(rpcPassword),
+        FfiConverterOptionString.lower(cookiePath),$0
     )
 })
 }
@@ -10184,6 +10267,13 @@ public func workBetter(newWorkHex: String, oldWorkHex: String)throws  -> Bool {
     uniffi_rustylib_fn_func_work_better(
         FfiConverterString.lower(newWorkHex),
         FfiConverterString.lower(oldWorkHex),$0
+    )
+})
+}
+public func writeCookieFile(path: String)throws  -> FfiRpcAuth {
+    return try  FfiConverterTypeFfiRpcAuth.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_write_cookie_file(
+        FfiConverterString.lower(path),$0
     )
 })
 }
@@ -10612,6 +10702,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_p2wpkh_address_from_xpub() != 4204) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_parse_basic_auth() != 23636) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_parse_display_hash32() != 60706) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10712,6 +10805,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_resolve_fixed_seeds() != 2549) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_resolve_rpc_auth() != 21256) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_rpc_call_json() != 63144) {
@@ -10868,6 +10964,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_work_better() != 48957) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_write_cookie_file() != 64510) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_wtxid_from_hex() != 62498) {

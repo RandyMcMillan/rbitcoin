@@ -7,7 +7,10 @@ mod blockstats;
 mod methods;
 mod server;
 
-pub use auth::{default_socket_path, default_token_path, read_cookie_file, RpcAuth};
+pub use auth::{
+    default_socket_path, default_token_path, parse_basic_auth, read_cookie_file, resolve_rpc_auth,
+    RpcAuth, write_cookie_file,
+};
 pub use blockstats::{
     is_unspendable, percentiles_by_weight, truncated_median, txout_serialized_size,
     PER_UTXO_OVERHEAD,

@@ -2740,6 +2740,359 @@ public func FfiConverterTypeFfiMempool_lower(_ value: FfiMempool) -> UnsafeMutab
 
 
 
+public protocol FfiMempoolHubProtocol : AnyObject {
+    
+    func acceptTx(txHex: String) throws  -> FfiAcceptResult
+    
+    func compact() throws  -> FfiCompactResult
+    
+    func contains(txidHex: String) throws  -> Bool
+    
+    func containsWtxid(wtxidHex: String) throws  -> Bool
+    
+    func expiryHours()  -> UInt64
+    
+    func feeDelta(txidHex: String) throws  -> Int64
+    
+    func flush() throws 
+    
+    func generation()  -> UInt64
+    
+    func getTx(txidHex: String) throws  -> String?
+    
+    func getTxByWtxid(wtxidHex: String) throws  -> String?
+    
+    func immediateRelay()  -> Bool
+    
+    func listLiveWtxids()  -> [FfiLiveWtxid]
+    
+    func liveCount()  -> UInt64
+    
+    func maxWeight()  -> UInt64
+    
+    func noteGetdataTx(n: UInt64) 
+    
+    func noteInvTx(n: UInt64) 
+    
+    func orphanCount()  -> UInt64
+    
+    func recentAccepts()  -> [FfiRecentAccept]
+    
+    func relayEnabled()  -> Bool
+    
+    func sampleResetPerf()  -> FfiMempoolPerfSample
+    
+    func setExpiryHours(hours: UInt64) 
+    
+    func setImmediateRelay(on: Bool) 
+    
+    func setRelayEnabled(on: Bool) 
+    
+    func templateUpdates()  -> UInt64
+    
+    func testAccept(txHex: String) throws  -> FfiAcceptResult
+    
+}
+
+open class FfiMempoolHub:
+    FfiMempoolHubProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_rustylib_fn_clone_ffimempoolhub(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_rustylib_fn_free_ffimempoolhub(pointer, $0) }
+    }
+
+    
+public static func `open`(queryPath: String, dir: String, weightLimit: UInt64, persist: Bool)throws  -> FfiMempoolHub {
+    return try  FfiConverterTypeFfiMempoolHub.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_constructor_ffimempoolhub_open(
+        FfiConverterString.lower(queryPath),
+        FfiConverterString.lower(dir),
+        FfiConverterUInt64.lower(weightLimit),
+        FfiConverterBool.lower(persist),$0
+    )
+})
+}
+    
+
+    
+open func acceptTx(txHex: String)throws  -> FfiAcceptResult {
+    return try  FfiConverterTypeFfiAcceptResult.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_accept_tx(self.uniffiClonePointer(),
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+    
+open func compact()throws  -> FfiCompactResult {
+    return try  FfiConverterTypeFfiCompactResult.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_compact(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func contains(txidHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_contains(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func containsWtxid(wtxidHex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_contains_wtxid(self.uniffiClonePointer(),
+        FfiConverterString.lower(wtxidHex),$0
+    )
+})
+}
+    
+open func expiryHours() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_expiry_hours(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func feeDelta(txidHex: String)throws  -> Int64 {
+    return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_fee_delta(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func flush()throws  {try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_flush(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func generation() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_generation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func getTx(txidHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_get_tx(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func getTxByWtxid(wtxidHex: String)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_get_tx_by_wtxid(self.uniffiClonePointer(),
+        FfiConverterString.lower(wtxidHex),$0
+    )
+})
+}
+    
+open func immediateRelay() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_immediate_relay(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func listLiveWtxids() -> [FfiLiveWtxid] {
+    return try!  FfiConverterSequenceTypeFfiLiveWtxid.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_list_live_wtxids(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func liveCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_live_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func maxWeight() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_max_weight(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func noteGetdataTx(n: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_note_getdata_tx(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(n),$0
+    )
+}
+}
+    
+open func noteInvTx(n: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_note_inv_tx(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(n),$0
+    )
+}
+}
+    
+open func orphanCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_orphan_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func recentAccepts() -> [FfiRecentAccept] {
+    return try!  FfiConverterSequenceTypeFfiRecentAccept.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_recent_accepts(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func relayEnabled() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_relay_enabled(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func sampleResetPerf() -> FfiMempoolPerfSample {
+    return try!  FfiConverterTypeFfiMempoolPerfSample.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_sample_reset_perf(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func setExpiryHours(hours: UInt64) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_set_expiry_hours(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(hours),$0
+    )
+}
+}
+    
+open func setImmediateRelay(on: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_set_immediate_relay(self.uniffiClonePointer(),
+        FfiConverterBool.lower(on),$0
+    )
+}
+}
+    
+open func setRelayEnabled(on: Bool) {try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_set_relay_enabled(self.uniffiClonePointer(),
+        FfiConverterBool.lower(on),$0
+    )
+}
+}
+    
+open func templateUpdates() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_template_updates(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func testAccept(txHex: String)throws  -> FfiAcceptResult {
+    return try  FfiConverterTypeFfiAcceptResult.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_test_accept(self.uniffiClonePointer(),
+        FfiConverterString.lower(txHex),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMempoolHub: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = FfiMempoolHub
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiMempoolHub {
+        return FfiMempoolHub(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: FfiMempoolHub) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMempoolHub {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: FfiMempoolHub, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolHub_lift(_ pointer: UnsafeMutableRawPointer) throws -> FfiMempoolHub {
+    return try FfiConverterTypeFfiMempoolHub.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolHub_lower(_ value: FfiMempoolHub) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeFfiMempoolHub.lower(value)
+}
+
+
+
+
 public protocol FfiNodeClockProtocol : AnyObject {
     
     func nowSecs()  -> UInt64
@@ -5285,6 +5638,104 @@ public func FfiConverterTypeFfiTxGraph_lower(_ value: FfiTxGraph) -> UnsafeMutab
 }
 
 
+public struct FfiAcceptResult {
+    public var txid: String
+    public var feeSat: UInt64
+    public var weight: UInt64
+    public var slot: UInt32
+    public var replaced: [String]
+    public var replacedScripthashes: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txid: String, feeSat: UInt64, weight: UInt64, slot: UInt32, replaced: [String], replacedScripthashes: [String]) {
+        self.txid = txid
+        self.feeSat = feeSat
+        self.weight = weight
+        self.slot = slot
+        self.replaced = replaced
+        self.replacedScripthashes = replacedScripthashes
+    }
+}
+
+
+
+extension FfiAcceptResult: Equatable, Hashable {
+    public static func ==(lhs: FfiAcceptResult, rhs: FfiAcceptResult) -> Bool {
+        if lhs.txid != rhs.txid {
+            return false
+        }
+        if lhs.feeSat != rhs.feeSat {
+            return false
+        }
+        if lhs.weight != rhs.weight {
+            return false
+        }
+        if lhs.slot != rhs.slot {
+            return false
+        }
+        if lhs.replaced != rhs.replaced {
+            return false
+        }
+        if lhs.replacedScripthashes != rhs.replacedScripthashes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txid)
+        hasher.combine(feeSat)
+        hasher.combine(weight)
+        hasher.combine(slot)
+        hasher.combine(replaced)
+        hasher.combine(replacedScripthashes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAcceptResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAcceptResult {
+        return
+            try FfiAcceptResult(
+                txid: FfiConverterString.read(from: &buf), 
+                feeSat: FfiConverterUInt64.read(from: &buf), 
+                weight: FfiConverterUInt64.read(from: &buf), 
+                slot: FfiConverterUInt32.read(from: &buf), 
+                replaced: FfiConverterSequenceString.read(from: &buf), 
+                replacedScripthashes: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiAcceptResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.txid, into: &buf)
+        FfiConverterUInt64.write(value.feeSat, into: &buf)
+        FfiConverterUInt64.write(value.weight, into: &buf)
+        FfiConverterUInt32.write(value.slot, into: &buf)
+        FfiConverterSequenceString.write(value.replaced, into: &buf)
+        FfiConverterSequenceString.write(value.replacedScripthashes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAcceptResult_lift(_ buf: RustBuffer) throws -> FfiAcceptResult {
+    return try FfiConverterTypeFfiAcceptResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAcceptResult_lower(_ value: FfiAcceptResult) -> RustBuffer {
+    return FfiConverterTypeFfiAcceptResult.lower(value)
+}
+
+
 public struct FfiBlockQueueOffer {
     public var queueId: UInt64
 
@@ -5776,6 +6227,72 @@ public func FfiConverterTypeFfiCoinbaseAtHeight_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeFfiCoinbaseAtHeight_lower(_ value: FfiCoinbaseAtHeight) -> RustBuffer {
     return FfiConverterTypeFfiCoinbaseAtHeight.lower(value)
+}
+
+
+public struct FfiCompactResult {
+    public var nTxs: UInt32
+    public var bytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nTxs: UInt32, bytes: UInt64) {
+        self.nTxs = nTxs
+        self.bytes = bytes
+    }
+}
+
+
+
+extension FfiCompactResult: Equatable, Hashable {
+    public static func ==(lhs: FfiCompactResult, rhs: FfiCompactResult) -> Bool {
+        if lhs.nTxs != rhs.nTxs {
+            return false
+        }
+        if lhs.bytes != rhs.bytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nTxs)
+        hasher.combine(bytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCompactResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCompactResult {
+        return
+            try FfiCompactResult(
+                nTxs: FfiConverterUInt32.read(from: &buf), 
+                bytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCompactResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.nTxs, into: &buf)
+        FfiConverterUInt64.write(value.bytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCompactResult_lift(_ buf: RustBuffer) throws -> FfiCompactResult {
+    return try FfiConverterTypeFfiCompactResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCompactResult_lower(_ value: FfiCompactResult) -> RustBuffer {
+    return FfiConverterTypeFfiCompactResult.lower(value)
 }
 
 
@@ -6637,6 +7154,72 @@ public func FfiConverterTypeFfiKeypair_lower(_ value: FfiKeypair) -> RustBuffer 
 }
 
 
+public struct FfiLiveWtxid {
+    public var txid: String
+    public var wtxid: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txid: String, wtxid: String) {
+        self.txid = txid
+        self.wtxid = wtxid
+    }
+}
+
+
+
+extension FfiLiveWtxid: Equatable, Hashable {
+    public static func ==(lhs: FfiLiveWtxid, rhs: FfiLiveWtxid) -> Bool {
+        if lhs.txid != rhs.txid {
+            return false
+        }
+        if lhs.wtxid != rhs.wtxid {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txid)
+        hasher.combine(wtxid)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiLiveWtxid: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiLiveWtxid {
+        return
+            try FfiLiveWtxid(
+                txid: FfiConverterString.read(from: &buf), 
+                wtxid: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiLiveWtxid, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.txid, into: &buf)
+        FfiConverterString.write(value.wtxid, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiLiveWtxid_lift(_ buf: RustBuffer) throws -> FfiLiveWtxid {
+    return try FfiConverterTypeFfiLiveWtxid.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiLiveWtxid_lower(_ value: FfiLiveWtxid) -> RustBuffer {
+    return FfiConverterTypeFfiLiveWtxid.lower(value)
+}
+
+
 public struct FfiMempoolGraphStats {
     public var ancestorcount: UInt64
     public var ancestorsize: UInt64
@@ -6806,6 +7389,232 @@ public func FfiConverterTypeFfiMempoolMeta_lift(_ buf: RustBuffer) throws -> Ffi
 #endif
 public func FfiConverterTypeFfiMempoolMeta_lower(_ value: FfiMempoolMeta) -> RustBuffer {
     return FfiConverterTypeFfiMempoolMeta.lower(value)
+}
+
+
+public struct FfiMempoolPerfSample {
+    public var accepts: UInt64
+    public var rejects: UInt64
+    public var acceptUs: UInt64
+    public var acceptMaxUs: UInt64
+    public var acceptLockUs: UInt64
+    public var acceptUtxoUs: UInt64
+    public var acceptScriptUs: UInt64
+    public var acceptDurableUs: UInt64
+    public var invTx: UInt64
+    public var getdataTx: UInt64
+    public var announce: UInt64
+    public var deltaPrevouts: UInt64
+    public var spentBodyLoads: UInt64
+    public var listLive: UInt64
+    public var listLiveMeta: UInt64
+    public var listLiveWtxids: UInt64
+    public var ageScan: UInt64
+    public var expireFullScans: UInt64
+    public var tipMtp: UInt64
+    public var getCoin: UInt64
+    public var getCoinBlockTxFks: UInt64
+    public var getCoinCreateMtp: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(accepts: UInt64, rejects: UInt64, acceptUs: UInt64, acceptMaxUs: UInt64, acceptLockUs: UInt64, acceptUtxoUs: UInt64, acceptScriptUs: UInt64, acceptDurableUs: UInt64, invTx: UInt64, getdataTx: UInt64, announce: UInt64, deltaPrevouts: UInt64, spentBodyLoads: UInt64, listLive: UInt64, listLiveMeta: UInt64, listLiveWtxids: UInt64, ageScan: UInt64, expireFullScans: UInt64, tipMtp: UInt64, getCoin: UInt64, getCoinBlockTxFks: UInt64, getCoinCreateMtp: UInt64) {
+        self.accepts = accepts
+        self.rejects = rejects
+        self.acceptUs = acceptUs
+        self.acceptMaxUs = acceptMaxUs
+        self.acceptLockUs = acceptLockUs
+        self.acceptUtxoUs = acceptUtxoUs
+        self.acceptScriptUs = acceptScriptUs
+        self.acceptDurableUs = acceptDurableUs
+        self.invTx = invTx
+        self.getdataTx = getdataTx
+        self.announce = announce
+        self.deltaPrevouts = deltaPrevouts
+        self.spentBodyLoads = spentBodyLoads
+        self.listLive = listLive
+        self.listLiveMeta = listLiveMeta
+        self.listLiveWtxids = listLiveWtxids
+        self.ageScan = ageScan
+        self.expireFullScans = expireFullScans
+        self.tipMtp = tipMtp
+        self.getCoin = getCoin
+        self.getCoinBlockTxFks = getCoinBlockTxFks
+        self.getCoinCreateMtp = getCoinCreateMtp
+    }
+}
+
+
+
+extension FfiMempoolPerfSample: Equatable, Hashable {
+    public static func ==(lhs: FfiMempoolPerfSample, rhs: FfiMempoolPerfSample) -> Bool {
+        if lhs.accepts != rhs.accepts {
+            return false
+        }
+        if lhs.rejects != rhs.rejects {
+            return false
+        }
+        if lhs.acceptUs != rhs.acceptUs {
+            return false
+        }
+        if lhs.acceptMaxUs != rhs.acceptMaxUs {
+            return false
+        }
+        if lhs.acceptLockUs != rhs.acceptLockUs {
+            return false
+        }
+        if lhs.acceptUtxoUs != rhs.acceptUtxoUs {
+            return false
+        }
+        if lhs.acceptScriptUs != rhs.acceptScriptUs {
+            return false
+        }
+        if lhs.acceptDurableUs != rhs.acceptDurableUs {
+            return false
+        }
+        if lhs.invTx != rhs.invTx {
+            return false
+        }
+        if lhs.getdataTx != rhs.getdataTx {
+            return false
+        }
+        if lhs.announce != rhs.announce {
+            return false
+        }
+        if lhs.deltaPrevouts != rhs.deltaPrevouts {
+            return false
+        }
+        if lhs.spentBodyLoads != rhs.spentBodyLoads {
+            return false
+        }
+        if lhs.listLive != rhs.listLive {
+            return false
+        }
+        if lhs.listLiveMeta != rhs.listLiveMeta {
+            return false
+        }
+        if lhs.listLiveWtxids != rhs.listLiveWtxids {
+            return false
+        }
+        if lhs.ageScan != rhs.ageScan {
+            return false
+        }
+        if lhs.expireFullScans != rhs.expireFullScans {
+            return false
+        }
+        if lhs.tipMtp != rhs.tipMtp {
+            return false
+        }
+        if lhs.getCoin != rhs.getCoin {
+            return false
+        }
+        if lhs.getCoinBlockTxFks != rhs.getCoinBlockTxFks {
+            return false
+        }
+        if lhs.getCoinCreateMtp != rhs.getCoinCreateMtp {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(accepts)
+        hasher.combine(rejects)
+        hasher.combine(acceptUs)
+        hasher.combine(acceptMaxUs)
+        hasher.combine(acceptLockUs)
+        hasher.combine(acceptUtxoUs)
+        hasher.combine(acceptScriptUs)
+        hasher.combine(acceptDurableUs)
+        hasher.combine(invTx)
+        hasher.combine(getdataTx)
+        hasher.combine(announce)
+        hasher.combine(deltaPrevouts)
+        hasher.combine(spentBodyLoads)
+        hasher.combine(listLive)
+        hasher.combine(listLiveMeta)
+        hasher.combine(listLiveWtxids)
+        hasher.combine(ageScan)
+        hasher.combine(expireFullScans)
+        hasher.combine(tipMtp)
+        hasher.combine(getCoin)
+        hasher.combine(getCoinBlockTxFks)
+        hasher.combine(getCoinCreateMtp)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMempoolPerfSample: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMempoolPerfSample {
+        return
+            try FfiMempoolPerfSample(
+                accepts: FfiConverterUInt64.read(from: &buf), 
+                rejects: FfiConverterUInt64.read(from: &buf), 
+                acceptUs: FfiConverterUInt64.read(from: &buf), 
+                acceptMaxUs: FfiConverterUInt64.read(from: &buf), 
+                acceptLockUs: FfiConverterUInt64.read(from: &buf), 
+                acceptUtxoUs: FfiConverterUInt64.read(from: &buf), 
+                acceptScriptUs: FfiConverterUInt64.read(from: &buf), 
+                acceptDurableUs: FfiConverterUInt64.read(from: &buf), 
+                invTx: FfiConverterUInt64.read(from: &buf), 
+                getdataTx: FfiConverterUInt64.read(from: &buf), 
+                announce: FfiConverterUInt64.read(from: &buf), 
+                deltaPrevouts: FfiConverterUInt64.read(from: &buf), 
+                spentBodyLoads: FfiConverterUInt64.read(from: &buf), 
+                listLive: FfiConverterUInt64.read(from: &buf), 
+                listLiveMeta: FfiConverterUInt64.read(from: &buf), 
+                listLiveWtxids: FfiConverterUInt64.read(from: &buf), 
+                ageScan: FfiConverterUInt64.read(from: &buf), 
+                expireFullScans: FfiConverterUInt64.read(from: &buf), 
+                tipMtp: FfiConverterUInt64.read(from: &buf), 
+                getCoin: FfiConverterUInt64.read(from: &buf), 
+                getCoinBlockTxFks: FfiConverterUInt64.read(from: &buf), 
+                getCoinCreateMtp: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiMempoolPerfSample, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.accepts, into: &buf)
+        FfiConverterUInt64.write(value.rejects, into: &buf)
+        FfiConverterUInt64.write(value.acceptUs, into: &buf)
+        FfiConverterUInt64.write(value.acceptMaxUs, into: &buf)
+        FfiConverterUInt64.write(value.acceptLockUs, into: &buf)
+        FfiConverterUInt64.write(value.acceptUtxoUs, into: &buf)
+        FfiConverterUInt64.write(value.acceptScriptUs, into: &buf)
+        FfiConverterUInt64.write(value.acceptDurableUs, into: &buf)
+        FfiConverterUInt64.write(value.invTx, into: &buf)
+        FfiConverterUInt64.write(value.getdataTx, into: &buf)
+        FfiConverterUInt64.write(value.announce, into: &buf)
+        FfiConverterUInt64.write(value.deltaPrevouts, into: &buf)
+        FfiConverterUInt64.write(value.spentBodyLoads, into: &buf)
+        FfiConverterUInt64.write(value.listLive, into: &buf)
+        FfiConverterUInt64.write(value.listLiveMeta, into: &buf)
+        FfiConverterUInt64.write(value.listLiveWtxids, into: &buf)
+        FfiConverterUInt64.write(value.ageScan, into: &buf)
+        FfiConverterUInt64.write(value.expireFullScans, into: &buf)
+        FfiConverterUInt64.write(value.tipMtp, into: &buf)
+        FfiConverterUInt64.write(value.getCoin, into: &buf)
+        FfiConverterUInt64.write(value.getCoinBlockTxFks, into: &buf)
+        FfiConverterUInt64.write(value.getCoinCreateMtp, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolPerfSample_lift(_ buf: RustBuffer) throws -> FfiMempoolPerfSample {
+    return try FfiConverterTypeFfiMempoolPerfSample.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMempoolPerfSample_lower(_ value: FfiMempoolPerfSample) -> RustBuffer {
+    return FfiConverterTypeFfiMempoolPerfSample.lower(value)
 }
 
 
@@ -7510,6 +8319,88 @@ public func FfiConverterTypeFfiQueuedBlockMeta_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeFfiQueuedBlockMeta_lower(_ value: FfiQueuedBlockMeta) -> RustBuffer {
     return FfiConverterTypeFfiQueuedBlockMeta.lower(value)
+}
+
+
+public struct FfiRecentAccept {
+    public var txid: String
+    public var feeSat: UInt64
+    public var weight: UInt64
+    public var valueSat: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(txid: String, feeSat: UInt64, weight: UInt64, valueSat: UInt64) {
+        self.txid = txid
+        self.feeSat = feeSat
+        self.weight = weight
+        self.valueSat = valueSat
+    }
+}
+
+
+
+extension FfiRecentAccept: Equatable, Hashable {
+    public static func ==(lhs: FfiRecentAccept, rhs: FfiRecentAccept) -> Bool {
+        if lhs.txid != rhs.txid {
+            return false
+        }
+        if lhs.feeSat != rhs.feeSat {
+            return false
+        }
+        if lhs.weight != rhs.weight {
+            return false
+        }
+        if lhs.valueSat != rhs.valueSat {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(txid)
+        hasher.combine(feeSat)
+        hasher.combine(weight)
+        hasher.combine(valueSat)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiRecentAccept: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRecentAccept {
+        return
+            try FfiRecentAccept(
+                txid: FfiConverterString.read(from: &buf), 
+                feeSat: FfiConverterUInt64.read(from: &buf), 
+                weight: FfiConverterUInt64.read(from: &buf), 
+                valueSat: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiRecentAccept, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.txid, into: &buf)
+        FfiConverterUInt64.write(value.feeSat, into: &buf)
+        FfiConverterUInt64.write(value.weight, into: &buf)
+        FfiConverterUInt64.write(value.valueSat, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRecentAccept_lift(_ buf: RustBuffer) throws -> FfiRecentAccept {
+    return try FfiConverterTypeFfiRecentAccept.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRecentAccept_lower(_ value: FfiRecentAccept) -> RustBuffer {
+    return FfiConverterTypeFfiRecentAccept.lower(value)
 }
 
 
@@ -9427,6 +10318,31 @@ fileprivate struct FfiConverterSequenceTypeFfiInputRecord: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiLiveWtxid: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiLiveWtxid]
+
+    public static func write(_ value: [FfiLiveWtxid], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiLiveWtxid.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiLiveWtxid] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiLiveWtxid]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiLiveWtxid.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiOutputRecord: FfiConverterRustBuffer {
     typealias SwiftType = [FfiOutputRecord]
 
@@ -9544,6 +10460,31 @@ fileprivate struct FfiConverterSequenceTypeFfiQueuedBlockMeta: FfiConverterRustB
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiQueuedBlockMeta.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiRecentAccept: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiRecentAccept]
+
+    public static func write(_ value: [FfiRecentAccept], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiRecentAccept.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiRecentAccept] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiRecentAccept]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiRecentAccept.read(from: &buf))
         }
         return seq
     }
@@ -12503,6 +13444,81 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffimempool_slot_stats() != 60716) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_accept_tx() != 64634) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_compact() != 3846) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_contains() != 1149) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_contains_wtxid() != 44668) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_expiry_hours() != 27251) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_fee_delta() != 61037) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_flush() != 61112) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_generation() != 38753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_get_tx() != 18006) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_get_tx_by_wtxid() != 53326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_immediate_relay() != 9092) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_list_live_wtxids() != 48603) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_live_count() != 61103) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_max_weight() != 43262) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_note_getdata_tx() != 51143) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_note_inv_tx() != 22800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_orphan_count() != 31037) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_recent_accepts() != 54306) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_relay_enabled() != 57909) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_sample_reset_perf() != 38694) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_set_expiry_hours() != 17027) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_set_immediate_relay() != 57912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_set_relay_enabled() != 987) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_template_updates() != 9762) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_test_accept() != 14047) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffinodeclock_now_secs() != 50083) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13134,6 +14150,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffimempool_open_or_create() != 36938) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_constructor_ffimempoolhub_open() != 30345) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_constructor_ffinodeclock_new() != 28177) {

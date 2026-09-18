@@ -3408,7 +3408,7 @@ impl FfiMempool {
     }
 }
 
-#[derive(uniffi::Record)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiMempoolGraphStats {
     pub ancestorcount: u64,
     pub ancestorsize: u64,
@@ -4776,6 +4776,33 @@ pub struct FfiCompactResult {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiGraphFeesModified {
+    pub stats: FfiMempoolGraphStats,
+    pub ancestor_fee_mod: i64,
+    pub descendant_fee_mod: i64,
+    pub chunk_fee: i64,
+    pub chunk_weight: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiFeeratePoint {
+    pub cum_weight: u64,
+    pub feerate: i64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiFeeHistogramEntry {
+    pub feerate: u64,
+    pub weight: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiFeeEstimate {
+    pub target_blocks: u32,
+    pub btc_per_kb: f64,
+}
+
 #[derive(uniffi::Object)]
 pub struct FfiMempoolHub {
     inner: Arc<rbitcoin_net::MempoolHub>,
@@ -5002,6 +5029,90 @@ impl FfiMempoolHub {
     pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
         self.inner.set_min_relay_sat_kvb(sat_kvb);
     }
+
+    pub fn min_relay_sat_kvb(&self) -> u64 {
+        self.inner.min_relay_sat_kvb()
+    }
+
+    pub fn graph_stats(&self, txid_hex: String) -> Result<Option<FfiMempoolGraphStats>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.graph_stats(&txid).map(|s| FfiMempoolGraphStats {
+            ancestorcount: s.ancestorcount,
+            ancestorsize: s.ancestorsize,
+            ancestorfees: s.ancestorfees,
+            descendantcount: s.descendantcount,
+            descendantsize: s.descendantsize,
+            descendantfees: s.descendantfees,
+        }))
+    }
+
+    pub fn graph_fees_modified(
+        &self,
+        txid_hex: String,
+    ) -> Result<Option<FfiGraphFeesModified>, RustyError> {
+        let txid = bitcoin::Txid::from_str(&txid_hex).map_err(|_| RustyError::InvalidInput)?;
+        Ok(self.inner.graph_fees_modified(&txid).map(|(s, a, d, cf, cw)| FfiGraphFeesModified {
+            stats: FfiMempoolGraphStats {
+                ancestorcount: s.ancestorcount,
+                ancestorsize: s.ancestorsize,
+                ancestorfees: s.ancestorfees,
+                descendantcount: s.descendantcount,
+                descendantsize: s.descendantsize,
+                descendantfees: s.descendantfees,
+            },
+            ancestor_fee_mod: a,
+            descendant_fee_mod: d,
+            chunk_fee: cf,
+            chunk_weight: cw,
+        }))
+    }
+
+    pub fn feerate_diagram(&self) -> Vec<FfiFeeratePoint> {
+        self.inner
+            .feerate_diagram()
+            .into_iter()
+            .map(|(w, r)| FfiFeeratePoint {
+                cum_weight: w,
+                feerate: r,
+            })
+            .collect()
+    }
+
+    pub fn fee_histogram(&self) -> Vec<FfiFeeHistogramEntry> {
+        self.inner
+            .fee_histogram()
+            .into_iter()
+            .map(|(r, w)| FfiFeeHistogramEntry { feerate: r, weight: w })
+            .collect()
+    }
+
+    pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
+        self.inner.estimate_fee_btc_per_kb(target_blocks)
+    }
+
+    pub fn fee_estimates_btc_per_kb(&self) -> Vec<FfiFeeEstimate> {
+        self.inner
+            .fee_estimates_btc_per_kb()
+            .into_iter()
+            .map(|(t, f)| FfiFeeEstimate {
+                target_blocks: t,
+                btc_per_kb: f,
+            })
+            .collect()
+    }
+
+    pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
+        self.inner.weight_above_feerate(rate_sat_per_kvb)
+    }
+
+    pub fn relay_fee_btc_per_kb(&self) -> f64 {
+        rbitcoin_net::MempoolHub::relay_fee_btc_per_kb()
+    }
+}
+
+#[uniffi::export]
+pub fn mempool_relay_fee_btc_per_kb() -> f64 {
+    rbitcoin_net::MempoolHub::relay_fee_btc_per_kb()
 }
 
 // --- Node Time FFI ---
@@ -8304,6 +8415,26 @@ mod tests {
         let txid = "0000000000000000000000000000000000000000000000000000000000000001";
         hub.prioritise_tx(txid.to_string(), 1000).unwrap();
         assert_eq!(hub.fee_delta(txid.to_string()).unwrap(), 1000);
+    }
+
+    #[test]
+    fn test_mempool_hub_fee_estimation_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let query_path = tmp.path().join("query").to_str().unwrap().to_string();
+        let mp_path = tmp.path().join("mp").to_str().unwrap().to_string();
+        let hub = FfiMempoolHub::open(query_path, mp_path, 300_000_000, false).unwrap();
+        assert!(hub.feerate_diagram().is_empty());
+        assert!(hub.fee_histogram().is_empty());
+        // fee_estimates returns entries for all depths even when empty
+        assert!(!hub.fee_estimates_btc_per_kb().is_empty());
+        assert_eq!(hub.estimate_fee_btc_per_kb(6), -1.0);
+        assert_eq!(hub.weight_above_feerate(1000), 0);
+        assert!(mempool_relay_fee_btc_per_kb() > 0.0);
+        assert_eq!(hub.min_relay_sat_kvb(), rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB);
+        // graph_stats on empty mempool
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001";
+        assert!(hub.graph_stats(txid.to_string()).unwrap().is_none());
+        assert!(hub.graph_fees_modified(txid.to_string()).unwrap().is_none());
     }
 
 }

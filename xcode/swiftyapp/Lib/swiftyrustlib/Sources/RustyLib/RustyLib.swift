@@ -2759,11 +2759,19 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     
     func containsWtxid(wtxidHex: String) throws  -> Bool
     
+    func estimateFeeBtcPerKb(targetBlocks: UInt32)  -> Double
+    
     func evictLiveTxids(txidsHex: [String]) throws  -> UInt64
     
     func expiryHours()  -> UInt64
     
     func feeDelta(txidHex: String) throws  -> Int64
+    
+    func feeEstimatesBtcPerKb()  -> [FfiFeeEstimate]
+    
+    func feeHistogram()  -> [FfiFeeHistogramEntry]
+    
+    func feerateDiagram()  -> [FfiFeeratePoint]
     
     func flush() throws 
     
@@ -2773,6 +2781,10 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     
     func getTxByWtxid(wtxidHex: String) throws  -> String?
     
+    func graphFeesModified(txidHex: String) throws  -> FfiGraphFeesModified?
+    
+    func graphStats(txidHex: String) throws  -> FfiMempoolGraphStats?
+    
     func immediateRelay()  -> Bool
     
     func listLiveWtxids()  -> [FfiLiveWtxid]
@@ -2780,6 +2792,8 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     func liveCount()  -> UInt64
     
     func maxWeight()  -> UInt64
+    
+    func minRelaySatKvb()  -> UInt64
     
     func noteGetdataTx(n: UInt64) 
     
@@ -2792,6 +2806,8 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     func recentAccepts()  -> [FfiRecentAccept]
     
     func relayEnabled()  -> Bool
+    
+    func relayFeeBtcPerKb()  -> Double
     
     func removeForBlock(txidsHex: [String]) throws  -> UInt64
     
@@ -2812,6 +2828,8 @@ public protocol FfiMempoolHubProtocol : AnyObject {
     func templateUpdates()  -> UInt64
     
     func testAccept(txHex: String) throws  -> FfiAcceptResult
+    
+    func weightAboveFeerate(rateSatPerKvb: UInt64)  -> UInt64
     
 }
 
@@ -2907,6 +2925,14 @@ open func containsWtxid(wtxidHex: String)throws  -> Bool {
 })
 }
     
+open func estimateFeeBtcPerKb(targetBlocks: UInt32) -> Double {
+    return try!  FfiConverterDouble.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_estimate_fee_btc_per_kb(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(targetBlocks),$0
+    )
+})
+}
+    
 open func evictLiveTxids(txidsHex: [String])throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffimempoolhub_evict_live_txids(self.uniffiClonePointer(),
@@ -2926,6 +2952,27 @@ open func feeDelta(txidHex: String)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffimempoolhub_fee_delta(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func feeEstimatesBtcPerKb() -> [FfiFeeEstimate] {
+    return try!  FfiConverterSequenceTypeFfiFeeEstimate.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_fee_estimates_btc_per_kb(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func feeHistogram() -> [FfiFeeHistogramEntry] {
+    return try!  FfiConverterSequenceTypeFfiFeeHistogramEntry.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_fee_histogram(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func feerateDiagram() -> [FfiFeeratePoint] {
+    return try!  FfiConverterSequenceTypeFfiFeeratePoint.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_feerate_diagram(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -2959,6 +3006,22 @@ open func getTxByWtxid(wtxidHex: String)throws  -> String? {
 })
 }
     
+open func graphFeesModified(txidHex: String)throws  -> FfiGraphFeesModified? {
+    return try  FfiConverterOptionTypeFfiGraphFeesModified.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_graph_fees_modified(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func graphStats(txidHex: String)throws  -> FfiMempoolGraphStats? {
+    return try  FfiConverterOptionTypeFfiMempoolGraphStats.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffimempoolhub_graph_stats(self.uniffiClonePointer(),
+        FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
 open func immediateRelay() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_immediate_relay(self.uniffiClonePointer(),$0
@@ -2983,6 +3046,13 @@ open func liveCount() -> UInt64 {
 open func maxWeight() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_max_weight(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func minRelaySatKvb() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_min_relay_sat_kvb(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3026,6 +3096,13 @@ open func recentAccepts() -> [FfiRecentAccept] {
 open func relayEnabled() -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_method_ffimempoolhub_relay_enabled(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func relayFeeBtcPerKb() -> Double {
+    return try!  FfiConverterDouble.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_relay_fee_btc_per_kb(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3099,6 +3176,14 @@ open func testAccept(txHex: String)throws  -> FfiAcceptResult {
     return try  FfiConverterTypeFfiAcceptResult.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffimempoolhub_test_accept(self.uniffiClonePointer(),
         FfiConverterString.lower(txHex),$0
+    )
+})
+}
+    
+open func weightAboveFeerate(rateSatPerKvb: UInt64) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_rustylib_fn_method_ffimempoolhub_weight_above_feerate(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(rateSatPerKvb),$0
     )
 })
 }
@@ -6609,6 +6694,294 @@ public func FfiConverterTypeFfiEsploraScriptFields_lower(_ value: FfiEsploraScri
 }
 
 
+public struct FfiFeeEstimate {
+    public var targetBlocks: UInt32
+    public var btcPerKb: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(targetBlocks: UInt32, btcPerKb: Double) {
+        self.targetBlocks = targetBlocks
+        self.btcPerKb = btcPerKb
+    }
+}
+
+
+
+extension FfiFeeEstimate: Equatable, Hashable {
+    public static func ==(lhs: FfiFeeEstimate, rhs: FfiFeeEstimate) -> Bool {
+        if lhs.targetBlocks != rhs.targetBlocks {
+            return false
+        }
+        if lhs.btcPerKb != rhs.btcPerKb {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(targetBlocks)
+        hasher.combine(btcPerKb)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFeeEstimate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFeeEstimate {
+        return
+            try FfiFeeEstimate(
+                targetBlocks: FfiConverterUInt32.read(from: &buf), 
+                btcPerKb: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiFeeEstimate, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.targetBlocks, into: &buf)
+        FfiConverterDouble.write(value.btcPerKb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeEstimate_lift(_ buf: RustBuffer) throws -> FfiFeeEstimate {
+    return try FfiConverterTypeFfiFeeEstimate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeEstimate_lower(_ value: FfiFeeEstimate) -> RustBuffer {
+    return FfiConverterTypeFfiFeeEstimate.lower(value)
+}
+
+
+public struct FfiFeeHistogramEntry {
+    public var feerate: UInt64
+    public var weight: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(feerate: UInt64, weight: UInt64) {
+        self.feerate = feerate
+        self.weight = weight
+    }
+}
+
+
+
+extension FfiFeeHistogramEntry: Equatable, Hashable {
+    public static func ==(lhs: FfiFeeHistogramEntry, rhs: FfiFeeHistogramEntry) -> Bool {
+        if lhs.feerate != rhs.feerate {
+            return false
+        }
+        if lhs.weight != rhs.weight {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(feerate)
+        hasher.combine(weight)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFeeHistogramEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFeeHistogramEntry {
+        return
+            try FfiFeeHistogramEntry(
+                feerate: FfiConverterUInt64.read(from: &buf), 
+                weight: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiFeeHistogramEntry, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.feerate, into: &buf)
+        FfiConverterUInt64.write(value.weight, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeHistogramEntry_lift(_ buf: RustBuffer) throws -> FfiFeeHistogramEntry {
+    return try FfiConverterTypeFfiFeeHistogramEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeHistogramEntry_lower(_ value: FfiFeeHistogramEntry) -> RustBuffer {
+    return FfiConverterTypeFfiFeeHistogramEntry.lower(value)
+}
+
+
+public struct FfiFeeratePoint {
+    public var cumWeight: UInt64
+    public var feerate: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(cumWeight: UInt64, feerate: Int64) {
+        self.cumWeight = cumWeight
+        self.feerate = feerate
+    }
+}
+
+
+
+extension FfiFeeratePoint: Equatable, Hashable {
+    public static func ==(lhs: FfiFeeratePoint, rhs: FfiFeeratePoint) -> Bool {
+        if lhs.cumWeight != rhs.cumWeight {
+            return false
+        }
+        if lhs.feerate != rhs.feerate {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(cumWeight)
+        hasher.combine(feerate)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiFeeratePoint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiFeeratePoint {
+        return
+            try FfiFeeratePoint(
+                cumWeight: FfiConverterUInt64.read(from: &buf), 
+                feerate: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiFeeratePoint, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.cumWeight, into: &buf)
+        FfiConverterInt64.write(value.feerate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeratePoint_lift(_ buf: RustBuffer) throws -> FfiFeeratePoint {
+    return try FfiConverterTypeFfiFeeratePoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiFeeratePoint_lower(_ value: FfiFeeratePoint) -> RustBuffer {
+    return FfiConverterTypeFfiFeeratePoint.lower(value)
+}
+
+
+public struct FfiGraphFeesModified {
+    public var stats: FfiMempoolGraphStats
+    public var ancestorFeeMod: Int64
+    public var descendantFeeMod: Int64
+    public var chunkFee: Int64
+    public var chunkWeight: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(stats: FfiMempoolGraphStats, ancestorFeeMod: Int64, descendantFeeMod: Int64, chunkFee: Int64, chunkWeight: UInt64) {
+        self.stats = stats
+        self.ancestorFeeMod = ancestorFeeMod
+        self.descendantFeeMod = descendantFeeMod
+        self.chunkFee = chunkFee
+        self.chunkWeight = chunkWeight
+    }
+}
+
+
+
+extension FfiGraphFeesModified: Equatable, Hashable {
+    public static func ==(lhs: FfiGraphFeesModified, rhs: FfiGraphFeesModified) -> Bool {
+        if lhs.stats != rhs.stats {
+            return false
+        }
+        if lhs.ancestorFeeMod != rhs.ancestorFeeMod {
+            return false
+        }
+        if lhs.descendantFeeMod != rhs.descendantFeeMod {
+            return false
+        }
+        if lhs.chunkFee != rhs.chunkFee {
+            return false
+        }
+        if lhs.chunkWeight != rhs.chunkWeight {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(stats)
+        hasher.combine(ancestorFeeMod)
+        hasher.combine(descendantFeeMod)
+        hasher.combine(chunkFee)
+        hasher.combine(chunkWeight)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiGraphFeesModified: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiGraphFeesModified {
+        return
+            try FfiGraphFeesModified(
+                stats: FfiConverterTypeFfiMempoolGraphStats.read(from: &buf), 
+                ancestorFeeMod: FfiConverterInt64.read(from: &buf), 
+                descendantFeeMod: FfiConverterInt64.read(from: &buf), 
+                chunkFee: FfiConverterInt64.read(from: &buf), 
+                chunkWeight: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiGraphFeesModified, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiMempoolGraphStats.write(value.stats, into: &buf)
+        FfiConverterInt64.write(value.ancestorFeeMod, into: &buf)
+        FfiConverterInt64.write(value.descendantFeeMod, into: &buf)
+        FfiConverterInt64.write(value.chunkFee, into: &buf)
+        FfiConverterUInt64.write(value.chunkWeight, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGraphFeesModified_lift(_ buf: RustBuffer) throws -> FfiGraphFeesModified {
+    return try FfiConverterTypeFfiGraphFeesModified.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGraphFeesModified_lower(_ value: FfiGraphFeesModified) -> RustBuffer {
+    return FfiConverterTypeFfiGraphFeesModified.lower(value)
+}
+
+
 public struct FfiHeadResizeSizeSnapshot {
     public var classAN: UInt64
     public var primaryBits: UInt32
@@ -9868,6 +10241,30 @@ fileprivate struct FfiConverterOptionTypeFfiCreateLocPair: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiGraphFeesModified: FfiConverterRustBuffer {
+    typealias SwiftType = FfiGraphFeesModified?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiGraphFeesModified.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiGraphFeesModified.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiHeaderRecord: FfiConverterRustBuffer {
     typealias SwiftType = FfiHeaderRecord?
 
@@ -10277,6 +10674,81 @@ fileprivate struct FfiConverterSequenceTypeFfiCoinbaseAtHeight: FfiConverterRust
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiCoinbaseAtHeight.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiFeeEstimate: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiFeeEstimate]
+
+    public static func write(_ value: [FfiFeeEstimate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiFeeEstimate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiFeeEstimate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiFeeEstimate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiFeeEstimate.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiFeeHistogramEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiFeeHistogramEntry]
+
+    public static func write(_ value: [FfiFeeHistogramEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiFeeHistogramEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiFeeHistogramEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiFeeHistogramEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiFeeHistogramEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiFeeratePoint: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiFeeratePoint]
+
+    public static func write(_ value: [FfiFeeratePoint], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiFeeratePoint.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiFeeratePoint] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiFeeratePoint]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiFeeratePoint.read(from: &buf))
         }
         return seq
     }
@@ -11549,6 +12021,12 @@ public func mempoolRbfrRatioNum() -> UInt64 {
     )
 })
 }
+public func mempoolRelayFeeBtcPerKb() -> Double {
+    return try!  FfiConverterDouble.lift(try! rustCall() {
+    uniffi_rustylib_fn_func_mempool_relay_fee_btc_per_kb($0
+    )
+})
+}
 public func mempoolSecondsPerBlock() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_rustylib_fn_func_mempool_seconds_per_block($0
@@ -12752,6 +13230,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_func_mempool_rbfr_ratio_num() != 17489) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_func_mempool_relay_fee_btc_per_kb() != 5531) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_func_mempool_seconds_per_block() != 16726) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13526,6 +14007,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffimempoolhub_contains_wtxid() != 44668) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_estimate_fee_btc_per_kb() != 38929) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_evict_live_txids() != 17453) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13533,6 +14017,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_fee_delta() != 61037) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_fee_estimates_btc_per_kb() != 31493) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_fee_histogram() != 12905) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_feerate_diagram() != 40123) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_flush() != 61112) {
@@ -13547,6 +14040,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_rustylib_checksum_method_ffimempoolhub_get_tx_by_wtxid() != 53326) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_graph_fees_modified() != 45456) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_graph_stats() != 53281) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_immediate_relay() != 9092) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13557,6 +14056,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_max_weight() != 43262) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_min_relay_sat_kvb() != 54152) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_note_getdata_tx() != 51143) {
@@ -13575,6 +14077,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_relay_enabled() != 57909) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_relay_fee_btc_per_kb() != 11811) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_remove_for_block() != 5136) {
@@ -13605,6 +14110,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffimempoolhub_test_accept() != 14047) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffimempoolhub_weight_above_feerate() != 51028) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffinodeclock_now_secs() != 50083) {

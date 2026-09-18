@@ -638,6 +638,8 @@ public protocol FfiActiveMempoolProtocol : AnyObject {
     
     func removeTxidTree(txidHex: String) throws  -> [String]
     
+    func reorgDisconnectReaccept(query: FfiQuery, txsHex: [String]) throws  -> [String]
+    
     func selectBlockTxs(maxWeightWu: UInt64)  -> [String]
     
     func setClusterLimits(count: UInt32?, sizeKvb: UInt32?) 
@@ -870,6 +872,15 @@ open func removeTxidTree(txidHex: String)throws  -> [String] {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
     uniffi_rustylib_fn_method_ffiactivemempool_remove_txid_tree(self.uniffiClonePointer(),
         FfiConverterString.lower(txidHex),$0
+    )
+})
+}
+    
+open func reorgDisconnectReaccept(query: FfiQuery, txsHex: [String])throws  -> [String] {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_method_ffiactivemempool_reorg_disconnect_reaccept(self.uniffiClonePointer(),
+        FfiConverterTypeFfiQuery.lower(query),
+        FfiConverterSequenceString.lower(txsHex),$0
     )
 })
 }
@@ -9765,6 +9776,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_remove_txid_tree() != 38135) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_method_ffiactivemempool_reorg_disconnect_reaccept() != 25683) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_method_ffiactivemempool_select_block_txs() != 6456) {

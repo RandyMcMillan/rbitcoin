@@ -6165,6 +6165,27 @@ pub fn psbt_fee_sat(hex: String) -> Result<u64, RustyError> {
     Ok(fee.to_sat())
 }
 
+#[uniffi::export]
+pub fn psbt_input_count(hex: String) -> Result<u64, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(psbt.inputs.len() as u64)
+}
+
+#[uniffi::export]
+pub fn psbt_output_count(hex: String) -> Result<u64, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(psbt.outputs.len() as u64)
+}
+
+#[uniffi::export]
+pub fn psbt_is_finalized(hex: String) -> Result<bool, RustyError> {
+    let bytes = rbitcoin_primitives::hex_decode(&hex).map_err(|_| RustyError::InvalidInput)?;
+    let psbt = bitcoin::Psbt::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
+    Ok(psbt.inputs.iter().all(|i| i.final_script_sig.is_some() || i.final_script_witness.is_some()))
+}
+
 // --- Chain constants & logs FFI ---
 
 #[uniffi::export]
@@ -8270,8 +8291,11 @@ mod tests {
         assert!(psbt_from_hex(psbt_hex.clone()).unwrap());
         let tx_hex = psbt_extract_tx_hex(psbt_hex.clone()).unwrap();
         assert!(!tx_hex.is_empty());
-        let fee = psbt_fee_sat(psbt_hex).unwrap();
+        let fee = psbt_fee_sat(psbt_hex.clone()).unwrap();
         assert_eq!(fee, 0);
+        assert_eq!(psbt_input_count(psbt_hex.clone()).unwrap(), 0);
+        assert_eq!(psbt_output_count(psbt_hex.clone()).unwrap(), 0);
+        assert!(psbt_is_finalized(psbt_hex).unwrap());
     }
 
     #[test]

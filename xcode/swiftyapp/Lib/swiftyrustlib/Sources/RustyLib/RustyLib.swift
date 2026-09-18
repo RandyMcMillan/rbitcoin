@@ -13770,6 +13770,27 @@ public func psbtFromHex(hex: String)throws  -> Bool {
     )
 })
 }
+public func psbtInputCount(hex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_input_count(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
+public func psbtIsFinalized(hex: String)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_is_finalized(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
+public func psbtOutputCount(hex: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeRustyError.lift) {
+    uniffi_rustylib_fn_func_psbt_output_count(
+        FfiConverterString.lower(hex),$0
+    )
+})
+}
 public func pureRbfrPays(newFee: UInt64, newWeight: UInt64, directFee: UInt64, directWeight: UInt64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_rustylib_fn_func_pure_rbfr_pays(
@@ -14872,6 +14893,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_psbt_from_hex() != 24117) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_psbt_input_count() != 17298) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_psbt_is_finalized() != 56432) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_rustylib_checksum_func_psbt_output_count() != 50211) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_rustylib_checksum_func_pure_rbfr_pays() != 25186) {

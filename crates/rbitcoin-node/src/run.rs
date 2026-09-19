@@ -280,6 +280,26 @@ pub async fn run_p2p_with_handle(
         }
     }
 
+    let tip_poll_shutdown = Arc::clone(&shutdown);
+    let tip_poll_hub = Arc::clone(&node.hub);
+    let tip_poll_height = Arc::clone(&tip_height);
+    let tip_poll_ibd = Arc::clone(&initial_block_download);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            if tip_poll_shutdown.requested() {
+                break;
+            }
+            if let Some(tip) = tip_poll_hub.tip_height() {
+                tip_poll_height.store(tip, Ordering::Relaxed);
+            }
+            tip_poll_ibd.store(tip_poll_hub.in_ibd(), Ordering::SeqCst);
+            tick.tick().await;
+        }
+    });
+
     let mempool_path = config.mempool_path();
     let query = node.hub.query.clone();
     let max_weight = config.mempool.max_weight;

@@ -16,7 +16,7 @@ const VERSIONBITS_NUM_BITS: i32 = 29;
 pub fn warn_period_threshold(network: Network) -> (u32, u32) {
     let period = match network {
         Network::Regtest => 144,
-        Network::Testnet | Network::Signet => 2016,
+        Network::Testnet | Network::Testnet4 | Network::Signet => 2016,
         Network::Mainnet => 2016,
     };
     let threshold = period * 3 / 4;
@@ -102,6 +102,13 @@ mod tests {
         let (p, t) = warn_period_threshold(Network::Regtest);
         assert_eq!(p, 144);
         assert_eq!(t, 108);
+    }
+
+    #[test]
+    fn testnet4_period_matches_testnet() {
+        let (p, t) = warn_period_threshold(Network::Testnet4);
+        assert_eq!(p, 2016);
+        assert_eq!(t, 1512);
     }
 
     #[test]

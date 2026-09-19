@@ -84,7 +84,7 @@ fn pin_conf_unknown_key_and_peertimeout(td: &TestDatadir) {
 #[test]
 fn node_cli_and_surface_smoke() {
     // Networks + run_node lifecycle
-    for net in [Network::Mainnet, Network::Testnet, Network::Signet, Network::Regtest] {
+    for net in [Network::Mainnet, Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
         let td = TestDatadir::new().unwrap();
         let cfg = NodeConfig::default().with_datadir(td.path()).with_network(net).with_tiny_heads();
         let handle = run_node(cfg).unwrap();

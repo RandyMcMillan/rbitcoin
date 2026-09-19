@@ -588,6 +588,10 @@ mod tests {
             magic_for_params(&ChainParams::testnet()),
             Magic::from(bitcoin::Network::Testnet)
         );
+        assert_eq!(
+            magic_for_params(&ChainParams::testnet4()),
+            Magic::from(bitcoin::Network::Testnet4)
+        );
         assert_eq!(magic_for_params(&ChainParams::signet()), Magic::from(bitcoin::Network::Signet));
         assert_eq!(magic_for_params(&ChainParams::regtest()), Magic::REGTEST);
     }

@@ -168,6 +168,7 @@ pub enum Network {
     #[default]
     Mainnet,
     Testnet,
+    Testnet4,
     Signet,
     Regtest,
 }
@@ -177,6 +178,7 @@ impl Network {
         match self {
             Network::Mainnet => "mainnet",
             Network::Testnet => "testnet",
+            Network::Testnet4 => "testnet4",
             Network::Signet => "signet",
             Network::Regtest => "regtest",
         }
@@ -186,6 +188,7 @@ impl Network {
         match s.to_ascii_lowercase().as_str() {
             "main" | "mainnet" => Ok(Network::Mainnet),
             "test" | "testnet" | "testnet3" => Ok(Network::Testnet),
+            "testnet4" => Ok(Network::Testnet4),
             "signet" => Ok(Network::Signet),
             "regtest" => Ok(Network::Regtest),
             other => Err(ParseNetworkError { input: other.to_string() }),
@@ -197,6 +200,7 @@ impl Network {
         match self {
             Network::Mainnet => 8333,
             Network::Testnet => 18333,
+            Network::Testnet4 => 48333,
             Network::Signet => 38333,
             Network::Regtest => 18444,
         }
@@ -207,6 +211,7 @@ impl Network {
         match self {
             Network::Mainnet => 8332,
             Network::Testnet => 18332,
+            Network::Testnet4 => 48332,
             Network::Signet => 38332,
             Network::Regtest => 18443,
         }
@@ -316,6 +321,7 @@ mod tests {
     fn network_parse_display_and_error() {
         assert_eq!(Network::parse("mainnet").unwrap(), Network::Mainnet);
         assert_eq!(Network::parse("TESTNET3").unwrap(), Network::Testnet);
+        assert_eq!(Network::parse("testnet4").unwrap(), Network::Testnet4);
         assert_eq!(Network::parse("signet").unwrap().as_str(), "signet");
         assert_eq!(format!("{}", Network::Regtest), "regtest");
         let err = Network::parse("bogus").unwrap_err();
@@ -325,6 +331,8 @@ mod tests {
         assert_eq!(Network::Mainnet.default_rpc_port(), 8332);
         assert_eq!(Network::Testnet.default_p2p_port(), 18333);
         assert_eq!(Network::Testnet.default_rpc_port(), 18332);
+        assert_eq!(Network::Testnet4.default_p2p_port(), 48333);
+        assert_eq!(Network::Testnet4.default_rpc_port(), 48332);
         assert_eq!(Network::Signet.default_p2p_port(), 38333);
         assert_eq!(Network::Signet.default_rpc_port(), 38332);
         assert_eq!(Network::Regtest.default_p2p_port(), 18444);

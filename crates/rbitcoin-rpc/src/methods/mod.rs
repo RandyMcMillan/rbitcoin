@@ -793,6 +793,7 @@ pub(crate) fn chain_name(n: Network) -> &'static str {
     match n {
         Network::Mainnet => "main",
         Network::Testnet => "test",
+        Network::Testnet4 => "testnet4",
         Network::Signet => "signet",
         Network::Regtest => "regtest",
     }

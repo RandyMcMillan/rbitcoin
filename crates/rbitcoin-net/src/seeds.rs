@@ -52,6 +52,9 @@ pub fn dns_seeds(network: Network) -> &'static [&'static str] {
             "testnet-seed.bluematt.me",
             "testnet-seed.bitcoin.schildbach.de",
         ],
+        Network::Testnet4 => &[
+            "seed.testnet4.bitcoin.sprovoost.nl",
+        ],
         Network::Signet => &["seed.signet.bitcoin.sprovoost.nl"],
         Network::Regtest => &[],
     }
@@ -62,6 +65,7 @@ pub fn fixed_seed_hosts(network: Network) -> &'static [&'static str] {
     match network {
         Network::Mainnet => &["seed.bitcoin.sipa.be:8333", "dnsseed.emzy.de:8333"],
         Network::Testnet => &["testnet-seed.bitcoin.jonasschnelli.ch:18333"],
+        Network::Testnet4 => &["seed.testnet4.bitcoin.sprovoost.nl:48333"],
         Network::Signet => &["seed.signet.bitcoin.sprovoost.nl:38333"],
         Network::Regtest => &[],
     }
@@ -1146,18 +1150,22 @@ mod tests {
     fn network_ports_and_seed_lists() {
         assert_eq!(default_port(Network::Mainnet), 8333);
         assert_eq!(default_port(Network::Testnet), 18333);
+        assert_eq!(default_port(Network::Testnet4), 48333);
         assert_eq!(default_port(Network::Signet), 38333);
         assert_eq!(default_port(Network::Regtest), 18444);
         assert_eq!(default_rpc_port(Network::Mainnet), 8332);
         assert_eq!(default_rpc_port(Network::Testnet), 18332);
+        assert_eq!(default_rpc_port(Network::Testnet4), 48332);
         assert_eq!(default_rpc_port(Network::Signet), 38332);
         assert_eq!(default_rpc_port(Network::Regtest), 18443);
         assert!(!dns_seeds(Network::Mainnet).is_empty());
         assert!(!dns_seeds(Network::Testnet).is_empty());
+        assert_eq!(dns_seeds(Network::Testnet4).len(), 1);
         assert_eq!(dns_seeds(Network::Signet).len(), 1);
         assert!(dns_seeds(Network::Regtest).is_empty());
         assert!(!fixed_seed_hosts(Network::Mainnet).is_empty());
         assert!(!fixed_seed_hosts(Network::Testnet).is_empty());
+        assert!(!fixed_seed_hosts(Network::Testnet4).is_empty());
         assert!(!fixed_seed_hosts(Network::Signet).is_empty());
         assert!(fixed_seed_hosts(Network::Regtest).is_empty());
         // Regtest has no seeds → resolve paths stay empty (no network I/O).

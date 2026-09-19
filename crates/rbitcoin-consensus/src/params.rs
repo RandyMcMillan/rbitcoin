@@ -35,6 +35,7 @@ impl ChainParams {
         match network {
             rbitcoin_primitives::Network::Mainnet => Self::mainnet(),
             rbitcoin_primitives::Network::Testnet => Self::testnet(),
+            rbitcoin_primitives::Network::Testnet4 => Self::testnet4(),
             rbitcoin_primitives::Network::Signet => Self::signet(),
             rbitcoin_primitives::Network::Regtest => Self::regtest(),
         }
@@ -84,6 +85,21 @@ impl ChainParams {
             pow_limit: Target::MAX_ATTAINABLE_TESTNET,
             checkpoints: vec![],
             btc: BtcParams::new(Network::Testnet),
+            signet_challenge: None,
+            csv_height_overlay: None,
+            segwit_height_overlay: None,
+            subsidy_halving_overlay: None,
+        }
+    }
+
+    pub fn testnet4() -> Self {
+        let genesis = constants::genesis_block(Network::Testnet4);
+        Self {
+            network: Network::Testnet4,
+            genesis_hash: genesis.block_hash(),
+            pow_limit: Target::MAX_ATTAINABLE_TESTNET,
+            checkpoints: vec![],
+            btc: BtcParams::new(Network::Testnet4),
             signet_challenge: None,
             csv_height_overlay: None,
             segwit_height_overlay: None,
@@ -388,6 +404,7 @@ pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
     match network {
         rbitcoin_primitives::Network::Mainnet => 840_000,
         rbitcoin_primitives::Network::Testnet => 2_500_000,
+        rbitcoin_primitives::Network::Testnet4 => 2_500_000,
         // Signet tip moves; keep default above typical tip so catch-up stays under
         // milestone until operators opt into full validation (`--milestone 0`).
         rbitcoin_primitives::Network::Signet => 2_000_000,

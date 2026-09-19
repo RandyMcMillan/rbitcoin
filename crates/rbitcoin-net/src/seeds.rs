@@ -52,9 +52,7 @@ pub fn dns_seeds(network: Network) -> &'static [&'static str] {
             "testnet-seed.bluematt.me",
             "testnet-seed.bitcoin.schildbach.de",
         ],
-        Network::Testnet4 => &[
-            "seed.testnet4.bitcoin.sprovoost.nl",
-        ],
+        Network::Testnet4 => &["seed.testnet4.bitcoin.sprovoost.nl"],
         Network::Signet => &["seed.signet.bitcoin.sprovoost.nl"],
         Network::Regtest => &[],
     }

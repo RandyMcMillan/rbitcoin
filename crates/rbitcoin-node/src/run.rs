@@ -18,7 +18,7 @@ use rbitcoin_rpc::{
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
@@ -34,6 +34,8 @@ pub struct NodeHandle {
     pub tip_height: Arc<AtomicU32>,
     /// `true` while the node has not yet met minimum chain work or is still in IBD.
     pub initial_block_download: Arc<AtomicBool>,
+    /// Number of live outbound full-relay peers.
+    pub connections: Arc<AtomicUsize>,
     /// Exclusive datadir flock (released on drop).
     _dir_locks: crate::lock::DirLocks,
 }
@@ -161,6 +163,7 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         mempool: None,
         tip_height: Arc::new(AtomicU32::new(0)),
         initial_block_download: Arc::new(AtomicBool::new(true)),
+        connections: Arc::new(AtomicUsize::new(0)),
         _dir_locks: dir_locks,
     })
 }
@@ -282,8 +285,10 @@ pub async fn run_p2p_with_handle(
 
     let tip_poll_shutdown = Arc::clone(&shutdown);
     let tip_poll_hub = Arc::clone(&node.hub);
+    let tip_poll_peers = Arc::clone(&node.peers);
     let tip_poll_height = Arc::clone(&tip_height);
     let tip_poll_ibd = Arc::clone(&initial_block_download);
+    let tip_poll_connections = Arc::clone(&handle.connections);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -296,6 +301,7 @@ pub async fn run_p2p_with_handle(
                 tip_poll_height.store(tip, Ordering::Relaxed);
             }
             tip_poll_ibd.store(tip_poll_hub.in_ibd(), Ordering::SeqCst);
+            tip_poll_connections.store(tip_poll_peers.live_peers().len(), Ordering::Relaxed);
             tick.tick().await;
         }
     });

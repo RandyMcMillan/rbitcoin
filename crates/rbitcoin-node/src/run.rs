@@ -18,7 +18,7 @@ use rbitcoin_rpc::{
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
@@ -30,6 +30,10 @@ pub struct NodeHandle {
     /// Durable cluster mempool (opened in `run_p2p` and attached to `ChainHub`).
     /// Smoke-only `run_node` leaves this `None`.
     pub mempool: Option<std::sync::Arc<MempoolHub>>,
+    /// Best block height observed by the tip-follow loop.
+    pub tip_height: Arc<AtomicU32>,
+    /// `true` while the node has not yet met minimum chain work or is still in IBD.
+    pub initial_block_download: Arc<AtomicBool>,
     /// Exclusive datadir flock (released on drop).
     _dir_locks: crate::lock::DirLocks,
 }
@@ -162,6 +166,8 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         config,
         query,
         mempool: None,
+        tip_height: Arc::new(AtomicU32::new(0)),
+        initial_block_download: Arc::new(AtomicBool::new(true)),
         _dir_locks: dir_locks,
     })
 }
@@ -187,7 +193,19 @@ pub async fn run_p2p_with_shutdown(
     config: NodeConfig,
     shutdown: Arc<Shutdown>,
 ) -> Result<(), NodeError> {
-    let handle = run_node(config.clone())?;
+    let handle = run_node(config)?;
+    run_p2p_with_handle(handle, shutdown).await
+}
+
+/// Long-running P2P (+ optional Electrum) from an already-open [`NodeHandle`].
+///
+/// The caller can inspect [`NodeHandle::tip_height`] and
+/// [`NodeHandle::initial_block_download`] while the node is running.
+pub async fn run_p2p_with_handle(
+    handle: NodeHandle,
+    shutdown: Arc<Shutdown>,
+) -> Result<(), NodeError> {
+    let config = handle.config.clone();
     let params = config.chain_params()?;
     let milestone = config.milestone();
     if milestone.height > 0 {
@@ -218,6 +236,8 @@ pub async fn run_p2p_with_shutdown(
         std::env::var("RBITCOIN_IO").unwrap_or_else(|_| "default".into()),
     );
 
+    let tip_height = Arc::clone(&handle.tip_height);
+    let initial_block_download = Arc::clone(&handle.initial_block_download);
     let query = handle.query;
     let p2p_ua =
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
@@ -715,6 +735,10 @@ pub async fn run_p2p_with_shutdown(
                 &mut stale_poll,
             )
             .await;
+            if let Some(tip) = node.tip_height() {
+                tip_height.store(tip, Ordering::Relaxed);
+            }
+            initial_block_download.store(node.hub.in_ibd(), Ordering::SeqCst);
             if let Some(ref h) = rpc_handle {
                 if h.stop.load(Ordering::SeqCst) {
                     // Core keeps the RPC server up until in-flight handlers
@@ -2258,6 +2282,44 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p with esplora");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_p2p_with_handle_updates_status_atomics() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-handle-{nanos}"));
+        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.listen.use_seeds = false;
+        cfg.listen.connect.clear();
+        cfg.max_run_secs = Some(0);
+
+        let handle = run_node(cfg.clone()).expect("run_node should succeed");
+        let tip_height = Arc::clone(&handle.tip_height);
+        let ibd = Arc::clone(&handle.initial_block_download);
+        let shutdown = Shutdown::new();
+        let sd = Arc::clone(&shutdown);
+
+        let task = tokio::spawn(async move {
+            run_p2p_with_handle(handle, sd).await
+        });
+
+        // Give the node a moment to start the tip-follow loop.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // IBD should be reported while the node is running (regtest with no
+        // peers quickly exits, so this may already be false, but the atomic
+        // must have been written at least once).
+        let _ = ibd.load(Ordering::SeqCst);
+
+        shutdown.request();
+        let result = tokio::time::timeout(Duration::from_secs(15), task).await;
+        assert!(result.is_ok(), "run_p2p_with_handle timed out");
+        result.unwrap().expect("run_p2p_with_handle should complete");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

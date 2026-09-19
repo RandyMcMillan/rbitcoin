@@ -19,17 +19,12 @@ use std::collections::HashSet;
 
 /// BIP324 application contents for `cmpctblock`.
 pub fn encode_cmpctblock_v2(hsi: &HeaderAndShortIds) -> Result<Vec<u8>, NetError> {
-    encode_v2_contents(NetworkMessage::CmpctBlock(CmpctBlock {
-        compact_block: hsi.clone(),
-    }))
+    encode_v2_contents(NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi.clone() }))
 }
 
 /// High-bandwidth BIP152 v2 `sendcmpct(1, 2)`.
 pub fn encode_sendcmpct_hb_v2() -> Result<Vec<u8>, NetError> {
-    encode_v2_contents(NetworkMessage::SendCmpct(SendCmpct {
-        send_compact: true,
-        version: 2,
-    }))
+    encode_v2_contents(NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }))
 }
 
 /// BIP324 `ping`.
@@ -65,9 +60,7 @@ pub fn cmpct_hsi_regtest_connectable(hsi: &HeaderAndShortIds) -> bool {
     if hsi.header.prev_blockhash != genesis.block_hash() {
         return false;
     }
-    hsi.header
-        .validate_pow(Target::from_compact(hsi.header.bits))
-        .is_ok()
+    hsi.header.validate_pow(Target::from_compact(hsi.header.bits)).is_ok()
 }
 
 /// Decode a compact announcement and restamp a unique grinded height-1 header.
@@ -78,11 +71,8 @@ pub fn prepare_cmpct_fuzz_hsi(data: &[u8]) -> Option<HeaderAndShortIds> {
     hsi.header.bits = genesis.header.bits;
     let mix = sha256::Hash::hash(data);
     let extra = u32::from_le_bytes(mix.to_byte_array()[..4].try_into().ok()?);
-    hsi.header.time = genesis
-        .header
-        .time
-        .saturating_add(REGTEST_BLOCK_SPACING)
-        .saturating_add(extra % 10_000);
+    hsi.header.time =
+        genesis.header.time.saturating_add(REGTEST_BLOCK_SPACING).saturating_add(extra % 10_000);
     grind_regtest_pow(&mut hsi.header);
     cmpct_hsi_regtest_connectable(&hsi).then_some(hsi)
 }
@@ -102,10 +92,7 @@ pub struct CmpctFuzzCase {
 pub fn prepare_cmpct_fuzz_case(data: &[u8]) -> Option<CmpctFuzzCase> {
     if data.first().is_some_and(|b| b % 8 == CMPCT_FUZZ_RAW_REM) {
         let hsi = prepare_cmpct_fuzz_hsi(data.get(1..).unwrap_or(&[]))?;
-        return Some(CmpctFuzzCase {
-            hsi,
-            fill_txs: Vec::new(),
-        });
+        return Some(CmpctFuzzCase { hsi, fill_txs: Vec::new() });
     }
     Some(structured_cmpct_case(data))
 }
@@ -149,10 +136,7 @@ fn cmpct_fuzz_dummy_tx(mix: sha256::Hash, i: usize) -> Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array(id),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array(id), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[id.to_vec()]),
@@ -237,9 +221,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn fixture(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join(name)
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(name)
     }
 
     #[test]
@@ -274,10 +256,7 @@ mod tests {
         // filled the duplicate and only `getblocktxn` [1].
         let case = prepare_cmpct_fuzz_case(&[2, 203, 4, 63]).unwrap();
         assert!(cmpct_hsi_regtest_connectable(&case.hsi));
-        assert_eq!(
-            cmpct_missing_for_case(&case).as_deref(),
-            Some(&[1u64, 4][..])
-        );
+        assert_eq!(cmpct_missing_for_case(&case).as_deref(), Some(&[1u64, 4][..]));
         assert!(
             cmpct_getblocktxn_agrees(&[1, 4], &[1]),
             "018 extra missing vs Core extra-txn fill must not panic"
@@ -293,14 +272,8 @@ mod tests {
 
     #[test]
     fn recipe_fixtures_match_layout() {
-        assert_eq!(
-            std::fs::read(fixture("cmpct_fuzz_two_tx.bin")).unwrap(),
-            [0, 1, 0, 0]
-        );
-        assert_eq!(
-            std::fs::read(fixture("cmpct_fuzz_all_prefilled.bin")).unwrap(),
-            [0, 0, 0, 0]
-        );
+        assert_eq!(std::fs::read(fixture("cmpct_fuzz_two_tx.bin")).unwrap(), [0, 1, 0, 0]);
+        assert_eq!(std::fs::read(fixture("cmpct_fuzz_all_prefilled.bin")).unwrap(), [0, 0, 0, 0]);
         assert_eq!(
             std::fs::read(fixture("cmpct_fuzz_dup_prefill_corrupt.bin")).unwrap(),
             [2, 203, 4, 63]

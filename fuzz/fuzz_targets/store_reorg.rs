@@ -45,8 +45,7 @@ fn open_base() -> Base {
         harness_failure(&format!("query open: {e}"));
     });
     let hub = ChainHub::new(q, diff_regtest_params(), Milestone::NONE);
-    hub.ensure_genesis()
-        .unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
+    hub.ensure_genesis().unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
     Base { hub, _store: store }
 }
 

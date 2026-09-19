@@ -46,8 +46,7 @@ impl CoreRpc {
             }
         }
         let mut s = TcpStream::connect(&self.host).map_err(|e| e.to_string())?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))
-            .map_err(|e| e.to_string())?;
+        s.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
         let _ = s.set_nodelay(true);
         let body = rpc_roundtrip(&mut s, &req)?;
         *slot = Some(s);
@@ -175,18 +174,12 @@ impl BlockOracle for CoreRpc {
         rewind_oracle_until(
             keep,
             || {
-                let body = self
-                    .call("getblockcount", "[]")
-                    .map_err(|_| "getblockcount")?;
+                let body = self.call("getblockcount", "[]").map_err(|_| "getblockcount")?;
                 let n = json_result_u64(&body).ok_or("getblockcount")?;
                 let n = u32::try_from(n).map_err(|_| "getblockcount")?;
-                let hash_body = self
-                    .call("getbestblockhash", "[]")
-                    .map_err(|_| "getbestblockhash")?;
-                let hash = parse_submitblock_json(&hash_body)
-                    .ok()
-                    .flatten()
-                    .ok_or("best hash")?;
+                let hash_body =
+                    self.call("getbestblockhash", "[]").map_err(|_| "getbestblockhash")?;
+                let hash = parse_submitblock_json(&hash_body).ok().flatten().ok_or("best hash")?;
                 Ok((n, hash))
             },
             |hash| {
@@ -275,20 +268,12 @@ pub fn spawn_bitcoind_p2p(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Ok((
-        CoreChild {
-            rpc,
-            child: std::sync::Mutex::new(child),
-        },
-        p2p,
-    ))
+    Ok((CoreChild { rpc, child: std::sync::Mutex::new(child) }, p2p))
 }
 
 pub fn regtest_genesis_time() -> i64 {
     i64::from(
-        rbitcoin_consensus::genesis_block(&rbitcoin_consensus::ChainParams::regtest())
-            .header
-            .time,
+        rbitcoin_consensus::genesis_block(&rbitcoin_consensus::ChainParams::regtest()).header.time,
     )
 }
 
@@ -306,10 +291,8 @@ fn wait_bitcoind_rpc(cookie: PathBuf, rpcport: u16) -> Result<CoreRpc, String> {
     wait_for_file(&cookie, Instant::now() + Duration::from_secs(90))
         .map_err(|_| "cookie file missing (datadir/.cookie)")?;
     let creds = std::fs::read_to_string(&cookie).map_err(|e| e.to_string())?;
-    let (user, pass) = creds
-        .trim()
-        .split_once(':')
-        .ok_or_else(|| "cookie not user:pass".to_string())?;
+    let (user, pass) =
+        creds.trim().split_once(':').ok_or_else(|| "cookie not user:pass".to_string())?;
     let rpc = CoreRpc {
         host: format!("127.0.0.1:{rpcport}"),
         auth_b64: basic_auth_b64(user, pass),
@@ -334,11 +317,7 @@ fn wait_bitcoind_rpc(cookie: PathBuf, rpcport: u16) -> Result<CoreRpc, String> {
 /// Core v31 docs: set to 0 to accept any fee rate. Node `maxfeerate` is
 /// sat/vB (`>= 100000` is a param error); fuzz still passes `0`.
 pub fn testmempoolaccept_params(hexs: &[&str]) -> String {
-    let inner = hexs
-        .iter()
-        .map(|h| format!("\"{h}\""))
-        .collect::<Vec<_>>()
-        .join(",");
+    let inner = hexs.iter().map(|h| format!("\"{h}\"")).collect::<Vec<_>>().join(",");
     format!(r#"[[{inner}], 0]"#)
 }
 
@@ -376,10 +355,7 @@ pub fn spawn_bitcoind(bin: &Path, datadir: &Path) -> Result<CoreChild, String> {
         .spawn()
         .map_err(|e| format!("spawn bitcoind: {e}"))?;
     let rpc = wait_bitcoind_rpc(cookie, rpcport)?;
-    Ok(CoreChild {
-        rpc,
-        child: std::sync::Mutex::new(child),
-    })
+    Ok(CoreChild { rpc, child: std::sync::Mutex::new(child) })
 }
 
 fn free_port() -> Result<u16, String> {
@@ -436,10 +412,7 @@ mod tests {
         // maxfeerate=0 means accept any fee rate (node sat/vB; Core BTC/kvB
         // is the functional-harness proxy).
         assert_eq!(testmempoolaccept_params(&["ab"]), r#"[["ab"], 0]"#);
-        assert_eq!(
-            testmempoolaccept_params(&["aa", "bb"]),
-            r#"[["aa","bb"], 0]"#
-        );
+        assert_eq!(testmempoolaccept_params(&["aa", "bb"]), r#"[["aa","bb"], 0]"#);
     }
 
     #[test]
@@ -473,14 +446,8 @@ mod tests {
             auth_b64: basic_auth_b64("u", "p"),
             stream: std::sync::Mutex::new(None),
         };
-        assert!(rpc
-            .call("getblockcount", "[]")
-            .unwrap()
-            .contains("\"result\":0"));
-        assert!(rpc
-            .call("getblockcount", "[]")
-            .unwrap()
-            .contains("\"result\":0"));
+        assert!(rpc.call("getblockcount", "[]").unwrap().contains("\"result\":0"));
+        assert!(rpc.call("getblockcount", "[]").unwrap().contains("\"result\":0"));
         th.join().unwrap();
     }
 }
@@ -489,9 +456,6 @@ pub fn tmp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "{prefix}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ))
 }

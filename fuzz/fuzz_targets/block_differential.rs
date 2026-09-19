@@ -28,10 +28,7 @@ const MAX_ORACLE_DOWN_STREAK: u64 = 20;
 fn harness_failure(what: &str) -> ! {
     eprintln!("=== BLOCK-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
     eprintln!("{what}");
-    eprintln!(
-        "comparisons_before_failure={}",
-        COMPARISONS.load(Ordering::Relaxed)
-    );
+    eprintln!("comparisons_before_failure={}", COMPARISONS.load(Ordering::Relaxed));
     std::process::exit(2);
 }
 
@@ -60,16 +57,10 @@ fn base() -> &'static Base {
         });
         let params = diff_regtest_params();
         let hub = rbitcoin_net::ChainHub::new(q, params.clone(), Milestone::NONE);
-        hub.ensure_genesis()
-            .unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
+        hub.ensure_genesis().unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
         let core = spawn_bitcoind(std::path::Path::new(&bin), &core_dir)
             .unwrap_or_else(|e| harness_failure(&e));
-        Base {
-            hub,
-            core,
-            tip: std::sync::Mutex::new(genesis_diff_tip(&params)),
-            _store: store,
-        }
+        Base { hub, core, tip: std::sync::Mutex::new(genesis_diff_tip(&params)), _store: store }
     })
 }
 

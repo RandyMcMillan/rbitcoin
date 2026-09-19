@@ -58,10 +58,7 @@ fn kernel_spend(script_sig: &[u8], script_pubkey: &[u8]) -> (Vec<TxOut>, Transac
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([1; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([1; 32]), vout: 0 },
             script_sig: ScriptBuf::from_bytes(script_sig.to_vec()),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -95,11 +92,8 @@ pub fn compare_script_kernel(script_sig: &[u8], script_pubkey: &[u8], flags: u8)
         script_pubkey_len: spk.len() as u32,
         value: amount as i64,
     };
-    let spent = if core_flags & VERIFY_TAPROOT != 0 {
-        Some(std::slice::from_ref(&utxo))
-    } else {
-        None
-    };
+    let spent =
+        if core_flags & VERIFY_TAPROOT != 0 { Some(std::slice::from_ref(&utxo)) } else { None };
     let core = verify_with_flags(spk, amount, &raw, spent, 0, core_flags).is_ok();
     if ours == core {
         KernelCmp::Agree { accept: ours }

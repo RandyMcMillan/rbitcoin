@@ -29,10 +29,7 @@ const MAX_ORACLE_DOWN_STREAK: u64 = 20;
 fn harness_failure(what: &str) -> ! {
     eprintln!("=== MEMPOOL-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
     eprintln!("{what}");
-    eprintln!(
-        "comparisons_before_failure={}",
-        COMPARISONS.load(Ordering::Relaxed)
-    );
+    eprintln!("comparisons_before_failure={}", COMPARISONS.load(Ordering::Relaxed));
     std::process::exit(2);
 }
 
@@ -61,8 +58,7 @@ fn base() -> &'static Base {
         });
         let params = diff_regtest_params();
         let hub = rbitcoin_net::ChainHub::new(q, params, Milestone::NONE);
-        hub.ensure_genesis()
-            .unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
+        hub.ensure_genesis().unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
         let mp = rbitcoin_net::MempoolHub::open(store.join("mp"), Arc::clone(&hub.query))
             .unwrap_or_else(|e| harness_failure(&format!("mempool: {e}")));
         mp.set_relay_enabled(true);
@@ -76,12 +72,7 @@ fn base() -> &'static Base {
         if let Err(e) = submit_pad_to_oracle(&core.rpc, &pad.bodies) {
             harness_failure(e);
         }
-        Base {
-            hub,
-            core,
-            pad,
-            _store: store,
-        }
+        Base { hub, core, pad, _store: store }
     })
 }
 

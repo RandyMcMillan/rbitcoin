@@ -21,10 +21,7 @@ pub fn parse_p2p_sequence(data: &[u8]) -> Vec<P2pSeqStep> {
             1 => P2pSeqKind::Block,
             2 => P2pSeqKind::Headers,
             _ => {
-                out.push(P2pSeqStep {
-                    kind: P2pSeqKind::Ping,
-                    skip: true,
-                });
+                out.push(P2pSeqStep { kind: P2pSeqKind::Ping, skip: true });
                 continue;
             }
         };
@@ -34,10 +31,7 @@ pub fn parse_p2p_sequence(data: &[u8]) -> Vec<P2pSeqStep> {
 }
 
 pub fn p2p_sequence_ping_comparisons(data: &[u8]) -> u32 {
-    parse_p2p_sequence(data)
-        .iter()
-        .filter(|s| !s.skip && s.kind == P2pSeqKind::Ping)
-        .count() as u32
+    parse_p2p_sequence(data).iter().filter(|s| !s.skip && s.kind == P2pSeqKind::Ping).count() as u32
 }
 
 #[cfg(test)]

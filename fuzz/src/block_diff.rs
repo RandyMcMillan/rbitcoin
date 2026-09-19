@@ -31,12 +31,8 @@ const CORE_SKIP: &[&str] = &[
 const CORE_DESYNC_SKIP: &[&str] = &["inconclusive", "bad-prevblk", "prev-blk-not-found"];
 const CORE_DUPLICATE_SKIP: &[&str] = &["duplicate", "duplicate-invalid", "duplicate-inconclusive"];
 /// Equal-work sibling is parked on Core (`inconclusive`) or already known.
-const CORE_SIDE_STORED: &[&str] = &[
-    "inconclusive",
-    "duplicate",
-    "duplicate-invalid",
-    "duplicate-inconclusive",
-];
+const CORE_SIDE_STORED: &[&str] =
+    &["inconclusive", "duplicate", "duplicate-invalid", "duplicate-inconclusive"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffVerdict {
@@ -118,19 +114,13 @@ pub enum CompareOne {
 
 pub fn diff_regtest_params() -> ChainParams {
     let mut params = ChainParams::regtest();
-    params
-        .apply_test_activation_height("bip34", 1)
-        .expect("regtest overlay");
+    params.apply_test_activation_height("bip34", 1).expect("regtest overlay");
     params
 }
 
 pub fn genesis_diff_tip(params: &ChainParams) -> DiffTip {
     let g = genesis_block(params);
-    DiffTip {
-        hash: g.block_hash(),
-        time: g.header.time,
-        height: 0,
-    }
+    DiffTip { hash: g.block_hash(), time: g.header.time, height: 0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,8 +199,7 @@ pub fn store_reorg_step(hub: &ChainHub, op: StoreReorgOp) -> Result<bool, String
             if height == 0 {
                 return Ok(false);
             }
-            hub.rewind_to_height(height - 1)
-                .map_err(store_reorg_map_err)?;
+            hub.rewind_to_height(height - 1).map_err(store_reorg_map_err)?;
             store_reorg_check_tip(hub, height - 1, None)?;
             Ok(false)
         }
@@ -274,35 +263,19 @@ pub fn mine_diff_pad(hub: &ChainHub, last: u32) -> Result<DiffPad, &'static str>
             _ => return Err("pad accept"),
         }
         if h == 1 {
-            mature = Some(OutPoint {
-                txid: b.txdata[0].compute_txid(),
-                vout: 0,
-            });
+            mature = Some(OutPoint { txid: b.txdata[0].compute_txid(), vout: 0 });
         }
         hash = b.block_hash();
         time = b.header.time;
         bodies.push(b);
     }
-    let tip = DiffTip {
-        hash,
-        time,
-        height: last,
-    };
-    Ok(DiffPad {
-        fork_parent: tip.clone(),
-        tip,
-        mature: mature.ok_or("pad mature")?,
-        bodies,
-    })
+    let tip = DiffTip { hash, time, height: last };
+    Ok(DiffPad { fork_parent: tip.clone(), tip, mature: mature.ok_or("pad mature")?, bodies })
 }
 
 pub fn mine_diff_stem(hub: &ChainHub, pad: DiffPad) -> Result<DiffPad, &'static str> {
     let h = pad.tip.height.saturating_add(1);
-    let b = mine_empty_regtest(
-        pad.tip.hash,
-        pad.tip.time.saturating_add(REGTEST_BLOCK_SPACING),
-        h,
-    );
+    let b = mine_empty_regtest(pad.tip.hash, pad.tip.time.saturating_add(REGTEST_BLOCK_SPACING), h);
     match hub.accept_received_block(b.clone()) {
         Ok(AcceptOutcome::Accepted { height }) if height == h => {}
         _ => return Err("stem accept"),
@@ -311,11 +284,7 @@ pub fn mine_diff_stem(hub: &ChainHub, pad: DiffPad) -> Result<DiffPad, &'static 
     bodies.push(b.clone());
     Ok(DiffPad {
         fork_parent: pad.tip,
-        tip: DiffTip {
-            hash: b.block_hash(),
-            time: b.header.time,
-            height: h,
-        },
+        tip: DiffTip { hash: b.block_hash(), time: b.header.time, height: h },
         mature: pad.mature,
         bodies,
     })
@@ -588,11 +557,7 @@ pub fn parse_script_fuzz_ctrl(data: &[u8]) -> (TxVersion, Witness, &[u8]) {
         items.push(bytes.to_vec());
     }
     let refs: Vec<&[u8]> = items.iter().map(|v| v.as_slice()).collect();
-    (
-        TxVersion::non_standard(ver),
-        Witness::from_slice(&refs),
-        rest,
-    )
+    (TxVersion::non_standard(ver), Witness::from_slice(&refs), rest)
 }
 
 fn parse_block_struct_ctrl(data: &[u8]) -> Option<(u8, bool, u8)> {
@@ -609,10 +574,7 @@ fn dummy_struct_tx(uniq: u32, witness: bool, extra_size: u8) -> Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([uniq as u8; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([uniq as u8; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -661,11 +623,7 @@ pub fn prepare_spend_candidate(tip: &DiffTip, mature: OutPoint, data: &[u8]) -> 
         }
         let mut txs = vec![spend];
         for i in 1..n {
-            txs.push(dummy_struct_tx(
-                uniq.wrapping_add(i as u32),
-                witness,
-                extra_size,
-            ));
+            txs.push(dummy_struct_tx(uniq.wrapping_add(i as u32), witness, extra_size));
         }
         return Some(mine_diff_paying(
             tip.hash,
@@ -680,11 +638,8 @@ pub fn prepare_spend_candidate(tip: &DiffTip, mature: OutPoint, data: &[u8]) -> 
         return None;
     }
     let height = tip.height.saturating_add(1);
-    let mut spend = parsed
-        .txdata
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| default_op_true_spend(mature, 0));
+    let mut spend =
+        parsed.txdata.get(1).cloned().unwrap_or_else(|| default_op_true_spend(mature, 0));
     if spend.input.is_empty() {
         spend.input.push(default_spend_in(mature));
     } else {
@@ -718,11 +673,7 @@ pub fn prepare_script_candidate(tip: &DiffTip, mature: OutPoint, data: &[u8]) ->
     if rest.is_empty() {
         return None;
     }
-    let script = if rest.len() > SCRIPT_FUZZ_MAX {
-        &rest[..SCRIPT_FUZZ_MAX]
-    } else {
-        rest
-    };
+    let script = if rest.len() > SCRIPT_FUZZ_MAX { &rest[..SCRIPT_FUZZ_MAX] } else { rest };
     let tx1 = Transaction {
         version,
         lock_time: LockTime::ZERO,
@@ -741,10 +692,7 @@ pub fn prepare_script_candidate(tip: &DiffTip, mature: OutPoint, data: &[u8]) ->
         version,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: tx1.compute_txid(),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: tx1.compute_txid(), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness,
@@ -774,20 +722,14 @@ pub fn prepare_csv_age_candidate(tip: &DiffTip, mature: OutPoint, data: &[u8]) -
     let n = data.len().min(7);
     buf[..n].copy_from_slice(&data[..n]);
     let seq = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let version = if buf[4] == 0 {
-        TxVersion::ONE
-    } else {
-        TxVersion::TWO
-    };
+    let version = if buf[4] == 0 { TxVersion::ONE } else { TxVersion::TWO };
     let time_shift = u32::from(u16::from_le_bytes([buf[5], buf[6]]));
     let mut spend = default_op_true_spend(mature, next_diff_cb_uniq());
     spend.version = version;
     spend.input[0].sequence = Sequence::from_consensus(seq);
     Some(mine_diff_paying(
         tip.hash,
-        tip.time
-            .saturating_add(REGTEST_BLOCK_SPACING)
-            .saturating_add(time_shift),
+        tip.time.saturating_add(REGTEST_BLOCK_SPACING).saturating_add(time_shift),
         tip.height.saturating_add(1),
         ScriptBuf::from_bytes(vec![0x51]),
         vec![spend],
@@ -1187,11 +1129,7 @@ pub fn prepare_height1_candidate(tip: &DiffTip, data: &[u8]) -> Option<Block> {
         let uniq = next_diff_cb_uniq();
         let mut extras = Vec::new();
         for i in 0..n_tx {
-            extras.push(dummy_struct_tx(
-                uniq.wrapping_add(i as u32),
-                witness,
-                extra_size,
-            ));
+            extras.push(dummy_struct_tx(uniq.wrapping_add(i as u32), witness, extra_size));
         }
         let mut block = mine_diff_paying(
             tip.hash,
@@ -1216,11 +1154,7 @@ pub fn prepare_height1_candidate(tip: &DiffTip, data: &[u8]) -> Option<Block> {
     for tx in block.txdata.iter_mut().skip(1) {
         stamp_diff_out(tx, uniq);
     }
-    prepare_regtest_candidate(
-        &mut block,
-        tip.hash,
-        tip.time.saturating_add(REGTEST_BLOCK_SPACING),
-    );
+    prepare_regtest_candidate(&mut block, tip.hash, tip.time.saturating_add(REGTEST_BLOCK_SPACING));
     stamp_diff_coinbase(&mut block, uniq);
     remine_diff_header(&mut block);
     Some(block)
@@ -1273,13 +1207,7 @@ fn restore_stem(
         Ok(AcceptOutcome::Accepted { .. } | AcceptOutcome::AlreadyHave) => {}
         _ => return Err("stem restore"),
     }
-    submit_known_block(
-        oracle,
-        stem,
-        CORE_DUPLICATE_SKIP,
-        "stem restore submit",
-        true,
-    )
+    submit_known_block(oracle, stem, CORE_DUPLICATE_SKIP, "stem restore submit", true)
 }
 
 /// After a side-chain build (fork / reorg-n), tip may sit on the side even when
@@ -1293,8 +1221,7 @@ fn park_reorg_stem(
 ) -> Result<(), &'static str> {
     let on_stem = hub.tip_hash() == Some(stem.block_hash());
     if !on_stem {
-        hub.rewind_to_height(pad_height)
-            .map_err(|_| "rewind failed")?;
+        hub.rewind_to_height(pad_height).map_err(|_| "rewind failed")?;
         match hub.accept_received_block(stem.clone()) {
             Ok(AcceptOutcome::Accepted { .. } | AcceptOutcome::AlreadyHave) => {}
             _ => return Err("stem restore"),
@@ -1302,13 +1229,7 @@ fn park_reorg_stem(
     }
     // Core may still sit on the side tip after a rejected child submit.
     let _ = oracle.core_precious_block(&stem.block_hash().to_string());
-    match submit_known_block(
-        oracle,
-        stem,
-        CORE_DUPLICATE_SKIP,
-        "stem restore submit",
-        true,
-    ) {
+    match submit_known_block(oracle, stem, CORE_DUPLICATE_SKIP, "stem restore submit", true) {
         Ok(()) => Ok(()),
         // Hub already on stem: Core submit is best-effort (mock reject queues).
         Err(_) if on_stem => Ok(()),
@@ -1370,15 +1291,7 @@ pub fn compare_fork_one(
         let _ = restore_stem(hub, oracle, stem);
         return CompareOne::Harness("oracle dead");
     }
-    finish_reorg_compare(
-        hub,
-        oracle,
-        base.fork_parent.height,
-        stem,
-        &child,
-        ours,
-        &reply,
-    )
+    finish_reorg_compare(hub, oracle, base.fork_parent.height, stem, &child, ours, &reply)
 }
 
 pub fn compare_fork_n_one(
@@ -1418,22 +1331,11 @@ pub fn compare_fork_n_one(
         let h = base.fork_parent.height.saturating_add(i);
         let nxt = mine_empty_regtest(
             side_branch.last().unwrap().block_hash(),
-            side_branch
-                .last()
-                .unwrap()
-                .header
-                .time
-                .saturating_add(REGTEST_BLOCK_SPACING),
+            side_branch.last().unwrap().header.time.saturating_add(REGTEST_BLOCK_SPACING),
             h,
         );
-        if submit_known_block(
-            oracle,
-            &nxt,
-            CORE_DUPLICATE_SKIP,
-            "side extend submit",
-            false,
-        )
-        .is_err()
+        if submit_known_block(oracle, &nxt, CORE_DUPLICATE_SKIP, "side extend submit", false)
+            .is_err()
         {
             let _ = park_reorg_stem(hub, oracle, base.fork_parent.height, stem);
             return CompareOne::Harness("side extend submit");
@@ -1497,15 +1399,7 @@ pub fn compare_fork_n_one(
         let _ = restore_stem(hub, oracle, stem);
         return CompareOne::Harness("oracle dead");
     }
-    finish_reorg_compare(
-        hub,
-        oracle,
-        base.fork_parent.height,
-        stem,
-        &child,
-        ours,
-        &reply,
-    )
+    finish_reorg_compare(hub, oracle, base.fork_parent.height, stem, &child, ours, &reply)
 }
 
 pub fn compare_cmpct_reorg_one(
@@ -1572,15 +1466,7 @@ pub fn compare_cmpct_reorg_one(
         let _ = restore_stem(hub, oracle, stem);
         return CompareOne::Harness("oracle dead");
     }
-    finish_reorg_compare(
-        hub,
-        oracle,
-        base.fork_parent.height,
-        stem,
-        &child,
-        ours,
-        &reply,
-    )
+    finish_reorg_compare(hub, oracle, base.fork_parent.height, stem, &child, ours, &reply)
 }
 
 fn core_desync_msg(reason: &str) -> &'static str {
@@ -1618,8 +1504,7 @@ fn finish_reorg_compare(
     let core = verdict_from_core_reply(reply);
     let rewind = |accepted: bool| -> Result<(), &'static str> {
         if accepted {
-            hub.rewind_to_height(pad_height)
-                .map_err(|_| "rewind failed")?;
+            hub.rewind_to_height(pad_height).map_err(|_| "rewind failed")?;
         }
         if accepted || core == DiffVerdict::Accept {
             core_park_child(oracle, child, stem)?;
@@ -1652,11 +1537,7 @@ fn finish_reorg_compare(
                 eprintln!("diff: core reject-reason={reason}");
             }
             let _ = park();
-            CompareOne::Disagreed {
-                ours: true,
-                core: false,
-                hex,
-            }
+            CompareOne::Disagreed { ours: true, core: false, hex }
         }
         (DiffVerdict::Reject, DiffVerdict::Reject) => {
             if let Err(e) = park() {
@@ -1667,11 +1548,7 @@ fn finish_reorg_compare(
         (DiffVerdict::Reject, DiffVerdict::Accept) => {
             let _ = core_park_child(oracle, child, stem);
             let _ = park();
-            CompareOne::Disagreed {
-                ours: false,
-                core: true,
-                hex,
-            }
+            CompareOne::Disagreed { ours: false, core: true, hex }
         }
         (DiffVerdict::Reject, DiffVerdict::Skip) => {
             let _ = park();
@@ -1747,18 +1624,12 @@ fn combine(
             if !reason.is_empty() {
                 eprintln!("diff: core reject-reason={reason}");
             }
-            CompareOne::Disagreed {
-                ours: true,
-                core: false,
-                hex: hex.to_string(),
-            }
+            CompareOne::Disagreed { ours: true, core: false, hex: hex.to_string() }
         }
         (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
-        (DiffVerdict::Reject, DiffVerdict::Accept) => CompareOne::Disagreed {
-            ours: false,
-            core: true,
-            hex: hex.to_string(),
-        },
+        (DiffVerdict::Reject, DiffVerdict::Accept) => {
+            CompareOne::Disagreed { ours: false, core: true, hex: hex.to_string() }
+        }
         (DiffVerdict::Reject, DiffVerdict::Skip) => CompareOne::Skipped,
         (DiffVerdict::Skip, DiffVerdict::Accept) => {
             let _ = oracle.core_rewind_to_height(keep);
@@ -1915,10 +1786,7 @@ mod tests {
 
     #[test]
     fn parse_submitblock_json_table() {
-        assert_eq!(
-            parse_submitblock_json(r#"{"result":null,"error":null,"id":1}"#).unwrap(),
-            None
-        );
+        assert_eq!(parse_submitblock_json(r#"{"result":null,"error":null,"id":1}"#).unwrap(), None);
         assert_eq!(
             parse_submitblock_json(r#"{"result":"inconclusive","error":null,"id":1}"#)
                 .unwrap()
@@ -1926,9 +1794,7 @@ mod tests {
             Some("inconclusive")
         );
         assert_eq!(
-            parse_submitblock_json(r#"{"result":"duplicate","error":null}"#)
-                .unwrap()
-                .as_deref(),
+            parse_submitblock_json(r#"{"result":"duplicate","error":null}"#).unwrap().as_deref(),
             Some("duplicate")
         );
         assert_eq!(
@@ -1977,18 +1843,12 @@ mod tests {
         assert!(is_core_mempool_policy_skip("bare-multisig"));
         assert!(is_core_mempool_policy_skip("tx-size"));
         assert!(is_core_mempool_policy_skip("version"));
-        assert!(is_core_mempool_policy_skip(
-            "non-mandatory-script-verify-flag-failed"
-        ));
-        assert!(!is_core_mempool_policy_skip(
-            "mandatory-script-verify-flag-failed"
-        ));
+        assert!(is_core_mempool_policy_skip("non-mandatory-script-verify-flag-failed"));
+        assert!(!is_core_mempool_policy_skip("mandatory-script-verify-flag-failed"));
         assert!(!is_core_mempool_policy_skip("bad-txns-in-belowout"));
         // Core v31.1 testmempoolaccept default maxfeerate (space, not max-fee).
         assert!(is_core_mempool_policy_skip("max feerate exceeded"));
-        assert!(is_core_mempool_policy_skip(
-            "mempool-script-verify-flag-failed (Cleanstack)"
-        ));
+        assert!(is_core_mempool_policy_skip("mempool-script-verify-flag-failed (Cleanstack)"));
         assert!(is_core_mempool_policy_skip(
             "mempool-script-verify-flag-failed (Extra items left on stack after execution)"
         ));
@@ -2081,10 +1941,7 @@ mod tests {
         assert!(is_core_connectivity_skip("duplicate-invalid"));
         assert!(!is_core_connectivity_skip("duplicated"));
         assert!(!is_core_connectivity_skip("bad-txnmrklroot"));
-        assert_eq!(
-            verdict_from_core_reply(&OracleReply::NullAccept),
-            DiffVerdict::Accept
-        );
+        assert_eq!(verdict_from_core_reply(&OracleReply::NullAccept), DiffVerdict::Accept);
         assert_eq!(
             verdict_from_core_reply(&OracleReply::Reason("inconclusive".into())),
             DiffVerdict::Skip
@@ -2101,10 +1958,7 @@ mod tests {
             verdict_from_accept(Ok(AcceptOutcome::Accepted { height: 1 })).unwrap(),
             DiffVerdict::Accept
         );
-        assert_eq!(
-            verdict_from_accept(Ok(AcceptOutcome::AlreadyHave)).unwrap(),
-            DiffVerdict::Skip
-        );
+        assert_eq!(verdict_from_accept(Ok(AcceptOutcome::AlreadyHave)).unwrap(), DiffVerdict::Skip);
         assert_eq!(
             verdict_from_accept(Ok(AcceptOutcome::IgnoredWeaker)).unwrap(),
             DiffVerdict::Skip
@@ -2145,10 +1999,7 @@ mod tests {
         store_reorg_apply(&hub, &[1u8; 32]).expect("sib1");
         store_reorg_apply(&hub, &[1u8; 32]).expect("sib2");
         let n = hub.held_body_count();
-        assert!(
-            n <= STORE_REORG_HELD_CAP,
-            "held_body_count {n} > fuzz cap {STORE_REORG_HELD_CAP}"
-        );
+        assert!(n <= STORE_REORG_HELD_CAP, "held_body_count {n} > fuzz cap {STORE_REORG_HELD_CAP}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2268,27 +2119,18 @@ mod tests {
         }
         assert_eq!(hub.tip_height(), Some(0));
 
-        assert!(matches!(
-            compare_one(&hub, &mut tip, &mock, b"junk"),
-            CompareOne::NotABlock
-        ));
+        assert!(matches!(compare_one(&hub, &mut tip, &mock, b"junk"), CompareOne::NotABlock));
 
         let mock = MockOracle::new(OracleReply::Reason("bad-txnmrklroot".into()));
         match compare_one(&hub, &mut tip, &mock, &raw) {
-            CompareOne::Disagreed {
-                ours: true,
-                core: false,
-                ..
-            } => {}
+            CompareOne::Disagreed { ours: true, core: false, .. } => {}
             other => panic!("disagree: {other:?}"),
         }
         hub.rewind_to_height(0).unwrap();
 
         let mut bad: Block = deserialize(&raw).unwrap();
-        bad.txdata[0].input[0].previous_output = OutPoint {
-            txid: bitcoin::Txid::from_byte_array([1u8; 32]),
-            vout: 0,
-        };
+        bad.txdata[0].input[0].previous_output =
+            OutPoint { txid: bitcoin::Txid::from_byte_array([1u8; 32]), vout: 0 };
         let mock = MockOracle::new(OracleReply::Reason("bad-cb-missing".into()));
         match compare_one(&hub, &mut tip, &mock, &serialize(&bad)) {
             CompareOne::Agreed { accept: false } => {}
@@ -2355,10 +2197,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbtc-wait-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("cookie");
@@ -2443,11 +2282,8 @@ mod tests {
         let params = diff_regtest_params();
         let g = genesis_block(&params);
         let mature = height1_mature_out();
-        let dummy = DiffTip {
-            hash: g.block_hash(),
-            time: g.header.time,
-            height: DIFF_MATURE_PAD_HEIGHT,
-        };
+        let dummy =
+            DiffTip { hash: g.block_hash(), time: g.header.time, height: DIFF_MATURE_PAD_HEIGHT };
         let raw = serialize(&mine_empty_regtest(
             g.block_hash(),
             g.header.time + REGTEST_BLOCK_SPACING,
@@ -2483,20 +2319,14 @@ mod tests {
         let before = long.txdata[0].output[0].script_pubkey.clone();
         super::stamp_diff_coinbase(&mut long, 3);
         assert!(long.txdata[0].input[0].script_sig.len() <= 100);
-        assert_ne!(
-            long.txdata[0].output[0].script_pubkey.as_bytes(),
-            before.as_bytes()
-        );
+        assert_ne!(long.txdata[0].output[0].script_pubkey.as_bytes(), before.as_bytes());
     }
 
     fn height1_mature_out() -> OutPoint {
         let params = diff_regtest_params();
         let g = genesis_block(&params);
         let h1 = mine_empty_regtest(g.block_hash(), g.header.time + REGTEST_BLOCK_SPACING, 1);
-        OutPoint {
-            txid: h1.txdata[0].compute_txid(),
-            vout: 0,
-        }
+        OutPoint { txid: h1.txdata[0].compute_txid(), vout: 0 }
     }
 
     fn spend_seed_block() -> Block {
@@ -2548,9 +2378,8 @@ mod tests {
         assert_eq!(mock.last_keep.get(), DIFF_TEST_PAD_HEIGHT);
 
         let seed = serialize(&spend_seed_block());
-        let mock = MockOracle::new(OracleReply::Reason(
-            "bad-txns-premature-spend-of-coinbase".into(),
-        ));
+        let mock =
+            MockOracle::new(OracleReply::Reason("bad-txns-premature-spend-of-coinbase".into()));
         match compare_spend_one(&hub, &mut tip, &mock, pad.mature, &seed) {
             CompareOne::Agreed { accept: false } => {}
             other => panic!("immature spend: {other:?}"),
@@ -2570,10 +2399,7 @@ mod tests {
             height: DIFF_MATURE_PAD_HEIGHT,
         };
         let mut spend = super::default_op_true_spend(
-            OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0x44; 32]),
-                vout: 7,
-            },
+            OutPoint { txid: bitcoin::Txid::from_byte_array([0x44; 32]), vout: 7 },
             0,
         );
         spend.version = TxVersion::TWO;
@@ -2592,10 +2418,7 @@ mod tests {
         assert_eq!(got.txdata[1].input[0].previous_output, mature);
         assert_eq!(got.txdata[1].version, TxVersion::TWO);
         assert_eq!(got.txdata[1].input[0].script_sig.as_bytes(), &[0x51]);
-        assert_eq!(
-            got.txdata[1].input[0].sequence,
-            Sequence::from_consensus(0xffff_fffe)
-        );
+        assert_eq!(got.txdata[1].input[0].sequence, Sequence::from_consensus(0xffff_fffe));
         let target = bitcoin::Target::from_compact(got.header.bits);
         assert!(got.header.validate_pow(target).is_ok());
         assert!(prepare_spend_candidate(&dummy, mature, b"junk").is_none());
@@ -2628,11 +2451,8 @@ mod tests {
         let params = diff_regtest_params();
         let g = genesis_block(&params);
         let mature = height1_mature_out();
-        let dummy = DiffTip {
-            hash: g.block_hash(),
-            time: g.header.time,
-            height: DIFF_MATURE_PAD_HEIGHT,
-        };
+        let dummy =
+            DiffTip { hash: g.block_hash(), time: g.header.time, height: DIFF_MATURE_PAD_HEIGHT };
         let raw = serialize(&spend_seed_block());
         let a = prepare_spend_candidate(&dummy, mature, &raw).unwrap();
         let b = prepare_spend_candidate(&dummy, mature, &raw).unwrap();
@@ -2694,10 +2514,7 @@ mod tests {
 
         let mock_rej = MockOracle::new(OracleReply::Reason("bad-txnmrklroot".into()));
         assert!(setup_side_block(&hub, &mock_rej, &side).is_err());
-        assert_eq!(
-            submit_side_to_oracle(&mock_rej, &side).unwrap_err(),
-            "side submit"
-        );
+        assert_eq!(submit_side_to_oracle(&mock_rej, &side).unwrap_err(), "side submit");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2722,10 +2539,7 @@ mod tests {
             "Core rewind is invalidate(child)+precious(stem), not pad-walk"
         );
 
-        assert!(matches!(
-            compare_fork_one(&hub, &base, &mock, b"junk"),
-            CompareOne::NotABlock
-        ));
+        assert!(matches!(compare_fork_one(&hub, &base, &mock, b"junk"), CompareOne::NotABlock));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3038,18 +2852,12 @@ mod tests {
         assert_eq!(got.txdata[1].output[0].script_pubkey.as_bytes(), &script);
         assert_eq!(
             got.txdata[2].input[0].previous_output,
-            OutPoint {
-                txid: got.txdata[1].compute_txid(),
-                vout: 0,
-            }
+            OutPoint { txid: got.txdata[1].compute_txid(), vout: 0 }
         );
         assert!(got.txdata[2].input[0].script_sig.is_empty());
         let long = vec![0x51; SCRIPT_FUZZ_MAX + 8];
         let trunc = prepare_script_candidate(&dummy, mature, &long).unwrap();
-        assert_eq!(
-            trunc.txdata[1].output[0].script_pubkey.len(),
-            SCRIPT_FUZZ_MAX
-        );
+        assert_eq!(trunc.txdata[1].output[0].script_pubkey.len(), SCRIPT_FUZZ_MAX);
         assert!(prepare_script_candidate(&dummy, mature, b"").is_none());
     }
 
@@ -3085,10 +2893,7 @@ mod tests {
         assert_eq!(txs[1].output[0].script_pubkey.as_bytes(), &[0x51]);
         assert_eq!(txs[0].version, TxVersion::TWO);
         assert_eq!(txs[0].lock_time, LockTime::from_consensus(7));
-        assert_eq!(
-            txs[0].input[0].sequence,
-            Sequence::from_consensus(0x0000_0001)
-        );
+        assert_eq!(txs[0].input[0].sequence, Sequence::from_consensus(0x0000_0001));
         assert_eq!(txs[0].input[0].script_sig.as_bytes(), &[0xae]);
         let w: Vec<Vec<u8>> = txs[0].input[0].witness.iter().map(|s| s.to_vec()).collect();
         assert_eq!(w[0], vec![0xaa, 0xbb, 0xcc]);
@@ -3112,11 +2917,7 @@ mod tests {
         let got = prepare_script_candidate(&dummy, mature, &data).unwrap();
         assert_eq!(got.txdata[1].version, TxVersion::TWO);
         assert_eq!(got.txdata[1].output[0].script_pubkey.as_bytes(), &[0x51]);
-        let wit: Vec<Vec<u8>> = got.txdata[2].input[0]
-            .witness
-            .iter()
-            .map(|s| s.to_vec())
-            .collect();
+        let wit: Vec<Vec<u8>> = got.txdata[2].input[0].witness.iter().map(|s| s.to_vec()).collect();
         assert_eq!(wit, vec![vec![0xde, 0xad]]);
         let plain = prepare_script_candidate(&dummy, mature, &[0x51]).unwrap();
         assert_eq!(plain.txdata[1].version, TxVersion::ONE);

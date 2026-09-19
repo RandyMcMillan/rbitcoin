@@ -66,8 +66,7 @@ fn base() -> &'static Base {
         });
         let params = diff_regtest_params();
         let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
-        hub.ensure_genesis()
-            .unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
+        hub.ensure_genesis().unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
         let (core, p2p) = spawn_bitcoind_p2p(std::path::Path::new(&bin), &core_dir)
             .unwrap_or_else(|e| harness_failure(&e));
         let rt = Builder::new_current_thread()
@@ -140,8 +139,7 @@ fn headers_live(b: &Base) -> bool {
     let Ok(frame) = encode_getheaders_empty_v2() else {
         return false;
     };
-    b.rt.block_on(async { sess.write_contents(&frame).await.ok() })
-        .is_some()
+    b.rt.block_on(async { sess.write_contents(&frame).await.ok() }).is_some()
 }
 
 fuzz_target!(|data: &[u8]| {

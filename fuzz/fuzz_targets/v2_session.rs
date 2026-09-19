@@ -34,10 +34,7 @@ const READ_WAIT: Duration = Duration::from_millis(200);
 fn harness_failure(what: &str) -> ! {
     eprintln!("=== V2-SESSION FUZZ HARNESS FAILURE ===");
     eprintln!("{what}");
-    eprintln!(
-        "comparisons_before_failure={}",
-        COMPARISONS.load(Ordering::Relaxed)
-    );
+    eprintln!("comparisons_before_failure={}", COMPARISONS.load(Ordering::Relaxed));
     std::process::exit(2);
 }
 
@@ -65,13 +62,7 @@ fn base() -> &'static Base {
         let session = rt
             .block_on(connect_session(p2p))
             .unwrap_or_else(|e| harness_failure(&format!("initial handshake: {e}")));
-        Base {
-            _core: core,
-            p2p,
-            rt,
-            session: Mutex::new(Some(session)),
-            _datadir: datadir,
-        }
+        Base { _core: core, p2p, rt, session: Mutex::new(Some(session)), _datadir: datadir }
     })
 }
 

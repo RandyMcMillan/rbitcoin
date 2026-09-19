@@ -34,10 +34,7 @@ const DRAIN: Duration = Duration::from_millis(200);
 fn harness_failure(what: &str) -> ! {
     eprintln!("=== CMPCT-DIFFERENTIAL FUZZ HARNESS FAILURE ===");
     eprintln!("{what}");
-    eprintln!(
-        "comparisons_before_failure={}",
-        COMPARISONS.load(Ordering::Relaxed)
-    );
+    eprintln!("comparisons_before_failure={}", COMPARISONS.load(Ordering::Relaxed));
     std::process::exit(2);
 }
 
@@ -65,13 +62,7 @@ fn base() -> &'static Base {
         let session = rt
             .block_on(connect_session(p2p))
             .unwrap_or_else(|e| harness_failure(&format!("initial handshake: {e}")));
-        Base {
-            core,
-            p2p,
-            rt,
-            session: Mutex::new(Some(session)),
-            _datadir: datadir,
-        }
+        Base { core, p2p, rt, session: Mutex::new(Some(session)), _datadir: datadir }
     })
 }
 
@@ -85,9 +76,7 @@ async fn connect_session(p2p: SocketAddr) -> Result<V2PlainSession, String> {
                 {
                     Ok(mut s) => {
                         let sendcmpct = encode_sendcmpct_hb_v2().map_err(|e| e.to_string())?;
-                        s.write_contents(&sendcmpct)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        s.write_contents(&sendcmpct).await.map_err(|e| e.to_string())?;
                         let _ = drain_frames(&mut s, None).await;
                         return Ok(s);
                     }

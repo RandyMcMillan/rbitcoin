@@ -916,6 +916,17 @@ pub async fn run_p2p_with_handle(
         }
     }
 
+    // If catch-up never completed but the node wasn't asked to stop, keep
+    // RPC alive so callers can poll status and resume IBD when peers return.
+    if !tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
+        info!("node: catch-up incomplete — keeping RPC alive until shutdown");
+        let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while !shutdown.requested() {
+            keepalive.tick().await;
+        }
+    }
+
     {
         let end_tip = node.tip_height().unwrap_or(0);
         let blocks_this_run = end_tip.saturating_sub(start_tip);

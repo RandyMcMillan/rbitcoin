@@ -171,8 +171,22 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// Cleanly exits on **SIGTERM** / **SIGINT** (`kill <pid>` or Ctrl+C): flushes the store
 /// and aborts peer tasks (runtime `shutdown_timeout` so leftover sessions cannot
 /// hold the process).
-#[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
+    let shutdown = Shutdown::new();
+    spawn_signal_handler(shutdown.clone());
+    run_p2p_with_shutdown(config, shutdown).await
+}
+
+/// Long-running P2P (+ optional Electrum) with caller-provided shutdown.
+///
+/// Does **not** install SIGTERM / SIGINT handlers. The caller is responsible
+/// for calling `shutdown.request()` to trigger a clean exit (store flush,
+/// peer abort, mempool persist).
+#[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
+pub async fn run_p2p_with_shutdown(
+    config: NodeConfig,
+    shutdown: Arc<Shutdown>,
+) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     let params = config.chain_params()?;
     let milestone = config.milestone();
@@ -330,8 +344,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.network.as_str()
     );
 
-    let shutdown = Shutdown::new();
-    spawn_signal_handler(shutdown.clone());
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {
         Some(spawn_sh_writebehind(

@@ -98,14 +98,7 @@ impl PoolEngine {
         buf: &mut [u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
-        self.push(
-            handle,
-            offset,
-            buf.as_mut_ptr(),
-            buf.len(),
-            user_data,
-            false,
-        )
+        self.push(handle, offset, buf.as_mut_ptr(), buf.len(), user_data, false)
     }
 
     pub(crate) fn push_pwrite(
@@ -115,14 +108,7 @@ impl PoolEngine {
         buf: &[u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
-        self.push(
-            handle,
-            offset,
-            buf.as_ptr() as *mut u8,
-            buf.len(),
-            user_data,
-            true,
-        )
+        self.push(handle, offset, buf.as_ptr() as *mut u8, buf.len(), user_data, true)
     }
 
     fn push(

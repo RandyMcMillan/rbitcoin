@@ -117,15 +117,9 @@ mod tests {
         type Set = HashSet<([u8; 32], u32), BuildHasherDefault<OutPointHasher>>;
         let mut s: Set = HashSet::with_hasher(BuildHasherDefault::default());
         assert!(s.insert((prefix, 0)));
-        assert!(
-            s.insert((prefix, 1)),
-            "same txid prefix, vout 0 vs 1 must be distinct"
-        );
+        assert!(s.insert((prefix, 1)), "same txid prefix, vout 0 vs 1 must be distinct");
         assert_eq!(s.len(), 2);
-        assert!(
-            s.insert((other, 0)),
-            "different txid, same vout must stay distinct"
-        );
+        assert!(s.insert((other, 0)), "different txid, same vout must stay distinct");
         assert_eq!(s.len(), 3);
     }
 }

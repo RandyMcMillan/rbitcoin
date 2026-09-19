@@ -138,16 +138,7 @@ impl Orphanage {
             announcers.insert(peer);
         }
         self.by_wtxid.insert(wtxid, txid);
-        self.by_txid.insert(
-            txid,
-            OrphanEntry {
-                tx,
-                wtxid,
-                weight,
-                missing,
-                announcers,
-            },
-        );
+        self.by_txid.insert(txid, OrphanEntry { tx, wtxid, weight, missing, announcers });
         self.fifo.push_back(txid);
         self.total_weight = self.total_weight.saturating_add(weight);
         true
@@ -206,10 +197,7 @@ impl Orphanage {
     }
 
     pub fn announcers_of(&self, txid: &Txid) -> Vec<u64> {
-        self.by_txid
-            .get(txid)
-            .map(|e| e.announcers.iter().copied().collect())
-            .unwrap_or_default()
+        self.by_txid.get(txid).map(|e| e.announcers.iter().copied().collect()).unwrap_or_default()
     }
 
     pub fn has_announcer(&self, peer: u64) -> bool {
@@ -273,12 +261,7 @@ impl Orphanage {
     /// create is now a chain UTXO.
     pub fn erase_for_block(&mut self, block_txids: &[Txid]) {
         let block: HashSet<Txid> = block_txids.iter().copied().collect();
-        let drop: Vec<Txid> = self
-            .by_txid
-            .keys()
-            .filter(|t| block.contains(*t))
-            .copied()
-            .collect();
+        let drop: Vec<Txid> = self.by_txid.keys().filter(|t| block.contains(*t)).copied().collect();
         for t in drop {
             self.remove_txid(&t);
         }
@@ -303,10 +286,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),

@@ -150,19 +150,11 @@ fn fuse8_geom(size: usize) -> Fuse8Geom {
     let segment_length: u32 = segment_length(ARITY, size as u32).min(262_144);
     let segment_length_mask: u32 = segment_length - 1;
     let factor = size_factor(ARITY, size as u32);
-    let capacity: u32 = if size > 1 {
-        (size as f64 * factor).round() as u32
-    } else {
-        0
-    };
+    let capacity: u32 = if size > 1 { (size as f64 * factor).round() as u32 } else { 0 };
     let init_segment_count = capacity.saturating_add(segment_length - 1) / segment_length;
     let array_len = init_segment_count * segment_length;
     let proposed = array_len.saturating_add(segment_length - 1) / segment_length;
-    let segment_count = if proposed < ARITY {
-        1
-    } else {
-        proposed - (ARITY - 1)
-    };
+    let segment_count = if proposed < ARITY { 1 } else { proposed - (ARITY - 1) };
     let fp_array_len = ((segment_count + ARITY - 1) * segment_length) as usize;
     let segment_count_length = segment_count * segment_length;
     let mut block_bits = 1u32;
@@ -292,12 +284,8 @@ impl BinaryFuse8 {
             let mut duplicates = 0usize;
             for i in 0..size {
                 let hash = reverse_order[i];
-                let (index1, index2, index3) = hash_of_hash(
-                    hash,
-                    segment_length,
-                    segment_length_mask,
-                    segment_count_length,
-                );
+                let (index1, index2, index3) =
+                    hash_of_hash(hash, segment_length, segment_length_mask, segment_count_length);
                 let (index1, index2, index3) = (index1 as usize, index2 as usize, index3 as usize);
                 t2count[index1] = t2count[index1].wrapping_add(4);
                 t2hash[index1] ^= hash;
@@ -371,12 +359,8 @@ impl BinaryFuse8 {
         for i in (0..size).rev() {
             let hash = reverse_order[i];
             let xor2 = fingerprint(hash) as u8;
-            let (index1, index2, index3) = hash_of_hash(
-                hash,
-                segment_length,
-                segment_length_mask,
-                segment_count_length,
-            );
+            let (index1, index2, index3) =
+                hash_of_hash(hash, segment_length, segment_length_mask, segment_count_length);
             let found = reverse_h[i] as usize;
             h012[0] = index1;
             h012[1] = index2;
@@ -433,9 +417,7 @@ mod tests {
         assert!(one.contains(0x1122_3344_5566_7788));
         assert!(one.len() > 0);
 
-        let keys: Vec<u64> = (0u64..50)
-            .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-            .collect();
+        let keys: Vec<u64> = (0u64..50).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
         let f = BinaryFuse8::try_from_keys(&keys).unwrap();
         for &k in &keys {
             assert!(f.contains(k), "FN on {k:#x}");

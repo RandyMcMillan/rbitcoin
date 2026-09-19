@@ -148,11 +148,7 @@ impl HeaderHead {
     fn create(base: PathBuf, scale: HeadScale) -> Result<Self, StoreError> {
         let target_slots = initial_slots_for(scale);
         let h = HashHead::create_with_slots(&base, target_slots)?;
-        Ok(Self {
-            base,
-            target_slots,
-            gens: RwLock::new(vec![h]),
-        })
+        Ok(Self { base, target_slots, gens: RwLock::new(vec![h]) })
     }
 
     fn open(base: PathBuf, body_count: u64, scale: HeadScale) -> Result<Self, StoreError> {
@@ -187,11 +183,7 @@ impl HeaderHead {
         {
             return Err(StoreError::Layout(HEADER_HEAD_EMPTY_REFUSE.to_string()));
         }
-        Ok(Self {
-            base,
-            target_slots,
-            gens: RwLock::new(gens),
-        })
+        Ok(Self { base, target_slots, gens: RwLock::new(gens) })
     }
 
     fn get_all(&self, key: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
@@ -430,8 +422,7 @@ impl HeaderTable {
             head_entries.push((rec.hash, *fk));
         }
         self.body.write_at(offset, &blob)?;
-        self.count
-            .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
+        self.count.store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         self.head.insert_many(&head_entries)?;
         Ok(out)
     }
@@ -580,10 +571,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-header-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -620,10 +608,7 @@ mod tests {
         assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
         assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
         // short decode
-        assert!(matches!(
-            HeaderRecord::decode(&[0u8; 10]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(HeaderRecord::decode(&[0u8; 10]), Err(StoreError::Corrupt(_))));
         t.flush().unwrap();
         t.flush_async().unwrap();
         drop(t);
@@ -641,10 +626,7 @@ mod tests {
                 .set_len((FILE_HEADER_LEN + 3) as u64)
                 .unwrap();
         }
-        assert!(matches!(
-            HeaderTable::open_tiny(&dir),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(HeaderTable::open_tiny(&dir), Err(StoreError::Corrupt(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -787,10 +769,7 @@ mod tests {
                 kids_of_c += 1;
             }
         }
-        assert_eq!(
-            kids_of_c, 0,
-            "C must not gain false children from poison puts"
-        );
+        assert_eq!(kids_of_c, 0, "C must not gain false children from poison puts");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -807,10 +786,7 @@ mod tests {
             hashes.push(hash);
             t.ensure(&sample(hash)).unwrap();
         }
-        assert!(
-            dir.join("header.head.g1").is_file(),
-            "tiny 64-slot gen0 must roll header.head.g1"
-        );
+        assert!(dir.join("header.head.g1").is_file(), "tiny 64-slot gen0 must roll header.head.g1");
         assert!(dir.join("header.head").is_file());
         let first = t.get_by_hash(&hashes[0]).unwrap().unwrap();
         let last = t.get_by_hash(&hashes[79]).unwrap().unwrap();
@@ -835,18 +811,12 @@ mod tests {
         let fks = t.ensure_batch(&recs).unwrap();
         assert_eq!(fks.len(), 80);
         assert_eq!(t.count(), 80);
-        assert!(
-            dir.join("header.head.g1").is_file(),
-            "tiny 64-slot gen0 must roll header.head.g1"
-        );
+        assert!(dir.join("header.head.g1").is_file(), "tiny 64-slot gen0 must roll header.head.g1");
         assert_eq!(t.get_by_hash(&recs[0].hash).unwrap().unwrap().0, Fk(1));
         assert_eq!(t.get_by_hash(&recs[79].hash).unwrap().unwrap().0, Fk(80));
         drop(t);
         let t = HeaderTable::open_tiny(&dir).unwrap();
-        assert_eq!(
-            t.get_by_hash(&recs[40].hash).unwrap().unwrap().1.hash,
-            recs[40].hash
-        );
+        assert_eq!(t.get_by_hash(&recs[40].hash).unwrap().unwrap().1.hash, recs[40].hash);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -868,8 +838,7 @@ mod tests {
                 let off = FILE_HEADER_LEN as u64 + (i as u64) * HEADER_RECORD_LEN as u64;
                 body.write_at(off, &rec.encode()).unwrap();
             }
-            body.set_logical_len(FILE_HEADER_LEN as u64 + 5 * HEADER_RECORD_LEN as u64)
-                .unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + 5 * HEADER_RECORD_LEN as u64).unwrap();
             body.flush().unwrap();
             let h = HashHead::create_with_slots(dir.join("header.head"), 32).unwrap();
             for (i, hash) in hashes.iter().enumerate() {
@@ -981,11 +950,7 @@ mod tests {
 
     #[test]
     fn header_record_v24_roundtrip_size_weight() {
-        let rec = HeaderRecord {
-            size: 285,
-            weight: 1140,
-            ..sample([1u8; 32])
-        };
+        let rec = HeaderRecord { size: 285, weight: 1140, ..sample([1u8; 32]) };
         let enc = rec.encode();
         assert_eq!(enc.len(), 96);
         let back = HeaderRecord::decode(&enc).unwrap();
@@ -1001,10 +966,8 @@ mod tests {
         let rec = sample([0x11; 32]);
         {
             let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
-            body.write_at(FILE_HEADER_LEN as u64, &rec.encode_v23())
-                .unwrap();
-            body.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V23 as u64)
-                .unwrap();
+            body.write_at(FILE_HEADER_LEN as u64, &rec.encode_v23()).unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V23 as u64).unwrap();
             body.flush().unwrap();
             let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
             h.insert(&rec.hash, Fk(1)).unwrap();

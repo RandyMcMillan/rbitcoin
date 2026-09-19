@@ -94,17 +94,11 @@ pub struct HeadOpenOpts {
 }
 
 impl HeadOpenOpts {
-    pub const MAINNET: Self = Self {
-        scale: HeadScale::Mainnet,
-        rebuild_seal_bits: None,
-        rebuild_workers: None,
-    };
+    pub const MAINNET: Self =
+        Self { scale: HeadScale::Mainnet, rebuild_seal_bits: None, rebuild_workers: None };
 
-    pub const TINY: Self = Self {
-        scale: HeadScale::Tiny,
-        rebuild_seal_bits: None,
-        rebuild_workers: None,
-    };
+    pub const TINY: Self =
+        Self { scale: HeadScale::Tiny, rebuild_seal_bits: None, rebuild_workers: None };
 
     pub fn tiny() -> Self {
         Self::TINY
@@ -197,10 +191,7 @@ impl MultiList {
         // ArrayLink kind is shared with Class C; multi-list is
         // linear append like idx — always FdOnly.
         let file = TableFile::create(path, TableKind::ArrayLink)?;
-        Ok(Self {
-            file,
-            count: Mutex::new(0),
-        })
+        Ok(Self { file, count: Mutex::new(0) })
     }
 
     fn open(head_path: &Path) -> Result<Self, StoreError> {
@@ -213,10 +204,7 @@ impl MultiList {
         if body % MULTI_REC_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("hash head multi-list size"));
         }
-        Ok(Self {
-            file,
-            count: Mutex::new(body / MULTI_REC_LEN as u64),
-        })
+        Ok(Self { file, count: Mutex::new(body / MULTI_REC_LEN as u64) })
     }
 
     fn offset(id: u64) -> u64 {
@@ -339,11 +327,7 @@ impl HashHead {
                 body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         }
-        Ok(Self {
-            file,
-            multi,
-            state: Mutex::new(HashState { slots, occupied: 0 }),
-        })
+        Ok(Self { file, multi, state: Mutex::new(HashState { slots, occupied: 0 }) })
     }
 
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, StoreError> {
@@ -370,9 +354,7 @@ impl HashHead {
                 let base = i * SLOT_SIZE;
                 let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
                 let packed = u64::from_le_bytes(
-                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
-                        .try_into()
-                        .unwrap(),
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE].try_into().unwrap(),
                 );
                 if !is_empty_slot(&k, packed) {
                     occupied += 1;
@@ -380,11 +362,7 @@ impl HashHead {
             }
             slot += n as u64;
         }
-        Ok(Self {
-            file,
-            multi,
-            state: Mutex::new(HashState { slots, occupied }),
-        })
+        Ok(Self { file, multi, state: Mutex::new(HashState { slots, occupied }) })
     }
 
     fn hash_slot(key: &HeadKey, slots: u64) -> u64 {
@@ -459,10 +437,7 @@ impl HashHead {
             return DEFAULT_SLOTS;
         }
         // keys/slots < NUM/DEN  ⇒  slots > keys * DEN / NUM
-        let min = keys
-            .saturating_mul(MAX_LOAD_DEN)
-            .div_ceil(MAX_LOAD_NUM)
-            .max(1);
+        let min = keys.saturating_mul(MAX_LOAD_DEN).div_ceil(MAX_LOAD_NUM).max(1);
         min.next_power_of_two().max(DEFAULT_SLOTS)
     }
 
@@ -617,9 +592,7 @@ impl HashHead {
                 let off = (slot as usize) * SLOT_SIZE;
                 let slot_key: HeadKey = table[off..off + HEAD_KEY_LEN].try_into().unwrap();
                 let packed = u64::from_le_bytes(
-                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
-                        .try_into()
-                        .unwrap(),
+                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE].try_into().unwrap(),
                 );
                 if is_empty_slot(&slot_key, packed) {
                     table[off..off + HEAD_KEY_LEN].copy_from_slice(&key);
@@ -635,11 +608,7 @@ impl HashHead {
                     table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
                         .copy_from_slice(&new_packed.to_le_bytes());
                     let (_, old_head) = unpack_value(packed);
-                    on_prev(if old_head.is_null() {
-                        None
-                    } else {
-                        Some(old_head)
-                    });
+                    on_prev(if old_head.is_null() { None } else { Some(old_head) });
                     placed = true;
                     break;
                 }
@@ -692,11 +661,7 @@ impl HashHead {
         file.ensure_capacity(need)?;
         file.set_logical_len(need)?;
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
-        Ok(Self {
-            file,
-            multi,
-            state: Mutex::new(HashState { slots, occupied: 0 }),
-        })
+        Ok(Self { file, multi, state: Mutex::new(HashState { slots, occupied: 0 }) })
     }
 
     /// Replace the OA file with a larger power-of-two. Open-only (no concurrent probes).
@@ -727,9 +692,7 @@ impl HashHead {
                 let base = i * SLOT_SIZE;
                 let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
                 let packed = u64::from_le_bytes(
-                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE]
-                        .try_into()
-                        .unwrap(),
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE].try_into().unwrap(),
                 );
                 if !is_empty_slot(&k, packed) {
                     entries.push((k, packed));
@@ -803,11 +766,7 @@ struct CachedChunk {
 
 impl<'a> SlotPageCache<'a> {
     fn new(head: &'a HashHead, slots: u64) -> Self {
-        Self {
-            head,
-            slots,
-            chunks: BTreeMap::new(),
-        }
+        Self { head, slots, chunks: BTreeMap::new() }
     }
 
     /// Insert / merge `fk` under the 16-byte prefix of `full`.
@@ -818,21 +777,14 @@ impl<'a> SlotPageCache<'a> {
             let (k, packed) = self.read_slot(slot)?;
             if is_empty_slot(&k, packed) {
                 self.write_slot(slot, &key, pack_sole(fk))?;
-                return Ok(InsertResult::Done {
-                    prev: None,
-                    new_slot: true,
-                });
+                return Ok(InsertResult::Done { prev: None, new_slot: true });
             }
             if k == key {
                 let (_, old_head) = unpack_value(packed);
                 let new_packed = merge_packed(&self.head.multi, packed, fk)?;
                 self.write_slot(slot, &key, new_packed)?;
                 return Ok(InsertResult::Done {
-                    prev: if old_head.is_null() {
-                        None
-                    } else {
-                        Some(old_head)
-                    },
+                    prev: if old_head.is_null() { None } else { Some(old_head) },
                     new_slot: false,
                 });
             }
@@ -847,17 +799,11 @@ impl<'a> SlotPageCache<'a> {
             let (k, old) = self.read_slot(slot)?;
             if is_empty_slot(&k, old) {
                 self.write_slot(slot, key, packed)?;
-                return Ok(InsertResult::Done {
-                    prev: None,
-                    new_slot: true,
-                });
+                return Ok(InsertResult::Done { prev: None, new_slot: true });
             }
             if &k == key {
                 self.write_slot(slot, key, packed)?;
-                return Ok(InsertResult::Done {
-                    prev: Some(Fk(old)),
-                    new_slot: false,
-                });
+                return Ok(InsertResult::Done { prev: Some(Fk(old)), new_slot: false });
             }
             slot = (slot + 1) & (self.slots - 1);
         }
@@ -868,11 +814,8 @@ impl<'a> SlotPageCache<'a> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SLOT_SIZE;
         let k: HeadKey = chunk.data[rel..rel + HEAD_KEY_LEN].try_into().unwrap();
-        let packed = u64::from_le_bytes(
-            chunk.data[rel + HEAD_KEY_LEN..rel + SLOT_SIZE]
-                .try_into()
-                .unwrap(),
-        );
+        let packed =
+            u64::from_le_bytes(chunk.data[rel + HEAD_KEY_LEN..rel + SLOT_SIZE].try_into().unwrap());
         Ok((k, packed))
     }
 
@@ -897,14 +840,7 @@ impl<'a> SlotPageCache<'a> {
             let len = n * SLOT_SIZE;
             let mut data = vec![0u8; len];
             self.head.file.read_at(off, &mut data)?;
-            self.chunks.insert(
-                chunk_idx,
-                CachedChunk {
-                    base_slot,
-                    data,
-                    dirty: false,
-                },
-            );
+            self.chunks.insert(chunk_idx, CachedChunk { base_slot, data, dirty: false });
         }
         Ok(self.chunks.get_mut(&chunk_idx).unwrap())
     }
@@ -981,10 +917,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "rbitcoin-hh-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ))
     }
 
@@ -1015,10 +948,7 @@ mod tests {
             }
         }
         let err = overflow.expect("64-slot head must refuse past 7/8");
-        assert!(
-            matches!(err, StoreError::Corrupt(HASH_HEAD_FULL)),
-            "got {err}"
-        );
+        assert!(matches!(err, StoreError::Corrupt(HASH_HEAD_FULL)), "got {err}");
         assert_eq!(h.slots(), 64);
         assert_eq!(h.get(&[0u8; 32]).unwrap(), Some(Fk(1)));
         cleanup_hh(&path);
@@ -1131,10 +1061,7 @@ mod tests {
         assert_eq!(HeadScale::Tiny.sh_main_shards(), 1);
         assert_eq!(HeadScale::Mainnet.sh_main_shards(), SH_MAIN_SHARDS_MAINNET);
         assert_eq!(sh_main_shard_count(HeadScale::Tiny), 1);
-        assert_eq!(
-            sh_main_shard_count(HeadScale::Mainnet),
-            SH_MAIN_SHARDS_MAINNET
-        );
+        assert_eq!(sh_main_shard_count(HeadScale::Mainnet), SH_MAIN_SHARDS_MAINNET);
     }
 
     #[test]
@@ -1261,10 +1188,7 @@ mod tests {
     fn head_scale_prefix_and_pack_helpers() {
         assert_eq!(HeadScale::Tiny.initial_slots(), DEFAULT_SLOTS);
         assert_eq!(HeadScale::Mainnet.initial_slots(), 1 << 22);
-        assert_eq!(
-            sh_main_shard_count(HeadScale::Mainnet),
-            SH_MAIN_SHARDS_MAINNET
-        );
+        assert_eq!(sh_main_shard_count(HeadScale::Mainnet), SH_MAIN_SHARDS_MAINNET);
         assert_eq!(initial_slots_for(HeadScale::Tiny), DEFAULT_SLOTS);
         assert_eq!(initial_slots_for(HeadScale::Mainnet), 1 << 22);
         let full = [0xABu8; 32];
@@ -1330,10 +1254,7 @@ mod tests {
         let h = h.rewrite_to_slots(64).unwrap();
         assert_eq!(h.slots(), 64);
         assert_eq!(h.get(&k).unwrap(), Some(Fk(9)));
-        assert!(
-            !grow.exists(),
-            "leftover .grow must not remain after rewrite"
-        );
+        assert!(!grow.exists(), "leftover .grow must not remain after rewrite");
         cleanup_hh(&path);
     }
 

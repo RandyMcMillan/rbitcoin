@@ -322,8 +322,7 @@ impl ConfirmWindow {
     }
 
     pub fn resolve_ns(&self) -> u64 {
-        self.arch_prep_inflight_ns
-            .saturating_add(self.arch_prep_head_fk_ns)
+        self.arch_prep_inflight_ns.saturating_add(self.arch_prep_head_fk_ns)
     }
 }
 
@@ -351,27 +350,17 @@ impl ConfirmStats {
     }
 
     pub fn note_last_write(&self, p: LastWritePhases) {
-        self.last_write_n
-            .store(u64::from(p.n_blocks), Ordering::Relaxed);
+        self.last_write_n.store(u64::from(p.n_blocks), Ordering::Relaxed);
         self.last_write_wall_ns.store(p.wall_ns, Ordering::Relaxed);
-        self.last_write_class_a_ns
-            .store(p.class_a_ns, Ordering::Relaxed);
-        self.last_write_ensure_ns
-            .store(p.ensure_ns, Ordering::Relaxed);
-        self.last_write_structural_ns
-            .store(p.structural_ns, Ordering::Relaxed);
-        self.last_write_spent_ns
-            .store(p.spent_ns, Ordering::Relaxed);
-        self.last_write_create_h_ns
-            .store(p.create_h_ns, Ordering::Relaxed);
-        self.last_write_bip68_ns
-            .store(p.bip68_ns, Ordering::Relaxed);
-        self.last_write_class_c_ns
-            .store(p.class_c_ns, Ordering::Relaxed);
-        self.last_write_spend_ann_ns
-            .store(p.spend_ann_ns, Ordering::Relaxed);
-        self.last_write_tweak_ns
-            .store(p.tweak_ns, Ordering::Relaxed);
+        self.last_write_class_a_ns.store(p.class_a_ns, Ordering::Relaxed);
+        self.last_write_ensure_ns.store(p.ensure_ns, Ordering::Relaxed);
+        self.last_write_structural_ns.store(p.structural_ns, Ordering::Relaxed);
+        self.last_write_spent_ns.store(p.spent_ns, Ordering::Relaxed);
+        self.last_write_create_h_ns.store(p.create_h_ns, Ordering::Relaxed);
+        self.last_write_bip68_ns.store(p.bip68_ns, Ordering::Relaxed);
+        self.last_write_class_c_ns.store(p.class_c_ns, Ordering::Relaxed);
+        self.last_write_spend_ann_ns.store(p.spend_ann_ns, Ordering::Relaxed);
+        self.last_write_tweak_ns.store(p.tweak_ns, Ordering::Relaxed);
     }
 
     pub fn last_write_phases(&self) -> LastWritePhases {
@@ -400,8 +389,7 @@ impl ConfirmStats {
     ) {
         self.last_pin_plan_ns.store(plan_pin_ns, Ordering::Relaxed);
         self.last_pin_cold_ns.store(cold_ns, Ordering::Relaxed);
-        self.last_pin_contract_ns
-            .store(contract_ns, Ordering::Relaxed);
+        self.last_pin_contract_ns.store(contract_ns, Ordering::Relaxed);
         self.last_pin_plan_n.store(pin_plan_n, Ordering::Relaxed);
         self.last_pin_new_n.store(pin_new_n, Ordering::Relaxed);
     }
@@ -554,10 +542,8 @@ impl ConfirmStats {
         miss_cands: u64,
     ) {
         self.last_miss_n.store(n, Ordering::Relaxed);
-        self.last_miss_pend
-            .store(u64::from(pending), Ordering::Relaxed);
-        self.last_miss_on
-            .store(Self::miss_on_code(miss_on), Ordering::Relaxed);
+        self.last_miss_pend.store(u64::from(pending), Ordering::Relaxed);
+        self.last_miss_on.store(Self::miss_on_code(miss_on), Ordering::Relaxed);
         self.last_miss_cands.store(miss_cands, Ordering::Relaxed);
         for (i, slot) in self.last_miss_txid.iter().enumerate() {
             let mut b = [0u8; 8];

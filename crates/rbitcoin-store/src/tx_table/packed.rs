@@ -314,14 +314,7 @@ impl InputRecord {
             witness
         };
         Ok((
-            Self {
-                prev_txid: [0u8; 32],
-                create_fk,
-                prev_index,
-                sequence,
-                script_sig,
-                witness,
-            },
+            Self { prev_txid: [0u8; 32], create_fk, prev_index, sequence, script_sig, witness },
             off,
         ))
     }
@@ -438,10 +431,8 @@ pub(super) fn xor_script_regions_in_input(
             if off + ilen > buf.len() {
                 return;
             }
-            secret.xor_bytes(
-                u64::from(wi as u32).saturating_add(1) << 16,
-                &mut buf[off..off + ilen],
-            );
+            secret
+                .xor_bytes(u64::from(wi as u32).saturating_add(1) << 16, &mut buf[off..off + ilen]);
             off += ilen;
         }
     }
@@ -885,11 +876,7 @@ pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
     // Empty need → all vouts (full materialize path without a second full decode).
     let take_all = need_vouts.is_empty();
     let mut need_i = 0usize;
-    let mut live = Vec::with_capacity(if take_all {
-        n_out as usize
-    } else {
-        need_vouts.len()
-    });
+    let mut live = Vec::with_capacity(if take_all { n_out as usize } else { need_vouts.len() });
     let mut sparse = Vec::with_capacity(live.capacity());
     for vout in 0..n_out {
         if off >= raw.len() {
@@ -915,9 +902,7 @@ pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
         }
     }
     if !take_all && need_i != need_vouts.len() {
-        return Err(StoreError::Corrupt(
-            "packed need_vouts missing (vout past output_count)",
-        ));
+        return Err(StoreError::Corrupt("packed need_vouts missing (vout past output_count)"));
     }
     check_trailing_zero_pad(raw, off)?;
     Ok((meta, live, sparse))
@@ -1017,15 +1002,9 @@ mod scan_p2tr_tests {
         let dec = OutputRecord::decode_at_secret(&raw[meta_n..], None).unwrap_err();
         assert!(format!("{dec}").contains("output value too large"), "{dec}");
         let skip = OutputRecord::skip_at(&raw[meta_n..]).unwrap_err();
-        assert!(
-            format!("{skip}").contains("output value too large"),
-            "{skip}"
-        );
+        assert!(format!("{skip}").contains("output value too large"), "{skip}");
         let visit = visit_packed_script_hashes(&raw, 1, None, |_| Ok(())).unwrap_err();
-        assert!(
-            format!("{visit}").contains("output value too large"),
-            "{visit}"
-        );
+        assert!(format!("{visit}").contains("output value too large"), "{visit}");
     }
 
     fn three_out_packed() -> (Vec<u8>, usize) {
@@ -1065,10 +1044,7 @@ mod scan_p2tr_tests {
         assert_eq!(sparse[0].0, 0);
         let empty_need =
             decode_packed_tx_need_outs_with_spender_rels_secret(truncated, 3, &[], None);
-        assert!(
-            empty_need.is_err(),
-            "empty need still requires a full outs walk"
-        );
+        assert!(empty_need.is_err(), "empty need still requires a full outs walk");
         assert!(txout_first_page_covers_need(truncated, 3, &[0]));
         assert!(!txout_first_page_covers_need(truncated, 3, &[]));
     }

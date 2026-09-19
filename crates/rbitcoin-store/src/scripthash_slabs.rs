@@ -103,9 +103,7 @@ pub fn decode_fk_delta_stream_into(
         let (d, used) = read_uleb128(buf.get(off..).unwrap_or(&[]))?;
         off += used;
         if d == 0 {
-            return Err(StoreError::Corrupt(
-                "invariant: scripthash fk stream zero delta",
-            ));
+            return Err(StoreError::Corrupt("invariant: scripthash fk stream zero delta"));
         }
         let next = out
             .last()

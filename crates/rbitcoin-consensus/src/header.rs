@@ -13,13 +13,7 @@ pub fn validate_header(
     height: Height,
     header: &Header,
 ) -> Result<(), ConsensusError> {
-    validate_header_hashed(
-        query,
-        params,
-        height,
-        header,
-        header.block_hash().to_byte_array(),
-    )
+    validate_header_hashed(query, params, height, header, header.block_hash().to_byte_array())
 }
 
 /// [`validate_header`] using a caller-computed header hash (lookup already hashed).
@@ -38,9 +32,8 @@ pub(crate) fn validate_header_hashed(
         }
     } else {
         let prev_height = Height(height.0 - 1);
-        let (_prev_fk, prev_rec) = query
-            .header_at_height(prev_height)?
-            .ok_or(ConsensusError::BadPrev)?;
+        let (_prev_fk, prev_rec) =
+            query.header_at_height(prev_height)?.ok_or(ConsensusError::BadPrev)?;
         if prev_rec.hash != header.prev_blockhash.to_byte_array() {
             return Err(ConsensusError::BadPrev);
         }
@@ -82,11 +75,7 @@ pub fn validate_header_on_parent(
     if header.bits != expected_bits {
         return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
     }
-    pow_hash_meets_target(
-        header.block_hash().to_byte_array(),
-        header.bits,
-        params.pow_limit,
-    )
+    pow_hash_meets_target(header.block_hash().to_byte_array(), header.bits, params.pow_limit)
 }
 
 /// POW vs a **caller-computed** header hash (no second SHA256d).
@@ -200,9 +189,7 @@ pub fn expected_next_bits(
 
     let interval = params.difficulty_adjustment_interval();
     let prev_height = Height(height.0 - 1);
-    let (_fk, prev_rec) = query
-        .header_at_height(prev_height)?
-        .ok_or(ConsensusError::BadPrev)?;
+    let (_fk, prev_rec) = query.header_at_height(prev_height)?.ok_or(ConsensusError::BadPrev)?;
     let prev_bits = CompactTarget::from_consensus(prev_rec.bits);
 
     if !height.0.is_multiple_of(interval) {
@@ -225,11 +212,7 @@ pub fn expected_next_bits(
         .ok_or(ConsensusError::BadHeader("missing retarget first header"))?;
 
     let timespan = prev_rec.timestamp.saturating_sub(first_rec.timestamp) as u64;
-    Ok(CompactTarget::from_next_work_required(
-        prev_bits,
-        timespan,
-        &params.btc,
-    ))
+    Ok(CompactTarget::from_next_work_required(prev_bits, timespan, &params.btc))
 }
 
 pub(crate) fn min_difficulty_or_walk(
@@ -292,10 +275,7 @@ mod median_time_past_tests {
         assert!(matches!(miss, ConsensusError::InvalidPow), "{miss:?}");
         let err =
             pow_hash_meets_target([0u8; 32], easy, ChainParams::mainnet().pow_limit).unwrap_err();
-        assert!(
-            matches!(err, ConsensusError::BadHeader(s) if s.contains("pow limit")),
-            "{err:?}"
-        );
+        assert!(matches!(err, ConsensusError::BadHeader(s) if s.contains("pow limit")), "{err:?}");
     }
 
     #[test]
@@ -307,10 +287,7 @@ mod median_time_past_tests {
     }
 
     fn temp_q() -> (std::path::PathBuf, Query) {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-hdr-mtp-{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -383,10 +360,7 @@ mod median_time_past_tests {
         let mtp = median_time_past(&q, Height(2)).unwrap();
         // times: 1000, 1010, 1020 → middle 1010
         assert_eq!(mtp, 1010);
-        let (n, buf) = q
-            .store()
-            .mtp_times_at(Height(2))
-            .expect("ring covers confirmed tip");
+        let (n, buf) = q.store().mtp_times_at(Height(2)).expect("ring covers confirmed tip");
         assert_eq!(n, 3);
         assert_eq!(median_time_past_times(&buf[..3]), 1010);
 
@@ -429,10 +403,7 @@ mod median_time_past_tests {
         let (n, buf) = q.store().mtp_times_at(Height(11)).expect("ring at tip");
         assert_eq!(n, 11);
         assert_eq!(median_time_past_times(&buf[..11]), want11);
-        assert!(
-            q.store().mtp_times_at(Height(5)).is_none(),
-            "historical MTP is not the tip ring"
-        );
+        assert!(q.store().mtp_times_at(Height(5)).is_none(), "historical MTP is not the tip ring");
         assert_eq!(
             median_time_past_store(&q, Height(5)).unwrap(),
             median_time_past_times(&times[0..=5])
@@ -441,10 +412,7 @@ mod median_time_past_tests {
         q.disconnect_tip().unwrap();
         let want10 = median_time_past_times(&times[0..=10]);
         assert_eq!(median_time_past_store(&q, Height(10)).unwrap(), want10);
-        let (n, buf) = q
-            .store()
-            .mtp_times_at(Height(10))
-            .expect("ring rebuilt after pop");
+        let (n, buf) = q.store().mtp_times_at(Height(10)).expect("ring rebuilt after pop");
         assert_eq!(median_time_past_times(&buf[..n as usize]), want10);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -533,10 +501,7 @@ mod median_time_past_tests {
             h.version = Version::from_consensus(4);
             h.time = 1_700_000_000 + 3 * 60 * 60;
             let err = check_header_version_and_future_time(&params, Height(1), &h).unwrap_err();
-            assert!(
-                matches!(err, ConsensusError::BadHeader(s) if s.contains("future")),
-                "{err:?}"
-            );
+            assert!(matches!(err, ConsensusError::BadHeader(s) if s.contains("future")), "{err:?}");
             h.time = 1_700_000_000 + 60 * 60;
             check_header_version_and_future_time(&params, Height(1), &h).unwrap();
         });
@@ -552,10 +517,7 @@ mod median_time_past_tests {
             check_header_version_and_future_time(&params, Height(1), &h).unwrap();
             h.time = 1_700_000_000 + 2 * 60 * 60 + 1;
             let err = check_header_version_and_future_time(&params, Height(1), &h).unwrap_err();
-            assert!(
-                matches!(err, ConsensusError::BadHeader(s) if s.contains("future")),
-                "{err:?}"
-            );
+            assert!(matches!(err, ConsensusError::BadHeader(s) if s.contains("future")), "{err:?}");
         });
     }
 

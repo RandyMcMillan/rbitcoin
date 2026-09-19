@@ -14,10 +14,7 @@ use std::process::ExitCode;
 pub(crate) enum OperatorArgs {
     Help,
     Version,
-    Ready {
-        config: NodeConfig,
-        log_level_cli: Option<Option<Level>>,
-    },
+    Ready { config: NodeConfig, log_level_cli: Option<Option<Level>> },
 }
 
 /// Assemble [`NodeConfig`] from argv (conf then CLI `apply_kv`). Does not open the store.
@@ -114,12 +111,7 @@ fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCode> 
             },
         }
     }
-    Ok(OperatorFlagEnd::Flags(ParsedOperatorFlags {
-        smoke,
-        conf_path,
-        log_level_cli,
-        kvs,
-    }))
+    Ok(OperatorFlagEnd::Flags(ParsedOperatorFlags { smoke, conf_path, log_level_cli, kvs }))
 }
 
 fn apply_operator_kvs(config: &mut NodeConfig, kvs: Vec<(String, String)>) -> Result<(), ExitCode> {
@@ -168,10 +160,7 @@ fn finish_operator_config(
     config.smoke = smoke;
     config.absorb_inbound_env();
     config.resolve_listen_defaults();
-    Ok(OperatorArgs::Ready {
-        config,
-        log_level_cli,
-    })
+    Ok(OperatorArgs::Ready { config, log_level_cli })
 }
 
 /// Process entry used by `main` and high-level scenarios.
@@ -182,10 +171,7 @@ where
 {
     let (mut config, log_level_cli) = match operator_config_from_args(args) {
         Ok(OperatorArgs::Help | OperatorArgs::Version) => return ExitCode::SUCCESS,
-        Ok(OperatorArgs::Ready {
-            config,
-            log_level_cli,
-        }) => (config, log_level_cli),
+        Ok(OperatorArgs::Ready { config, log_level_cli }) => (config, log_level_cli),
         Err(c) => return c,
     };
 
@@ -464,10 +450,7 @@ fn cli_apply_err(e: crate::error::NodeError) -> ExitCode {
 }
 
 fn blocking_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .max(4)
+    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(4)
 }
 
 fn node_tokio_runtime() -> std::io::Result<tokio::runtime::Runtime> {
@@ -486,20 +469,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_datadir() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-cli-{n}"))
     }
 
     /// `ExitCode` is not `PartialEq`; compare via `Debug` (stable, sufficient for tests).
     fn assert_exit(got: ExitCode, want: ExitCode) {
-        assert_eq!(
-            format!("{got:?}"),
-            format!("{want:?}"),
-            "exit code mismatch"
-        );
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "exit code mismatch");
     }
 
     #[test]
@@ -590,10 +566,7 @@ mod tests {
             h.contains("Networks: mainnet|testnet|signet|regtest."),
             "network list must end with a period"
         );
-        assert!(
-            h.contains("[--signet-block-time SECS]"),
-            "duration placeholder must be SECS"
-        );
+        assert!(h.contains("[--signet-block-time SECS]"), "duration placeholder must be SECS");
     }
 
     #[test]
@@ -607,10 +580,7 @@ mod tests {
         assert_exit(cli_main(["rbitcoin-node", "--shindex"]), ExitCode::from(2));
         assert_exit(cli_main(["rbitcoin-node", "-shindex"]), ExitCode::from(2));
         assert_exit(cli_main(["rbitcoin-node", "--sptweaks"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--sptweaks-dust=1"]),
-            ExitCode::from(2),
-        );
+        assert_exit(cli_main(["rbitcoin-node", "--sptweaks-dust=1"]), ExitCode::from(2));
     }
 
     #[test]
@@ -638,10 +608,7 @@ mod tests {
     fn check_blocks_cli_parses_zero_and_negative() {
         let omitted = ready_config(["rbitcoin-node"]);
         assert_eq!(omitted.check_blocks, None);
-        assert_eq!(
-            omitted.check_blocks_window(),
-            rbitcoin_store::VERIFY_TIP_BLOCKS
-        );
+        assert_eq!(omitted.check_blocks_window(), rbitcoin_store::VERIFY_TIP_BLOCKS);
         let six = ready_config(["rbitcoin-node", "--check-blocks=6"]);
         assert_eq!(six.check_blocks, Some(6));
         assert_eq!(six.check_blocks_window(), 6);
@@ -688,10 +655,7 @@ mod tests {
 
         let omitted = ready_config(["rbitcoin-node"]);
         assert_eq!(omitted.network, Network::Mainnet);
-        assert_eq!(
-            omitted.milestone_height,
-            default_milestone_height(Network::Mainnet)
-        );
+        assert_eq!(omitted.milestone_height, default_milestone_height(Network::Mainnet));
         assert!(omitted.milestone().skips_scripts_at(1));
 
         let cli0 = ready_config(["rbitcoin-node", "--milestone", "0"]);
@@ -703,10 +667,7 @@ mod tests {
         assert!(operator_config_from_args(["rbitcoin-node", "--assumevalid-height=0"]).is_err());
 
         assert!(
-            matches!(
-                operator_config_from_args(["rbitcoin-node", "-V"]),
-                Ok(OperatorArgs::Version)
-            ),
+            matches!(operator_config_from_args(["rbitcoin-node", "-V"]), Ok(OperatorArgs::Version)),
             "-V must assemble Version before run"
         );
         assert!(
@@ -714,10 +675,7 @@ mod tests {
             "empty --conf= must fail"
         );
         match operator_config_from_args(["rbitcoin-node", "--log-level=off"]) {
-            Ok(OperatorArgs::Ready {
-                log_level_cli: Some(None),
-                ..
-            }) => {}
+            Ok(OperatorArgs::Ready { log_level_cli: Some(None), .. }) => {}
             other => panic!("--log-level=off must be Ready with log off, got {other:?}"),
         }
         assert!(operator_config_from_args(["rbitcoin-node", "--log-level"]).is_err());
@@ -738,14 +696,9 @@ mod tests {
 
     #[test]
     fn flag_matrix_cli_equals_conf_apply_kv() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut cfg = crate::config::NodeConfig::default();
-        assert_eq!(
-            cfg.apply_kv("network", "regtest").unwrap(),
-            crate::config::ConfApply::Applied
-        );
+        assert_eq!(cfg.apply_kv("network", "regtest").unwrap(), crate::config::ConfApply::Applied);
         assert_eq!(cfg.network, Network::Regtest);
         assert_eq!(
             cfg.apply_kv("chain", "signet").unwrap(),
@@ -771,10 +724,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_exit(
-            cli_main(["rbitcoin-node", "--chain=regtest"]),
-            ExitCode::from(2),
-        );
+        assert_exit(cli_main(["rbitcoin-node", "--chain=regtest"]), ExitCode::from(2));
 
         let dir = tmp_datadir();
         let conf = dir.join("node.conf");
@@ -798,18 +748,13 @@ mod tests {
             ]),
             ExitCode::SUCCESS,
         );
-        assert!(
-            smoke.join("store").exists(),
-            "CLI datadir must win over conf"
-        );
+        assert!(smoke.join("store").exists(), "CLI datadir must win over conf");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn testactivationheight_cli_smoke_regtest() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
@@ -855,55 +800,22 @@ mod tests {
     fn unknown_and_missing_value_errors() {
         assert_exit(cli_main(["rbitcoin-node", "--nope"]), ExitCode::from(2));
         assert_exit(cli_main(["rbitcoin-node", "--network"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--network", "bogus"]),
-            ExitCode::from(2),
-        );
+        assert_exit(cli_main(["rbitcoin-node", "--network", "bogus"]), ExitCode::from(2));
         assert_exit(cli_main(["rbitcoin-node", "--datadir"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--datadir-cold"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--log-level", "wat"]),
-            ExitCode::from(2),
-        );
+        assert_exit(cli_main(["rbitcoin-node", "--datadir-cold"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--listen", "not-an-addr"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--log-level", "wat"]), ExitCode::from(2));
         assert_exit(cli_main(["rbitcoin-node", "--api-log"]), ExitCode::from(2));
         assert_exit(cli_main(["rbitcoin-node", "--asmap"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-outbound", "0"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
-            ExitCode::from(2),
-        );
+        assert_exit(cli_main(["rbitcoin-node", "--max-outbound", "0"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]), ExitCode::from(2));
         // Missing values / parse rejects for advanced knobs.
         assert_exit(cli_main(["rbitcoin-node", "--conf"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-inbound"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-inbound", "0"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-inbound", "nope"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--sp-tweaks-dust"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--sp-tweaks-dust", "nope"]),
-            ExitCode::from(2),
-        );
+        assert_exit(cli_main(["rbitcoin-node", "--max-inbound"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--max-inbound", "0"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--max-inbound", "nope"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--sp-tweaks-dust"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--sp-tweaks-dust", "nope"]), ExitCode::from(2));
         // Bad conf path / invalid conf log_level.
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -936,9 +848,7 @@ mod tests {
 
     #[test]
     fn smoke_datadir_cold_puts_inwit_on_cold_store() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         let hot = dir.join("hot");
         let cold = dir.join("cold");
@@ -993,9 +903,7 @@ mod tests {
 
     #[test]
     fn native_cli_flags_reject_core_aliases() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
@@ -1070,9 +978,7 @@ mod tests {
 
     #[test]
     fn conf_file_then_cli_override() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("node.conf");
@@ -1100,9 +1006,7 @@ mod tests {
     /// CLI omit of inbound must not clobber pre-set advanced envs.
     #[test]
     fn cli_omit_preserves_advanced_env() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "91");
         let dir = tmp_datadir();
         let code = cli_main([
@@ -1120,10 +1024,7 @@ mod tests {
             // no --max-inbound
         ]);
         assert_exit(code, ExitCode::SUCCESS);
-        assert_eq!(
-            std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
-            Ok("91")
-        );
+        assert_eq!(std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(), Ok("91"));
         std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND");
         let _ = std::fs::remove_dir_all(&dir);
     }

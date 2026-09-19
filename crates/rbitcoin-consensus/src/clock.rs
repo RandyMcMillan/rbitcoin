@@ -12,9 +12,7 @@ pub struct NodeClock {
 
 impl NodeClock {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            mock: AtomicI64::new(0),
-        })
+        Arc::new(Self { mock: AtomicI64::new(0) })
     }
 
     pub fn now_secs(&self) -> u64 {
@@ -37,9 +35,7 @@ pub fn wall_now() -> u64 {
 }
 
 fn unix_secs(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_secs()
+    now.duration_since(UNIX_EPOCH).expect("system clock before Unix epoch").as_secs()
 }
 
 thread_local! {

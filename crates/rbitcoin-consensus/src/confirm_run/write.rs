@@ -44,11 +44,7 @@ fn finish_already_committed_write(
     query: &Query,
     batch: &ScriptOkBatch,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let items: Vec<(u32, [u8; 32])> = batch
-        .prepared
-        .iter()
-        .map(|p| (p.height.0, p.hash))
-        .collect();
+    let items: Vec<(u32, [u8; 32])> = batch.prepared.iter().map(|p| (p.height.0, p.hash)).collect();
     finish_post_commit_hashes(query, &items)?;
     if let Some(h) = items.iter().map(|(h, _)| *h).max() {
         query.prune_write_create_loc(h);
@@ -87,16 +83,12 @@ fn apply_archive_plan(
         if plan.batch_pin.len() == plan.planned_fks.len() {
             std::mem::take(&mut plan.batch_pin)
         } else {
-            plan.packed
-                .iter()
-                .map(|(pin, _)| std::sync::Arc::clone(pin))
-                .collect()
+            plan.packed.iter().map(|(pin, _)| std::sync::Arc::clone(pin)).collect()
         };
     ns.plan_take_ns = t_take.elapsed().as_nanos() as u64;
     let t_ca = Instant::now();
-    let (committed, loc) = query
-        .archive_commit_plan_defer_head(plan)
-        .map_err(ConsensusError::from)?;
+    let (committed, loc) =
+        query.archive_commit_plan_defer_head(plan).map_err(ConsensusError::from)?;
     ns.class_a_ns = t_ca.elapsed().as_nanos() as u64;
     if !committed {
         return Ok(ns);
@@ -210,11 +202,8 @@ pub fn confirm_write_phase(
         let t_cc = Instant::now();
         let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
         let class_c_wall_ns = t_cc.elapsed().as_nanos() as u64;
-        let class_c_ns = query
-            .confirm_stats()
-            .class_c_ns
-            .load(Ordering::Relaxed)
-            .saturating_sub(cc0);
+        let class_c_ns =
+            query.confirm_stats().class_c_ns.load(Ordering::Relaxed).saturating_sub(cc0);
         let class_c_join_ns = class_c_wall_ns.saturating_sub(class_c_ns);
         if class_c_join_ns > 0 {
             rbitcoin_query::note_confirm(
@@ -224,14 +213,7 @@ pub fn confirm_write_phase(
         }
 
         let spend_ann_ns = post_commit(query, &annotate)?;
-        Ok((
-            out,
-            n_blocks,
-            structural_ns,
-            struct_ph,
-            class_c_ns,
-            spend_ann_ns,
-        ))
+        Ok((out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns))
     })();
 
     let t_join = Instant::now();
@@ -271,21 +253,19 @@ pub fn confirm_write_phase(
         query.prune_write_create_loc(h);
     }
     rbitcoin_query::note_confirm(&query.confirm_stats().phase_blocks, n_blocks as u64);
-    query
-        .confirm_stats()
-        .note_last_write(rbitcoin_query::LastWritePhases {
-            n_blocks: n_blocks as u32,
-            wall_ns: t_wall.elapsed().as_nanos() as u64,
-            class_a_ns,
-            ensure_ns,
-            structural_ns,
-            spent_ns: struct_ph.spent_ns,
-            create_h_ns: struct_ph.create_h_ns,
-            bip68_ns: struct_ph.bip68_ns,
-            class_c_ns,
-            spend_ann_ns,
-            tweak_ns,
-        });
+    query.confirm_stats().note_last_write(rbitcoin_query::LastWritePhases {
+        n_blocks: n_blocks as u32,
+        wall_ns: t_wall.elapsed().as_nanos() as u64,
+        class_a_ns,
+        ensure_ns,
+        structural_ns,
+        spent_ns: struct_ph.spent_ns,
+        create_h_ns: struct_ph.create_h_ns,
+        bip68_ns: struct_ph.bip68_ns,
+        class_c_ns,
+        spend_ann_ns,
+        tweak_ns,
+    });
     Ok(out)
 }
 
@@ -355,26 +335,16 @@ fn annotate_jobs_from_connected_hash(
         Some(h) if h.0 == height => {}
         _ => return Ok(Vec::new()),
     }
-    let Some((hfk, _)) = query
-        .get_header_by_hash(hash)
-        .map_err(ConsensusError::from)?
-    else {
+    let Some((hfk, _)) = query.get_header_by_hash(hash).map_err(ConsensusError::from)? else {
         return Ok(Vec::new());
     };
-    let Some(tx_fks) = query
-        .store()
-        .header_txs
-        .get_list(hfk)
-        .map_err(ConsensusError::from)?
-    else {
+    let Some(tx_fks) = query.store().header_txs.get_list(hfk).map_err(ConsensusError::from)? else {
         return Ok(Vec::new());
     };
     let mut jobs = Vec::new();
     for &spend_fk in &tx_fks {
-        let (_meta, ins, _outs) = query
-            .store()
-            .get_tx_full(spend_fk)
-            .map_err(ConsensusError::from)?;
+        let (_meta, ins, _outs) =
+            query.store().get_tx_full(spend_fk).map_err(ConsensusError::from)?;
         for (inp_i, inp) in ins.into_iter().enumerate() {
             if inp.is_coinbase() {
                 continue;
@@ -391,10 +361,8 @@ fn annotate_jobs_from_connected_hash(
             if create_fk.is_null() {
                 continue;
             }
-            let (off, len) = query
-                .store()
-                .tx_spent_range(create_fk)
-                .map_err(ConsensusError::from)?;
+            let (off, len) =
+                query.store().tx_spent_range(create_fk).map_err(ConsensusError::from)?;
             let abs = rbitcoin_store::spent_abs(off, inp.prev_index);
             if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
                 > off.saturating_add(len)
@@ -408,11 +376,7 @@ fn annotate_jobs_from_connected_hash(
                 .txs
                 .get_output_spender_meta(create_fk, inp.prev_index)
                 .map_err(ConsensusError::from)?;
-            let flags = if multi {
-                rbitcoin_store::output_flags::MULTI_SPENDER
-            } else {
-                0
-            };
+            let flags = if multi { rbitcoin_store::output_flags::MULTI_SPENDER } else { 0 };
             jobs.push(crate::block::SpendAnnotateJob {
                 abs,
                 field,
@@ -458,9 +422,7 @@ pub(super) fn fill_planned_create_layout_after_commit(
     }
     if !planned_fks.is_empty() {
         if loc.len() != planned_fks.len() || packed.len() != planned_fks.len() {
-            return Err(ConsensusError::Store(StoreError::Corrupt(
-                "invariant: append loc length",
-            )));
+            return Err(ConsensusError::Store(StoreError::Corrupt("invariant: append loc length")));
         }
         for (fk, (pair, pin)) in planned_fks.iter().zip(loc.iter().zip(packed.iter())) {
             let Some(id) = fk.get() else { continue };
@@ -478,11 +440,7 @@ pub(super) fn fill_planned_create_layout_after_commit(
             let mut checked = vouts.clone();
             checked.sort_unstable();
             checked.dedup();
-            let cb = if pin.tx().input_count != 1 {
-                Some(false)
-            } else {
-                None
-            };
+            let cb = if pin.tx().input_count != 1 { Some(false) } else { None };
             batch_parents.insert_create_pin(
                 *fk,
                 std::sync::Arc::clone(pin),
@@ -518,9 +476,7 @@ fn index_sp_tweaks_batch(
     // Tip write-through only. Direct IBD leaves the sequential cursor at origin
     // (or last backfill slot); post-IBD `backfill_sp_tweaks` owns the hole.
     let origin = params.taproot_height();
-    let mut next = query
-        .sptweaks_next_height()
-        .unwrap_or(rbitcoin_primitives::Height(origin));
+    let mut next = query.sptweaks_next_height().unwrap_or(rbitcoin_primitives::Height(origin));
     if next.0 < origin {
         next = rbitcoin_primitives::Height(origin);
     }
@@ -603,10 +559,7 @@ fn records_from_wire(
         let mut prevouts = Vec::with_capacity(tx.input.len());
         for inp in &tx.input {
             if inp.previous_output.is_null() {
-                prevouts.push(TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: ScriptBuf::new(),
-                });
+                prevouts.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() });
                 continue;
             }
             let tid = inp.previous_output.txid.to_byte_array();
@@ -625,15 +578,8 @@ fn records_from_wire(
                 parents.get_parent_txout_parts(create_fk, vout, |val, script, _| {
                     (val, script.to_vec())
                 })?;
-            let value = if val < 0 {
-                Amount::ZERO
-            } else {
-                Amount::from_sat(val as u64)
-            };
-            prevouts.push(TxOut {
-                value,
-                script_pubkey: ScriptBuf::from_bytes(script),
-            });
+            let value = if val < 0 { Amount::ZERO } else { Amount::from_sat(val as u64) };
+            prevouts.push(TxOut { value, script_pubkey: ScriptBuf::from_bytes(script) });
         }
         recs[i] = tweak_from_tx(tx, &prevouts).map(|t| t.tweak);
     }
@@ -654,10 +600,7 @@ fn records_aligned_from_store(
         )));
     }
     let map = tweaks_for_height(query, params, p.height)?;
-    Ok(p.txids
-        .iter()
-        .map(|id| map.get(id).map(|t| t.tweak))
-        .collect())
+    Ok(p.txids.iter().map(|id| map.get(id).map(|t| t.tweak)).collect())
 }
 
 #[cfg(test)]
@@ -730,10 +673,7 @@ mod records_from_wire_tests {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cb_id,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cb_id, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -743,15 +683,8 @@ mod records_from_wire_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let block = Block {
-            header: dummy_header(),
-            txdata: vec![cb, child],
-        };
-        let p = prepared(
-            10,
-            vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL, 0)],
-            vec![],
-        );
+        let block = Block { header: dummy_header(), txdata: vec![cb, child] };
+        let p = prepared(10, vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL, 0)], vec![]);
         let parents = rbitcoin_query::BatchParents::new();
         let recs = records_from_wire(&p, &block, &parents)
             .expect("same-block prevout is on the wire; pin must not be required");
@@ -782,10 +715,7 @@ mod records_from_wire_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let block = Block {
-            header: dummy_header(),
-            txdata: vec![cb, spend],
-        };
+        let block = Block { header: dummy_header(), txdata: vec![cb, spend] };
         let p = prepared(850_000, vec![], vec![]);
         let parents = rbitcoin_query::BatchParents::new();
         let recs = records_from_wire(&p, &block, &parents).expect(
@@ -817,15 +747,8 @@ mod records_from_wire_tests {
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
         };
-        let block = Block {
-            header: dummy_header(),
-            txdata: vec![cb, spend],
-        };
-        let txids = block
-            .txdata
-            .iter()
-            .map(|tx| tx.compute_txid().to_byte_array())
-            .collect();
+        let block = Block { header: dummy_header(), txdata: vec![cb, spend] };
+        let txids = block.txdata.iter().map(|tx| tx.compute_txid().to_byte_array()).collect();
         let p = prepared(850_000, vec![], txids);
         let parents = rbitcoin_query::BatchParents::new();
         assert!(
@@ -856,10 +779,7 @@ mod records_from_wire_tests {
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
         };
-        let block = Block {
-            header: dummy_header(),
-            txdata: vec![cb, spend],
-        };
+        let block = Block { header: dummy_header(), txdata: vec![cb, spend] };
         let p = prepared(850_000, vec![], vec![]);
         let parents = rbitcoin_query::BatchParents::new();
         assert!(

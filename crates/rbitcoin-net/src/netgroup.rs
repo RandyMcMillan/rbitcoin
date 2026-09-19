@@ -77,30 +77,15 @@ mod tests {
 
     #[test]
     fn netgroup_prefix_ipv4_slash16() {
-        assert_eq!(
-            netgroup(v4(1, 2, 3, 4), None),
-            netgroup(v4(1, 2, 9, 9), None)
-        );
-        assert_ne!(
-            netgroup(v4(1, 2, 3, 4), None),
-            netgroup(v4(1, 3, 0, 1), None)
-        );
+        assert_eq!(netgroup(v4(1, 2, 3, 4), None), netgroup(v4(1, 2, 9, 9), None));
+        assert_ne!(netgroup(v4(1, 2, 3, 4), None), netgroup(v4(1, 3, 0, 1), None));
     }
 
     #[test]
     fn netgroup_prefix_ipv6_slash32() {
-        let a = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-            1,
-        );
-        let b = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1)),
-            1,
-        );
-        let c = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 1)),
-            1,
-        );
+        let a = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 1);
+        let b = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1)), 1);
+        let c = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 1)), 1);
         assert_eq!(netgroup(a, None), netgroup(b, None));
         assert_ne!(netgroup(a, None), netgroup(c, None));
     }
@@ -113,10 +98,8 @@ mod tests {
         let c = v4(3, 4, 0, 1);
         assert_eq!(netgroup(a, Some(&m)), netgroup(b, Some(&m)));
         assert_ne!(netgroup(a, Some(&m)), netgroup(c, Some(&m)));
-        let v6 = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304)),
-            1,
-        );
+        let v6 =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304)), 1);
         assert_eq!(netgroup(a, Some(&m)), netgroup(v6, Some(&m)));
     }
 

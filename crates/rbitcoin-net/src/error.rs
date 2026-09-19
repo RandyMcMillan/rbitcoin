@@ -119,21 +119,12 @@ mod tests {
             (NetError::BadMagic, "wrong network magic"),
             (NetError::Consensus("c".into()), "consensus: c"),
             (NetError::Cancelled, "confirm cancelled"),
-            (
-                NetError::Mutated("bad-txnmrklroot".into()),
-                "consensus: bad-txnmrklroot",
-            ),
+            (NetError::Mutated("bad-txnmrklroot".into()), "consensus: bad-txnmrklroot"),
             (NetError::BadPrev, "consensus: unexpected previous header"),
-            (
-                NetError::SideBlock,
-                "protocol: side block; use accept_branch for reorg",
-            ),
+            (NetError::SideBlock, "protocol: side block; use accept_branch for reorg"),
             (NetError::UnknownParent, "protocol: unknown parent"),
             (
-                NetError::ConnectFailed {
-                    hash: [1u8; 32],
-                    msg: "bad spend".into(),
-                },
+                NetError::ConnectFailed { hash: [1u8; 32], msg: "bad spend".into() },
                 "consensus: bad spend",
             ),
         ];

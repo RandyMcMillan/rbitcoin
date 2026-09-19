@@ -36,14 +36,11 @@ pub(crate) type OutsByRangeOut = (Vec<Option<SparseOutsRow>>, u64, u64, u64, u64
 pub(crate) type SpenderSlot = (Fk, u8, u32);
 
 pub(crate) fn parse_rebuild_seal_bits(raw: Option<&str>) -> u32 {
-    raw.and_then(|s| s.parse::<u32>().ok())
-        .map(|b| b.clamp(6, 26))
-        .unwrap_or(25)
+    raw.and_then(|s| s.parse::<u32>().ok()).map(|b| b.clamp(6, 26)).unwrap_or(25)
 }
 
 pub(crate) fn parse_rebuild_workers(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(1, 256))
+    raw.and_then(|s| s.parse::<usize>().ok()).map(|n| n.clamp(1, 256))
 }
 
 pub(crate) fn tx_head_rebuild_workers_for_free_ram(cpus: usize, free_bytes: u64) -> usize {
@@ -148,9 +145,7 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
     }
     let flags = buf[0];
     if flags & BODY_META_V17_LAYOUT17 == 0 {
-        return Err(StoreError::Corrupt(
-            "legacy txout meta missing LAYOUT17 bit",
-        ));
+        return Err(StoreError::Corrupt("legacy txout meta missing LAYOUT17 bit"));
     }
     if flags & BODY_META_V17_RESERVED != 0 {
         return Err(StoreError::Corrupt("v17 txout meta reserved flags"));
@@ -216,12 +211,7 @@ pub struct OutputRecord {
 
 impl OutputRecord {
     pub fn unspent(value: i64, script: Vec<u8>) -> Self {
-        Self {
-            value,
-            script,
-            spender_field: Fk::NULL,
-            multi_spender: false,
-        }
+        Self { value, script, spender_field: Fk::NULL, multi_spender: false }
     }
 
     /// Encode `txout` payload (kind nibble + amount exp + ULEB mantissa; no spender).
@@ -288,15 +278,7 @@ impl OutputRecord {
             decode_script_kind_v17(kind, &buf[off..])?.0
         };
         off += used;
-        Ok((
-            Self {
-                value,
-                script,
-                spender_field: Fk::NULL,
-                multi_spender: false,
-            },
-            off,
-        ))
+        Ok((Self { value, script, spender_field: Fk::NULL, multi_spender: false }, off))
     }
 
     /// Bytes consumed by one `txout` output starting at `buf` (no script alloc).
@@ -355,16 +337,12 @@ pub use packed::*;
 pub(crate) use pending_head::PENDING_HEAD_CAP;
 
 fn span_rec(span: &[u8], span_off: u64, rec_off: u64, rec_len: u64) -> Result<&[u8], StoreError> {
-    let start = rec_off
-        .checked_sub(span_off)
-        .ok_or(StoreError::Corrupt("span record before span"))?;
+    let start =
+        rec_off.checked_sub(span_off).ok_or(StoreError::Corrupt("span record before span"))?;
     let start = usize::try_from(start).map_err(|_| StoreError::Corrupt("span start"))?;
     let len = usize::try_from(rec_len).map_err(|_| StoreError::Corrupt("span rec len"))?;
-    let end = start
-        .checked_add(len)
-        .ok_or(StoreError::Corrupt("span rec end"))?;
-    span.get(start..end)
-        .ok_or(StoreError::Corrupt("span record OOB"))
+    let end = start.checked_add(len).ok_or(StoreError::Corrupt("span rec end"))?;
+    span.get(start..end).ok_or(StoreError::Corrupt("span record OOB"))
 }
 
 fn pread_two_spans(
@@ -382,12 +360,8 @@ fn pread_two_spans(
     std::thread::scope(|s| {
         let ta = s.spawn(|| a.pread_span(a_off, a_len));
         let tb = s.spawn(|| b.pread_span(b_off, b_len));
-        let va = ta
-            .join()
-            .unwrap_or(Err(StoreError::Corrupt("txout span thread")))?;
-        let vb = tb
-            .join()
-            .unwrap_or(Err(StoreError::Corrupt("inwit span thread")))?;
+        let va = ta.join().unwrap_or(Err(StoreError::Corrupt("txout span thread")))?;
+        let vb = tb.join().unwrap_or(Err(StoreError::Corrupt("inwit span thread")))?;
         Ok((va, vb))
     })
 }
@@ -503,33 +477,23 @@ impl TxTable {
     }
 
     fn resolve_open_opts(opts: HeadOpenOpts) -> (u32, usize) {
-        let seal_bits = opts
-            .rebuild_seal_bits
-            .map(|b| b.clamp(6, 26))
-            .unwrap_or_else(|| {
-                parse_rebuild_seal_bits(
-                    std::env::var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS")
-                        .ok()
-                        .as_deref(),
+        let seal_bits = opts.rebuild_seal_bits.map(|b| b.clamp(6, 26)).unwrap_or_else(|| {
+            parse_rebuild_seal_bits(
+                std::env::var("RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS").ok().as_deref(),
+            )
+        });
+        let workers = opts.rebuild_workers.map(|n| n.clamp(1, 256)).unwrap_or_else(|| {
+            if let Some(n) = parse_rebuild_workers(
+                std::env::var("RBITCOIN_TX_HEAD_REBUILD_WORKERS").ok().as_deref(),
+            ) {
+                n
+            } else {
+                tx_head_rebuild_workers_for_free_ram(
+                    crate::sorted_run::logical_cpus(),
+                    crate::host_mem_available_bytes().unwrap_or(0),
                 )
-            });
-        let workers = opts
-            .rebuild_workers
-            .map(|n| n.clamp(1, 256))
-            .unwrap_or_else(|| {
-                if let Some(n) = parse_rebuild_workers(
-                    std::env::var("RBITCOIN_TX_HEAD_REBUILD_WORKERS")
-                        .ok()
-                        .as_deref(),
-                ) {
-                    n
-                } else {
-                    tx_head_rebuild_workers_for_free_ram(
-                        crate::sorted_run::logical_cpus(),
-                        crate::host_mem_available_bytes().unwrap_or(0),
-                    )
-                }
-            });
+            }
+        });
         (seal_bits, workers)
     }
 
@@ -621,30 +585,27 @@ impl TxTable {
                 "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
                  txid.body={n_txids} — truncating to {n}"
             );
-            let (tx_end, sp_end, in_end) = if n == 0 {
-                let h = crate::file::FILE_HEADER_LEN as u64;
-                (h, h, h)
-            } else {
-                let p = create_loc
-                    .range_batch(&[Fk(n)])?
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
-                let ir = inwit_loc
-                    .range_batch(&[Fk(n)])?
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or(StoreError::Corrupt(
-                        "invariant: inwit.loc range for truncate",
-                    ))?;
-                (
-                    p.txout.0.saturating_add(p.txout.1),
-                    p.spent.0.saturating_add(p.spent.1),
-                    ir.0.saturating_add(ir.1),
-                )
-            };
+            let (tx_end, sp_end, in_end) =
+                if n == 0 {
+                    let h = crate::file::FILE_HEADER_LEN as u64;
+                    (h, h, h)
+                } else {
+                    let p = create_loc
+                        .range_batch(&[Fk(n)])?
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
+                    let ir =
+                        inwit_loc.range_batch(&[Fk(n)])?.into_iter().next().flatten().ok_or(
+                            StoreError::Corrupt("invariant: inwit.loc range for truncate"),
+                        )?;
+                    (
+                        p.txout.0.saturating_add(p.txout.1),
+                        p.spent.0.saturating_add(p.spent.1),
+                        ir.0.saturating_add(ir.1),
+                    )
+                };
             create_loc.truncate_to_count(n)?;
             inwit_loc.truncate_to_count(n)?;
             body.truncate_body_to(n, tx_end)?;
@@ -829,9 +790,7 @@ impl TxTable {
             cur = end + 1;
         }
         if pairs.len() as u64 != count {
-            return Err(StoreError::Corrupt(
-                "tx.head unsealed body range count mismatch",
-            ));
+            return Err(StoreError::Corrupt("tx.head unsealed body range count mismatch"));
         }
         Ok(pairs)
     }
@@ -868,18 +827,14 @@ impl TxTable {
             for i in 0..n {
                 let s = i * 32;
                 let txid: [u8; 32] = blob[s..s + 32].try_into().unwrap();
-                pairs.push((
-                    crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid)),
-                    rel,
-                ));
+                pairs
+                    .push((crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid)), rel));
                 rel = rel.saturating_add(1);
             }
             cur = end + 1;
         }
         if pairs.len() as u64 != count {
-            return Err(StoreError::Corrupt(
-                "tx.head unsealed body range count mismatch",
-            ));
+            return Err(StoreError::Corrupt("tx.head unsealed body range count mismatch"));
         }
         Ok(pairs)
     }
@@ -1051,9 +1006,7 @@ impl TxTable {
             .next()
             .flatten()
             .ok_or(StoreError::NotFound)?;
-        let raw = self
-            .body
-            .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
+        let raw = self.body.with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
         let (mut tx, _, _, _) =
             decode_packed_tx_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
@@ -1202,36 +1155,19 @@ impl TxTable {
             }
         }
         let decode_ns = t_dec.elapsed().as_nanos() as u64;
-        Ok((
-            out,
-            body_ns,
-            decode_ns,
-            io.extend_n,
-            io.body_sqe_n,
-            io.guess_full_n,
-        ))
+        Ok((out, body_ns, decode_ns, io.extend_n, io.body_sqe_n, io.guess_full_n))
     }
 
     /// Bulk `body_range` for many fks (confirm load / reconstruct).
     ///
     /// Thin wrapper over [`Self::create_loc_range_batch`] (txout half).
     pub fn body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        Ok(self
-            .create_loc
-            .range_batch(fks)?
-            .into_iter()
-            .map(|p| p.map(|x| x.txout))
-            .collect())
+        Ok(self.create_loc.range_batch(fks)?.into_iter().map(|p| p.map(|x| x.txout)).collect())
     }
 
     /// `inwit.body` range for one create.
     pub fn inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        self.inwit_loc
-            .range_batch(&[fk])?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or(StoreError::NotFound)
+        self.inwit_loc.range_batch(&[fk])?.into_iter().next().flatten().ok_or(StoreError::NotFound)
     }
     pub fn spent_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.create_loc_range_batch(&[fk])?
@@ -1244,12 +1180,7 @@ impl TxTable {
 
     /// `spent.body` ranges (same fk order as [`Self::body_range_batch`]).
     pub fn spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        Ok(self
-            .create_loc
-            .range_batch(fks)?
-            .into_iter()
-            .map(|p| p.map(|x| x.spent))
-            .collect())
+        Ok(self.create_loc.range_batch(fks)?.into_iter().map(|p| p.map(|x| x.spent)).collect())
     }
 
     /// Annotate spends at known absolute spender-meta offsets (confirm write).
@@ -1412,12 +1343,7 @@ impl TxTable {
         for &i in &submitted {
             let ptr = bufs[i].as_mut_ptr();
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, META_LEN) };
-            ops.push(ReadOp {
-                fd: body_fd,
-                offset: abs_offs[i],
-                buf: slice,
-                result: i32::MIN,
-            });
+            ops.push(ReadOp { fd: body_fd, offset: abs_offs[i], buf: slice, result: i32::MIN });
         }
         bulk_io::pread_batch_backend(&mut ops, backend);
 
@@ -1480,11 +1406,10 @@ impl TxTable {
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        self.spent
-            .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
-                let (flags, field, vin) = decode_spent_slot(raw)?;
-                Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin))
-            })
+        self.spent.with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
+            let (flags, field, vin) = decode_spent_slot(raw)?;
+            Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin))
+        })
     }
 
     /// One packed body walk: spender meta for many vouts (ascending).
@@ -1545,11 +1470,7 @@ impl TxTable {
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        let flags = if multi {
-            output_flags::MULTI_SPENDER
-        } else {
-            0
-        };
+        let flags = if multi { output_flags::MULTI_SPENDER } else { 0 };
         let slot_vin = if multi { 0 } else { vin };
         let slot = encode_spent_slot(flags, field, slot_vin)?;
         self.spent.write_body_abs(abs, &slot)?;
@@ -1567,9 +1488,7 @@ impl TxTable {
             .next()
             .flatten()
             .ok_or(StoreError::NotFound)?;
-        let raw = self
-            .body
-            .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
+        let raw = self.body.with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
         let (mut tx, _ins, outs, _) =
             decode_packed_tx_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         let ir = self
@@ -1656,9 +1575,7 @@ impl TxTable {
             .next()
             .flatten()
             .ok_or(StoreError::NotFound)?;
-        let raw = self
-            .body
-            .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
+        let raw = self.body.with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
         let (mut tx, outs, _) =
             decode_packed_tx_outs_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
@@ -1763,10 +1680,7 @@ impl TxTable {
         if items.iter().any(|(_, _, outs)| outs.is_empty()) {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
-        if items
-            .iter()
-            .any(|(_, _, outs)| outs.iter().any(|o| o.value < 0))
-        {
+        if items.iter().any(|(_, _, outs)| outs.iter().any(|o| o.value < 0)) {
             return Err(StoreError::Corrupt("txout amount negative"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
@@ -1786,11 +1700,8 @@ impl TxTable {
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
-            let heads: Vec<([u8; 32], Fk)> = items
-                .iter()
-                .zip(fks.iter())
-                .map(|((tx, _, _), fk)| (tx.txid, *fk))
-                .collect();
+            let heads: Vec<([u8; 32], Fk)> =
+                items.iter().zip(fks.iter()).map(|((tx, _, _), fk)| (tx.txid, *fk)).collect();
             self.head_insert_many(&heads)?;
         }
         Ok(fks)
@@ -1929,9 +1840,7 @@ impl TxTable {
         let fks_in = self.inwit.finish_prepared(p_in)?;
         let fks_sp = self.spent.finish_prepared(p_sp)?;
         if fks != fks_in || fks != fks_sp {
-            return Err(StoreError::Corrupt(
-                "Class A append fk mismatch across stems",
-            ));
+            return Err(StoreError::Corrupt("Class A append fk mismatch across stems"));
         }
         Ok((fks, loc))
     }
@@ -2108,8 +2017,7 @@ impl TxTable {
             on_progress(first.saturating_add(count).saturating_sub(1), n, inserted);
             sealed.push((first, count, pubd));
         }
-        self.head
-            .install_rebuild_sealed(sealed, n.saturating_add(1))?;
+        self.head.install_rebuild_sealed(sealed, n.saturating_add(1))?;
         Ok(inserted)
     }
 
@@ -2190,11 +2098,7 @@ impl TxTable {
                 let fk = Fk(id);
                 if !force_all {
                     let mixed = self.secret.mix_txid(&txid);
-                    let present = self
-                        .head
-                        .probe_candidates(&mixed)?
-                        .iter()
-                        .any(|c| c.0 == fk.0);
+                    let present = self.head.probe_candidates(&mixed)?.iter().any(|c| c.0 == fk.0);
                     if present {
                         if id - last_progress >= PROGRESS_EVERY || id == n {
                             on_progress(id, n, inserted + batch.len() as u64);
@@ -2305,10 +2209,8 @@ impl TxTable {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut mixed: Vec<([u8; 32], Fk)> = entries
-            .iter()
-            .map(|(txid, fk)| (self.secret.mix_txid(txid), *fk))
-            .collect();
+        let mut mixed: Vec<([u8; 32], Fk)> =
+            entries.iter().map(|(txid, fk)| (self.secret.mix_txid(txid), *fk)).collect();
         self.head.insert_many_with(
             &mut mixed,
             Arc::new({

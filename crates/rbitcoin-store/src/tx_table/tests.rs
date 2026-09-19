@@ -14,10 +14,7 @@ use std::path::Path;
 fn tempfile_dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-{name}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -33,9 +30,7 @@ fn create_tiny(dir: &Path) -> TxTable {
 }
 
 fn rebuild_opts(bits: u32, workers: usize) -> HeadOpenOpts {
-    HeadOpenOpts::TINY
-        .with_rebuild_seal_bits(bits)
-        .with_rebuild_workers(workers)
+    HeadOpenOpts::TINY.with_rebuild_seal_bits(bits).with_rebuild_workers(workers)
 }
 
 fn create_tiny_rebuild(dir: &Path, bits: u32, workers: usize) -> TxTable {
@@ -129,8 +124,7 @@ fn open_refuses_txout_without_peer_stems() {
             output_start_fk: Fk::NULL,
             output_count: 0,
         };
-        t.put_full_batch_indexed(&meta_only_items(&[rec]), true)
-            .unwrap();
+        t.put_full_batch_indexed(&meta_only_items(&[rec]), true).unwrap();
     }
     let _ = std::fs::remove_file(dir.join("inwit.body"));
     match TxTable::open_tiny(&dir) {
@@ -156,9 +150,7 @@ fn put_full_batch_from_pins_roundtrip() {
     let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
-    let (fks, loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
-        .unwrap();
+    let (fks, loc) = t.put_full_batch_from_pins(&[(pin, ins)], true, &[]).unwrap();
     assert_eq!(loc.len(), 1);
     assert_eq!(loc[0].txout, t.body_range(fks[0]).unwrap());
     assert_eq!(loc[0].spent, t.spent_range(fks[0]).unwrap());
@@ -188,9 +180,7 @@ fn put_full_batch_one_body_write_wave() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let _ = crate::uring_session::tls_take_max_batch_pwrite_n();
-    let (fks, _loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
-        .unwrap();
+    let (fks, _loc) = t.put_full_batch_from_pins(&[(pin, ins)], true, &[]).unwrap();
     assert_eq!(fks.len(), 1);
     let (tx, got_ins, got_outs) = t.get_full(fks[0]).unwrap();
     assert_eq!(tx.output_count, 1);
@@ -229,10 +219,7 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
     };
     let parent_pin = std::sync::Arc::new((
         parent_tx,
-        vec![
-            OutputRecord::unspent(7, vec![0x51]),
-            OutputRecord::unspent(8, vec![0x52]),
-        ],
+        vec![OutputRecord::unspent(7, vec![0x51]), OutputRecord::unspent(8, vec![0x52])],
     ));
     let child_pin = std::sync::Arc::new((child_tx, vec![OutputRecord::unspent(5, vec![0x51])]));
     let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
@@ -283,13 +270,8 @@ fn pending_head_resolve_before_drain() {
         output_start_fk: Fk::NULL,
         output_count: 0,
     };
-    let fks = t
-        .put_full_batch_indexed(&meta_only_items(&[rec]), /*index=*/ false)
-        .unwrap();
-    assert!(
-        t.probe_body_match_fk(&txid).unwrap().is_none(),
-        "durable head must miss before drain"
-    );
+    let fks = t.put_full_batch_indexed(&meta_only_items(&[rec]), /*index=*/ false).unwrap();
+    assert!(t.probe_body_match_fk(&txid).unwrap().is_none(), "durable head must miss before drain");
     t.head_note_pending(&[(txid, fks[0])]);
     assert!(
         t.probe_body_match_fk(&txid).unwrap().is_none(),
@@ -338,22 +320,13 @@ fn pending_head_same_page_drains_one_write() {
             output_count: 0,
         })
         .collect();
-    let fks = t
-        .put_full_batch_indexed(&meta_only_items(&recs), false)
-        .unwrap();
-    let pending: Vec<([u8; 32], Fk)> = recs
-        .iter()
-        .zip(fks.iter())
-        .map(|(r, fk)| (r.txid, *fk))
-        .collect();
+    let fks = t.put_full_batch_indexed(&meta_only_items(&recs), false).unwrap();
+    let pending: Vec<([u8; 32], Fk)> =
+        recs.iter().zip(fks.iter()).map(|(r, fk)| (r.txid, *fk)).collect();
     t.head_note_pending(&pending);
     let _ = t.head.take_open_page_writes();
     assert_eq!(t.head_drain_pending().unwrap(), 8);
-    assert_eq!(
-        t.head.take_open_page_writes(),
-        1,
-        "same-page drain must be one page write"
-    );
+    assert_eq!(t.head.take_open_page_writes(), 1, "same-page drain must be one page write");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -373,8 +346,7 @@ fn pending_head_reopen_backfills_lagging_head() {
             output_start_fk: Fk::NULL,
             output_count: 0,
         };
-        t.put_full_batch_indexed(&meta_only_items(&[rec]), false)
-            .unwrap();
+        t.put_full_batch_indexed(&meta_only_items(&[rec]), false).unwrap();
         // No head insert, no pending (process kill).
         txid
     };
@@ -440,8 +412,7 @@ fn open_repairs_body_leading_txid_count() {
         output_start_fk: Fk::NULL,
     };
     let outs = vec![OutputRecord::unspent(42, vec![0x51])];
-    t2.put_full_batch_indexed(&[(tx, Vec::new(), outs)], true)
-        .unwrap();
+    t2.put_full_batch_indexed(&[(tx, Vec::new(), outs)], true).unwrap();
     assert_eq!(t2.count(), 4);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -629,20 +600,12 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
         for i in &inputs {
             let mut buf = Vec::new();
             i.encode_into(&mut buf);
-            assert_eq!(
-                i.encoded_len_exact(),
-                buf.len(),
-                "input exact len vs encode"
-            );
+            assert_eq!(i.encoded_len_exact(), buf.len(), "input exact len vs encode");
         }
         for o in &outputs {
             let mut buf = Vec::new();
             o.encode_into(&mut buf);
-            assert_eq!(
-                o.encoded_len_exact(),
-                buf.len(),
-                "output exact len vs encode"
-            );
+            assert_eq!(o.encoded_len_exact(), buf.len(), "output exact len vs encode");
         }
         let mut raw = Vec::new();
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
@@ -662,10 +625,7 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
 fn body_txid_range_matches_serial() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-txid-range-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -721,10 +681,7 @@ fn body_txid_range_matches_serial() {
 fn body_txid_thin_prefix_matches_fat_packed_body() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-thin-txid-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -749,9 +706,7 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
         witness: vec![vec![0xad; 50_000]], // fat body
     }];
     let outputs = vec![OutputRecord::unspent(42, vec![0x51; 100])];
-    let fk = t
-        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
-        .unwrap()[0];
+    let fk = t.put_full_batch_indexed(&[(tx, inputs, outputs)], true).unwrap()[0];
     let from_thin = t.body_txid(fk).unwrap();
     assert_eq!(from_thin, txid, "sidefile thin identity");
     let (_off, len) = t.inwit_range(fk).unwrap();
@@ -766,10 +721,7 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
 fn bulk_body_range_matches_sequential() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-bulk-body-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -796,10 +748,7 @@ fn bulk_body_range_matches_sequential() {
             witness: vec![],
         }];
         let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-        fks.push(
-            t.put_full_batch_indexed(&[(tx, inputs, outputs)], true)
-                .unwrap()[0],
-        );
+        fks.push(t.put_full_batch_indexed(&[(tx, inputs, outputs)], true).unwrap()[0]);
     }
     // Unsorted + sparse sample still matches serial body_range.
     let mut shuffled = fks.clone();
@@ -837,10 +786,7 @@ fn bulk_body_range_matches_sequential() {
 fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-shape-a-multi-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -892,9 +838,7 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
         witness: vec![],
     }];
     let solo_out = vec![OutputRecord::unspent(33, vec![0x51])];
-    let fk_solo = t
-        .put_full_batch_indexed(&[(solo_rec, solo_in, solo_out)], true)
-        .unwrap()[0];
+    let fk_solo = t.put_full_batch_indexed(&[(solo_rec, solo_in, solo_out)], true).unwrap()[0];
 
     let batch = t.get_fk_by_txid_batch(&[txid, solo, [0xff; 32]]).unwrap();
     assert_eq!(batch.len(), 3);
@@ -902,9 +846,8 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let multi = batch.iter().find(|(id, _)| *id == txid).unwrap();
     let (fk, range) = multi.1.expect("multi-cand hit");
     assert_eq!(fk, fk_new);
-    let (outs_rows, _, _, _, _, _) = t
-        .get_outs_by_range_batch(&[(fk, range.txout, txid, range.n_out, vec![0])])
-        .unwrap();
+    let (outs_rows, _, _, _, _, _) =
+        t.get_outs_by_range_batch(&[(fk, range.txout, txid, range.n_out, vec![0])]).unwrap();
     let (tx, outs, dens) = outs_rows[0].as_ref().expect("outs for winner");
     assert_eq!(tx.txid, txid);
     assert_eq!(outs.len(), 1);
@@ -914,9 +857,8 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let single = batch.iter().find(|(id, _)| *id == solo).unwrap();
     let (fk_s, range_s) = single.1.expect("single-cand hit");
     assert_eq!(fk_s, fk_solo);
-    let (solo_rows, _, _, _, _, _) = t
-        .get_outs_by_range_batch(&[(fk_s, range_s.txout, solo, range_s.n_out, vec![0])])
-        .unwrap();
+    let (solo_rows, _, _, _, _, _) =
+        t.get_outs_by_range_batch(&[(fk_s, range_s.txout, solo, range_s.n_out, vec![0])]).unwrap();
     let (tx_s, outs_s, _) = solo_rows[0].as_ref().expect("single outs");
     assert_eq!(tx_s.txid, solo);
     assert_eq!(outs_s[0].1.value, 33);
@@ -938,10 +880,7 @@ fn streaming_resolve_early_exit_fewer_body_lookups() {
     }
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-stream-early-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -985,10 +924,7 @@ fn get_fk_by_txid_batch_depth_wins_with_workers() {
         std::env::set_var("RBITCOIN_BULK_IO_WORKERS", "4");
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-tx-batch-depth-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1040,30 +976,18 @@ fn get_fk_by_txid_batch_depth_wins_with_workers() {
                 witness: vec![],
             }];
             let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            let fk = t
-                .put_full_batch_indexed(&[(rec, inputs, outputs)], true)
-                .unwrap()[0];
+            let fk = t.put_full_batch_indexed(&[(rec, inputs, outputs)], true).unwrap()[0];
             extra.push((other, fk));
         }
         let mut keys: Vec<[u8; 32]> = extra.iter().map(|(t, _)| *t).collect();
         keys.push(txid);
         keys.push([0xff; 32]); // miss
         let batch = t.get_fk_by_txid_batch(&keys).unwrap();
-        let hit = batch
-            .iter()
-            .find(|(t, _)| *t == txid)
-            .unwrap()
-            .1
-            .map(|(f, _)| f);
+        let hit = batch.iter().find(|(t, _)| *t == txid).unwrap().1.map(|(f, _)| f);
         assert_eq!(hit, Some(fk2));
         assert_ne!(hit, Some(fk1));
         for (other, fk) in &extra {
-            let h = batch
-                .iter()
-                .find(|(t, _)| t == other)
-                .unwrap()
-                .1
-                .map(|(f, _)| f);
+            let h = batch.iter().find(|(t, _)| t == other).unwrap().1.map(|(f, _)| f);
             assert_eq!(h, Some(*fk));
         }
         assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
@@ -1076,10 +1000,7 @@ fn get_fk_by_txid_batch_depth_wins_with_workers() {
 fn get_fk_by_txid_batch_matches_single() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-batch-fk-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1136,10 +1057,7 @@ fn get_fk_by_txid_batch_matches_single() {
 fn get_outs_denserels_by_range_sparse_need() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-range-dens-txid-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1173,14 +1091,11 @@ fn get_outs_denserels_by_range_sparse_need() {
         OutputRecord::unspent(2, vec![0x51, 0x52]),
         OutputRecord::unspent(3, big_script.clone()),
     ];
-    let fk = t
-        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
-        .unwrap()[0];
+    let fk = t.put_full_batch_indexed(&[(tx, inputs, outputs)], true).unwrap()[0];
     let range = t.body_range(fk).unwrap();
     // Only need vout 1 — skip allocating big scripts on 0 and 2.
-    let (rows, _, _, _, _, _) = t
-        .get_outs_by_range_batch(&[(fk, range, want_txid, 3, vec![1])])
-        .unwrap();
+    let (rows, _, _, _, _, _) =
+        t.get_outs_by_range_batch(&[(fk, range, want_txid, 3, vec![1])]).unwrap();
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
     assert_eq!(got.txid, want_txid);
     assert_eq!(live.len(), 1);
@@ -1224,14 +1139,11 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     for _ in 1..n_out {
         outputs.push(OutputRecord::unspent(1, vec![0x51; 64]));
     }
-    let fk = t
-        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
-        .unwrap()[0];
+    let fk = t.put_full_batch_indexed(&[(tx, inputs, outputs)], true).unwrap()[0];
     let range = t.body_range(fk).unwrap();
     assert!(range.1 > 4096);
-    let (rows, _, _, extend_n, _, guess_full_n) = t
-        .get_outs_by_range_batch(&[(fk, range, txid, 80, vec![0])])
-        .unwrap();
+    let (rows, _, _, extend_n, _, guess_full_n) =
+        t.get_outs_by_range_batch(&[(fk, range, txid, 80, vec![0])]).unwrap();
     assert_eq!(extend_n, 0);
     assert_eq!(guess_full_n, 0);
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
@@ -1239,9 +1151,8 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].0, 0);
     assert_eq!(sparse.len(), 1);
-    let (_, _, _, extend_all, _, guess_all) = t
-        .get_outs_by_range_batch(&[(fk, range, txid, 80, vec![])])
-        .unwrap();
+    let (_, _, _, extend_all, _, guess_all) =
+        t.get_outs_by_range_batch(&[(fk, range, txid, 80, vec![])]).unwrap();
     assert_eq!(extend_all, 0);
     assert_eq!(guess_all, 1);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1251,10 +1162,7 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
 fn head_primary_slot_stable_and_ordered() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-slot-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1295,11 +1203,8 @@ fn head_insert_many_tiny_roundtrip() {
     let items = meta_only_items(&recs);
     let fks = t.put_full_batch_indexed(&items, false).unwrap();
     assert_eq!(fks.len(), 64);
-    let heads: Vec<([u8; 32], Fk)> = recs
-        .iter()
-        .zip(fks.iter())
-        .map(|(r, fk)| (r.txid, *fk))
-        .collect();
+    let heads: Vec<([u8; 32], Fk)> =
+        recs.iter().zip(fks.iter()).map(|(r, fk)| (r.txid, *fk)).collect();
     t.head_insert_many(&heads).unwrap();
     assert_eq!(t.head_occupied(), 64);
     for (r, fk) in recs.iter().zip(fks.iter()) {
@@ -1313,10 +1218,7 @@ fn missing_tx_head_with_no_bodies_creates_empty() {
     with_env_lock(|| {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-tx-head-empty-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1391,11 +1293,7 @@ fn head_leading_truncated_class_a_rebuilds_on_open() {
         for i in 16..=20u64 {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(
-                t.probe_body_match_fk(&txid).unwrap(),
-                None,
-                "truncated fk {i}"
-            );
+            assert_eq!(t.probe_body_match_fk(&txid).unwrap(), None, "truncated fk {i}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     });
@@ -1405,10 +1303,7 @@ fn head_leading_truncated_class_a_rebuilds_on_open() {
 fn get_output_spender_metas_at_one_walk() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-metas-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1436,16 +1331,11 @@ fn get_output_spender_metas_at_one_walk() {
         OutputRecord::unspent(2, vec![0x51]),
         OutputRecord::unspent(3, vec![0x51]),
     ];
-    let fks = t
-        .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
-        .unwrap();
+    let fks = t.put_full_batch_indexed(&[(tx, inputs, outputs)], false).unwrap();
     let (off, len) = t.spent_range(fks[0]).unwrap();
     let s1 = Fk(10);
-    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1, 0), (2, Fk(20), 1)])
-        .unwrap();
-    let metas = t
-        .get_output_spender_metas_at(off, len, &[0, 1, 2, 99])
-        .unwrap();
+    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1, 0), (2, Fk(20), 1)]).unwrap();
+    let metas = t.get_output_spender_metas_at(off, len, &[0, 1, 2, 99]).unwrap();
     assert_eq!(metas.len(), 3);
     assert!(!metas[0].1 && metas[0].2 == s1 && metas[0].3 == 0);
     assert!(!metas[1].1 && metas[1].2.is_null());
@@ -1488,10 +1378,7 @@ fn get_output_spender_metas_at_one_walk() {
 fn put_spends_on_create_at_batch_patches_all_vouts() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-spend-batch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1519,15 +1406,12 @@ fn put_spends_on_create_at_batch_patches_all_vouts() {
         OutputRecord::unspent(20, vec![0x51]),
         OutputRecord::unspent(30, vec![0x51]),
     ];
-    let fks = t
-        .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
-        .unwrap();
+    let fks = t.put_full_batch_indexed(&[(tx, inputs, outputs)], true).unwrap();
     let fk = fks[0];
     let (off, len) = t.spent_range(fk).unwrap();
     let s1 = Fk(100);
     let s2 = Fk(200);
-    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1, 4), (2, s2, 5)])
-        .unwrap();
+    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1, 4), (2, s2, 5)]).unwrap();
     let (m0, f0, v0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     let (m2, f2, v2) = t.get_output_spender_meta_at(off, len, 2).unwrap();
     assert!(!m0 && f0 == s1 && v0 == 4);
@@ -1642,11 +1526,7 @@ fn output_run_roundtrip() {
     // OP_TRUE + spender_field(8) + flags + uleb value
     let mut tiny = Vec::new();
     run[0].encode_into(&mut tiny);
-    assert!(
-        tiny.len() < 24,
-        "op_true+value should be compact: {}",
-        tiny.len()
-    );
+    assert!(tiny.len() < 24, "op_true+value should be compact: {}", tiny.len());
 }
 
 #[test]
@@ -1689,11 +1569,8 @@ fn output_zero_and_50btc_exp() {
 
 #[test]
 fn output_live_utxo_mantissa_stays_one_byte() {
-    for (sats, exp, mantissa) in [
-        (330, 1u8, 33u8),
-        (1_250_000_000, 7, 125),
-        (2_500_000_000, 8, 25),
-    ] {
+    for (sats, exp, mantissa) in [(330, 1u8, 33u8), (1_250_000_000, 7, 125), (2_500_000_000, 8, 25)]
+    {
         let rec = OutputRecord::unspent(sats, vec![0x51]);
         let enc = rec.encode();
         assert_eq!(enc[0] >> 4, exp, "{sats}");
@@ -1737,9 +1614,7 @@ fn put_full_batch_from_pins_negative_value_is_corrupt() {
     let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let outs = vec![OutputRecord::unspent(-1, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
-    let err = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
-        .unwrap_err();
+    let err = t.put_full_batch_from_pins(&[(pin, ins)], true, &[]).unwrap_err();
     assert!(format!("{err}").contains("txout amount negative"), "{err}");
     assert_eq!(t.count(), 0, "negative pin append must not write Class A");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1903,10 +1778,8 @@ fn visit_packed_script_hashes_matches_full_decode() {
     encode_packed_tx_with_secret(&tx, &inputs, &outputs, &mut raw, Some(&secret));
     let (_, decoded, _) =
         decode_packed_tx_outs_with_spender_rels_secret(&raw, 3, Some(&secret)).unwrap();
-    let expect: Vec<[u8; 32]> = decoded
-        .iter()
-        .map(|o| crate::scripthash::script_hash(&o.script))
-        .collect();
+    let expect: Vec<[u8; 32]> =
+        decoded.iter().map(|o| crate::scripthash::script_hash(&o.script)).collect();
     let mut got = Vec::new();
     visit_packed_script_hashes(&raw, 3, Some(&secret), |h| {
         got.push(h);
@@ -1960,10 +1833,7 @@ fn short_or_truncated_packed_body_rejected() {
 fn address_head_get_by_txid() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-addr-head-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1987,9 +1857,7 @@ fn address_head_get_by_txid() {
         witness: vec![],
     }];
     let outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
-    let fks = t
-        .put_full_batch_indexed(&[(tx.clone(), inputs, outputs)], true)
-        .unwrap();
+    let fks = t.put_full_batch_indexed(&[(tx.clone(), inputs, outputs)], true).unwrap();
     assert_eq!(fks.len(), 1);
     let (fk, rec) = t.get_by_txid(&tx.txid).unwrap().expect("found");
     assert_eq!(fk, fks[0]);
@@ -2003,10 +1871,7 @@ fn address_head_get_by_txid() {
 #[test]
 fn packed_encode_decode_flags_and_error_arms() {
     // TxRecord short
-    assert!(matches!(
-        TxRecord::decode(&[0u8; 10]),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(TxRecord::decode(&[0u8; 10]), Err(StoreError::Corrupt(_))));
     let meta = TxRecord {
         txid: [9u8; 32],
         version: -1,
@@ -2041,17 +1906,11 @@ fn packed_encode_decode_flags_and_error_arms() {
         assert!(!d.multi_spender);
         let _ = o.encoded_len();
     }
-    assert!(matches!(
-        OutputRecord::decode_at(&[]),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(OutputRecord::decode_at(&[]), Err(StoreError::Corrupt(_))));
     // trailing on decode
     let mut trail = o_true.encode();
     trail.push(0xff);
-    assert!(matches!(
-        OutputRecord::decode(&trail),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(OutputRecord::decode(&trail), Err(StoreError::Corrupt(_))));
 
     // Input coinbase + full + prevout skip + errors
     let coin = InputRecord::coinbase(u32::MAX, vec![], vec![]);
@@ -2078,14 +1937,8 @@ fn packed_encode_decode_flags_and_error_arms() {
         assert_eq!(used, e.len());
         let _ = r.encoded_len();
     }
-    assert!(matches!(
-        InputRecord::decode_prevout_at(&[]),
-        Err(StoreError::Corrupt(_))
-    ));
-    assert!(matches!(
-        InputRecord::decode_at(&[]),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(InputRecord::decode_prevout_at(&[]), Err(StoreError::Corrupt(_))));
+    assert!(matches!(InputRecord::decode_at(&[]), Err(StoreError::Corrupt(_))));
     // RESERVED4 flag
     assert!(matches!(
         InputRecord::decode_at(&[input_flags::RESERVED4]),
@@ -2096,33 +1949,21 @@ fn packed_encode_decode_flags_and_error_arms() {
         Err(StoreError::Corrupt(_))
     ));
     // non-coinbase create_fk truncated
-    assert!(matches!(
-        InputRecord::decode_at(&[0u8, 1, 2]),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(InputRecord::decode_at(&[0u8, 1, 2]), Err(StoreError::Corrupt(_))));
     // create_fk null on non-coinbase
     let mut bad = vec![0u8]; // no NULL_PREV
     bad.extend_from_slice(&0u64.to_le_bytes());
     bad.push(0); // vout compact 0
-    assert!(matches!(
-        InputRecord::decode_at(&bad),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(InputRecord::decode_at(&bad), Err(StoreError::Corrupt(_))));
     // sequence truncated
     let mut bad = vec![0u8]; // no SEQ_FINAL
     bad.extend_from_slice(&1u64.to_le_bytes());
     bad.push(0);
-    assert!(matches!(
-        InputRecord::decode_at(&bad),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(InputRecord::decode_at(&bad), Err(StoreError::Corrupt(_))));
     // trailing
     let mut trail = coin.encode();
     trail.push(1);
-    assert!(matches!(
-        InputRecord::decode(&trail),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(InputRecord::decode(&trail), Err(StoreError::Corrupt(_))));
 
     // Packed encode/decode
     let tx = TxRecord {
@@ -2175,10 +2016,7 @@ fn packed_encode_decode_flags_and_error_arms() {
         decode_packed_tx_outs_with_spender_rels(&[0x01], 1),
         Err(StoreError::Corrupt(_))
     ));
-    assert!(matches!(
-        TxRecord::decode_body_meta(&[0x02]),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(TxRecord::decode_body_meta(&[0x02]), Err(StoreError::Corrupt(_))));
     assert!(matches!(
         decode_packed_tx_outs_with_spender_rels(&[0x01], 1),
         Err(StoreError::Corrupt(_))
@@ -2207,10 +2045,7 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert_eq!(decode_input_run(&irun, 2).unwrap().len(), 2);
     let mut trail_run = run.clone();
     trail_run.push(1);
-    assert!(matches!(
-        decode_output_run(&trail_run, 2),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(decode_output_run(&trail_run, 2), Err(StoreError::Corrupt(_))));
 
     // Output value > i64::MAX (uleb overflow)
     {
@@ -2218,20 +2053,14 @@ fn packed_encode_decode_flags_and_error_arms() {
         // uleb128 of value that exceeds i64::MAX: 0xFF… with enough bytes
         bad.extend(std::iter::repeat_n(0xff, 10));
         bad.push(0x01);
-        assert!(matches!(
-            OutputRecord::decode_at(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(OutputRecord::decode_at(&bad), Err(StoreError::Corrupt(_))));
     }
     // decode_prevout_at: create_fk null, prev_index too large, truncated fk
     {
         let mut null_fk = vec![0u8]; // no NULL_PREV
         null_fk.extend_from_slice(&0u64.to_le_bytes());
         null_fk.push(0);
-        assert!(matches!(
-            InputRecord::decode_prevout_at(&null_fk),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(InputRecord::decode_prevout_at(&null_fk), Err(StoreError::Corrupt(_))));
         // truncated create_fk (only 3 bytes after flags)
         assert!(matches!(
             InputRecord::decode_prevout_at(&[0u8, 1, 2, 3]),
@@ -2243,25 +2072,16 @@ fn packed_encode_decode_flags_and_error_arms() {
         // compact size 0xFF → 8-byte length follows; use value > u32::MAX
         big_vout.push(0xff);
         big_vout.extend_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
-        assert!(matches!(
-            InputRecord::decode_prevout_at(&big_vout),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(InputRecord::decode_prevout_at(&big_vout), Err(StoreError::Corrupt(_))));
         // same for full decode_at
-        assert!(matches!(
-            InputRecord::decode_at(&big_vout),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(InputRecord::decode_at(&big_vout), Err(StoreError::Corrupt(_))));
         // sequence truncated on decode_prevout (flags without SEQ_FINAL)
         let mut short_seq = vec![0u8];
         short_seq.extend_from_slice(&1u64.to_le_bytes());
         short_seq.push(0); // vout 0
                            // only 2 of 4 sequence bytes
         short_seq.extend_from_slice(&[1, 2]);
-        assert!(matches!(
-            InputRecord::decode_prevout_at(&short_seq),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(InputRecord::decode_prevout_at(&short_seq), Err(StoreError::Corrupt(_))));
         // witness item truncated
         let mut short_wit = vec![
             input_flags::SEQ_FINAL, // no EMPTY_WITNESS
@@ -2278,10 +2098,7 @@ fn packed_encode_decode_flags_and_error_arms() {
         short_wit.push(1); // 1 witness item
         short_wit.push(5); // item len 5
         short_wit.extend_from_slice(&[1, 2]); // only 2 bytes
-        assert!(matches!(
-            InputRecord::decode_at(&short_wit),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(InputRecord::decode_at(&short_wit), Err(StoreError::Corrupt(_))));
     }
     // packed outs short / trailing on outs_with_spender (loc n_out is the count)
     {
@@ -2306,10 +2123,7 @@ fn packed_encode_decode_flags_and_error_arms() {
             Err(StoreError::Corrupt(_))
         ));
         // short scan
-        assert!(matches!(
-            TxRecord::decode_body_meta(&[0u8; 8]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(TxRecord::decode_body_meta(&[0u8; 8]), Err(StoreError::Corrupt(_))));
         // non-zero trailing on outs_only path
         let mut good = Vec::new();
         encode_packed_tx(
@@ -2348,10 +2162,7 @@ fn packed_encode_decode_flags_and_error_arms() {
             None,
         );
         irun.push(0);
-        assert!(matches!(
-            decode_input_run(&irun, 1),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(decode_input_run(&irun, 1), Err(StoreError::Corrupt(_))));
     }
 }
 
@@ -2360,10 +2171,7 @@ fn packed_encode_decode_flags_and_error_arms() {
 fn body_txid_range_edges() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-txid-range-edge-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -2379,10 +2187,7 @@ fn body_txid_range_edges() {
 fn put_full_aligns_record_starts_and_txid_prefix() {
     let dir = std::env::temp_dir().join(format!(
         "rbitcoin-tx-align-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -2473,11 +2278,7 @@ fn get_full_span_matches_per_fk_get_full() {
                 output_start_fk: Fk::NULL,
                 output_count: 1,
             },
-            vec![InputRecord::coinbase(
-                u32::MAX,
-                vec![i],
-                vec![vec![0x51, i]],
-            )],
+            vec![InputRecord::coinbase(u32::MAX, vec![i], vec![vec![0x51, i]])],
             vec![OutputRecord::unspent(100 + i as i64, vec![0x51])],
         ));
     }
@@ -2523,10 +2324,8 @@ fn pread_two_spans_parallel_matches_serial() {
     let txout_ranges = t.body_ranges(first, last).unwrap();
     let inwit_fks: Vec<Fk> = (first..=last).map(Fk).collect();
     let inwit_pairs = t.inwit_loc.range_batch(&inwit_fks).unwrap();
-    let inwit_ranges: Vec<(u64, u64)> = inwit_pairs
-        .into_iter()
-        .map(|p| p.expect("inwit range"))
-        .collect();
+    let inwit_ranges: Vec<(u64, u64)> =
+        inwit_pairs.into_iter().map(|p| p.expect("inwit range")).collect();
     let (t0, _) = txout_ranges[0];
     let (tn, tln) = *txout_ranges.last().unwrap();
     let tspan = tn + tln - t0;
@@ -2561,9 +2360,7 @@ fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
         output_count: 0,
     };
     let r2 = r1.clone();
-    let fks = t
-        .put_full_batch_indexed(&meta_only_items(&[r1, r2]), true)
-        .unwrap();
+    let fks = t.put_full_batch_indexed(&meta_only_items(&[r1, r2]), true).unwrap();
     assert_eq!(fks.len(), 2);
     assert_ne!(fks[0], fks[1]);
     // Fill remaining to force seal of first segment (819 creates).
@@ -2581,8 +2378,7 @@ fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
             output_count: 0,
         });
     }
-    t.put_full_batch_indexed(&meta_only_items(&rest), true)
-        .unwrap();
+    t.put_full_batch_indexed(&meta_only_items(&rest), true).unwrap();
     // Next create forces roll/seal of the full segment.
     let mut more = [0u8; 32];
     more[0..8].copy_from_slice(&820u64.to_le_bytes());
@@ -2638,8 +2434,7 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
                 }
             })
             .collect();
-        t.put_full_batch_indexed(&meta_only_items(&recs), true)
-            .unwrap();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
         assert_eq!(t.head_segment_count(), 1);
         assert_eq!(t.head.sealed_segment_count(), 0);
         t.flush().unwrap();
@@ -2662,8 +2457,7 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
             }
         })
         .collect();
-    t.put_full_batch_indexed(&meta_only_items(&more), true)
-        .unwrap();
+    t.put_full_batch_indexed(&meta_only_items(&more), true).unwrap();
     t.flush_head().unwrap();
     assert!(t.head.sealed_segment_count() >= 1, "must have sealed");
     // Pre-reopen members must resolve through sealed fuse (no FN).
@@ -2705,8 +2499,7 @@ fn seal_without_retained_keys_matches_fuse_contains() {
             }
         })
         .collect();
-    t.put_full_batch_indexed(&meta_only_items(&recs), true)
-        .unwrap();
+    t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
     t.flush_head().unwrap();
     assert!(t.head.sealed_segment_count() >= 1);
     for i in [1u64, 50, 204, 205] {
@@ -2796,14 +2589,9 @@ fn segmented_head_roll_and_lookup_via_tx_table() {
         .collect();
     // insert in chunks
     for chunk in recs.chunks(100) {
-        t.put_full_batch_indexed(&meta_only_items(chunk), true)
-            .unwrap();
+        t.put_full_batch_indexed(&meta_only_items(chunk), true).unwrap();
     }
-    assert!(
-        t.head_segment_count() >= 2,
-        "segs={}",
-        t.head_segment_count()
-    );
+    assert!(t.head_segment_count() >= 2, "segs={}", t.head_segment_count());
     // lookup first, mid, last
     for i in [1u64, 400, 819, 820] {
         let mut txid = [0u8; 32];
@@ -2857,8 +2645,7 @@ fn empty_occupancy_head_open_rebuilds_mphf_not_oa_backfill() {
                         }
                     })
                     .collect();
-                t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                    .unwrap();
+                t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
                 t.flush().unwrap();
             }
             crate::segmented_head::wipe_segmented_head_files(&dir);
@@ -2901,8 +2688,7 @@ fn rebuild_head_direct_mphf_empty_tail() {
                         }
                     })
                     .collect();
-                t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                    .unwrap();
+                t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
                 t.flush().unwrap();
             }
             crate::segmented_head::wipe_segmented_head_files(&dir);
@@ -2914,20 +2700,10 @@ fn rebuild_head_direct_mphf_empty_tail() {
                 t.head.segment_count()
             );
             let root = dir.join("tx.head");
-            assert!(
-                !root.join("000000").is_file(),
-                "sealed range must not keep an OA file"
-            );
-            assert!(
-                !root.join("000001").is_file(),
-                "remainder must seal, not stay OA"
-            );
-            assert!(crate::tx_head_mphf::TxHeadMphf::exists(
-                &root.join("000000")
-            ));
-            assert!(crate::tx_head_mphf::TxHeadMphf::exists(
-                &root.join("000001")
-            ));
+            assert!(!root.join("000000").is_file(), "sealed range must not keep an OA file");
+            assert!(!root.join("000001").is_file(), "remainder must seal, not stay OA");
+            assert!(crate::tx_head_mphf::TxHeadMphf::exists(&root.join("000000")));
+            assert!(crate::tx_head_mphf::TxHeadMphf::exists(&root.join("000001")));
             assert!(!crate::tx_head_mphf::rel_path(&root.join("000000")).is_file());
             assert!(!crate::tx_head_mphf::rel_path(&root.join("000001")).is_file());
             assert_eq!(
@@ -2980,8 +2756,7 @@ fn rebuild_head_direct_mphf_bip30_newest_first() {
                     .collect();
                 let mut recs = vec![r1, r2];
                 recs.append(&mut rest);
-                t.put_full_batch_indexed(&meta_only_items(&recs), true)
-                    .unwrap();
+                t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
                 t.flush().unwrap();
             }
             crate::segmented_head::wipe_segmented_head_files(&dir);
@@ -3016,8 +2791,7 @@ fn plan_head_rebuild_ranges_chunks_seal_bits_not_oa_load() {
             }
         })
         .collect();
-    t.put_full_batch_indexed(&meta_only_items(&recs), true)
-        .unwrap();
+    t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
     assert_eq!(t.count(), 200);
     assert_eq!(
         plan_rebuild_ranges(t.count(), 6),
@@ -3126,9 +2900,7 @@ fn rebuild_opts_are_per_table() {
 fn refuse_legacy_mono_head_on_create() {
     let dir = tempfile_dir("legacy-mono");
     std::fs::write(dir.join("tx.head"), b"mono").unwrap();
-    let err = TxTable::create_tiny(&dir)
-        .err()
-        .expect("must refuse mono head");
+    let err = TxTable::create_tiny(&dir).err().expect("must refuse mono head");
     let s = format!("{err}");
     assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -3196,13 +2968,8 @@ fn open_seals_unsealed_nontail_after_copied_roll() {
                 }
             })
             .collect();
-        t.put_full_batch_indexed(&meta_only_items(&recs), true)
-            .unwrap();
-        assert_eq!(
-            t.head.sealed_segment_count(),
-            0,
-            "roll must leave the seal unpublished"
-        );
+        t.put_full_batch_indexed(&meta_only_items(&recs), true).unwrap();
+        assert_eq!(t.head.sealed_segment_count(), 0, "roll must leave the seal unpublished");
         assert!(
             t.head.unsealed_ranges().len() >= 2,
             "tail + sealing OA, unsealed={:?}",
@@ -3218,11 +2985,7 @@ fn open_seals_unsealed_nontail_after_copied_roll() {
     for i in [1u64, 100, 204, 205] {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&i.to_le_bytes());
-        assert_eq!(
-            t2.probe_body_match_fk(&txid).unwrap(),
-            Some(Fk(i)),
-            "fk={i}"
-        );
+        assert_eq!(t2.probe_body_match_fk(&txid).unwrap(), Some(Fk(i)), "fk={i}");
     }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&copy);
@@ -3245,11 +3008,7 @@ fn body_meta_v17_v1_locktime_zero_is_three_bytes() {
     let rec = rec_meta(1, 0, 1, 1);
     let mut buf = Vec::new();
     encode_body_meta_v17(&rec, &mut buf);
-    assert_eq!(
-        buf,
-        vec![0x89, 0x01],
-        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb input_count 1"
-    );
+    assert_eq!(buf, vec![0x89, 0x01], "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb input_count 1");
     let (got, n) = decode_body_meta_v17(&buf).unwrap();
     assert_eq!(n, 2);
     assert_eq!(got.version, 1);
@@ -3468,10 +3227,7 @@ fn spent_slot_multi_list_head_roundtrip_vin_zero() {
     let slot = encode_spent_slot(output_flags::MULTI_SPENDER, head, 0).unwrap();
     assert_eq!(slot[0], output_flags::MULTI_SPENDER);
     let (flags, field, vin) = decode_spent_slot(&slot).unwrap();
-    assert_eq!(
-        flags & output_flags::MULTI_SPENDER,
-        output_flags::MULTI_SPENDER
-    );
+    assert_eq!(flags & output_flags::MULTI_SPENDER, output_flags::MULTI_SPENDER);
     assert_eq!(field, head);
     assert_eq!(vin, 0);
 }
@@ -3575,10 +3331,7 @@ fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
         other => panic!("expected Corrupt, got {other:?}"),
     }
     raw[0] = 1 << 7;
-    assert!(matches!(
-        InputRecord::decode_prevout_at(&raw),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert!(matches!(InputRecord::decode_prevout_at(&raw), Err(StoreError::Corrupt(_))));
 }
 
 #[test]
@@ -3603,10 +3356,7 @@ fn reserved_flag_v17_spent_unknown_bits_are_corrupt() {
 fn script_kind_v17_kind_ten_is_corrupt() {
     match decode_script_kind_v17(10, &[]) {
         Err(StoreError::Corrupt(m)) => {
-            assert!(
-                m.contains("script kind") || m.contains("SCRIPT_KIND"),
-                "{m}"
-            );
+            assert!(m.contains("script kind") || m.contains("SCRIPT_KIND"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
     }
@@ -3633,8 +3383,7 @@ fn fat_inwit_uses_delta_loc_not_idx() {
             };
             let inputs = vec![InputRecord::coinbase(u32::MAX, fat_script.clone(), vec![])];
             let outs = vec![OutputRecord::unspent(1, vec![0x51])];
-            t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
-                .unwrap();
+            t.put_full_batch_indexed(&[(tx, inputs, outs)], false).unwrap();
         }
         assert!(dir.join("create.loc").is_file());
         assert!(dir.join("inwit.loc").is_file());
@@ -3668,11 +3417,9 @@ fn put_n_out(t: &TxTable, tag: u8, n_out: u32) -> Fk {
         output_count: n_out,
     };
     let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x51], vec![])];
-    let outs: Vec<OutputRecord> = (0..n_out)
-        .map(|i| OutputRecord::unspent(1 + i64::from(i), vec![0x51]))
-        .collect();
-    t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
-        .unwrap()[0]
+    let outs: Vec<OutputRecord> =
+        (0..n_out).map(|i| OutputRecord::unspent(1 + i64::from(i), vec![0x51])).collect();
+    t.put_full_batch_indexed(&[(tx, inputs, outs)], false).unwrap()[0]
 }
 
 #[test]
@@ -3681,10 +3428,7 @@ fn class_a_append_writes_create_loc() {
     let t = create_tiny(&dir);
     let f1 = put_n_out(&t, 1, 1);
     let f3 = put_n_out(&t, 3, 3);
-    assert!(
-        dir.join("create.loc").is_file(),
-        "create.loc must be created"
-    );
+    assert!(dir.join("create.loc").is_file(), "create.loc must be created");
     assert!(dir.join("create.off").is_file());
     assert!(!dir.join("spent.idx").exists());
     assert!(!dir.join("txout.idx").exists());
@@ -3700,10 +3444,7 @@ fn class_a_append_writes_create_loc() {
     t.flush().unwrap();
     drop(t);
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert!(
-        dir.join("create.loc").is_file(),
-        "reopen must keep create.loc"
-    );
+    assert!(dir.join("create.loc").is_file(), "reopen must keep create.loc");
     assert_eq!(t.spent_range(f1).unwrap(), (o1, l1));
     assert_eq!(t.spent_range(f3).unwrap(), (o3, l3));
     let _ = std::fs::remove_dir_all(&dir);

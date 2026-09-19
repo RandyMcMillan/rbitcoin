@@ -183,15 +183,9 @@ impl Mempool {
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_body_then_slots()?;
-        self.meta_file
-            .sync_data()
-            .map_err(|e| MempoolError::io(self.dir.join("meta"), e))?;
-        self.slots_file
-            .sync_data()
-            .map_err(|e| MempoolError::io(self.dir.join("slots"), e))?;
-        self.body_file
-            .sync_data()
-            .map_err(|e| MempoolError::io(self.dir.join("tx.body"), e))?;
+        self.meta_file.sync_data().map_err(|e| MempoolError::io(self.dir.join("meta"), e))?;
+        self.slots_file.sync_data().map_err(|e| MempoolError::io(self.dir.join("slots"), e))?;
+        self.body_file.sync_data().map_err(|e| MempoolError::io(self.dir.join("tx.body"), e))?;
         Ok(())
     }
 
@@ -222,8 +216,7 @@ impl Mempool {
     }
 
     fn now_ms(&self) -> u64 {
-        self.mock_now_ms
-            .unwrap_or_else(|| self.opened.elapsed().as_millis() as u64)
+        self.mock_now_ms.unwrap_or_else(|| self.opened.elapsed().as_millis() as u64)
     }
 
     /// Test clock. Production uses [`Instant`] elapsed from open.
@@ -367,12 +360,8 @@ impl Mempool {
     fn pwrite_slot_status(&mut self, slot: u32, status: u8) -> Result<(), MempoolError> {
         let path = self.dir.join("slots");
         let off = (SLOTS_HEADER + (slot as usize) * SLOT_REC) as u64;
-        self.slots_file
-            .seek(SeekFrom::Start(off))
-            .map_err(|e| MempoolError::io(&path, e))?;
-        self.slots_file
-            .write_all(&[status])
-            .map_err(|e| MempoolError::io(&path, e))?;
+        self.slots_file.seek(SeekFrom::Start(off)).map_err(|e| MempoolError::io(&path, e))?;
+        self.slots_file.write_all(&[status]).map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
     }
 
@@ -613,9 +602,7 @@ impl Mempool {
         let start = self.body_persisted_len.min(logical);
         self.last_body_write_off = start;
         if start < BODY_HEADER as u64 {
-            self.body_file
-                .seek(SeekFrom::Start(0))
-                .map_err(|e| MempoolError::io(&body_path, e))?;
+            self.body_file.seek(SeekFrom::Start(0)).map_err(|e| MempoolError::io(&body_path, e))?;
             self.body_file
                 .write_all(&self.body[..logical as usize])
                 .map_err(|e| MempoolError::io(&body_path, e))?;
@@ -637,9 +624,7 @@ impl Mempool {
                     .map_err(|e| MempoolError::io(&body_path, e))?;
             }
         }
-        self.body_file
-            .set_len(logical)
-            .map_err(|e| MempoolError::io(&body_path, e))?;
+        self.body_file.set_len(logical).map_err(|e| MempoolError::io(&body_path, e))?;
         self.body_persisted_len = logical;
         Ok(())
     }
@@ -668,12 +653,9 @@ impl Mempool {
     }
 
     fn write_slots_file(file: &mut File, path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
-        file.set_len(bytes.len() as u64)
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.write_all(bytes)
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.set_len(bytes.len() as u64).map_err(|e| MempoolError::io(path, e))?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
         Ok(())
     }
 
@@ -705,12 +687,8 @@ impl Mempool {
         let meta_path = self.dir.join("meta");
         let mut meta = [0u8; META_LEN];
         write_meta_bytes(&mut meta, self.generation, self.slot_cap, self.live_count);
-        self.meta_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
-        self.meta_file
-            .write_all(&meta)
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
+        self.meta_file.seek(SeekFrom::Start(0)).map_err(|e| MempoolError::io(&meta_path, e))?;
+        self.meta_file.write_all(&meta).map_err(|e| MempoolError::io(&meta_path, e))?;
         Ok(())
     }
 
@@ -811,8 +789,7 @@ fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), MempoolE
             .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
         let mut buf = [0u8; META_LEN];
-        file.read_exact(&mut buf)
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.read_exact(&mut buf).map_err(|e| MempoolError::io(path, e))?;
         if buf[0..4] != MEM_MAGIC {
             return Err(MempoolError::BadMagic);
         }
@@ -833,8 +810,7 @@ fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), MempoolE
             .map_err(|e| MempoolError::io(path, e))?;
         let mut buf = [0u8; META_LEN];
         write_meta_bytes(&mut buf, 0, DEFAULT_SLOT_CAP, 0);
-        file.write_all(&buf)
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(&buf).map_err(|e| MempoolError::io(path, e))?;
         file.flush().map_err(|e| MempoolError::io(path, e))?;
         Ok((file, 0, DEFAULT_SLOT_CAP, 0, MEM_SCHEMA))
     }
@@ -857,16 +833,12 @@ fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>), Mem
             .write(true)
             .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| MempoolError::io(path, e))?
-            .len() as usize;
+        let len = file.metadata().map_err(|e| MempoolError::io(path, e))?.len() as usize;
         if len < need {
             return Err(MempoolError::Corrupt("slots file short"));
         }
         let mut buf = vec![0u8; need];
-        file.read_exact(&mut buf)
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.read_exact(&mut buf).map_err(|e| MempoolError::io(path, e))?;
         if buf[0..4] != MEM_MAGIC {
             return Err(MempoolError::BadMagic);
         }
@@ -883,8 +855,7 @@ fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>), Mem
         buf[0..4].copy_from_slice(&MEM_MAGIC);
         buf[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
         buf[8..12].copy_from_slice(&slot_cap.to_le_bytes());
-        file.write_all(&buf)
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(&buf).map_err(|e| MempoolError::io(path, e))?;
         file.flush().map_err(|e| MempoolError::io(path, e))?;
         Ok((file, buf))
     }
@@ -898,18 +869,13 @@ fn open_or_init_body(path: &Path) -> Result<(File, Vec<u8>), MempoolError> {
             .write(true)
             .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| MempoolError::io(path, e))?
-            .len() as usize;
+        let len = file.metadata().map_err(|e| MempoolError::io(path, e))?.len() as usize;
         if len < BODY_HEADER {
             return Err(MempoolError::Corrupt("body too short"));
         }
         let mut buf = vec![0u8; len];
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.read_exact(&mut buf)
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| MempoolError::io(path, e))?;
+        file.read_exact(&mut buf).map_err(|e| MempoolError::io(path, e))?;
         if buf[0..4] != MEM_MAGIC {
             return Err(MempoolError::BadMagic);
         }
@@ -934,8 +900,7 @@ fn open_or_init_body(path: &Path) -> Result<(File, Vec<u8>), MempoolError> {
         buf[0..4].copy_from_slice(&MEM_MAGIC);
         buf[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
         buf[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
-        file.write_all(&buf[..BODY_HEADER])
-            .map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(&buf[..BODY_HEADER]).map_err(|e| MempoolError::io(path, e))?;
         file.flush().map_err(|e| MempoolError::io(path, e))?;
         Ok((file, buf))
     }
@@ -968,8 +933,7 @@ mod tests {
 
     fn put_live(mp: &mut Mempool, tid: &Txid, fee: u64, weight: u64) -> u32 {
         let tx = tiny_tx();
-        mp.append_live_tx(&tx, tid, &tx.compute_wtxid(), fee, weight, &[])
-            .unwrap()
+        mp.append_live_tx(&tx, tid, &tx.compute_wtxid(), fee, weight, &[]).unwrap()
     }
 
     #[test]
@@ -1037,17 +1001,10 @@ mod tests {
         mp.mark_slot_dead(slot).unwrap();
         assert_eq!(mp.live_count(), 0);
         let body_after = fs::read(dir.join("tx.body")).unwrap();
-        assert_eq!(
-            body_before, body_after,
-            "DEAD pwrite must not rewrite tx.body"
-        );
+        assert_eq!(body_before, body_after, "DEAD pwrite must not rewrite tx.body");
         drop(mp);
         let mp = Mempool::open_or_create(&dir).unwrap();
-        assert_eq!(
-            mp.live_count(),
-            0,
-            "DEAD of a flushed slot is durable without 5s"
-        );
+        assert_eq!(mp.live_count(), 0, "DEAD of a flushed slot is durable without 5s");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1080,19 +1037,13 @@ mod tests {
         mp.set_now_ms(0);
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         let persisted = mp.body_persisted_len();
         mp.persist_slots_without_body().unwrap();
         drop(mp);
         let mp = Mempool::open_or_create(&dir).unwrap();
-        let live = mp
-            .load_live_txs()
-            .expect("FREE-not-LIVE past EOF must load");
-        assert!(
-            live.is_empty(),
-            "LIVE must not be written past body_persisted_len={persisted}"
-        );
+        let live = mp.load_live_txs().expect("FREE-not-LIVE past EOF must load");
+        assert!(live.is_empty(), "LIVE must not be written past body_persisted_len={persisted}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1117,10 +1068,7 @@ mod tests {
         }
         mp.persist_if_dirty().unwrap();
         let body_after = fs::read(dir.join("tx.body")).unwrap();
-        assert_eq!(
-            body_before, body_after,
-            "DEAD persist must not rewrite mempool/tx.body"
-        );
+        assert_eq!(body_before, body_after, "DEAD persist must not rewrite mempool/tx.body");
         drop(mp);
         let mp = Mempool::open_or_create(&dir).unwrap();
         assert_eq!(mp.live_count(), 0);
@@ -1134,15 +1082,13 @@ mod tests {
         mp.set_now_ms(0);
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.set_now_ms(PERSIST_INTERVAL_MS);
         mp.persist_due().unwrap();
         let first_end = mp.body_persisted_len();
         let body_after_first = fs::read(dir.join("tx.body")).unwrap();
         let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 2, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 2, 400, &[]).unwrap();
         mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
         mp.persist_due().unwrap();
         assert_eq!(
@@ -1169,8 +1115,7 @@ mod tests {
         mp.set_now_ms(0);
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.set_now_ms(PERSIST_INTERVAL_MS);
         mp.persist_due().unwrap();
         assert_eq!(
@@ -1179,8 +1124,7 @@ mod tests {
             "first persist_due writes one LIVE record, not the full table"
         );
         let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 2, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 2, 400, &[]).unwrap();
         mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
         mp.persist_due().unwrap();
         assert_eq!(
@@ -1229,9 +1173,8 @@ mod tests {
         let dir = tmp_dir();
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         let txid = Txid::from_byte_array([0x11; 32]);
-        let slot = mp
-            .append_live_tx(&tiny_tx(), &txid, &tiny_tx().compute_wtxid(), 10, 400, &[])
-            .unwrap();
+        let slot =
+            mp.append_live_tx(&tiny_tx(), &txid, &tiny_tx().compute_wtxid(), 10, 400, &[]).unwrap();
         assert_eq!(mp.live_count(), 1);
         let (free, live, dead) = mp.slot_stats();
         assert_eq!(live, 1);
@@ -1253,10 +1196,7 @@ mod tests {
             let _ = Mempool::open_or_create(&dir2).unwrap();
         }
         {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .open(dir2.join("meta"))
-                .unwrap();
+            let mut f = fs::OpenOptions::new().write(true).open(dir2.join("meta")).unwrap();
             f.write_all(b"BAD!").unwrap();
         }
         match Mempool::open_or_create(&dir2) {
@@ -1303,11 +1243,7 @@ mod tests {
         let tid5 = Txid::from_byte_array([0x55; 32]);
         let tx = tiny_tx();
         let r = mp.append_live_tx(&tx, &tid5, &tx.compute_wtxid(), 1, 400, &[]);
-        assert!(
-            r.is_ok(),
-            "expected grow on full table, got {:?}",
-            r.err().map(|e| e.to_string())
-        );
+        assert!(r.is_ok(), "expected grow on full table, got {:?}", r.err().map(|e| e.to_string()));
         assert!(mp.meta().slot_cap > tiny);
         assert_eq!(mp.live_count(), tiny + 1);
         // Must not be the old Corrupt message.
@@ -1321,13 +1257,11 @@ mod tests {
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         let slots_first = fs::read(dir.join("slots")).unwrap();
         let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         drop(mp);
         fs::write(dir.join("slots"), &slots_first).unwrap();
@@ -1343,13 +1277,11 @@ mod tests {
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         let body_first = fs::read(dir.join("tx.body")).unwrap();
         let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         drop(mp);
         fs::write(dir.join("tx.body"), body_first).unwrap();
@@ -1369,14 +1301,12 @@ mod tests {
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         let slots_unpacked = fs::read(dir.join("slots")).unwrap();
         mp.mark_slot_dead(0).unwrap();
         let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         mp.compact().unwrap();
         let slots_packed = fs::read(dir.join("slots")).unwrap();
@@ -1410,11 +1340,9 @@ mod tests {
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         let raw = tiny_tx();
         let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[])
-            .unwrap();
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, &[]).unwrap();
         mp.flush().unwrap();
         assert_eq!(mp.live_count(), 2);
         let meta_before_compact = fs::read(dir.join("meta")).unwrap();
@@ -1423,9 +1351,7 @@ mod tests {
         drop(mp);
         fs::write(dir.join("meta"), &meta_before_compact).unwrap();
         let mp = Mempool::open_or_create(&dir).unwrap();
-        let live = mp
-            .load_live_txs()
-            .expect("packed images + stale live_count must load");
+        let live = mp.load_live_txs().expect("packed images + stale live_count must load");
         assert_eq!(live.len(), 1, "packed live set");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1482,17 +1408,9 @@ mod tests {
                 .all(|v| v.script_hash.is_none() && v.create_fk.is_none()));
         }
         let meta = fs::read(dir.join("meta")).unwrap();
-        assert_eq!(
-            &meta[4..6],
-            &MEM_SCHEMA.to_le_bytes(),
-            "meta stamped schema 2"
-        );
+        assert_eq!(&meta[4..6], &MEM_SCHEMA.to_le_bytes(), "meta stamped schema 2");
         let body = fs::read(dir.join("tx.body")).unwrap();
-        assert_eq!(
-            &body[4..6],
-            &MEM_SCHEMA.to_le_bytes(),
-            "body stamped schema 2"
-        );
+        assert_eq!(&body[4..6], &MEM_SCHEMA.to_le_bytes(), "body stamped schema 2");
         {
             let mp = Mempool::open_or_create(&dir).unwrap();
             let live = mp.load_live_txs().unwrap();

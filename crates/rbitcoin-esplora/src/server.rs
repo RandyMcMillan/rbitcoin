@@ -68,11 +68,7 @@ async fn meter_rest(req: Request, next: Next) -> Response {
         }
     }
     let status = resp.status();
-    let err = if status.is_success() {
-        None
-    } else {
-        Some(status.as_str().to_string())
-    };
+    let err = if status.is_success() { None } else { Some(status.as_str().to_string()) };
     rbitcoin_log::api_call(
         "esplora",
         "-",
@@ -352,11 +348,7 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub(crate) fn with_sh_join<R>(&self, f: impl FnOnce(&mut Option<ShJoinSlot>) -> R) -> R {
-        let mut slot = self
-            .sh_join
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
+        let mut slot = self.sh_join.lock().unwrap_or_else(|p| p.into_inner()).take();
         let r = f(&mut slot);
         *self.sh_join.lock().unwrap_or_else(|p| p.into_inner()) = slot;
         r
@@ -427,10 +419,7 @@ pub async fn run_esplora(
         .route("/tx/{txid}/raw", get(handlers::tx_raw))
         .route("/tx/{txid}/status", get(tx_status))
         .route("/tx/{txid}/merkle-proof", get(handlers::tx_merkle_proof))
-        .route(
-            "/tx/{txid}/merkleblock-proof",
-            get(handlers::tx_merkleblock_proof),
-        )
+        .route("/tx/{txid}/merkleblock-proof", get(handlers::tx_merkleblock_proof))
         .route("/tx/{txid}/outspend/{vout}", get(handlers::tx_outspend))
         .route("/tx/{txid}/outspends", get(handlers::tx_outspends))
         .route("/tx", post(handlers::post_tx))
@@ -438,49 +427,22 @@ pub async fn run_esplora(
         .route("/address/{addr}", get(handlers::address_info))
         .route("/address/{addr}/utxo", get(handlers::address_utxo))
         .route("/address/{addr}/txs", get(handlers::address_txs))
-        .route(
-            "/address/{addr}/txs/summary",
-            get(handlers::address_txs_summary),
-        )
-        .route(
-            "/address/{addr}/txs/summary/{last}",
-            get(handlers::address_txs_summary_cursor),
-        )
-        .route(
-            "/address/{addr}/txs/mempool",
-            get(handlers::address_txs_mempool),
-        )
-        .route(
-            "/address/{addr}/txs/chain",
-            get(handlers::address_txs_chain),
-        )
-        .route(
-            "/address/{addr}/txs/chain/{last}",
-            get(handlers::address_txs_chain_cursor),
-        )
+        .route("/address/{addr}/txs/summary", get(handlers::address_txs_summary))
+        .route("/address/{addr}/txs/summary/{last}", get(handlers::address_txs_summary_cursor))
+        .route("/address/{addr}/txs/mempool", get(handlers::address_txs_mempool))
+        .route("/address/{addr}/txs/chain", get(handlers::address_txs_chain))
+        .route("/address/{addr}/txs/chain/{last}", get(handlers::address_txs_chain_cursor))
         .route("/scripthash/{hash}", get(handlers::scripthash_info))
         .route("/scripthash/{hash}/utxo", get(handlers::scripthash_utxo))
         .route("/scripthash/{hash}/txs", get(handlers::scripthash_txs))
-        .route(
-            "/scripthash/{hash}/txs/summary",
-            get(handlers::scripthash_txs_summary),
-        )
+        .route("/scripthash/{hash}/txs/summary", get(handlers::scripthash_txs_summary))
         .route(
             "/scripthash/{hash}/txs/summary/{last}",
             get(handlers::scripthash_txs_summary_cursor),
         )
-        .route(
-            "/scripthash/{hash}/txs/mempool",
-            get(handlers::scripthash_txs_mempool),
-        )
-        .route(
-            "/scripthash/{hash}/txs/chain",
-            get(handlers::scripthash_txs_chain),
-        )
-        .route(
-            "/scripthash/{hash}/txs/chain/{last}",
-            get(handlers::scripthash_txs_chain_cursor),
-        )
+        .route("/scripthash/{hash}/txs/mempool", get(handlers::scripthash_txs_mempool))
+        .route("/scripthash/{hash}/txs/chain", get(handlers::scripthash_txs_chain))
+        .route("/scripthash/{hash}/txs/chain/{last}", get(handlers::scripthash_txs_chain_cursor))
         .route("/mempool", get(handlers::mempool_info))
         .route("/mempool/txids", get(handlers::mempool_txids))
         .route("/mempool/recent", get(handlers::mempool_recent))
@@ -489,22 +451,15 @@ pub async fn run_esplora(
         .route("/v1/fees/recommended", get(handlers::fees_recommended))
         .fallback(fallback_404)
         // Outer → inner: concurrency → body → timeout → meter → chain-view stamp.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            stamp_chain_view_mw,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), stamp_chain_view_mw))
         .layer(middleware::from_fn(meter_rest))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            timeout,
-        ))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(ConcurrencyLimitLayer::new(max_conn));
 
     // WS routes: separate from REST concurrency so upgrades do not hold HTTP permits.
-    let ws_routes = Router::new()
-        .route("/v1/ws", get(ws::ws_upgrade))
-        .route("/ws", get(ws::ws_upgrade));
+    let ws_routes =
+        Router::new().route("/v1/ws", get(ws::ws_upgrade)).route("/ws", get(ws::ws_upgrade));
 
     let app = rest.merge(ws_routes).with_state(state);
 
@@ -519,11 +474,7 @@ pub async fn run_esplora(
         }
     });
 
-    Ok(EsploraHandle {
-        local_addr,
-        shutdown,
-        task,
-    })
+    Ok(EsploraHandle { local_addr, shutdown, task })
 }
 
 async fn tip_height(State(st): State<AppState>) -> Response {
@@ -674,12 +625,7 @@ async fn fallback_404() -> Response {
 }
 
 pub(crate) fn plain_ok(body: String) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        body,
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
 pub(crate) fn not_found() -> Response {
@@ -713,8 +659,7 @@ pub(crate) fn mempool_wire(st: &AppState, txid: &[u8; 32]) -> Option<bitcoin::Tr
 
 fn encode_header_hex(hdr: &bitcoin::block::Header) -> Result<String, String> {
     let mut buf = Vec::with_capacity(80);
-    hdr.consensus_encode(&mut buf)
-        .map_err(|_| "header encode".to_string())?;
+    hdr.consensus_encode(&mut buf).map_err(|_| "header encode".to_string())?;
     Ok(rbitcoin_primitives::hex_encode(buf))
 }
 
@@ -814,12 +759,7 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let body = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
         (status, text, body)
     }
 
@@ -840,12 +780,7 @@ mod tests {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let body = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
         (status, body)
     }
 
@@ -893,10 +828,7 @@ mod tests {
         let sh = block_hash_hex(&rbitcoin_store::script_hash(&[0x51]));
         let (st, body) = http_get(handle.local_addr, &format!("/scripthash/{sh}")).await;
         assert_eq!(st, 503, "{body}");
-        assert!(
-            body.contains("scripthash join exceeds --max-sh-creates"),
-            "{body}"
-        );
+        assert!(body.contains("scripthash join exceeds --max-sh-creates"), "{body}");
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -914,16 +846,11 @@ mod tests {
             c.fetch_add(1, Ordering::Relaxed);
             Ok(json!({"height": 1, "rules": ["segwit"]}))
         })));
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None).await.expect("listen");
         let addr = handle.local_addr;
         let (st, raw, body) = http_get_raw(addr, "/block-template").await;
         assert_eq!(st, 200, "{body}");
-        assert!(
-            raw.to_ascii_lowercase().contains("cache-control: no-store"),
-            "{raw}"
-        );
+        assert!(raw.to_ascii_lowercase().contains("cache-control: no-store"), "{raw}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["height"], 1);
         let (st, _) = http_get(addr, "/block-template").await;
@@ -972,10 +899,7 @@ mod tests {
 
         let (st, raw, _) = http_get_raw(addr, "/blocks/tip/height").await;
         assert_eq!(st, 200);
-        assert_eq!(
-            header_value(&raw, HDR_CHAIN_TIP).as_deref(),
-            Some(tip.as_str())
-        );
+        assert_eq!(header_value(&raw, HDR_CHAIN_TIP).as_deref(), Some(tip.as_str()));
 
         let (st, body) = http_get(addr, "/no/such/path").await;
         assert_eq!(st, 404, "404 body={body}");
@@ -996,9 +920,7 @@ mod tests {
         q.connect_block(Height(1), &h1, &[t1]).unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None).await.expect("listen");
         let addr = handle.local_addr;
         let sh = rbitcoin_store::script_hash(&[0x51]);
         let sh_hex = block_hash_hex(&sh);
@@ -1029,10 +951,7 @@ mod tests {
         assert_ne!(tip_a, tip_b);
 
         let (st, raw, body) = http_get_raw(addr, "/mempool").await;
-        assert_eq!(
-            st, 200,
-            "mempool must not 503 on same-height replace: {body}"
-        );
+        assert_eq!(st, 200, "mempool must not 503 on same-height replace: {body}");
         assert!(
             header_value(&raw, HDR_CHAIN_TIP).is_none(),
             "mempool must not pin/stamp a chain view"
@@ -1067,10 +986,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/blocks/tip/hash", get(die_tip))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                stamp_chain_view_mw,
-            ))
+            .layer(middleware::from_fn_with_state(state.clone(), stamp_chain_view_mw))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1079,14 +995,8 @@ mod tests {
         });
         let (st, raw, body) = http_get_raw(addr, "/blocks/tip/hash").await;
         assert_eq!(st, 503, "body={body}");
-        assert!(
-            body.contains("chain view moved"),
-            "503 body must name the move: {body}"
-        );
-        assert!(
-            header_value(&raw, HDR_CHAIN_TIP).is_none(),
-            "503 must not stamp a fork tip"
-        );
+        assert!(body.contains("chain view moved"), "503 body must name the move: {body}");
+        assert!(header_value(&raw, HDR_CHAIN_TIP).is_none(), "503 must not stamp a fork tip");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1105,9 +1015,7 @@ mod tests {
         let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
         hub.set_relay_enabled(true);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), Some(hub), None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(hub), None).await.expect("listen");
         let addr = handle.local_addr;
         let h0hex = block_hash_hex(&hash0);
 
@@ -1204,17 +1112,9 @@ mod tests {
         assert!(path_never_pins("/v1/fees/recommended"));
         assert!(path_never_pins("/tx"));
         assert!(!path_never_pins("/tx/ab"));
-        assert!(parse_asof_param(&AsOfQuery { asof: None })
-            .unwrap()
-            .is_none());
-        assert!(parse_asof_param(&AsOfQuery {
-            asof: Some(String::new())
-        })
-        .is_err());
-        assert!(parse_asof_param(&AsOfQuery {
-            asof: Some("zz".into())
-        })
-        .is_err());
+        assert!(parse_asof_param(&AsOfQuery { asof: None }).unwrap().is_none());
+        assert!(parse_asof_param(&AsOfQuery { asof: Some(String::new()) }).is_err());
+        assert!(parse_asof_param(&AsOfQuery { asof: Some("zz".into()) }).is_err());
         assert!(parse_hash32("aa").is_err());
         assert!(parse_hash32("zz".repeat(32).as_str()).is_err());
     }
@@ -1228,9 +1128,7 @@ mod tests {
         q.connect_block(Height(0), &header, &[ta]).unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None).await.expect("listen");
         let addr = handle.local_addr;
 
         let (st, body) = http_get(addr, "/mempool").await;
@@ -1241,9 +1139,7 @@ mod tests {
         let (st, body) = http_get(addr, "/fee-estimates").await;
         assert_eq!(st, 200, "{body}");
         let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
-        for t in [
-            "1", "2", "3", "4", "5", "6", "10", "20", "144", "504", "1008",
-        ] {
+        for t in ["1", "2", "3", "4", "5", "6", "10", "20", "144", "504", "1008"] {
             assert_eq!(fees[t].as_f64(), Some(1.0), "{t}: {body}");
         }
 
@@ -1285,9 +1181,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None).await.expect("listen");
         let addr = handle.local_addr;
 
         let _ = q.sample_reset_reconstruct_archived();
@@ -1306,15 +1200,9 @@ mod tests {
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
-        let sep = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .expect("http headers");
+        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
         let raw = &buf[sep + 4..];
-        assert!(
-            String::from_utf8_lossy(&buf[..sep]).contains("200"),
-            "raw status"
-        );
+        assert!(String::from_utf8_lossy(&buf[..sep]).contains("200"), "raw status");
         let block: Block = deserialize(raw).expect("decode raw block");
         assert_eq!(block.txdata.len(), 1);
         assert!(
@@ -1347,10 +1235,7 @@ mod tests {
         mb.extract_matches(&mut matches, &mut indexes).unwrap();
         assert_eq!(indexes, vec![0]);
         assert_eq!(matches.len(), 1);
-        assert_eq!(
-            matches[0],
-            bitcoin::Txid::from_byte_array(coinbase_txids[0])
-        );
+        assert_eq!(matches[0], bitcoin::Txid::from_byte_array(coinbase_txids[0]));
 
         let (st, body) = http_get(addr, "/mempool/txids").await;
         assert_eq!(st, 200, "{body}");
@@ -1407,9 +1292,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None).await.expect("listen");
         let addr = handle.local_addr;
         let sh_hex = block_hash_hex(&script_hash(&[0x51]));
 
@@ -1451,9 +1334,8 @@ mod tests {
         let mut cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
         cfg.max_ws_connections = 2;
-        let handle = run_esplora(cfg, Arc::clone(&q), None, Some(tip_tx.clone()))
-            .await
-            .expect("listen");
+        let handle =
+            run_esplora(cfg, Arc::clone(&q), None, Some(tip_tx.clone())).await.expect("listen");
         let addr = handle.local_addr;
 
         // REST works before and during WS.
@@ -1462,16 +1344,12 @@ mod tests {
         assert_eq!(body, "1");
 
         let url = format!("ws://{addr}/v1/ws");
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .expect("ws upgrade");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("ws upgrade");
         // Handler task may lag the HTTP upgrade handshake.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        ws.send(WsMsg::Text(
-            r#"{"action":"want","data":["blocks","stats"]}"#.into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks","stats"]}"#.into()))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Inject tip (header minimal).
@@ -1508,15 +1386,9 @@ mod tests {
         assert!(v["block"]["id"].as_str().unwrap().len() == 64);
 
         ws.send(WsMsg::Text(r#"{"foo":1}"#.into())).await.unwrap();
-        ws.send(WsMsg::Text(r#"{"stop-track-addresses":true}"#.into()))
-            .await
-            .unwrap();
-        ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into()))
-            .await
-            .unwrap();
-        ws.send(WsMsg::Text(r#"{"track-address":"not-an-address"}"#.into()))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text(r#"{"stop-track-addresses":true}"#.into())).await.unwrap();
+        ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into())).await.unwrap();
+        ws.send(WsMsg::Text(r#"{"track-address":"not-an-address"}"#.into())).await.unwrap();
         let err = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
             .expect("timeout waiting invalid-address error")
@@ -1526,29 +1398,16 @@ mod tests {
             WsMsg::Text(t) => t.as_str().to_owned(),
             other => panic!("expected error text, got {other:?}"),
         };
-        assert!(
-            err_text.contains("invalid address"),
-            "invalid address error: {err_text}"
-        );
+        assert!(err_text.contains("invalid address"), "invalid address error: {err_text}");
         let id = "ab".repeat(32);
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"stop-track-tx":"{id}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"stop-track-tx":"{id}"}}"#)).into())).await.unwrap();
         ws.send(WsMsg::Text(
             r#"{"stop-track-address":"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz8z5y2"}"#.into(),
         ))
         .await
         .unwrap();
-        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{id}"}}"#).into()))
-            .await
-            .unwrap();
-        ws.send(WsMsg::Text(
-            r#"{"track-addresses":["not-an-address"]}"#.into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{id}"}}"#).into())).await.unwrap();
+        ws.send(WsMsg::Text(r#"{"track-addresses":["not-an-address"]}"#.into())).await.unwrap();
         let err2 = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
             .expect("timeout waiting track-addresses error")
@@ -1558,10 +1417,7 @@ mod tests {
             WsMsg::Text(t) => t.as_str().to_owned(),
             other => panic!("expected error text, got {other:?}"),
         };
-        assert!(
-            err2_text.contains("invalid address"),
-            "track-addresses error: {err2_text}"
-        );
+        assert!(err2_text.contains("invalid address"), "track-addresses error: {err2_text}");
 
         // REST still OK with WS open.
         let (st, body) = http_get(addr, "/blocks/tip/height").await;
@@ -1569,9 +1425,7 @@ mod tests {
 
         // Cap: third connection rejected when max_ws=2 (we have 1 open; open second ok, third fails).
         let url2 = format!("ws://{addr}/ws");
-        let (mut ws2, _) = tokio_tungstenite::connect_async(&url2)
-            .await
-            .expect("second ws");
+        let (mut ws2, _) = tokio_tungstenite::connect_async(&url2).await.expect("second ws");
         let third = tokio_tungstenite::connect_async(&url).await;
         assert!(
             third.is_err() || third.as_ref().ok().map(|(s, _)| s.get_ref()).is_none(),
@@ -1684,9 +1538,8 @@ mod tests {
             outputs: vec![OutputRecord::unspent(49_0000_0000, watch_spk.to_bytes())],
         };
         let (cb_header, cb) = coinbase(101, prev, parent_hash);
-        let _prev = q
-            .connect_block(Height(101), &cb_header, &[cb, ta_pay])
-            .expect("connect pay block");
+        let _prev =
+            q.connect_block(Height(101), &cb_header, &[cb, ta_pay]).expect("connect pay block");
         let tip_hash = cb_header.hash;
 
         let q = Arc::new(q);
@@ -1698,32 +1551,22 @@ mod tests {
         let (tip_tx, _) = broadcast::channel::<TipEvent>(16);
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(
-            cfg,
-            Arc::clone(&q),
-            Some(Arc::clone(&hub)),
-            Some(tip_tx.clone()),
-        )
-        .await
-        .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), Some(tip_tx.clone()))
+            .await
+            .expect("listen");
         let addr = handle.local_addr;
 
         let url = format!("ws://{addr}/v1/ws");
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-address":"{watch_addr}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-address":"{watch_addr}"}}"#)).into()))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Mempool path: another mature coinbase → watch address.
-        let op1 = OutPoint {
-            txid: bitcoin::Txid::from_byte_array(coinbase_txids[1]),
-            vout: 0,
-        };
+        let op1 = OutPoint { txid: bitcoin::Txid::from_byte_array(coinbase_txids[1]), vout: 0 };
         let mem_pay = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -1773,10 +1616,8 @@ mod tests {
             let v = ws_recv_json(&mut ws, 3).await;
             if let Some(arr) = v.get("address-transactions").and_then(|a| a.as_array()) {
                 assert!(!arr.is_empty());
-                let txids: Vec<&str> = arr
-                    .iter()
-                    .filter_map(|t| t.get("txid").and_then(|x| x.as_str()))
-                    .collect();
+                let txids: Vec<&str> =
+                    arr.iter().filter_map(|t| t.get("txid").and_then(|x| x.as_str())).collect();
                 assert!(
                     txids.iter().any(|t| *t == mem_hex),
                     "address-transactions should include mempool pay {mem_hex}, got {txids:?}"
@@ -1809,10 +1650,8 @@ mod tests {
         for _ in 0..12 {
             let v = ws_recv_json(&mut ws, 3).await;
             if let Some(arr) = v.get("block-transactions").and_then(|a| a.as_array()) {
-                let txids: Vec<&str> = arr
-                    .iter()
-                    .filter_map(|t| t.get("txid").and_then(|x| x.as_str()))
-                    .collect();
+                let txids: Vec<&str> =
+                    arr.iter().filter_map(|t| t.get("txid").and_then(|x| x.as_str())).collect();
                 assert!(
                     txids.contains(&pay_hex.as_str()),
                     "block-transactions should include confirmed pay {pay_hex}, got {txids:?}"
@@ -1851,10 +1690,7 @@ mod tests {
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
 
-        let op0 = OutPoint {
-            txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]),
-            vout: 0,
-        };
+        let op0 = OutPoint { txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]), vout: 0 };
         let spk = ScriptBuf::from_bytes(vec![0x51]);
         let pending = Transaction {
             version: TxVersion::TWO,
@@ -1883,25 +1719,15 @@ mod tests {
         let (tip_tx, _) = broadcast::channel::<TipEvent>(16);
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(
-            cfg,
-            Arc::clone(&q),
-            Some(Arc::clone(&hub)),
-            Some(tip_tx.clone()),
-        )
-        .await
-        .expect("listen");
-        let addr = handle.local_addr;
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), Some(tip_tx.clone()))
             .await
-            .unwrap();
+            .expect("listen");
+        let addr = handle.local_addr;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws")).await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-tx":"{pending_hex}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{pending_hex}"}}"#)).into())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         hub.accept_tx(&pending).expect("accept");
@@ -1940,8 +1766,7 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
         };
-        q.connect_block(Height(101), &h_hdr, &[cb, ta])
-            .expect("confirm pending");
+        q.connect_block(Height(101), &h_hdr, &[cb, ta]).expect("confirm pending");
         tip_tx
             .send(TipEvent {
                 height: 101,
@@ -1989,9 +1814,7 @@ mod tests {
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
         cfg.max_track_addresses = 1;
         cfg.max_track_txs = 1;
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None).await.expect("listen");
         let (mut ws, _) =
             tokio_tungstenite::connect_async(format!("ws://{}/v1/ws", handle.local_addr))
                 .await
@@ -2011,17 +1834,9 @@ mod tests {
             Address::p2wpkh(&cpk, Network::Regtest).to_string()
         };
 
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-address":"{a1}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-address":"{a1}"}}"#)).into())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-address":"{a2}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-address":"{a2}"}}"#)).into())).await.unwrap();
         let mut saw_addr_cap = false;
         for _ in 0..6 {
             let v = ws_recv_json(&mut ws, 2).await;
@@ -2037,19 +1852,13 @@ mod tests {
 
         let t1 = "11".repeat(32);
         let t2 = "22".repeat(32);
-        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t1}"}}"#)).into()))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t1}"}}"#)).into())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t2}"}}"#)).into()))
-            .await
-            .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t2}"}}"#)).into())).await.unwrap();
         let mut saw_tx_cap = false;
         for _ in 0..6 {
             let v = ws_recv_json(&mut ws, 2).await;
-            if v.get("error")
-                .and_then(|e| e.as_str())
-                .is_some_and(|s| s.contains("max_track_txs"))
+            if v.get("error").and_then(|e| e.as_str()).is_some_and(|s| s.contains("max_track_txs"))
             {
                 saw_tx_cap = true;
                 break;
@@ -2092,9 +1901,8 @@ mod tests {
 
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None)
-            .await
-            .expect("listen");
+        let handle =
+            run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None).await.expect("listen");
         let (mut ws, _) =
             tokio_tungstenite::connect_async(format!("ws://{}/v1/ws", handle.local_addr))
                 .await
@@ -2102,10 +1910,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // --- track-tx RBF ---
-        let op0 = OutPoint {
-            txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]),
-            vout: 0,
-        };
+        let op0 = OutPoint { txid: bitcoin::Txid::from_byte_array(coinbase_txids[0]), vout: 0 };
         let low = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -2121,11 +1926,7 @@ mod tests {
             }],
         };
         let low_hex = display_txid(low.compute_txid());
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-tx":"{low_hex}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{low_hex}"}}"#)).into())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         hub.accept_tx(&low).unwrap();
         // drain unconf
@@ -2169,20 +1970,13 @@ mod tests {
         assert!(saw, "track-tx RBF replace frame");
 
         // --- address-only RBF: old pays watch, new pays OP_TRUE ---
-        ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into()))
+        ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into())).await.unwrap();
+        ws.send(WsMsg::Text((format!(r#"{{"track-address":"{watch_addr}"}}"#)).into()))
             .await
             .unwrap();
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-address":"{watch_addr}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        let op1 = OutPoint {
-            txid: bitcoin::Txid::from_byte_array(coinbase_txids[1]),
-            vout: 0,
-        };
+        let op1 = OutPoint { txid: bitcoin::Txid::from_byte_array(coinbase_txids[1]), vout: 0 };
         let old_to_watch = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -2192,10 +1986,7 @@ mod tests {
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_0000_0000),
-                script_pubkey: watch_spk,
-            }],
+            output: vec![TxOut { value: Amount::from_sat(49_0000_0000), script_pubkey: watch_spk }],
         };
         let old_hex = display_txid(old_to_watch.compute_txid());
         hub.accept_tx(&old_to_watch).unwrap();
@@ -2238,10 +2029,7 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            saw_addr_rbf,
-            "address-only RBF: old paid watch, new does not"
-        );
+        assert!(saw_addr_rbf, "address-only RBF: old paid watch, new does not");
 
         let _ = ws.close(None).await;
         handle.shutdown().await;
@@ -2295,19 +2083,14 @@ mod tests {
         let sh_hex = block_hash_hex(&script_hash(&[0x51]));
 
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None)
-            .await
-            .expect("listen");
+        let handle =
+            run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None).await.expect("listen");
         let addr = handle.local_addr;
 
         let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
         assert_eq!(st, 200, "{body}");
         let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let row = arr
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["txid"] == txid_hex);
+        let row = arr.as_array().unwrap().iter().find(|r| r["txid"] == txid_hex);
         let row = row.expect("mempool list contains spend");
         assert!(row.get("vin").is_some(), "stub omitted vin: {row}");
         assert!(row.get("vout").is_some(), "stub omitted vout: {row}");

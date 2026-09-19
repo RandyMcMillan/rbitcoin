@@ -41,10 +41,7 @@ fn overlay_mempool_utxos(
         return;
     };
     out.retain(|x| {
-        let op = OutPoint {
-            txid: bitcoin::Txid::from_byte_array(x.tx_hash),
-            vout: x.tx_pos,
-        };
+        let op = OutPoint { txid: bitcoin::Txid::from_byte_array(x.tx_hash), vout: x.tx_pos };
         !mp.spends_outpoint(&op)
     });
     for item in mp.scripthash_mempool(sh) {
@@ -59,10 +56,7 @@ fn overlay_mempool_utxos(
             if script_hash(o.script_pubkey.as_bytes()) != *sh {
                 continue;
             }
-            let op = OutPoint {
-                txid: tid,
-                vout: vout as u32,
-            };
+            let op = OutPoint { txid: tid, vout: vout as u32 };
             if mp.spends_outpoint(&op) {
                 continue;
             }
@@ -96,10 +90,7 @@ pub fn scripthash_mempool_stats_slot(
     let items = mp.scripthash_mempool(sh);
     let mut stats = MempoolShStats::default();
     for u in query.scripthash_listunspent_slot(sh, slot)? {
-        let op = OutPoint {
-            txid: bitcoin::Txid::from_byte_array(u.tx_hash),
-            vout: u.tx_pos,
-        };
+        let op = OutPoint { txid: bitcoin::Txid::from_byte_array(u.tx_hash), vout: u.tx_pos };
         if mp.spends_outpoint(&op) {
             stats.spent_txo_count = stats.spent_txo_count.saturating_add(1);
             stats.spent_txo_sum = stats.spent_txo_sum.saturating_add(u.value);
@@ -118,10 +109,7 @@ pub fn scripthash_mempool_stats_slot(
             if script_hash(o.script_pubkey.as_bytes()) != *sh {
                 continue;
             }
-            let op = OutPoint {
-                txid: tid,
-                vout: vout as u32,
-            };
+            let op = OutPoint { txid: tid, vout: vout as u32 };
             if mp.spends_outpoint(&op) {
                 continue;
             }

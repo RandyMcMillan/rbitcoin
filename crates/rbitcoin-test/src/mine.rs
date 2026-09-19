@@ -17,11 +17,8 @@ pub fn bip34_script(height: u32) -> ScriptBuf {
 
 pub fn coinbase_tx(height: u32, value: Amount) -> Transaction {
     // Consensus: coinbase scriptSig length must be in 2..=100.
-    let mut ss = if height == 0 {
-        vec![0x00]
-    } else {
-        rbitcoin_consensus::bip34_height_script(height)
-    };
+    let mut ss =
+        if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
     while ss.len() < 2 {
         ss.push(0x00);
     }
@@ -50,18 +47,12 @@ pub fn spend_anyone_can_spend(prev_txid: bitcoin::Txid, vout: u32, value: Amount
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev_txid,
-                vout,
-            },
+            previous_output: OutPoint { txid: prev_txid, vout },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+        output: vec![TxOut { value, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
     }
 }
 
@@ -75,20 +66,14 @@ pub fn split_anyone_can_spend(
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev_txid,
-                vout,
-            },
+            previous_output: OutPoint { txid: prev_txid, vout },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
         output: values
             .iter()
-            .map(|value| TxOut {
-                value: *value,
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            })
+            .map(|value| TxOut { value: *value, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) })
             .collect(),
     }
 }
@@ -101,19 +86,13 @@ pub fn spend_many_anyone_can_spend(prevs: &[(bitcoin::Txid, u32)], value: Amount
         input: prevs
             .iter()
             .map(|(txid, vout)| TxIn {
-                previous_output: OutPoint {
-                    txid: *txid,
-                    vout: *vout,
-                },
+                previous_output: OutPoint { txid: *txid, vout: *vout },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             })
             .collect(),
-        output: vec![TxOut {
-            value,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+        output: vec![TxOut { value, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
     }
 }
 
@@ -137,9 +116,8 @@ pub fn mine_regtest_block(
         nonce: 0,
     };
     let mut block = Block { header, txdata };
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .expect("non-empty block has merkle root");
+    block.header.merkle_root =
+        block.compute_merkle_root().expect("non-empty block has merkle root");
 
     let target = Target::from_compact(bits);
     for nonce in 0..u32::MAX {

@@ -45,11 +45,7 @@ fn crc32_table() -> &'static [u32; 256] {
         for (i, slot) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
             }
             *slot = c;
         }
@@ -86,9 +82,7 @@ impl SortedRunPath {
 }
 
 fn seq_from_path(path: &Path) -> Option<u64> {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.parse::<u64>().ok())
+    path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Next run path: `{dir}/{seq:06}.run`.
@@ -251,10 +245,7 @@ pub struct RunWritePolicy {
 
 impl RunWritePolicy {
     /// Durable leftover-catalog write; full-speed write + DONTNEED.
-    pub const CATALOG: Self = Self {
-        durable: true,
-        drop_cache: true,
-    };
+    pub const CATALOG: Self = Self { durable: true, drop_cache: true };
 }
 
 /// Write a new sorted run from **already sorted** fixed-width records.
@@ -304,9 +295,7 @@ fn write_sorted_run_file(
         return Err(StoreError::Corrupt("sorted run: bad key/rec len"));
     }
     if !records.len().is_multiple_of(rec_len as usize) {
-        return Err(StoreError::Corrupt(
-            "sorted run: body not multiple of rec_len",
-        ));
+        return Err(StoreError::Corrupt("sorted run: body not multiple of rec_len"));
     }
     // Full-record keys (SH: key_len == rec_len == 40) must be unique and ordered.
     // Other families (key_len < rec_len) keep payload-only ties.
@@ -316,9 +305,7 @@ fn write_sorted_run_file(
         for rec in records.chunks_exact(rl) {
             if let Some(p) = prev {
                 if rec_key_cmp(rec, p, key_len as usize, rec_len) != Ordering::Greater {
-                    return Err(StoreError::Corrupt(
-                        "sorted run: records not strictly increasing",
-                    ));
+                    return Err(StoreError::Corrupt("sorted run: records not strictly increasing"));
                 }
             }
             prev = Some(rec);
@@ -365,13 +352,7 @@ fn write_sorted_run_file(
     if policy.drop_cache {
         advise_file_dont_need(path);
     }
-    Ok(SortedRunPath {
-        path: path.to_path_buf(),
-        count,
-        rec_len,
-        key_len,
-        body_crc32,
-    })
+    Ok(SortedRunPath { path: path.to_path_buf(), count, rec_len, key_len, body_crc32 })
 }
 
 /// Best-effort whole-file `POSIX_FADV_DONTNEED` (Linux). No-op elsewhere.
@@ -439,13 +420,7 @@ pub fn open_run(path: &Path) -> Result<SortedRunPath, StoreError> {
             return Err(StoreError::Corrupt("sorted run: trailing garbage"));
         }
     }
-    Ok(SortedRunPath {
-        path: path.to_path_buf(),
-        count,
-        rec_len,
-        key_len,
-        body_crc32,
-    })
+    Ok(SortedRunPath { path: path.to_path_buf(), count, rec_len, key_len, body_crc32 })
 }
 
 /// Compare two fixed records for merge / write order.
@@ -477,11 +452,7 @@ pub fn list_materialize_claims(dir: &Path) -> Result<Vec<SortedRunPath>, StoreEr
         .map_err(|e| io_err(dir, e))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|n| n.ends_with(".run.mat"))
-        })
+        .filter(|p| p.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.ends_with(".run.mat")))
         .collect();
     paths.sort();
     let mut out = Vec::with_capacity(paths.len());
@@ -530,11 +501,7 @@ fn mem_available_from_darwin_vm(
     if page_size == 0 {
         return None;
     }
-    Some(
-        free_count
-            .saturating_add(inactive_count)
-            .saturating_mul(page_size),
-    )
+    Some(free_count.saturating_add(inactive_count).saturating_mul(page_size))
 }
 
 #[cfg(target_os = "macos")]
@@ -562,11 +529,7 @@ fn mem_available_from_darwin_host() -> Option<u64> {
     if kr != libc::KERN_SUCCESS {
         return None;
     }
-    mem_available_from_darwin_vm(
-        page_size,
-        u64::from(vm.free_count),
-        u64::from(vm.inactive_count),
-    )
+    mem_available_from_darwin_vm(page_size, u64::from(vm.free_count), u64::from(vm.inactive_count))
 }
 
 #[cfg(windows)]
@@ -641,10 +604,7 @@ pub fn free_gib_label() -> String {
 }
 
 pub fn logical_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 256)
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 256)
 }
 
 fn scan_run_paths(dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
@@ -667,14 +627,10 @@ fn open_and_check_against_entry(
 ) -> Result<SortedRunPath, StoreError> {
     let run = open_run(path)?;
     if run.count != expect.count || run.key_len != expect.key_len || run.rec_len != expect.rec_len {
-        return Err(StoreError::Corrupt(
-            "sorted run: header does not match MANIFEST",
-        ));
+        return Err(StoreError::Corrupt("sorted run: header does not match MANIFEST"));
     }
     if expect.body_crc32 != 0 && run.body_crc32 != 0 && run.body_crc32 != expect.body_crc32 {
-        return Err(StoreError::Corrupt(
-            "sorted run: CRC does not match MANIFEST",
-        ));
+        return Err(StoreError::Corrupt("sorted run: CRC does not match MANIFEST"));
     }
     Ok(run)
 }
@@ -983,14 +939,8 @@ mod tests {
         assert!(!listed3.iter().any(|r| r.seq() == Some(4)));
 
         let d2 = tmp_dir();
-        write_sorted_run_file(
-            &next_run_path(&d2, 7),
-            32,
-            44,
-            &rec(7, 7),
-            RunWritePolicy::CATALOG,
-        )
-        .unwrap();
+        write_sorted_run_file(&next_run_path(&d2, 7), 32, 44, &rec(7, 7), RunWritePolicy::CATALOG)
+            .unwrap();
         assert!(!manifest_path(&d2).exists());
         let listed_legacy = list_runs(&d2).unwrap();
         assert_eq!(listed_legacy.len(), 1);
@@ -1063,10 +1013,7 @@ mod tests {
         body.extend_from_slice(&rec_lo);
         match write_sorted_run(&d.join("desc.run"), 40, 40, &body) {
             Err(StoreError::Corrupt(m)) => {
-                assert!(
-                    m.contains("not strictly increasing"),
-                    "expected order error, got {m}"
-                );
+                assert!(m.contains("not strictly increasing"), "expected order error, got {m}");
             }
             other => panic!("expected Corrupt unsorted, got {other:?}"),
         }

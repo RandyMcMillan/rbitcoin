@@ -45,9 +45,7 @@ impl SortedHead {
 
     /// Durability barrier (shutdown / SH flush). Data already pwrite'd.
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.file
-            .sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))
+        self.file.sync_data().map_err(|e| StoreError::io(&self.path, e))
     }
 
     /// Write a sealed sorted head. `recs` must be unique and sorted by key16.
@@ -112,21 +110,12 @@ impl SortedHead {
         }
         let ver = u16::from_le_bytes(header[4..6].try_into().unwrap());
         if ver != FORMAT_VER {
-            return Err(StoreError::Corrupt(
-                "scripthash sorted head: unsupported version",
-            ));
+            return Err(StoreError::Corrupt("scripthash sorted head: unsupported version"));
         }
         let count = u64::from_le_bytes(header[6..14].try_into().unwrap());
         let idx = read_idx(&idx_path(&path))?;
         let fuse = Some(SealedFuse8::read_from(&fuse_path(&path))?);
-        Ok(Self {
-            path,
-            file,
-            count,
-            idx,
-            fuse,
-            preads: AtomicU64::new(0),
-        })
+        Ok(Self { path, file, count, idx, fuse, preads: AtomicU64::new(0) })
     }
 
     pub fn get(&self, key: &ShHeadKey) -> Result<Option<ShHeadValue>, StoreError> {
@@ -233,10 +222,7 @@ fn pread_file_exact(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result
             return Err(std::io::Error::last_os_error());
         }
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "pread short",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"));
         }
         done += n as usize;
     }
@@ -252,10 +238,7 @@ fn pwrite_file(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "pwrite returned 0",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite returned 0"));
         }
         done += n as usize;
     }
@@ -327,10 +310,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-shsort-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&p);
         p.join("head")
@@ -436,10 +416,7 @@ mod tests {
             }
             assert!(got.is_none(), "absent key must not decode as present");
         }
-        assert!(
-            saw_fuse_miss,
-            "ovf fuse must skip data/idx IO on a true miss"
-        );
+        assert!(saw_fuse_miss, "ovf fuse must skip data/idx IO on a true miss");
 
         assert!(SortedHead::open(&path).unwrap().fuse.is_some());
         let _ = std::fs::remove_file(fuse_path(&path));

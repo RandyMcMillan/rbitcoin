@@ -226,12 +226,8 @@ impl VarTable {
         let end = start.saturating_add(body_blob.len() as u64);
         self.body.ensure_capacity(end)?;
         use crate::bulk_io::{self, WriteOp};
-        let mut ops = [WriteOp {
-            fd: self.body.read_fd(),
-            offset: start,
-            buf: body_blob,
-            result: i32::MIN,
-        }];
+        let mut ops =
+            [WriteOp { fd: self.body.read_fd(), offset: start, buf: body_blob, result: i32::MIN }];
         bulk_io::pwrite_batch(&mut ops);
         if ops[0].result < 0 {
             return self.body.write_at_pwrite(start, body_blob);
@@ -239,8 +235,7 @@ impl VarTable {
         if (ops[0].result as usize) != body_blob.len() {
             return self.body.write_at_pwrite(start, body_blob);
         }
-        self.body
-            .set_logical_len(end.max(self.body.logical_len()))?;
+        self.body.set_logical_len(end.max(self.body.logical_len()))?;
         Ok(())
     }
 }
@@ -359,13 +354,7 @@ impl VarTable {
                 ));
             }
         }
-        Ok(Some(PreparedAppend {
-            start,
-            body_blob,
-            starts,
-            fks,
-            base_count,
-        }))
+        Ok(Some(PreparedAppend { start, body_blob, starts, fks, base_count }))
     }
 
     pub(crate) fn body_write_fd(&self) -> IoHandle {
@@ -412,10 +401,7 @@ impl VarTable {
                 std::hint::spin_loop();
                 continue;
             }
-            let end = self
-                .published_body_end
-                .load(Ordering::Relaxed)
-                .max(FILE_HEADER_LEN as u64);
+            let end = self.published_body_end.load(Ordering::Relaxed).max(FILE_HEADER_LEN as u64);
             let count = self.count.load(Ordering::Relaxed);
             let s2 = self.publish_seq.load(Ordering::Acquire);
             if s1 == s2 {
@@ -449,10 +435,7 @@ impl VarTable {
         }
         let rc = crate::bulk_io::pread_single(self.body.read_fd(), offset, buf);
         if rc < 0 {
-            return Err(StoreError::io(
-                self.body.path(),
-                std::io::Error::from_raw_os_error(-rc),
-            ));
+            return Err(StoreError::io(self.body.path(), std::io::Error::from_raw_os_error(-rc)));
         }
         if (rc as usize) != buf.len() {
             self.body.read_at(offset, buf)?;
@@ -466,19 +449,11 @@ impl VarTable {
         }
         use crate::bulk_io::ReadOp;
         use crate::io_backend::ReadIoBackend;
-        let mut ops = [ReadOp {
-            fd: self.body.read_fd(),
-            offset,
-            buf,
-            result: i32::MIN,
-        }];
+        let mut ops = [ReadOp { fd: self.body.read_fd(), offset, buf, result: i32::MIN }];
         crate::bulk_io::pread_batch_backend(&mut ops, ReadIoBackend::Pread);
         let rc = ops[0].result;
         if rc < 0 {
-            return Err(StoreError::io(
-                self.body.path(),
-                std::io::Error::from_raw_os_error(-rc),
-            ));
+            return Err(StoreError::io(self.body.path(), std::io::Error::from_raw_os_error(-rc)));
         }
         if (rc as usize) != buf.len() {
             self.body.read_at(offset, buf)?;
@@ -552,9 +527,7 @@ mod tests {
 
     #[test]
     fn put_batch_publish_visible_to_concurrent_readers() {
-        let _stress = crate::file::TEST_MMAP_STRESS_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _stress = crate::file::TEST_MMAP_STRESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, AtomicOrdering::Relaxed);
         let dir = std::env::temp_dir().join(format!("rbitcoin-var-pub-{id}"));
@@ -628,10 +601,7 @@ mod tests {
     fn published_meta_seqlock_matches_last_record_len() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-var-seqlock-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -657,11 +627,7 @@ mod tests {
             }
             let start = end.saturating_sub(64);
             assert!(end >= start + 64, "end={end} start={start} c={c}");
-            assert_eq!(
-                end - start,
-                64,
-                "seqlock pair torn: c={c} end={end} start={start}"
-            );
+            assert_eq!(end - start, 64, "seqlock pair torn: c={c} end={end} start={start}");
         }
         stop.store(1, AtomicOrdering::Release);
         writer.join().unwrap();
@@ -673,10 +639,7 @@ mod tests {
     fn var_table_surface_helpers_and_errors() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-var-surface-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -736,10 +699,7 @@ mod tests {
     fn with_bytes_at_into_overwrites_dirty_capacity() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-var-into-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

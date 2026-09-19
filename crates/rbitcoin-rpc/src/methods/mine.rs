@@ -95,10 +95,7 @@ pub(crate) fn decode_output_script(ctx: &RpcContext, s: &str) -> Result<ScriptBu
         }
     }
     let bytes = hex_decode(s).map_err(|e| {
-        rpc_error(
-            ERR_INVALID_PARAMS,
-            format!("output must be an address or hex script: {e}"),
-        )
+        rpc_error(ERR_INVALID_PARAMS, format!("output must be an address or hex script: {e}"))
     })?;
     Ok(ScriptBuf::from_bytes(bytes))
 }
@@ -108,16 +105,8 @@ pub(crate) fn hashes_json(hashes: &[BlockHash]) -> Value {
 }
 
 pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
-    let txs = ctx
-        .mempool
-        .as_ref()
-        .map(|mp| mp.select_block_txs())
-        .unwrap_or_default();
-    let min = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.block_min_tx_fee_sat_kvb())
-        .unwrap_or(1);
+    let txs = ctx.mempool.as_ref().map(|mp| mp.select_block_txs()).unwrap_or_default();
+    let min = ctx.chain.as_ref().map(|c| c.block_min_tx_fee_sat_kvb()).unwrap_or(1);
     filter_block_min_fee(ctx, txs, min)
 }
 
@@ -205,10 +194,7 @@ pub(crate) fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
         let mp = ctx.mempool.as_ref();
         for v in arr {
             let s = v.as_str().ok_or_else(|| {
-                rpc_error(
-                    ERR_INVALID_PARAMS,
-                    "transactions entries must be hex or txid",
-                )
+                rpc_error(ERR_INVALID_PARAMS, "transactions entries must be hex or txid")
             })?;
             // Core: 64-hex → Txid::FromHex first; miss → not in mempool (-5).
             if s.len() == 64 {
@@ -239,10 +225,7 @@ pub(crate) fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             }
         }
     } else if params.get(1, "transactions").is_some() {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMS,
-            "transactions must be an array",
-        ));
+        return Err(rpc_error(ERR_INVALID_PARAMS, "transactions must be an array"));
     } else {
         return Err(rpc_error(ERR_INVALID_PARAMS, "transactions required"));
     }
@@ -256,12 +239,10 @@ pub(crate) fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             "hex": serialize_hex(&block),
         }));
     }
-    let hashes = miner
-        .generate_to_script(1, script, extra)
-        .map_err(|e| generateblock_validity_error(&e))?;
-    let hash = hashes
-        .first()
-        .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
+    let hashes =
+        miner.generate_to_script(1, script, extra).map_err(|e| generateblock_validity_error(&e))?;
+    let hash =
+        hashes.first().ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
     Ok(json!({ "hash": hash.to_string() }))
 }
 
@@ -283,10 +264,7 @@ pub(crate) fn generateblock_validity_error(e: &str) -> Value {
         "bad-txnmrklroot",
     ] {
         if s.contains(needle) {
-            return rpc_error(
-                ERR_VERIFY_ERROR,
-                format!("TestBlockValidity failed: {needle}"),
-            );
+            return rpc_error(ERR_VERIFY_ERROR, format!("TestBlockValidity failed: {needle}"));
         }
     }
     rpc_error(ERR_VERIFY_ERROR, format!("TestBlockValidity failed: {s}"))
@@ -298,12 +276,7 @@ pub(crate) fn parse_generateblock_output(
     ctx: &RpcContext,
     output: &str,
 ) -> Result<ScriptBuf, Value> {
-    let invalid = || {
-        rpc_error(
-            ERR_INVALID_ADDRESS_OR_KEY,
-            "Error: Invalid address or descriptor",
-        )
-    };
+    let invalid = || rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Error: Invalid address or descriptor");
     if output.contains('(') {
         if output.contains("/*") {
             return Err(rpc_error(
@@ -477,9 +450,7 @@ pub(crate) fn setmocktime(ctx: &RpcContext, params: &RpcParams) -> Result<Value,
     let miner = require_regtest_miner(ctx, "setmocktime")?;
     let raw = params.req(0, "timestamp")?;
     let ts = mocktime_i64(raw)?;
-    miner
-        .set_mock_time(ts)
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    miner.set_mock_time(ts).map_err(|e| rpc_error(ERR_MISC, e))?;
     if let Some(peers) = ctx.peers.as_ref() {
         peers.set_mock_now(ts as u64);
     }
@@ -493,20 +464,12 @@ pub(crate) fn mocktime_i64(v: &Value) -> Result<i64, Value> {
     let n = match v {
         Value::Number(n) => n,
         _ => {
-            return Err(rpc_error(
-                ERR_INVALID_PARAMETER,
-                "timestamp must be an integer",
-            ));
+            return Err(rpc_error(ERR_INVALID_PARAMETER, "timestamp must be an integer"));
         }
     };
-    let i = n
-        .as_i64()
-        .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok()));
+    let i = n.as_i64().or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok()));
     let Some(i) = i else {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "timestamp must be an integer",
-        ));
+        return Err(rpc_error(ERR_INVALID_PARAMETER, "timestamp must be an integer"));
     };
     if !(0..=9_223_372_036).contains(&i) {
         return Err(rpc_error(
@@ -528,15 +491,9 @@ pub(crate) fn gbt_rules(req: Option<&Value>) -> Result<Vec<String>, Value> {
         ));
     };
     let rules = obj.get("rules").and_then(Value::as_array).ok_or_else(|| {
-        rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        )
+        rpc_error(ERR_INVALID_PARAMETER, "getblocktemplate must be called with the segwit rule set")
     })?;
-    let names: Vec<String> = rules
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
+    let names: Vec<String> = rules.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
     if !names.iter().any(|r| r == "segwit") {
         return Err(rpc_error(
             ERR_INVALID_PARAMETER,
@@ -567,10 +524,7 @@ pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<V
             gbt_template(ctx)
         }
         "proposal" => gbt_proposal(ctx, req),
-        other => Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            format!("Invalid mode: {other}"),
-        )),
+        other => Err(rpc_error(ERR_INVALID_PARAMETER, format!("Invalid mode: {other}"))),
     }
 }
 
@@ -604,11 +558,7 @@ pub(crate) fn gbt_longpoll_id(ctx: &RpcContext) -> String {
     } else {
         String::new()
     };
-    let updates = ctx
-        .mempool
-        .as_ref()
-        .map(|m| m.template_updates())
-        .unwrap_or(0);
+    let updates = ctx.mempool.as_ref().map(|m| m.template_updates()).unwrap_or(0);
     format!("{tip}{updates}")
 }
 
@@ -625,26 +575,19 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     } else {
         return Err(rpc_error(ERR_MISC, "no tip"));
     };
-    let params = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.params.clone())
-        .unwrap_or_else(|| match ctx.network {
+    let params =
+        ctx.chain.as_ref().map(|c| c.params.clone()).unwrap_or_else(|| match ctx.network {
             Network::Regtest => rbitcoin_consensus::ChainParams::regtest(),
             Network::Signet => rbitcoin_consensus::ChainParams::signet(),
             Network::Testnet => rbitcoin_consensus::ChainParams::testnet(),
             Network::Mainnet => rbitcoin_consensus::ChainParams::mainnet(),
         });
-    let now = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.clock.now_secs() as u32)
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0)
-        });
+    let now = ctx.chain.as_ref().map(|c| c.clock.now_secs() as u32).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    });
     let curtime = tip_time.saturating_add(1).max(now);
     let bits = rbitcoin_consensus::expected_next_bits(
         ctx.query.as_ref(),
@@ -694,10 +637,8 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     if let Some(c) = ctx.chain.as_ref() {
         c.note_gbt_assembled();
     }
-    let wtxids: Vec<[u8; 32]> = selected
-        .iter()
-        .map(|tx| tx.compute_wtxid().to_byte_array())
-        .collect();
+    let wtxids: Vec<[u8; 32]> =
+        selected.iter().map(|tx| tx.compute_wtxid().to_byte_array()).collect();
     let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
     Ok(json!({
         "capabilities": ["proposal"],
@@ -755,11 +696,8 @@ pub(crate) fn gbt_check_proposal(ctx: &RpcContext, block: &Block) -> Result<(), 
         return Err("inconclusive-not-best-prevblk".into());
     }
     let height = tip_h.0.saturating_add(1);
-    let params = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.params.clone())
-        .unwrap_or_else(|| match ctx.network {
+    let params =
+        ctx.chain.as_ref().map(|c| c.params.clone()).unwrap_or_else(|| match ctx.network {
             Network::Regtest => rbitcoin_consensus::ChainParams::regtest(),
             Network::Signet => rbitcoin_consensus::ChainParams::signet(),
             Network::Testnet => rbitcoin_consensus::ChainParams::testnet(),
@@ -784,24 +722,17 @@ pub(crate) fn gbt_check_proposal(ctx: &RpcContext, block: &Block) -> Result<(), 
     if block.header.time < mtp {
         return Err("time-too-old".into());
     }
-    let now = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.clock.now_secs() as u32)
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0)
-        });
+    let now = ctx.chain.as_ref().map(|c| c.clock.now_secs() as u32).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    });
     if u64::from(block.header.time) > u64::from(now).saturating_add(2 * 60 * 60) {
         return Err("time-too-new".into());
     }
-    let milestone = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.milestone)
-        .unwrap_or(rbitcoin_consensus::Milestone::NONE);
+    let milestone =
+        ctx.chain.as_ref().map(|c| c.milestone).unwrap_or(rbitcoin_consensus::Milestone::NONE);
     // Spends before txid-uniqueness: two copies of the same non-coinbase
     // tx are `bad-txns-inputs-missingorspent` (Core CheckBlock order).
     gbt_proposal_connect(ctx, block, height, mtp)?;
@@ -840,13 +771,7 @@ pub(crate) fn gbt_proposal_connect(
         if tx.is_coinbase() {
             let tid = tx.compute_txid();
             for (vout, o) in tx.output.iter().enumerate() {
-                created.insert(
-                    OutPoint {
-                        txid: tid,
-                        vout: vout as u32,
-                    },
-                    o.clone(),
-                );
+                created.insert(OutPoint { txid: tid, vout: vout as u32 }, o.clone());
             }
             continue;
         }
@@ -871,13 +796,7 @@ pub(crate) fn gbt_proposal_connect(
         }
         let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
-            created.insert(
-                OutPoint {
-                    txid: tid,
-                    vout: vout as u32,
-                },
-                o.clone(),
-            );
+            created.insert(OutPoint { txid: tid, vout: vout as u32 }, o.clone());
         }
     }
     Ok(())
@@ -894,25 +813,14 @@ pub(crate) fn gbt_chain_txout(ctx: &RpcContext, op: &OutPoint) -> Option<bitcoin
         .tx_output_at_fk(fk, op.vout)
         .ok()
         .or_else(|| ctx.query.tx_output(&rec, op.vout).ok())?;
-    let value = if out.value < 0 {
-        Amount::ZERO
-    } else {
-        Amount::from_sat(out.value as u64)
-    };
-    Some(bitcoin::TxOut {
-        value,
-        script_pubkey: ScriptBuf::from_bytes(out.script),
-    })
+    let value = if out.value < 0 { Amount::ZERO } else { Amount::from_sat(out.value as u64) };
+    Some(bitcoin::TxOut { value, script_pubkey: ScriptBuf::from_bytes(out.script) })
 }
 
 /// Tip height, difficulty, pooledtx, and `blockmintxfee` (BTC/kvB, `sat_btc_json`).
 pub(crate) fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
-    let pooledtx = ctx
-        .mempool
-        .as_ref()
-        .map(|m| m.list_live_meta().len())
-        .unwrap_or(0);
+    let pooledtx = ctx.mempool.as_ref().map(|m| m.list_live_meta().len()).unwrap_or(0);
     let bits = tip_bits(ctx).unwrap_or(0x207f_ffff);
     let target = bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(bits));
     let difficulty = difficulty_from_bits(bits);
@@ -923,16 +831,9 @@ pub(crate) fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
         m.insert("currentblocktx".into(), json!(0));
     }
     m.insert("difficulty".into(), json!(difficulty));
-    m.insert(
-        "networkhashps".into(),
-        json!(network_hash_ps(ctx, 120, -1).unwrap_or(0.0)),
-    );
+    m.insert("networkhashps".into(), json!(network_hash_ps(ctx, 120, -1).unwrap_or(0.0)));
     m.insert("pooledtx".into(), json!(pooledtx));
-    let min_sat = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.block_min_tx_fee_sat_kvb())
-        .unwrap_or(1);
+    let min_sat = ctx.chain.as_ref().map(|c| c.block_min_tx_fee_sat_kvb()).unwrap_or(1);
     m.insert("blockmintxfee".into(), sat_btc_json(min_sat as i64));
     m.insert("chain".into(), json!(chain_name(ctx.network)));
     m.insert("bits".into(), json!(format!("{bits:08x}")));
@@ -973,11 +874,7 @@ pub(crate) fn network_hash_ps(ctx: &RpcContext, nblocks: i64, height: i64) -> Re
     if tip == 0 {
         return Ok(0.0);
     }
-    let end = if height < 0 || height as u32 > tip {
-        tip
-    } else {
-        height as u32
-    };
+    let end = if height < 0 || height as u32 > tip { tip } else { height as u32 };
     let n = if nblocks <= 0 { 120u32 } else { nblocks as u32 };
     let start = end.saturating_sub(n);
     let t0 = header_time(ctx, start).unwrap_or(0);
@@ -988,11 +885,7 @@ pub(crate) fn network_hash_ps(ctx: &RpcContext, nblocks: i64, height: i64) -> Re
 }
 
 pub(crate) fn header_time(ctx: &RpcContext, h: u32) -> Option<u32> {
-    let (_, rec) = ctx
-        .query
-        .header_at_height(rbitcoin_primitives::Height(h))
-        .ok()
-        .flatten()?;
+    let (_, rec) = ctx.query.header_at_height(rbitcoin_primitives::Height(h)).ok().flatten()?;
     Some(rec.timestamp)
 }
 
@@ -1010,9 +903,7 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
     }
     let prev = block.header.prev_blockhash.to_byte_array();
     let known = hub.query.get_header_by_hash(&prev).ok().flatten().is_some()
-        || hub
-            .held_body(&bitcoin::BlockHash::from_byte_array(prev))
-            .is_some();
+        || hub.held_body(&bitcoin::BlockHash::from_byte_array(prev)).is_some();
     if !known {
         return SubmitBlockOutcome::Rejected("prev-blk-not-found".into());
     }
@@ -1055,13 +946,7 @@ fn cheap_submit_tx_reject(query: &rbitcoin_query::Query, block: &Block) -> Optio
             }
             let tid = tx.compute_txid();
             for (v, o) in tx.output.iter().enumerate() {
-                created.insert(
-                    OutPoint {
-                        txid: tid,
-                        vout: v as u32,
-                    },
-                    o.clone(),
-                );
+                created.insert(OutPoint { txid: tid, vout: v as u32 }, o.clone());
             }
             continue;
         }
@@ -1088,15 +973,9 @@ fn cheap_submit_tx_reject(query: &rbitcoin_query::Query, block: &Block) -> Optio
                 else {
                     return Some("bad-txns-inputs-missingorspent".into());
                 };
-                let value = if out.value < 0 {
-                    Amount::ZERO
-                } else {
-                    Amount::from_sat(out.value as u64)
-                };
-                TxOut {
-                    value,
-                    script_pubkey: bitcoin::ScriptBuf::from_bytes(out.script),
-                }
+                let value =
+                    if out.value < 0 { Amount::ZERO } else { Amount::from_sat(out.value as u64) };
+                TxOut { value, script_pubkey: bitcoin::ScriptBuf::from_bytes(out.script) }
             };
             in_val = in_val.saturating_add(txout.value.to_sat());
         }
@@ -1106,13 +985,7 @@ fn cheap_submit_tx_reject(query: &rbitcoin_query::Query, block: &Block) -> Optio
         }
         let tid = tx.compute_txid();
         for (v, o) in tx.output.iter().enumerate() {
-            created.insert(
-                OutPoint {
-                    txid: tid,
-                    vout: v as u32,
-                },
-                o.clone(),
-            );
+            created.insert(OutPoint { txid: tid, vout: v as u32 }, o.clone());
         }
     }
     None

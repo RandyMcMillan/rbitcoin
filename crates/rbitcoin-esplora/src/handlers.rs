@@ -38,9 +38,8 @@ fn best_chain_block(
     };
     // Prefer archived path: does not re-require stored.hash == wire block_hash
     // (synthetic fixture headers use lab hashes; production hashes match).
-    let block = query
-        .reconstruct_archived_block(hash)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let block =
+        query.reconstruct_archived_block(hash)?.ok_or(rbitcoin_store::StoreError::NotFound)?;
     Ok((height, block))
 }
 
@@ -52,23 +51,13 @@ pub(crate) fn block_summary_json(
     let Some(height) = query.height_of_hash(hash)? else {
         return Err(rbitcoin_store::StoreError::NotFound);
     };
-    let (header_fk, rec) = query
-        .header_at_height(height)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
-    let prev_hash = if rec.prev_fk.is_null() {
-        [0u8; 32]
-    } else {
-        query.store().get_header(rec.prev_fk)?.hash
-    };
-    let tx_count = query
-        .store()
-        .header_txs
-        .get_range(header_fk)?
-        .map(|(_, n)| n)
-        .unwrap_or(0);
-    let (size, weight) = query
-        .block_size_weight(header_fk)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let (header_fk, rec) =
+        query.header_at_height(height)?.ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let prev_hash =
+        if rec.prev_fk.is_null() { [0u8; 32] } else { query.store().get_header(rec.prev_fk)?.hash };
+    let tx_count = query.store().header_txs.get_range(header_fk)?.map(|(_, n)| n).unwrap_or(0);
+    let (size, weight) =
+        query.block_size_weight(header_fk)?.ok_or(rbitcoin_store::StoreError::NotFound)?;
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = median_time_past(query, height)?;
@@ -99,9 +88,8 @@ fn median_time_past(query: &Query, height: Height) -> Result<u32, rbitcoin_query
     let start = height.0.saturating_sub(n.saturating_sub(1));
     let mut times = Vec::with_capacity(n as usize);
     for h in start..=height.0 {
-        let (_fk, rec) = query
-            .header_at_height(Height(h))?
-            .ok_or(rbitcoin_store::StoreError::NotFound)?;
+        let (_fk, rec) =
+            query.header_at_height(Height(h))?.ok_or(rbitcoin_store::StoreError::NotFound)?;
         times.push(rec.timestamp);
     }
     Ok(median_time_past_times(&times))
@@ -127,11 +115,7 @@ pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>)
     match tokio::task::spawn_blocking(move || best_chain_block(&q, &hash)).await {
         Ok(Ok((_h, block))) => {
             let raw = serialize(&block);
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                raw,
-            )
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/octet-stream")], raw)
                 .into_response()
         }
         Ok(Err(e)) => store_err(e),
@@ -272,11 +256,7 @@ pub async fn block_txs_0(State(st): State<AppState>, Path(hash_hex): Path<String
 
 fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
     if !start.is_multiple_of(25) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "start_index must be a multiple of 25",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "start_index must be a multiple of 25").into_response();
     }
     let Ok(hash) = parse_hash32(hash_hex) else {
         return not_found();
@@ -344,12 +324,10 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         };
         match st.query.get_tx_by_txid(&txid) {
             Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
-                Ok(raw) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    raw,
-                )
-                    .into_response(),
+                Ok(raw) => {
+                    (StatusCode::OK, [(header::CONTENT_TYPE, "application/octet-stream")], raw)
+                        .into_response()
+                }
                 Err(e) => store_err(e),
             },
             Ok(None) => match mempool_wire(&st, &txid) {
@@ -408,11 +386,8 @@ fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     };
     header.merkle_root =
         bitcoin::TxMerkleNode::from_byte_array(rbitcoin_store::merkle_root_from_txids(&ids));
-    let txids: Vec<bitcoin::Txid> = ids
-        .iter()
-        .copied()
-        .map(bitcoin::Txid::from_byte_array)
-        .collect();
+    let txids: Vec<bitcoin::Txid> =
+        ids.iter().copied().map(bitcoin::Txid::from_byte_array).collect();
     let want = bitcoin::Txid::from_byte_array(txid);
     let mb = MerkleBlock::from_header_txids_with_predicate(&header, &txids, |t| *t == want);
     let mut raw = Vec::new();
@@ -444,11 +419,7 @@ pub async fn tx_outspend(
             Ok(v) => v,
             Err(r) => return r,
         };
-        let mp = if asof.is_none() {
-            st.mempool.as_deref()
-        } else {
-            None
-        };
+        let mp = if asof.is_none() { st.mempool.as_deref() } else { None };
         match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
             Ok(v) => maybe_attach_view(Json(v).into_response(), view),
             Err(e) => store_err(e),
@@ -492,11 +463,7 @@ pub async fn tx_outspends(
             Ok(v) => v,
             Err(r) => return r,
         };
-        let mp = if asof.is_none() {
-            st.mempool.as_deref()
-        } else {
-            None
-        };
+        let mp = if asof.is_none() { st.mempool.as_deref() } else { None };
         let mut arr = Vec::with_capacity(nout as usize);
         for vout in 0..nout {
             match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
@@ -531,16 +498,10 @@ fn outspend_json(
         }
     }
     if let Some(mp) = mempool {
-        let op = OutPoint {
-            txid: Txid::from_byte_array(*txid),
-            vout,
-        };
+        let op = OutPoint { txid: Txid::from_byte_array(*txid), vout };
         if let Some(spend) = mp.spending_txid(&op) {
             let vin = mp.get_tx(&spend).and_then(|tx| {
-                tx.input
-                    .iter()
-                    .position(|i| i.previous_output == op)
-                    .map(|i| i as u32)
+                tx.input.iter().position(|i| i.previous_output == op).map(|i| i as u32)
             });
             return Ok(json!({
                 "spent": true,
@@ -572,11 +533,7 @@ fn block_template_sync(st: &AppState) -> Response {
         Ok(None) => return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
         Err(e) => return store_err(e),
     };
-    let updates = st
-        .mempool
-        .as_ref()
-        .map(|m| m.template_updates())
-        .unwrap_or(0);
+    let updates = st.mempool.as_ref().map(|m| m.template_updates()).unwrap_or(0);
     let mut cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(c) = cache.as_ref() {
         if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
@@ -585,12 +542,7 @@ fn block_template_sync(st: &AppState) -> Response {
     }
     match (fun.0)() {
         Ok(body) => {
-            *cache = Some(GbtCache {
-                at: Instant::now(),
-                tip,
-                updates,
-                body: body.clone(),
-            });
+            *cache = Some(GbtCache { at: Instant::now(), tip, updates, body: body.clone() });
             gbt_json(&body)
         }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
@@ -600,10 +552,7 @@ fn block_template_sync(st: &AppState) -> Response {
 fn gbt_json(body: &Value) -> Response {
     (
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
+        [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")],
         body.to_string(),
     )
         .into_response()
@@ -668,12 +617,10 @@ pub async fn address_info(
 ) -> Response {
     match resolve_address_sh(&addr_s, st.network) {
         Ok(sh) => {
-            spawn_join(
-                move || match sh_stats_json(&st, &sh, Some(addr_s.as_str()), None, asof) {
-                    Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
-                    Err(e) => store_err(e),
-                },
-            )
+            spawn_join(move || match sh_stats_json(&st, &sh, Some(addr_s.as_str()), None, asof) {
+                Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
+                Err(e) => store_err(e),
+            })
             .await
         }
         Err(_) => not_found(),
@@ -688,12 +635,10 @@ pub async fn scripthash_info(
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    spawn_join(
-        move || match sh_stats_json(&st, &sh, None, Some(sh_hex.as_str()), asof) {
-            Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
-            Err(e) => store_err(e),
-        },
-    )
+    spawn_join(move || match sh_stats_json(&st, &sh, None, Some(sh_hex.as_str()), asof) {
+        Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
+        Err(e) => store_err(e),
+    })
     .await
 }
 
@@ -761,9 +706,7 @@ fn sh_stats_json(
     asof: Option<[u8; 32]>,
 ) -> Result<(Value, Option<rbitcoin_query::ChainView>), rbitcoin_query::QueryError> {
     let (chain, view) = if asof.is_some() {
-        let view = st
-            .query
-            .pin_view(ChainViewKind::ScriptHash, asof.as_ref())?;
+        let view = st.query.pin_view(ChainViewKind::ScriptHash, asof.as_ref())?;
         if view.is_none() {
             return Err(StoreError::NotFound);
         }
@@ -1113,22 +1056,15 @@ fn sat_vb_for_target(pairs: &[(u32, f64)], target: u32) -> u32 {
         .iter()
         .find(|(t, _)| *t == target)
         .map(|(_, btc_kb)| {
-            let sat_vb = if *btc_kb < 0.0 {
-                1.0
-            } else {
-                *btc_kb * 100_000.0
-            };
+            let sat_vb = if *btc_kb < 0.0 { 1.0 } else { *btc_kb * 100_000.0 };
             sat_vb.round().max(1.0) as u32
         })
         .unwrap_or(1)
 }
 
 fn fees_recommended_sync(st: &AppState) -> Response {
-    let pairs: Vec<(u32, f64)> = st
-        .mempool
-        .as_ref()
-        .map(|m| m.fee_estimates_btc_per_kb())
-        .unwrap_or_default();
+    let pairs: Vec<(u32, f64)> =
+        st.mempool.as_ref().map(|m| m.fee_estimates_btc_per_kb()).unwrap_or_default();
     Json(json!({
         "fastestFee": sat_vb_for_target(&pairs, 1),
         "halfHourFee": sat_vb_for_target(&pairs, 3),
@@ -1141,22 +1077,15 @@ fn fees_recommended_sync(st: &AppState) -> Response {
 
 fn fee_estimates_sync(st: &AppState) -> Response {
     let mut obj = serde_json::Map::new();
-    let pairs: Vec<(u32, f64)> = st
-        .mempool
-        .as_ref()
-        .map(|m| m.fee_estimates_btc_per_kb())
-        .unwrap_or_default();
+    let pairs: Vec<(u32, f64)> =
+        st.mempool.as_ref().map(|m| m.fee_estimates_btc_per_kb()).unwrap_or_default();
     if pairs.is_empty() {
         for t in [1u32, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008] {
             obj.insert(t.to_string(), json!(1.0));
         }
     } else {
         for (t, btc_kb) in pairs {
-            let sat_vb = if btc_kb < 0.0 {
-                1.0
-            } else {
-                (btc_kb * 1_000_000.0).round() / 10.0
-            };
+            let sat_vb = if btc_kb < 0.0 { 1.0 } else { (btc_kb * 1_000_000.0).round() / 10.0 };
             obj.insert(t.to_string(), json!(sat_vb));
         }
     }
@@ -1235,13 +1164,9 @@ fn mempool_txs_json(st: &AppState, sh: &[u8; 32]) -> Vec<Value> {
         let Some(tx) = mp.get_tx(&txid) else {
             continue;
         };
-        if let Ok(v) = build_tx_json_from_tx(
-            &st.query,
-            &tx,
-            st.network,
-            Some(item.fee),
-            Some(mp.as_ref()),
-        ) {
+        if let Ok(v) =
+            build_tx_json_from_tx(&st.query, &tx, st.network, Some(item.fee), Some(mp.as_ref()))
+        {
             out.push(v);
         }
     }
@@ -1259,10 +1184,7 @@ pub async fn post_tx(State(st): State<AppState>, body: Bytes) -> Response {
     if body.len() > st.max_body {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
     }
-    let hex = std::str::from_utf8(&body)
-        .unwrap_or("")
-        .trim()
-        .trim_matches('"');
+    let hex = std::str::from_utf8(&body).unwrap_or("").trim().trim_matches('"');
     let raw = match rbitcoin_primitives::hex_decode(hex) {
         Ok(r) => r,
         Err(e) => {
@@ -1299,56 +1221,39 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
         }
     };
     let Some(arr) = parsed.as_array() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "body must be a JSON array of tx hex strings",
-        )
+        return (StatusCode::BAD_REQUEST, "body must be a JSON array of tx hex strings")
             .into_response();
     };
     // Soft cap before mempool internal limits (DoS).
     if arr.len() > 25 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "package too large (max 25 transactions)",
-        )
+        return (StatusCode::BAD_REQUEST, "package too large (max 25 transactions)")
             .into_response();
     }
     let mut txs = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
         let Some(hex) = v.as_str() else {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("package[{i}] must be a hex string"),
-            )
+            return (StatusCode::BAD_REQUEST, format!("package[{i}] must be a hex string"))
                 .into_response();
         };
         let raw = match rbitcoin_primitives::hex_decode(hex.trim()) {
             Ok(r) => r,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("package[{i}] invalid hex: {e}"),
-                )
+                return (StatusCode::BAD_REQUEST, format!("package[{i}] invalid hex: {e}"))
                     .into_response();
             }
         };
         match deserialize::<bitcoin::Transaction>(&raw) {
             Ok(t) => txs.push(t),
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("package[{i}] invalid tx: {e}"),
-                )
+                return (StatusCode::BAD_REQUEST, format!("package[{i}] invalid tx: {e}"))
                     .into_response();
             }
         }
     }
     match mp.accept_package_async(txs).await {
         Ok(results) => {
-            let txids: Vec<String> = results
-                .iter()
-                .map(|r| block_hash_hex(&r.txid.to_byte_array()))
-                .collect();
+            let txids: Vec<String> =
+                results.iter().map(|r| block_hash_hex(&r.txid.to_byte_array())).collect();
             Json(json!({ "txids": txids })).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -1419,11 +1324,7 @@ mod pure_helper_tests {
         let (dir, q) = temp_query();
         let hash = seed_genesis(&q);
         let summary = block_summary_json(&q, &hash).expect("summary");
-        assert!(
-            summary["bits"].is_u64(),
-            "Esplora bits is u32, not hex: {}",
-            summary["bits"]
-        );
+        assert!(summary["bits"].is_u64(), "Esplora bits is u32, not hex: {}", summary["bits"]);
         assert_eq!(summary["bits"], 0x207f_ffff);
         let block = q.reconstruct_archived_block(&hash).unwrap().unwrap();
         assert_eq!(summary["size"], block.total_size() as u64);
@@ -1462,18 +1363,10 @@ mod pure_helper_tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         );
         let spend_fk = q.store().put_tx_full_batch_indexed(&[spend], true).unwrap()[0];
-        q.store()
-            .put_spend_create(create_fk, 0, spend_fk, 0)
-            .unwrap();
+        q.store().put_spend_create(create_fk, 0, spend_fk, 0).unwrap();
         let view = q.pin_chain_view().unwrap().expect("tip");
-        q.store()
-            .header_txs
-            .put_range(view.header_fk, create_fk, 2)
-            .unwrap();
-        q.store()
-            .strong_tx
-            .set_strong(spend_fk, view.header_fk)
-            .unwrap();
+        q.store().header_txs.put_range(view.header_fk, create_fk, 2).unwrap();
+        q.store().strong_tx.set_strong(spend_fk, view.header_fk).unwrap();
         q.store().rebuild_height_fence().unwrap();
         let v = outspend_json(&q, None, &[0xcb; 32], 0, Some(&view)).unwrap();
         assert_eq!(v["spent"], true, "{v}");
@@ -1486,17 +1379,11 @@ mod pure_helper_tests {
     fn resolve_address_sh_and_block_summary_surface() {
         // Invalid / wrong-network addresses.
         assert!(resolve_address_sh("not-an-address", Network::Bitcoin).is_err());
-        assert!(resolve_address_sh(
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-            Network::Regtest
-        )
-        .is_err());
+        assert!(resolve_address_sh("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", Network::Regtest)
+            .is_err());
         // Well-known mainnet P2WPKH.
-        let sh = resolve_address_sh(
-            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-            Network::Bitcoin,
-        )
-        .expect("mainnet p2wpkh");
+        let sh = resolve_address_sh("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", Network::Bitcoin)
+            .expect("mainnet p2wpkh");
         assert_ne!(sh, [0u8; 32]);
 
         let (dir, q) = temp_query();
@@ -1513,11 +1400,7 @@ mod pure_helper_tests {
         assert!(block_summary_json(&q, &[0x11; 32]).is_err());
         let _ = q.sample_reset_reconstruct_archived();
         let _ = block_summary_json(&q, &hash).expect("summary again");
-        assert_eq!(
-            q.sample_reset_reconstruct_archived(),
-            0,
-            "block JSON uses stamped size/weight"
-        );
+        assert_eq!(q.sample_reset_reconstruct_archived(), 0, "block JSON uses stamped size/weight");
         assert!(q.reconstruct_archived_block(&hash).unwrap().is_some());
         assert!(q.sample_reset_reconstruct_archived() >= 1);
         let _ = std::fs::remove_dir_all(dir);
@@ -1603,17 +1486,9 @@ mod pure_helper_tests {
         assert_eq!(after_info, 3);
 
         let _ = super::utxo_response(&st, &sh, None);
-        assert_eq!(
-            body_ok_reads(),
-            after_info,
-            "/utxo must reuse the last SH join"
-        );
+        assert_eq!(body_ok_reads(), after_info, "/utxo must reuse the last SH join");
         let _ = super::chain_page_sh(&st, &sh, None, None);
-        assert_eq!(
-            body_ok_reads(),
-            after_info,
-            "/txs must reuse the last SH join"
-        );
+        assert_eq!(body_ok_reads(), after_info, "/txs must reuse the last SH join");
 
         let _ = std::fs::remove_dir_all(dir);
     }

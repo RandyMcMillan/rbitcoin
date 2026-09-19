@@ -48,10 +48,7 @@ pub(crate) struct InflightReq {
 
 impl Default for InflightReq {
     fn default() -> Self {
-        Self {
-            peers: HashSet::new(),
-            started_at: Instant::now(),
-        }
+        Self { peers: HashSet::new(), started_at: Instant::now() }
     }
 }
 
@@ -59,10 +56,7 @@ impl InflightReq {
     pub(crate) fn new(peer: usize) -> Self {
         let mut peers = HashSet::with_capacity(1);
         peers.insert(peer);
-        Self {
-            peers,
-            started_at: Instant::now(),
-        }
+        Self { peers, started_at: Instant::now() }
     }
 
     pub(crate) fn contains_peer(&self, peer: usize) -> bool {
@@ -246,12 +240,8 @@ impl IbdWorkState {
 
     /// Drop work-path slots strictly above `ht` (reorg apply suffix).
     pub(crate) fn clear_path_above(&mut self, ht: u32) {
-        let drop: Vec<BlockHash> = self
-            .height_to_hash
-            .iter()
-            .filter(|(h, _)| **h > ht)
-            .map(|(_, hash)| *hash)
-            .collect();
+        let drop: Vec<BlockHash> =
+            self.height_to_hash.iter().filter(|(h, _)| **h > ht).map(|(_, hash)| *hash).collect();
         self.height_to_hash.retain(|h, _| *h <= ht);
         for hash in drop {
             self.ordered_set.remove(&hash);
@@ -309,8 +299,7 @@ impl IbdWorkState {
                 && (live.contains(hash) || inflight.contains_key(hash))
         });
         if self.known_headers.len() > live.len().saturating_add(4096) {
-            self.known_headers
-                .retain(|h| live.contains(h) || inflight.contains_key(h));
+            self.known_headers.retain(|h| live.contains(h) || inflight.contains_key(h));
             self.header_fks.retain(|h, _| {
                 live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
             });
@@ -320,8 +309,7 @@ impl IbdWorkState {
         }
         // Bound body presence cache to live work (rejected
         // never hygiene-pruned — see BodyPresence::hygiene_retain).
-        self.body
-            .hygiene_retain(|h| live.contains(h) || inflight.contains_key(h));
+        self.body.hygiene_retain(|h| live.contains(h) || inflight.contains_key(h));
     }
 }
 
@@ -423,10 +411,7 @@ mod tests {
         let b = h(2);
         assert!(st.try_set_path_slot(a, 1, tip, Some((0, tip))));
         assert_eq!(st.height_to_hash.get(&1), Some(&a));
-        assert!(
-            !st.try_set_path_slot(b, 1, tip, Some((0, tip))),
-            "first connected occupant wins"
-        );
+        assert!(!st.try_set_path_slot(b, 1, tip, Some((0, tip))), "first connected occupant wins");
         assert_eq!(st.height_to_hash.get(&1), Some(&a));
         assert_eq!(st.hash_height.get(&b), Some(&1), "off-path still noted");
         let off = h(3);

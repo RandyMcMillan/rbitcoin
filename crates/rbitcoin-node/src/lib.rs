@@ -11,4 +11,6 @@ mod run;
 pub use cli::cli_main;
 pub use config::{DatadirOpts, ListenOpts, MempoolOpts, NodeConfig, RpcOpts};
 pub use error::NodeError;
-pub use run::{run_node, run_p2p, run_p2p_with_handle, run_p2p_with_shutdown, NodeHandle, Shutdown};
+pub use run::{
+    run_node, run_p2p, run_p2p_with_handle, run_p2p_with_shutdown, NodeHandle, Shutdown,
+};

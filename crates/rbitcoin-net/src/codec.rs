@@ -131,10 +131,7 @@ impl FramedMessage {
             Ok(Some(msg)) if sl.is_empty() => RawNetworkMessage::new(self.magic, msg),
             _ => RawNetworkMessage::new(
                 self.magic,
-                NetworkMessage::Unknown {
-                    command: cmd,
-                    payload: self.payload,
-                },
+                NetworkMessage::Unknown { command: cmd, payload: self.payload },
             ),
         }
     }
@@ -234,9 +231,7 @@ fn decode_cmd_payload(
         "headers" => {
             let n = bitcoin::consensus::encode::VarInt::consensus_decode(d)?.0 as usize;
             if n > MAX_HEADERS_RESULTS {
-                return Err(bitcoin::consensus::encode::Error::ParseFailed(
-                    "too many headers",
-                ));
+                return Err(bitcoin::consensus::encode::Error::ParseFailed("too many headers"));
             }
             let mut hs = Vec::with_capacity(n);
             for _ in 0..n {
@@ -289,11 +284,7 @@ mod tests {
         let genesis = genesis_block(Network::Bitcoin);
         let want = genesis.block_hash();
         let payload = serialize(&genesis);
-        let frame = FramedMessage {
-            magic,
-            command: *b"block\0\0\0\0\0\0\0",
-            payload,
-        };
+        let frame = FramedMessage { magic, command: *b"block\0\0\0\0\0\0\0", payload };
         assert!(frame.is_block());
         assert_eq!(frame.block_hash_from_header().expect("header hash"), want);
         match frame.decode().payload() {
@@ -363,45 +354,27 @@ mod tests {
         let magic = signet_magic();
         let nonce: u64 = 0x1122_3344_5566_7788;
         let payload = nonce.to_le_bytes().to_vec();
-        let ping = FramedMessage {
-            magic,
-            command: *b"ping\0\0\0\0\0\0\0\0",
-            payload: payload.clone(),
-        };
+        let ping =
+            FramedMessage { magic, command: *b"ping\0\0\0\0\0\0\0\0", payload: payload.clone() };
         assert!(ping.is_ping());
         assert_eq!(ping.ping_nonce(), Some(nonce));
         assert!(!ping.decode_is_cpu_heavy());
 
-        let short = FramedMessage {
-            magic,
-            command: *b"ping\0\0\0\0\0\0\0\0",
-            payload: vec![1, 2, 3],
-        };
+        let short =
+            FramedMessage { magic, command: *b"ping\0\0\0\0\0\0\0\0", payload: vec![1, 2, 3] };
         assert!(short.ping_nonce().is_none());
 
-        let headers = FramedMessage {
-            magic,
-            command: *b"headers\0\0\0\0\0",
-            payload: vec![],
-        };
+        let headers = FramedMessage { magic, command: *b"headers\0\0\0\0\0", payload: vec![] };
         assert!(headers.is_headers());
         assert!(headers.decode_is_cpu_heavy());
         assert!(headers.block_hash_from_header().is_none());
 
-        let nf = FramedMessage {
-            magic,
-            command: *b"notfound\0\0\0\0",
-            payload: vec![],
-        };
+        let nf = FramedMessage { magic, command: *b"notfound\0\0\0\0", payload: vec![] };
         assert!(nf.is_notfound());
         assert!(nf.decode_is_cpu_heavy());
 
         // Corrupt payload → Unknown path (not a panic).
-        let bad = FramedMessage {
-            magic,
-            command: *b"block\0\0\0\0\0\0\0",
-            payload: vec![0u8; 10],
-        };
+        let bad = FramedMessage { magic, command: *b"block\0\0\0\0\0\0\0", payload: vec![0u8; 10] };
         match bad.decode().payload() {
             NetworkMessage::Unknown { command, .. } => {
                 assert_eq!(command.to_string(), "block");
@@ -418,12 +391,11 @@ mod tests {
             bitcoin::BlockHash::from_byte_array([0; 32]),
         )]);
         assert!(!encode_is_cpu_heavy(&small));
-        let large = NetworkMessage::Inv(vec![
-            Inventory::Block(bitcoin::BlockHash::from_byte_array(
-                [0; 32]
-            ));
-            65
-        ]);
+        let large =
+            NetworkMessage::Inv(vec![
+                Inventory::Block(bitcoin::BlockHash::from_byte_array([0; 32]));
+                65
+            ]);
         assert!(encode_is_cpu_heavy(&large));
     }
 }

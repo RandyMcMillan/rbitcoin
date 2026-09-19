@@ -123,8 +123,7 @@ impl CreateLoc {
         let loc_end = FILE_HEADER_LEN as u64 + new_count * SLOT;
         self.loc.set_logical_len(loc_end)?;
         let n_win = new_count / LOC_WINDOW;
-        self.off
-            .set_logical_len(FILE_HEADER_LEN as u64 + n_win * OFF_SLOT)?;
+        self.off.set_logical_len(FILE_HEADER_LEN as u64 + n_win * OFF_SLOT)?;
         {
             let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
             cps.truncate(n_win as usize);
@@ -136,8 +135,7 @@ impl CreateLoc {
             for &(fk, st, n_out) in rows.iter() {
                 blob.extend_from_slice(&encode_create_ovf_row(fk, st, n_out));
             }
-            self.ovf
-                .set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
+            self.ovf.set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
             if !blob.is_empty() {
                 self.ovf.write_at(FILE_HEADER_LEN as u64, &blob)?;
             }
@@ -185,8 +183,7 @@ impl CreateLoc {
                 ));
             }
         }
-        self.loc
-            .write_at(loc_file_off(base + 1, SLOT), &loc_bytes)?;
+        self.loc.write_at(loc_file_off(base + 1, SLOT), &loc_bytes)?;
         if !ovf_bytes.is_empty() {
             let ovf_at = FILE_HEADER_LEN as u64 + self.ovf.data_len();
             self.ovf.write_at(ovf_at, &ovf_bytes)?;
@@ -220,8 +217,7 @@ impl CreateLoc {
                 cps.push((txout_abs, spent_abs));
             }
         }
-        self.count
-            .store(base + recs.len() as u64, Ordering::Release);
+        self.count.store(base + recs.len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -332,12 +328,7 @@ impl CreateLoc {
             let len = w.buf.len();
             // SAFETY: each window owns a distinct `buf` until this function returns.
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            ops.push(ReadOp {
-                fd,
-                offset: off,
-                buf: slice,
-                result: i32::MIN,
-            });
+            ops.push(ReadOp { fd, offset: off, buf: slice, result: i32::MIN });
         }
         let held = ctx.session().is_some();
         if held {
@@ -346,8 +337,7 @@ impl CreateLoc {
                 Ok(false) => {
                     drop(ops);
                     for w in windows.iter_mut() {
-                        self.loc
-                            .pread_at(loc_file_off(w.win_first, SLOT), &mut w.buf)?;
+                        self.loc.pread_at(loc_file_off(w.win_first, SLOT), &mut w.buf)?;
                     }
                     return Ok(());
                 }
@@ -364,10 +354,7 @@ impl CreateLoc {
         }
         drop(ops);
         for i in shorts {
-            self.loc.pread_at(
-                loc_file_off(windows[i].win_first, SLOT),
-                &mut windows[i].buf,
-            )?;
+            self.loc.pread_at(loc_file_off(windows[i].win_first, SLOT), &mut windows[i].buf)?;
         }
         Ok(())
     }
@@ -396,11 +383,7 @@ fn emit_pair(
     n_out: u32,
     out: &mut [Option<CreateLocPair>],
 ) {
-    out[orig] = Some(CreateLocPair {
-        txout: (tx, tlen),
-        spent: (sp, slen),
-        n_out,
-    });
+    out[orig] = Some(CreateLocPair { txout: (tx, tlen), spent: (sp, slen), n_out });
 }
 
 fn extract_pairs_ovf(
@@ -529,17 +512,11 @@ fn deinterleave_pairs_u8x8_scalar(buf: &[u8]) -> ([u8; 8], [u8; 8], bool) {
 fn inclusive_u8x8_times_8(st: &[u8; 8], no: &[u8; 8]) -> ([u32; 8], [u32; 8]) {
     #[cfg(target_arch = "x86_64")]
     let out = unsafe {
-        (
-            sse2_u8x8_times_8_inclusive(st.as_ptr()),
-            sse2_u8x8_times_8_inclusive(no.as_ptr()),
-        )
+        (sse2_u8x8_times_8_inclusive(st.as_ptr()), sse2_u8x8_times_8_inclusive(no.as_ptr()))
     };
     #[cfg(target_arch = "aarch64")]
     let out = unsafe {
-        (
-            neon_u8x8_times_8_inclusive(st.as_ptr()),
-            neon_u8x8_times_8_inclusive(no.as_ptr()),
-        )
+        (neon_u8x8_times_8_inclusive(st.as_ptr()), neon_u8x8_times_8_inclusive(no.as_ptr()))
     };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let out = {
@@ -661,12 +638,7 @@ mod tests {
     use crate::testutil::TempDir;
 
     fn rec(txout_start: u64, txout_len: u64, spent_start: u64, n_out: u32) -> CreateLocAppend {
-        CreateLocAppend {
-            txout_start,
-            txout_len,
-            spent_start,
-            n_out,
-        }
+        CreateLocAppend { txout_start, txout_len, spent_start, n_out }
     }
 
     fn chain(n_out: &[u32], txout_len: &[u64]) -> Vec<CreateLocAppend> {
@@ -738,9 +710,7 @@ mod tests {
         let dir = TempDir::labeled("create-loc-order").unwrap();
         let loc = CreateLoc::create(dir.path()).unwrap();
         loc.append(&chain(&[1, 1, 1], &[8, 8, 8])).unwrap();
-        let got = loc
-            .range_batch(&[Fk(3), Fk(1), Fk(2), Fk::NULL, Fk(9)])
-            .unwrap();
+        let got = loc.range_batch(&[Fk(3), Fk(1), Fk(2), Fk::NULL, Fk(9)]).unwrap();
         assert_eq!(got[0].unwrap().txout.0, FILE_HEADER_LEN as u64 + 16);
         assert_eq!(got[1].unwrap().txout.0, FILE_HEADER_LEN as u64);
         assert_eq!(got[2].unwrap().txout.0, FILE_HEADER_LEN as u64 + 8);
@@ -758,29 +728,14 @@ mod tests {
         assert_eq!(loc.count(), 1025);
         let got = loc.range_batch(&[Fk(1), Fk(1024), Fk(1025)]).unwrap();
         assert_eq!(got[0].unwrap().txout, (FILE_HEADER_LEN as u64, 8));
-        assert_eq!(
-            got[1].unwrap().txout,
-            (FILE_HEADER_LEN as u64 + 1023 * 8, 8)
-        );
-        assert_eq!(
-            got[2].unwrap().txout,
-            (FILE_HEADER_LEN as u64 + 1024 * 8, 8)
-        );
-        assert_eq!(
-            got[2].unwrap().spent,
-            (FILE_HEADER_LEN as u64 + 1024 * 8, 8)
-        );
+        assert_eq!(got[1].unwrap().txout, (FILE_HEADER_LEN as u64 + 1023 * 8, 8));
+        assert_eq!(got[2].unwrap().txout, (FILE_HEADER_LEN as u64 + 1024 * 8, 8));
+        assert_eq!(got[2].unwrap().spent, (FILE_HEADER_LEN as u64 + 1024 * 8, 8));
         drop(loc);
         let loc = CreateLoc::open(dir.path()).unwrap();
         let got = loc.range_batch(&[Fk(1024), Fk(1025)]).unwrap();
-        assert_eq!(
-            got[0].unwrap().txout,
-            (FILE_HEADER_LEN as u64 + 1023 * 8, 8)
-        );
-        assert_eq!(
-            got[1].unwrap().txout,
-            (FILE_HEADER_LEN as u64 + 1024 * 8, 8)
-        );
+        assert_eq!(got[0].unwrap().txout, (FILE_HEADER_LEN as u64 + 1023 * 8, 8));
+        assert_eq!(got[1].unwrap().txout, (FILE_HEADER_LEN as u64 + 1024 * 8, 8));
     }
 
     #[test]
@@ -852,8 +807,7 @@ mod tests {
     fn create_loc_opens_legacy_12b_ovf() {
         let dir = TempDir::labeled("create-loc-ovf12").unwrap();
         let loc = CreateLoc::create(dir.path()).unwrap();
-        loc.append(&chain(&[256, 256, 256, 256], &[8, 8, 8, 8]))
-            .unwrap();
+        loc.append(&chain(&[256, 256, 256, 256], &[8, 8, 8, 8])).unwrap();
         drop(loc);
         write_legacy_create_ovf_v22(
             dir.path(),
@@ -883,10 +837,7 @@ mod tests {
         assert_eq!(got[1].unwrap().n_out, 1);
         assert_eq!(got[2].unwrap().n_out, 1);
         assert_eq!(got[0].unwrap().spent.0, FILE_HEADER_LEN as u64 + 7 * 8);
-        assert_eq!(
-            got[2].unwrap().spent.0,
-            FILE_HEADER_LEN as u64 + 7 * 8 + 256 * 8 + 7 * 8
-        );
+        assert_eq!(got[2].unwrap().spent.0, FILE_HEADER_LEN as u64 + 7 * 8 + 256 * 8 + 7 * 8);
         if let Ok(mut sess) =
             crate::uring_session::UringSession::try_open(crate::uring_session::DEFAULT_ENTRIES)
         {
@@ -991,8 +942,7 @@ mod tests {
     fn range_batch_multi_window_matches_serial_and_held() {
         let dir = TempDir::labeled("create-loc-batch-win").unwrap();
         let loc = CreateLoc::create(dir.path()).unwrap();
-        loc.append(&chain(&vec![1u32; 2000], &vec![8u64; 2000]))
-            .unwrap();
+        loc.append(&chain(&vec![1u32; 2000], &vec![8u64; 2000])).unwrap();
         let fks = [Fk(3), Fk(50), Fk(1024), Fk(1025), Fk(2000), Fk::NULL];
         let batch = loc.range_batch(&fks).unwrap();
         for (i, fk) in fks.iter().enumerate() {
@@ -1002,9 +952,7 @@ mod tests {
         if let Ok(mut sess) =
             crate::uring_session::UringSession::try_open(crate::uring_session::DEFAULT_ENTRIES)
         {
-            let held = loc
-                .range_batch_ctx(&fks, &mut crate::IoCtx::held(&mut sess))
-                .unwrap();
+            let held = loc.range_batch_ctx(&fks, &mut crate::IoCtx::held(&mut sess)).unwrap();
             assert_eq!(held, batch);
         }
     }

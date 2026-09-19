@@ -246,10 +246,7 @@ fn rehydrate_one_height(
         st.body.mark_missing(hash);
     }
     let has_class_a = st.body.is_known_archived(&hash)
-        || hub
-            .query
-            .is_block_archived(&hash.to_byte_array())
-            .unwrap_or(false);
+        || hub.query.is_block_archived(&hash.to_byte_array()).unwrap_or(false);
     if !has_class_a {
         return Ok(RehydrateOne::Stop { failed: false });
     }
@@ -279,9 +276,7 @@ fn rehydrate_offer_class_a(
             return Ok(RehydrateOne::Stop { failed: true });
         }
     };
-    let merkle_ok = block
-        .compute_merkle_root()
-        .is_some_and(|mr| mr == block.header.merkle_root);
+    let merkle_ok = block.compute_merkle_root().is_some_and(|mr| mr == block.header.merkle_root);
     if !merkle_ok || block.block_hash() != hash {
         warn!(
             "ibd: Class A rehydrate h={ht} {hash}: reconstructed body fails header check \
@@ -299,10 +294,7 @@ fn rehydrate_offer_class_a(
         return Ok(RehydrateOne::Stop { failed: true });
     }
     let header_fk = st.header_fks.get(&hash).copied().unwrap_or(Fk::NULL);
-    if let Err(e) = hub
-        .query
-        .block_queue_offer(ht, hash.to_byte_array(), header_fk.0, &payload)
-    {
+    if let Err(e) = hub.query.block_queue_offer(ht, hash.to_byte_array(), header_fk.0, &payload) {
         warn!("ibd: Class A rehydrate offer h={ht}: {e} — re-getdata");
         st.body.mark_missing(hash);
         return Ok(RehydrateOne::Stop { failed: true });
@@ -310,9 +302,7 @@ fn rehydrate_offer_class_a(
     st.body.mark_pending(hash);
     confirm_feed.note(ht, hash);
     st.max_ready_height = st.max_ready_height.max(ht);
-    Ok(RehydrateOne::Offered {
-        bytes: payload.len() as u64,
-    })
+    Ok(RehydrateOne::Offered { bytes: payload.len() as u64 })
 }
 
 #[cfg(test)]
@@ -334,11 +324,8 @@ mod class_a_rehydrate_tests {
     use rbitcoin_query::testutil::FixtureChain;
 
     fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            rbitcoin_consensus::bip34_height_script(height)
-        };
+        let mut ss =
+            if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }
@@ -365,10 +352,7 @@ mod class_a_rehydrate_tests {
             bits,
             nonce: 0,
         };
-        let mut block = Block {
-            header,
-            txdata: vec![coinbase],
-        };
+        let mut block = Block { header, txdata: vec![coinbase] };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let target = Target::from_compact(bits);
         for nonce in 0..u32::MAX {
@@ -385,10 +369,7 @@ mod class_a_rehydrate_tests {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("ca-max0");
         let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
         let feed = ConfirmFeed::new();
-        assert_eq!(
-            rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 0).unwrap(),
-            0
-        );
+        assert_eq!(rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 0).unwrap(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -413,14 +394,8 @@ mod class_a_rehydrate_tests {
 
         let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
         super::super::path::seed_work_path_from_store(&mut st, &hub);
-        assert!(
-            st.body.is_known_archived(&hashes[0]),
-            "seed must mark Class A known"
-        );
-        assert!(
-            !hub.query.block_queue_has_height(1),
-            "BQ empty before rehydrate"
-        );
+        assert!(st.body.is_known_archived(&hashes[0]), "seed must mark Class A known");
+        assert!(!hub.query.block_queue_has_height(1), "BQ empty before rehydrate");
         assert!(
             !claim_ready(&hub, &mut st.body, 1, &hashes[0]),
             "Class A alone is not claim-ready"
@@ -431,14 +406,8 @@ mod class_a_rehydrate_tests {
         assert_eq!(n, 3, "contiguous Class A prefix should all rehydrate");
         for (i, h) in hashes.iter().enumerate() {
             let ht = (i as u32) + 1;
-            assert!(
-                hub.query.block_queue_has_height(ht),
-                "BQ must hold height {ht}"
-            );
-            assert!(
-                st.body.is_pending(h),
-                "pending after Class A rehydrate h={ht}"
-            );
+            assert!(hub.query.block_queue_has_height(ht), "BQ must hold height {ht}");
+            assert!(st.body.is_pending(h), "pending after Class A rehydrate h={ht}");
             assert!(
                 claim_ready(&hub, &mut st.body, ht, h),
                 "claim_ready after Class A rehydrate h={ht}"
@@ -476,63 +445,32 @@ mod class_a_rehydrate_tests {
             "empty queue"
         );
 
-        hub.query
-            .block_queue_offer(0, gen.to_byte_array(), 0, b"stale")
-            .unwrap();
-        hub.query
-            .block_queue_offer(1, hashes[0].to_byte_array(), 0, b"")
-            .unwrap();
+        hub.query.block_queue_offer(0, gen.to_byte_array(), 0, b"stale").unwrap();
+        hub.query.block_queue_offer(1, hashes[0].to_byte_array(), 0, b"").unwrap();
         st.body.mark_archived(hashes[1]);
-        hub.query
-            .block_queue_offer(2, hashes[1].to_byte_array(), 7, b"wire2")
-            .unwrap();
+        hub.query.block_queue_offer(2, hashes[1].to_byte_array(), 7, b"wire2").unwrap();
         hub.note_confirmed_tip(&[(3, hashes[2])]).unwrap();
-        assert!(
-            hub.has_block(&hashes[2]),
-            "stale confirmed-set must not dequeue above-tip wire"
-        );
+        assert!(hub.has_block(&hashes[2]), "stale confirmed-set must not dequeue above-tip wire");
         assert_eq!(hub.tip_height(), Some(0));
-        hub.query
-            .block_queue_offer(3, hashes[2].to_byte_array(), 0, b"wire3")
-            .unwrap();
+        hub.query.block_queue_offer(3, hashes[2].to_byte_array(), 0, b"wire3").unwrap();
         let unk = BlockHash::from_byte_array([0x11; 32]);
-        hub.query
-            .block_queue_offer(u32::MAX, unk.to_byte_array(), 0, b"unk")
-            .unwrap();
+        hub.query.block_queue_offer(u32::MAX, unk.to_byte_array(), 0, b"unk").unwrap();
         for (i, h) in hashes.iter().enumerate() {
             st.record_height(*h, (i as u32) + 1);
         }
 
         let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed).unwrap();
         assert_eq!(n, 2, "ready heights are 2 and 3");
-        assert!(
-            !hub.query.block_queue_has_height(0),
-            "drop residue at confirmed tip"
-        );
-        assert!(
-            !hub.query.block_queue_has_height(1),
-            "empty payload dequeue"
-        );
+        assert!(!hub.query.block_queue_has_height(0), "drop residue at confirmed tip");
+        assert!(!hub.query.block_queue_has_height(1), "empty payload dequeue");
         assert!(hub.query.block_queue_has_height(2), "keep known-archived");
-        assert!(
-            hub.query.block_queue_has_height(3),
-            "keep has_block above tip"
-        );
-        assert!(
-            hub.query.block_queue_has_height(u32::MAX),
-            "unknown height stays queued"
-        );
+        assert!(hub.query.block_queue_has_height(3), "keep has_block above tip");
+        assert!(hub.query.block_queue_has_height(u32::MAX), "unknown height stays queued");
         assert!(st.body.is_pending(&hashes[1]));
         assert!(st.body.is_pending(&hashes[2]));
-        assert!(
-            claim_ready(&hub, &mut st.body, 2, &hashes[1]),
-            "kept BQ is claim-ready"
-        );
+        assert!(claim_ready(&hub, &mut st.body, 2, &hashes[1]), "kept BQ is claim-ready");
         assert!(st.body.is_missing(&unk), "unknown height marked missing");
-        assert!(
-            st.body.is_missing(&hashes[0]),
-            "tip+1 gap marked missing for densify"
-        );
+        assert!(st.body.is_missing(&hashes[0]), "tip+1 gap marked missing for densify");
         assert_eq!(st.header_fks.get(&hashes[1]).copied(), Some(Fk(7)));
         assert_eq!(feed.size_snap().0, 2);
 
@@ -544,9 +482,7 @@ mod class_a_rehydrate_tests {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("bq-rehydrate-notip");
         assert!(hub.tip_height().is_none());
         let h = BlockHash::from_byte_array([0x22; 32]);
-        hub.query
-            .block_queue_offer(0, h.to_byte_array(), 1, b"gen")
-            .unwrap();
+        hub.query.block_queue_offer(0, h.to_byte_array(), 1, b"gen").unwrap();
         let mut st = IbdWorkState::new(Vec::new(), None, None);
         let feed = ConfirmFeed::new();
         let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed).unwrap();

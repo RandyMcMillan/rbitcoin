@@ -31,10 +31,7 @@ impl ParentPinStamp {
 
     #[inline]
     pub(super) fn create_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
-        self.idents
-            .get(&create_fk_id)
-            .map(|p| p.txid)
-            .filter(|t| *t != [0u8; 32])
+        self.idents.get(&create_fk_id).map(|p| p.txid).filter(|t| *t != [0u8; 32])
     }
 
     #[inline]
@@ -58,17 +55,9 @@ impl ParentPinStamp {
     }
 }
 
-pub type WireBlockIn = (
-    Height,
-    Arc<Block>,
-    Option<Arc<[rbitcoin_query::TxPrecompute]>>,
-);
-type LookupPhaseOut = (
-    Option<rbitcoin_query::ArchiveWritePlan>,
-    Vec<BodyMeta>,
-    Vec<Arc<Block>>,
-    u64,
-);
+pub type WireBlockIn = (Height, Arc<Block>, Option<Arc<[rbitcoin_query::TxPrecompute]>>);
+type LookupPhaseOut =
+    (Option<rbitcoin_query::ArchiveWritePlan>, Vec<BodyMeta>, Vec<Arc<Block>>, u64);
 
 /// Lookup-stage output: structure + plan batch (create_fk + parent body ranges).
 ///
@@ -160,14 +149,7 @@ pub fn confirm_wire_lookup_stamp(
     rbitcoin_query::note_confirm(&query.confirm_stats().lookup_head_ns, plan_ns);
     let work_ns = t0.elapsed().as_nanos() as u64;
     rbitcoin_query::note_confirm(&query.confirm_stats().lookup_total_ns, work_ns);
-    Ok(PlanStampOutcome {
-        plan,
-        parent_pin,
-        work_ns,
-        metas,
-        wire_blocks,
-        archived_pairs,
-    })
+    Ok(PlanStampOutcome { plan, parent_pin, work_ns, metas, wire_blocks, archived_pairs })
 }
 
 /// plan=None rehydrate: stamp external parent create_fk + body_range + txid
@@ -250,11 +232,7 @@ pub(super) fn stamp_parent_pin_archived(
     }
     for (tid, id) in same_batch {
         stamp.resolved.insert(tid, id);
-        stamp
-            .idents
-            .entry(id)
-            .or_insert_with(|| rbitcoin_query::ParentIdent::new(tid))
-            .txid = tid;
+        stamp.idents.entry(id).or_insert_with(|| rbitcoin_query::ParentIdent::new(tid)).txid = tid;
     }
     // Identities are stamped from wire prev_txid at insert time — never soft-fill
     // from txid.body here (that would be a dual path after lookup promised identity).
@@ -292,23 +270,11 @@ pub fn confirm_wire_load_from_plan(
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     let t_work = Instant::now();
     let t_load = Instant::now();
-    let PlanStampOutcome {
-        mut plan,
-        mut parent_pin,
-        metas,
-        wire_blocks,
-        ..
-    } = stamped;
+    let PlanStampOutcome { mut plan, mut parent_pin, metas, wire_blocks, .. } = stamped;
 
     let ifo = pipeline.map(|p| p.in_flight);
-    let (batch_parents, spend_edges) = pin_for_wire_batch(
-        query,
-        plan.as_ref(),
-        &mut parent_pin,
-        &metas,
-        &wire_blocks,
-        ifo,
-    )?;
+    let (batch_parents, spend_edges) =
+        pin_for_wire_batch(query, plan.as_ref(), &mut parent_pin, &metas, &wire_blocks, ifo)?;
     if let Some(ref mut p) = plan {
         p.freeze_after_pin();
     }
@@ -318,15 +284,8 @@ pub fn confirm_wire_load_from_plan(
         t_load.elapsed().as_nanos() as u64,
     );
 
-    let prepared = assemble_run(
-        query,
-        params,
-        milestone,
-        metas,
-        &wire_blocks,
-        &batch_parents,
-        &spend_edges,
-    )?;
+    let prepared =
+        assemble_run(query, params, milestone, metas, &wire_blocks, &batch_parents, &spend_edges)?;
     drop(spend_edges);
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
@@ -432,9 +391,7 @@ pub(super) fn wire_lookup_phase(
     let (plan, filter_ns, batch_ns) =
         lookup_bind_archive_plan(query, pipeline, &mut metas, &wire_blocks)?;
     let plan_ns = filter_ns.saturating_add(batch_ns);
-    lookup_note_stamp(
-        query, struct_ns, header_ns, prepare_ns, filter_ns, batch_ns, plan_ns,
-    );
+    lookup_note_stamp(query, struct_ns, header_ns, prepare_ns, filter_ns, batch_ns, plan_ns);
     Ok((plan, metas, wire_blocks, plan_ns))
 }
 
@@ -448,9 +405,7 @@ fn check_carried_header_lens(
     if (!p.carried_header_fks.is_empty() || !p.carried_header_hashes.is_empty())
         && (p.carried_header_fks.len() != n_blocks || p.carried_header_hashes.len() != n_blocks)
     {
-        return Err(ConsensusError::Store(StoreError::Corrupt(
-            "invariant: carried header length",
-        )));
+        return Err(ConsensusError::Store(StoreError::Corrupt("invariant: carried header length")));
     }
     Ok(())
 }
@@ -536,16 +491,12 @@ fn stamp_header_fk(
             Err(e) => return Err(ConsensusError::from(e)),
         }
     }
-    if let Some((fk, _)) = query
-        .get_header_by_hash(&header_rec.hash)
-        .map_err(ConsensusError::from)?
+    if let Some((fk, _)) =
+        query.get_header_by_hash(&header_rec.hash).map_err(ConsensusError::from)?
     {
         Ok(fk)
     } else {
-        query
-            .store()
-            .put_header(header_rec)
-            .map_err(ConsensusError::from)
+        query.store().put_header(header_rec).map_err(ConsensusError::from)
     }
 }
 
@@ -570,9 +521,7 @@ fn lookup_note_stamp(
     batch_ns: u64,
     plan_ns: u64,
 ) {
-    query
-        .confirm_stats()
-        .note_stamp(struct_ns, prepare_ns, filter_ns, batch_ns);
+    query.confirm_stats().note_stamp(struct_ns, prepare_ns, filter_ns, batch_ns);
     if struct_ns > 0 {
         rbitcoin_query::note_confirm(&query.confirm_stats().phase_prep_struct_ns, struct_ns);
     }
@@ -593,11 +542,8 @@ fn lookup_bind_have_body(
     wire_blocks: &[Arc<Block>],
 ) -> Result<(), ConsensusError> {
     for (i, m) in metas.iter_mut().enumerate() {
-        if let Some(list) = query
-            .store()
-            .header_txs
-            .get_list(m.header_fk)
-            .map_err(ConsensusError::from)?
+        if let Some(list) =
+            query.store().header_txs.get_list(m.header_fk).map_err(ConsensusError::from)?
         {
             m.tx_fks = list;
         }
@@ -622,12 +568,9 @@ fn lookup_bind_need_body<'a>(
 ) -> Result<rbitcoin_query::ArchiveWritePlan, ConsensusError> {
     let mut need = Vec::with_capacity(need_fks.len());
     for fk in need_fks {
-        let i = metas
-            .iter()
-            .position(|m| m.header_fk == *fk)
-            .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-                "invariant: need-body header_fk not in batch",
-            )))?;
+        let i = metas.iter().position(|m| m.header_fk == *fk).ok_or(ConsensusError::Store(
+            rbitcoin_store::StoreError::Corrupt("invariant: need-body header_fk not in batch"),
+        ))?;
         need.push((*fk, &wire_blocks[i], metas[i].txids.as_slice()));
     }
     let plan = match pipeline {
@@ -677,9 +620,8 @@ fn lookup_bind_archive_plan(
 ) -> Result<(Option<rbitcoin_query::ArchiveWritePlan>, u64, u64), ConsensusError> {
     let t_filter = Instant::now();
     let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
-    let need_fks = query
-        .archive_filter_need_header_fks(&header_fks)
-        .map_err(ConsensusError::from)?;
+    let need_fks =
+        query.archive_filter_need_header_fks(&header_fks).map_err(ConsensusError::from)?;
     confirm_archive_kind(header_fks.len(), need_fks.len())?;
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
     let t_batch = Instant::now();
@@ -687,13 +629,7 @@ fn lookup_bind_archive_plan(
         lookup_bind_have_body(query, metas, wire_blocks)?;
         None
     } else {
-        Some(lookup_bind_need_body(
-            query,
-            pipeline,
-            metas,
-            wire_blocks,
-            &need_fks,
-        )?)
+        Some(lookup_bind_need_body(query, pipeline, metas, wire_blocks, &need_fks)?)
     };
     let batch_ns = t_batch.elapsed().as_nanos() as u64;
     Ok((plan, filter_ns, batch_ns))
@@ -714,9 +650,7 @@ pub(super) fn confirm_archive_kind(
     } else if n_need == n_headers {
         Ok(ConfirmArchiveKind::AllNeedBody)
     } else {
-        Err(ConsensusError::Store(StoreError::Corrupt(
-            "invariant: confirm batch mixed archived",
-        )))
+        Err(ConsensusError::Store(StoreError::Corrupt("invariant: confirm batch mixed archived")))
     }
 }
 
@@ -728,9 +662,7 @@ pub(super) fn create_fks_from_header_ranges(
         let Some(hid) = hfk.get() else { continue };
         let mut slice = Vec::with_capacity(n as usize);
         for i in 0..n {
-            slice.push(rbitcoin_primitives::Fk(
-                first.0.saturating_add(u64::from(i)),
-            ));
+            slice.push(rbitcoin_primitives::Fk(first.0.saturating_add(u64::from(i))));
         }
         by_header.insert(hid, slice);
     }
@@ -767,10 +699,7 @@ mod tests {
                 version: TxVersion::ONE,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: Txid::from_byte_array(prev),
-                        vout: 0,
-                    },
+                    previous_output: OutPoint { txid: Txid::from_byte_array(prev), vout: 0 },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::new(),
@@ -841,14 +770,8 @@ mod tests {
             Some(&[parent_txid][..]),
         )
         .expect("archived stamp");
-        assert_eq!(
-            stamp.body_range(88),
-            helper.idents.get(&88).and_then(|p| p.body)
-        );
-        assert_eq!(
-            stamp.create_txid(88),
-            helper.idents.get(&88).map(|p| p.txid)
-        );
+        assert_eq!(stamp.body_range(88), helper.idents.get(&88).and_then(|p| p.body));
+        assert_eq!(stamp.create_txid(88), helper.idents.get(&88).map(|p| p.txid));
         assert_eq!(stamp.resolved.get(&parent_txid), Some(&88));
         let empty_wire = stamp_parent_pin_archived(
             &q,
@@ -879,12 +802,8 @@ mod tests {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        let pres: Arc<[TxPrecompute]> = b1
-            .txdata
-            .iter()
-            .map(TxPrecompute::from_tx)
-            .collect::<Vec<_>>()
-            .into();
+        let pres: Arc<[TxPrecompute]> =
+            b1.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
         let items = [(Height(1), Arc::new(b1), Some(Arc::clone(&pres)))];
         let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("coinbase-only stamp");
@@ -896,11 +815,7 @@ mod tests {
         assert_eq!(stamped.metas[0].pres[0].txid, pres[0].txid);
         let plan = stamped.plan.as_ref().expect("new body plans");
         assert_eq!(plan.packed.len(), 1);
-        assert_eq!(
-            plan.packed[0].1.len(),
-            1,
-            "wire planner fills packed ins from stamp edges"
-        );
+        assert_eq!(plan.packed[0].1.len(), 1, "wire planner fills packed ins from stamp edges");
         assert_eq!(
             plan.packed[0].1[0].script_sig,
             items[0].1.txdata[0].input[0].script_sig.to_bytes()
@@ -912,11 +827,7 @@ mod tests {
             "CreatePin outs from wire script_pubkey"
         );
         assert_eq!(
-            plan.batch_pin[0]
-                .out_parts(0)
-                .expect("coinbase out")
-                .1
-                .as_ptr(),
+            plan.batch_pin[0].out_parts(0).expect("coinbase out").1.as_ptr(),
             want.as_ptr(),
             "plan must not copy scriptPubKey"
         );
@@ -935,11 +846,8 @@ mod tests {
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         let hash = b1.block_hash().to_byte_array();
-        let genesis_fk = q
-            .get_header_by_hash(&genesis.block_hash().to_byte_array())
-            .unwrap()
-            .unwrap()
-            .0;
+        let genesis_fk =
+            q.get_header_by_hash(&genesis.block_hash().to_byte_array()).unwrap().unwrap().0;
         let rec = crate::header_to_record(genesis_fk, &b1.header, hash);
         let hfk = q.store().put_header(&rec).unwrap();
         let n_headers = q.store().headers.count();
@@ -955,18 +863,10 @@ mod tests {
             carried_header_hashes: vec![hash],
         };
         let items = [(Height(1), Arc::new(b1), None)];
-        let _ = q
-            .confirm_stats()
-            .phase_prep_header_skip_n
-            .swap(0, Ordering::Relaxed);
+        let _ = q.confirm_stats().phase_prep_header_skip_n.swap(0, Ordering::Relaxed);
         let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
             .expect("carried header stamp");
-        assert_eq!(
-            q.confirm_stats()
-                .phase_prep_header_skip_n
-                .load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(q.confirm_stats().phase_prep_header_skip_n.load(Ordering::Relaxed), 1);
         assert_eq!(q.store().headers.count(), n_headers);
         assert_eq!(stamped.metas[0].header_fk, hfk);
         let plan = stamped.plan.as_ref().expect("plan");
@@ -1000,11 +900,8 @@ mod tests {
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let genesis_fk = q
-            .get_header_by_hash(&genesis.block_hash().to_byte_array())
-            .unwrap()
-            .unwrap()
-            .0;
+        let genesis_fk =
+            q.get_header_by_hash(&genesis.block_hash().to_byte_array()).unwrap().unwrap().0;
         let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         let hash = b1.block_hash().to_byte_array();
         let n_headers = q.store().headers.count();
@@ -1020,18 +917,10 @@ mod tests {
             carried_header_hashes: vec![hash],
         };
         let items = [(Height(1), Arc::new(b1), None)];
-        let _ = q
-            .confirm_stats()
-            .phase_prep_header_skip_n
-            .swap(0, Ordering::Relaxed);
+        let _ = q.confirm_stats().phase_prep_header_skip_n.swap(0, Ordering::Relaxed);
         let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
             .expect("dummy BQ fk still ensures");
-        assert_eq!(
-            q.confirm_stats()
-                .phase_prep_header_skip_n
-                .load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(q.confirm_stats().phase_prep_header_skip_n.load(Ordering::Relaxed), 0);
         assert!(q.store().headers.count() > n_headers);
         assert_ne!(stamped.metas[0].header_fk, genesis_fk);
         let _ = std::fs::remove_dir_all(&path);
@@ -1158,10 +1047,7 @@ mod tests {
 
         let hfk = stamped.metas[0].header_fk;
         let first_fk = stamped.metas[0].tx_fks[0];
-        q.store()
-            .header_txs
-            .put_range(hfk, first_fk, 2)
-            .expect("tamper list length");
+        q.store().header_txs.put_range(hfk, first_fk, 2).expect("tamper list length");
         match confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None) {
             Err(ConsensusError::Store(StoreError::Corrupt(m))) => {
                 assert_eq!(m, "invariant: archived stamp tx_fks/txids length");

@@ -123,15 +123,9 @@ pub fn resolve_dns_seeds(network: Network) -> Vec<SocketAddr> {
     let port = default_port(network);
     let mut out = Vec::new();
     for names in seed_lookup_names(network) {
-        let x_ips = names
-            .first()
-            .map(|h| resolve_host_port(h, port))
-            .unwrap_or_default();
+        let x_ips = names.first().map(|h| resolve_host_port(h, port)).unwrap_or_default();
         let plain_ips = if x_ips.is_empty() {
-            names
-                .get(1)
-                .map(|h| resolve_host_port(h, port))
-                .unwrap_or_default()
+            names.get(1).map(|h| resolve_host_port(h, port)).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -366,11 +360,7 @@ impl AddrMan {
     }
 
     fn evict_oldest_new(&mut self) -> bool {
-        let victim = self
-            .order
-            .iter()
-            .copied()
-            .find(|a| !self.flags(a).has_connected());
+        let victim = self.order.iter().copied().find(|a| !self.flags(a).has_connected());
         let Some(addr) = victim else {
             return false;
         };
@@ -379,16 +369,9 @@ impl AddrMan {
     }
 
     fn evict_for_learn(&mut self) -> bool {
-        let victim = self
-            .order
-            .iter()
-            .copied()
-            .find(|a| self.flags(a).is_incompatible())
-            .or_else(|| {
-                self.order
-                    .iter()
-                    .copied()
-                    .find(|a| self.flags(a).failed_last_connect())
+        let victim =
+            self.order.iter().copied().find(|a| self.flags(a).is_incompatible()).or_else(|| {
+                self.order.iter().copied().find(|a| self.flags(a).failed_last_connect())
             });
         if let Some(addr) = victim {
             self.evict_one(addr);
@@ -401,18 +384,9 @@ impl AddrMan {
         if self.order.len() <= cap {
             return;
         }
-        let mut keep: Vec<SocketAddr> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|a| self.flags(a).has_connected())
-            .collect();
-        keep.extend(
-            self.order
-                .iter()
-                .copied()
-                .filter(|a| !self.flags(a).has_connected()),
-        );
+        let mut keep: Vec<SocketAddr> =
+            self.order.iter().copied().filter(|a| self.flags(a).has_connected()).collect();
+        keep.extend(self.order.iter().copied().filter(|a| !self.flags(a).has_connected()));
         keep.truncate(cap);
         let keep_set: HashSet<SocketAddr> = keep.iter().copied().collect();
         self.order = keep;
@@ -443,16 +417,11 @@ impl AddrMan {
     }
 
     pub fn flags(&self, addr: &SocketAddr) -> PeerFlags {
-        self.by_addr
-            .get(addr)
-            .copied()
-            .unwrap_or_else(PeerFlags::empty)
+        self.by_addr.get(addr).copied().unwrap_or_else(PeerFlags::empty)
     }
 
     pub fn entry(&self, addr: &SocketAddr) -> Option<PeerEntry> {
-        self.by_addr
-            .get(addr)
-            .map(|&flags| PeerEntry { addr: *addr, flags })
+        self.by_addr.get(addr).map(|&flags| PeerEntry { addr: *addr, flags })
     }
 
     pub fn len(&self) -> usize {
@@ -573,10 +542,7 @@ impl AddrMan {
             ranked.retain(|(_, _, incompat, _)| !*incompat);
         }
         let now = Instant::now();
-        if ranked
-            .iter()
-            .any(|(_, _, _, a)| !self.recently_attempted(*a, now))
-        {
+        if ranked.iter().any(|(_, _, _, a)| !self.recently_attempted(*a, now)) {
             ranked.retain(|(_, _, _, a)| !self.recently_attempted(*a, now));
         }
         let asmap = self.asmap.as_deref();
@@ -587,11 +553,8 @@ impl AddrMan {
             if out.len() >= max {
                 break;
             }
-            let slice: Vec<SocketAddr> = ranked
-                .iter()
-                .filter(|(t, _, _, _)| *t == tier)
-                .map(|(_, _, _, a)| *a)
-                .collect();
+            let slice: Vec<SocketAddr> =
+                ranked.iter().filter(|(t, _, _, _)| *t == tier).map(|(_, _, _, a)| *a).collect();
             if slice.is_empty() {
                 continue;
             }
@@ -689,36 +652,23 @@ impl AddrMan {
             let addr: SocketAddr = addr_s.parse().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "peers file {}:{}: bad addr: {e}",
-                        path.display(),
-                        lineno + 1
-                    ),
+                    format!("peers file {}:{}: bad addr: {e}", path.display(), lineno + 1),
                 )
             })?;
-            let flags_u: u8 = if let Some(hex) = flags_s
-                .strip_prefix("0x")
-                .or_else(|| flags_s.strip_prefix("0X"))
+            let flags_u: u8 = if let Some(hex) =
+                flags_s.strip_prefix("0x").or_else(|| flags_s.strip_prefix("0X"))
             {
                 u8::from_str_radix(hex, 16).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "peers file {}:{}: bad flags: {e}",
-                            path.display(),
-                            lineno + 1
-                        ),
+                        format!("peers file {}:{}: bad flags: {e}", path.display(), lineno + 1),
                     )
                 })?
             } else {
                 flags_s.parse().map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "peers file {}:{}: bad flags: {e}",
-                            path.display(),
-                            lineno + 1
-                        ),
+                        format!("peers file {}:{}: bad flags: {e}", path.display(), lineno + 1),
                     )
                 })?
             };
@@ -985,10 +935,7 @@ mod tests {
         assert!(am.add_learned(addr(9), 3));
         assert_eq!(am.len(), 3);
         assert!(am.entry(&addr(9)).is_some());
-        assert!(
-            am.entry(&addr(1)).is_none(),
-            "incompatible is evicted before failed-last-connect"
-        );
+        assert!(am.entry(&addr(1)).is_none(), "incompatible is evicted before failed-last-connect");
     }
 
     #[test]
@@ -1013,10 +960,7 @@ mod tests {
         assert!(am.add_learned(addr(9), 3));
         assert_eq!(am.len(), 3);
         assert!(am.entry(&addr(9)).is_some());
-        assert!(
-            am.entry(&addr(1)).is_none(),
-            "oldest new is evicted after incompat/failed"
-        );
+        assert!(am.entry(&addr(1)).is_none(), "oldest new is evicted after incompat/failed");
         assert!(am.entry(&addr(2)).is_some());
         assert!(am.entry(&addr(3)).is_some());
     }
@@ -1081,10 +1025,7 @@ mod tests {
         }
         a.merge_from(&b);
         assert_eq!(a.len(), MAX_ADDR_MAN);
-        assert!(
-            a.entry(&addr_n(0)).is_some(),
-            "tried addrs must survive merge trim"
-        );
+        assert!(a.entry(&addr_n(0)).is_some(), "tried addrs must survive merge trim");
         assert!(
             a.entry(&addr_n(MAX_ADDR_MAN as u32)).is_none(),
             "extra new from the other book must not grow past cap"
@@ -1116,17 +1057,12 @@ mod tests {
         let loaded = AddrMan::load(&path).unwrap();
         assert_eq!(loaded.len(), MAX_ADDR_MAN);
         for i in 0..n_tried {
-            assert!(
-                loaded.entry(&addr_n(i)).is_some(),
-                "tried {i} must survive trim"
-            );
+            assert!(loaded.entry(&addr_n(i)).is_some(), "tried {i} must survive trim");
             assert!(loaded.flags(&addr_n(i)).has_connected());
         }
         let n_new_kept = MAX_ADDR_MAN - n_tried as usize;
         assert!(loaded.entry(&addr_n(n_tried)).is_some());
-        assert!(loaded
-            .entry(&addr_n(n_tried + n_new_kept as u32 - 1))
-            .is_some());
+        assert!(loaded.entry(&addr_n(n_tried + n_new_kept as u32 - 1)).is_some());
         assert!(loaded.entry(&addr_n(n_total - 1)).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1199,10 +1135,7 @@ mod tests {
         assert!(bits.has(ServiceFlags::WITNESS));
         assert!(bits.has(ServiceFlags::P2P_V2));
         assert_eq!(bits.to_u64(), 0x809);
-        assert_eq!(
-            dns_seed_query_host("seed.bitcoin.sipa.be", bits),
-            "x809.seed.bitcoin.sipa.be"
-        );
+        assert_eq!(dns_seed_query_host("seed.bitcoin.sipa.be", bits), "x809.seed.bitcoin.sipa.be");
         assert_eq!(
             dns_seed_query_host("seed.signet.bitcoin.sprovoost.nl", bits),
             "x809.seed.signet.bitcoin.sprovoost.nl"
@@ -1325,10 +1258,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-peers-err-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let missing = dir.join("no-such-peers");
@@ -1364,20 +1294,14 @@ mod tests {
 
         // Bad address token.
         let bad_addr = dir.join("bad-addr");
-        std::fs::write(
-            &bad_addr,
-            format!("{}\nnot-an-addr 0\n", AddrMan::PEERS_FILE_MAGIC),
-        )
-        .unwrap();
+        std::fs::write(&bad_addr, format!("{}\nnot-an-addr 0\n", AddrMan::PEERS_FILE_MAGIC))
+            .unwrap();
         assert!(AddrMan::load(&bad_addr).is_err());
 
         // Bad hex flags.
         let bad_hex = dir.join("bad-hex");
-        std::fs::write(
-            &bad_hex,
-            format!("{}\n{} 0xZZ\n", AddrMan::PEERS_FILE_MAGIC, addr(1)),
-        )
-        .unwrap();
+        std::fs::write(&bad_hex, format!("{}\n{} 0xZZ\n", AddrMan::PEERS_FILE_MAGIC, addr(1)))
+            .unwrap();
         assert!(AddrMan::load(&bad_hex).is_err());
 
         // Bad decimal flags + 0X uppercase hex prefix path.
@@ -1390,11 +1314,8 @@ mod tests {
         assert!(AddrMan::load(&bad_dec).is_err());
 
         let ok_upper = dir.join("ok-upper");
-        std::fs::write(
-            &ok_upper,
-            format!("{}\n{} 0X01\n", AddrMan::PEERS_FILE_MAGIC, addr(7)),
-        )
-        .unwrap();
+        std::fs::write(&ok_upper, format!("{}\n{} 0X01\n", AddrMan::PEERS_FILE_MAGIC, addr(7)))
+            .unwrap();
         let u = AddrMan::load(&ok_upper).unwrap();
         assert!(u.flags(&addr(7)).has_connected());
 

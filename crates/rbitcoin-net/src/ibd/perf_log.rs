@@ -102,18 +102,12 @@ pub(crate) struct WriteStageSample {
     pub dequeue_ns: u64,
 }
 
-type WriteInvTok = (
-    &'static str,
-    fn(&WriteStageSample) -> u64,
-    fn(&WriteStageSample) -> u64,
-);
+type WriteInvTok = (&'static str, fn(&WriteStageSample) -> u64, fn(&WriteStageSample) -> u64);
 
 impl WriteStageSample {
     /// Sum of the exclusive write inventory tokens (ms).
     pub fn stage_ms(&self) -> u64 {
-        Self::INVENTORY
-            .iter()
-            .fold(0, |acc, (_, ms, _)| acc.saturating_add(ms(self)))
+        Self::INVENTORY.iter().fold(0, |acc, (_, ms, _)| acc.saturating_add(ms(self)))
     }
 
     /// Exclusive write inventory: one row per token (`write=` = this sum).
@@ -135,9 +129,7 @@ impl WriteStageSample {
 
     /// Same inventory in nanoseconds (`format_debug` us/blk write=).
     pub fn stage_ns(&self) -> u64 {
-        Self::INVENTORY
-            .iter()
-            .fold(0, |acc, (_, _, ns)| acc.saturating_add(ns(self)))
+        Self::INVENTORY.iter().fold(0, |acc, (_, _, ns)| acc.saturating_add(ns(self)))
     }
 }
 
@@ -740,10 +732,7 @@ fn fill_rss_from_smaps_rollup(out: &mut ProcRss, s: &str) {
 }
 
 fn parse_kb_field(rest: &str) -> u64 {
-    rest.split_whitespace()
-        .next()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0)
+    rest.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
 fn kb_mib(kb: u64) -> u64 {
@@ -1172,10 +1161,8 @@ fn append_write_inventory_info(out: &mut String, s: &IbdPerfSample) {
                 " {name}={v}ms(spent={} create_h={} bip68={})",
                 s.structural_spent_ms, s.structural_create_h_ms, s.structural_bip68_ms
             )),
-            "pins" => out.push_str(&format!(
-                " {name}={v}ms(take={} map={})",
-                s.pins_take_ms, s.pins_map_ms
-            )),
+            "pins" => out
+                .push_str(&format!(" {name}={v}ms(take={} map={})", s.pins_take_ms, s.pins_map_ms)),
             _ => out.push_str(&format!(" {name}={v}ms")),
         }
     }
@@ -1215,9 +1202,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     );
     let load_wall_ms = load_stage_wall_ms(s);
     let thr_lookup_busy = s.thr_lookup_stamp_ms.saturating_add(s.thr_lookup_other_ms);
-    let thr_lookup_wait = s
-        .thr_lookup_claim_ms
-        .saturating_add(s.thr_lookup_send_wait_ms);
+    let thr_lookup_wait = s.thr_lookup_claim_ms.saturating_add(s.thr_lookup_send_wait_ms);
     let thr_load_busy = s
         .thr_load_pack_ms
         .saturating_add(s.thr_load_clone_ms)
@@ -1225,12 +1210,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_load_pin_ms)
         .saturating_add(s.thr_load_asm_ms)
         .saturating_add(s.thr_load_prune_ms);
-    let thr_load_wait = s
-        .thr_load_recv_wait_ms
-        .saturating_add(s.thr_load_send_wait_ms);
-    let thr_script_wait = s
-        .thr_script_recv_wait_ms
-        .saturating_add(s.thr_script_send_wait_ms);
+    let thr_load_wait = s.thr_load_recv_wait_ms.saturating_add(s.thr_load_send_wait_ms);
+    let thr_script_wait = s.thr_script_recv_wait_ms.saturating_add(s.thr_script_send_wait_ms);
     let stamp_head_ms = s.stamp_batch_head_fk_ms;
     let stamp_pack_ms = s.thr_load_stamp_ms.saturating_sub(stamp_head_ms);
     out.push_str(&format!(
@@ -1356,27 +1337,17 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         let tot = hits.saturating_add(s.load_pin_new);
         div_or_0(100 * hits, tot)
     };
-    let plan_pin_ms = if s.load_plan_pin_ms > 0 {
-        s.load_plan_pin_ms
-    } else {
-        s.load_pin_body_ms
-    };
+    let plan_pin_ms = if s.load_plan_pin_ms > 0 { s.load_plan_pin_ms } else { s.load_pin_body_ms };
     let cold_io_ms = s.load_cold_io_ms;
     let cold_range_ms = s.load_cold_range_ms;
-    let cold_for_us = if cold_range_ms > 0 {
-        cold_range_ms
-    } else {
-        cold_io_ms
-    };
+    let cold_for_us = if cold_range_ms > 0 { cold_range_ms } else { cold_io_ms };
     let pin_cold_us_per = div_or_0(cold_for_us.saturating_mul(1000), s.load_pin_new);
     let asm_prev_us_per_in = div_or_0(s.asm_prevout_ms.saturating_mul(1000), s.asm_in_n);
     let plan_batch = plan_batch_ms(s);
     let pre_assemble = s.load_ms;
     let pin_budget_ms = s.load_parent_pin_ms;
     let asm_budget_ms = s.connect_ms;
-    let other_budget_ms = load_wall_ms
-        .saturating_sub(pin_budget_ms)
-        .saturating_sub(asm_budget_ms);
+    let other_budget_ms = load_wall_ms.saturating_sub(pin_budget_ms).saturating_sub(asm_budget_ms);
     out.push_str(&format!(
         " | load_budget total={}ms pin={}ms asm={}ms other={}ms",
         load_wall_ms, pin_budget_ms, asm_budget_ms, other_budget_ms,
@@ -1486,9 +1457,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         out.push_str(&format!(" reject={}", s.confirm_reject_stops));
     }
     if let Some((first, n, inputs, elapsed_ms)) = s.live {
-        out.push_str(&format!(
-            " | live h={first} n={n} in={inputs} {elapsed_ms}ms"
-        ));
+        out.push_str(&format!(" | live h={first} n={n} in={inputs} {elapsed_ms}ms"));
     }
     if s.headers_done {
         out.push_str(" headers_done");
@@ -1527,10 +1496,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "body", s.sh_body_ms);
     append_nz(&mut out, "head", s.sh_head_ms);
     if s.sh_collect_pin > 0 || s.sh_collect_cold > 0 {
-        out.push_str(&format!(
-            " sh_src pin={} cold={}",
-            s.sh_collect_pin, s.sh_collect_cold
-        ));
+        out.push_str(&format!(" sh_src pin={} cold={}", s.sh_collect_pin, s.sh_collect_cold));
     }
 
     let conf_q = super::confirm::format_conf_q(
@@ -1685,9 +1651,8 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let wloc_mib = o.wloc_bytes / (1024 * 1024);
     let h2h_mib = (o.h2h_keys as u64).saturating_mul(48) / (1024 * 1024);
     let fence_mib = (o.fence_runs as u64).saturating_mul(16) / (1024 * 1024);
-    let conf_wire_mib = (load_wire_mib
-        .saturating_add(script_wire_mib)
-        .saturating_add(write_wire_mib)) as u64;
+    let conf_wire_mib =
+        (load_wire_mib.saturating_add(script_wire_mib).saturating_add(write_wire_mib)) as u64;
     let fuse8_mib = h.fuse8_bytes / (1024 * 1024);
     let mphf_g_mib = h.mphf_g_bytes / (1024 * 1024);
     let mphf_occ_mib = h.mphf_occ_bytes / (1024 * 1024);
@@ -1863,9 +1828,7 @@ mod tests {
         s.connect_ms = 8;
         assert_eq!(load_stage_wall_ms(&s), 38);
         let info = format_info(&s);
-        let write_at = info
-            .find(" | write ")
-            .unwrap_or_else(|| panic!("no write section: {info}"));
+        let write_at = info.find(" | write ").unwrap_or_else(|| panic!("no write section: {info}"));
         let write_sec = &info[write_at..];
         let mut last = 0usize;
         for (name, ms, _) in WriteStageSample::INVENTORY {
@@ -1881,9 +1844,7 @@ mod tests {
         last = 0;
         for (name, _, ns) in WriteStageSample::INVENTORY {
             let tok = format!("{name}={}", us(ns(&s.write)));
-            let pos = dbg
-                .find(&tok)
-                .unwrap_or_else(|| panic!("format_debug missing {tok}: {dbg}"));
+            let pos = dbg.find(&tok).unwrap_or_else(|| panic!("format_debug missing {tok}: {dbg}"));
             assert!(pos >= last, "{name} out of INVENTORY order in {dbg}");
             last = pos;
         }
@@ -1967,10 +1928,7 @@ mod tests {
         assert!(!line.contains(" disk="), "{line}");
         assert!(line.contains("bq soft=7/180 RAM=128MiB"), "{line}");
         assert!(line.contains("buf_ahead=224"), "{line}");
-        assert!(
-            !line.contains("lead="),
-            "schema12: no Class A lead= on perf: {line}"
-        );
+        assert!(!line.contains("lead="), "schema12: no Class A lead= on perf: {line}");
         assert!(!line.contains("arch_hwm"), "{line}");
         assert!(!line.contains("arch_q="), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
@@ -1989,16 +1947,10 @@ mod tests {
         let split = format_info(&s);
         assert!(split.contains("load_thr busy/wait=2550/200ms"), "{split}");
         assert!(split.contains("pack=100ms"), "{split}");
-        assert!(
-            split.contains("stamp=1700ms(pack=1700ms head=0ms)"),
-            "{split}"
-        );
+        assert!(split.contains("stamp=1700ms(pack=1700ms head=0ms)"), "{split}");
         s.stamp_batch_head_fk_ms = 200;
         let nested = format_info(&s);
-        assert!(
-            nested.contains("stamp=1700ms(pack=1500ms head=200ms)"),
-            "{nested}"
-        );
+        assert!(nested.contains("stamp=1700ms(pack=1500ms head=200ms)"), "{nested}");
         assert!(split.contains("pin=700ms"), "{split}");
         assert!(split.contains("prune=50ms"), "{split}");
         assert!(split.contains("script=20ms(jobs=12 skip=3)"), "{split}");
@@ -2011,10 +1963,7 @@ mod tests {
         );
         // load wall = load_ms(30)+assemble(8) = 38
         assert!(line.contains("load=38ms"), "{line}");
-        assert!(
-            !line.contains("connect="),
-            "assemble is inside load, not a peer stage: {line}"
-        );
+        assert!(!line.contains("connect="), "assemble is inside load, not a peer stage: {line}");
         // write = class_a(12)+ensure(3)+class_c(40)+sh(0)+spend(25)+tweaks(7) = 87
         assert!(line.contains("write=87ms"), "{line}");
         assert!(line.contains("class_a=12ms"), "{line}");
@@ -2063,14 +2012,8 @@ mod tests {
         s.spent_cold_ms = 3;
         s.spent_pending_ms = 2;
         let line = format_info(&s);
-        assert!(
-            line.contains("struct=50ms(spent=30 create_h=5 bip68=20)"),
-            "{line}"
-        );
-        assert!(
-            line.contains("spent_sub(abs=20 strong=5 cold=3 pending=2)"),
-            "{line}"
-        );
+        assert!(line.contains("struct=50ms(spent=30 create_h=5 bip68=20)"), "{line}");
+        assert!(line.contains("spent_sub(abs=20 strong=5 cold=3 pending=2)"), "{line}");
         // write = 12+3+50+40+25+7 = 137
         assert!(line.contains("write=137ms"), "{line}");
         assert!(line.contains("class_a_sub(body=7 head=2"), "{line}");
@@ -2110,10 +2053,7 @@ mod tests {
         assert!(stuffed_dbg.contains("plans=9"), "{stuffed_dbg}");
         assert!(stuffed_sizes.contains("conf_plans=9"), "{stuffed_sizes}");
         for tok in [&stuffed_info, &stuffed_dbg] {
-            assert!(
-                !tok.contains("thru="),
-                "stuffed plans must not revive thru=: {tok}"
-            );
+            assert!(!tok.contains("thru="), "stuffed plans must not revive thru=: {tok}");
         }
         assert!(
             !stuffed_sizes.contains("load thru="),
@@ -2330,10 +2270,7 @@ mod tests {
         assert!(dbg.contains("head_rd("), "{dbg}");
         assert!(dbg.contains("pend=3"), "{dbg}");
         assert!(dbg.contains("probe_us/key="), "{dbg}");
-        assert!(
-            dbg.contains("sh_src pin=7 cold=3") || dbg.contains("sh collect=9"),
-            "{dbg}"
-        );
+        assert!(dbg.contains("sh_src pin=7 cold=3") || dbg.contains("sh collect=9"), "{dbg}");
         // Zero-key / zero-block edge arms in the same helpers.
         s.arch_resolve_blocks = 0;
         s.arch_prep_head_keys = 0;
@@ -2516,10 +2453,7 @@ mod tests {
         assert!(!line.contains("sticky_fk="), "{line}");
         assert!(line.contains("loadq=3/14 blks=8 wire=2MiB"), "{line}");
         assert!(line.contains("scriptq=2/5 blks=16 wire=12MiB"), "{line}");
-        assert!(
-            line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"),
-            "{line}"
-        );
+        assert!(line.contains("writeq=1/5 blks=16 wire=4MiB parents=500"), "{line}");
         assert!(line.contains("feed ready=8 inflight=32"), "{line}");
         assert!(line.contains("txhead bits=25"), "{line}");
         assert!(line.contains("segs=3 sealed=2"), "{line}");
@@ -2578,10 +2512,7 @@ mod tests {
     fn read_proc_rss_returns_nonzero_on_linux() {
         let r = read_proc_rss();
         // Agent VM is Linux with /proc; RSS should be readable for this process.
-        assert!(
-            r.rss_kb > 0,
-            "expected VmRSS from /proc/self/status, got {r:?}"
-        );
+        assert!(r.rss_kb > 0, "expected VmRSS from /proc/self/status, got {r:?}");
         // Modern kernels expose RssAnon/RssFile on status; at least one side
         // of the split should be non-zero for a running process with heap+.text.
         assert!(
@@ -2594,10 +2525,7 @@ mod tests {
         // anon+file ≈ rss (shmem folded into file; allow small accounting skew).
         let sum = r.anon_kb.saturating_add(r.file_kb);
         let skew = sum.abs_diff(r.rss_kb);
-        assert!(
-            skew <= 1024,
-            "anon+file should ≈ rss (±1MiB): sum={sum} skew={skew} {r:?}"
-        );
+        assert!(skew <= 1024, "anon+file should ≈ rss (±1MiB): sum={sum} skew={skew} {r:?}");
     }
 
     #[test]

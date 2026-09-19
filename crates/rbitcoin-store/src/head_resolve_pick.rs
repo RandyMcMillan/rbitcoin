@@ -157,14 +157,8 @@ mod tests {
     use crate::height_fence::{FenceRun, HeightFence};
 
     fn fence_on(fks: &[u64]) -> HeightFence {
-        let runs: Vec<FenceRun> = fks
-            .iter()
-            .map(|&id| FenceRun {
-                first_fk: id,
-                count: 1,
-                height: 0,
-            })
-            .collect();
+        let runs: Vec<FenceRun> =
+            fks.iter().map(|&id| FenceRun { first_fk: id, count: 1, height: 0 }).collect();
         HeightFence::from_runs(runs)
     }
 
@@ -237,18 +231,9 @@ mod tests {
 
     #[test]
     fn leftover_miss_classifies_head_body_idx_fence() {
-        assert_eq!(
-            classify_leftover_miss(0, false, false),
-            LeftoverMissOn::Head
-        );
-        assert_eq!(
-            classify_leftover_miss(3, false, false),
-            LeftoverMissOn::Body
-        );
-        assert_eq!(
-            classify_leftover_miss(3, true, false),
-            LeftoverMissOn::Fence
-        );
+        assert_eq!(classify_leftover_miss(0, false, false), LeftoverMissOn::Head);
+        assert_eq!(classify_leftover_miss(3, false, false), LeftoverMissOn::Body);
+        assert_eq!(classify_leftover_miss(3, true, false), LeftoverMissOn::Fence);
         assert_eq!(classify_leftover_miss(3, true, true), LeftoverMissOn::Idx);
         assert_eq!(LeftoverMissOn::Head.as_str(), "head");
         assert_eq!(LeftoverMissOn::Body.as_str(), "body");
@@ -290,10 +275,7 @@ mod tests {
         assert!(pick_winner(&cands[0], filled[0], &want, &map, Some(&ht)).is_some());
         skip[0] = true;
         let shot_b = next_id_shot(&cands, &filled, &skip, usize::MAX);
-        assert!(
-            shot_b.is_empty(),
-            "connected in shot A must not fetch the tail"
-        );
+        assert!(shot_b.is_empty(), "connected in shot A must not fetch the tail");
     }
 
     #[test]

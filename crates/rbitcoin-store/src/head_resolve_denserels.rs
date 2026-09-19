@@ -89,10 +89,7 @@ fn hex_bytes(b: &[u8]) -> String {
 }
 
 fn format_leftover_probe_diag(d: &crate::head_resolve_stats::LeftoverProbeDiag) -> String {
-    let age = d
-        .sealed_age
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "-".into());
+    let age = d.sealed_age.map(|a| a.to_string()).unwrap_or_else(|| "-".into());
     let mut s = format!(
         "leftover probe diag txid={} mix={} page_base={} bits={} file_id={} first_fk={} age={} \
          hit_empty={} depth_end={} empty_local={} occ={} hop2eq={} ncand={}",
@@ -213,10 +210,11 @@ fn resolve_fk_and_range_batch_opts(
         return Ok(Vec::new());
     }
     match io_backend::read_io_backend() {
-        ReadIoBackend::Uring => map_uring_resolve(
-            resolve_fk_and_range_uring(table, txids, heights, tip_only),
-            || resolve_fk_and_range_pread(table, txids, heights, tip_only),
-        ),
+        ReadIoBackend::Uring => {
+            map_uring_resolve(resolve_fk_and_range_uring(table, txids, heights, tip_only), || {
+                resolve_fk_and_range_pread(table, txids, heights, tip_only)
+            })
+        }
         ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids, heights, tip_only),
     }
 }
@@ -281,9 +279,7 @@ fn resolve_identity_core(
 
     let t_probe = Instant::now();
     let open =
-        table
-            .head
-            .probe_candidates_batch_wave(&mixed, HeadProbeWave::Open, None, &mut ctx)?;
+        table.head.probe_candidates_batch_wave(&mixed, HeadProbeWave::Open, None, &mut ctx)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &open));
     id_idx_wave(
@@ -412,17 +408,11 @@ fn attach_loc_to_identity(
                 crate::uring_session::note_uring_invariant(
                     crate::uring_session::UringInvariant::IdxRangeMissing,
                 );
-                return Err(StoreError::Corrupt(
-                    "invariant: loc range missing after identity",
-                ));
+                return Err(StoreError::Corrupt("invariant: loc range missing after identity"));
             }
         }
     }
-    Ok(txids
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, winner[i]))
-        .collect())
+    Ok(txids.iter().enumerate().map(|(i, t)| (*t, winner[i])).collect())
 }
 
 /// Connected if a height fence is set, else any winner.
@@ -452,9 +442,7 @@ fn unfinished_mask(
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> Vec<bool> {
-    (0..picked.len())
-        .map(|i| !key_finished(i, picked, connected, heights))
-        .collect()
+    (0..picked.len()).map(|i| !key_finished(i, picked, connected, heights)).collect()
 }
 
 #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
@@ -696,10 +684,7 @@ mod tests {
         let mut pread_hits = 0u32;
         let out = map_uring_resolve(Err(StoreError::Unavailable), || {
             pread_hits += 1;
-            Ok(vec![(
-                [0u8; 32],
-                None::<(Fk, crate::create_loc::CreateLocPair)>,
-            )])
+            Ok(vec![([0u8; 32], None::<(Fk, crate::create_loc::CreateLocPair)>)])
         })
         .unwrap();
         assert_eq!(pread_hits, 1);
@@ -795,12 +780,7 @@ mod tests {
     fn resolve_records_winner_age_open_segment() {
         let _ = crate::head_resolve_stats::sample_and_reset();
         let (dir, t, txids) = seed_table(16);
-        assert_eq!(
-            t.head.segment_count(),
-            1,
-            "unexpected segs={}",
-            t.head.segment_count()
-        );
+        assert_eq!(t.head.segment_count(), 1, "unexpected segs={}", t.head.segment_count());
         let first = t.head.first_fks_snapshot();
         assert_eq!(first, vec![1]);
         let got = resolve_fk_and_range_batch(&t, &txids).unwrap();
@@ -845,10 +825,8 @@ mod tests {
         let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
         let full = t.head.probe_candidates_batch(&mixed).unwrap();
         let open = t.head.probe_candidates_batch_open(&mixed).unwrap();
-        let mid = t
-            .head
-            .probe_candidates_batch_sealed_hot(&mixed, &vec![true; mixed.len()])
-            .unwrap();
+        let mid =
+            t.head.probe_candidates_batch_sealed_hot(&mixed, &vec![true; mixed.len()]).unwrap();
         let active = vec![true; mixed.len()];
         let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
         let merged = merge_cands(&[open.clone(), mid.clone(), cold.clone()]);
@@ -902,33 +880,23 @@ mod tests {
         let first = t.head.first_fks_snapshot();
         let mixed: Vec<[u8; 32]> = txids.iter().map(|x| t.secret.mix_txid(x)).collect();
         let open = t.head.probe_candidates_batch_open(&mixed).unwrap();
-        let mid = t
-            .head
-            .probe_candidates_batch_sealed_hot(&mixed, &vec![true; mixed.len()])
-            .unwrap();
+        let mid =
+            t.head.probe_candidates_batch_sealed_hot(&mixed, &vec![true; mixed.len()]).unwrap();
         let active = vec![true; mixed.len()];
         let cold = t.head.probe_candidates_batch_cold(&mixed, &active).unwrap();
         let full = t.head.probe_candidates_batch(&mixed).unwrap();
         let merged = merge_cands(&[open.clone(), mid.clone(), cold.clone()]);
         assert_eq!(merged, full, "open∪sealed_hot∪cold must equal full probe");
-        let mid_off = t
-            .head
-            .probe_candidates_batch_sealed_hot(&mixed, &vec![false; mixed.len()])
-            .unwrap();
+        let mid_off =
+            t.head.probe_candidates_batch_sealed_hot(&mixed, &vec![false; mixed.len()]).unwrap();
         assert!(
             mid_off.iter().all(|c| c.is_empty()),
             "inactive sealed-hot mask must skip every key"
         );
-        let hit = mid
-            .iter()
-            .position(|c| !c.is_empty())
-            .expect("expected sealed-hot cands");
+        let hit = mid.iter().position(|c| !c.is_empty()).expect("expected sealed-hot cands");
         let mut one = vec![false; mixed.len()];
         one[hit] = true;
-        let mid_one = t
-            .head
-            .probe_candidates_batch_sealed_hot(&mixed, &one)
-            .unwrap();
+        let mid_one = t.head.probe_candidates_batch_sealed_hot(&mixed, &one).unwrap();
         assert_eq!(mid_one[hit], mid[hit]);
         for (i, c) in mid_one.iter().enumerate() {
             if i != hit {
@@ -943,19 +911,11 @@ mod tests {
             }
             for &fk in &mid[i] {
                 let age = crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0).unwrap();
-                assert!(
-                    age <= HEAD_PROBE_HOT_MAX_AGE,
-                    "sealed-hot cand fk={} age={age}",
-                    fk.0
-                );
+                assert!(age <= HEAD_PROBE_HOT_MAX_AGE, "sealed-hot cand fk={} age={age}", fk.0);
             }
             for &fk in &cold[i] {
                 let age = crate::head_resolve_stats::sealed_age_for_fk(&first, fk.0).unwrap();
-                assert!(
-                    age > HEAD_PROBE_HOT_MAX_AGE,
-                    "cold cand fk={} age={age}",
-                    fk.0
-                );
+                assert!(age > HEAD_PROBE_HOT_MAX_AGE, "cold cand fk={} age={age}", fk.0);
                 saw_cold = true;
             }
         }
@@ -966,10 +926,7 @@ mod tests {
             !open[0].iter().any(|f| f.0 == 1) && !mid[0].iter().any(|f| f.0 == 1),
             "oldest create must not be in open or sealed-hot"
         );
-        assert!(
-            cold[0].iter().any(|f| f.0 == 1),
-            "oldest create must be in cold"
-        );
+        assert!(cold[0].iter().any(|f| f.0 == 1), "oldest create must be in cold");
         let open_i = txids.len() - 1;
         let hot_i = hit;
         let cold_i = 0;
@@ -1056,10 +1013,7 @@ mod tests {
             .expect("standalone loc must not fail-close on a poisoned probe ring");
         assert_eq!(got[0].unwrap().txout, t.body_range(Fk(1)).unwrap());
         assert_eq!(got[1].unwrap().txout, t.body_range(Fk(2)).unwrap());
-        match t
-            .create_loc
-            .range_batch_ctx(&[Fk(1)], &mut crate::IoCtx::held(&mut sess))
-        {
+        match t.create_loc.range_batch_ctx(&[Fk(1)], &mut crate::IoCtx::held(&mut sess)) {
             Err(e) => {
                 let m = format!("{e}");
                 assert!(m.contains("poisoned") || m.contains("io_uring"), "{m}");
@@ -1074,13 +1028,7 @@ mod tests {
     #[test]
     fn attach_loc_missing_after_identity_is_corrupt() {
         let (dir, t, txids) = seed_table(2);
-        match attach_loc_to_identity(
-            &t,
-            &[txids[0]],
-            IdentityHits {
-                picked: vec![Some(Fk(99))],
-            },
-        ) {
+        match attach_loc_to_identity(&t, &[txids[0]], IdentityHits { picked: vec![Some(Fk(99))] }) {
             Err(StoreError::Corrupt(m)) => {
                 assert!(m.contains("loc range missing after identity"), "{m}");
             }

@@ -42,25 +42,16 @@ impl TxidBody {
             file.write_at_pwrite(FILE_HEADER_LEN as u64, &pad)?;
             // Logical end already advanced by write_at_pwrite HWM.
         }
-        Ok(Self {
-            file,
-            count: std::sync::atomic::AtomicU64::new(0),
-        })
+        Ok(Self { file, count: std::sync::atomic::AtomicU64::new(0) })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let path = Self::path(dir);
         let file = TableFile::open(path, TableKind::TxidBody)?;
         let len = file.logical_len();
-        let count = if len <= TXID_BODY_HEADER {
-            0
-        } else {
-            (len - TXID_BODY_HEADER) / TXID_ENTRY_LEN
-        };
-        Ok(Self {
-            file,
-            count: std::sync::atomic::AtomicU64::new(count),
-        })
+        let count =
+            if len <= TXID_BODY_HEADER { 0 } else { (len - TXID_BODY_HEADER) / TXID_ENTRY_LEN };
+        Ok(Self { file, count: std::sync::atomic::AtomicU64::new(count) })
     }
 
     fn path(dir: &Path) -> PathBuf {
@@ -84,8 +75,7 @@ impl TxidBody {
         }
         let new_len = TXID_BODY_HEADER + new_count * TXID_ENTRY_LEN;
         self.file.set_logical_len(new_len)?;
-        self.count
-            .store(new_count, std::sync::atomic::Ordering::Release);
+        self.count.store(new_count, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -163,10 +153,7 @@ impl TxidBody {
         let mut buf = [0u8; 32];
         let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut buf);
         if rc < 0 {
-            return Err(StoreError::io(
-                self.file.path(),
-                std::io::Error::from_raw_os_error(-rc),
-            ));
+            return Err(StoreError::io(self.file.path(), std::io::Error::from_raw_os_error(-rc)));
         }
         if (rc as usize) != 32 {
             self.file.pread_at(off, &mut buf)?;
@@ -188,10 +175,7 @@ impl TxidBody {
         let mut blob = vec![0u8; count * 32];
         let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut blob);
         if rc < 0 {
-            return Err(StoreError::io(
-                self.file.path(),
-                std::io::Error::from_raw_os_error(-rc),
-            ));
+            return Err(StoreError::io(self.file.path(), std::io::Error::from_raw_os_error(-rc)));
         }
         if (rc as usize) != blob.len() {
             self.file.pread_at(off, &mut blob)?;
@@ -319,12 +303,7 @@ impl TxidBody {
                 let ptr = blob.as_mut_ptr();
                 let len = blob.len();
                 let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                ops.push(ReadOp {
-                    fd,
-                    offset: off,
-                    buf: slice,
-                    result: i32::MIN,
-                });
+                ops.push(ReadOp { fd, offset: off, buf: slice, result: i32::MIN });
             }
             used_session = crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops)?;
             if used_session {
@@ -379,10 +358,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("rbitcoin-txid-body-{n}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -490,15 +466,9 @@ mod tests {
         // No-op truncate to same count.
         t.truncate_to_count(2).unwrap();
         // Past-count truncate is corrupt.
-        assert!(matches!(
-            t.truncate_to_count(5),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(t.truncate_to_count(5), Err(StoreError::Corrupt(_))));
         // Append at wrong expected count.
-        assert!(matches!(
-            t.append_batch(0, &[[0u8; 32]]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(t.append_batch(0, &[[0u8; 32]]), Err(StoreError::Corrupt(_))));
         // Empty append is fine.
         t.append_batch(2, &[]).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

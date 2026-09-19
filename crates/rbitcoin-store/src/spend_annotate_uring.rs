@@ -106,11 +106,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 let abs = work[edge_i].0;
                 abs_busy.insert(abs);
                 let slot = free_slots.pop().unwrap();
-                slots[slot] = Some(Slot {
-                    edge_i,
-                    phase: Phase::Reading,
-                    buf: [0u8; META_LEN],
-                });
+                slots[slot] = Some(Slot { edge_i, phase: Phase::Reading, buf: [0u8; META_LEN] });
                 {
                     let s = slots[slot].as_mut().unwrap();
                     let ud = uring_session::pack_ud(
@@ -152,9 +148,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 if slot >= slots.len() {
                     return Err(StoreError::Corrupt("spend annotate bad user_data"));
                 }
-                let mut st = slots[slot]
-                    .take()
-                    .ok_or(StoreError::Corrupt("spend annotate empty slot"))?;
+                let mut st =
+                    slots[slot].take().ok_or(StoreError::Corrupt("spend annotate empty slot"))?;
                 let expect = match st.phase {
                     Phase::Reading => uring_session::KIND_SPEND_META_READ,
                     Phase::Writing => uring_session::KIND_SPEND_META_WRITE,
@@ -386,11 +381,7 @@ fn group_writes_by_spent_page(writes: &[SpentAbsWrite], body_pub: u64) -> Vec<Sp
         let Some((off, len)) = clip_spent_page_window(lo, hi, body_pub) else {
             return;
         };
-        groups.push(SpentPageGroup {
-            off,
-            len,
-            writes: cur,
-        });
+        groups.push(SpentPageGroup { off, len, writes: cur });
     };
 
     for &w in writes {
@@ -419,9 +410,7 @@ fn poke_spent_page(buf: &mut [u8], off: u64, writes: &[SpentAbsWrite]) -> Result
     for &(abs, _, _, _, _, meta) in writes {
         let i = abs.saturating_sub(off) as usize;
         if i.saturating_add(META_LEN) > buf.len() {
-            return Err(StoreError::Corrupt(
-                "spend annotate poke outside page window",
-            ));
+            return Err(StoreError::Corrupt("spend annotate poke outside page window"));
         }
         buf[i..i + META_LEN].copy_from_slice(&meta);
     }
@@ -501,11 +490,7 @@ fn put_spend_batch_pure_write_pwrite(
     let groups = group_writes_by_spent_page(writes, body_pub);
     for g in &groups {
         let mut buf = vec![0u8; g.len];
-        if txs
-            .spent
-            .read_prefix_at(g.off, g.len as u64, &mut buf)
-            .is_err()
-        {
+        if txs.spent.read_prefix_at(g.off, g.len as u64, &mut buf).is_err() {
             cold_group_edges(&mut cold, &g.writes);
             continue;
         }
@@ -607,9 +592,8 @@ fn put_spend_batch_pure_write_uring(
                 if slot >= slots.len() {
                     return Err(StoreError::Corrupt("spend pure-write bad user_data"));
                 }
-                let mut st = slots[slot]
-                    .take()
-                    .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
+                let mut st =
+                    slots[slot].take().ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
                 let expect = match st.phase {
                     Phase::Reading => uring_session::KIND_SPEND_PAGE_READ,
                     Phase::Writing => uring_session::KIND_SPEND_PAGE_WRITE,
@@ -721,9 +705,7 @@ mod tests {
             witness: vec![],
         }];
         let outputs = vec![OutputRecord::unspent(50, vec![0x51]); n_out as usize];
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outputs)], false).unwrap()[0];
         let (off, len) = t.spent_range_batch(&[fk]).unwrap()[0].unwrap();
         (fk, off, len)
     }
@@ -734,10 +716,9 @@ mod tests {
 
     #[test]
     fn pure_write_known_null_mmap_and_uring() {
-        for backend in [
-            crate::io_backend::WriteIoBackend::Uring,
-            crate::io_backend::WriteIoBackend::Pwrite,
-        ] {
+        for backend in
+            [crate::io_backend::WriteIoBackend::Uring, crate::io_backend::WriteIoBackend::Pwrite]
+        {
             let (dir, t, spenders) = temp_table();
             let (cfk, off, _len) = put_one(&t);
             let abs = crate::tx_table::spent_abs(off, 0);
@@ -861,16 +842,12 @@ mod tests {
         };
         let pin = std::sync::Arc::new((
             tx,
-            vec![
-                OutputRecord::unspent(7, vec![0x51]),
-                OutputRecord::unspent(8, vec![0x52]),
-            ],
+            vec![OutputRecord::unspent(7, vec![0x51]), OutputRecord::unspent(8, vec![0x52])],
         ));
         let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
         let sfk = Fk(9);
-        let (fks, _loc) = t
-            .put_full_batch_from_pins(&[(pin, ins)], false, &[vec![(0u32, sfk, 0)]])
-            .unwrap();
+        let (fks, _loc) =
+            t.put_full_batch_from_pins(&[(pin, ins)], false, &[vec![(0u32, sfk, 0)]]).unwrap();
         let cfk = fks[0];
         let (off, _) = t.spent_range(cfk).unwrap();
         let abs = crate::tx_table::spent_abs(off, 0);
@@ -896,11 +873,7 @@ mod tests {
             )
             .unwrap();
             assert!(cold_u.is_empty());
-            assert_eq!(
-                uring_session::tls_take_sqe_n(),
-                0,
-                "Skip must not page-RMW spent.body"
-            );
+            assert_eq!(uring_session::tls_take_sqe_n(), 0, "Skip must not page-RMW spent.body");
         }
         let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
         assert_eq!(bulk2[0].unwrap().0, sfk);
@@ -953,10 +926,9 @@ mod tests {
     /// Two vouts on one page: both land; a third slot on that page is unchanged.
     #[test]
     fn pure_write_two_vouts_same_page_preserves_neighbor() {
-        for backend in [
-            crate::io_backend::WriteIoBackend::Uring,
-            crate::io_backend::WriteIoBackend::Pwrite,
-        ] {
+        for backend in
+            [crate::io_backend::WriteIoBackend::Uring, crate::io_backend::WriteIoBackend::Pwrite]
+        {
             let (dir, t, spenders) = temp_table();
             let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
             let abs0 = crate::tx_table::spent_abs(off, 0);
@@ -996,25 +968,14 @@ mod tests {
             .unwrap();
             assert!(cold.is_empty());
 
-            let bulk = t
-                .get_spender_meta_at_abs_batch(&[abs0, abs1, abs2])
-                .unwrap();
+            let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs1, abs2]).unwrap();
             assert_eq!(bulk[0].unwrap().0, Fk(10));
-            assert_eq!(
-                bulk[1].unwrap().0,
-                sentinel,
-                "neighbor slot must be preserved"
-            );
+            assert_eq!(bulk[1].unwrap().0, sentinel, "neighbor slot must be preserved");
             assert_eq!(bulk[2].unwrap().0, Fk(12));
 
             let mut hdr_after = [0u8; crate::file::FILE_HEADER_LEN];
-            t.spent
-                .read_prefix_at(0, crate::file::FILE_HEADER_LEN as u64, &mut hdr_after)
-                .unwrap();
-            assert_eq!(
-                hdr_before, hdr_after,
-                "page 0 RMW must not rewrite file header"
-            );
+            t.spent.read_prefix_at(0, crate::file::FILE_HEADER_LEN as u64, &mut hdr_after).unwrap();
+            assert_eq!(hdr_before, hdr_after, "page 0 RMW must not rewrite file header");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -1022,20 +983,15 @@ mod tests {
     /// Vouts whose abs straddle a 4 KiB page both persist.
     #[test]
     fn pure_write_two_pages_both_land() {
-        for backend in [
-            crate::io_backend::WriteIoBackend::Uring,
-            crate::io_backend::WriteIoBackend::Pwrite,
-        ] {
+        for backend in
+            [crate::io_backend::WriteIoBackend::Uring, crate::io_backend::WriteIoBackend::Pwrite]
+        {
             let (dir, t, spenders) = temp_table();
             // 512 × 8 B from file offset 16 crosses 4096 (slot 510 starts at 4096).
             let (cfk, off, _len) = put_n_outs(&t, 512, 0x33);
             let abs0 = crate::tx_table::spent_abs(off, 0);
             let abs_last = crate::tx_table::spent_abs(off, 511);
-            assert_ne!(
-                abs0 & !0xfff,
-                abs_last & !0xfff,
-                "fixture must straddle a 4 KiB page"
-            );
+            assert_ne!(abs0 & !0xfff, abs_last & !0xfff, "fixture must straddle a 4 KiB page");
             let k0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
             let k1 = t.get_spender_meta_at_abs_batch(&[abs_last]).unwrap()[0].unwrap();
             let cold = put_spend_batch_by_abs_meta_known(
@@ -1093,10 +1049,8 @@ mod tests {
     fn group_writes_by_spent_page_merges_same_page() {
         let meta = [1u8; META_LEN];
         let slot = META_LEN as u64;
-        let writes = [
-            (16u64, Fk(1), 0, Fk(10), 0, meta),
-            (16 + 2 * slot, Fk(1), 2, Fk(12), 0, meta),
-        ];
+        let writes =
+            [(16u64, Fk(1), 0, Fk(10), 0, meta), (16 + 2 * slot, Fk(1), 2, Fk(12), 0, meta)];
         let rec = 3 * slot;
         let g = group_writes_by_spent_page(&writes, 16 + rec);
         assert_eq!(g.len(), 1);
@@ -1108,10 +1062,8 @@ mod tests {
     #[test]
     fn group_writes_by_spent_page_keeps_distinct_pages() {
         let meta = [1u8; META_LEN];
-        let writes = [
-            (16u64, Fk(1), 0, Fk(10), 0, meta),
-            (4096u64 + 16, Fk(2), 0, Fk(12), 0, meta),
-        ];
+        let writes =
+            [(16u64, Fk(1), 0, Fk(10), 0, meta), (4096u64 + 16, Fk(2), 0, Fk(12), 0, meta)];
         let g = group_writes_by_spent_page(&writes, 4096 + 16 + META_LEN as u64);
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].off, crate::file::FILE_HEADER_LEN as u64);
@@ -1126,10 +1078,7 @@ mod tests {
         let first = 4096u64 - 3;
         let second = first + slot;
         let end = second + slot;
-        let writes = [
-            (first, Fk(1), 0, Fk(10), 0, meta),
-            (second, Fk(1), 1, Fk(11), 0, meta),
-        ];
+        let writes = [(first, Fk(1), 0, Fk(10), 0, meta), (second, Fk(1), 1, Fk(11), 0, meta)];
         let g = group_writes_by_spent_page(&writes, end);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].writes.len(), 2);

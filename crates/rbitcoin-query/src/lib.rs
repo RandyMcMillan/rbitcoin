@@ -438,8 +438,7 @@ impl Query {
         if max_fk == 0 {
             return;
         }
-        self.head_drain_fk
-            .fetch_max(max_fk, AtomicOrdering::Release);
+        self.head_drain_fk.fetch_max(max_fk, AtomicOrdering::Release);
     }
 
     pub fn head_drain_fk(&self) -> u64 {
@@ -452,21 +451,14 @@ impl Query {
     /// after the last batch of that wave. `None` when drain is 0 or the drain
     /// fk is not on the fence (Class C/fence can lead unpublished head).
     pub fn drain_and_fence_hi(&self) -> Option<u32> {
-        self.store
-            .height_fence_snapshot()
-            .drain_and_fence_hi(self.head_drain_fk())
+        self.store.height_fence_snapshot().drain_and_fence_hi(self.head_drain_fk())
     }
 
     /// Record a tip shrink so load can drop in-flight layers for that height.
     pub(crate) fn note_disconnect_height(&self, height: u32) {
-        self.disconnect_height
-            .store(height, AtomicOrdering::Release);
+        self.disconnect_height.store(height, AtomicOrdering::Release);
         self.disconnect_gen.fetch_add(1, AtomicOrdering::Release);
-        let rewind = if height == 0 {
-            None
-        } else {
-            Some(height.saturating_sub(1))
-        };
+        let rewind = if height == 0 { None } else { Some(height.saturating_sub(1)) };
         self.set_lookup_taken_hi(rewind);
         self.set_lookup_started_hi(rewind);
         self.set_class_a_hi(rewind);
@@ -493,20 +485,17 @@ impl Query {
 
     /// Request in-flight confirm to abort cooperative load (IBD SIGINT).
     pub fn request_confirm_cancel(&self) {
-        self.confirm_cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.confirm_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Clear cancel before a new confirm/IBD session.
     pub fn clear_confirm_cancel(&self) {
-        self.confirm_cancel
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.confirm_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// True after [`Self::request_confirm_cancel`] until cleared.
     pub fn confirm_cancelled(&self) -> bool {
-        self.confirm_cancel
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.confirm_cancel.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Last height with SH creates applied (after tip). `None` if empty chain.
@@ -573,8 +562,7 @@ impl Query {
     }
 
     pub(crate) fn note_reconstruct_archived(&self) {
-        self.reconstruct_archived
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.reconstruct_archived.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Sample-and-reset packed body bytes read by thin BIP-352 serve.
@@ -584,8 +572,7 @@ impl Query {
 
     pub(crate) fn note_thin_tweak_body_bytes(&self, n: u64) {
         if n > 0 {
-            self.thin_tweak_body_bytes
-                .fetch_add(n, AtomicOrdering::Relaxed);
+            self.thin_tweak_body_bytes.fetch_add(n, AtomicOrdering::Relaxed);
         }
     }
 
@@ -599,8 +586,7 @@ impl Query {
     /// Direct IBD and Tip both annotate after Class C (`post_commit` on the wire
     /// path; [`Query::confirm_block`] on the Query Class C-only path).
     pub fn set_spend_index(&self, enabled: bool) {
-        self.spend_index
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        self.spend_index.store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn spend_index_enabled(&self) -> bool {
@@ -662,8 +648,7 @@ impl Query {
     /// Enable/disable txid hash-head inserts on archive (default on). Off under
     /// milestone IBD; Class A bodies remain complete via header_txs fk lists.
     pub fn set_tx_index(&self, enabled: bool) {
-        self.tx_index
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        self.tx_index.store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn tx_index_enabled(&self) -> bool {
@@ -696,14 +681,11 @@ impl Query {
     /// [`Self::block_queue_offer`]. `rate_blocks_per_s` is accepted for call-site
     /// compatibility; restriction is byte-only (window size is separate).
     pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
-        self.soft_confirm_window.store(
-            soft_confirm_window_n(rate_blocks_per_s),
-            AtomicOrdering::Relaxed,
-        );
+        self.soft_confirm_window
+            .store(soft_confirm_window_n(rate_blocks_per_s), AtomicOrdering::Relaxed);
         let depth_bytes = self.block_queue.lock().unwrap().bytes();
         let restricted = soft_assign_restricted(depth_bytes);
-        self.block_queue_pressure
-            .store(restricted, AtomicOrdering::Relaxed);
+        self.block_queue_pressure.store(restricted, AtomicOrdering::Relaxed);
         restricted
     }
 
@@ -724,8 +706,7 @@ impl Query {
 
     /// Publish lookup consume high-water. `None` resets (disconnect / reject).
     pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
-        self.lookup_taken_hi
-            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+        self.lookup_taken_hi.store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
     pub fn lookup_started_hi(&self) -> Option<u32> {
@@ -738,8 +719,7 @@ impl Query {
     }
 
     pub fn set_lookup_started_hi(&self, hi: Option<u32>) {
-        self.lookup_started_hi
-            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+        self.lookup_started_hi.store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
     /// Advance [`Self::lookup_started_hi`] to `hi` if higher (never rewind).
@@ -758,8 +738,7 @@ impl Query {
     }
 
     pub fn set_class_a_hi(&self, hi: Option<u32>) {
-        self.class_a_hi
-            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+        self.class_a_hi.store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
     /// Keep Class A append loc until write of the last height whose TipOnly
@@ -998,11 +977,7 @@ impl Query {
             if let Some(w) = g.resolved.get(&h) {
                 out.resolved.push((h, w.clone()));
             } else if g.has_raw(h) {
-                out.raw.push((
-                    h,
-                    g.input_count_at(h).unwrap_or(0),
-                    g.header_fk_at(h).unwrap_or(0),
-                ));
+                out.raw.push((h, g.input_count_at(h).unwrap_or(0), g.header_fk_at(h).unwrap_or(0)));
             }
         }
         out
@@ -1055,17 +1030,11 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
-        let h2h_keys = self
-            .height_by_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map
-            .len();
+        let h2h_keys = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner()).map.len();
         let mut head = self.store.txs.head_resize_size_snapshot();
         head.class_c_l2_bytes = self.store.class_c_l2_resident_bytes();
-        head.mphf_g_bytes = head
-            .mphf_g_bytes
-            .saturating_add(self.store.scripthash.mphf_g_resident_bytes());
+        head.mphf_g_bytes =
+            head.mphf_g_bytes.saturating_add(self.store.scripthash.mphf_g_resident_bytes());
         head.mphf_occ_bytes = self.store.scripthash.mphf_occ_resident_bytes();
         ProcessOwnedSizes {
             conf_plans,
@@ -1272,8 +1241,7 @@ impl Query {
         spending_tx_fk: Fk,
         spending_vin: u32,
     ) -> Result<Fk, QueryError> {
-        self.store
-            .put_spend(out_txid, out_index, spending_tx_fk, spending_vin)
+        self.store.put_spend(out_txid, out_index, spending_tx_fk, spending_vin)
     }
 
     /// Strong (best-chain confirmed) spenders only.
@@ -1393,14 +1361,7 @@ impl Query {
             &children,
             &mut score_memo,
         )?;
-        self.resume_walk_best_kids(
-            tip_fk,
-            tip_height,
-            max,
-            best_sib,
-            &children,
-            &mut score_memo,
-        )
+        self.resume_walk_best_kids(tip_fk, tip_height, max, best_sib, &children, &mut score_memo)
     }
 
     fn resume_index_children(
@@ -1500,12 +1461,7 @@ impl Query {
     ) -> Result<Vec<ResumeWorkEntry>, QueryError> {
         let mut out = Vec::with_capacity(max.min(4096));
         let (mut cur_fk, mut height) = if let Some((fk, hash, has_body, sib_h)) = best_sib {
-            out.push(ResumeWorkEntry {
-                height: sib_h,
-                hash,
-                header_fk: fk,
-                has_body,
-            });
+            out.push(ResumeWorkEntry { height: sib_h, hash, header_fk: fk, has_body });
             (fk, sib_h)
         } else {
             (tip_fk, tip_height)
@@ -1545,12 +1501,7 @@ impl Query {
                 break;
             };
             height = height.saturating_add(1);
-            out.push(ResumeWorkEntry {
-                height,
-                hash,
-                header_fk: fk,
-                has_body,
-            });
+            out.push(ResumeWorkEntry { height, hash, header_fk: fk, has_body });
             cur_fk = fk;
         }
         Ok(out)
@@ -1620,9 +1571,9 @@ impl Query {
             }
             memo.insert(fk.0, (own + best_child_w, best_depth.saturating_add(1)));
         }
-        memo.get(&root.0).copied().ok_or(StoreError::Corrupt(
-            "resume_subtree_score: root missing after walk",
-        ))
+        memo.get(&root.0)
+            .copied()
+            .ok_or(StoreError::Corrupt("resume_subtree_score: root missing after walk"))
     }
 
     /// Flush header rows + Class A body associations (IBD writer durability).

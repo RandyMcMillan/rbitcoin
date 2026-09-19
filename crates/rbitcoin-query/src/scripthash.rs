@@ -206,12 +206,7 @@ fn history_items_from_joined(
     }
     let items: Vec<ScriptHashHistoryItem> = by_txid
         .into_iter()
-        .map(|(txid, (height, tx_fk))| ScriptHashHistoryItem {
-            height,
-            txid,
-            tx_fk,
-            fee: None,
-        })
+        .map(|(txid, (height, tx_fk))| ScriptHashHistoryItem { height, txid, tx_fk, fee: None })
         .collect();
     apply_history_filter(&items, filter)
 }
@@ -311,14 +306,8 @@ pub(crate) struct ShJoinNeed {
 }
 
 impl ShJoinNeed {
-    pub(crate) const HISTORY: Self = Self {
-        create_identity: true,
-        spender_identity: true,
-    };
-    pub(crate) const BALANCE: Self = Self {
-        create_identity: false,
-        spender_identity: false,
-    };
+    pub(crate) const HISTORY: Self = Self { create_identity: true, spender_identity: true };
+    pub(crate) const BALANCE: Self = Self { create_identity: false, spender_identity: false };
     pub(crate) const LISTUNSPENT: Self = Self::BALANCE;
     pub(crate) const CHAIN_STATS: Self = Self::BALANCE;
 }
@@ -347,43 +336,27 @@ impl Query {
         }
         let loaded = super::load_creates_once(&self.store, fks, IdxBodyMode::Outs)?;
         if loaded.len() != fks.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: SH create body missing after load",
-            ));
+            return Err(StoreError::Corrupt("invariant: SH create body missing after load"));
         }
-        let txids = if need.create_identity {
-            self.store.txids_get_many(fks)?
-        } else {
-            Vec::new()
-        };
+        let txids = if need.create_identity { self.store.txids_get_many(fks)? } else { Vec::new() };
         let heights = self.store.tx_height_get_batch(fks)?;
         if need.create_identity && txids.len() != fks.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: SH create identity batch length",
-            ));
+            return Err(StoreError::Corrupt("invariant: SH create identity batch length"));
         }
         if heights.len() != fks.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: SH create height batch length",
-            ));
+            return Err(StoreError::Corrupt("invariant: SH create height batch length"));
         }
         let mut out = Vec::new();
         for (i, create) in loaded.iter().enumerate() {
             if create.fk != fks[i] {
-                return Err(StoreError::Corrupt(
-                    "invariant: SH create load order mismatch",
-                ));
+                return Err(StoreError::Corrupt("invariant: SH create load order mismatch"));
             }
             let Some((_tx, outs, _rels)) = &create.decoded_outs else {
-                return Err(StoreError::Corrupt(
-                    "invariant: SH create missing decoded outs",
-                ));
+                return Err(StoreError::Corrupt("invariant: SH create missing decoded outs"));
             };
             let txid = if need.create_identity {
                 let Some(txid) = txids[i] else {
-                    return Err(StoreError::Corrupt(
-                        "invariant: SH create missing txid.body",
-                    ));
+                    return Err(StoreError::Corrupt("invariant: SH create missing txid.body"));
                 };
                 txid
             } else {
@@ -455,20 +428,12 @@ impl Query {
         if let Some(to) = to_height {
             let heights = self.store.tx_height_get_batch(&fks)?;
             if heights.len() != fks.len() {
-                return Err(StoreError::Corrupt(
-                    "invariant: SH create height batch length",
-                ));
+                return Err(StoreError::Corrupt("invariant: SH create height batch length"));
             }
             fks = fks
                 .into_iter()
                 .zip(heights)
-                .filter_map(|(fk, h)| {
-                    if i64::from(h.unwrap_or(0)) >= to {
-                        None
-                    } else {
-                        Some(fk)
-                    }
-                })
+                .filter_map(|(fk, h)| if i64::from(h.unwrap_or(0)) >= to { None } else { Some(fk) })
                 .collect();
         }
         let mut out = Vec::new();
@@ -482,9 +447,7 @@ impl Query {
             out.extend(self.join_spends_wave(&creates, need, view)?);
             spends_us = spends_us.saturating_add(t_s.elapsed().as_micros());
         }
-        let total_us = pages_us
-            .saturating_add(class_a_us)
-            .saturating_add(spends_us);
+        let total_us = pages_us.saturating_add(class_a_us).saturating_add(spends_us);
         if total_us >= 10_000 {
             rbitcoin_log::trace!(
                 "sh_join: creates={} outs={} need={} pages_us={} class_a_us={} spends_us={}",
@@ -521,18 +484,11 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
         view: &ChainView,
     ) -> Result<(), QueryError> {
-        if slot
-            .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view))
-        {
+        if slot.as_ref().is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view)) {
             return Ok(());
         }
         let joined = self.sh_join(scripthash, ShJoinNeed::BALANCE, None, view)?;
-        *slot = Some(ShJoinSlot {
-            scripthash: *scripthash,
-            tip_hash: view.hash,
-            joined,
-        });
+        *slot = Some(ShJoinSlot { scripthash: *scripthash, tip_hash: view.hash, joined });
         Ok(())
     }
 
@@ -565,16 +521,12 @@ impl Query {
         let txids = self.store.txids_get_many(&fks)?;
         let heights = self.store.tx_height_get_batch(&fks)?;
         if txids.len() != fks.len() || heights.len() != fks.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: SH spender identity/height batch length",
-            ));
+            return Err(StoreError::Corrupt("invariant: SH spender identity/height batch length"));
         }
         let mut id_by_fk = HashMap::new();
         for (i, fk) in fks.iter().enumerate() {
             let Some(txid) = txids[i] else {
-                return Err(StoreError::Corrupt(
-                    "invariant: SH spender missing txid.body",
-                ));
+                return Err(StoreError::Corrupt("invariant: SH spender missing txid.body"));
             };
             id_by_fk.insert(*fk, (txid, heights[i].unwrap_or(0)));
         }
@@ -587,11 +539,7 @@ impl Query {
                 let Some((txid, height)) = id_by_fk.get(fk).copied() else {
                     return Err(StoreError::Corrupt("invariant: SH spender identity miss"));
                 };
-                spenders.push(ShSpender {
-                    fk: *fk,
-                    txid,
-                    height,
-                });
+                spenders.push(ShSpender { fk: *fk, txid, height });
             }
             rec.spenders = spenders;
         }
@@ -605,10 +553,7 @@ impl Query {
                 confirmed = confirmed.saturating_add(rec.out.value);
             }
         }
-        Ok(ScriptHashBalance {
-            confirmed,
-            unconfirmed: 0,
-        })
+        Ok(ScriptHashBalance { confirmed, unconfirmed: 0 })
     }
 
     fn listunspent_from_joined(
@@ -723,9 +668,7 @@ impl Query {
             }
             for (i, fk) in spender_fks.iter().enumerate() {
                 let Some(txid) = txids[i] else {
-                    return Err(StoreError::Corrupt(
-                        "invariant: SH spender missing txid.body",
-                    ));
+                    return Err(StoreError::Corrupt("invariant: SH spender missing txid.body"));
                 };
                 id_by_fk.insert(*fk, (txid, heights[i].unwrap_or(0)));
             }
@@ -739,11 +682,7 @@ impl Query {
                     let Some((txid, height)) = id_by_fk.get(fk).copied() else {
                         return Err(StoreError::Corrupt("invariant: SH spender identity miss"));
                     };
-                    spenders.push(ShSpender {
-                        fk: *fk,
-                        txid,
-                        height,
-                    });
+                    spenders.push(ShSpender { fk: *fk, txid, height });
                 }
             }
             out.push(ShJoinedOut {
@@ -866,9 +805,7 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
         view: &ChainView,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let hit = slot
-            .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
+        let hit = slot.as_ref().is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
         if !hit && filter.to_height.is_some() {
             return self.scripthash_history_filtered_in(scripthash, filter, view);
         }
@@ -898,9 +835,7 @@ impl Query {
         slot: &mut Option<ShJoinSlot>,
         view: &ChainView,
     ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
-        let hit = slot
-            .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
+        let hit = slot.as_ref().is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
         if !hit && filter.to_height.is_some() {
             return self.scripthash_history_summary_filtered_in(scripthash, filter, view);
         }
@@ -967,9 +902,7 @@ impl Query {
         scripthash: &[u8; 32],
         height: Height,
     ) -> Result<bool, QueryError> {
-        Ok(!self
-            .scripthash_tx_fks_at_height(scripthash, height)?
-            .is_empty())
+        Ok(!self.scripthash_tx_fks_at_height(scripthash, height)?.is_empty())
     }
 
     /// Confirmed balance for a scripthash.
@@ -1047,16 +980,12 @@ impl Query {
         }
         let txids = self.store.txids_get_many(&fks)?;
         if txids.len() != fks.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: SH unspent identity batch length",
-            ));
+            return Err(StoreError::Corrupt("invariant: SH unspent identity batch length"));
         }
         let mut by_fk = HashMap::new();
         for (fk, txid) in fks.iter().zip(txids) {
             let Some(txid) = txid else {
-                return Err(StoreError::Corrupt(
-                    "invariant: SH create missing txid.body",
-                ));
+                return Err(StoreError::Corrupt("invariant: SH create missing txid.body"));
             };
             by_fk.insert(*fk, txid);
         }
@@ -1287,12 +1216,7 @@ mod history_filter_tests {
     fn item(height: i64, txid0: u8) -> ScriptHashHistoryItem {
         let mut txid = [0u8; 32];
         txid[0] = txid0;
-        ScriptHashHistoryItem {
-            height,
-            txid,
-            tx_fk: Fk::NULL,
-            fee: None,
-        }
+        ScriptHashHistoryItem { height, txid, tx_fk: Fk::NULL, fee: None }
     }
 
     #[test]
@@ -1310,10 +1234,7 @@ mod history_filter_tests {
         let items = vec![item(1, 1), item(5, 2), item(10, 3), item(15, 4)];
         let f = HistoryFilter::height_window(5, Some(15));
         let got = apply_history_filter(&items, &f);
-        assert_eq!(
-            got.iter().map(|i| i.height).collect::<Vec<_>>(),
-            vec![5, 10]
-        );
+        assert_eq!(got.iter().map(|i| i.height).collect::<Vec<_>>(), vec![5, 10]);
     }
 
     #[test]
@@ -1331,10 +1252,7 @@ mod history_filter_tests {
         let mut f = HistoryFilter::open();
         f.order = HistoryOrder::NewestFirst;
         let got = apply_history_filter(&items, &f);
-        assert_eq!(
-            got.iter().map(|i| i.height).collect::<Vec<_>>(),
-            vec![3, 2, 1]
-        );
+        assert_eq!(got.iter().map(|i| i.height).collect::<Vec<_>>(), vec![3, 2, 1]);
     }
 
     #[test]

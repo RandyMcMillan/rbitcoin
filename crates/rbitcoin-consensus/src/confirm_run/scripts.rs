@@ -77,13 +77,7 @@ impl Inflight {
             Ok(w) => w,
             Err(e) => return Err((e, meta)),
         };
-        let inf = Self {
-            batch,
-            wave,
-            meta,
-            t0,
-            done_ns: Cell::new(None),
-        };
+        let inf = Self { batch, wave, meta, t0, done_ns: Cell::new(None) };
         let _ = inf.is_complete();
         Ok(inf)
     }
@@ -97,10 +91,7 @@ impl Inflight {
     }
 
     fn finish(self) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConsensusError> {
-        let work_ns = self
-            .done_ns
-            .get()
-            .unwrap_or_else(|| self.t0.elapsed().as_nanos() as u64);
+        let work_ns = self.done_ns.get().unwrap_or_else(|| self.t0.elapsed().as_nanos() as u64);
         if let Some(w) = self.wave {
             w.finish()?;
         }
@@ -283,12 +274,6 @@ impl ScriptsBatchMeta {
     pub fn from_batch(batch: &LoadedBatch, mat_ns: u64) -> Self {
         let heights_hashes = batch.heights_hashes();
         let first_h = heights_hashes.first().map(|(h, _)| *h).unwrap_or(0);
-        Self {
-            n: batch.len(),
-            first_h,
-            heights_hashes,
-            mat_ns,
-            t0: Instant::now(),
-        }
+        Self { n: batch.len(), first_h, heights_hashes, mat_ns, t0: Instant::now() }
     }
 }

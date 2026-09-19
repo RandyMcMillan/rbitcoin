@@ -80,9 +80,7 @@ pub fn clear_leftover_miss() {
 /// Record the first leftover miss in this batch (later calls ignored).
 pub fn note_leftover_miss(on: LeftoverMissOn, n_cands: u64) {
     LAST_MISS_ON.with(|slot| {
-        if slot
-            .compare_exchange(0, miss_on_code(on), Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
+        if slot.compare_exchange(0, miss_on_code(on), Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             LAST_MISS_CANDS.with(|c| c.store(n_cands, Ordering::Relaxed));
         }
@@ -138,27 +136,18 @@ pub fn leftover_probe_diag_ready() -> bool {
 
 /// True when a leftover hop-dump for `txid` was recorded this process.
 pub fn leftover_probe_diag_recorded(txid: &[u8; 32]) -> bool {
-    RECORDED_PROBE_TXIDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|t| t == txid)
+    RECORDED_PROBE_TXIDS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|t| t == txid)
 }
 
 pub fn take_leftover_probe_diag() -> Option<LeftoverProbeDiag> {
     LAST_PROBE_DIAG_SET.store(0, Ordering::Relaxed);
-    LAST_PROBE_DIAG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
+    LAST_PROBE_DIAG.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 pub(crate) fn note_leftover_probe_diag(diag: LeftoverProbeDiag) {
     LAST_PROBE_DIAG_SET.store(1, Ordering::Relaxed);
     {
-        let mut rec = RECORDED_PROBE_TXIDS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut rec = RECORDED_PROBE_TXIDS.lock().unwrap_or_else(|e| e.into_inner());
         if rec.len() >= 16 {
             rec.remove(0);
         }
@@ -208,9 +197,7 @@ impl Default for Sample {
 
 impl Sample {
     pub fn sum_ns(&self) -> u64 {
-        self.probe_ns
-            .saturating_add(self.idx_ns)
-            .saturating_add(self.body_ns)
+        self.probe_ns.saturating_add(self.idx_ns).saturating_add(self.body_ns)
     }
 
     /// Mean 1-based rank of winning cand (0 if no hits).
@@ -506,10 +493,7 @@ mod tests {
         note_leftover_probe_diag(dummy_probe_diag(ghost));
         note_leftover_miss(LeftoverMissOn::Head, 3);
         clear_leftover_miss();
-        assert!(
-            take_leftover_miss().is_none(),
-            "miss class is per resolve batch"
-        );
+        assert!(take_leftover_miss().is_none(), "miss class is per resolve batch");
         assert!(
             leftover_probe_diag_recorded(&ghost),
             "hop-dump txid must survive the next resolve clear"

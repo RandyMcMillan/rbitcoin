@@ -62,16 +62,9 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         .as_ref()
         .map(|c| c.in_ibd())
         .unwrap_or_else(|| ctx.initial_block_download.load(Ordering::Relaxed));
-    let headers = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.best_header_height())
-        .unwrap_or(tip);
-    let verificationprogress = if headers == 0 {
-        1.0
-    } else {
-        (tip as f64 / headers as f64).clamp(0.0, 1.0)
-    };
+    let headers = ctx.chain.as_ref().map(|c| c.best_header_height()).unwrap_or(tip);
+    let verificationprogress =
+        if headers == 0 { 1.0 } else { (tip as f64 / headers as f64).clamp(0.0, 1.0) };
     let (time, mediantime) = if let Some(h) = ctx.query.tip_height() {
         if let Ok(Some((_, rec))) = ctx.query.header_at_height(h) {
             let mtp = rbitcoin_consensus::median_time_past(ctx.query.as_ref(), h)
@@ -103,21 +96,14 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
 pub(crate) fn rpc_warnings(ctx: &RpcContext) -> Vec<String> {
     let w = rbitcoin_net::warning_strings(ctx.query.as_ref(), ctx.network);
     if !w.is_empty()
-        && ctx
-            .alert_fired
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        && ctx.alert_fired.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
     {
         if let Some(cmd) = ctx.alert_notify.as_deref() {
             let msg = w.join(", ");
             // Core ShellEscape: single-quote so `(versionbit N)` is not a subshell.
             let escaped = format!("'{}'", msg.replace('\'', "'\\''"));
             let shell = cmd.replace("%s", &escaped);
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&shell)
-                .status()
-            {
+            match std::process::Command::new("sh").arg("-c").arg(&shell).status() {
                 Ok(st) if !st.success() => {
                     rbitcoin_log::warn!("alertnotify exited {st}: {shell}");
                 }
@@ -146,10 +132,7 @@ pub(crate) fn difficulty_from_bits(bits: u32) -> f64 {
 }
 
 pub(crate) fn difficulty_at_tip(ctx: &RpcContext) -> Result<f64, Value> {
-    let tip = ctx
-        .query
-        .tip_height()
-        .ok_or_else(|| rpc_error(ERR_MISC, "no tip"))?;
+    let tip = ctx.query.tip_height().ok_or_else(|| rpc_error(ERR_MISC, "no tip"))?;
     let (_, rec) = ctx
         .query
         .header_at_height(tip)
@@ -183,8 +166,7 @@ pub(crate) fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Val
             .wire_header_at_height(height)
             .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
         let mut raw = Vec::new();
-        hdr.consensus_encode(&mut raw)
-            .map_err(|_| rpc_error(ERR_MISC, "header encode"))?;
+        hdr.consensus_encode(&mut raw).map_err(|_| rpc_error(ERR_MISC, "header encode"))?;
         return Ok(json!(hex_encode(raw)));
     }
     let prev = if height.0 > 0 {
@@ -244,14 +226,11 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
         None => opt_verbosity(params, 1, "verbose")?,
     };
     let hash = parse_hash32_display(hash_hex)?;
-    let height = match ctx
-        .query
-        .height_of_hash(&hash)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-    {
-        Some(h) => h,
-        None => return getblock_unknown_hash(ctx, hash, verbosity),
-    };
+    let height =
+        match ctx.query.height_of_hash(&hash).map_err(|e| rpc_error(ERR_MISC, e.to_string()))? {
+            Some(h) => h,
+            None => return getblock_unknown_hash(ctx, hash, verbosity),
+        };
     let prev = if height.0 > 0 {
         ctx.query
             .header_at_height(Height(height.0 - 1))
@@ -268,10 +247,7 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
             .header_at_height(height)
             .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
             .ok_or_else(|| rpc_error(ERR_MISC, "header missing"))?;
-        let ids = ctx
-            .query
-            .block_txids(height)
-            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        let ids = ctx.query.block_txids(height).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
         let txids: Vec<String> = ids.iter().map(hash_hex_display).collect();
         return Ok(json!({
             "hash": hash_hex_display(&hash),
@@ -295,9 +271,7 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     if verbosity == 0 {
         let mut raw = Vec::new();
-        block
-            .consensus_encode(&mut raw)
-            .map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
+        block.consensus_encode(&mut raw).map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
         return Ok(json!(hex_encode(raw)));
     }
     let txids: Vec<String> = block
@@ -322,11 +296,7 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     });
     if verbosity >= 2 {
         let net = rpc_btc_network(ctx.network);
-        let txs: Vec<Value> = block
-            .txdata
-            .iter()
-            .map(|tx| tx_to_json(tx, None, net))
-            .collect();
+        let txs: Vec<Value> = block.txdata.iter().map(|tx| tx_to_json(tx, None, net)).collect();
         obj["tx"] = json!(txs);
     }
     Ok(obj)
@@ -337,9 +307,7 @@ fn getblock_unknown_hash(ctx: &RpcContext, hash: [u8; 32], verbosity: u32) -> Re
     if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
         if verbosity == 0 {
             let mut raw = Vec::new();
-            block
-                .consensus_encode(&mut raw)
-                .map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
+            block.consensus_encode(&mut raw).map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
             return Ok(json!(hex_encode(raw)));
         }
         let txids: Vec<String> = block
@@ -362,10 +330,7 @@ fn getblock_unknown_hash(ctx: &RpcContext, hash: [u8; 32], verbosity: u32) -> Re
     let header_only = ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
         || ctx.query.get_header_by_hash(&hash).ok().flatten().is_some();
     if header_only {
-        return Err(rpc_error(
-            ERR_MISC,
-            "Block not available (not fully downloaded)",
-        ));
+        return Err(rpc_error(ERR_MISC, "Block not available (not fully downloaded)"));
     }
     Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
 }
@@ -385,17 +350,11 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
         "abort" => return Ok(json!(false)),
         "start" => {}
         other => {
-            return Err(rpc_error(
-                ERR_INVALID_PARAMETER,
-                format!("Invalid action '{other}'"),
-            ));
+            return Err(rpc_error(ERR_INVALID_PARAMETER, format!("Invalid action '{other}'")));
         }
     }
     let objs = params.get_array(1, "scanobjects").ok_or_else(|| {
-        rpc_error(
-            ERR_MISC,
-            "scanobjects argument is required for the start action",
-        )
+        rpc_error(ERR_MISC, "scanobjects argument is required for the start action")
     })?;
     let mut scripts: Vec<Vec<u8>> = Vec::new();
     for o in objs {
@@ -439,10 +398,8 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
         String::new()
     };
 
-    let found = ctx
-        .query
-        .scan_unspent_scripts(&scripts)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let found =
+        ctx.query.scan_unspent_scripts(&scripts).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let mut unspents = Vec::with_capacity(found.len());
     let mut total_sat = 0u64;
     for u in found {
@@ -474,10 +431,8 @@ pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     let n = params.req_u64(1, "n")? as u32;
     let include_mempool = params.opt_bool(2, "include_mempool")?.unwrap_or(true);
     let want = parse_hash32_display(hex)?;
-    let connected = ctx
-        .query
-        .tx_fk_by_txid_tip(&want)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let connected =
+        ctx.query.tx_fk_by_txid_tip(&want).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
 
     if include_mempool && connected.is_none() {
         if let Some(mp) = ctx.mempool.as_ref() {
@@ -502,32 +457,19 @@ pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     let Some(fk) = connected else {
         return Ok(Value::Null);
     };
-    let rec = ctx
-        .query
-        .get_tx(fk)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    if ctx
-        .query
-        .is_outpoint_spent(&want, n)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-    {
+    let rec = ctx.query.get_tx(fk).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    if ctx.query.is_outpoint_spent(&want, n).map_err(|e| rpc_error(ERR_MISC, e.to_string()))? {
         return Ok(Value::Null);
     }
     if include_mempool {
         if let Some(mp) = ctx.mempool.as_ref() {
-            let op = bitcoin::OutPoint {
-                txid: Txid::from_byte_array(want),
-                vout: n,
-            };
+            let op = bitcoin::OutPoint { txid: Txid::from_byte_array(want), vout: n };
             if mp.spends_outpoint(&op) {
                 return Ok(Value::Null);
             }
         }
     }
-    let out = ctx
-        .query
-        .tx_output_at_fk(fk, n)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let out = ctx.query.tx_output_at_fk(fk, n).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let height = ctx
         .query
         .store()
@@ -537,11 +479,7 @@ pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
     let confs = tip.saturating_sub(height).saturating_add(1);
     let coinbase = rec.input_count == 1
-        && ctx
-            .query
-            .tx_input_at_fk(fk, &rec, 0)
-            .map(|inp| inp.is_coinbase())
-            .unwrap_or(false);
+        && ctx.query.tx_input_at_fk(fk, &rec, 0).map(|inp| inp.is_coinbase()).unwrap_or(false);
     Ok(json!({
         "bestblock": getbestblockhash(ctx)?,
         "confirmations": confs,
@@ -607,10 +545,7 @@ pub(crate) fn wait_timeout_ms(params: &RpcParams, idx: usize, name: &str) -> Res
 }
 
 pub(crate) fn tip_hash_height(ctx: &RpcContext) -> Result<(String, u32), Value> {
-    let h = ctx
-        .query
-        .tip_height()
-        .ok_or_else(|| rpc_error(ERR_MISC, "no tip"))?;
+    let h = ctx.query.tip_height().ok_or_else(|| rpc_error(ERR_MISC, "no tip"))?;
     let (_, rec) = ctx
         .query
         .header_at_height(h)
@@ -716,9 +651,7 @@ pub(crate) fn wait_for_tip(
 }
 
 pub(crate) fn require_chain(ctx: &RpcContext) -> Result<&rbitcoin_net::ChainHub, Value> {
-    ctx.chain
-        .as_deref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "chain hub not attached"))
+    ctx.chain.as_deref().ok_or_else(|| rpc_error(ERR_MISC, "chain hub not attached"))
 }
 
 pub(crate) fn parse_blockhash_param(params: &RpcParams) -> Result<bitcoin::BlockHash, Value> {
@@ -747,8 +680,7 @@ pub(crate) fn submitheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value
     let hub = require_chain(ctx)?;
     let hex = params.req_str(0, "hexdata")?;
     let header = decode_header_hex(hex)?;
-    hub.process_submitted_header(&header)
-        .map_err(|e| rpc_error(ERR_VERIFY_ERROR, e))?;
+    hub.process_submitted_header(&header).map_err(|e| rpc_error(ERR_VERIFY_ERROR, e))?;
     Ok(Value::Null)
 }
 
@@ -769,8 +701,7 @@ pub(crate) fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Va
     params.reject_unknown(&["blockhash"])?;
     let hub = require_chain(ctx)?;
     let hash = parse_blockhash_param(params)?;
-    hub.reconsider_block(hash)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    hub.reconsider_block(hash).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     Ok(Value::Null)
 }
 

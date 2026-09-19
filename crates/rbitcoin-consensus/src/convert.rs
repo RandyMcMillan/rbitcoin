@@ -26,10 +26,7 @@ pub fn block_to_apply(
     header: &Header,
     txs: &[Transaction],
 ) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
-    let txids: Vec<[u8; 32]> = txs
-        .iter()
-        .map(|t| t.compute_txid().to_byte_array())
-        .collect();
+    let txids: Vec<[u8; 32]> = txs.iter().map(|t| t.compute_txid().to_byte_array()).collect();
     block_to_apply_with_txids(query, header, txs, &txids)
 }
 
@@ -89,11 +86,7 @@ fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusErr
                 prev_txid: inp.previous_output.txid.to_byte_array(),
                 // Archive resolve fills create_fk before pack; coinbase stays NULL.
                 create_fk: Fk::NULL,
-                prev_index: if is_cb {
-                    u32::MAX
-                } else {
-                    inp.previous_output.vout
-                },
+                prev_index: if is_cb { u32::MAX } else { inp.previous_output.vout },
                 sequence: inp.sequence.to_consensus_u32(),
                 script_sig: inp.script_sig.to_bytes(),
                 witness: inp.witness.to_vec(),
@@ -284,10 +277,7 @@ mod tests {
         for bad in [edge([2u8; 32], 3), edge([1u8; 32], 4)] {
             let err = rbitcoin_query::input_records_from_wire(&tx, Fk(9), &[bad])
                 .expect_err("mismatched edge must not encode");
-            assert!(
-                format!("{err}").contains("edge/wire prevout"),
-                "unexpected error: {err}"
-            );
+            assert!(format!("{err}").contains("edge/wire prevout"), "unexpected error: {err}");
         }
     }
 }

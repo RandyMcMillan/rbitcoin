@@ -11,18 +11,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 fn load_block(name: &str) -> Block {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
     deserialize(&std::fs::read(&path).unwrap_or_else(|e| panic!("fixture {name}: {e}")))
         .unwrap_or_else(|e| panic!("block {name}: {e}"))
 }
 
 fn hex_bytes(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
 }
 
 fn block_contains_byte(b: &Block, needle: u8) -> bool {
@@ -54,20 +49,14 @@ fn captured_signet_blocks_match_hashes_and_opcodes() {
         format!("{}", b.block_hash()),
         "000000ad6bf1ea934186822de99a611924d94aff8fbcb1ad6be2c790c3b92ae1"
     );
-    assert!(
-        block_contains_byte(&b, 0xba),
-        "expected 0xba (OP_CHECKSIGADD) in block 200001"
-    );
+    assert!(block_contains_byte(&b, 0xba), "expected 0xba (OP_CHECKSIGADD) in block 200001");
 
     let b = load_block("signet_block_200945.bin");
     assert_eq!(
         format!("{}", b.block_hash()),
         "00000065c6d2d4cb574038892a535c50efd66f28265a6ab4c48bd121fef795f7"
     );
-    assert!(
-        block_contains_byte(&b, 0x8c),
-        "expected 0x8c (OP_1SUB) in block 200945"
-    );
+    assert!(block_contains_byte(&b, 0x8c), "expected 0x8c (OP_1SUB) in block 200945");
 
     let b = load_block("signet_block_201393.bin");
     assert_eq!(
@@ -82,10 +71,7 @@ fn captured_signet_blocks_match_hashes_and_opcodes() {
             }
         }
     }
-    assert!(
-        max_item > 10_000,
-        "expected a witness item >10k (tapscript leaf); max={max_item}"
-    );
+    assert!(max_item > 10_000, "expected a witness item >10k (tapscript leaf); max={max_item}");
 
     let b = load_block("signet_block_204802.bin");
     assert_eq!(
@@ -106,11 +92,7 @@ fn captured_signet_blocks_match_hashes_and_opcodes() {
         "00000006a50036265f927963d06c5c5353317b13a030d01afd6b2c0b2f887a91"
     );
     assert!(b.txdata.len() > 1);
-    let fat = b
-        .txdata
-        .iter()
-        .find(|t| t.input.len() > 100)
-        .expect("fat multi-input tx");
+    let fat = b.txdata.iter().find(|t| t.input.len() > 100).expect("fat multi-input tx");
     assert_eq!(
         format!("{}", fat.compute_txid()),
         "540b5d85f73d6eedef68893e70ce3bb52bdad0354a8204a8a43d2340387dc2ff"
@@ -152,17 +134,10 @@ fn block_90719_codeseparator_tapscript_verifies() {
             Instruction::PushBytes(_) => {}
         }
     }
-    assert_eq!(
-        (n_codesep, n_csv, n_cs),
-        (2, 2, 1),
-        "expected CODESEP×2 CSV×2 CS×1 leaf"
-    );
+    assert_eq!((n_codesep, n_csv, n_cs), (2, 2, 1), "expected CODESEP×2 CSV×2 CS×1 leaf");
 
     let spk = ScriptBuf::from_bytes(hex_bytes(PREV_90719_SPK_HEX));
-    let prevout = TxOut {
-        value: Amount::from_sat(PREV_90719_VALUE),
-        script_pubkey: spk,
-    };
+    let prevout = TxOut { value: Amount::from_sat(PREV_90719_VALUE), script_pubkey: spk };
     let expected_prev = OutPoint {
         txid: bitcoin::Txid::from_str(
             "dce07b6d74ee3740007ac1f1b9a08510d1c897e516abbc009fb34e7b5b2536d3",

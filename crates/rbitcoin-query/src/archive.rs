@@ -37,10 +37,7 @@ pub struct CreatePinArc {
 
 impl CreatePinArc {
     fn wrap(inner: CreatePinInner) -> CreatePin {
-        Arc::new(Self {
-            loc: std::sync::OnceLock::new(),
-            inner,
-        })
+        Arc::new(Self { loc: std::sync::OnceLock::new(), inner })
     }
 
     /// Loc from Class A append (None until write sets it).
@@ -65,15 +62,8 @@ impl std::ops::Deref for CreatePinArc {
 /// [`CreatePin`] payload.
 #[derive(Debug)]
 pub enum CreatePinInner {
-    Records {
-        tx: TxRecord,
-        outs: Vec<OutputRecord>,
-    },
-    Wire {
-        block: Arc<bitcoin::Block>,
-        tx_index: u32,
-        tx: TxRecord,
-    },
+    Records { tx: TxRecord, outs: Vec<OutputRecord> },
+    Wire { block: Arc<bitcoin::Block>, tx_index: u32, tx: TxRecord },
 }
 
 impl CreatePinInner {
@@ -82,11 +72,7 @@ impl CreatePinInner {
     }
 
     pub fn wire(block: Arc<bitcoin::Block>, tx_index: u32, tx: TxRecord) -> CreatePin {
-        CreatePinArc::wrap(Self::Wire {
-            block,
-            tx_index,
-            tx,
-        })
+        CreatePinArc::wrap(Self::Wire { block, tx_index, tx })
     }
 
     #[inline]
@@ -100,13 +86,9 @@ impl CreatePinInner {
     pub fn n_out(&self) -> usize {
         match self {
             Self::Records { outs, .. } => outs.len(),
-            Self::Wire {
-                block, tx_index, ..
-            } => block
-                .txdata
-                .get(*tx_index as usize)
-                .map(|t| t.output.len())
-                .unwrap_or(0),
+            Self::Wire { block, tx_index, .. } => {
+                block.txdata.get(*tx_index as usize).map(|t| t.output.len()).unwrap_or(0)
+            }
         }
     }
 
@@ -117,14 +99,8 @@ impl CreatePinInner {
                 let o = outs.get(vout as usize)?;
                 Some((o.value, o.script.as_slice()))
             }
-            Self::Wire {
-                block, tx_index, ..
-            } => {
-                let o = block
-                    .txdata
-                    .get(*tx_index as usize)?
-                    .output
-                    .get(vout as usize)?;
+            Self::Wire { block, tx_index, .. } => {
+                let o = block.txdata.get(*tx_index as usize)?.output.get(vout as usize)?;
                 Some((o.value.to_sat() as i64, o.script_pubkey.as_bytes()))
             }
         }
@@ -142,9 +118,7 @@ impl CreatePinInner {
                     f(o.script.as_slice());
                 }
             }
-            Self::Wire {
-                block, tx_index, ..
-            } => {
+            Self::Wire { block, tx_index, .. } => {
                 if let Some(tx) = block.txdata.get(*tx_index as usize) {
                     for o in &tx.output {
                         f(o.script_pubkey.as_bytes());
@@ -156,9 +130,7 @@ impl CreatePinInner {
 
     fn wire_tx(&self) -> Option<&bitcoin::Transaction> {
         match self {
-            Self::Wire {
-                block, tx_index, ..
-            } => block.txdata.get(*tx_index as usize),
+            Self::Wire { block, tx_index, .. } => block.txdata.get(*tx_index as usize),
             Self::Records { .. } => None,
         }
     }
@@ -344,10 +316,7 @@ impl ArchiveWritePlan {
     /// Wire `prev_txid` known for this create_fk at plan stamp (RAM only).
     #[inline]
     pub fn external_parent_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
-        self.external_parents
-            .get(&create_fk_id)
-            .map(|p| p.txid)
-            .filter(|t| *t != [0u8; 32])
+        self.external_parents.get(&create_fk_id).map(|p| p.txid).filter(|t| *t != [0u8; 32])
     }
 
     /// Same-header create: assemble uses the wire `TxOut` (do not pin).
@@ -501,8 +470,7 @@ impl ArchiveWritePlan {
         self.per_header_ranges = new_ranges;
         self.per_header_sw = new_sw;
         self.edges.retain(|id, _| keep_fks.contains(id));
-        self.batch_creates
-            .retain(|(_, fk)| fk.get().is_some_and(|id| keep_fks.contains(&id)));
+        self.batch_creates.retain(|(_, fk)| fk.get().is_some_and(|id| keep_fks.contains(&id)));
         // body_est is an upper bound; leave as-is (overestimate is safe for reserve).
         Ok(!self.packed.is_empty())
     }
@@ -586,16 +554,12 @@ pub fn input_records_from_wire(
     edges: &[crate::SpendEdge],
 ) -> Result<Vec<InputRecord>, StoreError> {
     if tx.input.len() != edges.len() {
-        return Err(StoreError::Corrupt(
-            "invariant: write encode spends/tx input mismatch",
-        ));
+        return Err(StoreError::Corrupt("invariant: write encode spends/tx input mismatch"));
     }
     let mut out = Vec::with_capacity(tx.input.len());
     for (inp, e) in tx.input.iter().zip(edges.iter()) {
         if e.spend_fk != spend_fk {
-            return Err(StoreError::Corrupt(
-                "invariant: write encode spend_fk mismatch",
-            ));
+            return Err(StoreError::Corrupt("invariant: write encode spend_fk mismatch"));
         }
         let is_cb = inp.previous_output.is_null()
             || (inp.previous_output.txid.to_byte_array() == [0u8; 32]
@@ -609,16 +573,12 @@ pub fn input_records_from_wire(
             continue;
         }
         if e.create_fk.is_null() {
-            return Err(StoreError::Corrupt(
-                "invariant: write encode missing create_fk",
-            ));
+            return Err(StoreError::Corrupt("invariant: write encode missing create_fk"));
         }
         if e.prev_txid != inp.previous_output.txid.to_byte_array()
             || e.vout != inp.previous_output.vout
         {
-            return Err(StoreError::Corrupt(
-                "invariant: write encode edge/wire prevout mismatch",
-            ));
+            return Err(StoreError::Corrupt("invariant: write encode edge/wire prevout mismatch"));
         }
         out.push(InputRecord {
             prev_txid: inp.previous_output.txid.to_byte_array(),
@@ -639,11 +599,7 @@ fn plan_in_from_txin(inp: &bitcoin::TxIn) -> PlanIn {
             && inp.previous_output.vout == u32::MAX);
     PlanIn {
         prev_txid: inp.previous_output.txid.to_byte_array(),
-        prev_index: if is_coinbase {
-            u32::MAX
-        } else {
-            inp.previous_output.vout
-        },
+        prev_index: if is_coinbase { u32::MAX } else { inp.previous_output.vout },
         is_coinbase,
     }
 }
@@ -833,13 +789,7 @@ impl Query {
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
         for row in work {
-            let PlanRow {
-                tx_fk,
-                tx,
-                ins,
-                block,
-                tx_index,
-            } = row;
+            let PlanRow { tx_fk, tx, ins, block, tx_index } = row;
             let mut tx_edges: Vec<crate::SpendEdge> = Vec::with_capacity(ins.len());
             for (i, inp) in ins.iter().enumerate() {
                 if inp.is_coinbase {
@@ -865,10 +815,7 @@ impl Query {
                 };
                 if let Some(pid) = create_fk.get() {
                     if !ArchiveWritePlan::create_in_header_ranges(&per_header_ranges, tx_fk, pid) {
-                        external_parent_vouts
-                            .entry(pid)
-                            .or_default()
-                            .push(inp.prev_index);
+                        external_parent_vouts.entry(pid).or_default().push(inp.prev_index);
                     }
                 }
                 if inp.prev_index == u32::MAX {
@@ -926,8 +873,7 @@ impl Query {
         // heuristics were dead work that cost O(headers) RwLock gets per plan.
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
-        self.confirm_stats()
-            .note_resolve_counts(0, 0, 0, 0, batch_stamp, resolved_stamp);
+        self.confirm_stats().note_resolve_counts(0, 0, 0, 0, batch_stamp, resolved_stamp);
         self.confirm_stats().note_prep_plan(
             assign_ns,
             collect_ns,
@@ -991,9 +937,7 @@ impl Query {
         let n_blocks = plan.per_header_ranges.len() as u64;
 
         let t = Instant::now();
-        self.store
-            .txs
-            .reserve_append(plan.body_est, plan.packed.len() as u64)?;
+        self.store.txs.reserve_append(plan.body_est, plan.packed.len() as u64)?;
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
@@ -1035,9 +979,7 @@ impl Query {
 
         let t = Instant::now();
         if !plan.per_header_ranges.is_empty() {
-            self.store
-                .header_txs
-                .put_ranges_batch(&plan.per_header_ranges)?;
+            self.store.header_txs.put_ranges_batch(&plan.per_header_ranges)?;
         }
         if !plan.per_header_sw.is_empty() {
             if plan.per_header_sw.len() != plan.per_header_ranges.len() {
@@ -1156,10 +1098,8 @@ mod tests {
                 (*fk, Arc::new(b), ids)
             })
             .collect();
-        let refs: Vec<WirePlanNeed<'_>> = wires
-            .iter()
-            .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
-            .collect();
+        let refs: Vec<WirePlanNeed<'_>> =
+            wires.iter().map(|(fk, b, ids)| (*fk, b, ids.as_slice())).collect();
         let carried: Vec<[u8; 32]> = need
             .iter()
             .flat_map(|(_, txs)| {
@@ -1269,10 +1209,7 @@ mod tests {
         assert_eq!(plan.batch_pin.len(), plan.packed.len());
         // packed pin half and batch_pin share the same Arc (no outs double-store).
         for ((pin_packed, _), pin) in plan.packed.iter().zip(plan.batch_pin.iter()) {
-            assert!(
-                Arc::ptr_eq(pin_packed, pin),
-                "packed and batch_pin must share CreatePin Arc"
-            );
+            assert!(Arc::ptr_eq(pin_packed, pin), "packed and batch_pin must share CreatePin Arc");
             // plan construction: one Arc for packed + one for batch_pin.
             assert_eq!(Arc::strong_count(pin), 2);
         }
@@ -1312,14 +1249,8 @@ mod tests {
                 s.arch_blocks >= 1 || s.arch_prep_assign_ns > 0 || s.arch_prep_stamp_ns > 0,
                 "plan noted"
             );
-            assert!(
-                s.arch_write_blocks >= 1 || s.arch_write_total_ns > 0,
-                "commit total"
-            );
-            assert!(
-                s.arch_write_blocks >= 1 || s.arch_write_body_ns > 0,
-                "body put timed"
-            );
+            assert!(s.arch_write_blocks >= 1 || s.arch_write_total_ns > 0, "commit total");
+            assert!(s.arch_write_blocks >= 1 || s.arch_write_body_ns > 0, "body put timed");
             let wsum = s.write_phases_sum_ns();
             assert!(
                 wsum <= s.arch_write_total_ns.saturating_add(200_000),
@@ -1338,14 +1269,8 @@ mod tests {
         let seed = vec![(Fk(1), vec![coinbase_apply(1)])];
         // Need a real header_fk path: plan only needs Vec<(Fk, Vec<TxApply>)>.
         let need0 = seed;
-        let p0 = plan_applies(
-            &q,
-            &need0,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
+        let p0 =
+            plan_applies(&q, &need0, q.tx_body_count() + 1, &crate::InFlight::new(), None).unwrap();
         q.archive_commit_plan(p0).unwrap();
         assert_eq!(q.tx_body_count(), 1);
 
@@ -1440,11 +1365,7 @@ mod tests {
         let need_b = vec![(Fk(2), vec![child])];
         let mut inflight = crate::InFlight::new();
         inflight.note_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
+            plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
             None,
         );
         let plan_b =
@@ -1497,11 +1418,7 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let mut log = crate::InFlight::new();
         log.note_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
+            plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
             None,
         );
         q.archive_commit_plan(plan_a).unwrap();
@@ -1524,9 +1441,7 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
         q.archive_commit_plan(plan_a).unwrap();
-        q.store()
-            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
-            .unwrap();
+        q.store().height_fence_extend(rbitcoin_primitives::Height(0), header_fk).unwrap();
         q.on_load_pack().unwrap();
         let mut child_txid = [0u8; 32];
         child_txid[0] = 0xea;
@@ -1571,22 +1486,15 @@ mod tests {
             size: 0,
             weight: 0,
         };
-        q.confirm_parent_cache()
-            .put_header_plan(1, Fk(2), rec, vec![Fk(2)], [0u8; 32]);
+        q.confirm_parent_cache().put_header_plan(1, Fk(2), rec, vec![Fk(2)], [0u8; 32]);
         assert!(q.confirm_parent_cache().get_header_plan(1).is_some());
         q.on_load_pack().unwrap();
         assert!(
             q.confirm_parent_cache().get_header_plan(1).is_some(),
             "store tip below the plan — do not GC height 1"
         );
-        q.store()
-            .confirmed
-            .set(rbitcoin_primitives::Height(0), Fk(1))
-            .unwrap();
-        q.store()
-            .confirmed
-            .set(rbitcoin_primitives::Height(1), Fk(2))
-            .unwrap();
+        q.store().confirmed.set(rbitcoin_primitives::Height(0), Fk(1)).unwrap();
+        q.store().confirmed.set(rbitcoin_primitives::Height(1), Fk(2)).unwrap();
         q.on_load_pack().unwrap();
         assert!(
             q.confirm_parent_cache().get_header_plan(1).is_none(),
@@ -1606,25 +1514,14 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let mut log = crate::InFlight::new();
         log.note_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
+            plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
             None,
         );
         q.archive_commit_plan(plan_a).unwrap();
         assert_eq!(q.store().tx_height_get(parent_fk).unwrap(), None);
         log.prune_below_height(q.drain_and_fence_hi());
-        assert_eq!(
-            q.drain_and_fence_hi(),
-            None,
-            "drain fk not on fence: keep inflight"
-        );
-        assert!(
-            log.get_create_fk(&parent_txid).is_some(),
-            "fence missing: prune must keep"
-        );
+        assert_eq!(q.drain_and_fence_hi(), None, "drain fk not on fence: keep inflight");
+        assert!(log.get_create_fk(&parent_txid).is_some(), "fence missing: prune must keep");
         let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xee)])];
         let plan_b = plan_applies(&q, &need_b, 2, &log, None)
             .expect("in-flight binds after drain, before fence");
@@ -1643,9 +1540,7 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
         q.archive_commit_plan(plan_a).unwrap();
-        q.store()
-            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
-            .unwrap();
+        q.store().height_fence_extend(rbitcoin_primitives::Height(0), header_fk).unwrap();
         q.on_load_pack().unwrap();
 
         let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xed)])];
@@ -1682,11 +1577,7 @@ mod tests {
         let header_fk = plan_a.per_header_ranges[0].0;
         let mut log = crate::InFlight::new();
         log.note_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
+            plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
             None,
         );
         q.archive_commit_plan_defer_head(plan_a).unwrap();
@@ -1694,15 +1585,10 @@ mod tests {
             q.store().txs.pending_head_len() >= 1,
             "create must still be queued — drain has not inserted tx.head"
         );
-        q.store()
-            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
-            .unwrap();
+        q.store().height_fence_extend(rbitcoin_primitives::Height(0), header_fk).unwrap();
         log.prune_below_height(q.drain_and_fence_hi());
         assert_eq!(q.drain_and_fence_hi(), None, "drain_fk 0: HWM is None");
-        assert!(
-            log.get_create_fk(&parent_txid).is_some(),
-            "drain_fk 0: prune must keep"
-        );
+        assert!(log.get_create_fk(&parent_txid).is_some(), "drain_fk 0: prune must keep");
         let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xec)])];
         let plan_b = plan_applies(&q, &need_b, 2, &log, None)
             .expect("in-flight binds after fence, before drain");
@@ -1720,11 +1606,7 @@ mod tests {
             .store
             .txs
             .put_full_batch_indexed(
-                &[(
-                    parent.tx.clone(),
-                    parent.inputs.clone(),
-                    parent.outputs.clone(),
-                )],
+                &[(parent.tx.clone(), parent.inputs.clone(), parent.outputs.clone())],
                 true,
             )
             .unwrap();
@@ -1734,19 +1616,13 @@ mod tests {
 
         // Simulate plan stamp reverse map (txid→fk invert).
         let mut plan = super::ArchiveWritePlan::empty();
-        plan.external_parents
-            .insert(pid, crate::ParentIdent::with_body(parent_txid, range));
+        plan.external_parents.insert(pid, crate::ParentIdent::with_body(parent_txid, range));
 
         let known = plan.external_parent_txid(pid).expect("reverse map");
-        let (rows, _body_ns, _dec_ns, _extend_n, _sqe_n, _guess_n) = q
-            .store
-            .get_outs_by_range_batch(&[(parent_fk, range, known, 1, vec![0])])
-            .unwrap();
+        let (rows, _body_ns, _dec_ns, _extend_n, _sqe_n, _guess_n) =
+            q.store.get_outs_by_range_batch(&[(parent_fk, range, known, 1, vec![0])]).unwrap();
         let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
-        assert_eq!(
-            tx.txid, parent_txid,
-            "API sets known_txid (RAM), not sidefile"
-        );
+        assert_eq!(tx.txid, parent_txid, "API sets known_txid (RAM), not sidefile");
         assert_eq!(live.len(), 1);
         assert_eq!(sparse.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1807,10 +1683,7 @@ mod tests {
         assert_eq!(plan.batch_creates[0].0, child_txid);
         // Plan stamp is fk+range only — denserels load at pin by offset.
         assert!(
-            plan.external_parents
-                .get(&1)
-                .and_then(|p| p.body)
-                .is_some_and(|r| r.1 > 0),
+            plan.external_parents.get(&1).and_then(|p| p.body).is_some_and(|r| r.1 > 0),
             "plan must record Class A body range for head-resolved parent"
         );
         assert_eq!(
@@ -1844,17 +1717,11 @@ mod tests {
             "same-header create must not be in parent_vouts"
         );
 
-        let cross = vec![
-            (Fk(10), vec![parent]),
-            (Fk(11), vec![child_spend(parent_txid, 0xce)]),
-        ];
+        let cross = vec![(Fk(10), vec![parent]), (Fk(11), vec![child_spend(parent_txid, 0xce)])];
         let plan_cross =
             plan_applies(&q, &cross, 1, &crate::InFlight::new(), None).expect("cross height");
         assert_eq!(
-            plan_cross
-                .external_parent_vouts
-                .get(&1)
-                .map(|v| v.as_slice()),
+            plan_cross.external_parent_vouts.get(&1).map(|v| v.as_slice()),
             Some(&[0u32][..]),
             "later header in the pack must pin the earlier create"
         );
@@ -1890,15 +1757,8 @@ mod tests {
             let plan =
                 plan_applies(&q, &need, 2, &crate::InFlight::new(), None).expect("parent via head");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
-            assert!(plan
-                .external_parents
-                .get(&1)
-                .and_then(|p| p.body)
-                .is_some_and(|r| r.1 > 0));
-            assert_eq!(
-                plan.external_parents.get(&1).and_then(|p| p.spent),
-                Some(spent)
-            );
+            assert!(plan.external_parents.get(&1).and_then(|p| p.body).is_some_and(|r| r.1 > 0));
+            assert_eq!(plan.external_parents.get(&1).and_then(|p| p.spent), Some(spent));
             assert_eq!(
                 q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed),
                 0,
@@ -1936,16 +1796,10 @@ mod tests {
             plan_applies(&q, &need, 2, &crate::InFlight::new(), None).expect("prestamp parent");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
-            plan.external_parents
-                .get(&1)
-                .and_then(|p| p.body)
-                .is_some_and(|r| r.1 > 0),
+            plan.external_parents.get(&1).and_then(|p| p.body).is_some_and(|r| r.1 > 0),
             "pre-stamped create_fk must still receive body_range"
         );
-        assert_eq!(
-            plan.external_parents.get(&1).and_then(|p| p.spent),
-            Some(spent)
-        );
+        assert_eq!(plan.external_parents.get(&1).and_then(|p| p.spent), Some(spent));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1981,10 +1835,7 @@ mod tests {
             "IBD stamp must not loc-by-fk"
         );
         assert!(
-            plan.external_parents
-                .get(&1)
-                .and_then(|p| p.pin.as_ref())
-                .is_some(),
+            plan.external_parents.get(&1).and_then(|p| p.pin.as_ref()).is_some(),
             "inflight pin is kept"
         );
         assert_eq!(
@@ -2042,10 +1893,7 @@ mod tests {
             plan_applies(&q, &need, 2, ifo, None).expect("parent via creates-only in_flight");
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert!(
-            plan.external_parents
-                .get(&1)
-                .and_then(|p| p.body)
-                .is_some_and(|r| r.1 > 0),
+            plan.external_parents.get(&1).and_then(|p| p.body).is_some_and(|r| r.1 > 0),
             "creates-only in_flight must still stamp body_range for load denserels"
         );
         assert_eq!(plan.external_parent_txid(1), Some(parent_txid));
@@ -2054,11 +1902,7 @@ mod tests {
             Some(&[0u32][..]),
             "lookup packing must publish parent need-vouts for load pin"
         );
-        let spent = q
-            .store
-            .txs
-            .spent_range(Fk(1))
-            .expect("archived spent range");
+        let spent = q.store.txs.spent_range(Fk(1)).expect("archived spent range");
         assert_eq!(
             plan.external_parents.get(&1).and_then(|p| p.spent),
             Some(spent),
@@ -2132,11 +1976,7 @@ mod tests {
         )
         .expect("stamp archived parent");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(1)));
-        assert!(helper
-            .idents
-            .get(&1)
-            .and_then(|p| p.body)
-            .is_some_and(|r| r.1 > 0));
+        assert!(helper.idents.get(&1).and_then(|p| p.body).is_some_and(|r| r.1 > 0));
         assert_eq!(
             helper.idents.get(&1).and_then(|p| p.spent),
             Some(spent),
@@ -2160,12 +2000,8 @@ mod tests {
             size: 0,
             weight: 0,
         };
-        let hfk = q
-            .commit_class_a_only(&header, &[coinbase_apply(1)])
-            .unwrap();
-        let need = q
-            .archive_filter_need_header_fks(&[hfk, hfk, Fk(99)])
-            .unwrap();
+        let hfk = q.commit_class_a_only(&header, &[coinbase_apply(1)]).unwrap();
+        let need = q.archive_filter_need_header_fks(&[hfk, hfk, Fk(99)]).unwrap();
         assert_eq!(need, vec![Fk(99)], "archived + dup dropped; missing kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2182,10 +2018,7 @@ mod tests {
         let cb = plan.edges.get(&1).expect("coinbase edges");
         assert_eq!(cb.len(), 1);
         assert!(cb[0].create_fk.is_null());
-        let edges = plan
-            .edges
-            .get(&2)
-            .expect("plan stamp must emit spend edges");
+        let edges = plan.edges.get(&2).expect("plan stamp must emit spend edges");
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].prev_txid, parent_txid);
         assert_eq!(edges[0].vout, 0);
@@ -2236,10 +2069,7 @@ mod tests {
             version: TxVersion::ONE,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent_txid,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent_txid, vout: 0 },
                 script_sig: ScriptBuf::from_bytes(script_sig.clone()),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -2249,10 +2079,8 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0xbb]),
             }],
         };
-        let txids = vec![
-            parent.compute_txid().to_byte_array(),
-            child.compute_txid().to_byte_array(),
-        ];
+        let txids =
+            vec![parent.compute_txid().to_byte_array(), child.compute_txid().to_byte_array()];
         let block = Block {
             header: Header {
                 version: Version::ONE,
@@ -2282,17 +2110,9 @@ mod tests {
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
         );
-        let first = CreateLocPair {
-            txout: (8, 16),
-            spent: (8, 8),
-            n_out: 1,
-        };
+        let first = CreateLocPair { txout: (8, 16), spent: (8, 8), n_out: 1 };
         pin.set_loc(first);
-        pin.set_loc(CreateLocPair {
-            txout: (99, 1),
-            spent: (99, 1),
-            n_out: 9,
-        });
+        pin.set_loc(CreateLocPair { txout: (99, 1), spent: (99, 1), n_out: 9 });
         assert_eq!(pin.loc().copied(), Some(first));
     }
 
@@ -2326,20 +2146,12 @@ mod tests {
         );
         assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(
-            plan.batch_pin[0]
-                .out_parts(0)
-                .expect("parent out")
-                .1
-                .as_ptr(),
+            plan.batch_pin[0].out_parts(0).expect("parent out").1.as_ptr(),
             parent_ptr,
             "plan must not copy scriptPubKey"
         );
         assert_eq!(
-            plan.batch_pin[1]
-                .out_parts(0)
-                .expect("child out")
-                .1
-                .as_ptr(),
+            plan.batch_pin[1].out_parts(0).expect("child out").1.as_ptr(),
             child_ptr,
             "plan must not copy scriptPubKey"
         );
@@ -2357,11 +2169,7 @@ mod tests {
         assert_eq!(edges[0].vout, 0);
         assert_eq!(edges[0].spend_fk, Fk(2));
         assert_eq!(edges[0].create_fk, Fk(1));
-        assert!(
-            plan.body_est >= 10_000,
-            "body_est must count wire ins, got {}",
-            plan.body_est
-        );
+        assert!(plan.body_est >= 10_000, "body_est must count wire ins, got {}", plan.body_est);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2380,10 +2188,7 @@ mod tests {
                 None,
             )
             .expect("wire plan");
-        assert!(
-            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
-            "stamp must fill packed ins"
-        );
+        assert!(plan.packed.iter().all(|(_, ins)| !ins.is_empty()), "stamp must fill packed ins");
         for (_, ins) in plan.packed.iter_mut() {
             ins.clear();
         }
@@ -2415,16 +2220,9 @@ mod tests {
         assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2), Fk(3)]);
         assert_eq!(plan.packed[0].0.tx().txid, txid);
         assert_eq!(plan.packed[1].0.tx().txid, txid);
-        assert_eq!(
-            plan.batch_creates,
-            vec![(txid, Fk(1)), (txid, Fk(2)), (child_txid, Fk(3))]
-        );
+        assert_eq!(plan.batch_creates, vec![(txid, Fk(1)), (txid, Fk(2)), (child_txid, Fk(3))]);
         let spend = plan.edges.get(&3).expect("child");
-        assert_eq!(
-            spend[0].create_fk,
-            Fk(2),
-            "same-wave spend binds newest BIP30 create"
-        );
+        assert_eq!(spend[0].create_fk, Fk(2), "same-wave spend binds newest BIP30 create");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2435,8 +2233,7 @@ mod tests {
         let err = plan_applies(&q, &need, 1, &crate::InFlight::new(), None)
             .expect_err("in-block duplicate txid");
         assert!(
-            err.to_string()
-                .contains("duplicate txid in block body (consensus violation)"),
+            err.to_string().contains("duplicate txid in block body (consensus violation)"),
             "got: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2479,10 +2276,7 @@ mod tests {
             let _ = q.confirm_stats().take_window();
             let err = plan_applies(&q, &need, 1, &crate::InFlight::new(), None)
                 .expect_err("bq parent_hits map is not a stamp source");
-            assert!(
-                err.to_string().contains("parent create_fk unresolved"),
-                "got: {err}"
-            );
+            assert!(err.to_string().contains("parent create_fk unresolved"), "got: {err}");
             let mix = q.confirm_stats().take_window();
             assert_eq!(mix.pin_txid_n, 0);
             assert!(mix.head_need > 0, "bq-map-only parent must leftover");
@@ -2516,10 +2310,7 @@ mod tests {
             let plan = plan_applies(&q, &need, 1, &crate::InFlight::new(), Some(&skel))
                 .expect("skeleton stamp");
             assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));
-            assert_eq!(
-                plan.external_parents.get(&66).and_then(|p| p.body),
-                Some((3000, 24))
-            );
+            assert_eq!(plan.external_parents.get(&66).and_then(|p| p.body), Some((3000, 24)));
             assert_eq!(plan.external_parent_txid(66), Some(parent_txid));
             let mix = q.confirm_stats().take_window();
             assert_eq!(mix.pin_txid_n, 1, "skeleton hits use the id_cache meter");
@@ -2558,10 +2349,7 @@ mod tests {
                 Some(&[]),
             )
             .expect_err("empty carried_need must not collect PlanIn prevs");
-        assert!(
-            err.to_string().contains("parent create_fk unresolved"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("parent create_fk unresolved"), "got: {err}");
         let plan = q
             .archive_plan_batch_from_wire(
                 &[(Fk(1), &block, txids.as_slice())],
@@ -2571,12 +2359,7 @@ mod tests {
                 Some(&[parent_txid][..]),
             )
             .expect("carried key stamps without a second input walk");
-        let inp = plan
-            .edges
-            .values()
-            .flatten()
-            .find(|e| e.vout != u32::MAX)
-            .expect("spend");
+        let inp = plan.edges.values().flatten().find(|e| e.vout != u32::MAX).expect("spend");
         assert_eq!(inp.create_fk, Fk(66));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2610,10 +2393,7 @@ mod tests {
         )
         .expect("shared helper");
         assert_eq!(helper.resolved.get(&parent_txid), Some(&Fk(88)));
-        assert_eq!(
-            helper.idents.get(&88).and_then(|p| p.body),
-            Some((4000, 32))
-        );
+        assert_eq!(helper.idents.get(&88).and_then(|p| p.body), Some((4000, 32)));
         assert_eq!(helper.idents.get(&88).map(|p| p.txid), Some(parent_txid));
 
         let child = child_spend(parent_txid, 0x72);
@@ -2625,10 +2405,7 @@ mod tests {
             plan.external_parents.get(&88).and_then(|p| p.body),
             helper.idents.get(&88).and_then(|p| p.body)
         );
-        assert_eq!(
-            plan.external_parent_txid(88),
-            helper.idents.get(&88).map(|p| p.txid)
-        );
+        assert_eq!(plan.external_parent_txid(88), helper.idents.get(&88).map(|p| p.txid));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2696,9 +2473,7 @@ mod tests {
         let parent_fk = plan_a.batch_creates[0].1;
         let header_fk = plan_a.per_header_ranges[0].0;
         q.archive_commit_plan(plan_a).unwrap();
-        q.store()
-            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
-            .unwrap();
+        q.store().height_fence_extend(rbitcoin_primitives::Height(0), header_fk).unwrap();
         q.on_load_pack().unwrap();
 
         {
@@ -2719,9 +2494,7 @@ mod tests {
         let need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
         let mut plan_a = plan_applies(&q, &need_a, 1, &crate::InFlight::new(), None).unwrap();
         // Simulate residual stamp staging (must not survive freeze/append).
-        plan_a
-            .external_parents
-            .insert(99, crate::ParentIdent::with_body([9u8; 32], (0, 1)));
+        plan_a.external_parents.insert(99, crate::ParentIdent::with_body([9u8; 32], (0, 1)));
         let txid = plan_a.batch_pin[0].tx().txid;
         let fk = plan_a.planned_fks[0];
         plan_a.freeze_after_pin();
@@ -2732,24 +2505,14 @@ mod tests {
         );
         let mut log = crate::InFlight::new();
         log.note_pins(
-            plan_a
-                .planned_fks
-                .iter()
-                .zip(plan_a.batch_pin.iter())
-                .map(|(fk, pin)| (*fk, pin)),
+            plan_a.planned_fks.iter().zip(plan_a.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
             None,
         );
-        assert_eq!(
-            log.get_create_fk(&txid),
-            Some(fk),
-            "in-flight still has txid→fk after freeze"
-        );
+        assert_eq!(log.get_create_fk(&txid), Some(fk), "in-flight still has txid→fk after freeze");
 
         let need_b = vec![(Fk(2), vec![coinbase_apply(2), coinbase_apply(3)])];
         let mut plan_b = plan_applies(&q, &need_b, 2, &crate::InFlight::new(), None).unwrap();
-        plan_b
-            .external_parents
-            .insert(88, crate::ParentIdent::with_body([0u8; 32], (0, 1)));
+        plan_b.external_parents.insert(88, crate::ParentIdent::with_body([0u8; 32], (0, 1)));
         plan_b.freeze_after_pin();
 
         let fks_a = plan_a.planned_fks.clone();
@@ -2758,10 +2521,7 @@ mod tests {
         assert_eq!(fks_b.len(), 2);
 
         plan_a.append(plan_b);
-        assert!(
-            plan_a.external_parents.is_empty(),
-            "append must not keep stamp staging maps"
-        );
+        assert!(plan_a.external_parents.is_empty(), "append must not keep stamp staging maps");
         assert_eq!(plan_a.planned_fks.len(), 3);
         assert_eq!(&plan_a.planned_fks[..1], &fks_a[..]);
         assert_eq!(&plan_a.planned_fks[1..], &fks_b[..]);
@@ -2793,14 +2553,8 @@ mod tests {
         };
         let hfk = q.ensure_header(&header).unwrap();
         let need = vec![(hfk, vec![coinbase_apply(42)])];
-        let plan = plan_applies(
-            &q,
-            &need,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
+        let plan =
+            plan_applies(&q, &need, q.tx_body_count() + 1, &crate::InFlight::new(), None).unwrap();
         assert!(!plan.is_empty());
         assert!(q.archive_commit_plan(plan).unwrap(), "first commit appends");
         let n = q.tx_body_count();
@@ -2809,14 +2563,8 @@ mod tests {
 
         // Rebuild a plan as if lookup incorrectly re-planned the same header.
         let need2 = vec![(hfk, vec![coinbase_apply(42)])];
-        let plan2 = plan_applies(
-            &q,
-            &need2,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
+        let plan2 =
+            plan_applies(&q, &need2, q.tx_body_count() + 1, &crate::InFlight::new(), None).unwrap();
         // filter_need empties txs when has_body — plan may be empty. Force a
         // non-empty plan by planning against a fresh need then swapping ranges.
         if plan2.is_empty() {
@@ -2824,16 +2572,9 @@ mod tests {
             // Commit empty is no-op.
             assert!(!q.archive_commit_plan(plan2).unwrap());
         } else {
-            assert!(
-                !q.archive_commit_plan(plan2).unwrap(),
-                "second commit must skip re-append"
-            );
+            assert!(!q.archive_commit_plan(plan2).unwrap(), "second commit must skip re-append");
         }
-        assert_eq!(
-            q.tx_body_count(),
-            n,
-            "tx body count must not grow on idempotent re-commit"
-        );
+        assert_eq!(q.tx_body_count(), n, "tx body count must not grow on idempotent re-commit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2864,9 +2605,7 @@ mod tests {
         ];
         plan.batch_pin = vec![dummy_pin(1), dummy_pin(2), dummy_pin(3)];
         // Header 10 already has body; 20 needs body.
-        let keep = plan
-            .retain_headers_needing_body(|hfk| Ok(hfk == Fk(10)))
-            .unwrap();
+        let keep = plan.retain_headers_needing_body(|hfk| Ok(hfk == Fk(10))).unwrap();
         assert!(keep);
         assert_eq!(plan.per_header_ranges, vec![(Fk(20), Fk(3), 1)]);
         assert_eq!(plan.planned_fks, vec![Fk(3)]);
@@ -2894,13 +2633,9 @@ mod tests {
         // No per_header_ranges: keep iff packed non-empty.
         let mut empty_ranges = super::ArchiveWritePlan::empty();
         empty_ranges.packed = vec![(dummy_pin(1), Vec::new())];
-        assert!(empty_ranges
-            .retain_headers_needing_body(|_| Ok(false))
-            .unwrap());
+        assert!(empty_ranges.retain_headers_needing_body(|_| Ok(false)).unwrap());
         let mut empty_all = super::ArchiveWritePlan::empty();
-        assert!(!empty_all
-            .retain_headers_needing_body(|_| Ok(false))
-            .unwrap());
+        assert!(!empty_all.retain_headers_needing_body(|_| Ok(false)).unwrap());
 
         // All headers already have body → clear plan, false.
         let mut all_have = super::ArchiveWritePlan::empty();
@@ -2929,15 +2664,12 @@ mod tests {
         with_null.packed = vec![(dummy_pin(0), Vec::new()), (dummy_pin(5), Vec::new())];
         with_null.batch_pin = vec![dummy_pin(0), dummy_pin(5)];
         // Header 1 already has body; header 2 needs body (first=Fk(5)).
-        assert!(with_null
-            .retain_headers_needing_body(|hfk| Ok(hfk == Fk(1)))
-            .unwrap());
+        assert!(with_null.retain_headers_needing_body(|hfk| Ok(hfk == Fk(1))).unwrap());
         assert_eq!(with_null.planned_fks, vec![Fk(5)]);
 
         // external_parent_txid / clear_external / append empty other.
         let mut plan = super::ArchiveWritePlan::empty();
-        plan.external_parents
-            .insert(7, crate::ParentIdent::new([0xab; 32]));
+        plan.external_parents.insert(7, crate::ParentIdent::new([0xab; 32]));
         assert_eq!(plan.external_parent_txid(7), Some([0xab; 32]));
         assert!(plan.external_parent_txid(8).is_none());
         plan.clear_external_parent_outs();

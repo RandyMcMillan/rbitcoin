@@ -66,8 +66,7 @@ impl StoreSecret {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
-        f.write_all(&self.bytes)
-            .map_err(|e| StoreError::io(&path, e))?;
+        f.write_all(&self.bytes).map_err(|e| StoreError::io(&path, e))?;
         f.sync_all().map_err(|e| StoreError::io(&path, e))?;
         Ok(())
     }
@@ -77,16 +76,13 @@ impl StoreSecret {
         let path = secret_path(store_dir);
         let mut f = std::fs::File::open(&path).map_err(|e| StoreError::io(&path, e))?;
         let mut bytes = [0u8; SECRET_LEN];
-        f.read_exact(&mut bytes)
-            .map_err(|e| StoreError::io(&path, e))?;
+        f.read_exact(&mut bytes).map_err(|e| StoreError::io(&path, e))?;
 
         let mut extra = [0u8; 1];
         match f.read(&mut extra) {
             Ok(0) => {}
             Ok(_) => {
-                return Err(StoreError::Corrupt(
-                    "store.secret longer than 32 bytes (wipe datadir)",
-                ))
+                return Err(StoreError::Corrupt("store.secret longer than 32 bytes (wipe datadir)"))
             }
             Err(e) => return Err(StoreError::io(&path, e)),
         }
@@ -237,10 +233,7 @@ mod tests {
         let path = dir.join(SECRET_FILE);
         // 33 bytes → corrupt (longer than 32).
         std::fs::write(&path, vec![0u8; 33]).unwrap();
-        assert!(matches!(
-            StoreSecret::load_from_store_dir(&dir),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(StoreSecret::load_from_store_dir(&dir), Err(StoreError::Corrupt(_))));
         // generate forces first byte nonzero path when unlucky zeros — just call once more.
         let mut s = StoreSecret::generate();
         // force first byte path by reconstructing

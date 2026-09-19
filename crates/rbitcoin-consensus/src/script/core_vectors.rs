@@ -179,10 +179,7 @@ fn build_credit(script_pubkey: ScriptBuf, value: Amount) -> Transaction {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value,
-            script_pubkey,
-        }],
+        output: vec![TxOut { value, script_pubkey }],
     }
 }
 
@@ -192,18 +189,12 @@ fn build_spend(credit: &Transaction, script_sig: ScriptBuf, witness: Witness) ->
         version: bitcoin::transaction::Version::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: credit_txid,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: credit_txid, vout: 0 },
             script_sig,
             sequence: Sequence::MAX,
             witness,
         }],
-        output: vec![TxOut {
-            value: credit.output[0].value,
-            script_pubkey: ScriptBuf::new(),
-        }],
+        output: vec![TxOut { value: credit.output[0].value, script_pubkey: ScriptBuf::new() }],
     }
 }
 
@@ -211,9 +202,7 @@ fn build_spend(credit: &Transaction, script_sig: ScriptBuf, witness: Witness) ->
 /// ending with nValue (BTC). Returns optional Taproot output key for `#TAPROOTOUTPUT#`.
 fn parse_witness_and_amount(first: &Value) -> Result<(Witness, Amount, Option<[u8; 32]>), String> {
     // Core: [wit_hex..., amount_number] inside first array element when present.
-    let arr = first
-        .as_array()
-        .ok_or_else(|| "witness cell not array".to_string())?;
+    let arr = first.as_array().ok_or_else(|| "witness cell not array".to_string())?;
     if arr.is_empty() {
         return Ok((Witness::new(), Amount::ZERO, None));
     }
@@ -366,26 +355,13 @@ fn run_script_row(
     let spk = ScriptBuf::from_bytes(script_pubkey.to_vec());
     let credit = build_credit(spk.clone(), amount);
     let mut spend = build_spend(&credit, ScriptBuf::from_bytes(script_sig.to_vec()), witness);
-    let prev = TxOut {
-        value: amount,
-        script_pubkey: credit.output[0].script_pubkey.clone(),
-    };
-    spend.input[0].previous_output = OutPoint {
-        txid: credit.compute_txid(),
-        vout: 0,
-    };
+    let prev = TxOut { value: amount, script_pubkey: credit.output[0].script_pubkey.clone() };
+    spend.input[0].previous_output = OutPoint { txid: credit.compute_txid(), vout: 0 };
 
     // Without SCRIPT_VERIFY_WITNESS, Core treats v0/v1 programs as bare scripts.
     // Production always enables witness post-segwit; flag-off is Core-vector only.
     if !flags.witness {
-        return eval_bare_pair(
-            &spend,
-            script_sig,
-            script_pubkey,
-            amount,
-            flags,
-            flags.cleanstack,
-        );
+        return eval_bare_pair(&spend, script_sig, script_pubkey, amount, flags, flags.cleanstack);
     }
 
     let job = ScriptCheckJob {
@@ -426,10 +402,8 @@ fn eval_bare_pair(
     flags: &CoreFlags,
     cleanstack: bool,
 ) -> Result<(), String> {
-    let prevouts = [TxOut {
-        value: amount,
-        script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()),
-    }];
+    let prevouts =
+        [TxOut { value: amount, script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()) }];
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let ss = Script::from_bytes(script_sig);
     if !script_sig.is_empty() {
@@ -550,13 +524,7 @@ struct RowStats {
 fn run_all_script_rows() -> RowStats {
     let root = load_json();
     let arr = root.as_array().expect("script_tests root array");
-    let mut st = RowStats {
-        total: 0,
-        ran: 0,
-        pass: 0,
-        fail: 0,
-        failures: Vec::new(),
-    };
+    let mut st = RowStats { total: 0, ran: 0, pass: 0, fail: 0, failures: Vec::new() };
 
     for (idx, row) in arr.iter().enumerate() {
         let Value::Array(cells) = row else {
@@ -620,8 +588,7 @@ fn run_all_script_rows() -> RowStats {
                 st.ran += 1;
                 st.fail += 1;
                 if st.failures.len() < 40 {
-                    st.failures
-                        .push(format!("#{idx} assemble scriptSig: {e} sig={sig_s:?}"));
+                    st.failures.push(format!("#{idx} assemble scriptSig: {e} sig={sig_s:?}"));
                 }
                 continue;
             }
@@ -632,8 +599,7 @@ fn run_all_script_rows() -> RowStats {
                 st.ran += 1;
                 st.fail += 1;
                 if st.failures.len() < 40 {
-                    st.failures
-                        .push(format!("#{idx} #TAPROOTOUTPUT# without control block"));
+                    st.failures.push(format!("#{idx} #TAPROOTOUTPUT# without control block"));
                 }
                 continue;
             };
@@ -647,8 +613,7 @@ fn run_all_script_rows() -> RowStats {
                     st.ran += 1;
                     st.fail += 1;
                     if st.failures.len() < 40 {
-                        st.failures
-                            .push(format!("#{idx} assemble scriptPubKey: {e} pk={pk_s:?}"));
+                        st.failures.push(format!("#{idx} assemble scriptPubKey: {e} pk={pk_s:?}"));
                     }
                     continue;
                 }
@@ -688,19 +653,7 @@ fn core_script_tests_all_rows() {
     for f in &st.failures {
         eprintln!("  FAIL {f}");
     }
-    assert!(
-        st.fail == 0,
-        "core script_tests failures: {} (see FAIL lines)",
-        st.fail
-    );
-    assert!(
-        st.total > 500,
-        "expected hundreds of Core rows, total={}",
-        st.total
-    );
-    assert_eq!(
-        st.pass, st.ran,
-        "every ran row must pass (pass={} ran={})",
-        st.pass, st.ran
-    );
+    assert!(st.fail == 0, "core script_tests failures: {} (see FAIL lines)", st.fail);
+    assert!(st.total > 500, "expected hundreds of Core rows, total={}", st.total);
+    assert_eq!(st.pass, st.ran, "every ran row must pass (pass={} ran={})", st.pass, st.ran);
 }

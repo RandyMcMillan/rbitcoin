@@ -250,29 +250,20 @@ pub async fn ibd_cancellable(
     if peers.is_empty() {
         return Err(NetError::Protocol("no peers for ibd"));
     }
-    let cancelled = || {
-        cancel
-            .as_ref()
-            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
-            .unwrap_or(false)
-    };
+    let cancelled =
+        || cancel.as_ref().map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false);
 
     hub.ensure_genesis()?;
 
     // Body events must not wait behind Headers (single-FIFO waste).
     let (body_tx, mut body_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<PeerEvent>();
-    let sinks = PeerEventSinks {
-        body: body_tx,
-        ctrl: ctrl_tx,
-    };
+    let sinks = PeerEventSinks { body: body_tx, ctrl: ctrl_tx };
 
     // Nested `ibd-net` runtime panicked on SIGINT (`Cannot drop a runtime in an
     // async context`) when the outer select dropped this future.
     {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         info!(
             "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; body queue: in-process; confirm: lookup+load+scripts+write OS threads)"
         );
@@ -283,12 +274,8 @@ pub async fn ibd_cancellable(
     // Initial concurrent dial — cap to ~2× live target (never the whole book).
     // With DNS/peers persistence the book can be 300+ addresses; dialing them all
     // at once saturates FDs and yields 100+ "ready" slots that immediately die.
-    let initial_dial_n = cfg
-        .target_peers
-        .saturating_mul(2)
-        .max(peers.len())
-        .min(peer_sess.book().len())
-        .max(1);
+    let initial_dial_n =
+        cfg.target_peers.saturating_mul(2).max(peers.len()).min(peer_sess.book().len()).max(1);
     let initial = dial_batch(
         peer_sess.book(),
         &next_peer_id,
@@ -317,11 +304,7 @@ pub async fn ibd_cancellable(
     if initial_slots.is_empty() {
         return Err(NetError::Protocol("no peers connected"));
     }
-    let init_peer_tip = initial_slots
-        .iter()
-        .map(|s| s.peer_height)
-        .max()
-        .unwrap_or(0);
+    let init_peer_tip = initial_slots.iter().map(|s| s.peer_height).max().unwrap_or(0);
     info!(
         "ibd: {} / {} peers ready (target={}, book={}, max_peer_height={})",
         initial_slots.len(),
@@ -359,9 +342,7 @@ pub async fn ibd_cancellable(
 
     let loop_stats = Arc::new(LoopStats::default());
     let store_class_a_bodies = hub.query.archived_block_count().unwrap_or(0);
-    loop_stats
-        .archived_bodies
-        .store(store_class_a_bodies, Ordering::Relaxed);
+    loop_stats.archived_bodies.store(store_class_a_bodies, Ordering::Relaxed);
     if store_class_a_bodies > 0 {
         info!("ibd: store has {store_class_a_bodies} Class A bodies (seed)");
     }
@@ -501,14 +482,7 @@ pub async fn ibd_cancellable(
                 AssignDepth::Full
             };
             let tip_before_assign = hub.tip_height();
-            assign_work_ordered(
-                &mut st,
-                hub.as_ref(),
-                &cfg,
-                &loop_stats,
-                depth,
-                tip_rate_opt,
-            );
+            assign_work_ordered(&mut st, hub.as_ref(), &cfg, &loop_stats, depth, tip_rate_opt);
             if hub.tip_height() < tip_before_assign {
                 confirm_feed.clear();
             }
@@ -653,11 +627,7 @@ pub async fn ibd_cancellable(
         }
         st.slots.retain(|s| s.alive);
 
-        if redial_handle
-            .as_ref()
-            .map(|h| h.is_finished())
-            .unwrap_or(false)
-        {
+        if redial_handle.as_ref().map(|h| h.is_finished()).unwrap_or(false) {
             if let Some(h) = redial_handle.take() {
                 match h.await {
                     Ok(result) => {
@@ -712,11 +682,8 @@ pub async fn ibd_cancellable(
         // interval — redial immediately so we never race the exit check.
         let alive_n = st.slots.iter().filter(|s| s.alive).count();
         let target = cfg.target_peers.max(1);
-        let redial_interval = if alive_n == 0 {
-            Duration::from_secs(0)
-        } else {
-            Duration::from_secs(15)
-        };
+        let redial_interval =
+            if alive_n == 0 { Duration::from_secs(0) } else { Duration::from_secs(15) };
         if redial_handle.is_none()
             && alive_n < target
             && !peer_sess.book().is_empty()
@@ -810,10 +777,8 @@ pub async fn ibd_cancellable(
 
             let peer_cap = peers_n.saturating_mul(cfg.per_peer);
             let inflight_cap = cfg.window.min(peer_cap).max(1);
-            let ahead = prog
-                .ready_hwm
-                .saturating_sub(prog.tip)
-                .saturating_add(st.inflight.len() as u32);
+            let ahead =
+                prog.ready_hwm.saturating_sub(prog.tip).saturating_add(st.inflight.len() as u32);
             let conf_q_hwm = confirm_queues.sample_hwm_and_reset();
             let mut conf_pipe = confirm_queues.content_snap();
             let (feed_ready, feed_inflight) = confirm_feed.size_snap();
@@ -929,9 +894,7 @@ pub async fn ibd_cancellable(
                         accepted.load(Ordering::SeqCst),
                         dark_redial_empty
                     );
-                    return Err(NetError::Protocol(
-                        "all peers dead mid catch-up (not complete)",
-                    ));
+                    return Err(NetError::Protocol("all peers dead mid catch-up (not complete)"));
                 }
                 AllPeersDead::WaitRedial => {}
             }
@@ -1044,10 +1007,7 @@ pub async fn ibd_cancellable(
     confirm_feed.request_stop();
     hub.query.request_confirm_cancel();
 
-    info!(
-        "ibd: waiting for confirm engine to stop ({:?})…",
-        t_teardown.elapsed()
-    );
+    info!("ibd: waiting for confirm engine to stop ({:?})…", t_teardown.elapsed());
     let confirm_join = tokio::task::spawn_blocking(move || {
         let _ = confirm_engine.join();
     });
@@ -1063,10 +1023,7 @@ pub async fn ibd_cancellable(
                 break;
             }
             Err(_) => {
-                warn!(
-                    "ibd: still waiting for confirm engine ({:?})…",
-                    t_teardown.elapsed()
-                );
+                warn!("ibd: still waiting for confirm engine ({:?})…", t_teardown.elapsed());
             }
         }
     }

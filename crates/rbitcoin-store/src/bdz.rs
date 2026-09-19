@@ -26,34 +26,21 @@ const RANK_SUPER_BITS: u32 = 512;
 #[derive(Debug)]
 enum GStore {
     Ram(Box<[u32]>),
-    Fd {
-        file: File,
-        path: PathBuf,
-        off: u64,
-        n_bytes: u64,
-        g_bits: u32,
-        page_preads: AtomicU64,
-    },
+    Fd { file: File, path: PathBuf, off: u64, n_bytes: u64, g_bits: u32, page_preads: AtomicU64 },
 }
 
 enum OccBits {
     Words(Box<[u64]>),
-    Map {
-        map: ReadonlyMap,
-        off: usize,
-        len: usize,
-    },
+    Map { map: ReadonlyMap, off: usize, len: usize },
 }
 
 impl std::fmt::Debug for OccBits {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Words(w) => f.debug_tuple("Words").field(&w.len()).finish(),
-            Self::Map { off, len, .. } => f
-                .debug_struct("Map")
-                .field("off", off)
-                .field("len", len)
-                .finish(),
+            Self::Map { off, len, .. } => {
+                f.debug_struct("Map").field("off", off).field("len", len).finish()
+            }
         }
     }
 }
@@ -234,31 +221,16 @@ impl BdzMphf {
         keys: &[u64],
         ctx: &mut crate::IoCtx<'_>,
     ) -> Result<Vec<u32>, StoreError> {
-        let GStore::Fd {
-            file,
-            path,
-            off,
-            n_bytes,
-            g_bits,
-            page_preads,
-            ..
-        } = &self.g
-        else {
+        let GStore::Fd { file, path, off, n_bytes, g_bits, page_preads, .. } = &self.g else {
             return Err(StoreError::Corrupt("bdz mphf: fd batch"));
         };
         let g_bits = *g_bits;
         let partite = self.compact.is_some();
-        let verts: Vec<[u32; 3]> = keys
-            .iter()
-            .map(|&k| hash_verts(k, self.seed, self.m, partite))
-            .collect();
+        let verts: Vec<[u32; 3]> =
+            keys.iter().map(|&k| hash_verts(k, self.seed, self.m, partite)).collect();
         let mut page_ids: Vec<u32> = verts
             .iter()
-            .flat_map(|v| {
-                v.iter()
-                    .copied()
-                    .flat_map(|vert| vertex_pages(vert, g_bits))
-            })
+            .flat_map(|v| v.iter().copied().flat_map(|vert| vertex_pages(vert, g_bits)))
             .collect();
         page_ids.sort_unstable();
         page_ids.dedup();
@@ -287,13 +259,7 @@ impl BdzMphf {
         }
         match &self.g {
             GStore::Ram(g) => Ok(g.first().copied().unwrap_or(0)),
-            GStore::Fd {
-                file,
-                path,
-                off,
-                g_bits,
-                ..
-            } => {
+            GStore::Fd { file, path, off, g_bits, .. } => {
                 if *g_bits == G_BITS_WORDS {
                     let mut buf = [0u8; 4];
                     pread_exact(file, path, *off, &mut buf)?;
@@ -359,10 +325,7 @@ impl BdzMphf {
                 compact: None,
             });
         }
-        let m = (u64::from(n) * GAMMA_NUM)
-            .div_ceil(GAMMA_DEN)
-            .max(u64::from(n) + 3)
-            .max(3) as u32;
+        let m = (u64::from(n) * GAMMA_NUM).div_ceil(GAMMA_DEN).max(u64::from(n) + 3).max(3) as u32;
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         let mut scratch = PeelScratch::default();
         for _try in 0..MAX_SEED {
@@ -704,12 +667,7 @@ fn load_g_page(
     if need == 0 {
         return Ok(0);
     }
-    pread_exact(
-        file,
-        path,
-        g_off + u64::from(page) * G_PAGE_BYTES as u64,
-        &mut buf[..need],
-    )?;
+    pread_exact(file, path, g_off + u64::from(page) * G_PAGE_BYTES as u64, &mut buf[..need])?;
     Ok(need)
 }
 
@@ -725,16 +683,9 @@ fn stream_or_load_pages(
     fill: &mut impl FnMut(u32, &[u8]),
 ) -> Result<(), StoreError> {
     match ctx.session() {
-        Some(session) => stream_g_pages(
-            session,
-            file,
-            path,
-            off,
-            n_bytes,
-            page_ids,
-            page_preads,
-            fill,
-        ),
+        Some(session) => {
+            stream_g_pages(session, file, path, off, n_bytes, page_ids, page_preads, fill)
+        }
         None => {
             for &page in page_ids {
                 let mut buf = [0u8; G_PAGE_BYTES];
@@ -763,9 +714,7 @@ fn stream_g_pages(
         return Ok(());
     }
     let fd = IoHandle::from_file(file);
-    let pool_n = (crate::uring_session::DEFAULT_ENTRIES as usize)
-        .min(n_pages)
-        .max(1);
+    let pool_n = (crate::uring_session::DEFAULT_ENTRIES as usize).min(n_pages).max(1);
     let mut bufs: Vec<[u8; G_PAGE_BYTES]> = vec![[0u8; G_PAGE_BYTES]; pool_n];
     let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
     let mut free_slots: Vec<usize> = (0..pool_n).collect();
@@ -827,10 +776,7 @@ fn stream_g_pages(
                 let page = page_ids[pi];
                 let need = g_page_need(n_bytes, page);
                 if res < 0 {
-                    return Err(StoreError::io(
-                        path,
-                        std::io::Error::from_raw_os_error(-res),
-                    ));
+                    return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-res)));
                 }
                 let mut n = res as usize;
                 if n < need {
@@ -863,11 +809,7 @@ fn packed_g_bytes(n_verts: u32, g_bits: u32) -> u64 {
 
 fn pack_g_write<W: Write>(g: &[u32], g_bits: u32, w: &mut W) -> std::io::Result<()> {
     const PAGE: usize = 4096;
-    let mask = if g_bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << g_bits) - 1
-    };
+    let mask = if g_bits == 32 { u32::MAX } else { (1u32 << g_bits) - 1 };
     let mut page = [0u8; PAGE];
     let mut n = 0usize;
     let mut acc = 0u64;
@@ -926,13 +868,7 @@ fn unpack_g_bits_from_page_window(
     if start_byte < page_base {
         return 0;
     }
-    extract_g_window(
-        page,
-        next,
-        (start_byte - page_base) as usize,
-        (start % 8) as u32,
-        g_bits,
-    )
+    extract_g_window(page, next, (start_byte - page_base) as usize, (start % 8) as u32, g_bits)
 }
 
 fn extract_g_window(page: &[u8], next: Option<&[u8]>, off: usize, rem: u32, g_bits: u32) -> u32 {
@@ -951,11 +887,7 @@ fn extract_g_window(page: &[u8], next: Option<&[u8]>, off: usize, rem: u32, g_bi
         };
         acc |= u64::from(b) << (8 * i);
     }
-    let mask = if g_bits >= 32 {
-        u32::MAX
-    } else {
-        (1u32 << g_bits) - 1
-    };
+    let mask = if g_bits >= 32 { u32::MAX } else { (1u32 << g_bits) - 1 };
     ((acc >> rem) as u32) & mask
 }
 
@@ -1208,10 +1140,7 @@ fn assign_g(
 }
 
 fn compact_vertex_count(n: u32) -> u32 {
-    let m = (u64::from(n) * GAMMA_NUM)
-        .div_ceil(GAMMA_DEN)
-        .max(u64::from(n) + 3)
-        .max(3);
+    let m = (u64::from(n) * GAMMA_NUM).div_ceil(GAMMA_DEN).max(u64::from(n) + 3).max(3);
     let m = m.div_ceil(3) * 3;
     m as u32
 }
@@ -1273,11 +1202,7 @@ fn popcount_bits(occ: &[u8], lo: usize, hi: usize) -> u32 {
         let bit = b % 8;
         let take = (8 - bit).min(hi - b);
         let byte = occ.get(byte_i).copied().unwrap_or(0);
-        let mask = if take == 8 {
-            0xFFu8
-        } else {
-            ((1u8 << take) - 1) << bit
-        };
+        let mask = if take == 8 { 0xFFu8 } else { ((1u8 << take) - 1) << bit };
         n += (byte & mask).count_ones();
         b += take;
     }
@@ -1300,20 +1225,12 @@ fn supers_from_occ_bytes(occ: &[u8], m: u32) -> Box<[u32]> {
 
 impl CompactRank {
     fn empty() -> Self {
-        Self {
-            m: 0,
-            occ: OccBits::Words(Box::new([])),
-            supers: Box::new([0]),
-        }
+        Self { m: 0, occ: OccBits::Words(Box::new([])), supers: Box::new([0]) }
     }
 
     fn from_occ(occ: Box<[u64]>, m: u32) -> Self {
         let supers = supers_from_occ_bytes(u64_words_as_bytes(&occ), m);
-        Self {
-            m,
-            occ: OccBits::Words(occ),
-            supers,
-        }
+        Self { m, occ: OccBits::Words(occ), supers }
     }
 
     fn from_mapped(map: ReadonlyMap, off: usize, len: usize, m: u32) -> Result<Self, StoreError> {
@@ -1326,11 +1243,7 @@ impl CompactRank {
             return Err(StoreError::Corrupt("bdz mphf: occ truncated"));
         }
         let supers = supers_from_occ_bytes(&bytes[off..off + len], m);
-        Ok(Self {
-            m,
-            occ: OccBits::Map { map, off, len },
-            supers,
-        })
+        Ok(Self { m, occ: OccBits::Map { map, off, len }, supers })
     }
 
     fn occ_bytes(&self) -> &[u8] {
@@ -1358,9 +1271,8 @@ mod tests {
 
     #[test]
     fn bdz_injective_10k() {
-        let keys: Vec<u64> = (0..10_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7))
-            .collect();
+        let keys: Vec<u64> =
+            (0..10_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7)).collect();
         let f = BdzMphf::build(&keys).unwrap();
         let mut seen = vec![false; keys.len()];
         for &k in &keys {
@@ -1376,9 +1288,8 @@ mod tests {
 
     #[test]
     fn bdz_injective_2k() {
-        let keys: Vec<u64> = (0..2_000u64)
-            .map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11))
-            .collect();
+        let keys: Vec<u64> =
+            (0..2_000u64).map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11)).collect();
         let f = BdzMphf::build(&keys).unwrap();
         let mut seen = vec![false; keys.len()];
         for &k in &keys {
@@ -1404,10 +1315,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bdz-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
@@ -1431,15 +1339,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bdz-fd-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let keys: Vec<u64> = (0..10_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7))
-            .collect();
+        let keys: Vec<u64> =
+            (0..10_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7)).collect();
         let ram = BdzMphf::build(&keys).unwrap();
         assert!(ram.g_bytes_resident() > 0);
         let p = dir.join("t.mphf");
@@ -1494,9 +1398,8 @@ mod tests {
     #[test]
     fn assigned_peel_2k_permutation() {
         let n = 2_000u32;
-        let keys: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11))
-            .collect();
+        let keys: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11)).collect();
         let values: Vec<u32> = (0..n).map(|i| (i * 17 + 3) % n).collect();
         let mut seen = vec![false; n as usize];
         for &v in &values {
@@ -1523,11 +1426,7 @@ mod tests {
             let g: Vec<u32> = (0..64).map(|i| i % (1u32 << (g_bits.min(5)))).collect();
             let packed = pack_g(&g, g_bits);
             for (v, &want) in g.iter().enumerate() {
-                assert_eq!(
-                    unpack_g_at(&packed, v as u32, g_bits),
-                    want,
-                    "g_bits={g_bits} v={v}"
-                );
+                assert_eq!(unpack_g_at(&packed, v as u32, g_bits), want, "g_bits={g_bits} v={v}");
             }
         }
     }
@@ -1571,17 +1470,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bdz2-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let n = 1_200u32;
         let modulus = 1u32 << 25;
-        let keys: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13))
-            .collect();
+        let keys: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13)).collect();
         let values: Vec<u32> = (0..n).map(|i| i * 17 + 3).collect();
         let ram = BdzMphf::build_assigned(&keys, &values, modulus).unwrap();
         let p = dir.join("t.mphf");
@@ -1610,20 +1505,14 @@ mod tests {
         let k = straddle_key.expect("expected a page-straddling vertex at 25-bit width");
         let verts = fd.vertices(k);
         let g_bits = g_bits_for_modulus(modulus);
-        let mut pages: Vec<u32> = verts
-            .iter()
-            .copied()
-            .flat_map(|v| vertex_pages(v, g_bits))
-            .collect();
+        let mut pages: Vec<u32> =
+            verts.iter().copied().flat_map(|v| vertex_pages(v, g_bits)).collect();
         pages.sort_unstable();
         pages.dedup();
         let _ = fd.take_g_page_preads();
         assert_eq!(fd.index(k).unwrap(), ram.index(k).unwrap());
         assert_eq!(fd.take_g_page_preads(), pages.len() as u64);
-        assert!(
-            pages.len() >= 2,
-            "straddle vertex must include both page sides"
-        );
+        assert!(pages.len() >= 2, "straddle vertex must include both page sides");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1632,17 +1521,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bdz2-batch-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let n = 1_200u32;
         let modulus = 1u32 << 25;
-        let keys: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13))
-            .collect();
+        let keys: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13)).collect();
         let values: Vec<u32> = (0..n).map(|i| i * 17 + 3).collect();
         let ram = BdzMphf::build_assigned(&keys, &values, modulus).unwrap();
         let p = dir.join("t.mphf");
@@ -1650,10 +1535,7 @@ mod tests {
         let fd = BdzMphf::read_packed_from(&p).unwrap();
         let g_bits = g_bits_for_modulus(modulus);
         assert!(
-            keys.iter().any(|&k| ram
-                .vertices(k)
-                .iter()
-                .any(|&v| vertex_straddles_page(v, g_bits))),
+            keys.iter().any(|&k| ram.vertices(k).iter().any(|&v| vertex_straddles_page(v, g_bits))),
             "batch must include a page-straddling vertex"
         );
         let mut want: Vec<u32> = keys.iter().map(|&k| ram.index(k).unwrap()).collect();
@@ -1661,9 +1543,7 @@ mod tests {
         want.push(ram.index(miss).unwrap());
         let mut batch_keys = keys.clone();
         batch_keys.push(miss);
-        let got = fd
-            .index_batch(&batch_keys, &mut crate::IoCtx::none())
-            .unwrap();
+        let got = fd.index_batch(&batch_keys, &mut crate::IoCtx::none()).unwrap();
         assert_eq!(got, want);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1671,9 +1551,7 @@ mod tests {
     #[test]
     fn packed_g_scatter_reversed_pages_match_forward() {
         let g_bits = 25u32;
-        let g: Vec<u32> = (0..3_000u32)
-            .map(|i| i.wrapping_mul(17).wrapping_add(3))
-            .collect();
+        let g: Vec<u32> = (0..3_000u32).map(|i| i.wrapping_mul(17).wrapping_add(3)).collect();
         let packed = pack_g(&g, g_bits);
         assert!(
             packed.len() > G_PAGE_BYTES * 2,
@@ -1683,11 +1561,8 @@ mod tests {
             (0..g.len() as u32).any(|v| vertex_straddles_page(v, g_bits)),
             "packed g must include a page-straddling vertex"
         );
-        let pages: Vec<(u32, &[u8])> = packed
-            .chunks(G_PAGE_BYTES)
-            .enumerate()
-            .map(|(i, c)| (i as u32, c))
-            .collect();
+        let pages: Vec<(u32, &[u8])> =
+            packed.chunks(G_PAGE_BYTES).enumerate().map(|(i, c)| (i as u32, c)).collect();
         let verts: Vec<[u32; 3]> = (0..g.len() as u32).map(|v| [v, v, v]).collect();
         let want: Vec<[u32; 3]> = verts
             .iter()
@@ -1713,17 +1588,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bdz2-held-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let n = 1_200u32;
         let modulus = 1u32 << 25;
-        let keys: Vec<u64> = (0..n as u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13))
-            .collect();
+        let keys: Vec<u64> =
+            (0..n as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13)).collect();
         let values: Vec<u32> = (0..n).map(|i| i * 17 + 3).collect();
         let ram = BdzMphf::build_assigned(&keys, &values, modulus).unwrap();
         let p = dir.join("t.mphf");
@@ -1750,9 +1621,8 @@ mod tests {
 
     #[test]
     fn compact_injective_2k() {
-        let keys: Vec<u64> = (0..2_000u64)
-            .map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11))
-            .collect();
+        let keys: Vec<u64> =
+            (0..2_000u64).map(|i| i.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(11)).collect();
         let f = BdzMphf::build_compact(&keys).unwrap();
         let mut seen = vec![false; keys.len()];
         for &k in &keys {
@@ -1780,15 +1650,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bdz3-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let keys: Vec<u64> = (0..2_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13))
-            .collect();
+        let keys: Vec<u64> =
+            (0..2_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13)).collect();
         let ram = BdzMphf::build_compact(&keys).unwrap();
         let p = dir.join("t.mphf");
         ram.write_compact_to(&p).unwrap();
@@ -1801,18 +1667,10 @@ mod tests {
         assert_eq!(fd.g_bytes_resident(), 0);
         let m = compact_vertex_count(keys.len() as u32);
         let occ_off = HEADER_LEN3 + packed_g_bytes(m, COMPACT_G_BITS);
-        assert_ne!(
-            occ_off % 8,
-            0,
-            "occ follows packed g; rank must popcount bytes, not &[u64]"
-        );
+        assert_ne!(occ_off % 8, 0, "occ follows packed g; rank must popcount bytes, not &[u64]");
         let n_supers = (m as usize).div_ceil(RANK_SUPER_BITS as usize);
         let supers_heap = (n_supers + 1) * 4;
-        assert_eq!(
-            fd.occ_bytes_resident(),
-            supers_heap,
-            "open must map occ; heap is supers only"
-        );
+        assert_eq!(fd.occ_bytes_resident(), supers_heap, "open must map occ; heap is supers only");
         assert!(occ_packed_bytes(m) as usize > supers_heap);
         assert_eq!(raw.len() as u64, ram.trailer_off());
         assert_eq!(fd.trailer_off(), ram.trailer_off());

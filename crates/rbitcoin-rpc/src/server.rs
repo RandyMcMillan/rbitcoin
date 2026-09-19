@@ -117,21 +117,16 @@ pub async fn run_rpc(
         alert_fired: Arc::new(AtomicBool::new(false)),
     });
 
-    let work_queue = config
-        .work_queue
-        .filter(|n| *n > 0)
-        .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    let work_queue =
+        config.work_queue.filter(|n| *n > 0).map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     let mut local_addr = None;
 
     if let Some(addr) = config.listen {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("rpc bind {addr}: {e}"))?;
-        let bound = listener
-            .local_addr()
-            .map_err(|e| format!("rpc local_addr: {e}"))?;
+        let listener =
+            TcpListener::bind(addr).await.map_err(|e| format!("rpc bind {addr}: {e}"))?;
+        let bound = listener.local_addr().map_err(|e| format!("rpc local_addr: {e}"))?;
         local_addr = Some(bound);
         let state = AppState {
             ctx: Arc::clone(&ctx),
@@ -151,10 +146,7 @@ pub async fn run_rpc(
                 .await
                 .ok();
         }));
-        info!(
-            "rpc: HTTP JSON-RPC on {bound} (bearer token {})",
-            token_path.display()
-        );
+        info!("rpc: HTTP JSON-RPC on {bound} (bearer token {})", token_path.display());
     }
 
     #[cfg(unix)]
@@ -169,12 +161,8 @@ pub async fn run_rpc(
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
         }
-        let state = AppState {
-            ctx: Arc::clone(&ctx),
-            auth: auth.clone(),
-            work_queue,
-            require_auth: false,
-        };
+        let state =
+            AppState { ctx: Arc::clone(&ctx), auth: auth.clone(), work_queue, require_auth: false };
         let app = Router::new().route("/", post(rpc_post)).with_state(state);
         let shutdown_w = Arc::clone(&shutdown);
         tasks.push(tokio::spawn(async move {
@@ -235,10 +223,7 @@ async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         match sem.try_acquire() {
             Ok(p) => Some(p),
             Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Work queue depth exceeded\n",
-                )
+                return (StatusCode::SERVICE_UNAVAILABLE, "Work queue depth exceeded\n")
                     .into_response();
             }
         }
@@ -403,11 +388,8 @@ fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
     };
     let has_id = req.as_object().is_some_and(|m| m.contains_key("id"));
     let notification = ver == JsonRpcVer::V2 && !has_id;
-    let id = if has_id {
-        Some(req.get("id").cloned().unwrap_or(serde_json::Value::Null))
-    } else {
-        None
-    };
+    let id =
+        if has_id { Some(req.get("id").cloned().unwrap_or(serde_json::Value::Null)) } else { None };
     let method = match req.get("method").and_then(|m| m.as_str()) {
         Some(m) => m,
         None => {
@@ -450,10 +432,7 @@ fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
     let dispatched = handle_request_dispatch(ctx, method, params);
     let wall_ms = t0.elapsed().as_millis() as u64;
     let err_s = match &dispatched {
-        Err(e) => e
-            .get("message")
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string()),
+        Err(e) => e.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()),
         Ok(_) => None,
     };
     rbitcoin_log::api_call("rpc", "-", method, &params_s, wall_ms, err_s.as_deref());
@@ -483,10 +462,7 @@ fn handle_request_dispatch(
 }
 
 fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {
-    let Some(val) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    else {
+    let Some(val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
         return false;
     };
     if let Some(tok) = parse_bearer_auth(val) {
@@ -527,18 +503,11 @@ mod tests {
             "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_s}",
             body_s.len()
         );
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        stream
-            .write_all(req.as_bytes())
-            .await
-            .map_err(|e| format!("write: {e}"))?;
+        let mut stream =
+            tokio::net::TcpStream::connect(addr).await.map_err(|e| format!("connect: {e}"))?;
+        stream.write_all(req.as_bytes()).await.map_err(|e| format!("write: {e}"))?;
         let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| format!("read: {e}"))?;
+        stream.read_to_end(&mut buf).await.map_err(|e| format!("read: {e}"))?;
         let text = String::from_utf8_lossy(&buf);
         let body_start = text.find("\r\n\r\n").ok_or("no HTTP body")? + 4;
         let json_body = &text[body_start..];
@@ -563,70 +532,45 @@ mod tests {
 
             alert_notify: None,
         };
-        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
-            .await
-            .unwrap();
+        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
-        let count = post_rpc(
-            tcp_addr(&handle),
-            &handle.auth,
-            "getblockcount",
-            serde_json::json!([]),
-        )
-        .await
-        .unwrap();
+        let count =
+            post_rpc(tcp_addr(&handle), &handle.auth, "getblockcount", serde_json::json!([]))
+                .await
+                .unwrap();
         assert!(count["error"].is_null(), "{count}");
         assert_eq!(count["result"], 0);
 
-        let help = post_rpc(
-            tcp_addr(&handle),
-            &handle.auth,
-            "help",
-            serde_json::json!([]),
-        )
-        .await
-        .unwrap();
+        let help =
+            post_rpc(tcp_addr(&handle), &handle.auth, "help", serde_json::json!([])).await.unwrap();
         assert!(help["error"].is_null(), "{help}");
         let s = help["result"].as_str().unwrap();
         assert!(s.contains("getblockchaininfo"));
 
-        let mem = post_rpc(
-            tcp_addr(&handle),
-            &handle.auth,
-            "getmempoolinfo",
-            serde_json::json!([]),
-        )
-        .await
-        .unwrap();
+        let mem =
+            post_rpc(tcp_addr(&handle), &handle.auth, "getmempoolinfo", serde_json::json!([]))
+                .await
+                .unwrap();
         assert!(mem["error"].is_null(), "{mem}");
         assert_eq!(mem["result"]["size"], 0);
 
-        let chain = post_rpc(
-            tcp_addr(&handle),
-            &handle.auth,
-            "getblockchaininfo",
-            serde_json::json!([]),
-        )
-        .await
-        .unwrap();
+        let chain =
+            post_rpc(tcp_addr(&handle), &handle.auth, "getblockchaininfo", serde_json::json!([]))
+                .await
+                .unwrap();
         assert!(chain["error"].is_null(), "{chain}");
         assert_eq!(chain["result"]["chain"], "regtest");
 
         // 401 without auth
-        let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle))
-            .await
-            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle)).await.unwrap();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let bad = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
         stream.write_all(bad).await.unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
-        assert!(
-            text.contains("401") || text.contains("Unauthorized"),
-            "{text}"
-        );
+        assert!(text.contains("401") || text.contains("Unauthorized"), "{text}");
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -649,11 +593,7 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
-        let status: u16 = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let status: u16 = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
         let json_body = text[body_start..].trim();
         let parsed = if json_body.is_empty() {
@@ -682,9 +622,7 @@ mod tests {
 
             alert_notify: None,
         };
-        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
-            .await
-            .unwrap();
+        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
 
         let batch = serde_json::json!([
@@ -692,12 +630,8 @@ mod tests {
             {"jsonrpc":"2.0","id":2,"method":"invalidmethod"},
             {"jsonrpc":"2.0","id":4,"pizza":"sausage"}
         ]);
-        let (st, body) = post_raw(
-            tcp_addr(&handle),
-            &handle.auth,
-            batch.to_string().as_bytes(),
-        )
-        .await;
+        let (st, body) =
+            post_raw(tcp_addr(&handle), &handle.auth, batch.to_string().as_bytes()).await;
         assert_eq!(st, 200, "{body:?}");
         let arr = body.unwrap();
         assert_eq!(arr[0]["jsonrpc"], "2.0");
@@ -720,17 +654,11 @@ mod tests {
         assert_eq!(st, 500);
         assert_eq!(body.unwrap()["error"]["message"], "Parse error");
 
-        let (st, body) = post_raw(
-            tcp_addr(&handle),
-            &handle.auth,
-            br#"{"jsonrpc":2,"method":"getblockcount"}"#,
-        )
-        .await;
+        let (st, body) =
+            post_raw(tcp_addr(&handle), &handle.auth, br#"{"jsonrpc":2,"method":"getblockcount"}"#)
+                .await;
         assert_eq!(st, 400);
-        assert_eq!(
-            body.unwrap()["error"]["message"],
-            "jsonrpc field must be a string"
-        );
+        assert_eq!(body.unwrap()["error"]["message"], "jsonrpc field must be a string");
 
         let (st, _) = post_raw(
             tcp_addr(&handle),
@@ -761,9 +689,7 @@ mod tests {
 
             alert_notify: None,
         };
-        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
-            .await
-            .unwrap();
+        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let (st, body) = post_raw(
             tcp_addr(&handle),
@@ -778,20 +704,10 @@ mod tests {
             {"jsonrpc":"1.0","id":1,"method":"getblockcount"},
             {"jsonrpc":"1.0","id":2,"method":"getblockcount"}
         ]);
-        let (st, body) = post_raw(
-            tcp_addr(&handle),
-            &handle.auth,
-            batch.to_string().as_bytes(),
-        )
-        .await;
-        assert_eq!(
-            st, 200,
-            "one POST is one occupancy even with 2 methods: {body:?}"
-        );
-        let arr = body
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .expect("batch json");
+        let (st, body) =
+            post_raw(tcp_addr(&handle), &handle.auth, batch.to_string().as_bytes()).await;
+        assert_eq!(st, 200, "one POST is one occupancy even with 2 methods: {body:?}");
+        let arr = body.as_ref().and_then(|v| v.as_array()).expect("batch json");
         assert_eq!(arr.len(), 2, "{body:?}");
 
         let mut hits = Vec::new();
@@ -800,25 +716,14 @@ mod tests {
             let addr = tcp_addr(&handle);
             let auth = handle.auth.clone();
             set.spawn(async move {
-                post_raw(
-                    addr,
-                    &auth,
-                    br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
-                )
-                .await
+                post_raw(addr, &auth, br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#).await
             });
         }
         while let Some(r) = set.join_next().await {
             hits.push(r.unwrap().0);
         }
-        assert!(
-            hits.contains(&503),
-            "full permit must HTTP 503, got {hits:?}"
-        );
-        assert!(
-            hits.contains(&200),
-            "some occupancy must still succeed, got {hits:?}"
-        );
+        assert!(hits.contains(&503), "full permit must HTTP 503, got {hits:?}");
+        assert!(hits.contains(&200), "some occupancy must still succeed, got {hits:?}");
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -840,9 +745,7 @@ mod tests {
             work_queue: None,
             alert_notify: None,
         };
-        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
-            .await
-            .unwrap();
+        let handle = run_rpc(cfg, q, Some(mp), None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let addr = tcp_addr(&handle);
         let auth = &handle.auth;
@@ -880,17 +783,10 @@ mod tests {
         )
         .await;
         assert_eq!(st, 500);
-        assert_eq!(
-            body.unwrap()["error"]["message"],
-            "params must be array or object"
-        );
+        assert_eq!(body.unwrap()["error"]["message"], "params must be array or object");
 
-        let (st, body) = post_raw(
-            addr,
-            auth,
-            br#"{"jsonrpc":"1.0","id":1,"method":7,"params":[]}"#,
-        )
-        .await;
+        let (st, body) =
+            post_raw(addr, auth, br#"{"jsonrpc":"1.0","id":1,"method":7,"params":[]}"#).await;
         assert_eq!(st, 400);
         assert_eq!(body.unwrap()["error"]["message"], "Missing method");
 
@@ -921,10 +817,7 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
-        assert!(
-            text.contains("401") || text.contains("Unauthorized"),
-            "{text}"
-        );
+        assert!(text.contains("401") || text.contains("Unauthorized"), "{text}");
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mal = b"POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic !!!\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
@@ -932,10 +825,7 @@ mod tests {
         buf.clear();
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
-        assert!(
-            text.contains("401") || text.contains("Unauthorized"),
-            "{text}"
-        );
+        assert!(text.contains("401") || text.contains("Unauthorized"), "{text}");
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -960,11 +850,7 @@ mod tests {
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
-        let status: u16 = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let status: u16 = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let body_start = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
         let json_body = text[body_start..].trim();
         let parsed = if json_body.is_empty() {
@@ -993,9 +879,8 @@ mod tests {
         let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let addr = tcp_addr(&handle);
-        let count = post_rpc(addr, &handle.auth, "getblockcount", serde_json::json!([]))
-            .await
-            .unwrap();
+        let count =
+            post_rpc(addr, &handle.auth, "getblockcount", serde_json::json!([])).await.unwrap();
         assert_eq!(count["result"], 0, "{count}");
         use base64::Engine;
         let basic = base64::engine::general_purpose::STANDARD.encode("ignored:pass");
@@ -1034,13 +919,8 @@ mod tests {
             work_queue: None,
             alert_notify: None,
         };
-        let err = run_rpc(cfg, q, None, None, None, None, None)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("rpc-listen") || err.contains("AF_UNIX"),
-            "{err}"
-        );
+        let err = run_rpc(cfg, q, None, None, None, None, None).await.unwrap_err();
+        assert!(err.contains("rpc-listen") || err.contains("AF_UNIX"), "{err}");
     }
 
     #[cfg(unix)]

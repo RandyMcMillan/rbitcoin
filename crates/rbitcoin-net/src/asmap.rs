@@ -349,13 +349,7 @@ fn sanity_check_bits(asmap: &[u8], mut bits: i32) -> bool {
             }
             prevopcode = JUMP;
         } else if opcode == MATCH {
-            if !sanity_match(
-                &mut pos,
-                asmap,
-                prevopcode,
-                &mut had_incomplete_match,
-                &mut bits,
-            ) {
+            if !sanity_match(&mut pos, asmap, prevopcode, &mut had_incomplete_match, &mut bits) {
                 return false;
             }
             prevopcode = MATCH;
@@ -497,10 +491,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-asmap-trunc-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.dat");

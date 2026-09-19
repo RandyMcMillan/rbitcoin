@@ -53,10 +53,7 @@ fn repo_root() -> PathBuf {
     let start = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut cur: &Path = &start;
     loop {
-        if cur
-            .join("scripts/core-functional/init-submodule.sh")
-            .is_file()
-        {
+        if cur.join("scripts/core-functional/init-submodule.sh").is_file() {
             return cur.to_path_buf();
         }
         match cur.parent() {
@@ -73,10 +70,7 @@ fn ensure_submodule() {
             return;
         }
         let script = repo_root().join("scripts/core-functional/init-submodule.sh");
-        eprintln!(
-            "core_fixture: missing submodule; running {}",
-            script.display()
-        );
+        eprintln!("core_fixture: missing submodule; running {}", script.display());
         let status = Command::new(&script)
             .status()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", script.display()));
@@ -151,10 +145,7 @@ mod tests {
         let p = stage_core_json("script_tests.json");
         assert!(p.is_file(), "staged {p:?}");
         let head = fs::read_to_string(&p).unwrap();
-        assert!(
-            head.trim_start().starts_with('['),
-            "expected JSON array at {p:?}"
-        );
+        assert!(head.trim_start().starts_with('['), "expected JSON array at {p:?}");
     }
 
     #[test]
@@ -162,10 +153,7 @@ mod tests {
         let p = stage_core_json("sighash.json");
         assert!(p.is_file(), "staged {p:?}");
         let head = fs::read_to_string(&p).unwrap();
-        assert!(
-            head.trim_start().starts_with('['),
-            "expected JSON array at {p:?}"
-        );
+        assert!(head.trim_start().starts_with('['), "expected JSON array at {p:?}");
     }
 
     #[test]
@@ -184,10 +172,7 @@ mod tests {
         assert!(p.is_file(), "staged {p:?}");
         let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert!(v.get("version").is_some(), "expected version at {p:?}");
-        assert!(
-            v.get("scriptPubKey").is_some(),
-            "expected scriptPubKey at {p:?}"
-        );
+        assert!(v.get("scriptPubKey").is_some(), "expected scriptPubKey at {p:?}");
     }
 
     #[test]
@@ -207,10 +192,7 @@ mod tests {
             "bip341_wallet_vectors.json",
         ] {
             let p = fixtures.join(name);
-            assert!(
-                !p.exists(),
-                "do not check in {p:?}; cargo test stages from the submodule"
-            );
+            assert!(!p.exists(), "do not check in {p:?}; cargo test stages from the submodule");
         }
     }
 }

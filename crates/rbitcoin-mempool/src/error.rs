@@ -38,10 +38,7 @@ impl std::error::Error for MempoolError {
 
 impl MempoolError {
     pub(crate) fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
-        MempoolError::Io {
-            path: path.into(),
-            source,
-        }
+        MempoolError::Io { path: path.into(), source }
     }
 }
 

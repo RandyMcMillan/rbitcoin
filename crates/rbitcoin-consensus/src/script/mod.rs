@@ -185,17 +185,13 @@ fn verify_native_witness<'a>(
     match (version, program.len()) {
         (0, 20) => p2wpkh::verify(job, input_index, tx, pre),
         (0, 32) => p2wsh::verify(job, input_index, tx),
-        (0, _) => Err(ConsensusError::Script(
-            "WITNESS_PROGRAM_WRONG_LENGTH".into(),
-        )),
+        (0, _) => Err(ConsensusError::Script("WITNESS_PROGRAM_WRONG_LENGTH".into())),
         (1, 32) if job.taproot_active => {
             p2tr::verify(job, input_index, tx, sighash_cache(cache, tx))
         }
         _ => {
             if job.discourage_upgradable_witness {
-                return Err(ConsensusError::Script(
-                    "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into(),
-                ));
+                return Err(ConsensusError::Script("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM".into()));
             }
             Ok(())
         }
@@ -420,10 +416,8 @@ pub(crate) mod crypto {
         use EcdsaSighashType::*;
         let mapped = EcdsaSighashType::from_consensus(raw_ty);
         // `split_anyonecanpay_flag` is crate-private in rust-bitcoin 0.32.
-        let anyone_can_pay = matches!(
-            mapped,
-            AllPlusAnyoneCanPay | NonePlusAnyoneCanPay | SinglePlusAnyoneCanPay
-        );
+        let anyone_can_pay =
+            matches!(mapped, AllPlusAnyoneCanPay | NonePlusAnyoneCanPay | SinglePlusAnyoneCanPay);
         let base = match mapped {
             None | NonePlusAnyoneCanPay => None,
             Single | SinglePlusAnyoneCanPay => Single,
@@ -431,11 +425,8 @@ pub(crate) mod crypto {
         };
         let zero = [0u8; 32];
 
-        let hash_prevouts: [u8; 32] = if !anyone_can_pay {
-            sighash_midstate(pre.hash_prevouts())?
-        } else {
-            zero
-        };
+        let hash_prevouts: [u8; 32] =
+            if !anyone_can_pay { sighash_midstate(pre.hash_prevouts())? } else { zero };
 
         let hash_sequence: [u8; 32] = if !anyone_can_pay && base != Single && base != None {
             sighash_midstate(pre.hash_sequence())?
@@ -502,14 +493,7 @@ pub(crate) mod crypto {
         let script_code = script_pubkey
             .p2wpkh_script_code()
             .ok_or_else(|| ConsensusError::Script("bip143 not p2wpkh".into()))?;
-        bip143_signature_hash(
-            tx,
-            input_index,
-            script_code.as_script(),
-            amount,
-            raw_ty,
-            pre,
-        )
+        bip143_signature_hash(tx, input_index, script_code.as_script(), amount, raw_ty, pre)
     }
 
     /// P2WSH / WitnessV0 BIP143 using [`crate::TxPrecompute`] midstates.
@@ -803,10 +787,7 @@ mod verify_routing_tests {
         let err = crypto::bip143_p2wsh_signature_hash(&tx, 0, wscript, amt, 0x01, &pre)
             .expect_err("connect-only precompute must not sighash");
         let msg = err.to_string();
-        assert!(
-            msg.contains("invariant: sighash midstate missing"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("invariant: sighash midstate missing"), "got: {msg}");
     }
 
     #[test]
@@ -838,11 +819,8 @@ mod verify_routing_tests {
         );
         let e = annotate_script_err(ConsensusError::MissingPrevout, &job, 0);
         assert!(matches!(e, ConsensusError::MissingPrevout));
-        let e2 = annotate_script_err(
-            ConsensusError::Script("already txid=abc vin=0".into()),
-            &job,
-            3,
-        );
+        let e2 =
+            annotate_script_err(ConsensusError::Script("already txid=abc vin=0".into()), &job, 3);
         match e2 {
             ConsensusError::Script(m) => assert!(m.contains("already txid=")),
             other => panic!("{other:?}"),
@@ -900,24 +878,14 @@ mod verify_routing_tests {
 
     #[test]
     fn p2pkh_shape_error_detection() {
-        assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script(
-            "p2pkh scriptSig len".into()
-        )));
-        assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script(
-            "p2pkh scriptSig".into()
-        )));
-        assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script(
-            "p2pkh scriptSig op".into()
-        )));
+        assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script("p2pkh scriptSig len".into())));
+        assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script("p2pkh scriptSig".into())));
+        assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script("p2pkh scriptSig op".into())));
         assert!(p2pkh_scriptsig_shape_error(&ConsensusError::Script(
             "p2pkh scriptSig unexpected op".into()
         )));
-        assert!(!p2pkh_scriptsig_shape_error(&ConsensusError::Script(
-            "p2pkh ecdsa".into()
-        )));
-        assert!(!p2pkh_scriptsig_shape_error(
-            &ConsensusError::MissingPrevout
-        ));
+        assert!(!p2pkh_scriptsig_shape_error(&ConsensusError::Script("p2pkh ecdsa".into())));
+        assert!(!p2pkh_scriptsig_shape_error(&ConsensusError::MissingPrevout));
     }
 
     #[test]

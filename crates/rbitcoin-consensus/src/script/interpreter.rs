@@ -306,11 +306,7 @@ impl<'a> EvalContext<'a> {
         script_code: &'a Script,
         sig_version: SigVersion,
     ) -> Self {
-        let amount = job
-            .prevouts
-            .get(input_index)
-            .map(|p| p.value)
-            .unwrap_or(Amount::ZERO);
+        let amount = job.prevouts.get(input_index).map(|p| p.value).unwrap_or(Amount::ZERO);
         Self::from_eval_parts(
             tx,
             input_index,
@@ -508,9 +504,7 @@ pub(crate) fn eval_script(
                 }
                 // Core: disabled opcodes fail even in unexecuted branches (legacy/v0).
                 if ctx.sig_version != SigVersion::TapScript && is_disabled_legacy(code) {
-                    return Err(ConsensusError::Script(format!(
-                        "disabled opcode 0x{code:02x}"
-                    )));
+                    return Err(ConsensusError::Script(format!("disabled opcode 0x{code:02x}")));
                 }
                 // CONST_SCRIPTCODE: OP_CODESEPARATOR rejected in Base even unexecuted.
                 if code == 0xab && ctx.const_scriptcode && ctx.sig_version == SigVersion::Base {
@@ -787,8 +781,7 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("OP_CODESEPARATOR".into()));
                         }
                         ctx.codeseparator_pos.set(this_pos);
-                        ctx.codeseparator_script_off
-                            .set(Some(byte_index.saturating_add(1)));
+                        ctx.codeseparator_script_off.set(Some(byte_index.saturating_add(1)));
                     }
                     0xac => op_checksig(stack, altstack.len(), ctx, false)?,
                     0xad => op_checksig(stack, altstack.len(), ctx, true)?,
@@ -873,9 +866,7 @@ pub(crate) fn eval_script(
                                 "disabled opcode 0x{code:02x}"
                             )));
                         }
-                        return Err(ConsensusError::Script(format!(
-                            "unknown opcode 0x{code:02x}"
-                        )));
+                        return Err(ConsensusError::Script(format!("unknown opcode 0x{code:02x}")));
                     }
                 }
                 // Core: stack + altstack share MAX_STACK_SIZE (1000).
@@ -1464,9 +1455,7 @@ fn push(stack: &mut Vec<Vec<u8>>, alt_len: usize, v: Vec<u8>) -> Result<(), Cons
 }
 
 fn pop(stack: &mut Vec<Vec<u8>>) -> Result<Vec<u8>, ConsensusError> {
-    stack
-        .pop()
-        .ok_or_else(|| ConsensusError::Script("stack empty".into()))
+    stack.pop().ok_or_else(|| ConsensusError::Script("stack empty".into()))
 }
 
 fn require_n(stack: &[Vec<u8>], n: usize) -> Result<(), ConsensusError> {
@@ -1643,14 +1632,8 @@ mod success_and_disabled_tests {
         }];
         // script_code points into script_bytes via Script::from_bytes
         let script = Script::from_bytes(script_bytes);
-        let ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(50_000),
-            &prevouts,
-            script,
-            sig_version,
-        );
+        let ctx =
+            EvalContext::new(&tx, 0, Amount::from_sat(50_000), &prevouts, script, sig_version);
         let mut stack = Vec::new();
         eval_script(script, &mut stack, &ctx)
     }
@@ -1672,10 +1655,7 @@ mod success_and_disabled_tests {
         let script = vec![0x00, 0x00, 0x7e];
         let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("disabled") || msg.contains("0x7e"),
-            "unexpected: {msg}"
-        );
+        assert!(msg.contains("disabled") || msg.contains("0x7e"), "unexpected: {msg}");
     }
 
     /// Core: disabled opcodes fail even in unexecuted IF branches.
@@ -1697,10 +1677,7 @@ mod success_and_disabled_tests {
         // OP_0 IF OP_VERIF ELSE OP_1 ENDIF
         let script = vec![0x00, 0x63, 0x65, 0x67, 0x51, 0x68];
         let err = eval(&script, SigVersion::Base).unwrap_err();
-        assert!(
-            format!("{err}").contains("VERIF") || format!("{err}").contains("opcode"),
-            "{err}"
-        );
+        assert!(format!("{err}").contains("VERIF") || format!("{err}").contains("opcode"), "{err}");
     }
 
     #[test]
@@ -1712,10 +1689,7 @@ mod success_and_disabled_tests {
     }
 
     fn hex_literal(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
     /// strip_op_codeseparator + script_code_bytes + OP_PUSHDATA lengths.
@@ -1850,58 +1824,18 @@ mod success_and_disabled_tests {
         let cases: &[(&str, Vec<u8>, SigVersion)] = &[
             ("1ADD", vec![0x51, 0x8b, 0x52, 0x87], SigVersion::WitnessV0),
             ("1SUB", vec![0x52, 0x8c, 0x51, 0x87], SigVersion::WitnessV0),
-            (
-                "NEGATE",
-                vec![0x51, 0x8f, 0x4f, 0x87],
-                SigVersion::WitnessV0,
-            ),
+            ("NEGATE", vec![0x51, 0x8f, 0x4f, 0x87], SigVersion::WitnessV0),
             ("ABS", vec![0x4f, 0x90, 0x51, 0x87], SigVersion::WitnessV0),
-            (
-                "SHA1",
-                vec![0x00, 0xa7, 0x82, 0x01, 0x14, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "RIPEMD160",
-                vec![0x00, 0xa6, 0x82, 0x01, 0x14, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "SHA256",
-                vec![0x00, 0xa8, 0x82, 0x01, 0x20, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "HASH160",
-                vec![0x00, 0xa9, 0x82, 0x01, 0x14, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "HASH256",
-                vec![0x00, 0xaa, 0x82, 0x01, 0x20, 0x87],
-                SigVersion::WitnessV0,
-            ),
+            ("SHA1", vec![0x00, 0xa7, 0x82, 0x01, 0x14, 0x87], SigVersion::WitnessV0),
+            ("RIPEMD160", vec![0x00, 0xa6, 0x82, 0x01, 0x14, 0x87], SigVersion::WitnessV0),
+            ("SHA256", vec![0x00, 0xa8, 0x82, 0x01, 0x20, 0x87], SigVersion::WitnessV0),
+            ("HASH160", vec![0x00, 0xa9, 0x82, 0x01, 0x14, 0x87], SigVersion::WitnessV0),
+            ("HASH256", vec![0x00, 0xaa, 0x82, 0x01, 0x20, 0x87], SigVersion::WitnessV0),
             ("SIZE", vec![0x00, 0x82, 0x00, 0x87], SigVersion::WitnessV0),
-            (
-                "WITHIN",
-                vec![0x51, 0x00, 0x52, 0xa5, 0x51, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "MIN",
-                vec![0x51, 0x52, 0xa3, 0x51, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "MAX",
-                vec![0x51, 0x52, 0xa4, 0x52, 0x87],
-                SigVersion::WitnessV0,
-            ),
-            (
-                "CHECKSIGADD",
-                vec![0x00, 0x51, 0x01, 0xff, 0xba, 0x51, 0x87],
-                SigVersion::TapScript,
-            ),
+            ("WITHIN", vec![0x51, 0x00, 0x52, 0xa5, 0x51, 0x87], SigVersion::WitnessV0),
+            ("MIN", vec![0x51, 0x52, 0xa3, 0x51, 0x87], SigVersion::WitnessV0),
+            ("MAX", vec![0x51, 0x52, 0xa4, 0x52, 0x87], SigVersion::WitnessV0),
+            ("CHECKSIGADD", vec![0x00, 0x51, 0x01, 0xff, 0xba, 0x51, 0x87], SigVersion::TapScript),
         ];
         for (name, script, sv) in cases {
             match eval(script, *sv) {
@@ -1935,10 +1869,7 @@ mod success_and_disabled_tests {
         // After pops: n, keys, m, sigs, dummy — for 0/0: push dummy, 0, 0, CHECKMULTISIG
         let script = vec![0x01, 0xff, 0x00, 0x00, 0xae, 0x51]; // dummy, 0, 0, CMS, TRUE won't run
         let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
-        assert!(
-            format!("{err}").contains("NULLDUMMY"),
-            "expected NULLDUMMY, got {err}"
-        );
+        assert!(format!("{err}").contains("NULLDUMMY"), "expected NULLDUMMY, got {err}");
         // Empty dummy 0-of-0 succeeds (CMS pushes true), then need true top — CMS pushes 1.
         let script_ok = vec![0x00, 0x00, 0x00, 0xae]; // empty dummy, m=0, n=0, CMS
         eval(&script_ok, SigVersion::WitnessV0).expect("0-of-0 empty dummy");
@@ -2004,10 +1935,7 @@ mod success_and_disabled_tests {
         );
         let mut stack2 = Vec::new();
         let err = eval_script(script, &mut stack2, &ctx2).unwrap_err();
-        assert!(
-            format!("{err}").contains("CSV"),
-            "v2 should enforce CSV, got {err}"
-        );
+        assert!(format!("{err}").contains("CSV"), "v2 should enforce CSV, got {err}");
     }
 
     #[test]
@@ -2100,9 +2028,7 @@ mod success_and_disabled_tests {
         // Truncated pushdata — no success past end
         assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4c])));
         assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4d, 0x01])));
-        assert!(!tapscript_has_op_success(Script::from_bytes(&[
-            0x4e, 0x01, 0x00
-        ])));
+        assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4e, 0x01, 0x00])));
         let _ = (leaf, leaf2, leaf3);
     }
 
@@ -2274,10 +2200,7 @@ mod success_and_disabled_tests {
     #[test]
     fn cltv_empty_stack_is_invalid() {
         let err = eval(&[0xb1], SigVersion::Base).unwrap_err();
-        assert!(
-            format!("{err}").contains("stack"),
-            "empty-stack CLTV: {err}"
-        );
+        assert!(format!("{err}").contains("stack"), "empty-stack CLTV: {err}");
     }
 
     #[test]
@@ -2419,14 +2342,8 @@ mod minimal_data_tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }];
         let script = Script::from_bytes(script_bytes);
-        let mut ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(50_000),
-            &prevouts,
-            script,
-            SigVersion::Base,
-        );
+        let mut ctx =
+            EvalContext::new(&tx, 0, Amount::from_sat(50_000), &prevouts, script, SigVersion::Base);
         ctx.minimal_data = md;
         let mut stack = Vec::new();
         eval_script(script, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
@@ -2506,14 +2423,8 @@ mod minimal_data_tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }];
         let script = Script::from_bytes(&[0x51]);
-        let ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(1),
-            &prevouts,
-            script,
-            SigVersion::Base,
-        );
+        let ctx =
+            EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, script, SigVersion::Base);
         assert!(!ctx.minimal_data);
         assert!(!ctx.nullfail && !ctx.low_s && !ctx.strictenc && !ctx.null_dummy);
     }

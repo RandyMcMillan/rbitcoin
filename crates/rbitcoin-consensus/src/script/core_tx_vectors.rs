@@ -25,9 +25,7 @@ fn load_array(name: &str) -> Vec<Value> {
     let path = fixture(name);
     let s = fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing {path:?}: {e}"));
     let v: Value = serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {name}: {e}"));
-    v.as_array()
-        .cloned()
-        .unwrap_or_else(|| panic!("{name}: root not array"))
+    v.as_array().cloned().unwrap_or_else(|| panic!("{name}: root not array"))
 }
 
 /// Script flags we implement for Core tx corpora.
@@ -299,21 +297,15 @@ fn with_flag(mut f: TxFlags, i: usize, on: bool) -> TxFlags {
 
 /// Parse one prevout entry: [txid_hex, vout, scriptPubKey_scriptlang, amount?]
 fn parse_prevout(cell: &Value) -> Result<(bitcoin::Txid, u32, TxOut), String> {
-    let a = cell
-        .as_array()
-        .ok_or_else(|| "prevout not array".to_string())?;
+    let a = cell.as_array().ok_or_else(|| "prevout not array".to_string())?;
     if a.len() < 3 {
         return Err(format!("prevout short: {a:?}"));
     }
     let txid_hex = a[0].as_str().ok_or("txid")?;
     // Core JSON uses display-order hex (`GetHex`); rust-bitcoin `from_str` matches.
-    let txid: bitcoin::Txid = txid_hex
-        .parse()
-        .map_err(|e| format!("txid parse {txid_hex}: {e}"))?;
-    let vout = a[1]
-        .as_u64()
-        .or_else(|| a[1].as_i64().map(|x| x as u64))
-        .unwrap_or(0) as u32;
+    let txid: bitcoin::Txid =
+        txid_hex.parse().map_err(|e| format!("txid parse {txid_hex}: {e}"))?;
+    let vout = a[1].as_u64().or_else(|| a[1].as_i64().map(|x| x as u64)).unwrap_or(0) as u32;
     let spk_s = a[2].as_str().ok_or("scriptPubKey")?;
     let spk = ScriptBuf::from_bytes(assemble_script(spk_s)?);
     // Core tx_valid/tx_invalid amounts are integer **satoshis** (not BTC floats).
@@ -331,14 +323,7 @@ fn parse_prevout(cell: &Value) -> Result<(bitcoin::Txid, u32, TxOut), String> {
     } else {
         Amount::ZERO
     };
-    Ok((
-        txid,
-        vout,
-        TxOut {
-            value,
-            script_pubkey: spk,
-        },
-    ))
+    Ok((txid, vout, TxOut { value, script_pubkey: spk }))
 }
 
 /// Core `CheckTransaction` (context-free structural consensus checks).
@@ -358,9 +343,8 @@ fn check_transaction_struct(tx: &Transaction) -> Result<(), String> {
         if v > MAX_MONEY {
             return Err("BADTX: vout toolarge".into());
         }
-        n_value_out = n_value_out
-            .checked_add(v)
-            .ok_or_else(|| "BADTX: vouttotal toolarge".to_string())?;
+        n_value_out =
+            n_value_out.checked_add(v).ok_or_else(|| "BADTX: vouttotal toolarge".to_string())?;
         if n_value_out > MAX_MONEY {
             return Err("BADTX: vouttotal toolarge".into());
         }
@@ -394,9 +378,7 @@ fn verify_tx_row(
     flags_s: &str,
     expect_ok: bool,
 ) -> Result<(), String> {
-    let prev_arr = prevouts_json
-        .as_array()
-        .ok_or_else(|| "prevouts not array".to_string())?;
+    let prev_arr = prevouts_json.as_array().ok_or_else(|| "prevouts not array".to_string())?;
     let mut map: std::collections::HashMap<(bitcoin::Txid, u32), TxOut> =
         std::collections::HashMap::new();
     for p in prev_arr {
@@ -413,18 +395,12 @@ fn verify_tx_row(
     let mut prevouts = Vec::with_capacity(tx.input.len());
     for vin in &tx.input {
         let key = (vin.previous_output.txid, vin.previous_output.vout);
-        let po = map
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| format!("missing prevout {key:?}"))?;
+        let po = map.get(&key).cloned().ok_or_else(|| format!("missing prevout {key:?}"))?;
         prevouts.push(po);
     }
     // Core: tx_valid uses ~flags; tx_invalid uses flags as enable set.
-    let flags = if expect_ok {
-        parse_tx_valid_flags(flags_s)
-    } else {
-        parse_tx_invalid_flags(flags_s)
-    };
+    let flags =
+        if expect_ok { parse_tx_valid_flags(flags_s) } else { parse_tx_invalid_flags(flags_s) };
     verify_parsed_tx(&tx, prevouts, &flags)
 }
 

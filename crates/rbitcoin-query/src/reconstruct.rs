@@ -12,20 +12,13 @@ impl Query {
         let t0 = Instant::now();
         crate::note_confirm(&self.confirm_stats().wf_body_store, 1);
         let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
-        crate::note_confirm(
-            &self.confirm_stats().wf_body_store_ns,
-            t0.elapsed().as_nanos() as u64,
-        );
+        crate::note_confirm(&self.confirm_stats().wf_body_store_ns, t0.elapsed().as_nanos() as u64);
         Ok((tx, outs, inputs))
     }
 
     /// Create txids in block order from `txid.body` (no packed `txout` decode).
     pub fn block_txids(&self, height: Height) -> Result<Vec<[u8; 32]>, QueryError> {
-        let header_fk = self
-            .store
-            .confirmed
-            .get(height)?
-            .ok_or(StoreError::NotFound)?;
+        let header_fk = self.store.confirmed.get(height)?.ok_or(StoreError::NotFound)?;
         let (first, n) = self
             .store
             .header_txs
@@ -53,10 +46,7 @@ impl Query {
         use bitcoin::hashes::{sha256d, Hash as _};
 
         let txids = self.block_txids(height)?;
-        let pos = txids
-            .iter()
-            .position(|t| t == txid)
-            .ok_or(StoreError::NotFound)?;
+        let pos = txids.iter().position(|t| t == txid).ok_or(StoreError::NotFound)?;
         let mut branch = Vec::new();
         let mut idx = pos;
         let mut layer: Vec<[u8; 32]> = txids;
@@ -64,11 +54,7 @@ impl Query {
             if layer.len() % 2 == 1 {
                 layer.push(*layer.last().unwrap());
             }
-            let sibling = if idx % 2 == 0 {
-                layer[idx + 1]
-            } else {
-                layer[idx - 1]
-            };
+            let sibling = if idx % 2 == 0 { layer[idx + 1] } else { layer[idx - 1] };
             branch.push(sibling);
             let mut next = Vec::with_capacity(layer.len() / 2);
             let mut i = 0;
@@ -82,19 +68,11 @@ impl Query {
             layer = next;
             idx /= 2;
         }
-        Ok(MerkleProof {
-            block_height: height.0,
-            pos,
-            merkle: branch,
-        })
+        Ok(MerkleProof { block_height: height.0, pos, merkle: branch })
     }
 
     pub fn block_tx_fks(&self, height: Height) -> Result<Vec<Fk>, QueryError> {
-        let header_fk = self
-            .store
-            .confirmed
-            .get(height)?
-            .ok_or(StoreError::NotFound)?;
+        let header_fk = self.store.confirmed.get(height)?.ok_or(StoreError::NotFound)?;
         self.store
             .header_txs
             .get_list(header_fk)?
@@ -119,11 +97,7 @@ impl Query {
         let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_store(tx_fk)?;
         let mut cache = U64Map::default();
         self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
-        Ok(Self::transaction_from_class_a(
-            rec,
-            stored_outputs,
-            stored_inputs,
-        ))
+        Ok(Self::transaction_from_class_a(rec, stored_outputs, stored_inputs))
     }
 
     fn transaction_from_class_a(
@@ -181,9 +155,7 @@ impl Query {
                 continue;
             }
             let Some(id) = inp.create_fk.get() else {
-                return Err(StoreError::Corrupt(
-                    "input missing create_fk for wire rebuild",
-                ));
+                return Err(StoreError::Corrupt("input missing create_fk for wire rebuild"));
             };
             if cache.get(&id).is_some() {
                 continue;
@@ -223,9 +195,7 @@ impl Query {
                 continue;
             }
             let Some(id) = inp.create_fk.get() else {
-                return Err(StoreError::Corrupt(
-                    "input missing create_fk for wire rebuild",
-                ));
+                return Err(StoreError::Corrupt("input missing create_fk for wire rebuild"));
             };
             let Some(&txid) = cache.get(&id) else {
                 return Err(StoreError::Corrupt(
@@ -289,8 +259,7 @@ impl Query {
         use bitcoin::consensus::Encodable;
         let tx = self.reconstruct_tx(tx_fk)?;
         let mut raw = Vec::new();
-        tx.consensus_encode(&mut raw)
-            .map_err(|_| StoreError::Corrupt("tx encode"))?;
+        tx.consensus_encode(&mut raw).map_err(|_| StoreError::Corrupt("tx encode"))?;
         Ok(raw)
     }
 
@@ -302,8 +271,7 @@ impl Query {
         let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
             return Ok(None);
         };
-        self.reconstruct_archived_block_from_parts(rec, tx_fks)
-            .map(Some)
+        self.reconstruct_archived_block_from_parts(rec, tx_fks).map(Some)
     }
 
     /// BIP144 size and BIP141 weight for a header row.
@@ -328,9 +296,7 @@ impl Query {
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
         let weight = u32::try_from(block.weight().to_wu())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
-        self.store
-            .headers
-            .set_size_weight(header_fk, size, weight)?;
+        self.store.headers.set_size_weight(header_fk, size, weight)?;
         Ok(Some((size, weight)))
     }
 
@@ -357,11 +323,7 @@ impl Query {
         let rows = self.load_class_a_rows(&tx_fks)?;
         let mut txdata = Vec::with_capacity(rows.len());
         for (rec_tx, stored_inputs, stored_outputs) in rows {
-            txdata.push(Self::transaction_from_class_a(
-                rec_tx,
-                stored_outputs,
-                stored_inputs,
-            ));
+            txdata.push(Self::transaction_from_class_a(rec_tx, stored_outputs, stored_inputs));
         }
         Ok(Block { header, txdata })
     }
@@ -454,11 +416,7 @@ mod encode_witness_tests {
             output_start_fk: Fk::NULL,
             output_count: 1,
         };
-        let ins = vec![InputRecord::coinbase(
-            u32::MAX,
-            vec![0x01],
-            vec![vec![0x51]],
-        )];
+        let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![vec![0x51]])];
         let outs = vec![OutputRecord::unspent(50, vec![0x51])];
         let mut out = Vec::new();
         encode_class_a_tx(&mut out, &rec, &ins, &outs);

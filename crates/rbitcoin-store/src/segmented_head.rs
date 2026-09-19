@@ -79,9 +79,7 @@ pub struct SegmentedTxHead {
 impl SegmentedTxHead {
     pub fn create(dir: &Path, layout: HeadLayout) -> Result<Self, StoreError> {
         if layout.entry_bytes != 4 {
-            return Err(StoreError::Corrupt(
-                "segmented tx.head requires 4 B relative entries",
-            ));
+            return Err(StoreError::Corrupt("segmented tx.head requires 4 B relative entries"));
         }
         let dir = dir.to_path_buf();
         refuse_legacy_mono_head(&dir)?;
@@ -150,20 +148,13 @@ impl SegmentedTxHead {
                 fuse,
             }));
         }
-        let unsealed_nontail = segs
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| i + 1 != segs.len() && !s.sealed)
-            .count();
+        let unsealed_nontail =
+            segs.iter().enumerate().filter(|(i, s)| i + 1 != segs.len() && !s.sealed).count();
         if unsealed_nontail > 1 {
-            return Err(StoreError::Corrupt(
-                "tx.head multiple unsealed non-tail segments",
-            ));
+            return Err(StoreError::Corrupt("tx.head multiple unsealed non-tail segments"));
         }
         for w in segs.windows(2) {
-            let a_end = w[0]
-                .first_fk
-                .saturating_add(w[0].count.load(Ordering::Relaxed));
+            let a_end = w[0].first_fk.saturating_add(w[0].count.load(Ordering::Relaxed));
             if w[1].first_fk != a_end {
                 return Err(StoreError::Corrupt("tx.head segment fk gap/overlap"));
             }
@@ -219,10 +210,7 @@ impl SegmentedTxHead {
     ///
     /// Used by head-resolve winner-age stats ([`crate::head_resolve_stats::sealed_age_for_fk`]).
     pub fn first_fks_snapshot(&self) -> Vec<u64> {
-        self.segments_snapshot()
-            .iter()
-            .map(|s| s.first_fk)
-            .collect()
+        self.segments_snapshot().iter().map(|s| s.first_fk).collect()
     }
 
     pub fn sealed_segment_count(&self) -> usize {
@@ -230,10 +218,7 @@ impl SegmentedTxHead {
     }
 
     pub fn occupied(&self) -> u64 {
-        self.segments_snapshot()
-            .iter()
-            .map(|s| s.count.load(Ordering::Relaxed))
-            .sum()
+        self.segments_snapshot().iter().map(|s| s.count.load(Ordering::Relaxed)).sum()
     }
 
     /// True when `tx.head/meta` records a non-zero segment count (no table open).
@@ -270,12 +255,7 @@ impl SegmentedTxHead {
     pub fn sealed_fuse_resident_bytes(&self) -> u64 {
         self.segments_snapshot()
             .iter()
-            .map(|s| {
-                s.fuse
-                    .as_ref()
-                    .map(|f| f.fingerprint_heap_bytes() as u64)
-                    .unwrap_or(0)
-            })
+            .map(|s| s.fuse.as_ref().map(|f| f.fingerprint_heap_bytes() as u64).unwrap_or(0))
             .sum()
     }
 
@@ -342,9 +322,7 @@ impl SegmentedTxHead {
                 continue;
             }
             if !s.sealed {
-                return Err(StoreError::Corrupt(
-                    "tx.head install_sealed_fuse: segment not sealed",
-                ));
+                return Err(StoreError::Corrupt("tx.head install_sealed_fuse: segment not sealed"));
             }
             *s = Arc::new(Segment {
                 first_fk: s.first_fk,
@@ -359,9 +337,7 @@ impl SegmentedTxHead {
             break;
         }
         if !found {
-            return Err(StoreError::Corrupt(
-                "tx.head install_sealed_fuse: file_id not found",
-            ));
+            return Err(StoreError::Corrupt("tx.head install_sealed_fuse: file_id not found"));
         }
         *guard = Arc::new(new_list);
         Ok(())
@@ -387,9 +363,10 @@ impl SegmentedTxHead {
             let mut pairs = Vec::with_capacity(count as usize);
             for i in 0..count {
                 let fk = first_fk + i;
-                let mixed = snap.iter().find(|(_, f)| *f == fk).map(|(m, _)| *m).ok_or(
-                    StoreError::Corrupt("tx.head seal collect: fk not in insert batch"),
-                )?;
+                let mixed =
+                    snap.iter().find(|(_, f)| *f == fk).map(|(m, _)| *m).ok_or(
+                        StoreError::Corrupt("tx.head seal collect: fk not in insert batch"),
+                    )?;
                 pairs.push((fuse_key_from_mixed(&mixed), (i as u32) + 1));
             }
             Ok(pairs)
@@ -414,9 +391,7 @@ impl SegmentedTxHead {
         while i < entries.len() {
             self.ensure_open_for(entries[i].1 .0)?;
             let segs = self.segments_snapshot();
-            let last = segs
-                .last()
-                .ok_or(StoreError::Corrupt("tx.head no open segment"))?;
+            let last = segs.last().ok_or(StoreError::Corrupt("tx.head no open segment"))?;
             if last.sealed {
                 return Err(StoreError::Corrupt("tx.head tail sealed unexpectedly"));
             }
@@ -787,9 +762,9 @@ impl SegmentedTxHead {
                 *self.seal_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
                 Ok(())
             }
-            Err(mpsc::TryRecvError::Disconnected) => Err(StoreError::Corrupt(
-                "tx.head background seal worker disconnected",
-            )),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(StoreError::Corrupt("tx.head background seal worker disconnected"))
+            }
         }
     }
 
@@ -804,9 +779,7 @@ impl SegmentedTxHead {
         match rx.recv() {
             Ok(Ok(p)) => self.apply_seal_publish_locked(p),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(StoreError::Corrupt(
-                "tx.head background seal worker disconnected",
-            )),
+            Err(_) => Err(StoreError::Corrupt("tx.head background seal worker disconnected")),
         }
     }
 
@@ -853,9 +826,7 @@ impl SegmentedTxHead {
     fn roll_tail_background_locked(&self, collect: SealCollect) -> Result<(), StoreError> {
         self.wait_seal_locked()?;
         let segs = self.segments_snapshot();
-        let last = segs
-            .last()
-            .ok_or(StoreError::Corrupt("tx.head roll empty"))?;
+        let last = segs.last().ok_or(StoreError::Corrupt("tx.head roll empty"))?;
         if last.sealed {
             return Ok(());
         }
@@ -977,8 +948,7 @@ impl SegmentedTxHead {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
             *guard = Arc::new(list);
         }
-        self.next_file_id
-            .store(max_id.saturating_add(1), Ordering::Relaxed);
+        self.next_file_id.store(max_id.saturating_add(1), Ordering::Relaxed);
         self.open_new_locked(tail_first_fk)?;
         Ok(())
     }
@@ -989,12 +959,7 @@ impl SegmentedTxHead {
             .iter()
             .map(|s| {
                 let flags = if s.sealed { FLAG_SEALED } else { 0 };
-                (
-                    s.first_fk,
-                    s.count.load(Ordering::Relaxed),
-                    s.file_id,
-                    flags,
-                )
+                (s.first_fk, s.count.load(Ordering::Relaxed), s.file_id, flags)
             })
             .collect();
         write_meta(&self.dir, self.layout.bits, &descs)
@@ -1022,9 +987,7 @@ fn collect_and_seal(
         t0.elapsed().as_millis()
     );
     if pairs.len() as u64 != count {
-        return Err(StoreError::Corrupt(
-            "tx.head seal collect pair count mismatch",
-        ));
+        return Err(StoreError::Corrupt("tx.head seal collect pair count mismatch"));
     }
     build_seal_publish(dir, file_id, first_fk, count, pairs)
 }
@@ -1092,24 +1055,14 @@ fn refuse_legacy_mono_head(dir: &Path) -> Result<(), StoreError> {
                 .map(|rd| rd.filter_map(|e| e.ok()).next().is_some())
                 .unwrap_or(false);
             if non_empty {
-                return Err(StoreError::Corrupt(
-                    "legacy sharded tx.head/ dir — reindex required",
-                ));
+                return Err(StoreError::Corrupt("legacy sharded tx.head/ dir — reindex required"));
             }
         }
     }
-    for name in [
-        "tx.head.new",
-        "tx.head.resize",
-        "tx.head.bak",
-        "tx.head.overflow",
-    ] {
+    for name in ["tx.head.new", "tx.head.resize", "tx.head.bak", "tx.head.overflow"] {
         let p = dir.join(name);
         if p.exists() {
-            rbitcoin_log::warn!(
-                "store: removing obsolete mono-head artifact {}",
-                p.display()
-            );
+            rbitcoin_log::warn!("store: removing obsolete mono-head artifact {}", p.display());
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -1260,10 +1213,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("rbitcoin-seghead-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -1359,10 +1309,8 @@ mod tests {
         let mut entries: Vec<_> = (0..205u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
         h.insert_many_with(&mut entries, collect).unwrap();
         h.flush().unwrap();
-        let got = collect_tid
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .expect("collect ran on sidecar");
+        let got =
+            collect_tid.lock().unwrap_or_else(|e| e.into_inner()).expect("collect ran on sidecar");
         assert_ne!(got, caller, "collect must run on the seal sidecar");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1393,10 +1341,7 @@ mod tests {
         // Known members resolve (as candidates).
         for i in [1u64, 400, 819, 820] {
             let cands = h.probe_candidates(&mixed(i)).unwrap();
-            assert!(
-                cands.iter().any(|f| f.0 == i),
-                "missing fk={i} cands={cands:?}"
-            );
+            assert!(cands.iter().any(|f| f.0 == i), "missing fk={i} cands={cands:?}");
         }
         // Global miss.
         let miss = h.probe_candidates(&mixed(0xDEAD_BEEF)).unwrap();
@@ -1430,10 +1375,7 @@ mod tests {
         assert!(!sealed.is_file(), "sealed OA file must be unlinked");
         assert!(crate::tx_head_mphf::TxHeadMphf::exists(&sealed));
         assert!(!crate::tx_head_mphf::rel_path(&sealed).is_file());
-        assert_eq!(
-            &std::fs::read(crate::tx_head_mphf::mphf_path(&sealed)).unwrap()[0..4],
-            b"BDZ2"
-        );
+        assert_eq!(&std::fs::read(crate::tx_head_mphf::mphf_path(&sealed)).unwrap()[0..4], b"BDZ2");
         assert!(dir.join("tx.head").join("000000.fuse8").is_file());
         let cands = h.probe_candidates(&mixed(1)).unwrap();
         assert_eq!(cands.len(), 1, "cands={cands:?}");
@@ -1460,17 +1402,12 @@ mod tests {
                 })
                 .collect())
         });
-        h.insert_many_with(&mut [(k, Fk(821))], collect.clone())
-            .unwrap();
+        h.insert_many_with(&mut [(k, Fk(821))], collect.clone()).unwrap();
         let mut fill: Vec<_> = (822..1639).map(|i| (mixed(i), Fk(i))).collect();
         h.insert_many_with(&mut fill, collect.clone()).unwrap();
         h.insert_many_with(&mut [(k, Fk(1639))], collect).unwrap();
         let cands = h.probe_candidates(&k).unwrap();
-        assert_eq!(
-            cands.first().copied(),
-            Some(Fk(1639)),
-            "newest first {cands:?}"
-        );
+        assert_eq!(cands.first().copied(), Some(Fk(1639)), "newest first {cands:?}");
         assert!(cands.iter().any(|f| f.0 == 821), "cands={cands:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1491,17 +1428,12 @@ mod tests {
             // Block `meta.tmp` so persist_meta fails inside the publish.
             let block = dir.join("tx.head").join("meta.tmp");
             std::fs::create_dir(&block).unwrap();
-            let err = h
-                .flush()
-                .expect_err("meta persist must fail during publish");
+            let err = h.flush().expect_err("meta persist must fail during publish");
             let _ = err;
             std::fs::remove_dir(&block).unwrap();
         }
         let oa = dir.join("tx.head").join("000000");
-        assert!(
-            oa.is_file(),
-            "OA must not be unlinked before sealed meta is durable"
-        );
+        assert!(oa.is_file(), "OA must not be unlinked before sealed meta is durable");
         let h2 = SegmentedTxHead::open(&dir).expect("reopen without rebuild");
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1), "cands={cands:?}");
@@ -1530,10 +1462,7 @@ mod tests {
         let mphf_before = std::fs::read(&mphf).unwrap();
         std::fs::write(&oa, b"leftover pre-unlink OA").unwrap();
         let h2 = SegmentedTxHead::open(&dir).unwrap();
-        assert!(
-            !oa.is_file(),
-            "leftover sealed-segment OA must be discarded on open"
-        );
+        assert!(!oa.is_file(), "leftover sealed-segment OA must be discarded on open");
         assert_eq!(
             std::fs::read(&mphf).unwrap(),
             mphf_before,
@@ -1598,23 +1527,14 @@ mod tests {
         assert!(h_roll.segment_count() >= 2);
         h_roll.flush().unwrap();
         assert!(h_roll.sealed_segment_count() >= 1);
-        assert!(h_roll
-            .probe_candidates(&mixed(50))
-            .unwrap()
-            .iter()
-            .any(|f| f.0 == 50));
-        assert!(h_roll
-            .probe_candidates(&mixed(220))
-            .unwrap()
-            .iter()
-            .any(|f| f.0 == 220));
+        assert!(h_roll.probe_candidates(&mixed(50)).unwrap().iter().any(|f| f.0 == 50));
+        assert!(h_roll.probe_candidates(&mixed(220)).unwrap().iter().any(|f| f.0 == 220));
 
         let dir_mono = tmp();
         std::fs::write(dir_mono.join("tx.head"), b"legacy").unwrap();
         let layout_mono = HeadLayout::with_entry_bytes(10, 4).unwrap();
-        let err = SegmentedTxHead::create(&dir_mono, layout_mono)
-            .err()
-            .expect("must refuse mono head");
+        let err =
+            SegmentedTxHead::create(&dir_mono, layout_mono).err().expect("must refuse mono head");
         let s = format!("{err}");
         assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
 
@@ -1641,10 +1561,7 @@ mod tests {
             "insert_many must not join/publish the sidecar seal"
         );
         let unsealed = h.unsealed_ranges();
-        assert!(
-            unsealed.len() >= 2,
-            "tail + in-flight seal, unsealed={unsealed:?}"
-        );
+        assert!(unsealed.len() >= 2, "tail + in-flight seal, unsealed={unsealed:?}");
         let oa = dir.join("tx.head").join("000000");
         assert!(oa.is_file(), "sealing OA stays on disk until publish");
         let open = h.probe_candidates_batch_open(&[mixed(1)]).unwrap();
@@ -1653,16 +1570,8 @@ mod tests {
             "Open wave must probe the sealing OA, cands={:?}",
             open[0]
         );
-        assert!(h
-            .probe_candidates(&mixed(1))
-            .unwrap()
-            .iter()
-            .any(|f| f.0 == 1));
-        assert!(h
-            .probe_candidates(&mixed(205))
-            .unwrap()
-            .iter()
-            .any(|f| f.0 == 205));
+        assert!(h.probe_candidates(&mixed(1)).unwrap().iter().any(|f| f.0 == 1));
+        assert!(h.probe_candidates(&mixed(205)).unwrap().iter().any(|f| f.0 == 205));
 
         h.flush().unwrap();
         assert!(h.sealed_segment_count() >= 1);
@@ -1674,11 +1583,7 @@ mod tests {
             "sealed segment leaves the Open wave, cands={:?}",
             open_after[0]
         );
-        assert!(h
-            .probe_candidates(&mixed(1))
-            .unwrap()
-            .iter()
-            .any(|f| f.0 == 1));
+        assert!(h.probe_candidates(&mixed(1)).unwrap().iter().any(|f| f.0 == 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

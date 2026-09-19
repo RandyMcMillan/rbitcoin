@@ -18,10 +18,7 @@ impl RunControl {
     pub fn open(store_dir: &Path, subdir: &str) -> Self {
         let runs_dir = store_dir.join(subdir);
         let _ = std::fs::create_dir_all(&runs_dir);
-        Self {
-            runs_dir,
-            runs_io: Arc::new(Mutex::new(())),
-        }
+        Self { runs_dir, runs_io: Arc::new(Mutex::new(())) }
     }
 }
 
@@ -33,9 +30,7 @@ impl RunControl {
 pub fn on_disk_run_count(runs_dir: &Path, runs_io: &Mutex<()>) -> usize {
     let _held = runs_io.lock().unwrap();
     let catalog = list_runs(runs_dir).map(|r| r.len()).unwrap_or(0);
-    let claims = list_materialize_claims(runs_dir)
-        .map(|r| r.len())
-        .unwrap_or(0);
+    let claims = list_materialize_claims(runs_dir).map(|r| r.len()).unwrap_or(0);
     catalog.saturating_add(claims)
 }
 
@@ -71,10 +66,7 @@ mod tests {
     fn clear_runs_dir_keeps_seal() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-runctrl-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let ctrl = RunControl::open(&dir, "sh.runs");

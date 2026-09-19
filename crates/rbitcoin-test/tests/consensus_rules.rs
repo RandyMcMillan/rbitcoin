@@ -34,17 +34,13 @@ fn pin_h4_checkpoint_and_h6_pow_limit(
     b1: &bitcoin::Block,
 ) {
     let mut matched = params.clone();
-    matched.checkpoints.push(Checkpoint {
-        height: 1,
-        hash: b1.block_hash(),
-    });
+    matched.checkpoints.push(Checkpoint { height: 1, hash: b1.block_hash() });
     validate_header(q, &matched, Height(1), &b1.header).expect("h4 checkpoint match");
 
     let mut mismatch = params.clone();
-    mismatch.checkpoints.push(Checkpoint {
-        height: 1,
-        hash: BlockHash::from_byte_array([0xcc; 32]),
-    });
+    mismatch
+        .checkpoints
+        .push(Checkpoint { height: 1, hash: BlockHash::from_byte_array([0xcc; 32]) });
     let err = validate_header(q, &mismatch, Height(1), &b1.header).unwrap_err();
     assert!(
         matches!(err, ConsensusError::BadHeader(s) if s.contains("checkpoint")),
@@ -55,10 +51,7 @@ fn pin_h4_checkpoint_and_h6_pow_limit(
     let mut tight = params.clone();
     tight.pow_limit = ChainParams::mainnet().pow_limit;
     let err = validate_header(q, &tight, Height(1), &near.header).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadHeader(s) if s.contains("pow limit")),
-        "h6: {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::BadHeader(s) if s.contains("pow limit")), "h6: {err:?}");
 }
 
 fn pin_bip68_time_lock(
@@ -134,10 +127,7 @@ fn h8_rejects_timestamp_too_far_in_future() {
         }
     }
     let err = validate_header(&q, &params, Height(1), &bad.header).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadHeader(s) if s.contains("future")),
-        "{err:?}"
-    );
+    assert!(matches!(err, ConsensusError::BadHeader(s) if s.contains("future")), "{err:?}");
 }
 
 fn grind_pow(block: &mut bitcoin::Block) {
@@ -204,16 +194,11 @@ fn h7_rejects_header_hash_above_target() {
     h.nonce = 0;
     let expected = expected_next_bits(&q, &params, Height(1), h.time).unwrap();
     h.bits = expected;
-    if h.validate_pow(bitcoin::Target::from_compact(h.bits))
-        .is_ok()
-    {
+    if h.validate_pow(bitcoin::Target::from_compact(h.bits)).is_ok() {
         h.nonce = h.nonce.wrapping_add(1);
     }
     let err = validate_header(&q, &params, Height(1), &h).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::InvalidPow),
-        "expected InvalidPow, got {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::InvalidPow), "expected InvalidPow, got {err:?}");
 }
 
 #[allow(clippy::cognitive_complexity)] // one fixture, many boundary arms
@@ -228,10 +213,7 @@ fn header_and_spending_boundaries() {
     let mut bad_g = g.clone();
     bad_g.header.nonce = g.header.nonce.wrapping_add(1);
     let err = validate_header(&q, &params, Height::GENESIS, &bad_g.header).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadHeader(s) if s.contains("genesis")),
-        "h1: {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::BadHeader(s) if s.contains("genesis")), "h1: {err:?}");
     accept_and_connect_block(&q, &params, Height::GENESIS, &g, Milestone::NONE).unwrap();
 
     let mut bad_prev = mine_regtest_block(g.block_hash(), g.header.time + 1, 1, vec![]);
@@ -290,11 +272,8 @@ fn header_and_spending_boundaries() {
     assert_eq!(q.tip_height(), Some(Height(100)));
     time += 600;
 
-    let missing = spend_anyone_can_spend(
-        bitcoin::Txid::from_byte_array([0xab; 32]),
-        0,
-        Amount::from_sat(1),
-    );
+    let missing =
+        spend_anyone_can_spend(bitcoin::Txid::from_byte_array([0xab; 32]), 0, Amount::from_sat(1));
     let miss_block = mine_regtest_block(tip, time, 101, vec![missing]);
     let err = accept_and_connect_block(&q, &params, Height(101), &miss_block, Milestone::NONE);
     assert!(

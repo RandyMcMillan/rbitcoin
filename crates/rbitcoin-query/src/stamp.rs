@@ -59,35 +59,17 @@ pub struct ParentIdent {
 impl ParentIdent {
     #[inline]
     pub fn new(txid: [u8; 32]) -> Self {
-        Self {
-            txid,
-            body: None,
-            spent: None,
-            n_out: None,
-            pin: None,
-        }
+        Self { txid, body: None, spent: None, n_out: None, pin: None }
     }
 
     #[inline]
     pub fn with_body(txid: [u8; 32], body: (u64, u64)) -> Self {
-        Self {
-            txid,
-            body: Some(body),
-            spent: None,
-            n_out: None,
-            pin: None,
-        }
+        Self { txid, body: Some(body), spent: None, n_out: None, pin: None }
     }
 
     #[inline]
     pub fn with_loc(txid: [u8; 32], body: (u64, u64), spent: (u64, u64), n_out: u32) -> Self {
-        Self {
-            txid,
-            body: Some(body),
-            spent: Some(spent),
-            n_out: Some(n_out),
-            pin: None,
-        }
+        Self { txid, body: Some(body), spent: Some(spent), n_out: Some(n_out), pin: None }
     }
 }
 
@@ -112,9 +94,7 @@ pub struct ExternalParentStamp {
 
 impl ExternalParentStamp {
     fn bind(&mut self, id: u64, txid: [u8; 32]) -> &mut ParentIdent {
-        self.idents
-            .entry(id)
-            .or_insert_with(|| ParentIdent::new(txid))
+        self.idents.entry(id).or_insert_with(|| ParentIdent::new(txid))
     }
 }
 
@@ -421,14 +401,8 @@ mod tests {
             .put_full_batch_indexed(
                 &[(
                     p.tx().clone(),
-                    vec![rbitcoin_store::InputRecord::coinbase(
-                        u32::MAX,
-                        vec![0x01],
-                        vec![],
-                    )],
-                    (0..p.n_out() as u32)
-                        .filter_map(|v| p.out_record(v))
-                        .collect(),
+                    vec![rbitcoin_store::InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                    (0..p.n_out() as u32).filter_map(|v| p.out_record(v)).collect(),
                 )],
                 true,
             )
@@ -439,14 +413,9 @@ mod tests {
         let mut inflight = InFlight::new();
         inflight.note_pins([(Fk(1), &p)], Some(1));
         let skel = BatchParentIds::default();
-        let st = stamp_external_parents(
-            q.store(),
-            &[txid],
-            &inflight,
-            Some(&skel),
-            q.confirm_stats(),
-        )
-        .unwrap();
+        let st =
+            stamp_external_parents(q.store(), &[txid], &inflight, Some(&skel), q.confirm_stats())
+                .unwrap();
         assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(1)));
         let ident = st.idents.get(&1).expect("inflight ident");
@@ -473,14 +442,8 @@ mod tests {
             .put_full_batch_indexed(
                 &[(
                     p.tx().clone(),
-                    vec![rbitcoin_store::InputRecord::coinbase(
-                        u32::MAX,
-                        vec![0x01],
-                        vec![],
-                    )],
-                    (0..p.n_out() as u32)
-                        .filter_map(|v| p.out_record(v))
-                        .collect(),
+                    vec![rbitcoin_store::InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                    (0..p.n_out() as u32).filter_map(|v| p.out_record(v)).collect(),
                 )],
                 true,
             )
@@ -500,14 +463,9 @@ mod tests {
         let mut inflight = InFlight::new();
         inflight.note_pins([(Fk(1), &p)], Some(1));
         let skel = BatchParentIds::default();
-        let st = stamp_external_parents(
-            q.store(),
-            &[txid],
-            &inflight,
-            Some(&skel),
-            q.confirm_stats(),
-        )
-        .expect("pin loc must bind without disk loc");
+        let st =
+            stamp_external_parents(q.store(), &[txid], &inflight, Some(&skel), q.confirm_stats())
+                .expect("pin loc must bind without disk loc");
         let ident = st.idents.get(&1).expect("inflight ident");
         assert_eq!(ident.spent, Some(pair.spent));
         assert_eq!(ident.body, Some(pair.txout));
@@ -526,14 +484,8 @@ mod tests {
             .put_full_batch_indexed(
                 &[(
                     p.tx().clone(),
-                    vec![rbitcoin_store::InputRecord::coinbase(
-                        u32::MAX,
-                        vec![0x01],
-                        vec![],
-                    )],
-                    (0..p.n_out() as u32)
-                        .filter_map(|v| p.out_record(v))
-                        .collect(),
+                    vec![rbitcoin_store::InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                    (0..p.n_out() as u32).filter_map(|v| p.out_record(v)).collect(),
                 )],
                 true,
             )
@@ -545,14 +497,9 @@ mod tests {
         let mut inflight = InFlight::new();
         inflight.note_pins([(Fk(1), &p)], Some(1));
         let skel = BatchParentIds::default();
-        let st = stamp_external_parents(
-            q.store(),
-            &[txid],
-            &inflight,
-            Some(&skel),
-            q.confirm_stats(),
-        )
-        .expect("body HWM without loc count is same-wave hole, not Corrupt");
+        let st =
+            stamp_external_parents(q.store(), &[txid], &inflight, Some(&skel), q.confirm_stats())
+                .expect("body HWM without loc count is same-wave hole, not Corrupt");
         let ident = st.idents.get(&1).expect("inflight ident");
         assert!(ident.pin.is_some());
         assert_eq!(ident.spent, None);
@@ -567,14 +514,9 @@ mod tests {
         inflight.note_pins([(Fk(42), &p)], Some(1));
         let txid = p.tx().txid;
         let skel = BatchParentIds::default();
-        let st = stamp_external_parents(
-            q.store(),
-            &[txid],
-            &inflight,
-            Some(&skel),
-            q.confirm_stats(),
-        )
-        .unwrap();
+        let st =
+            stamp_external_parents(q.store(), &[txid], &inflight, Some(&skel), q.confirm_stats())
+                .unwrap();
         let ident = st.idents.get(&42).expect("inflight ident");
         assert!(ident.pin.is_some());
         assert_eq!(ident.spent, None);
@@ -601,14 +543,9 @@ mod tests {
             n_out: Arc::new(n_out),
             need_vouts: U64Map::default(),
         };
-        let st = stamp_external_parents(
-            q.store(),
-            &[txid],
-            &inflight,
-            Some(&skel),
-            q.confirm_stats(),
-        )
-        .unwrap();
+        let st =
+            stamp_external_parents(q.store(), &[txid], &inflight, Some(&skel), q.confirm_stats())
+                .unwrap();
         assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
         let ident = st.idents.get(&42).expect("inflight ident");
         assert!(ident.pin.is_some(), "inflight pin is kept");

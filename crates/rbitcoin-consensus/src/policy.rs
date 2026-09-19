@@ -113,9 +113,7 @@ pub fn is_unspendable(script: &[u8]) -> bool {
 
 /// Libre has no dust *limit*; a 0-value spendable output is still dust.
 pub fn zero_value_spendable_is_dust(tx: &Transaction) -> bool {
-    tx.output
-        .iter()
-        .any(|o| o.value.to_sat() == 0 && !is_unspendable(o.script_pubkey.as_bytes()))
+    tx.output.iter().any(|o| o.value.to_sat() == 0 && !is_unspendable(o.script_pubkey.as_bytes()))
 }
 
 /// Libre admission for a single tx given fee and weight (no dust limit, no template ban).
@@ -268,10 +266,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        assert_eq!(
-            check_libre_admission(&cb, 0, 100),
-            PolicyResult::NonStandard("coinbase")
-        );
+        assert_eq!(check_libre_admission(&cb, 0, 100), PolicyResult::NonStandard("coinbase"));
 
         // No inputs / no outputs.
         let mut no_in = bare_tx(1);

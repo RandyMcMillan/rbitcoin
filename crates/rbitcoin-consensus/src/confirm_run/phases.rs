@@ -26,9 +26,8 @@ fn assemble_parent_mtp_and_bits(
                 prev_bits_raw = Some(plan.header_rec.bits);
                 prev_time = Some(plan.header_rec.timestamp);
             }
-        } else if let Some((_fk, rec)) = query
-            .header_at_height(Height(h))
-            .map_err(ConsensusError::from)?
+        } else if let Some((_fk, rec)) =
+            query.header_at_height(Height(h)).map_err(ConsensusError::from)?
         {
             times.push(rec.timestamp);
             if h == prev_h.0 {
@@ -260,10 +259,7 @@ pub(super) fn structural_run(
         t0.elapsed().as_nanos() as u64,
     );
     rbitcoin_query::note_confirm(&query.confirm_stats().structural_spent_ns, tot.spent_ns);
-    rbitcoin_query::note_confirm(
-        &query.confirm_stats().structural_spent_abs_ns,
-        tot.spent_abs_ns,
-    );
+    rbitcoin_query::note_confirm(&query.confirm_stats().structural_spent_abs_ns, tot.spent_abs_ns);
     rbitcoin_query::note_confirm(
         &query.confirm_stats().structural_spent_strong_ns,
         tot.spent_strong_ns,
@@ -276,10 +272,7 @@ pub(super) fn structural_run(
         &query.confirm_stats().structural_spent_pending_ns,
         tot.spent_pending_ns,
     );
-    rbitcoin_query::note_confirm(
-        &query.confirm_stats().structural_create_h_ns,
-        tot.create_h_ns,
-    );
+    rbitcoin_query::note_confirm(&query.confirm_stats().structural_create_h_ns, tot.create_h_ns);
     rbitcoin_query::note_confirm(&query.confirm_stats().structural_bip68_ns, tot.bip68_ns);
     Ok(tot)
 }
@@ -301,28 +294,12 @@ pub(super) fn class_c_commit(
             tx_fks: std::mem::take(&mut p.tx_fks),
         })
         .collect();
-    let pins = if write_create_pins.is_empty() {
-        None
-    } else {
-        Some(write_create_pins)
-    };
-    let out = query
-        .confirm_blocks_run_with_create_pins(&items, pins)
-        .map_err(ConsensusError::from)?;
-    let strong_d = query
-        .confirm_stats()
-        .strong_ns
-        .load(QOrd::Relaxed)
-        .saturating_sub(strong0);
-    let tip_d = query
-        .confirm_stats()
-        .tip_ns
-        .load(QOrd::Relaxed)
-        .saturating_sub(tip0);
-    rbitcoin_query::note_confirm(
-        &query.confirm_stats().class_c_ns,
-        strong_d.saturating_add(tip_d),
-    );
+    let pins = if write_create_pins.is_empty() { None } else { Some(write_create_pins) };
+    let out =
+        query.confirm_blocks_run_with_create_pins(&items, pins).map_err(ConsensusError::from)?;
+    let strong_d = query.confirm_stats().strong_ns.load(QOrd::Relaxed).saturating_sub(strong0);
+    let tip_d = query.confirm_stats().tip_ns.load(QOrd::Relaxed).saturating_sub(tip0);
+    rbitcoin_query::note_confirm(&query.confirm_stats().class_c_ns, strong_d.saturating_add(tip_d));
     Ok(out)
 }
 
@@ -335,13 +312,8 @@ pub(super) fn post_commit(
 ) -> Result<u64, ConsensusError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !annotate.is_empty() {
-        let mut abs_edges: Vec<(
-            u64,
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-            u32,
-        )> = Vec::with_capacity(annotate.len());
+        let mut abs_edges: Vec<(u64, rbitcoin_primitives::Fk, u32, rbitcoin_primitives::Fk, u32)> =
+            Vec::with_capacity(annotate.len());
         let mut known: Vec<(rbitcoin_primitives::Fk, u8, u32)> = Vec::with_capacity(annotate.len());
         for job in annotate {
             abs_edges.push((job.abs, job.create_fk, job.vout, job.spend_fk, job.vin));
@@ -410,9 +382,8 @@ pub(super) fn expected_bits_extending(
     // Period-start may still be above confirmed tip during tip-ahead multi-block
     // load (i>0). Lookup/load already put_header_plan for that height — use it.
     let first_height = Height(height.0 - interval);
-    let first_ts = if let Some((_fk, rec)) = query
-        .header_at_height(first_height)
-        .map_err(ConsensusError::from)?
+    let first_ts = if let Some((_fk, rec)) =
+        query.header_at_height(first_height).map_err(ConsensusError::from)?
     {
         rec.timestamp
     } else if let Some(plan) = query.confirm_parent_cache().get_header_plan(first_height.0) {
@@ -421,9 +392,5 @@ pub(super) fn expected_bits_extending(
         return Err(ConsensusError::BadHeader("missing retarget first header"));
     };
     let timespan = prev_time.saturating_sub(first_ts) as u64;
-    Ok(CompactTarget::from_next_work_required(
-        prev_bits,
-        timespan,
-        &params.btc,
-    ))
+    Ok(CompactTarget::from_next_work_required(prev_bits, timespan, &params.btc))
 }

@@ -39,21 +39,14 @@ pub fn prepare_regtest_candidate(block: &mut Block, prev: BlockHash, time: u32) 
     block.header.prev_blockhash = prev;
     block.header.bits = CompactTarget::from_consensus(REGTEST_POW_BITS);
     block.header.time = time;
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .unwrap_or(TxMerkleNode::from_byte_array([0u8; 32]));
+    block.header.merkle_root =
+        block.compute_merkle_root().unwrap_or(TxMerkleNode::from_byte_array([0u8; 32]));
     grind_regtest_pow(&mut block.header);
 }
 
 /// Mine one empty-ish regtest block (trivial bits).
 pub fn mine_empty_regtest(prev: BlockHash, time: u32, height: u32) -> Block {
-    mine_regtest_paying(
-        prev,
-        time,
-        height,
-        ScriptBuf::from_bytes(vec![0x51]),
-        Vec::new(),
-    )
+    mine_regtest_paying(prev, time, height, ScriptBuf::from_bytes(vec![0x51]), Vec::new())
 }
 
 /// Mine one regtest block paying `script_pubkey`, optional extra txs, trivial bits.
@@ -92,11 +85,7 @@ pub fn mine_regtest_paying(
 }
 
 fn coinbase_paying(height: u32, script_pubkey: ScriptBuf) -> Transaction {
-    let mut ss = if height == 0 {
-        vec![0x00]
-    } else {
-        bip34_height_script(height)
-    };
+    let mut ss = if height == 0 { vec![0x00] } else { bip34_height_script(height) };
     while ss.len() < 2 {
         ss.push(0x00);
     }
@@ -149,24 +138,14 @@ mod tests {
 
     #[test]
     fn pad_collects_early_coinbases() {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbtc-pad-{n}"));
         let q = Query::open_or_create_tiny(&dir).unwrap();
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _t, cbs) = pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            3,
-            2,
-        );
+        let (_tip, _t, cbs) =
+            pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, 3, 2);
         assert_eq!(cbs.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -196,14 +175,8 @@ mod tests {
         let t = genesis.header.time + 1;
         let b149 = mine_empty_regtest(prev, t, 149);
         let b150 = mine_empty_regtest(prev, t, 150);
-        assert_eq!(
-            b149.txdata[0].output[0].value,
-            Amount::from_sat(50_0000_0000)
-        );
-        assert_eq!(
-            b150.txdata[0].output[0].value,
-            Amount::from_sat(25_0000_0000)
-        );
+        assert_eq!(b149.txdata[0].output[0].value, Amount::from_sat(50_0000_0000));
+        assert_eq!(b150.txdata[0].output[0].value, Amount::from_sat(25_0000_0000));
     }
 
     #[test]
@@ -243,14 +216,8 @@ mod tests {
         let after: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
         assert_eq!(after, txids);
         assert_eq!(block.header.prev_blockhash, genesis.block_hash());
-        assert_eq!(
-            block.header.bits,
-            CompactTarget::from_consensus(REGTEST_POW_BITS)
-        );
-        assert_eq!(
-            block.header.merkle_root,
-            block.compute_merkle_root().unwrap()
-        );
+        assert_eq!(block.header.bits, CompactTarget::from_consensus(REGTEST_POW_BITS));
+        assert_eq!(block.header.merkle_root, block.compute_merkle_root().unwrap());
         let target = Target::from_compact(block.header.bits);
         assert!(block.header.validate_pow(target).is_ok());
     }
@@ -268,10 +235,7 @@ mod tests {
         let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let got: Block = bitcoin::consensus::encode::deserialize(&raw).expect("fixture block");
         assert_eq!(got.header.prev_blockhash, genesis.block_hash());
-        assert_eq!(
-            got.header.bits,
-            CompactTarget::from_consensus(REGTEST_POW_BITS)
-        );
+        assert_eq!(got.header.bits, CompactTarget::from_consensus(REGTEST_POW_BITS));
         let target = Target::from_compact(got.header.bits);
         assert!(got.header.validate_pow(target).is_ok());
         assert_eq!(

@@ -11,10 +11,7 @@ use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 
 fn spks(prevouts: &[TxOut]) -> Vec<&[u8]> {
-    prevouts
-        .iter()
-        .map(|o| o.script_pubkey.as_bytes())
-        .collect()
+    prevouts.iter().map(|o| o.script_pubkey.as_bytes()).collect()
 }
 
 #[test]
@@ -109,10 +106,7 @@ fn p2sh_and_witness_sigop_paths() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([1; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([1; 32]), vout: 0 },
             script_sig: ScriptBuf::from_bytes(ss),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[vec![0x00], vec![0x01; 33]]),
@@ -122,10 +116,8 @@ fn p2sh_and_witness_sigop_paths() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(1),
-        script_pubkey: ScriptBuf::from_bytes(p2sh_spk),
-    }];
+    let prevouts =
+        vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes(p2sh_spk) }];
     assert!(witness_sigop_count(&tx, &spks(&prevouts)) >= 1);
     // P2SH bare redeem with CHECKSIG
     let redeem2 = vec![0xac];
@@ -142,10 +134,7 @@ fn p2sh_and_witness_sigop_paths() {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([2; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([2; 32]), vout: 0 },
             script_sig: ScriptBuf::from_bytes(ss2),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -155,10 +144,8 @@ fn p2sh_and_witness_sigop_paths() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prev2 = vec![TxOut {
-        value: Amount::from_sat(1),
-        script_pubkey: ScriptBuf::from_bytes(spk2),
-    }];
+    let prev2 =
+        vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes(spk2) }];
     assert!(p2sh_sigop_count(&tx2, &spks(&prev2)) >= 1);
     assert!(tx_sigop_cost(&tx2, &spks(&prev2), true, true) >= 4);
     // Nested P2SH without redeem push → continue (0 witness sigops).
@@ -166,10 +153,7 @@ fn p2sh_and_witness_sigop_paths() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([3; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([3; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -235,10 +219,7 @@ fn p2sh_sigops_from_redeem() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([1; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([1; 32]), vout: 0 },
             script_sig: ScriptBuf::from_bytes(ss),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -248,10 +229,8 @@ fn p2sh_sigops_from_redeem() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(10),
-        script_pubkey: ScriptBuf::from_bytes(p2sh_spk),
-    }];
+    let prevouts =
+        vec![TxOut { value: Amount::from_sat(10), script_pubkey: ScriptBuf::from_bytes(p2sh_spk) }];
     assert_eq!(p2sh_sigop_count(&tx, &spks(&prevouts)), 1);
     // legacy×4 + p2sh×4 = 0 + 4 (no legacy CHECKSIG in ss/spk for bare count of redeem)
     let cost = tx_sigop_cost(&tx, &spks(&prevouts), true, true);
@@ -267,10 +246,7 @@ fn witness_p2wpkh_counts_one() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([2; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([2; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[vec![0x30], vec![0x02; 33]]),
@@ -280,10 +256,8 @@ fn witness_p2wpkh_counts_one() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(10),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    }];
+    let prevouts =
+        vec![TxOut { value: Amount::from_sat(10), script_pubkey: ScriptBuf::from_bytes(spk) }];
     assert_eq!(witness_sigop_count(&tx, &spks(&prevouts)), 1);
 }
 
@@ -292,10 +266,7 @@ fn witness_sigops_gated_on_segwit() {
     let mut spk = vec![0x00, 0x14];
     spk.extend([0u8; 20]);
     let inp = TxIn {
-        previous_output: OutPoint {
-            txid: Txid::from_byte_array([2; 32]),
-            vout: 0,
-        },
+        previous_output: OutPoint { txid: Txid::from_byte_array([2; 32]), vout: 0 },
         script_sig: ScriptBuf::new(),
         sequence: Sequence::MAX,
         witness: Witness::new(),
@@ -311,10 +282,8 @@ fn witness_sigops_gated_on_segwit() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(10),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    }];
+    let prevouts =
+        vec![TxOut { value: Amount::from_sat(10), script_pubkey: ScriptBuf::from_bytes(spk) }];
     assert_eq!(tx_sigop_cost(&tx, &spks(&prevouts), false, false), 0);
     assert_eq!(tx_sigop_cost(&tx, &spks(&prevouts), false, true), 1);
 }
@@ -358,10 +327,7 @@ fn witness_p2wsh_and_nested_p2sh() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([3; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([3; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[vec![0x01], ws.clone()]),
@@ -371,10 +337,8 @@ fn witness_p2wsh_and_nested_p2sh() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(10),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    }];
+    let prevouts =
+        vec![TxOut { value: Amount::from_sat(10), script_pubkey: ScriptBuf::from_bytes(spk) }];
     assert_eq!(witness_sigop_count(&tx, &spks(&prevouts)), 1);
 
     // Nested P2SH-P2WPKH: redeem in scriptSig.
@@ -389,10 +353,7 @@ fn witness_p2wsh_and_nested_p2sh() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([4; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([4; 32]), vout: 0 },
             script_sig: ScriptBuf::from_bytes(ss),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[vec![0x30], vec![0x02; 33]]),
@@ -402,10 +363,8 @@ fn witness_p2wsh_and_nested_p2sh() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let prevouts2 = vec![TxOut {
-        value: Amount::from_sat(10),
-        script_pubkey: ScriptBuf::from_bytes(p2sh),
-    }];
+    let prevouts2 =
+        vec![TxOut { value: Amount::from_sat(10), script_pubkey: ScriptBuf::from_bytes(p2sh) }];
     assert_eq!(witness_sigop_count(&tx2, &spks(&prevouts2)), 1);
 
     // p2sh_sigop prevouts short / non-p2sh skip
@@ -427,10 +386,7 @@ fn verify_one_script_job_skips_anyone_can_spend() {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([9; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -511,12 +467,8 @@ fn job_tx_traits_and_shared_mut_panic() {
     assert_eq!(block_subsidy(0, &p), 50 * 100_000_000);
     assert_eq!(block_subsidy(210_000, &p), 25 * 100_000_000);
     assert_eq!(block_subsidy(6_930_000, &p), 0);
-    assert!(is_anyone_can_spend(
-        ScriptBuf::from_bytes(vec![0x51]).as_script()
-    ));
-    assert!(!is_anyone_can_spend(
-        ScriptBuf::from_bytes(vec![0x00]).as_script()
-    ));
+    assert!(is_anyone_can_spend(ScriptBuf::from_bytes(vec![0x51]).as_script()));
+    assert!(!is_anyone_can_spend(ScriptBuf::from_bytes(vec![0x00]).as_script()));
     let final_tx = Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,

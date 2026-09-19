@@ -29,15 +29,7 @@ pub fn put_spend_on_create(
     spending_tx_fk: Fk,
     spending_vin: u32,
 ) -> Result<(), StoreError> {
-    put_spend_on_create_at(
-        txs,
-        spenders,
-        create_tx_fk,
-        vout,
-        spending_tx_fk,
-        spending_vin,
-        None,
-    )
+    put_spend_on_create_at(txs, spenders, create_tx_fk, vout, spending_tx_fk, spending_vin, None)
 }
 
 /// Like [`put_spend_on_create`] with optional cache-held body `(offset, len)` — **no idx**.
@@ -149,10 +141,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-point-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -160,9 +149,8 @@ mod tests {
     }
 
     fn put_create(txs: &TxTable, txid: [u8; 32], n_out: u32) -> Fk {
-        let outs: Vec<_> = (0..n_out)
-            .map(|i| OutputRecord::unspent(i as i64 + 1, vec![0x51]))
-            .collect();
+        let outs: Vec<_> =
+            (0..n_out).map(|i| OutputRecord::unspent(i as i64 + 1, vec![0x51])).collect();
         let item = (
             TxRecord {
                 txid,

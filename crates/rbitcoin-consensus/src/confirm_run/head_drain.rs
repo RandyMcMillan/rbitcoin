@@ -24,10 +24,8 @@ struct DrainWorkers {
 fn pool() -> &'static DrainWorkers {
     static POOL: OnceLock<DrainWorkers> = OnceLock::new();
     static SPAWN: OnceLock<()> = OnceLock::new();
-    let pool = POOL.get_or_init(|| DrainWorkers {
-        jobs: Mutex::new(VecDeque::new()),
-        cv: Condvar::new(),
-    });
+    let pool =
+        POOL.get_or_init(|| DrainWorkers { jobs: Mutex::new(VecDeque::new()), cv: Condvar::new() });
     SPAWN.get_or_init(|| {
         let jobs = &pool.jobs;
         let cv = &pool.cv;
@@ -75,13 +73,8 @@ impl HeadDrainHandle {
     }
 
     fn recv_result(&mut self) -> Result<u64, StoreError> {
-        let rx = self
-            .rx
-            .take()
-            .ok_or(StoreError::Corrupt("tx.head drain handle joined twice"))?;
-        rx.recv().unwrap_or(Err(StoreError::Corrupt(
-            "tx.head write-behind drain thread gone",
-        )))
+        let rx = self.rx.take().ok_or(StoreError::Corrupt("tx.head drain handle joined twice"))?;
+        rx.recv().unwrap_or(Err(StoreError::Corrupt("tx.head write-behind drain thread gone")))
     }
 
     #[cfg(test)]
@@ -128,9 +121,7 @@ where
                 ));
             }
             let r = panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or({
-                Err(StoreError::Corrupt(
-                    "tx.head write-behind drain thread panicked",
-                ))
+                Err(StoreError::Corrupt("tx.head write-behind drain thread panicked"))
             });
             let _ = tx.send(r);
         }));
@@ -151,11 +142,7 @@ impl SendStorePtr {
     }
     fn insert(self, batch: &[([u8; 32], rbitcoin_primitives::Fk)]) -> Result<u64, StoreError> {
         // SAFETY: confirm write still borrows `Store` until the drain handle joins.
-        unsafe {
-            (*(self.0 as *const rbitcoin_store::Store))
-                .txs
-                .head_insert_queued(batch)
-        }
+        unsafe { (*(self.0 as *const rbitcoin_store::Store)).txs.head_insert_queued(batch) }
     }
 }
 

@@ -507,17 +507,7 @@ async fn prepare_outbound_session(
     sess.attach_wire(wire);
     let id = sess.id;
     follow_live.fetch_add(1, Ordering::SeqCst);
-    Ok(PreparedOutbound {
-        peer,
-        magic,
-        hub,
-        peers,
-        follow_live,
-        reader,
-        writer,
-        sess,
-        id,
-    })
+    Ok(PreparedOutbound { peer, magic, hub, peers, follow_live, reader, writer, sess, id })
 }
 
 async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetError> {
@@ -573,9 +563,7 @@ async fn run_outbound_session_with_abort(
 #[cfg(test)]
 pub(crate) async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
 }
 
 /// Resolve P2P message magic, including BIP325 custom-Signet derivation.
@@ -600,10 +588,7 @@ mod tests {
             magic_for_params(&ChainParams::testnet()),
             Magic::from(bitcoin::Network::Testnet)
         );
-        assert_eq!(
-            magic_for_params(&ChainParams::signet()),
-            Magic::from(bitcoin::Network::Signet)
-        );
+        assert_eq!(magic_for_params(&ChainParams::signet()), Magic::from(bitcoin::Network::Signet));
         assert_eq!(magic_for_params(&ChainParams::regtest()), Magic::REGTEST);
     }
 
@@ -613,10 +598,7 @@ mod tests {
 
         let challenge = ScriptBuf::from_bytes(vec![0x51]);
         let params = ChainParams::custom_signet(challenge, 60).unwrap();
-        assert_eq!(
-            magic_for_params(&params),
-            Magic::from_bytes([0x54, 0xd2, 0x6f, 0xbd])
-        );
+        assert_eq!(magic_for_params(&params), Magic::from_bytes([0x54, 0xd2, 0x6f, 0xbd]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -648,10 +630,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-p2p-shutdown-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -686,10 +665,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-p2p-shutdown-grace-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -715,10 +691,7 @@ mod tests {
             done.load(Ordering::SeqCst),
             "shutdown must not abort a session task that finishes within the grace window"
         );
-        assert!(
-            t0.elapsed() < Duration::from_secs(2),
-            "shutdown must still bound wait"
-        );
+        assert!(t0.elapsed() < Duration::from_secs(2), "shutdown must still bound wait");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -728,10 +701,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-p2p-extra-listen-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -744,10 +714,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let extra = node
-            .add_listen("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let extra = node.add_listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
         assert_ne!(extra, node.local_addr);
         assert!(std::net::TcpStream::connect(extra).is_ok());
         node.shutdown().await;

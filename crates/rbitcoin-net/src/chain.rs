@@ -51,10 +51,7 @@ impl HeldBodies {
     const STALE_BELOW: u32 = 288;
 
     fn new() -> Self {
-        Self {
-            by_hash: HashMap::new(),
-            next_seq: 1,
-        }
+        Self { by_hash: HashMap::new(), next_seq: 1 }
     }
 
     fn get(&self, hash: &BlockHash) -> Option<&Block> {
@@ -97,12 +94,7 @@ impl HeldBodies {
                 .filter(|(h, _)| !keep.contains(*h))
                 .min_by_key(|(_, (_, s))| *s)
                 .map(|(h, _)| *h)
-                .or_else(|| {
-                    self.by_hash
-                        .iter()
-                        .min_by_key(|(_, (_, s))| *s)
-                        .map(|(h, _)| *h)
-                });
+                .or_else(|| self.by_hash.iter().min_by_key(|(_, (_, s))| *s).map(|(h, _)| *h));
             if let Some(k) = victim {
                 self.by_hash.remove(&k);
             }
@@ -125,10 +117,7 @@ struct Invalidated {
 
 impl Invalidated {
     fn new() -> Self {
-        Self {
-            set: RwLock::new(HashSet::new()),
-            paths: RwLock::new(Vec::new()),
-        }
+        Self { set: RwLock::new(HashSet::new()), paths: RwLock::new(Vec::new()) }
     }
 }
 
@@ -139,9 +128,7 @@ struct HeaderTips {
 
 impl HeaderTips {
     fn new() -> Self {
-        Self {
-            by_hash: HashMap::new(),
-        }
+        Self { by_hash: HashMap::new() }
     }
 
     fn get(&self, hash: &BlockHash) -> Option<(BlockHash, u32)> {
@@ -384,9 +371,7 @@ impl ChainHub {
 
     /// Block min tx fee (sat/kvB). Default 1.
     pub fn set_block_min_tx_fee_sat_kvb(&self, sat_kvb: u64) {
-        self.mining
-            .block_min_tx_fee_sat_kvb
-            .store(sat_kvb, Ordering::Relaxed);
+        self.mining.block_min_tx_fee_sat_kvb.store(sat_kvb, Ordering::Relaxed);
     }
 
     pub fn block_min_tx_fee_sat_kvb(&self) -> u64 {
@@ -435,10 +420,7 @@ impl ChainHub {
                 return;
             }
         }
-        let Some(fill) = self
-            .mempool()
-            .and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata))
-        else {
+        let Some(fill) = self.mempool().and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata)) else {
             return;
         };
         self.remember_cmpct_prefill(
@@ -453,9 +435,7 @@ impl ChainHub {
             return None;
         }
         let g = self.prefill_plan.lock().expect("prefill plan");
-        g.as_ref()
-            .filter(|p| p.hash == *hash)
-            .map(|p| p.indexes.clone())
+        g.as_ref().filter(|p| p.hash == *hash).map(|p| p.indexes.clone())
     }
 
     /// Min-chain-work floor. Below the floor: no getheaders serve, no tip relay.
@@ -481,15 +461,8 @@ impl ChainHub {
             if prev.to_byte_array() == [0u8; 32] {
                 return crate::most_work::sum_work(extra.into_iter());
             }
-            if let Some(h) = self
-                .query
-                .height_of_hash(&prev.to_byte_array())
-                .ok()
-                .flatten()
-            {
-                let base = self
-                    .work_through_height(h.0)
-                    .unwrap_or(Work::from_be_bytes([0u8; 32]));
+            if let Some(h) = self.query.height_of_hash(&prev.to_byte_array()).ok().flatten() {
+                let base = self.work_through_height(h.0).unwrap_or(Work::from_be_bytes([0u8; 32]));
                 extra.push(base);
                 return crate::most_work::sum_work(extra.into_iter());
             }
@@ -561,13 +534,7 @@ impl ChainHub {
     /// Unknown prev is not low-work (Core sends getheaders instead).
     pub(crate) fn header_below_anti_dos(&self, header: &Header) -> bool {
         let prev = header.prev_blockhash;
-        if self
-            .query
-            .height_of_hash(&prev.to_byte_array())
-            .ok()
-            .flatten()
-            .is_none()
-        {
+        if self.query.height_of_hash(&prev.to_byte_array()).ok().flatten().is_none() {
             return false;
         }
         self.work_with_header(header) < self.anti_dos_work_threshold()
@@ -598,9 +565,7 @@ impl ChainHub {
         self.ensure_chain_work_prefix()?;
         let p = self.chain_work_prefix.read().unwrap();
         let i = height.min(tip) as usize;
-        Ok(p.get(i)
-            .copied()
-            .unwrap_or_else(|| Work::from_be_bytes([0u8; 32])))
+        Ok(p.get(i).copied().unwrap_or_else(|| Work::from_be_bytes([0u8; 32])))
     }
 
     /// Tip recency vs [`Self::clock`] (default 24h).
@@ -690,10 +655,7 @@ impl ChainHub {
     }
 
     pub fn tip_height(&self) -> Option<u32> {
-        self.query
-            .tip_height()
-            .map(|h| h.0)
-            .or_else(|| self.cache.tip_height())
+        self.query.tip_height().map(|h| h.0).or_else(|| self.cache.tip_height())
     }
 
     pub fn tip_hash(&self) -> Option<BlockHash> {
@@ -739,11 +701,7 @@ impl ChainHub {
     /// the RAM body cache can evict, and `confirmed` is insert-only across
     /// reorgs. A stale "we have it" would permanently suppress getdata.
     pub fn is_connected(&self, hash: &BlockHash) -> bool {
-        self.query
-            .height_of_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()
-            .is_some()
+        self.query.height_of_hash(&hash.to_byte_array()).ok().flatten().is_some()
     }
 
     /// Active tip plus known side tips (held / archive losers / invalidate).
@@ -753,15 +711,7 @@ impl ChainHub {
     pub fn chaintips(&self) -> Vec<ChainTipInfo> {
         let mut out: HashMap<BlockHash, ChainTipInfo> = HashMap::new();
         if let (Some(height), Some(hash)) = (self.tip_height(), self.tip_hash()) {
-            out.insert(
-                hash,
-                ChainTipInfo {
-                    height,
-                    hash,
-                    branchlen: 0,
-                    status: "active",
-                },
-            );
+            out.insert(hash, ChainTipInfo { height, hash, branchlen: 0, status: "active" });
         }
 
         let record =
@@ -785,15 +735,7 @@ impl ChainHub {
                 match map.get(&hash) {
                     Some(prev) if rank(prev.status) >= rank(status) => {}
                     _ => {
-                        map.insert(
-                            hash,
-                            ChainTipInfo {
-                                height,
-                                hash,
-                                branchlen,
-                                status,
-                            },
-                        );
+                        map.insert(hash, ChainTipInfo { height, hash, branchlen, status });
                     }
                 }
             };
@@ -810,11 +752,8 @@ impl ChainHub {
                 if covered.contains(&hash) {
                     continue;
                 }
-                let status = if self.header_ancestry_invalid(hash) {
-                    "invalid"
-                } else {
-                    "headers-only"
-                };
+                let status =
+                    if self.header_ancestry_invalid(hash) { "invalid" } else { "headers-only" };
                 record(&mut out, hash, status);
             }
         }
@@ -877,18 +816,11 @@ impl ChainHub {
         if let Some((prev, _)) = self.header_tips.read().unwrap().get(hash) {
             return Some(prev);
         }
-        let (_, rec) = self
-            .query
-            .get_header_by_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()?;
+        let (_, rec) = self.query.get_header_by_hash(&hash.to_byte_array()).ok().flatten()?;
         if rec.prev_fk.is_null() {
             return Some(BlockHash::from_byte_array([0u8; 32]));
         }
-        self.query
-            .get_header(rec.prev_fk)
-            .ok()
-            .map(|p| BlockHash::from_byte_array(p.hash))
+        self.query.get_header(rec.prev_fk).ok().map(|p| BlockHash::from_byte_array(p.hash))
     }
 
     fn header_ancestry_invalid(&self, tip: BlockHash) -> bool {
@@ -923,12 +855,7 @@ impl ChainHub {
                 return Some((branchlen.saturating_sub(1), branchlen));
             }
             if self.is_connected(&prev) {
-                let parent_h = self
-                    .query
-                    .height_of_hash(&prev.to_byte_array())
-                    .ok()
-                    .flatten()?
-                    .0;
+                let parent_h = self.query.height_of_hash(&prev.to_byte_array()).ok().flatten()?.0;
                 return Some((parent_h.saturating_add(branchlen), branchlen));
             }
             h = prev;
@@ -963,11 +890,7 @@ impl ChainHub {
                 .flatten()
                 .map(|h| h.0.saturating_add(1))
         } else {
-            self.header_tips
-                .read()
-                .unwrap()
-                .get(&prev)
-                .map(|(_, h)| h.saturating_add(1))
+            self.header_tips.read().unwrap().get(&prev).map(|(_, h)| h.saturating_add(1))
         };
         let Some(height) = height else {
             return;
@@ -988,12 +911,7 @@ impl ChainHub {
 
     /// Best-chain or header-only height of `hash`.
     pub fn header_height(&self, hash: &BlockHash) -> Option<u32> {
-        if let Some(h) = self
-            .query
-            .height_of_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()
-        {
+        if let Some(h) = self.query.height_of_hash(&hash.to_byte_array()).ok().flatten() {
             return Some(h.0);
         }
         self.header_tips.read().unwrap().height_of(hash)
@@ -1013,10 +931,7 @@ impl ChainHub {
     /// A reconstructed compact with the right header hash and wrong txs must
     /// not poison later getdata of that hash.
     fn remember_failed_accept(&self, offered: BlockHash, e: &NetError) {
-        let hash = e
-            .failing_block_hash()
-            .map(BlockHash::from_byte_array)
-            .unwrap_or(offered);
+        let hash = e.failing_block_hash().map(BlockHash::from_byte_array).unwrap_or(offered);
         if accept_err_is_mutated(e) {
             self.drop_held(hash);
             return;
@@ -1037,12 +952,7 @@ impl ChainHub {
     pub fn knows_header(&self, hash: &BlockHash) -> bool {
         self.is_connected(hash)
             || self.header_tips.read().unwrap().contains(hash)
-            || self
-                .query
-                .get_header_by_hash(&hash.to_byte_array())
-                .ok()
-                .flatten()
-                .is_some()
+            || self.query.get_header_by_hash(&hash.to_byte_array()).ok().flatten().is_some()
             || self.held_body(hash).is_some()
     }
 
@@ -1075,31 +985,18 @@ impl ChainHub {
         if let Some(b) = self.load_side_body(hash) {
             return Some(b.header);
         }
-        if let Some(h) = self
-            .query
-            .height_of_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()
-        {
+        if let Some(h) = self.query.height_of_hash(&hash.to_byte_array()).ok().flatten() {
             if let Ok(Some(b)) = self.block_at_height(h.0) {
                 if b.block_hash() == *hash {
                     return Some(b.header);
                 }
             }
         }
-        if let Some(b) = self
-            .query
-            .reconstruct_archived_block(&hash.to_byte_array())
-            .ok()
-            .flatten()
+        if let Some(b) = self.query.reconstruct_archived_block(&hash.to_byte_array()).ok().flatten()
         {
             return Some(b.header);
         }
-        let (_, rec) = self
-            .query
-            .get_header_by_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()?;
+        let (_, rec) = self.query.get_header_by_hash(&hash.to_byte_array()).ok().flatten()?;
         let prev = if rec.prev_fk.is_null() {
             BlockHash::from_byte_array([0u8; 32])
         } else {
@@ -1119,12 +1016,7 @@ impl ChainHub {
     /// parent, and MTP are reject strings (`RPC_VERIFY_ERROR` / `-25`).
     pub fn process_submitted_header(&self, header: &Header) -> Result<(), String> {
         let hash = header.block_hash();
-        if self
-            .query
-            .get_header_by_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()
-            .is_some()
+        if self.query.get_header_by_hash(&hash.to_byte_array()).ok().flatten().is_some()
             || self.header_tips.read().unwrap().contains(&hash)
             || self.is_connected(&hash)
         {
@@ -1133,12 +1025,7 @@ impl ChainHub {
         let prev = header.prev_blockhash;
         let prev_bytes = prev.to_byte_array();
         let prev_known = prev_bytes == [0u8; 32]
-            || self
-                .query
-                .get_header_by_hash(&prev_bytes)
-                .ok()
-                .flatten()
-                .is_some()
+            || self.query.get_header_by_hash(&prev_bytes).ok().flatten().is_some()
             || self.header_tips.read().unwrap().contains(&prev)
             || self.is_connected(&prev)
             || self.held_body(&prev).is_some();
@@ -1167,10 +1054,7 @@ impl ChainHub {
     pub fn ensure_header_fk(&self, header: &Header) -> Result<Fk, NetError> {
         let prev_fk = self.header_sync_prev_fk(header, &HashMap::new())?;
         let rec = header_to_record(prev_fk, header, header.block_hash().to_byte_array());
-        let fk = self
-            .query
-            .ensure_header(&rec)
-            .map_err(|e| NetError::Consensus(e.to_string()))?;
+        let fk = self.query.ensure_header(&rec).map_err(|e| NetError::Consensus(e.to_string()))?;
         self.note_header_tip(header);
         Ok(fk)
     }
@@ -1199,14 +1083,7 @@ impl ChainHub {
             {
                 out[i] = fk;
                 if let Some(h) = self.stored_header_height(&header.block_hash()) {
-                    in_batch.insert(
-                        hash,
-                        HeaderSyncNode {
-                            fk,
-                            header: *header,
-                            height: h,
-                        },
-                    );
+                    in_batch.insert(hash, HeaderSyncNode { fk, header: *header, height: h });
                 }
                 continue;
             }
@@ -1217,23 +1094,14 @@ impl ChainHub {
                 .unwrap_or(0);
             next = next.saturating_add(1);
             let fk = Fk(next);
-            in_batch.insert(
-                hash,
-                HeaderSyncNode {
-                    fk,
-                    header: *header,
-                    height,
-                },
-            );
+            in_batch.insert(hash, HeaderSyncNode { fk, header: *header, height });
             recs.push((i, header_to_record(prev_fk, header, hash)));
             out[i] = fk;
         }
         if !recs.is_empty() {
             let only: Vec<_> = recs.iter().map(|(_, r)| r.clone()).collect();
-            let got = self
-                .query
-                .ensure_headers(&only)
-                .map_err(|e| NetError::Consensus(e.to_string()))?;
+            let got =
+                self.query.ensure_headers(&only).map_err(|e| NetError::Consensus(e.to_string()))?;
             for ((i, _), fk) in recs.iter().zip(got) {
                 out[*i] = fk;
             }
@@ -1290,11 +1158,9 @@ impl ChainHub {
             )
             .map_err(|e| NetError::Consensus(e.to_string()));
         }
-        let parent = self
-            .sync_parent_header(&parent_hash, in_batch)
-            .ok_or_else(|| {
-                NetError::Consensus("header parent unknown — ensure parent before child".into())
-            })?;
+        let parent = self.sync_parent_header(&parent_hash, in_batch).ok_or_else(|| {
+            NetError::Consensus("header parent unknown — ensure parent before child".into())
+        })?;
         let parent_height = self
             .sync_parent_height(&parent_hash, in_batch)
             .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
@@ -1395,11 +1261,7 @@ impl ChainHub {
             .header_along_off_tip(parent, parent_height, first_h, in_batch)
             .ok_or_else(|| NetError::Consensus("missing retarget first header".into()))?;
         let timespan = u64::from(parent.time.saturating_sub(first.time));
-        Ok(CompactTarget::from_next_work_required(
-            parent.bits,
-            timespan,
-            &self.params.btc,
-        ))
+        Ok(CompactTarget::from_next_work_required(parent.bits, timespan, &self.params.btc))
     }
 
     fn min_diff_off_tip(
@@ -1563,10 +1425,7 @@ impl ChainHub {
         confirm_write_phase(&self.query, &self.params, self.milestone, batch)
             .map_err(NetError::from_consensus)?;
         self.note_confirmed_tip(&meta)?;
-        Ok(meta
-            .iter()
-            .map(|&(height, _)| AcceptOutcome::Accepted { height })
-            .collect())
+        Ok(meta.iter().map(|&(height, _)| AcceptOutcome::Accepted { height }).collect())
     }
 
     pub(crate) fn note_confirmed_tip(
@@ -1600,12 +1459,8 @@ impl ChainHub {
         for &(height, hash) in need_meta {
             confirmed.insert(hash);
             if let Ok(hdr) = self.query.wire_header_at_height(Height(height)) {
-                let _ = self.tip_tx.send(TipEvent {
-                    height,
-                    hash,
-                    header: hdr,
-                    reorg_branch_len: 0,
-                });
+                let _ =
+                    self.tip_tx.send(TipEvent { height, hash, header: hdr, reorg_branch_len: 0 });
             }
         }
         drop(confirmed);
@@ -1633,21 +1488,11 @@ impl ChainHub {
         extra_txs: Vec<Transaction>,
     ) -> Result<bitcoin::Block, NetError> {
         self.ensure_genesis()?;
-        let tip_h = self
-            .tip_height()
-            .ok_or(NetError::Protocol("generate: no tip"))?;
-        let prev = self
-            .tip_hash()
-            .ok_or(NetError::Protocol("generate: no tip hash"))?;
+        let tip_h = self.tip_height().ok_or(NetError::Protocol("generate: no tip"))?;
+        let prev = self.tip_hash().ok_or(NetError::Protocol("generate: no tip hash"))?;
         let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
         let time = self.generate_block_time(tip_h, tip_time);
-        Ok(mine_regtest_paying(
-            prev,
-            time,
-            tip_h.saturating_add(1),
-            script_pubkey,
-            extra_txs,
-        ))
+        Ok(mine_regtest_paying(prev, time, tip_h.saturating_add(1), script_pubkey, extra_txs))
     }
 
     /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
@@ -1683,19 +1528,11 @@ impl ChainHub {
         let mut hashes = Vec::with_capacity(nblocks as usize);
         let mut extras = extra_txs;
         for i in 0..nblocks {
-            let tip_h = self
-                .tip_height()
-                .ok_or(NetError::Protocol("generate: no tip"))?;
-            let prev = self
-                .tip_hash()
-                .ok_or(NetError::Protocol("generate: no tip hash"))?;
+            let tip_h = self.tip_height().ok_or(NetError::Protocol("generate: no tip"))?;
+            let prev = self.tip_hash().ok_or(NetError::Protocol("generate: no tip hash"))?;
             let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
             let time = self.generate_block_time(tip_h, tip_time);
-            let txs = if i == 0 {
-                std::mem::take(&mut extras)
-            } else {
-                Vec::new()
-            };
+            let txs = if i == 0 { std::mem::take(&mut extras) } else { Vec::new() };
             let block = mine_regtest_paying(
                 prev,
                 time,
@@ -1823,19 +1660,8 @@ impl ChainHub {
         let known = self.is_connected(&hash)
             || self.load_side_body(&hash).is_some()
             || self.header_tips.read().unwrap().contains(&hash)
-            || self
-                .query
-                .get_header_by_hash(&hash.to_byte_array())
-                .ok()
-                .flatten()
-                .is_some()
-            || self
-                .invalidated
-                .paths
-                .read()
-                .unwrap()
-                .iter()
-                .any(|p| p.contains(&hash));
+            || self.query.get_header_by_hash(&hash.to_byte_array()).ok().flatten().is_some()
+            || self.invalidated.paths.read().unwrap().iter().any(|p| p.contains(&hash));
         if !known {
             return Err(NetError::Consensus("Block not found".into()));
         }
@@ -2000,9 +1826,7 @@ impl ChainHub {
                 Ok(AcceptOutcome::Accepted { height: 0 })
             }
             Some(tip_h) => {
-                let tip_hash = self
-                    .tip_hash()
-                    .ok_or(NetError::Protocol("missing tip hash"))?;
+                let tip_hash = self.tip_hash().ok_or(NetError::Protocol("missing tip hash"))?;
                 if prev == tip_hash {
                     let height = tip_h.saturating_add(1);
                     self.remember_cmpct_prefill_from_block(block.as_ref());
@@ -2099,10 +1923,7 @@ impl ChainHub {
         if blocks.is_empty() {
             return Err(NetError::Protocol("empty branch"));
         }
-        if blocks
-            .iter()
-            .any(|b| self.is_block_invalid(&b.block_hash()))
-        {
+        if blocks.iter().any(|b| self.is_block_invalid(&b.block_hash())) {
             return Err(NetError::Consensus("block is invalidated".into()));
         }
         for w in blocks.windows(2) {
@@ -2187,9 +2008,7 @@ impl ChainHub {
                 if let Some(th) = self.tip_hash() {
                     self.confirmed.write().unwrap().remove(&th);
                 }
-                self.query
-                    .disconnect_tip()
-                    .map_err(|e| NetError::Consensus(e.to_string()))?;
+                self.query.disconnect_tip().map_err(|e| NetError::Consensus(e.to_string()))?;
             }
             self.cache.clear();
             self.confirmed.write().unwrap().clear();
@@ -2204,8 +2023,7 @@ impl ChainHub {
         base: u32,
         old_path: &[Block],
     ) -> Result<(), NetError> {
-        self.announce_reorg_len
-            .store(blocks.len() as u32, Ordering::Relaxed);
+        self.announce_reorg_len.store(blocks.len() as u32, Ordering::Relaxed);
         for (i, b) in blocks.iter().enumerate() {
             if let Err(e) = self.connect_at(base + i as u32, Arc::new(b.clone())) {
                 self.announce_reorg_len.store(0, Ordering::Relaxed);
@@ -2325,11 +2143,7 @@ impl ChainHub {
             .flatten()
             .map(|h| h.0.saturating_add(1))
             .or_else(|| {
-                self.header_tips
-                    .read()
-                    .unwrap()
-                    .get(&prev)
-                    .map(|(_, h)| h.saturating_add(1))
+                self.header_tips.read().unwrap().get(&prev).map(|(_, h)| h.saturating_add(1))
             })
     }
 
@@ -2404,12 +2218,7 @@ impl ChainHub {
             if self.is_connected(&prev) || held.contains(&prev) {
                 continue;
             }
-            if self
-                .query
-                .reconstruct_archived_block(&prev.to_byte_array())
-                .ok()
-                .flatten()
-                .is_some()
+            if self.query.reconstruct_archived_block(&prev.to_byte_array()).ok().flatten().is_some()
             {
                 continue;
             }
@@ -2424,10 +2233,7 @@ impl ChainHub {
         if let Some(b) = self.held_body(hash) {
             return Some(b);
         }
-        self.query
-            .reconstruct_archived_block(&hash.to_byte_array())
-            .ok()
-            .flatten()
+        self.query.reconstruct_archived_block(&hash.to_byte_array()).ok().flatten()
     }
 
     /// Walk hold + archive from `tip` back to a best-chain parent.
@@ -2473,10 +2279,7 @@ impl ChainHub {
             let Some(branch) = self.assemble_side_branch(start) else {
                 continue;
             };
-            if branch
-                .iter()
-                .any(|b| self.is_block_invalid(&b.block_hash()))
-            {
+            if branch.iter().any(|b| self.is_block_invalid(&b.block_hash())) {
                 continue;
             }
             let w = sum_work(branch.iter().map(|b| b.header.work()));
@@ -2555,10 +2358,7 @@ impl ChainHub {
         })
         .map_err(|e| {
             let reason = rbitcoin_consensus::block_reject_reason(&e);
-            rbitcoin_log::info!(
-                "{}",
-                rbitcoin_consensus::block_reject_log_line(hash, &reason)
-            );
+            rbitcoin_log::info!("{}", rbitcoin_consensus::block_reject_log_line(hash, &reason));
             if reject_is_mutated(&reason) {
                 NetError::Mutated(reason)
             } else {
@@ -2643,12 +2443,8 @@ impl ChainHub {
             }
             mp.evict_after_reorg();
         }
-        self.query
-            .drop_sh_pending_from(Height(keep_height.saturating_add(1)));
-        self.chain_work_prefix
-            .write()
-            .unwrap()
-            .truncate(keep_height as usize + 1);
+        self.query.drop_sh_pending_from(Height(keep_height.saturating_add(1)));
+        self.chain_work_prefix.write().unwrap().truncate(keep_height as usize + 1);
         Ok(())
     }
 
@@ -2711,17 +2507,12 @@ impl ChainHub {
         }
         self.ensure_chain_work_prefix()?;
         let p = self.chain_work_prefix.read().unwrap();
-        let end = p
-            .get(tip as usize)
-            .copied()
-            .unwrap_or_else(|| Work::from_be_bytes([0u8; 32]));
+        let end = p.get(tip as usize).copied().unwrap_or_else(|| Work::from_be_bytes([0u8; 32]));
         if start == 0 {
             return Ok(end);
         }
-        let base = p
-            .get((start - 1) as usize)
-            .copied()
-            .unwrap_or_else(|| Work::from_be_bytes([0u8; 32]));
+        let base =
+            p.get((start - 1) as usize).copied().unwrap_or_else(|| Work::from_be_bytes([0u8; 32]));
         Ok(end - base)
     }
 
@@ -2999,19 +2790,12 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
                 }
             }
         }
-        info!(
-            "ibd: confirmed-set seed complete tip={} in {:?}",
-            tip.0,
-            t0.elapsed()
-        );
+        info!("ibd: confirmed-set seed complete tip={} in {:?}", tip.0, t0.elapsed());
     };
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn_blocking(run);
     } else {
-        std::thread::Builder::new()
-            .name("confirmed-seed".into())
-            .spawn(run)
-            .ok();
+        std::thread::Builder::new().name("confirmed-seed".into()).spawn(run).ok();
     }
 }
 
@@ -3065,10 +2849,7 @@ mod tests {
             assert_eq!(hub2.params.network, bitcoin::Network::Regtest);
             assert_eq!(hub2.query.store().headers.head_target_slots(), 64);
         }
-        assert!(
-            !path.exists(),
-            "drop must remove the Tiny hub directory {path:?}"
-        );
+        assert!(!path.exists(), "drop must remove the Tiny hub directory {path:?}");
     }
 
     fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
@@ -3082,10 +2863,7 @@ mod tests {
         let tip = hub.tip_hash().expect("genesis");
         let child = BlockHash::from_byte_array([2; 32]);
         hub.remember_cmpct_prefill(child, tip, vec![0, 1]);
-        assert!(
-            hub.cmpct_prefill_indexes(&child).is_none(),
-            "default knob off stores nothing"
-        );
+        assert!(hub.cmpct_prefill_indexes(&child).is_none(), "default knob off stores nothing");
         hub.set_prefill_compact(true);
         hub.remember_cmpct_prefill(child, tip, vec![0, 1]);
         assert_eq!(hub.cmpct_prefill_indexes(&child), Some(vec![0, 1]));
@@ -3097,10 +2875,7 @@ mod tests {
         );
         hub.set_prefill_compact(false);
         hub.remember_cmpct_prefill(child, tip, vec![0, 9]);
-        assert!(
-            hub.cmpct_prefill_indexes(&child).is_none(),
-            "knob off hides the plan"
-        );
+        assert!(hub.cmpct_prefill_indexes(&child).is_none(), "knob off hides the plan");
         hub.set_prefill_compact(true);
         assert_eq!(
             hub.cmpct_prefill_indexes(&child),
@@ -3110,12 +2885,7 @@ mod tests {
     }
 
     fn mature_spend_tx(hub: &ChainHub) -> Transaction {
-        let cb = hub
-            .query
-            .reconstruct_block_at_height(Height(1))
-            .unwrap()
-            .txdata[0]
-            .compute_txid();
+        let cb = hub.query.reconstruct_block_at_height(Height(1)).unwrap().txdata[0].compute_txid();
         Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
@@ -3143,8 +2913,7 @@ mod tests {
     fn generate_remembers_prefill_for_tx_not_in_mempool() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad");
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![]).expect("pad");
         let _mp = attach_mp(dir.path(), &hub);
         hub.set_prefill_compact(true);
         let extra = mature_spend_tx(&hub);
@@ -3163,8 +2932,7 @@ mod tests {
     fn generate_omits_live_mempool_tx_from_prefill() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad");
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![]).expect("pad");
         let mp = attach_mp(dir.path(), &hub);
         hub.set_prefill_compact(true);
         let extra = mature_spend_tx(&hub);
@@ -3184,8 +2952,7 @@ mod tests {
     fn submit_remembers_prefill_for_tx_not_in_mempool() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad");
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![]).expect("pad");
         let _mp = attach_mp(dir.path(), &hub);
         hub.set_prefill_compact(true);
         let extra = mature_spend_tx(&hub);
@@ -3208,11 +2975,8 @@ mod tests {
     }
 
     fn coinbase(height: u32) -> Transaction {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            rbitcoin_consensus::bip34_height_script(height)
-        };
+        let mut ss =
+            if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }
@@ -3236,10 +3000,8 @@ mod tests {
     fn strip_txids_from_pres_match_compute_txid() {
         let a = coinbase(1);
         let b = coinbase(2);
-        let pres: Vec<_> = [&a, &b]
-            .into_iter()
-            .map(rbitcoin_query::TxPrecompute::from_tx)
-            .collect();
+        let pres: Vec<_> =
+            [&a, &b].into_iter().map(rbitcoin_query::TxPrecompute::from_tx).collect();
         let got = ChainHub::strip_txids_from_pres(&pres);
         assert_eq!(got, vec![a.compute_txid(), b.compute_txid()]);
     }
@@ -3254,10 +3016,7 @@ mod tests {
             bits,
             nonce: 0,
         };
-        let mut block = Block {
-            header,
-            txdata: vec![coinbase(height)],
-        };
+        let mut block = Block { header, txdata: vec![coinbase(height)] };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let target = Target::from_compact(bits);
         for nonce in 0..u32::MAX {
@@ -3357,36 +3116,18 @@ mod tests {
             accept_prev_not_found_log(h),
             format!("p2p: accept dropped {h} (prev not found)")
         );
-        assert_eq!(
-            ignoring_low_work_chain_log(14),
-            "p2p: ignore low-work headers height=14"
-        );
-        assert_eq!(
-            synchronizing_blockheaders_log(14),
-            "p2p: headers sync height=14"
-        );
-        assert_eq!(
-            initial_getheaders_log(0, 0),
-            "p2p: initial getheaders height=0 peer=0"
-        );
+        assert_eq!(ignoring_low_work_chain_log(14), "p2p: ignore low-work headers height=14");
+        assert_eq!(synchronizing_blockheaders_log(14), "p2p: headers sync height=14");
+        assert_eq!(initial_getheaders_log(0, 0), "p2p: initial getheaders height=0 peer=0");
         assert_eq!(
             headers_timeout_disconnect_log(0),
             "p2p: headers sync timeout, disconnect peer=0"
         );
-        assert_eq!(
-            headers_timeout_noban_log(0),
-            "p2p: headers sync timeout, keep peer=0"
-        );
-        assert_eq!(
-            received_getdata_wtx_log("aabbccdd", 3),
-            "p2p: getdata wtx aabbccdd peer=3"
-        );
+        assert_eq!(headers_timeout_noban_log(0), "p2p: headers sync timeout, keep peer=0");
+        assert_eq!(received_getdata_wtx_log("aabbccdd", 3), "p2p: getdata wtx aabbccdd peer=3");
         assert_eq!(received_tx_log(), "p2p: received tx");
         // Test formula: now=1_000_000, genesis=0 → variable = ceil(1e6/6e5)=2.
-        assert_eq!(
-            headers_download_timeout_secs(1_000_000, 0),
-            1_000_000 + 900 + 2
-        );
+        assert_eq!(headers_download_timeout_secs(1_000_000, 0), 1_000_000 + 900 + 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3490,8 +3231,7 @@ mod tests {
         let tip_time = mid + 10_000;
         let h1 = mine(gen, mid, 1);
         hub.accept_block(h1.clone()).unwrap();
-        hub.accept_block(mine(h1.block_hash(), tip_time, 2))
-            .unwrap();
+        hub.accept_block(mine(h1.block_hash(), tip_time, 2)).unwrap();
         let mock = i64::from(tip_time) - 3_000;
         assert!(mock as u32 > mid, "mock must sit above MTP");
         hub.clock.set_mock(mock);
@@ -3534,26 +3274,14 @@ mod tests {
 
         hub.set_max_tip_age_secs(3600);
         hub.clock.set_mock(i64::from(tip_time) + 3601);
-        assert!(
-            hub.tip_is_stale_for_ibd(),
-            "tip older than configured max must be stale for IBD"
-        );
+        assert!(hub.tip_is_stale_for_ibd(), "tip older than configured max must be stale for IBD");
 
         hub.clock.set_mock(i64::from(tip_time) + 3600);
-        assert!(
-            !hub.tip_is_stale_for_ibd(),
-            "tip at exactly max age must leave IBD"
-        );
+        assert!(!hub.tip_is_stale_for_ibd(), "tip at exactly max age must leave IBD");
         assert!(!hub.in_ibd(), "leaving IBD latches");
         hub.clock.set_mock(i64::from(tip_time) + 3600 * 48);
-        assert!(
-            hub.tip_is_stale_for_ibd(),
-            "stale helper still follows clock"
-        );
-        assert!(
-            !hub.in_ibd(),
-            "Core m_cached_finished_ibd stays false after leave"
-        );
+        assert!(hub.tip_is_stale_for_ibd(), "stale helper still follows clock");
+        assert!(!hub.in_ibd(), "Core m_cached_finished_ibd stays false after leave");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3638,10 +3366,7 @@ mod tests {
         hub.set_minimum_chain_work(Some(min));
         let gen = hub.tip_hash().unwrap();
         let b1 = mine(gen, 1_300_000_000, 1);
-        assert!(
-            hub.header_below_minwork(&b1.header),
-            "genesis+1 must stay below 0x10"
-        );
+        assert!(hub.header_below_minwork(&b1.header), "genesis+1 must stay below 0x10");
         hub.set_minimum_chain_work(None);
         hub.accept_block(b1.clone()).unwrap();
         let b2 = mine(b1.block_hash(), 1_300_000_100, 2);
@@ -3790,10 +3515,7 @@ mod tests {
         low_ver.merkle_root = bitcoin::TxMerkleNode::from_byte_array([3u8; 32]);
         rbitcoin_consensus::grind_regtest_pow(&mut low_ver);
         let err = hub.ensure_header(&low_ver).unwrap_err();
-        assert!(
-            err.to_string().contains("bad-version"),
-            "fork child below BIP65 nVersion: {err}"
-        );
+        assert!(err.to_string().contains("bad-version"), "fork child below BIP65 nVersion: {err}");
         assert_eq!(hub.query.store().header_count(), before);
 
         let mut h2 = b1.header;
@@ -3822,25 +3544,17 @@ mod tests {
         batch_old.merkle_root = bitcoin::TxMerkleNode::from_byte_array([6u8; 32]);
         rbitcoin_consensus::grind_regtest_pow(&mut batch_old);
         let after_far = hub.query.store().header_count();
-        let err = hub
-            .ensure_headers_batch(&[h2, batch_old])
-            .expect_err("batch must fail closed on MTP");
-        assert!(
-            err.to_string().contains("median-time-past"),
-            "in-batch MTP fail: {err}"
-        );
+        let err =
+            hub.ensure_headers_batch(&[h2, batch_old]).expect_err("batch must fail closed on MTP");
+        assert!(err.to_string().contains("median-time-past"), "in-batch MTP fail: {err}");
         assert_eq!(hub.query.store().header_count(), after_far);
 
         let empty = HashMap::new();
         assert_eq!(hub.stored_header_height(&b1.block_hash()), Some(1));
-        assert!(hub
-            .stored_header_height(&BlockHash::from_byte_array([0xab; 32]))
-            .is_none());
+        assert!(hub.stored_header_height(&BlockHash::from_byte_array([0xab; 32])).is_none());
         let mtp = hub.mtp_off_tip(&b1.header, &empty);
         assert!(mtp <= b1.header.time);
-        let child_bits = hub
-            .expected_bits_off_tip(&h2, &b1.header, 1, &empty)
-            .unwrap();
+        let child_bits = hub.expected_bits_off_tip(&h2, &b1.header, 1, &empty).unwrap();
         assert_eq!(child_bits, b1.header.bits);
         let mut far_bits = h2;
         far_bits.time = b1.header.time.saturating_add(10_000);
@@ -3872,17 +3586,11 @@ mod tests {
             )
         );
         assert!(!line_probe.contains("UpdateTip"), "{line_probe}");
-        assert!(matches!(
-            hub.accept_block(b1).unwrap(),
-            AcceptOutcome::Accepted { height: 1 }
-        ));
+        assert!(matches!(hub.accept_block(b1).unwrap(), AcceptOutcome::Accepted { height: 1 }));
         assert_eq!(hub.tip_height(), Some(1));
         // Second block also accepted (one log per height on real path).
         let b2 = mine(hash, 1_300_000_600, 2);
-        assert!(matches!(
-            hub.accept_block(b2).unwrap(),
-            AcceptOutcome::Accepted { height: 2 }
-        ));
+        assert!(matches!(hub.accept_block(b2).unwrap(), AcceptOutcome::Accepted { height: 2 }));
         assert_eq!(hub.tip_height(), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3896,9 +3604,7 @@ mod tests {
         let b2 = mine(b1.block_hash(), 1_300_000_600, 2);
         let b3 = mine(b2.block_hash(), 1_300_001_200, 3);
         let before = hub.query.store().header_count();
-        let fks = hub
-            .ensure_headers_batch(&[b1.header, b2.header, b3.header])
-            .unwrap();
+        let fks = hub.ensure_headers_batch(&[b1.header, b2.header, b3.header]).unwrap();
         assert_eq!(fks.len(), 3);
         assert_eq!(hub.query.store().header_count(), before + 3);
         assert_eq!(
@@ -4009,10 +3715,7 @@ mod tests {
         ));
         assert_eq!(hub.tip_height(), Some(1));
         // AlreadyHave on re-accept.
-        assert!(matches!(
-            hub.accept_block(b1.clone()).unwrap(),
-            AcceptOutcome::AlreadyHave
-        ));
+        assert!(matches!(hub.accept_block(b1.clone()).unwrap(), AcceptOutcome::AlreadyHave));
 
         // Non-genesis without tip rejected on empty hub.
         let (dir2, empty) = tmp_hub();
@@ -4034,10 +3737,7 @@ mod tests {
         assert_eq!(hub.work_through_height(0).unwrap(), gwork);
         assert_eq!(tip_w - gwork, b1.header.work() + b2.header.work());
         let extra = mine(b2.block_hash(), 1_300_000_200, 3);
-        assert_eq!(
-            hub.work_with_header(&extra.header),
-            tip_w + extra.header.work()
-        );
+        assert_eq!(hub.work_with_header(&extra.header), tip_w + extra.header.work());
         assert!(hub.mempool().is_none());
         let _ = hub.subscribe_tips();
 
@@ -4075,10 +3775,7 @@ mod tests {
         assert_eq!(already, (n as u32) - 1);
         assert_eq!(hub.tip_height(), Some(1));
         // Tip body membership: every strong+height tx at tip is in header_txs.
-        let tip_fks = hub
-            .query
-            .block_tx_fks(rbitcoin_primitives::Height(1))
-            .unwrap();
+        let tip_fks = hub.query.block_tx_fks(rbitcoin_primitives::Height(1)).unwrap();
         let tip_set: std::collections::HashSet<u64> =
             tip_fks.iter().filter_map(|f| f.get()).collect();
         for &fk in &tip_fks {
@@ -4128,28 +3825,18 @@ mod tests {
         };
         assert_eq!(mat1.batch.len(), 1);
         assert!(mat1.batch.archive_plan.is_some());
-        assert_eq!(
-            hub.tip_height(),
-            Some(0),
-            "tip must not advance on load alone"
-        );
+        assert_eq!(hub.tip_height(), Some(0), "tip must not advance on load alone");
 
         // Update pipeline caches from plan (load-thread note_lookup_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
         if plan.batch_pin.len() == plan.planned_fks.len() {
             inflight.note_pins(
-                plan.planned_fks
-                    .iter()
-                    .zip(plan.batch_pin.iter())
-                    .map(|(fk, pin)| (*fk, pin)),
+                plan.planned_fks.iter().zip(plan.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
                 None,
             );
         } else {
             inflight.note_pins(
-                plan.packed
-                    .iter()
-                    .zip(plan.planned_fks.iter())
-                    .map(|((pin, _), fk)| (*fk, pin)),
+                plan.packed.iter().zip(plan.planned_fks.iter()).map(|((pin, _), fk)| (*fk, pin)),
                 None,
             );
         }
@@ -4178,16 +3865,8 @@ mod tests {
         assert!(mat2.batch.archive_plan.is_some());
         // Reserved fks for batch2 start after batch1's plan.
         let p1_last = plan.planned_fks.last().unwrap().get().unwrap();
-        let p2_first = mat2
-            .batch
-            .archive_plan
-            .as_ref()
-            .unwrap()
-            .planned_fks
-            .first()
-            .unwrap()
-            .get()
-            .unwrap();
+        let p2_first =
+            mat2.batch.archive_plan.as_ref().unwrap().planned_fks.first().unwrap().get().unwrap();
         assert!(
             p2_first > p1_last,
             "batch2 fks must not collide with batch1 reserved fks ({p2_first} <= {p1_last})"
@@ -4214,22 +3893,13 @@ mod tests {
         assert!(hub.has_block(&h1));
         assert_eq!(hub.tip_height(), Some(1));
         // Already confirmed → AlreadyHave.
-        assert!(matches!(
-            hub.accept_block(b1.clone()).unwrap(),
-            AcceptOutcome::AlreadyHave
-        ));
+        assert!(matches!(hub.accept_block(b1.clone()).unwrap(), AcceptOutcome::AlreadyHave));
         // Wire load on already-confirmed → None.
-        assert!(hub
-            .confirm_wire_load_phase(&[(Height(1), b1.clone())])
-            .unwrap()
-            .is_none());
+        assert!(hub.confirm_wire_load_phase(&[(Height(1), b1.clone())]).unwrap().is_none());
 
         // Unknown parent.
         let orphan = mine(BlockHash::from_byte_array([9u8; 32]), 1_300_000_200, 99);
-        assert!(matches!(
-            hub.accept_block(orphan).unwrap_err(),
-            NetError::UnknownParent
-        ));
+        assert!(matches!(hub.accept_block(orphan).unwrap_err(), NetError::UnknownParent));
 
         // accept_branch empty / unlinked.
         assert!(hub.accept_branch(&[]).is_err());
@@ -4250,10 +3920,7 @@ mod tests {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let orphan = mine(BlockHash::from_byte_array([9u8; 32]), 1_300_000_500, 99);
-        assert!(matches!(
-            hub.accept_block(orphan).unwrap_err(),
-            NetError::UnknownParent
-        ));
+        assert!(matches!(hub.accept_block(orphan).unwrap_err(), NetError::UnknownParent));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4304,10 +3971,7 @@ mod tests {
         assert_eq!(tips[0].status, "active");
         assert_eq!(tips[0].hash, fork[2].block_hash());
         assert_eq!(tips[0].branchlen, 0);
-        let fork_tip = tips
-            .iter()
-            .find(|t| t.status == "valid-fork")
-            .expect("loser");
+        let fork_tip = tips.iter().find(|t| t.status == "valid-fork").expect("loser");
         assert_eq!(fork_tip.hash, a2.block_hash());
         assert_eq!(fork_tip.height, 2);
         assert_eq!(fork_tip.branchlen, 2);
@@ -4335,10 +3999,7 @@ mod tests {
         }
         for b in &eq {
             let out = hub.accept_received_block(b.clone()).unwrap();
-            assert!(matches!(
-                out,
-                AcceptOutcome::IgnoredWeaker | AcceptOutcome::AlreadyHave
-            ));
+            assert!(matches!(out, AcceptOutcome::IgnoredWeaker | AcceptOutcome::AlreadyHave));
         }
         assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
         hub.precious_block(eq[2].block_hash()).unwrap();
@@ -4360,16 +4021,9 @@ mod tests {
         hub.invalidate_block(fork[1].block_hash()).unwrap();
         assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
         assert!(hub.held_body(&tip).is_none());
-        assert!(hub
-            .query
-            .reconstruct_archived_block(&tip.to_byte_array())
-            .unwrap()
-            .is_some());
+        assert!(hub.query.reconstruct_archived_block(&tip.to_byte_array()).unwrap().is_some());
         hub.reconsider_block(fork[1].block_hash()).unwrap();
-        assert!(
-            hub.held_body(&tip).is_none(),
-            "reconsider must not park the old tip"
-        );
+        assert!(hub.held_body(&tip).is_none(), "reconsider must not park the old tip");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4406,10 +4060,7 @@ mod tests {
 
         hub.invalidate_block(eq[2].block_hash()).unwrap();
         let err = hub.precious_block(eq[2].block_hash()).unwrap_err();
-        assert!(
-            err.to_string().to_ascii_lowercase().contains("invalid"),
-            "{err}"
-        );
+        assert!(err.to_string().to_ascii_lowercase().contains("invalid"), "{err}");
         hub.reconsider_block(eq[2].block_hash()).unwrap();
         assert_eq!(
             hub.tip_hash().unwrap(),
@@ -4431,10 +4082,7 @@ mod tests {
         let child = mine(b1.block_hash(), 1_300_020_100, 2);
         hub.ensure_header(&child.header).unwrap();
         let tips = hub.chaintips();
-        let ho = tips
-            .iter()
-            .find(|t| t.status == "headers-only")
-            .expect("headers-only child");
+        let ho = tips.iter().find(|t| t.status == "headers-only").expect("headers-only child");
         assert_eq!(ho.hash, child.block_hash());
         assert_eq!(ho.height, 2);
         assert_eq!(ho.branchlen, 1);
@@ -4476,10 +4124,7 @@ mod tests {
             }
         }
         let out = hub.accept_block(sibling).unwrap();
-        assert!(matches!(
-            out,
-            AcceptOutcome::IgnoredWeaker | AcceptOutcome::Accepted { .. }
-        ));
+        assert!(matches!(out, AcceptOutcome::IgnoredWeaker | AcceptOutcome::Accepted { .. }));
 
         // block_at_height via reconstruct after tip extend.
         let b2 = mine(hub.tip_hash().unwrap(), 1_300_001_100, 2);
@@ -4506,10 +4151,7 @@ mod tests {
     fn connect_at_releases_sh_after_tip_event() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        let genesis = hub
-            .block_at_height(0)
-            .unwrap()
-            .expect("genesis after ensure");
+        let genesis = hub.block_at_height(0).unwrap().expect("genesis after ensure");
         rbitcoin_consensus::pad_empty_from(
             hub.query.as_ref(),
             &hub.params,
@@ -4546,10 +4188,7 @@ mod tests {
 
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        let genesis = hub
-            .block_at_height(0)
-            .unwrap()
-            .expect("genesis after ensure");
+        let genesis = hub.block_at_height(0).unwrap().expect("genesis after ensure");
         let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
             hub.query.as_ref(),
             &hub.params,
@@ -4571,10 +4210,7 @@ mod tests {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4587,50 +4223,29 @@ mod tests {
         let spend_id = spend.compute_txid().to_byte_array();
         mp.accept_tx(&spend).expect("accept spend");
         let in_mp = |mp: &crate::tx_relay::MempoolHub| {
-            mp.scripthash_mempool(&sh)
-                .iter()
-                .any(|r| r.txid == spend_id)
+            mp.scripthash_mempool(&sh).iter().any(|r| r.txid == spend_id)
         };
-        let in_hist = || {
-            hub.query
-                .scripthash_history(&sh)
-                .unwrap()
-                .iter()
-                .any(|r| r.txid == spend_id)
-        };
+        let in_hist =
+            || hub.query.scripthash_history(&sh).unwrap().iter().any(|r| r.txid == spend_id);
         assert!(in_mp(&mp), "pre-connect: tx must be in mempool overlay");
         assert!(!in_hist(), "pre-connect: tx must not be confirmed history");
 
-        let cold0 = hub
-            .query
-            .confirm_stats()
-            .sh_collect_cold
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let block = hub
-            .assemble_block_to_script(spk, vec![spend])
-            .expect("assemble");
+        let cold0 =
+            hub.query.confirm_stats().sh_collect_cold.load(std::sync::atomic::Ordering::Relaxed);
+        let block = hub.assemble_block_to_script(spk, vec![spend]).expect("assemble");
         match hub.accept_block(block).expect("connect spend block") {
             AcceptOutcome::Accepted { height } => assert_eq!(height, 101),
             other => panic!("expected Accepted, got {other:?}"),
         }
-        let cold1 = hub
-            .query
-            .confirm_stats()
-            .sh_collect_cold
-            .load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            cold1, cold0,
-            "mempool-origin creates must collect from pins, not cold Class A"
-        );
+        let cold1 =
+            hub.query.confirm_stats().sh_collect_cold.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(cold1, cold0, "mempool-origin creates must collect from pins, not cold Class A");
         assert_eq!(
             hub.query.sh_indexed_through_height(),
             through,
             "accept must not drain durable SH"
         );
-        assert!(
-            !in_mp(&mp),
-            "post-connect: mempool overlay must not keep the confirmed tx"
-        );
+        assert!(!in_mp(&mp), "post-connect: mempool overlay must not keep the confirmed tx");
         assert!(
             in_hist(),
             "post-connect: pending SH must show the confirmed tx before durable apply"
@@ -4642,11 +4257,7 @@ mod tests {
             .iter()
             .filter(|r| r.txid == spend_id)
             .count();
-        let mp_hits = mp
-            .scripthash_mempool(&sh)
-            .iter()
-            .filter(|r| r.txid == spend_id)
-            .count();
+        let mp_hits = mp.scripthash_mempool(&sh).iter().filter(|r| r.txid == spend_id).count();
         assert_eq!(
             hist_hits + mp_hits,
             1,
@@ -4656,14 +4267,8 @@ mod tests {
         let h101 = hub.tip_hash().expect("spend block");
         hub.invalidate_block(h101).expect("reorg spend block");
         assert_eq!(hub.tip_height(), Some(100));
-        assert!(
-            in_mp(&mp),
-            "reorg must restore mempool overlay before dropping RAM SH head"
-        );
-        assert!(
-            !in_hist(),
-            "disconnected spend must not remain confirmed history"
-        );
+        assert!(in_mp(&mp), "reorg must restore mempool overlay before dropping RAM SH head");
+        assert!(!in_hist(), "disconnected spend must not remain confirmed history");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4708,10 +4313,7 @@ mod tests {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: spend.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: spend.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4732,8 +4334,7 @@ mod tests {
         assert_eq!(coin.create_height, 1);
 
         let h10 = hub.block_at_height(10).unwrap().expect("height 10");
-        hub.invalidate_block(h10.block_hash())
-            .expect("invalidate height 10");
+        hub.invalidate_block(h10.block_hash()).expect("invalidate height 10");
         assert_eq!(hub.tip_height(), Some(9));
         assert_eq!(
             mp.live_count(),
@@ -4752,10 +4353,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-dersig-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
@@ -4798,10 +4396,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-cltv-{}-{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
@@ -4936,10 +4531,7 @@ mod tests {
 
         // Weaker single-block branch at height 1 → IgnoredWeaker (less work than tip path).
         let out = hub.accept_branch(&[side]).unwrap();
-        assert!(matches!(
-            out,
-            AcceptOutcome::IgnoredWeaker | AcceptOutcome::Accepted { .. }
-        ));
+        assert!(matches!(out, AcceptOutcome::IgnoredWeaker | AcceptOutcome::Accepted { .. }));
 
         // Gap above tip: parent is tip, but we already have tip+1 path — build orphan
         // child of non-tip ancestor that's not tip-1? parent at height 0 with tip 2
@@ -4947,10 +4539,7 @@ mod tests {
         // Missing parent:
         let orphan = mine(BlockHash::from_byte_array([0xab; 32]), 1_300_003_000, 99);
         assert!(
-            matches!(
-                hub.accept_block(orphan.clone()).unwrap_err(),
-                NetError::UnknownParent
-            ),
+            matches!(hub.accept_block(orphan.clone()).unwrap_err(), NetError::UnknownParent),
             "unknown parent must be NetError::UnknownParent"
         );
         assert!(
@@ -4992,10 +4581,7 @@ mod tests {
         let mp = attach_mp(dir.path(), &hub);
         let write_out = hub.confirm_write(script_out.batch).unwrap();
         assert_eq!(write_out.len(), 1);
-        assert!(matches!(
-            write_out[0],
-            AcceptOutcome::Accepted { height: 1 }
-        ));
+        assert!(matches!(write_out[0], AcceptOutcome::Accepted { height: 1 }));
         assert_eq!(hub.tip_height(), Some(1));
         assert!(
             mp.try_contains_wtxid(&cb_wtxid),
@@ -5050,21 +4636,9 @@ mod tests {
         let main_tip = hub.tip_hash().unwrap();
 
         // Fork parent at height 2.
-        let fork_parent = hub
-            .query
-            .header_at_height(Height(2))
-            .unwrap()
-            .unwrap()
-            .1
-            .hash;
+        let fork_parent = hub.query.header_at_height(Height(2)).unwrap().unwrap().1.hash;
         let fork_prev = BlockHash::from_byte_array(fork_parent);
-        let fork_time = hub
-            .query
-            .header_at_height(Height(2))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
+        let fork_time = hub.query.header_at_height(Height(2)).unwrap().unwrap().1.timestamp;
 
         // Competing branch depth 16 from height 3..=18 (16 blocks) → more work.
         let mut branch = Vec::new();
@@ -5100,21 +4674,9 @@ mod tests {
         // Mid-branch invalid: longer path from height 10 with a bad spend in the middle.
         let pre_tip = hub.tip_hash().unwrap();
         let pre_h = hub.tip_height().unwrap();
-        let fork2 = hub
-            .query
-            .header_at_height(Height(10))
-            .unwrap()
-            .unwrap()
-            .1
-            .hash;
+        let fork2 = hub.query.header_at_height(Height(10)).unwrap().unwrap().1.hash;
         let fork2_prev = BlockHash::from_byte_array(fork2);
-        let fork2_time = hub
-            .query
-            .header_at_height(Height(10))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
+        let fork2_time = hub.query.header_at_height(Height(10)).unwrap().unwrap().1.timestamp;
 
         // Path length 10 (> remaining 8 on main from 11..=18) so work_better.
         let mut bad_branch = Vec::new();
@@ -5149,19 +4711,13 @@ mod tests {
             bad_branch.push(b);
         }
         assert_eq!(bad_branch.len(), 10);
-        let err = hub
-            .accept_branch(&bad_branch)
-            .expect_err("invalid mid-branch must fail connect");
+        let err = hub.accept_branch(&bad_branch).expect_err("invalid mid-branch must fail connect");
         assert!(
             matches!(err, NetError::Consensus(_) | NetError::ConnectFailed { .. }),
             "expected consensus fail, got {err}"
         );
         // Tip restored to pre-attempt.
-        assert_eq!(
-            hub.tip_height(),
-            Some(pre_h),
-            "tip height must restore after failed reorg"
-        );
+        assert_eq!(hub.tip_height(), Some(pre_h), "tip height must restore after failed reorg");
         assert_eq!(
             hub.tip_hash().unwrap(),
             pre_tip,
@@ -5186,21 +4742,9 @@ mod tests {
             hub.accept_block(b).unwrap();
         }
         assert_eq!(hub.tip_height(), Some(10));
-        let fork_parent = hub
-            .query
-            .header_at_height(Height(1))
-            .unwrap()
-            .unwrap()
-            .1
-            .hash;
+        let fork_parent = hub.query.header_at_height(Height(1)).unwrap().unwrap().1.hash;
         let fork_prev = BlockHash::from_byte_array(fork_parent);
-        let fork_time = hub
-            .query
-            .header_at_height(Height(1))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
+        let fork_time = hub.query.header_at_height(Height(1)).unwrap().unwrap().1.timestamp;
         // 99 blocks after height 1 → tip height 100.
         let mut branch = Vec::with_capacity(99);
         let mut p = fork_prev;
@@ -5250,10 +4794,7 @@ mod tests {
         );
         assert_eq!(hub.tip_height(), Some(289));
         let tip_hash = hub.tip_hash().unwrap();
-        let tip_block = hub
-            .block_at_height(289)
-            .unwrap()
-            .expect("padded tip reconstructable");
+        let tip_block = hub.block_at_height(289).unwrap().expect("padded tip reconstructable");
         let mut near = rbitcoin_consensus::mine_empty_regtest(
             tip_block.header.prev_blockhash,
             tip_block.header.time.saturating_add(1),
@@ -5290,12 +4831,7 @@ mod tests {
             "sibling at previous tip height must stay held"
         );
 
-        let far = mine_distinct(
-            gen,
-            1_300_040_002,
-            1,
-            &[b1.block_hash(), stale.block_hash()],
-        );
+        let far = mine_distinct(gen, 1_300_040_002, 1, &[b1.block_hash(), stale.block_hash()]);
         assert!(matches!(
             hub.accept_received_block(far.clone()).unwrap(),
             AcceptOutcome::IgnoredWeaker
@@ -5326,13 +4862,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        mine_regtest_paying(
-            prev,
-            time,
-            height,
-            ScriptBuf::from_bytes(vec![0x51]),
-            vec![spend],
-        )
+        mine_regtest_paying(prev, time, height, ScriptBuf::from_bytes(vec![0x51]), vec![spend])
     }
 
     #[test]
@@ -5350,9 +4880,7 @@ mod tests {
         assert!(hub.held_body(&side.block_hash()).is_some());
 
         let bad = missing_prevout_child(side.block_hash(), side.header.time.saturating_add(600), 2);
-        let err = hub
-            .accept_received_block(bad.clone())
-            .expect_err("missing prevout must reject");
+        let err = hub.accept_received_block(bad.clone()).expect_err("missing prevout must reject");
         match err {
             NetError::Consensus(s) => {
                 assert!(s.contains("bad-txns-inputs-missingorspent"), "got {s}");
@@ -5368,10 +4896,7 @@ mod tests {
             hub.held_body(&bad.block_hash()).is_none(),
             "consensus-invalid child must leave held_bodies"
         );
-        assert!(
-            hub.is_block_invalid(&bad.block_hash()),
-            "missingorspent child is BLOCK_FAILED"
-        );
+        assert!(hub.is_block_invalid(&bad.block_hash()), "missingorspent child is BLOCK_FAILED");
 
         assert!(matches!(
             hub.accept_received_block(side.clone()).unwrap(),
@@ -5417,34 +4942,19 @@ mod tests {
             AcceptOutcome::IgnoredWeaker
         ));
 
-        let honest = mine(
-            winner.block_hash(),
-            winner.header.time.saturating_add(600),
-            2,
-        );
+        let honest = mine(winner.block_hash(), winner.header.time.saturating_add(600), 2);
         let mut mutated = honest.clone();
         mutated.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x52]);
         assert_eq!(mutated.block_hash(), honest.block_hash());
-        assert_ne!(
-            mutated.compute_merkle_root().unwrap(),
-            mutated.header.merkle_root
-        );
+        assert_ne!(mutated.compute_merkle_root().unwrap(), mutated.header.merkle_root);
 
-        let err = hub
-            .accept_received_block(mutated)
-            .expect_err("mutated merkle must reject");
+        let err = hub.accept_received_block(mutated).expect_err("mutated merkle must reject");
         match &err {
             NetError::Mutated(s) | NetError::Consensus(s) => {
-                assert!(
-                    s.contains("merkle") || s.contains("bad-txnmrklroot"),
-                    "got {s}"
-                );
+                assert!(s.contains("merkle") || s.contains("bad-txnmrklroot"), "got {s}");
             }
             NetError::ConnectFailed { msg, hash } => {
-                assert!(
-                    msg.contains("merkle") || msg.contains("bad-txnmrklroot"),
-                    "got {msg}"
-                );
+                assert!(msg.contains("merkle") || msg.contains("bad-txnmrklroot"), "got {msg}");
                 assert_eq!(*hash, honest.block_hash().to_byte_array());
             }
             other => panic!("expected mutated reject, got {other:?}"),

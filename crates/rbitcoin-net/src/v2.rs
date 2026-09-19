@@ -88,10 +88,7 @@ impl Default for WireBytes {
 
 impl WireBytes {
     pub fn new() -> Self {
-        Self {
-            recv: Arc::new(AtomicU64::new(0)),
-            sent: Arc::new(AtomicU64::new(0)),
-        }
+        Self { recv: Arc::new(AtomicU64::new(0)), sent: Arc::new(AtomicU64::new(0)) }
     }
 }
 
@@ -170,22 +167,13 @@ pub fn v2_packet_too_large_log(n: usize) -> String {
 
 /// Cancellation-safe BIP324 application read (length prefix, then body).
 enum DecryptState {
-    ReadingLength {
-        length_bytes: [u8; 3],
-        bytes_read: usize,
-    },
-    ReadingPayload {
-        packet_bytes: Vec<u8>,
-        bytes_read: usize,
-    },
+    ReadingLength { length_bytes: [u8; 3], bytes_read: usize },
+    ReadingPayload { packet_bytes: Vec<u8>, bytes_read: usize },
 }
 
 impl DecryptState {
     fn reading_length() -> Self {
-        Self::ReadingLength {
-            length_bytes: [0u8; 3],
-            bytes_read: 0,
-        }
+        Self::ReadingLength { length_bytes: [0u8; 3], bytes_read: 0 }
     }
 }
 
@@ -200,11 +188,7 @@ pub struct V2SessionReader<R> {
 impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
     fn from_protocol_reader(r: ProtocolReader<R>) -> Self {
         let (inbound_cipher, reader) = r.into_inner();
-        Self {
-            inbound_cipher,
-            reader,
-            state: DecryptState::reading_length(),
-        }
+        Self { inbound_cipher, reader, state: DecryptState::reading_length() }
     }
     /// Next genuine application contents (skips decoys). Checks the decrypted
     /// length prefix against [`MAX_V2_CONTENTS_LEN`] before reading the body.
@@ -234,10 +218,7 @@ impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
     {
         loop {
             match &mut self.state {
-                DecryptState::ReadingLength {
-                    length_bytes,
-                    bytes_read,
-                } => {
+                DecryptState::ReadingLength { length_bytes, bytes_read } => {
                     while *bytes_read < length_bytes.len() {
                         let n = self.reader.read(&mut length_bytes[*bytes_read..]).await?;
                         if n == 0 {
@@ -261,10 +242,7 @@ impl<R: AsyncRead + Unpin + Send> V2SessionReader<R> {
                         bytes_read: 0,
                     };
                 }
-                DecryptState::ReadingPayload {
-                    packet_bytes,
-                    bytes_read,
-                } => {
+                DecryptState::ReadingPayload { packet_bytes, bytes_read } => {
                     while *bytes_read < packet_bytes.len() {
                         let n = self.reader.read(&mut packet_bytes[*bytes_read..]).await?;
                         if n == 0 {
@@ -441,9 +419,7 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
             Some(name) => (command_to_12(name), contents[1..].to_vec()),
             None => {
                 rbitcoin_log::info!("{}", v2_invalid_message_type_log());
-                return Err(NetError::InvalidV2Type {
-                    contents_len: contents.len(),
-                });
+                return Err(NetError::InvalidV2Type { contents_len: contents.len() });
             }
         }
     } else {
@@ -454,9 +430,7 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
         cmd12.copy_from_slice(&contents[1..13]);
         if command_from_12(&cmd12).is_err() {
             rbitcoin_log::info!("{}", v2_invalid_message_type_log());
-            return Err(NetError::InvalidV2Type {
-                contents_len: contents.len(),
-            });
+            return Err(NetError::InvalidV2Type { contents_len: contents.len() });
         }
         (cmd12, contents[13..].to_vec())
     };
@@ -465,11 +439,7 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
         return Err(NetError::MessageTooLarge(payload.len()));
     }
 
-    Ok(FramedMessage {
-        magic,
-        command,
-        payload,
-    })
+    Ok(FramedMessage { magic, command, payload })
 }
 
 /// Parse BIP324 application contents with regtest magic, then try-decode.
@@ -576,33 +546,16 @@ pub async fn open_v2_with_wire(
     std.set_nonblocking(true).map_err(NetError::Io)?;
     let tcp_shutdown = std.try_clone().map_err(NetError::Io)?;
     let stream = TcpStream::from_std(std).map_err(NetError::Io)?;
-    let role = if inbound {
-        Role::Responder
-    } else {
-        Role::Initiator
-    };
+    let role = if inbound { Role::Responder } else { Role::Initiator };
     let magic_bytes = magic.to_bytes();
     let (rh, wh) = stream.into_split();
-    let reader = BufReader::new(CountRead {
-        inner: rh,
-        n: Arc::clone(&wire.recv),
-    });
-    let writer = CountWrite {
-        inner: wh,
-        n: Arc::clone(&wire.sent),
-    };
+    let reader = BufReader::new(CountRead { inner: rh, n: Arc::clone(&wire.recv) });
+    let writer = CountWrite { inner: wh, n: Arc::clone(&wire.sent) };
     // Protocol performs many small reads; BufReader is required for performance.
     let mut reader = reader;
-    let prefix = if inbound {
-        wait_v1_prefix_mismatch(&mut reader, magic_bytes).await?
-    } else {
-        Vec::new()
-    };
-    let reader = PrefixedRead {
-        prefix,
-        pos: 0,
-        inner: reader,
-    };
+    let prefix =
+        if inbound { wait_v1_prefix_mismatch(&mut reader, magic_bytes).await? } else { Vec::new() };
+    let reader = PrefixedRead { prefix, pos: 0, inner: reader };
     let protocol = match Protocol::new(magic_bytes, role, None, None, reader, writer).await {
         Ok(p) => p,
         Err(e) => {
@@ -617,12 +570,7 @@ pub async fn open_v2_with_wire(
         }
     };
     let (r, w) = protocol.into_split();
-    Ok((
-        V2SessionReader::from_protocol_reader(r),
-        w,
-        wire,
-        tcp_shutdown,
-    ))
+    Ok((V2SessionReader::from_protocol_reader(r), w, wire, tcp_shutdown))
 }
 
 /// Encrypt and send raw BIP324 application contents (short/long command + payload).
@@ -633,10 +581,7 @@ pub async fn write_v2_contents<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
-    writer
-        .write(&Payload::genuine(contents))
-        .await
-        .map_err(map_protocol_error)
+    writer.write(&Payload::genuine(contents)).await.map_err(map_protocol_error)
 }
 
 /// Encrypt and send one application message.
@@ -749,10 +694,7 @@ mod tests {
         // Application handshake uses long form (not short-id).
         assert!(short_id_for_command("version").is_none());
         assert!(short_id_for_command("verack").is_none());
-        assert_eq!(
-            v2_invalid_message_type_log(),
-            "p2p: V2 transport error: invalid message type"
-        );
+        assert_eq!(v2_invalid_message_type_log(), "p2p: V2 transport error: invalid message type");
         assert_eq!(MAX_V2_CONTENTS_LEN, 4_000_013);
         assert_eq!(
             v2_packet_too_large_log(4_000_014),
@@ -763,10 +705,7 @@ mod tests {
         assert!(short_id_for_command("wtxidrelay").is_none());
         assert!(short_id_for_command("sendheaders").is_none());
         assert!(short_id_for_command("sendaddrv2").is_none());
-        assert_eq!(
-            v2_handshake_timeout_log(0),
-            "p2p: V2 handshake timeout, disconnecting peer=0"
-        );
+        assert_eq!(v2_handshake_timeout_log(0), "p2p: V2 handshake timeout, disconnecting peer=0");
         assert_eq!(
             v2_missing_garbage_terminator_log(),
             "p2p: V2 transport error: missing garbage terminator"
@@ -831,10 +770,7 @@ mod tests {
         assert_eq!(contents[0], 0); // long form
         assert_eq!(&contents[1..11], b"sendaddrv2");
         let frame = parse_v2_contents(magic, &contents).expect("digit in command ok");
-        assert!(matches!(
-            frame.decode().payload(),
-            NetworkMessage::SendAddrV2
-        ));
+        assert!(matches!(frame.decode().payload(), NetworkMessage::SendAddrV2));
     }
 
     /// `test_msgtype`: unknown short id logs and is not a hard disconnect.
@@ -961,10 +897,7 @@ mod tests {
             Err(e) => e,
         };
         let mapped = map_protocol_error(err);
-        assert!(
-            matches!(mapped, NetError::V1Peer),
-            "expected V1Peer, got {mapped}"
-        );
+        assert!(matches!(mapped, NetError::V1Peer), "expected V1Peer, got {mapped}");
     }
 
     /// `p2p_v2_misbehaving.py` EARLY_KEY_RESPONSE: inbound responder must not
@@ -1063,9 +996,7 @@ mod tests {
     }
 
     fn v2_fixture_path(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(name)
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
     }
 
     #[test]
@@ -1098,10 +1029,7 @@ mod tests {
     #[test]
     fn v2_sendcmpct_fixture_matches_encode() {
         let expected = encode_v2_contents(NetworkMessage::SendCmpct(
-            bitcoin::p2p::message_compact_blocks::SendCmpct {
-                send_compact: true,
-                version: 2,
-            },
+            bitcoin::p2p::message_compact_blocks::SendCmpct { send_compact: true, version: 2 },
         ))
         .unwrap();
         let path = v2_fixture_path("v2_sendcmpct.bin");

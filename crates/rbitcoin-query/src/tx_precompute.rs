@@ -48,17 +48,11 @@ impl TxPrecompute {
     pub fn from_tx_wire(tx: &Transaction, wire: &[u8], sighash: bool) -> Self {
         let has_witness = uses_segwit_serialization(tx);
         let wtxid = sha256d::Hash::hash(wire).to_byte_array();
-        let (txid, base_size) = if has_witness {
-            hash_stripped_txid(tx)
-        } else {
-            (wtxid, wire.len())
-        };
+        let (txid, base_size) =
+            if has_witness { hash_stripped_txid(tx) } else { (wtxid, wire.len()) };
         let (sigops, out_sum) = sigops_and_out_sum(tx);
-        let [sha_prevouts, sha_sequences, sha_outputs] = if sighash {
-            sighash_midstates(tx)
-        } else {
-            [None, None, None]
-        };
+        let [sha_prevouts, sha_sequences, sha_outputs] =
+            if sighash { sighash_midstates(tx) } else { [None, None, None] };
         Self {
             txid,
             wtxid,
@@ -223,10 +217,7 @@ impl TxPrecompute {
     }
 
     pub fn weight_wu(&self) -> u64 {
-        (self
-            .base_size
-            .saturating_mul(3)
-            .saturating_add(self.total_size)) as u64
+        (self.base_size.saturating_mul(3).saturating_add(self.total_size)) as u64
     }
 
     /// BIP143/341 common hashes on a [`Self::from_tx_connect`] row (no txid walk).
@@ -375,9 +366,7 @@ fn enc(w: &mut impl bitcoin::io::Write, v: &impl Encodable) -> usize {
 }
 
 fn sha256_again(single: &[u8; 32]) -> [u8; 32] {
-    sha256::Hash::from_byte_array(*single)
-        .hash_again()
-        .to_byte_array()
+    sha256::Hash::from_byte_array(*single).hash_again().to_byte_array()
 }
 
 /// rust-bitcoin `Transaction::uses_segwit_serialization` (private).
@@ -441,23 +430,13 @@ mod tests {
         assert_eq!(p.total_size, tx.total_size(), "total_size");
         assert_eq!(p.weight_wu(), tx.weight().to_wu(), "weight");
         assert_eq!(p.sigops, oracle_sigops(tx), "sigops");
-        assert_eq!(
-            p.sha_prevouts,
-            Some(oracle_sha_prevouts(tx)),
-            "sha_prevouts"
-        );
-        assert_eq!(
-            p.sha_sequences,
-            Some(oracle_sha_sequences(tx)),
-            "sha_sequences"
-        );
+        assert_eq!(p.sha_prevouts, Some(oracle_sha_prevouts(tx)), "sha_prevouts");
+        assert_eq!(p.sha_sequences, Some(oracle_sha_sequences(tx)), "sha_sequences");
         assert_eq!(p.sha_outputs, Some(oracle_sha_outputs(tx)), "sha_outputs");
         assert_eq!(
             p.hash_prevouts(),
             Some(
-                sha256::Hash::from_byte_array(p.sha_prevouts.unwrap())
-                    .hash_again()
-                    .to_byte_array()
+                sha256::Hash::from_byte_array(p.sha_prevouts.unwrap()).hash_again().to_byte_array()
             )
         );
     }
@@ -547,10 +526,7 @@ mod tests {
             }],
         };
         assert_connect_matches_ids(&tx);
-        assert_eq!(
-            TxPrecompute::from_tx_connect(&tx).wtxid,
-            tx.compute_wtxid().to_byte_array()
-        );
+        assert_eq!(TxPrecompute::from_tx_connect(&tx).wtxid, tx.compute_wtxid().to_byte_array());
     }
 
     #[test]
@@ -604,10 +580,7 @@ mod tests {
             super::pres_for_tip(&[live.clone(), other.clone()], false, |tid| tid == live_id);
         assert_eq!(pres.len(), 2);
         assert_eq!(pres[0].txid, live_id);
-        assert_eq!(
-            pres[0].sha_prevouts, None,
-            "live tx must skip sighash midstates"
-        );
+        assert_eq!(pres[0].sha_prevouts, None, "live tx must skip sighash midstates");
         assert_eq!(
             pres[1].sha_prevouts,
             Some(oracle_sha_prevouts(&other)),
@@ -658,13 +631,7 @@ mod tests {
         let mut es = sha256::Hash::engine();
         prev.value.consensus_encode(&mut ea).unwrap();
         prev.script_pubkey.consensus_encode(&mut es).unwrap();
-        assert_eq!(
-            p.sha_amounts,
-            Some(sha256::Hash::from_engine(ea).to_byte_array())
-        );
-        assert_eq!(
-            p.sha_scriptpubkeys,
-            Some(sha256::Hash::from_engine(es).to_byte_array())
-        );
+        assert_eq!(p.sha_amounts, Some(sha256::Hash::from_engine(ea).to_byte_array()));
+        assert_eq!(p.sha_scriptpubkeys, Some(sha256::Hash::from_engine(es).to_byte_array()));
     }
 }

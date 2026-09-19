@@ -121,10 +121,7 @@ impl ChainParams {
     }
 
     pub fn checkpoint_at(&self, height: Height) -> Option<BlockHash> {
-        self.checkpoints
-            .iter()
-            .find(|c| c.height == height.0)
-            .map(|c| c.hash)
+        self.checkpoints.iter().find(|c| c.height == height.0).map(|c| c.hash)
     }
 
     pub fn difficulty_adjustment_interval(&self) -> u32 {
@@ -324,10 +321,7 @@ fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
         block_hash_from_display_hex(hex)
     }
     vec![
-        Checkpoint {
-            height: 0,
-            hash: genesis,
-        },
+        Checkpoint { height: 0, hash: genesis },
         Checkpoint {
             height: 11_111,
             hash: h("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"),
@@ -462,10 +456,7 @@ mod tests {
         );
         assert!(main.is_bip30_repeat(91842, h91842));
         assert!(main.is_bip30_repeat(91880, h91880));
-        assert!(
-            !main.is_bip30_repeat(91842, h91880),
-            "wrong hash at 91842 is not grandfathered"
-        );
+        assert!(!main.is_bip30_repeat(91842, h91880), "wrong hash at 91842 is not grandfathered");
         assert!(!main.is_bip30_repeat(91880, h91842));
         assert!(
             !main.is_bip30_repeat(91859, h91842),
@@ -492,71 +483,25 @@ mod tests {
     fn mainnet_checkpoints_match_core_chain() {
         let p = ChainParams::mainnet();
         let expected: &[(u32, &str)] = &[
-            (
-                0,
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-            ),
-            (
-                11_111,
-                "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d",
-            ),
-            (
-                33_333,
-                "000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6",
-            ),
-            (
-                74_000,
-                "0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20",
-            ),
-            (
-                105_000,
-                "00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97",
-            ),
-            (
-                134_444,
-                "00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe",
-            ),
-            (
-                168_000,
-                "000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763",
-            ),
-            (
-                193_000,
-                "000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317",
-            ),
-            (
-                210_000,
-                "000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e",
-            ),
-            (
-                216_116,
-                "00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e",
-            ),
-            (
-                225_430,
-                "00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932",
-            ),
-            (
-                250_000,
-                "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214",
-            ),
-            (
-                279_000,
-                "0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40",
-            ),
-            (
-                295_000,
-                "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983",
-            ),
+            (0, "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
+            (11_111, "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"),
+            (33_333, "000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6"),
+            (74_000, "0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"),
+            (105_000, "00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97"),
+            (134_444, "00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe"),
+            (168_000, "000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763"),
+            (193_000, "000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317"),
+            (210_000, "000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e"),
+            (216_116, "00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e"),
+            (225_430, "00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932"),
+            (250_000, "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214"),
+            (279_000, "0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"),
+            (295_000, "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"),
         ];
         assert_eq!(p.checkpoints.len(), expected.len());
         for (i, (h, hex)) in expected.iter().enumerate() {
             assert_eq!(p.checkpoints[i].height, *h, "height order");
-            assert_eq!(
-                p.checkpoint_at(Height(*h)).unwrap(),
-                display_hash(hex),
-                "checkpoint {h}"
-            );
+            assert_eq!(p.checkpoint_at(Height(*h)).unwrap(), display_hash(hex), "checkpoint {h}");
         }
         // Explicit pin for the IBD stall case.
         assert_eq!(
@@ -568,22 +513,10 @@ mod tests {
     #[test]
     fn for_network_and_helpers() {
         use rbitcoin_primitives::Network;
-        assert_eq!(
-            ChainParams::for_network(Network::Mainnet).network,
-            bitcoin::Network::Bitcoin
-        );
-        assert_eq!(
-            ChainParams::for_network(Network::Testnet).network,
-            bitcoin::Network::Testnet
-        );
-        assert_eq!(
-            ChainParams::for_network(Network::Signet).network,
-            bitcoin::Network::Signet
-        );
-        assert_eq!(
-            ChainParams::for_network(Network::Regtest).network,
-            bitcoin::Network::Regtest
-        );
+        assert_eq!(ChainParams::for_network(Network::Mainnet).network, bitcoin::Network::Bitcoin);
+        assert_eq!(ChainParams::for_network(Network::Testnet).network, bitcoin::Network::Testnet);
+        assert_eq!(ChainParams::for_network(Network::Signet).network, bitcoin::Network::Signet);
+        assert_eq!(ChainParams::for_network(Network::Regtest).network, bitcoin::Network::Regtest);
 
         let tn = ChainParams::testnet();
         assert_eq!(tn.csv_height(), 770_112);
@@ -638,10 +571,7 @@ mod tests {
         use rbitcoin_query::Query;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbtc-overlay-csv-{n}"));
         let q = Query::open_or_create_tiny(&dir).unwrap();
         let mut params = ChainParams::regtest();
@@ -669,10 +599,7 @@ mod tests {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -691,10 +618,7 @@ mod tests {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::from_consensus(10),
                 witness: Witness::new(),
@@ -737,23 +661,13 @@ mod tests {
             crate::Milestone::NONE,
         )
         .unwrap();
-        let (tip2, time2, cbs2) = crate::pad_empty_from(
-            &q2,
-            &lax,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            100,
-            1,
-        );
+        let (tip2, time2, cbs2) =
+            crate::pad_empty_from(&q2, &lax, genesis.block_hash(), genesis.header.time, 1, 100, 1);
         let p_lax = Transaction {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs2[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs2[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -771,10 +685,7 @@ mod tests {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: p_lax.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: p_lax.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::from_consensus(10),
                 witness: Witness::new(),

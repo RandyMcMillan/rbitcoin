@@ -40,11 +40,7 @@ pub(crate) enum ClientMsg {
 
 fn json_str_list(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default()
 }
 
@@ -74,10 +70,8 @@ fn parse_address_track(obj: &serde_json::Map<String, Value>) -> Option<ClientMsg
             return Some(ClientMsg::StopTrackAddresses);
         }
         if let Some(arr) = v.as_array() {
-            let addrs: Vec<String> = arr
-                .iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect();
+            let addrs: Vec<String> =
+                arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
             return Some(ClientMsg::TrackAddresses(addrs));
         }
     }
@@ -112,10 +106,8 @@ fn parse_tx_track(obj: &serde_json::Map<String, Value>) -> Option<ClientMsg> {
             return Some(ClientMsg::StopTrackTxs);
         }
         if let Some(arr) = v.as_array() {
-            let ids: Vec<String> = arr
-                .iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect();
+            let ids: Vec<String> =
+                arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
             return Some(ClientMsg::TrackTxs(ids));
         }
     }
@@ -135,9 +127,7 @@ fn parse_tx_track(obj: &serde_json::Map<String, Value>) -> Option<ClientMsg> {
 
 pub(crate) fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("invalid json: {e}"))?;
-    let obj = v
-        .as_object()
-        .ok_or_else(|| "client message must be a JSON object".to_string())?;
+    let obj = v.as_object().ok_or_else(|| "client message must be a JSON object".to_string())?;
     if let Some(m) = parse_want_action(obj) {
         return Ok(m);
     }
@@ -267,10 +257,7 @@ pub async fn ws_upgrade(ws: WebSocketUpgrade, State(st): State<AppState>) -> Res
     let permit = match sem.try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "too many websocket connections",
-            )
+            return (StatusCode::SERVICE_UNAVAILABLE, "too many websocket connections")
                 .into_response();
         }
     };
@@ -478,10 +465,7 @@ fn mempool_announce_frames(
     let mut replaced = None;
     if !ann.replaced.is_empty() {
         let addr_hit_old = !watched.is_empty()
-            && ann
-                .replaced_scripthashes
-                .iter()
-                .any(|sh| watched.contains_key(sh));
+            && ann.replaced_scripthashes.iter().any(|sh| watched.contains_key(sh));
         let mut addr_hit_new = false;
         if !watched.is_empty() {
             if let Some(m) = mempool {
@@ -536,11 +520,7 @@ fn mempool_announce_frames(
         }
     }
 
-    MempoolAnnounceFrames {
-        replaced,
-        address_txs,
-        tx_status: tracked.contains(&ann.txid),
-    }
+    MempoolAnnounceFrames { replaced, address_txs, tx_status: tracked.contains(&ann.txid) }
 }
 
 async fn on_mempool_announce(
@@ -592,10 +572,7 @@ async fn push_tx_status(
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), ()> {
     let status = tx_status_for(st, txid);
-    let confirmed = status
-        .get("confirmed")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
+    let confirmed = status.get("confirmed").and_then(|c| c.as_bool()).unwrap_or(false);
     let prev = conn.last_confirmed.get(txid).copied();
     if prev == Some(confirmed) {
         return Ok(());
@@ -620,12 +597,7 @@ fn tx_status_for(st: &AppState, txid: &Txid) -> Value {
             return s;
         }
     }
-    if st
-        .mempool
-        .as_ref()
-        .map(|m| m.contains(txid))
-        .unwrap_or(false)
-    {
+    if st.mempool.as_ref().map(|m| m.contains(txid)).unwrap_or(false) {
         return json!({ "confirmed": false });
     }
     json!({ "confirmed": false })
@@ -723,26 +695,14 @@ mod tests {
         assert!(parse_client_msg("[]").is_err());
         assert!(parse_client_msg("null").is_err());
         assert!(parse_client_msg("1").is_err());
-        assert_eq!(
-            parse_client_msg(r#"{"track-address":1}"#).unwrap(),
-            ClientMsg::Noop
-        );
-        assert_eq!(
-            parse_client_msg(r#"{"track-tx":false}"#).unwrap(),
-            ClientMsg::StopTrackTxs
-        );
+        assert_eq!(parse_client_msg(r#"{"track-address":1}"#).unwrap(), ClientMsg::Noop);
+        assert_eq!(parse_client_msg(r#"{"track-tx":false}"#).unwrap(), ClientMsg::StopTrackTxs);
         assert_eq!(
             parse_client_msg(r#"{"track-address":null}"#).unwrap(),
             ClientMsg::StopTrackAddresses
         );
-        assert_eq!(
-            parse_client_msg(r#"{"stop-track-address":1}"#).unwrap(),
-            ClientMsg::Noop
-        );
-        assert_eq!(
-            parse_client_msg(r#"{"action":"want"}"#).unwrap(),
-            ClientMsg::Want(vec![])
-        );
+        assert_eq!(parse_client_msg(r#"{"stop-track-address":1}"#).unwrap(), ClientMsg::Noop);
+        assert_eq!(parse_client_msg(r#"{"action":"want"}"#).unwrap(), ClientMsg::Want(vec![]));
         assert_eq!(
             parse_client_msg(r#"{"track-addresses":null}"#).unwrap(),
             ClientMsg::StopTrackAddresses
@@ -764,17 +724,8 @@ mod tests {
             parse_client_msg(&format!(r#"{{"stop-track-tx":"{id}"}}"#)).unwrap(),
             ClientMsg::StopTrackTx(Some(id))
         );
-        assert_eq!(
-            parse_client_msg(r#"{"track-tx":""}"#).unwrap(),
-            ClientMsg::StopTrackTxs
-        );
-        assert_eq!(
-            parse_client_msg(r#"{"track-txs":null}"#).unwrap(),
-            ClientMsg::StopTrackTxs
-        );
-        assert_eq!(
-            parse_client_msg(r#"{"action":"ping"}"#).unwrap(),
-            ClientMsg::Noop
-        );
+        assert_eq!(parse_client_msg(r#"{"track-tx":""}"#).unwrap(), ClientMsg::StopTrackTxs);
+        assert_eq!(parse_client_msg(r#"{"track-txs":null}"#).unwrap(), ClientMsg::StopTrackTxs);
+        assert_eq!(parse_client_msg(r#"{"action":"ping"}"#).unwrap(), ClientMsg::Noop);
     }
 }

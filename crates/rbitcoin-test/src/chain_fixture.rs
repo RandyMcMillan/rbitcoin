@@ -70,11 +70,7 @@ pub fn build_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> M
     blocks.push(b_spend);
     query.apply_sh_pending().unwrap();
 
-    MatureRegtestChain {
-        blocks,
-        spend_height,
-        matured_coinbase_txid,
-    }
+    MatureRegtestChain { blocks, spend_height, matured_coinbase_txid }
 }
 
 /// Fast empty pad via [`rbitcoin_consensus::pad_empty_from`].
@@ -102,11 +98,7 @@ pub fn assert_reconstruct_eq(query: &Query, height: u32, original: &Block) {
     let recon = query
         .reconstruct_block_at_height(Height(height))
         .unwrap_or_else(|e| panic!("reconstruct height {height}: {e}"));
-    assert_eq!(
-        recon.block_hash(),
-        original.block_hash(),
-        "hash height {height}"
-    );
+    assert_eq!(recon.block_hash(), original.block_hash(), "hash height {height}");
     assert_eq!(recon.header, original.header, "header height {height}");
     assert_eq!(recon.txdata.len(), original.txdata.len());
     for (i, (a, b)) in recon.txdata.iter().zip(original.txdata.iter()).enumerate() {

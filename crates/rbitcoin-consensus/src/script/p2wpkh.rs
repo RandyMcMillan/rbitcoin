@@ -21,14 +21,10 @@ pub(crate) fn verify(
     if input.witness.len() != 2 {
         return Err(ConsensusError::Script("p2wpkh witness len".into()));
     }
-    let sig_raw = input
-        .witness
-        .nth(0)
-        .ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
-    let pubkey_raw = input
-        .witness
-        .nth(1)
-        .ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
+    let sig_raw =
+        input.witness.nth(0).ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
+    let pubkey_raw =
+        input.witness.nth(1).ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
     if sig_raw.is_empty() || pubkey_raw.is_empty() {
         return Err(ConsensusError::Script("p2wpkh empty witness item".into()));
     }
@@ -69,14 +65,10 @@ pub(crate) fn verify_with_keyhash(
     if input.witness.len() != 2 {
         return Err(ConsensusError::Script("p2wpkh witness len".into()));
     }
-    let sig_raw = input
-        .witness
-        .nth(0)
-        .ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
-    let pubkey_raw = input
-        .witness
-        .nth(1)
-        .ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
+    let sig_raw =
+        input.witness.nth(0).ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
+    let pubkey_raw =
+        input.witness.nth(1).ok_or_else(|| ConsensusError::Script("p2wpkh witness".into()))?;
 
     let pk_hash = crypto::hash160(pubkey_raw);
     if &pk_hash != keyhash {

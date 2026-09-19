@@ -26,11 +26,7 @@ pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
     if whole_s.is_empty() && frac_s.is_empty() {
         return Err("invalid");
     }
-    let whole: u64 = if whole_s.is_empty() {
-        0
-    } else {
-        whole_s.parse().map_err(|_| "invalid")?
-    };
+    let whole: u64 = if whole_s.is_empty() { 0 } else { whole_s.parse().map_err(|_| "invalid")? };
     let mut frac = frac_s.to_string();
     if frac.len() > 8 {
         frac.truncate(8);
@@ -38,11 +34,7 @@ pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
     while frac.len() < 8 {
         frac.push('0');
     }
-    let frac_n: u64 = if frac.is_empty() {
-        0
-    } else {
-        frac.parse().map_err(|_| "invalid")?
-    };
+    let frac_n: u64 = if frac.is_empty() { 0 } else { frac.parse().map_err(|_| "invalid")? };
     Ok(whole.saturating_mul(100_000_000).saturating_add(frac_n))
 }
 
@@ -234,10 +226,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            datadir: DatadirOpts {
-                path: Self::default_datadir(),
-                cold: None,
-            },
+            datadir: DatadirOpts { path: Self::default_datadir(), cold: None },
             listen: ListenOpts::default(),
             mempool: MempoolOpts::default(),
             rpc: RpcOpts::default(),
@@ -346,9 +335,7 @@ impl NodeConfig {
         if self.milestone_height == 0 {
             Milestone::NONE
         } else {
-            Milestone {
-                height: self.milestone_height,
-            }
+            Milestone { height: self.milestone_height }
         }
     }
 
@@ -403,11 +390,9 @@ impl NodeConfig {
             None => ChainParams::for_network(self.network),
         };
         for (name, height) in &self.test_activation_heights {
-            params
-                .apply_test_activation_height(name, *height)
-                .map_err(|e| {
-                    NodeError::Config(format!("test_activation_height {name}@{height}: {e}"))
-                })?;
+            params.apply_test_activation_height(name, *height).map_err(|e| {
+                NodeError::Config(format!("test_activation_height {name}@{height}: {e}"))
+            })?;
         }
         Ok(params)
     }
@@ -421,9 +406,7 @@ impl NodeConfig {
                 return Err(NodeError::Config("datadir-cold must not be empty".into()));
             }
             if cold == &self.datadir.path {
-                return Err(NodeError::Config(
-                    "datadir-cold must differ from datadir".into(),
-                ));
+                return Err(NodeError::Config("datadir-cold must differ from datadir".into()));
             }
         }
         if self.listen.max_outbound == 0 {
@@ -440,14 +423,10 @@ impl NodeConfig {
             ));
         }
         if self.signet_block_time.is_some() && self.signet_challenge.is_none() {
-            return Err(NodeError::Config(
-                "signet-block-time requires signet-challenge".into(),
-            ));
+            return Err(NodeError::Config("signet-block-time requires signet-challenge".into()));
         }
         if self.signet_block_time == Some(0) {
-            return Err(NodeError::Config(
-                "signet-block-time must be greater than zero".into(),
-            ));
+            return Err(NodeError::Config("signet-block-time must be greater than zero".into()));
         }
         if self.listen.electrum.is_some() && !self.shindex {
             return Err(NodeError::Config(
@@ -467,10 +446,8 @@ impl NodeConfig {
     /// Fill `--rpc-listen` omitted ADDR from `--network`. Implies unix socket.
     pub fn resolve_listen_defaults(&mut self) {
         if self.rpc.listen_default && self.rpc.listen.is_none() {
-            self.rpc.listen = Some(SocketAddr::from((
-                [127, 0, 0, 1],
-                self.network.default_rpc_port(),
-            )));
+            self.rpc.listen =
+                Some(SocketAddr::from(([127, 0, 0, 1], self.network.default_rpc_port())));
         }
         if self.rpc.listen.is_some() {
             self.rpc.socket = true;
@@ -495,10 +472,8 @@ impl NodeConfig {
         self.validate()?;
         let root = self.datadir.path();
         let created_root = !root.exists();
-        std::fs::create_dir_all(root).map_err(|source| NodeError::Datadir {
-            path: self.datadir.path.clone(),
-            source,
-        })?;
+        std::fs::create_dir_all(root)
+            .map_err(|source| NodeError::Datadir { path: self.datadir.path.clone(), source })?;
         if root.exists() && !root.is_dir() {
             return Err(NodeError::Config(format!(
                 "datadir is not a directory: {}",
@@ -517,15 +492,11 @@ impl NodeConfig {
                 )));
             }
             let created_cold = !cold.exists();
-            std::fs::create_dir_all(cold).map_err(|source| NodeError::Datadir {
-                path: cold.clone(),
-                source,
-            })?;
+            std::fs::create_dir_all(cold)
+                .map_err(|source| NodeError::Datadir { path: cold.clone(), source })?;
             let store = cold.join("store");
-            std::fs::create_dir_all(&store).map_err(|source| NodeError::Datadir {
-                path: store,
-                source,
-            })?;
+            std::fs::create_dir_all(&store)
+                .map_err(|source| NodeError::Datadir { path: store, source })?;
             if created_cold {
                 rbitcoin_log::info!("node: created datadir-cold {}", cold.display());
             }
@@ -612,9 +583,7 @@ impl NodeConfig {
             "datadir" => self.datadir.path = PathBuf::from(val),
             "datadir_cold" => {
                 if val.is_empty() {
-                    return Err(NodeError::Config(
-                        "conf datadir_cold requires a path".into(),
-                    ));
+                    return Err(NodeError::Config("conf datadir_cold requires a path".into()));
                 }
                 self.datadir.cold = Some(PathBuf::from(val));
             }
@@ -635,15 +604,13 @@ impl NodeConfig {
                 );
             }
             "listen" => {
-                let addr: SocketAddr = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf listen: {e}")))?;
+                let addr: SocketAddr =
+                    val.parse().map_err(|e| NodeError::Config(format!("conf listen: {e}")))?;
                 self.push_p2p_listen(addr)?;
             }
             "connect" => {
                 self.listen.connect.push(
-                    val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
+                    val.parse().map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
                 );
             }
             "seed_node" => {
@@ -712,9 +679,7 @@ impl NodeConfig {
             }
             "rpc_token_file" => {
                 if val.is_empty() {
-                    return Err(NodeError::Config(
-                        "conf rpc_token_file requires a path".into(),
-                    ));
+                    return Err(NodeError::Config("conf rpc_token_file requires a path".into()));
                 }
                 self.rpc.token_file = Some(PathBuf::from(val));
             }
@@ -722,8 +687,7 @@ impl NodeConfig {
             "test_activation_height" => {
                 let (name, height) = ChainParams::parse_test_activation_height(val)
                     .map_err(|e| NodeError::Config(format!("conf test_activation_height: {e}")))?;
-                self.test_activation_heights
-                    .push((name.to_string(), height));
+                self.test_activation_heights.push((name.to_string(), height));
             }
             "persist_mempool" => {
                 self.mempool.persist = parse_conf_bool(val)
@@ -775,9 +739,7 @@ impl NodeConfig {
             }
             "min_relay_tx_fee" => {
                 if val.is_empty() {
-                    return Err(NodeError::Config(
-                        "conf min_relay_tx_fee requires a value".into(),
-                    ));
+                    return Err(NodeError::Config("conf min_relay_tx_fee requires a value".into()));
                 }
                 parse_btc_to_sat(val)
                     .map_err(|e| NodeError::Config(format!("conf min_relay_tx_fee: {e}")))?;
@@ -809,13 +771,10 @@ impl NodeConfig {
             }
             "external_ip" => {
                 if val.is_empty() {
-                    return Err(NodeError::Config(
-                        "conf external_ip requires an address".into(),
-                    ));
+                    return Err(NodeError::Config("conf external_ip requires an address".into()));
                 }
-                let ip: std::net::IpAddr = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
+                let ip: std::net::IpAddr =
+                    val.parse().map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
                 self.listen.external_ips.push(ip);
             }
             "peer_timeout" => {
@@ -823,9 +782,7 @@ impl NodeConfig {
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf peer_timeout: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Init(
-                        "peer-timeout must be a positive integer.".into(),
-                    ));
+                    return Err(NodeError::Init("peer-timeout must be a positive integer.".into()));
                 }
                 self.listen.peer_timeout_secs = Some(n);
             }
@@ -834,9 +791,8 @@ impl NodeConfig {
                     Some(parse_minimum_chain_work(val).map_err(NodeError::Init)?);
             }
             "milestone" => {
-                self.milestone_height = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf milestone: {e}")))?;
+                self.milestone_height =
+                    val.parse().map_err(|e| NodeError::Config(format!("conf milestone: {e}")))?;
                 self.milestone_explicit = true;
             }
             "max_outbound" => {
@@ -849,9 +805,8 @@ impl NodeConfig {
                 self.listen.max_outbound = n;
             }
             "max_inbound" => {
-                let n: u32 = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf max_inbound: {e}")))?;
+                let n: u32 =
+                    val.parse().map_err(|e| NodeError::Config(format!("conf max_inbound: {e}")))?;
                 if n == 0 {
                     return Err(NodeError::Config("conf max_inbound must be >= 1".into()));
                 }
@@ -863,9 +818,7 @@ impl NodeConfig {
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf mempool_size_mb: {e}")))?;
                 if mb == 0 {
-                    return Err(NodeError::Config(
-                        "conf mempool_size_mb must be >= 1".into(),
-                    ));
+                    return Err(NodeError::Config("conf mempool_size_mb must be >= 1".into()));
                 }
                 self.mempool.max_weight = mb.saturating_mul(1_000_000);
             }
@@ -907,9 +860,8 @@ impl NodeConfig {
                     .map_err(|e| NodeError::Config(format!("conf inhibit_suspend: {e}")))?;
             }
             "mock_time" => {
-                let n: i64 = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf mock_time: {e}")))?;
+                let n: i64 =
+                    val.parse().map_err(|e| NodeError::Config(format!("conf mock_time: {e}")))?;
                 if n < 0 {
                     return Err(NodeError::Config("conf mock_time must be >= 0".into()));
                 }
@@ -922,9 +874,8 @@ impl NodeConfig {
                 self.check_blocks = Some(n);
             }
             "max_tip_age" => {
-                let n: i64 = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf max_tip_age: {e}")))?;
+                let n: i64 =
+                    val.parse().map_err(|e| NodeError::Config(format!("conf max_tip_age: {e}")))?;
                 if n < 0 {
                     return Err(NodeError::Config("conf max_tip_age must be >= 0".into()));
                 }
@@ -938,9 +889,7 @@ impl NodeConfig {
             }
             "block_min_tx_fee" => {
                 if val.is_empty() {
-                    return Err(NodeError::Config(
-                        "conf block_min_tx_fee requires a value".into(),
-                    ));
+                    return Err(NodeError::Config("conf block_min_tx_fee requires a value".into()));
                 }
                 parse_btc_to_sat(val)
                     .map_err(|e| NodeError::Config(format!("conf block_min_tx_fee: {e}")))?;
@@ -975,10 +924,7 @@ pub(crate) fn parse_signet_challenge(value: &str) -> Result<ScriptBuf, String> {
 }
 
 fn is_conf_true(val: &str) -> bool {
-    matches!(
-        val.to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on" | ""
-    )
+    matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on" | "")
 }
 
 /// Parse `1`/`true`/`yes`/`on` → true; `0`/`false`/`no`/`off` → false.
@@ -993,10 +939,7 @@ fn parse_conf_bool(val: &str) -> Result<bool, String> {
 
 /// `--min-chain-work=<hex>` (optional `0x`, at most 64 hex digits).
 pub fn parse_minimum_chain_work(spec: &str) -> Result<[u8; 32], String> {
-    let hex = spec
-        .strip_prefix("0x")
-        .or_else(|| spec.strip_prefix("0X"))
-        .unwrap_or(spec);
+    let hex = spec.strip_prefix("0x").or_else(|| spec.strip_prefix("0X")).unwrap_or(spec);
     if hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
             "Invalid minimum work specified ({spec}), must be up to 64 hex digits"
@@ -1032,25 +975,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-node-cfg-{n}"))
     }
 
     #[test]
     fn apply_kv_is_the_conf_setter_and_unknown_is_not_error() {
         let mut c = NodeConfig::default();
-        assert_eq!(
-            c.apply_kv("network", "regtest").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("network", "regtest").unwrap(), ConfApply::Applied);
         assert_eq!(c.network, Network::Regtest);
-        assert_eq!(
-            c.apply_kv("datadir", "/tmp/rb-apply-kv").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("datadir", "/tmp/rb-apply-kv").unwrap(), ConfApply::Applied);
         assert_eq!(c.datadir.path(), Path::new("/tmp/rb-apply-kv"));
         match c.apply_kv("not-a-real-key", "1").unwrap() {
             ConfApply::Unknown(k) => assert_eq!(k, "not-a-real-key"),
@@ -1060,20 +994,11 @@ mod tests {
 
     #[test]
     fn rpc_listen_and_dropped_user_apply_kv() {
-        let err = NodeConfig::default()
-            .apply_kv("rpcuser", "u")
-            .unwrap_err()
-            .to_string();
+        let err = NodeConfig::default().apply_kv("rpcuser", "u").unwrap_err().to_string();
         assert!(err.contains("rpc.token"), "{err}");
-        let err = NodeConfig::default()
-            .apply_kv("rpcpassword", "p")
-            .unwrap_err()
-            .to_string();
+        let err = NodeConfig::default().apply_kv("rpcpassword", "p").unwrap_err().to_string();
         assert!(err.contains("rpc.token"), "{err}");
-        let mut rpc = NodeConfig {
-            network: Network::Regtest,
-            ..NodeConfig::default()
-        };
+        let mut rpc = NodeConfig { network: Network::Regtest, ..NodeConfig::default() };
         assert_eq!(rpc.apply_kv("rpc", "1").unwrap(), ConfApply::Applied);
         assert!(rpc.rpc.socket);
         assert_eq!(rpc.apply_kv("rpc_listen", "").unwrap(), ConfApply::Applied);
@@ -1087,10 +1012,7 @@ mod tests {
         let mut c = NodeConfig::default();
         assert_eq!(c.max_sh_creates, 0);
         assert!(!c.esplora_block_template);
-        assert_eq!(
-            c.apply_kv("max_sh_creates", "100").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("max_sh_creates", "100").unwrap(), ConfApply::Applied);
         assert_eq!(c.max_sh_creates, 100);
         match c.apply_kv("maxshcreates", "7").unwrap() {
             ConfApply::Unknown(k) => assert_eq!(k, "maxshcreates"),
@@ -1100,21 +1022,12 @@ mod tests {
         assert!(c.shindex);
         assert_eq!(c.apply_kv("sp_tweaks", "1").unwrap(), ConfApply::Applied);
         assert!(c.sptweaks);
-        assert_eq!(
-            c.apply_kv("sp_tweaks_dust", "546").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("sp_tweaks_dust", "546").unwrap(), ConfApply::Applied);
         assert_eq!(c.sptweaks_dust, 546);
         assert_eq!(c.max_sh_creates, 100);
         let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
-        assert!(
-            format!("{bad}").contains("max_sh_creates"),
-            "garbage must name the knob: {bad}"
-        );
-        assert_eq!(
-            c.apply_kv("esplora_block_template", "1").unwrap(),
-            ConfApply::Applied
-        );
+        assert!(format!("{bad}").contains("max_sh_creates"), "garbage must name the knob: {bad}");
+        assert_eq!(c.apply_kv("esplora_block_template", "1").unwrap(), ConfApply::Applied);
         assert!(c.esplora_block_template);
         match c.apply_kv("esplorablocktemplate", "0").unwrap() {
             ConfApply::Unknown(k) => assert_eq!(k, "esplorablocktemplate"),
@@ -1144,23 +1057,14 @@ mod tests {
     fn minrelaytxfee_garbage_and_negative_are_config_errors() {
         let mut c = NodeConfig::default();
         let bad = c.apply_kv("min_relay_tx_fee", "nope").unwrap_err();
-        assert!(
-            format!("{bad}").contains("min_relay_tx_fee"),
-            "garbage must name the knob: {bad}"
-        );
+        assert!(format!("{bad}").contains("min_relay_tx_fee"), "garbage must name the knob: {bad}");
         let neg = c.apply_kv("min_relay_tx_fee", "-0.0001").unwrap_err();
         assert!(
             format!("{neg}").contains("min_relay_tx_fee"),
             "negative must name the knob: {neg}"
         );
-        assert_eq!(
-            c.apply_kv("min_relay_tx_fee", "0").unwrap(),
-            ConfApply::Applied
-        );
-        assert_eq!(
-            c.apply_kv("min_relay_tx_fee", "0.00000001").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("min_relay_tx_fee", "0").unwrap(), ConfApply::Applied);
+        assert_eq!(c.apply_kv("min_relay_tx_fee", "0.00000001").unwrap(), ConfApply::Applied);
         match c.apply_kv("minrelaytxfee", "0").unwrap() {
             ConfApply::Unknown(k) => assert_eq!(k, "minrelaytxfee"),
             other => panic!("{other:?}"),
@@ -1178,10 +1082,7 @@ mod tests {
         assert_eq!(c.apply_kv("check-blocks", "0").unwrap(), ConfApply::Applied);
         assert_eq!(c.check_blocks, Some(0));
         assert_eq!(c.check_blocks_window(), 0);
-        assert_eq!(
-            c.apply_kv("check_blocks", "-1").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("check_blocks", "-1").unwrap(), ConfApply::Applied);
         assert_eq!(c.check_blocks, Some(-1));
         assert_eq!(c.check_blocks_window(), 0);
         let bad = c.apply_kv("check_blocks", "nope").unwrap_err();
@@ -1212,68 +1113,32 @@ mod tests {
     #[test]
     fn duplicate_listen_is_init_error() {
         let mut c = NodeConfig::default();
-        assert_eq!(
-            c.apply_kv("listen", "127.0.0.1:18444").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("listen", "127.0.0.1:18444").unwrap(), ConfApply::Applied);
         let err = c.apply_kv("listen", "127.0.0.1:18444").unwrap_err();
-        assert!(
-            err.to_string().contains("Duplicate binding configuration"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("Duplicate binding configuration"), "{err}");
     }
 
     #[test]
     fn whitelist_parse_errors_match_core() {
         let mut c = NodeConfig::default();
-        let err = c
-            .apply_kv("net-permission", "in,out@127.0.0.1")
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Only direction was set, no permissions"),
-            "{err}"
-        );
-        let err = c
-            .apply_kv("net-permission", "oopsie@127.0.0.1")
-            .unwrap_err();
+        let err = c.apply_kv("net-permission", "in,out@127.0.0.1").unwrap_err();
+        assert!(err.to_string().contains("Only direction was set, no permissions"), "{err}");
+        let err = c.apply_kv("net-permission", "oopsie@127.0.0.1").unwrap_err();
         assert!(err.to_string().contains("Invalid P2P permission"), "{err}");
-        let err = c
-            .apply_kv("net-permission", "noban@127.0.0.1:230")
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Invalid netmask specified in --net-permission"),
-            "{err}"
-        );
-        let err = c
-            .apply_kv("net-permission-bind", "noban@127.0.0.1/10")
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Cannot resolve --net-permission-bind address"),
-            "{err}"
-        );
-        assert_eq!(
-            c.apply_kv("net-permission", "127.0.0.1").unwrap(),
-            ConfApply::Applied
-        );
+        let err = c.apply_kv("net-permission", "noban@127.0.0.1:230").unwrap_err();
+        assert!(err.to_string().contains("Invalid netmask specified in --net-permission"), "{err}");
+        let err = c.apply_kv("net-permission-bind", "noban@127.0.0.1/10").unwrap_err();
+        assert!(err.to_string().contains("Cannot resolve --net-permission-bind address"), "{err}");
+        assert_eq!(c.apply_kv("net-permission", "127.0.0.1").unwrap(), ConfApply::Applied);
         let t = c.finalized_net_perms();
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let bind = "127.0.0.1:18444".parse().unwrap();
-        assert_eq!(
-            t.strings_for(ip, true, bind),
-            ["noban", "relay", "mempool", "download"]
-        );
+        assert_eq!(t.strings_for(ip, true, bind), ["noban", "relay", "mempool", "download"]);
         c.net_permission_relay = false;
         let t = c.finalized_net_perms();
-        assert_eq!(
-            t.strings_for(ip, true, bind),
-            ["noban", "mempool", "download"]
-        );
+        assert_eq!(t.strings_for(ip, true, bind), ["noban", "mempool", "download"]);
         let mut c2 = NodeConfig::default();
-        c2.apply_kv("net-permission-bind", "noban@127.0.0.1:18445")
-            .unwrap();
+        c2.apply_kv("net-permission-bind", "noban@127.0.0.1:18445").unwrap();
         assert_eq!(
             c2.listen.p2p,
             Some("127.0.0.1:18445".parse().unwrap()),
@@ -1291,15 +1156,9 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(c.prefill_compact);
-        assert_eq!(
-            c.apply_kv("prefill_compact", "0").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("prefill_compact", "0").unwrap(), ConfApply::Applied);
         assert!(!c.prefill_compact);
-        assert_eq!(
-            c.apply_kv("prefill_compact", "1").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(c.apply_kv("prefill_compact", "1").unwrap(), ConfApply::Applied);
         assert!(c.prefill_compact);
     }
 
@@ -1312,10 +1171,7 @@ mod tests {
         #[cfg(windows)]
         {
             let s = store.to_string_lossy();
-            assert!(
-                !s.contains('/'),
-                "default datadir must use Windows separators, got {s}"
-            );
+            assert!(!s.contains('/'), "default datadir must use Windows separators, got {s}");
             assert_eq!(p.to_str(), Some(r".\datadir"));
         }
         #[cfg(not(windows))]
@@ -1371,10 +1227,7 @@ mod tests {
         let cold = dir.join("cold");
         let mut split = NodeConfig::default().with_datadir(&dir);
         split.datadir.cold = Some(cold.clone());
-        assert_eq!(
-            split.store_cold_path().as_deref(),
-            Some(cold.join("store").as_path())
-        );
+        assert_eq!(split.store_cold_path().as_deref(), Some(cold.join("store").as_path()));
         split.ensure_datadir().unwrap();
         assert!(cold.join("store").is_dir());
         let mut same = NodeConfig::default().with_datadir(&dir);
@@ -1412,28 +1265,17 @@ mod tests {
         assert_eq!(cfg.mempool.max_weight, 50_000_000);
         assert_eq!(cfg.milestone_height, 100);
         assert_eq!(cfg.conf_log_level.as_deref(), Some("debug"));
-        assert_eq!(
-            cfg.api_log.as_deref(),
-            Some(std::path::Path::new("/tmp/rbitcoin-api.jsonl"))
-        );
-        assert_eq!(
-            cfg.asmap.as_deref(),
-            Some(std::path::Path::new("/tmp/ip_asn.dat"))
-        );
+        assert_eq!(cfg.api_log.as_deref(), Some(std::path::Path::new("/tmp/rbitcoin-api.jsonl")));
+        assert_eq!(cfg.asmap.as_deref(), Some(std::path::Path::new("/tmp/ip_asn.dat")));
         assert_eq!(cfg.listen.connect.len(), 1);
-        assert_eq!(
-            cfg.datadir.cold.as_deref(),
-            Some(std::path::Path::new("/mnt/hdd/rbtc-cold"))
-        );
+        assert_eq!(cfg.datadir.cold.as_deref(), Some(std::path::Path::new("/mnt/hdd/rbtc-cold")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Env is an input when inbound was not explicit; never published back.
     #[test]
     fn absorb_inbound_env_reads_but_does_not_write() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_in = std::env::var_os("RBITCOIN_P2P_MAX_INBOUND");
         std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "99");
         let mut cfg = NodeConfig::default();
@@ -1449,10 +1291,7 @@ mod tests {
         explicit.listen.max_inbound = 12;
         explicit.listen.max_inbound_explicit = true;
         explicit.absorb_inbound_env();
-        assert_eq!(
-            explicit.listen.max_inbound, 12,
-            "explicit CLI/conf wins over env"
-        );
+        assert_eq!(explicit.listen.max_inbound, 12, "explicit CLI/conf wins over env");
         match prev_in {
             Some(v) => std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", v),
             None => std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND"),
@@ -1465,10 +1304,7 @@ mod tests {
         cfg.listen.max_inbound = 42;
         cfg.listen.max_inbound_explicit = true;
         assert_eq!(cfg.listen.max_inbound, 42);
-        assert_eq!(
-            NodeConfig::default().listen.max_inbound,
-            DEFAULT_MAX_INBOUND
-        );
+        assert_eq!(NodeConfig::default().listen.max_inbound, DEFAULT_MAX_INBOUND);
     }
 
     #[test]
@@ -1499,34 +1335,19 @@ mod tests {
         let mut cfg = NodeConfig::default();
         assert_eq!(cfg.apply_kv("trusted", "1").unwrap(), ConfApply::Applied);
         assert!(cfg.trusted);
-        assert_eq!(
-            cfg.apply_kv("always-relay", "1").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(cfg.apply_kv("always-relay", "1").unwrap(), ConfApply::Applied);
         assert!(cfg.always_relay);
         assert_eq!(cfg.apply_kv("relay", "1").unwrap(), ConfApply::Applied);
         assert!(cfg.relay);
-        assert_eq!(
-            cfg.apply_kv("min-chain-work", "0x65").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(cfg.apply_kv("min-chain-work", "0x65").unwrap(), ConfApply::Applied);
         assert!(cfg.minimum_chain_work.is_some());
-        assert_eq!(
-            cfg.apply_kv("max-tip-age", "3600").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(cfg.apply_kv("max-tip-age", "3600").unwrap(), ConfApply::Applied);
         assert_eq!(cfg.max_tip_age_secs, Some(3600));
-        assert_eq!(
-            cfg.apply_kv("blocks-only", "1").unwrap(),
-            ConfApply::Applied
-        );
+        assert_eq!(cfg.apply_kv("blocks-only", "1").unwrap(), ConfApply::Applied);
         assert!(cfg.mempool.blocksonly);
         assert_eq!(cfg.apply_kv("ua-comment", "x").unwrap(), ConfApply::Applied);
         assert_eq!(cfg.uacomments.as_slice(), ["x"]);
-        assert_eq!(
-            cfg.apply_kv("chain", "regtest").unwrap(),
-            ConfApply::Unknown("chain".into())
-        );
+        assert_eq!(cfg.apply_kv("chain", "regtest").unwrap(), ConfApply::Unknown("chain".into()));
         assert_eq!(
             cfg.apply_kv("whitelist", "noban@127.0.0.1").unwrap(),
             ConfApply::Unknown("whitelist".into())
@@ -1566,10 +1387,7 @@ mod tests {
     #[test]
     fn custom_signet_options_require_signet_and_challenge() {
         let challenge = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-        let mainnet = NodeConfig {
-            signet_challenge: Some(challenge),
-            ..NodeConfig::default()
-        };
+        let mainnet = NodeConfig { signet_challenge: Some(challenge), ..NodeConfig::default() };
         assert!(mainnet.validate().is_err());
 
         let missing_challenge = NodeConfig {
@@ -1685,10 +1503,7 @@ mod tests {
         cfg.listen.esplora = Some("127.0.0.1:3000".parse().unwrap());
         cfg.shindex = false;
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("sh_index") || err.contains("--sh-index"),
-            "got {err}"
-        );
+        assert!(err.contains("sh_index") || err.contains("--sh-index"), "got {err}");
     }
 
     #[test]
@@ -1707,10 +1522,7 @@ mod tests {
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
         assert!(cfg.sptweaks);
-        assert_eq!(
-            cfg.sptweaks_dust,
-            rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST
-        );
+        assert_eq!(cfg.sptweaks_dust, rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST);
         cfg.validate().unwrap();
     }
 
@@ -1817,10 +1629,7 @@ mod tests {
 
     #[test]
     fn testactivationheight_csv_overlay_on_chain_params() {
-        let mut cfg = NodeConfig {
-            network: Network::Regtest,
-            ..NodeConfig::default()
-        };
+        let mut cfg = NodeConfig { network: Network::Regtest, ..NodeConfig::default() };
         cfg.test_activation_heights.push(("csv".into(), 102));
         let p = cfg.chain_params().unwrap();
         assert_eq!(p.csv_height(), 102);
@@ -1833,13 +1642,10 @@ mod tests {
         assert!(plain.prefill_compact);
         assert!(plain.test_activation_heights.is_empty());
         assert_eq!(
-            NodeConfig {
-                network: Network::Regtest,
-                ..NodeConfig::default()
-            }
-            .chain_params()
-            .unwrap()
-            .csv_height(),
+            NodeConfig { network: Network::Regtest, ..NodeConfig::default() }
+                .chain_params()
+                .unwrap()
+                .csv_height(),
             1
         );
     }

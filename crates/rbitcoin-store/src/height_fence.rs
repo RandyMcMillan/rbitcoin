@@ -41,18 +41,14 @@ pub struct HeightFence {
 
 impl HeightFence {
     pub fn empty() -> Self {
-        Self {
-            runs: Arc::new(Vec::new()),
-        }
+        Self { runs: Arc::new(Vec::new()) }
     }
 
     /// Sort by `first_fk` and drop empty counts.
     pub fn from_runs(mut runs: Vec<FenceRun>) -> Self {
         runs.retain(|r| r.count > 0 && r.first_fk > 0);
         runs.sort_unstable_by_key(|r| r.first_fk);
-        Self {
-            runs: Arc::new(runs),
-        }
+        Self { runs: Arc::new(runs) }
     }
 
     /// True when `other` shares this fence's run allocation (cheap snapshot).
@@ -82,11 +78,7 @@ impl HeightFence {
             if n == 0 {
                 continue;
             }
-            runs.push(FenceRun {
-                first_fk: id,
-                count: n,
-                height: h,
-            });
+            runs.push(FenceRun { first_fk: id, count: n, height: h });
         }
         Ok(Self::from_runs(runs))
     }
@@ -108,11 +100,7 @@ impl HeightFence {
             return;
         }
         let runs = Arc::make_mut(&mut self.runs);
-        runs.push(FenceRun {
-            first_fk: id,
-            count,
-            height,
-        });
+        runs.push(FenceRun { first_fk: id, count, height });
         if runs.len() >= 2 {
             let n = runs.len();
             if runs[n - 1].first_fk < runs[n - 2].first_fk {
@@ -233,11 +221,7 @@ impl HeightFence {
     pub fn max_connected_fk(&self) -> u64 {
         self.runs
             .iter()
-            .map(|r| {
-                r.first_fk
-                    .saturating_add(u64::from(r.count))
-                    .saturating_sub(1)
-            })
+            .map(|r| r.first_fk.saturating_add(u64::from(r.count)).saturating_sub(1))
             .max()
             .unwrap_or(0)
     }
@@ -319,11 +303,7 @@ mod tests {
     use super::*;
 
     fn run(first: u64, count: u32, height: u32) -> FenceRun {
-        FenceRun {
-            first_fk: first,
-            count,
-            height,
-        }
+        FenceRun { first_fk: first, count, height }
     }
 
     #[test]
@@ -334,14 +314,8 @@ mod tests {
         }
         let (n, buf) = r.window_at(11).expect("tip window");
         assert_eq!(n, 11);
-        assert_eq!(
-            &buf[..11],
-            &[1010, 1020, 1030, 1040, 1050, 1060, 1070, 1080, 1090, 1100, 1110]
-        );
-        assert!(
-            r.window_at(10).is_none(),
-            "historical height is not the ring"
-        );
+        assert_eq!(&buf[..11], &[1010, 1020, 1030, 1040, 1050, 1060, 1070, 1080, 1090, 1100, 1110]);
+        assert!(r.window_at(10).is_none(), "historical height is not the ring");
         assert!(!r.try_push(13, 9), "hole is not sequential");
         assert!(r.window_at(11).is_some());
         r.clear();
@@ -362,10 +336,7 @@ mod tests {
         assert_eq!(f.height_of(Fk(5)), Some(1));
         assert_eq!(f.height_of(Fk(6)), None);
         assert_eq!(f.height_of(Fk::NULL), None);
-        assert_eq!(
-            f.get_batch(&[Fk(2), Fk(4), Fk(9)]),
-            vec![Some(0), Some(1), None]
-        );
+        assert_eq!(f.get_batch(&[Fk(2), Fk(4), Fk(9)]), vec![Some(0), Some(1), None]);
     }
 
     #[test]
@@ -374,11 +345,7 @@ mod tests {
         // confirmed h=1 is a new archive at 6..=8.
         let f = HeightFence::from_runs(vec![run(1, 2, 0), run(6, 3, 1)]);
         assert_eq!(f.height_of(Fk(2)), Some(0));
-        assert_eq!(
-            f.height_of(Fk(3)),
-            None,
-            "orphaned fk must not take neighbor height"
-        );
+        assert_eq!(f.height_of(Fk(3)), None, "orphaned fk must not take neighbor height");
         assert_eq!(f.height_of(Fk(5)), None);
         assert_eq!(f.height_of(Fk(6)), Some(1));
         assert_eq!(f.height_of(Fk(8)), Some(1));
@@ -404,10 +371,7 @@ mod tests {
         assert!(f.shares_runs(&snap), "snapshot must be Arc, not a vec copy");
         assert_eq!(snap.height_of(Fk(1)), Some(0));
         f.extend(1, Fk(3), 1);
-        assert!(
-            !f.shares_runs(&snap),
-            "extend COWs away from live snapshots"
-        );
+        assert!(!f.shares_runs(&snap), "extend COWs away from live snapshots");
         assert_eq!(snap.height_of(Fk(3)), None);
         assert_eq!(f.height_of(Fk(3)), Some(1));
         assert_eq!(snap.len(), 1);
@@ -447,18 +411,10 @@ mod tests {
         assert_eq!(HeightFence::empty().drain_and_fence_hi(1), None);
         let f = HeightFence::from_runs(vec![run(1, 50, 2), run(51, 50, 40)]);
         assert_eq!(f.drain_and_fence_hi(0), None, "no drain: keep all inflight");
-        assert_eq!(
-            f.drain_and_fence_hi(40),
-            Some(2),
-            "drain on height 2 while fence tip is 40"
-        );
+        assert_eq!(f.drain_and_fence_hi(40), Some(2), "drain on height 2 while fence tip is 40");
         assert_eq!(f.max_height(), Some(40));
         assert_eq!(f.drain_and_fence_hi(90), Some(40), "drain on fence tip");
-        assert_eq!(
-            f.drain_and_fence_hi(200),
-            None,
-            "drain fk not on fence (drain ahead of fence)"
-        );
+        assert_eq!(f.drain_and_fence_hi(200), None, "drain fk not on fence (drain ahead of fence)");
     }
 
     #[test]
@@ -468,20 +424,14 @@ mod tests {
         assert!(f.covers_fk_span(1, 2));
         assert!(f.covers_fk_span(6, 8));
         assert!(!f.covers_fk_span(3, 5), "hole is not leftover-visible");
-        assert!(
-            !f.covers_fk_span(1, 8),
-            "span that includes a hole is not covered"
-        );
+        assert!(!f.covers_fk_span(1, 8), "span that includes a hole is not covered");
         assert!(!f.covers_fk_span(8, 10), "past last run end");
         assert!(f.covers_fk_span(7, 7));
     }
 
     #[test]
     fn height_fence_unconnected_ranges() {
-        assert_eq!(
-            HeightFence::empty().unconnected_ranges(0),
-            Vec::<(u64, u64)>::new()
-        );
+        assert_eq!(HeightFence::empty().unconnected_ranges(0), Vec::<(u64, u64)>::new());
         assert_eq!(
             HeightFence::empty().unconnected_ranges(10),
             vec![(1, 11)],

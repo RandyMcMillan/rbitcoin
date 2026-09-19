@@ -83,9 +83,7 @@ impl LoadAheadState {
         let parent_hash = if path_lo == store_path_lo {
             None
         } else {
-            self.last_loaded
-                .filter(|(h, _)| *h + 1 == path_lo)
-                .map(|(_, hash)| hash)
+            self.last_loaded.filter(|(h, _)| *h + 1 == path_lo).map(|(_, hash)| hash)
         };
         WireLoadPipeline {
             path_lo,
@@ -107,18 +105,12 @@ impl LoadAheadState {
     ) {
         if plan.batch_pin.len() == plan.planned_fks.len() {
             self.in_flight.note_pins(
-                plan.planned_fks
-                    .iter()
-                    .zip(plan.batch_pin.iter())
-                    .map(|(fk, pin)| (*fk, pin)),
+                plan.planned_fks.iter().zip(plan.batch_pin.iter()).map(|(fk, pin)| (*fk, pin)),
                 Some(last_height),
             );
         } else {
             self.in_flight.note_pins(
-                plan.packed
-                    .iter()
-                    .zip(plan.planned_fks.iter())
-                    .map(|((pin, _), fk)| (*fk, pin)),
+                plan.packed.iter().zip(plan.planned_fks.iter()).map(|((pin, _), fk)| (*fk, pin)),
                 Some(last_height),
             );
         }
@@ -137,10 +129,8 @@ impl LoadAheadState {
         if pairs.is_empty() {
             return;
         }
-        if let Some((_, last_id)) = pairs
-            .iter()
-            .filter_map(|(_, f)| f.get().map(|id| ((), id)))
-            .max_by_key(|(_, id)| *id)
+        if let Some((_, last_id)) =
+            pairs.iter().filter_map(|(_, f)| f.get().map(|id| ((), id))).max_by_key(|(_, id)| *id)
         {
             self.next_tx_start = last_id.saturating_add(1).max(1);
         }
@@ -530,9 +520,7 @@ fn reoffer_blocks_to_body_queue<'a>(
             .flatten()
             .map(|(fk, _)| fk.0)
             .unwrap_or(0);
-        let _ = hub
-            .query
-            .block_queue_offer(h, hash.to_byte_array(), header_fk, &payload);
+        let _ = hub.query.block_queue_offer(h, hash.to_byte_array(), header_fk, &payload);
     }
 }
 
@@ -554,10 +542,7 @@ fn load_fail_rewind_wave<'a>(
 }
 
 pub(crate) fn lookup_ready_hash(feed: &ConfirmFeed, height: u32) -> Option<BlockHash> {
-    feed.inner
-        .lock()
-        .ok()
-        .and_then(|g| g.ready.get(&height).map(|(h, _)| *h))
+    feed.inner.lock().ok().and_then(|g| g.ready.get(&height).map(|(h, _)| *h))
 }
 
 const LOOKUP_FAULT_HALT_AFTER: u32 = 8;
@@ -629,13 +614,7 @@ fn emit_confirm_reject(
         let until = height.saturating_add(batch_len as u32).saturating_sub(1);
         feed.request_single_block(until);
     }
-    tx.send(ConfirmEvent::Reject {
-        height,
-        hash,
-        class,
-        err,
-        batch_len,
-    })
+    tx.send(ConfirmEvent::Reject { height, hash, class, err, batch_len })
 }
 
 /// Hard cap on consecutive ready heights in one confirm wave.
@@ -660,11 +639,7 @@ pub(crate) fn confirm_batch_max_inputs() -> u32 {
 /// Σ `tx.input.len()` over a decoded block (test oracle for stamped `n_inputs`).
 #[cfg(test)]
 pub(crate) fn block_input_count(block: &bitcoin::Block) -> u32 {
-    block
-        .txdata
-        .iter()
-        .map(|tx| tx.input.len() as u32)
-        .fold(0u32, u32::saturating_add)
+    block.txdata.iter().map(|tx| tx.input.len() as u32).fold(0u32, u32::saturating_add)
 }
 
 /// Whether the packed run should stop **after** accepting a block that left
@@ -1058,26 +1033,21 @@ impl ConfirmQueueDepths {
     #[inline]
     fn note_batch_depth_send(depth: &AtomicUsize, hwm: &AtomicUsize) {
         let prev = depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(1))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)))
             .unwrap_or(0);
         Self::note_depth_hwm(hwm, prev.saturating_add(1));
     }
 
     #[inline]
     fn note_batch_depth_recv(depth: &AtomicUsize) {
-        let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
+        let _ =
+            depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
     }
 
     fn note_load_send(&self, blocks: usize, wire_bytes: usize) {
         Self::note_batch_depth_send(&self.lookup_to_load, &self.load_hwm);
         self.load_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(blocks))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(blocks)))
             .ok();
         self.load_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1088,9 +1058,7 @@ impl ConfirmQueueDepths {
     fn note_load_recv(&self, blocks: usize, wire_bytes: usize) {
         Self::note_batch_depth_recv(&self.lookup_to_load);
         self.load_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(blocks))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(blocks)))
             .ok();
         self.load_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1104,9 +1072,7 @@ impl ConfirmQueueDepths {
         // Saturating: concurrent note_script_send under parallel load can race past
         // usize::MAX on wire_bytes/parents counters in debug overflow checks.
         self.script_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(blocks))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(blocks)))
             .ok();
         self.script_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1114,17 +1080,13 @@ impl ConfirmQueueDepths {
             })
             .ok();
         self.script_parents
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(parents))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(parents)))
             .ok();
     }
     fn note_script_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         Self::note_batch_depth_recv(&self.load_to_scripts);
         self.script_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(blocks))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(blocks)))
             .ok();
         self.script_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1132,18 +1094,14 @@ impl ConfirmQueueDepths {
             })
             .ok();
         self.script_parents
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(parents))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(parents)))
             .ok();
     }
 
     fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         Self::note_batch_depth_send(&self.scripts_to_write, &self.write_hwm);
         self.write_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(blocks))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(blocks)))
             .ok();
         self.write_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1151,17 +1109,13 @@ impl ConfirmQueueDepths {
             })
             .ok();
         self.write_parents
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(parents))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(parents)))
             .ok();
     }
     fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         Self::note_batch_depth_recv(&self.scripts_to_write);
         self.write_blocks
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(blocks))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(blocks)))
             .ok();
         self.write_wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1169,9 +1123,7 @@ impl ConfirmQueueDepths {
             })
             .ok();
         self.write_parents
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(parents))
-            })
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(parents)))
             .ok();
     }
 }
@@ -1196,10 +1148,7 @@ pub(crate) fn format_stamp_reject_missing_prevout(
     if miss_n > 0 {
         s.push_str(&format!(" miss_n={miss_n}"));
         if let Some(raw) = miss_txid {
-            s.push_str(&format!(
-                " miss_txid={}",
-                bitcoin::Txid::from_byte_array(raw)
-            ));
+            s.push_str(&format!(" miss_txid={}", bitcoin::Txid::from_byte_array(raw)));
         }
         s.push_str(&format!(" pending={}", u8::from(pending)));
         if let Some(on) = miss_on {
@@ -1243,11 +1192,7 @@ fn drain_script_ok_write_queue(
     rx: &std::sync::mpsc::Receiver<rbitcoin_consensus::ScriptOkBatch>,
     max_parts: usize,
     mut on_extra: impl FnMut(&rbitcoin_consensus::ScriptOkBatch),
-) -> (
-    rbitcoin_consensus::ScriptOkBatch,
-    usize,
-    Option<rbitcoin_consensus::ScriptOkBatch>,
-) {
+) -> (rbitcoin_consensus::ScriptOkBatch, usize, Option<rbitcoin_consensus::ScriptOkBatch>) {
     let mut batch = first;
     let mut parts = 1usize;
     let max_parts = max_parts.max(1);

@@ -31,142 +31,63 @@ async fn pin_wallet_protocol_1_6(stream: &mut TcpStream) {
     let ver = rpc(stream, 40, "server.version", json!(["test", "1.6"])).await;
     assert_eq!(ver["result"][1].as_str(), Some("1.6"), "{ver}");
     let info = rpc(stream, 41, "mempool.get_info", json!([])).await;
-    assert!(
-        info["result"]["minrelaytxfee"].as_f64().unwrap() > 0.0,
-        "{info}"
-    );
+    assert!(info["result"]["minrelaytxfee"].as_f64().unwrap() > 0.0, "{info}");
     assert_eq!(info["result"]["unbroadcastcount"], 0);
     pin_outpoint_1_6(stream).await;
     pin_silentpayments_1_6(stream).await;
     let hdrs = rpc(stream, 48, "blockchain.block.headers", json!([0, 1])).await;
-    assert!(
-        hdrs["result"]["headers"].as_array().is_some(),
-        "1.6 headers is a list: {hdrs}"
-    );
+    assert!(hdrs["result"]["headers"].as_array().is_some(), "1.6 headers is a list: {hdrs}");
 }
 
 async fn pin_outpoint_1_6(stream: &mut TcpStream) {
     let zero = format!("{:064}", 0);
-    let st = rpc(
-        stream,
-        42,
-        "blockchain.outpoint.get_status",
-        json!([zero.clone(), 0]),
-    )
-    .await;
+    let st = rpc(stream, 42, "blockchain.outpoint.get_status", json!([zero.clone(), 0])).await;
     assert_eq!(st["result"]["spent"], false, "{st}");
-    let sub = rpc(
-        stream,
-        43,
-        "blockchain.outpoint.subscribe",
-        json!([zero.clone(), 0]),
-    )
-    .await;
+    let sub = rpc(stream, 43, "blockchain.outpoint.subscribe", json!([zero.clone(), 0])).await;
     assert_eq!(sub["result"]["spent"], false, "{sub}");
-    let un = rpc(
-        stream,
-        44,
-        "blockchain.outpoint.unsubscribe",
-        json!([zero.clone(), 0]),
-    )
-    .await;
+    let un = rpc(stream, 44, "blockchain.outpoint.unsubscribe", json!([zero.clone(), 0])).await;
     assert_eq!(un["result"], json!(true), "{un}");
-    let un2 = rpc(
-        stream,
-        49,
-        "blockchain.outpoint.unsubscribe",
-        json!([zero, 0]),
-    )
-    .await;
+    let un2 = rpc(stream, 49, "blockchain.outpoint.unsubscribe", json!([zero, 0])).await;
     assert_eq!(un2["result"], json!(false), "second unsubscribe: {un2}");
-    let sub_again = rpc(
-        stream,
-        51,
-        "blockchain.outpoint.subscribe",
-        json!([format!("{:064}", 0), 0]),
-    )
-    .await;
+    let sub_again =
+        rpc(stream, 51, "blockchain.outpoint.subscribe", json!([format!("{:064}", 0), 0])).await;
     assert_eq!(sub_again["result"]["spent"], false, "{sub_again}");
-    let bad_op = rpc(
-        stream,
-        56,
-        "blockchain.outpoint.get_status",
-        json!([format!("{:064}", 0)]),
-    )
-    .await;
-    assert!(
-        bad_op.get("error").is_some(),
-        "outpoint missing vout: {bad_op}"
-    );
+    let bad_op =
+        rpc(stream, 56, "blockchain.outpoint.get_status", json!([format!("{:064}", 0)])).await;
+    assert!(bad_op.get("error").is_some(), "outpoint missing vout: {bad_op}");
 }
 
 async fn pin_silentpayments_1_6(stream: &mut TcpStream) {
-    let sp = rpc(
-        stream,
-        45,
-        "blockchain.silentpayments.subscribe",
-        json!([SP_SCAN, SP_SPEND, 0]),
-    )
-    .await;
+    let sp =
+        rpc(stream, 45, "blockchain.silentpayments.subscribe", json!([SP_SCAN, SP_SPEND, 0])).await;
     assert_eq!(sp["result"]["start_height"], 0, "{sp}");
-    assert!(
-        sp["result"]["address"].as_str().unwrap().contains("sp"),
-        "{sp}"
-    );
+    assert!(sp["result"]["address"].as_str().unwrap().contains("sp"), "{sp}");
     let note = read_notify(stream, "silentpayments history").await;
-    assert_eq!(
-        note["method"].as_str(),
-        Some("blockchain.silentpayments.subscribe"),
-        "{note}"
-    );
+    assert_eq!(note["method"].as_str(), Some("blockchain.silentpayments.subscribe"), "{note}");
     assert!(note["params"]["history"].as_array().is_some(), "{note}");
-    let unsp = rpc(
-        stream,
-        46,
-        "blockchain.silentpayments.unsubscribe",
-        json!([SP_SCAN, SP_SPEND, 0]),
-    )
-    .await;
+    let unsp =
+        rpc(stream, 46, "blockchain.silentpayments.unsubscribe", json!([SP_SCAN, SP_SPEND, 0]))
+            .await;
     assert!(unsp["result"].as_str().unwrap().contains("sp"), "{unsp}");
-    let unsp2 = rpc(
-        stream,
-        53,
-        "blockchain.silentpayments.unsubscribe",
-        json!([SP_SCAN, SP_SPEND, 0]),
-    )
-    .await;
+    let unsp2 =
+        rpc(stream, 53, "blockchain.silentpayments.unsubscribe", json!([SP_SCAN, SP_SPEND, 0]))
+            .await;
     assert!(
         unsp2["result"].as_str().unwrap().contains("sp"),
         "second unsubscribe still returns address: {unsp2}"
     );
-    let headers = rpc(
-        stream,
-        54,
-        "blockchain.block.headers",
-        json!([0, 1_000_000]),
-    )
-    .await;
+    let headers = rpc(stream, 54, "blockchain.block.headers", json!([0, 1_000_000])).await;
     let tip_h = headers["result"]["count"].as_u64().expect("header count") - 1;
-    let clamped = rpc(
-        stream,
-        55,
-        "blockchain.silentpayments.subscribe",
-        json!([SP_SCAN, SP_SPEND, 500_000]),
-    )
-    .await;
+    let clamped =
+        rpc(stream, 55, "blockchain.silentpayments.subscribe", json!([SP_SCAN, SP_SPEND, 500_000]))
+            .await;
     assert_eq!(
         clamped["result"]["start_height"].as_u64(),
         Some(tip_h),
         "start past tip clamps: {clamped}"
     );
     let _ = read_notify(stream, "silentpayments clamp history").await;
-    let bad = rpc(
-        stream,
-        47,
-        "blockchain.silentpayments.subscribe",
-        json!(["00", "02"]),
-    )
-    .await;
+    let bad = rpc(stream, 47, "blockchain.silentpayments.subscribe", json!(["00", "02"])).await;
     assert!(bad.get("error").is_some(), "{bad}");
 }
 
@@ -219,12 +140,7 @@ async fn http_get_raw(addr: SocketAddr, path: &str) -> (u16, String, String) {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
     (status, text, body)
 }
 
@@ -240,24 +156,15 @@ async fn assert_esplora_asof_hides_later_spend(
     assert_eq!(st, 200, "asof create utxo body={body}");
     let utxos: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(utxos.as_array().unwrap().len(), 1, "{body}");
-    assert_eq!(
-        http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(),
-        Some(asof_create)
-    );
-    assert_eq!(
-        http_header_value(&raw, "x-bitcoin-chain-tip-height").as_deref(),
-        Some("102")
-    );
+    assert_eq!(http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(), Some(asof_create));
+    assert_eq!(http_header_value(&raw, "x-bitcoin-chain-tip-height").as_deref(), Some("102"));
 
     let (st, raw, body) =
         http_get_raw(addr, &format!("/scripthash/{sh}/utxo?asof={asof_spend}")).await;
     assert_eq!(st, 200, "asof spend utxo body={body}");
     let utxos: Value = serde_json::from_str(&body).unwrap();
     assert!(utxos.as_array().unwrap().is_empty(), "{body}");
-    assert_eq!(
-        http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(),
-        Some(asof_spend)
-    );
+    assert_eq!(http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(), Some(asof_spend));
 
     let (st, _, body) =
         http_get_raw(addr, &format!("/tx/{create_hex}/status?asof={asof_create}")).await;
@@ -265,11 +172,8 @@ async fn assert_esplora_asof_hides_later_spend(
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["confirmed"], true);
 
-    let (st, _, _) = http_get_raw(
-        addr,
-        &format!("/scripthash/{sh}/utxo?asof={}", "ee".repeat(32)),
-    )
-    .await;
+    let (st, _, _) =
+        http_get_raw(addr, &format!("/scripthash/{sh}/utxo?asof={}", "ee".repeat(32))).await;
     assert_eq!(st, 404);
 
     let (st, raw, _) = http_get_raw(addr, &format!("/tx/{create_hex}?asof={asof_create}")).await;
@@ -371,10 +275,7 @@ async fn electrum_server_version_history_balance() {
     let hist = v["result"].as_array().expect("history array");
     assert!(!hist.is_empty());
     for row in hist {
-        assert!(
-            row.get("fee").is_none(),
-            "confirmed history omits fee: {row}"
-        );
+        assert!(row.get("fee").is_none(), "confirmed history omits fee: {row}");
     }
 
     let sh_hex = electrum_scripthash_hex(&[0x51]);
@@ -436,14 +337,8 @@ async fn electrum_server_version_history_balance() {
     // Notification has no id — wait for one line.
     read_line_timeout(&mut reader, &mut resp_line, "tip notification").await;
     let push: Value = serde_json::from_str(&resp_line).unwrap();
-    assert_eq!(
-        push["method"].as_str(),
-        Some("blockchain.headers.subscribe")
-    );
-    assert_eq!(
-        push["params"][0]["height"].as_u64(),
-        Some((tip_h + 1) as u64)
-    );
+    assert_eq!(push["method"].as_str(), Some("blockchain.headers.subscribe"));
+    assert_eq!(push["params"][0]["height"].as_u64(), Some((tip_h + 1) as u64));
 
     drop(reader);
 
@@ -488,22 +383,10 @@ async fn electrum_server_version_history_balance() {
     pin_wallet_protocol_1_6(&mut stream).await;
 
     let sh_hex = electrum_scripthash_hex(&[0x51]);
-    let v = rpc(
-        &mut stream,
-        8,
-        "blockchain.scripthash.listunspent",
-        json!([sh_hex]),
-    )
-    .await;
+    let v = rpc(&mut stream, 8, "blockchain.scripthash.listunspent", json!([sh_hex])).await;
     assert!(v["result"].as_array().is_some());
 
-    let v = rpc(
-        &mut stream,
-        9,
-        "blockchain.scripthash.subscribe",
-        json!([sh_hex]),
-    )
-    .await;
+    let v = rpc(&mut stream, 9, "blockchain.scripthash.subscribe", json!([sh_hex])).await;
     // status is hex string or null for empty
     assert!(v.get("result").is_some());
 
@@ -536,27 +419,15 @@ async fn electrum_server_version_history_balance() {
         let mut op_line = String::new();
         read_line_timeout(&mut reader, &mut op_line, "outpoint notification").await;
         let op_push: Value = serde_json::from_str(&op_line).unwrap();
-        assert_eq!(
-            op_push["method"].as_str(),
-            Some("blockchain.outpoint.subscribe"),
-            "{op_push}"
-        );
+        assert_eq!(op_push["method"].as_str(), Some("blockchain.outpoint.subscribe"), "{op_push}");
         let mut sh_line = String::new();
         read_line_timeout(&mut reader, &mut sh_line, "scripthash notification").await;
         let push: Value = serde_json::from_str(&sh_line).unwrap();
-        assert_eq!(
-            push["method"].as_str(),
-            Some("blockchain.scripthash.subscribe"),
-            "{push}"
-        );
+        assert_eq!(push["method"].as_str(), Some("blockchain.scripthash.subscribe"), "{push}");
     }
-    let un_op = rpc(
-        &mut stream,
-        52,
-        "blockchain.outpoint.unsubscribe",
-        json!([format!("{:064}", 0), 0]),
-    )
-    .await;
+    let un_op =
+        rpc(&mut stream, 52, "blockchain.outpoint.unsubscribe", json!([format!("{:064}", 0), 0]))
+            .await;
     assert_eq!(un_op["result"], json!(true), "{un_op}");
 
     let miss_h = next_h + 1;
@@ -590,57 +461,21 @@ async fn electrum_server_version_history_balance() {
     assert!(extra.is_err(), "untouched tip must not restatus: {extra:?}");
 
     // Coinbase of height 1 via id_from_pos.
-    let v = rpc(
-        &mut stream,
-        10,
-        "blockchain.transaction.id_from_pos",
-        json!([1, 0]),
-    )
-    .await;
+    let v = rpc(&mut stream, 10, "blockchain.transaction.id_from_pos", json!([1, 0])).await;
     let txid_hex = v["result"].as_str().expect("txid").to_string();
     assert_eq!(txid_hex.len(), 64);
-    let v = rpc(
-        &mut stream,
-        50,
-        "blockchain.transaction.id_from_pos",
-        json!([1, 0, false]),
-    )
-    .await;
+    let v = rpc(&mut stream, 50, "blockchain.transaction.id_from_pos", json!([1, 0, false])).await;
     assert_eq!(v["result"].as_str(), Some(txid_hex.as_str()));
-    let v = rpc(
-        &mut stream,
-        51,
-        "blockchain.transaction.id_from_pos",
-        json!([1, 0, true]),
-    )
-    .await;
+    let v = rpc(&mut stream, 51, "blockchain.transaction.id_from_pos", json!([1, 0, true])).await;
     assert_eq!(v["result"]["tx_hash"].as_str(), Some(txid_hex.as_str()));
     assert!(v["result"]["merkle"].as_array().is_some(), "{v}");
-    let v = rpc(
-        &mut stream,
-        52,
-        "blockchain.transaction.id_from_pos",
-        json!([1, 99]),
-    )
-    .await;
+    let v = rpc(&mut stream, 52, "blockchain.transaction.id_from_pos", json!([1, 99])).await;
     assert!(v.get("error").is_some(), "pos OOB: {v}");
 
-    let v = rpc(
-        &mut stream,
-        11,
-        "blockchain.transaction.get",
-        json!([txid_hex]),
-    )
-    .await;
+    let v = rpc(&mut stream, 11, "blockchain.transaction.get", json!([txid_hex])).await;
     assert!(v["result"].as_str().unwrap().len() > 20);
 
-    let v = rpc(
-        &mut stream,
-        12,
-        "blockchain.transaction.get",
-        json!([txid_hex, true]),
-    )
-    .await;
+    let v = rpc(&mut stream, 12, "blockchain.transaction.get", json!([txid_hex, true])).await;
     assert!(v["result"]["hex"].as_str().is_some());
     assert!(v["result"]["vin"][0].get("coinbase").is_some());
     assert_eq!(v["result"]["vout"][0]["n"], 0);
@@ -650,44 +485,21 @@ async fn electrum_server_version_history_balance() {
     assert!(v["result"]["confirmations"].as_u64().unwrap() >= 1);
     assert_eq!(v["result"]["blockhash"].as_str().unwrap().len(), 64, "{v}");
 
-    let v = rpc(
-        &mut stream,
-        13,
-        "blockchain.transaction.get_merkle",
-        json!([txid_hex, 1]),
-    )
-    .await;
+    let v = rpc(&mut stream, 13, "blockchain.transaction.get_merkle", json!([txid_hex, 1])).await;
     assert_eq!(v["result"]["block_height"].as_u64(), Some(1));
     assert!(v["result"]["merkle"].as_array().is_some());
-    let v = rpc(
-        &mut stream,
-        27,
-        "blockchain.transaction.get_merkle",
-        json!([txid_hex, 2]),
-    )
-    .await;
+    let v = rpc(&mut stream, 27, "blockchain.transaction.get_merkle", json!([txid_hex, 2])).await;
     let merkle_msg = v["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        merkle_msg.contains("not found"),
-        "wrong height for known txid: {v}"
-    );
+    assert!(merkle_msg.contains("not found"), "wrong height for known txid: {v}");
 
     let create_hex =
         rbitcoin_primitives::display_hash_hex(&chain.matured_coinbase_txid.to_byte_array());
     let spend_hex = rbitcoin_primitives::display_hash_hex(
-        &chain.blocks.last().unwrap().txdata[1]
-            .compute_txid()
-            .to_byte_array(),
+        &chain.blocks.last().unwrap().txdata[1].compute_txid().to_byte_array(),
     );
     let spend_h = chain.spend_height;
     let sh_hex = electrum_scripthash_hex(&[0x51]);
-    let full = rpc(
-        &mut stream,
-        21,
-        "blockchain.scripthash.get_history",
-        json!([sh_hex]),
-    )
-    .await;
+    let full = rpc(&mut stream, 21, "blockchain.scripthash.get_history", json!([sh_hex])).await;
     let full_rows = full["result"].as_array().expect("full history");
     assert!(
         full_rows.iter().any(|r| r["tx_hash"] == create_hex),
@@ -697,28 +509,15 @@ async fn electrum_server_version_history_balance() {
         full_rows.iter().any(|r| r["tx_hash"] == spend_hex),
         "full history missing spend: {full}"
     );
-    let from_create = rpc(
-        &mut stream,
-        22,
-        "blockchain.scripthash.get_history",
-        json!([sh_hex, 1]),
-    )
-    .await;
+    let from_create =
+        rpc(&mut stream, 22, "blockchain.scripthash.get_history", json!([sh_hex, 1])).await;
     assert!(
-        from_create["result"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["tx_hash"] == create_hex),
+        from_create["result"].as_array().unwrap().iter().any(|r| r["tx_hash"] == create_hex),
         "from_height at first create: {from_create}"
     );
-    let before_spend = rpc(
-        &mut stream,
-        23,
-        "blockchain.scripthash.get_history",
-        json!([sh_hex, 1, spend_h]),
-    )
-    .await;
+    let before_spend =
+        rpc(&mut stream, 23, "blockchain.scripthash.get_history", json!([sh_hex, 1, spend_h]))
+            .await;
     let before_rows = before_spend["result"].as_array().unwrap();
     assert!(
         before_rows.iter().any(|r| r["tx_hash"] == create_hex),
@@ -728,46 +527,20 @@ async fn electrum_server_version_history_balance() {
         before_rows.iter().all(|r| r["tx_hash"] != spend_hex),
         "exclusive to_height must hide spend: {before_spend}"
     );
+    assert!(before_rows.len() < full_rows.len(), "window must be shorter than full history");
+    let open_to =
+        rpc(&mut stream, 24, "blockchain.scripthash.get_history", json!([sh_hex, 1, -1])).await;
     assert!(
-        before_rows.len() < full_rows.len(),
-        "window must be shorter than full history"
-    );
-    let open_to = rpc(
-        &mut stream,
-        24,
-        "blockchain.scripthash.get_history",
-        json!([sh_hex, 1, -1]),
-    )
-    .await;
-    assert!(
-        open_to["result"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["tx_hash"] == spend_hex),
+        open_to["result"].as_array().unwrap().iter().any(|r| r["tx_hash"] == spend_hex),
         "to_height=-1 must include spend: {open_to}"
     );
-    let status = rpc(
-        &mut stream,
-        25,
-        "blockchain.scripthash.subscribe",
-        json!([sh_hex]),
-    )
-    .await;
+    let status = rpc(&mut stream, 25, "blockchain.scripthash.subscribe", json!([sh_hex])).await;
     let status_s = status["result"].as_str().expect("subscribe status");
     assert!(!status_s.is_empty(), "{status}");
-    let bad_from = rpc(
-        &mut stream,
-        26,
-        "blockchain.scripthash.get_history",
-        json!([sh_hex, "x"]),
-    )
-    .await;
+    let bad_from =
+        rpc(&mut stream, 26, "blockchain.scripthash.get_history", json!([sh_hex, "x"])).await;
     let bad_msg = bad_from["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        bad_msg.contains("expected number"),
-        "invalid from_height: {bad_from}"
-    );
+    assert!(bad_msg.contains("expected number"), "invalid from_height: {bad_from}");
 
     let v = rpc(&mut stream, 14, "blockchain.estimatefee", json!([2])).await;
     assert!(v["result"].as_f64().is_some() || v["result"].as_i64().is_some());
@@ -779,13 +552,7 @@ async fn electrum_server_version_history_balance() {
     assert!(v["result"].as_array().is_some());
 
     // Missing tx.
-    let v = rpc(
-        &mut stream,
-        17,
-        "blockchain.transaction.get",
-        json!(["00".repeat(32)]),
-    )
-    .await;
+    let v = rpc(&mut stream, 17, "blockchain.transaction.get", json!(["00".repeat(32)])).await;
     assert!(v.get("error").is_some(), "{v}");
 
     // Unknown method.
@@ -793,21 +560,9 @@ async fn electrum_server_version_history_balance() {
     assert!(v.get("error").is_some());
 
     // Broadcast without mempool → error.
-    let v = rpc(
-        &mut stream,
-        19,
-        "blockchain.transaction.broadcast",
-        json!(["00"]),
-    )
-    .await;
+    let v = rpc(&mut stream, 19, "blockchain.transaction.broadcast", json!(["00"])).await;
     assert!(v.get("error").is_some());
-    let v = rpc(
-        &mut stream,
-        21,
-        "blockchain.transaction.broadcast_package",
-        json!([["00"]]),
-    )
-    .await;
+    let v = rpc(&mut stream, 21, "blockchain.transaction.broadcast_package", json!([["00"]])).await;
     assert!(v.get("error").is_some(), "{v}");
 
     // Bad params.
@@ -821,10 +576,7 @@ async fn electrum_server_version_history_balance() {
     at_cap.push(b'\n');
     dos.write_all(&at_cap).await.unwrap();
     let v = rpc(&mut dos, 2, "server.ping", json!([])).await;
-    assert!(
-        v.get("result").is_some(),
-        "line at max_request_bytes must not close: {v}"
-    );
+    assert!(v.get("result").is_some(), "line at max_request_bytes must not close: {v}");
     let mut over = vec![b'A'; 2048];
     over.push(b'\n');
     dos.write_all(&over).await.unwrap();
@@ -834,11 +586,7 @@ async fn electrum_server_version_history_balance() {
         read_line_timeout(&mut reader, &mut resp, "request line too long").await;
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], json!(-32600), "{v}");
-        assert_eq!(
-            v["error"]["message"].as_str(),
-            Some("request line too long"),
-            "{v}"
-        );
+        assert_eq!(v["error"]["message"].as_str(), Some("request line too long"), "{v}");
     }
 
     handle.shutdown().await;
@@ -853,65 +601,24 @@ async fn electrum_scripthash_sub_cap_unsubscribe_frees_slot() {
     let (tip_tx, _) = broadcast::channel(4);
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     cfg.max_scripthash_subs = 2;
-    let handle = run_electrum(cfg, q, params, tip_tx, None)
-        .await
-        .expect("electrum listen");
+    let handle = run_electrum(cfg, q, params, tip_tx, None).await.expect("electrum listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
     let h1 = "11".repeat(32);
     let h2 = "22".repeat(32);
     let h3 = "33".repeat(32);
-    let v = rpc(
-        &mut stream,
-        1,
-        "blockchain.scripthash.subscribe",
-        json!([h1.clone()]),
-    )
-    .await;
+    let v = rpc(&mut stream, 1, "blockchain.scripthash.subscribe", json!([h1.clone()])).await;
     assert!(v.get("result").is_some(), "{v}");
-    let v = rpc(
-        &mut stream,
-        2,
-        "blockchain.scripthash.subscribe",
-        json!([h2]),
-    )
-    .await;
+    let v = rpc(&mut stream, 2, "blockchain.scripthash.subscribe", json!([h2])).await;
     assert!(v.get("result").is_some(), "{v}");
-    let v = rpc(
-        &mut stream,
-        3,
-        "blockchain.scripthash.subscribe",
-        json!([h3.clone()]),
-    )
-    .await;
+    let v = rpc(&mut stream, 3, "blockchain.scripthash.subscribe", json!([h3.clone()])).await;
     let msg = v["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("too many"), "{v}");
-    let v = rpc(
-        &mut stream,
-        4,
-        "blockchain.scripthash.unsubscribe",
-        json!([h3.clone()]),
-    )
-    .await;
+    let v = rpc(&mut stream, 4, "blockchain.scripthash.unsubscribe", json!([h3.clone()])).await;
     assert_eq!(v["result"], json!(false), "never subscribed");
-    let v = rpc(
-        &mut stream,
-        5,
-        "blockchain.scripthash.unsubscribe",
-        json!([h1]),
-    )
-    .await;
+    let v = rpc(&mut stream, 5, "blockchain.scripthash.unsubscribe", json!([h1])).await;
     assert_eq!(v["result"], json!(true));
-    let v = rpc(
-        &mut stream,
-        6,
-        "blockchain.scripthash.subscribe",
-        json!([h3]),
-    )
-    .await;
-    assert!(
-        v.get("error").is_none(),
-        "unsubscribe must free a cap slot: {v}"
-    );
+    let v = rpc(&mut stream, 6, "blockchain.scripthash.subscribe", json!([h3])).await;
+    assert!(v.get("error").is_none(), "unsubscribe must free a cap slot: {v}");
     handle.shutdown().await;
 }
 
@@ -949,18 +656,12 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[0],
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: coinbase_txids[0], vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: spk.clone(),
-        }],
+        output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: spk.clone() }],
     };
     mp.accept_tx(&parent).expect("accept");
     mp.set_relay_enabled(false);
@@ -982,65 +683,32 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     let sh = electrum_scripthash_hex(spk.as_bytes());
     let (tip_tx, _) = broadcast::channel(4);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(
-        cfg,
-        Arc::clone(&q_arc),
-        params,
-        tip_tx,
-        Some(Arc::clone(&mp)),
-    )
-    .await
-    .expect("electrum listen");
+    let handle = run_electrum(cfg, Arc::clone(&q_arc), params, tip_tx, Some(Arc::clone(&mp)))
+        .await
+        .expect("electrum listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
     let want = rbitcoin_primitives::display_hash_hex(&parent.compute_txid().to_byte_array());
-    let bal = rpc(
-        &mut stream,
-        1,
-        "blockchain.scripthash.get_balance",
-        json!([sh.clone()]),
-    )
-    .await;
+    let bal = rpc(&mut stream, 1, "blockchain.scripthash.get_balance", json!([sh.clone()])).await;
     assert_eq!(bal["result"]["confirmed"], value, "{bal}");
     assert_eq!(
         bal["result"]["unconfirmed"], 0,
         "confirmed leftover must not add unconfirmed delta: {bal}"
     );
-    let unspent = rpc(
-        &mut stream,
-        2,
-        "blockchain.scripthash.listunspent",
-        json!([sh.clone()]),
-    )
-    .await;
+    let unspent =
+        rpc(&mut stream, 2, "blockchain.scripthash.listunspent", json!([sh.clone()])).await;
     let rows = unspent["result"].as_array().unwrap();
     let hits: Vec<_> = rows.iter().filter(|u| u["tx_hash"] == want).collect();
     assert_eq!(hits.len(), 1, "duplicate confirmed+mempool UTXO: {unspent}");
     assert!(hits[0]["height"].as_i64().unwrap() > 0, "{hits:?}");
-    let mem = rpc(
-        &mut stream,
-        3,
-        "blockchain.scripthash.get_mempool",
-        json!([sh]),
-    )
-    .await;
-    let mem_hits: Vec<_> = mem["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|u| u["tx_hash"] == want)
-        .collect();
+    let mem = rpc(&mut stream, 3, "blockchain.scripthash.get_mempool", json!([sh])).await;
+    let mem_hits: Vec<_> =
+        mem["result"].as_array().unwrap().iter().filter(|u| u["tx_hash"] == want).collect();
     assert!(
         mem_hits.is_empty(),
         "get_mempool must skip leftover already connected on the tip: {mem}"
     );
 
-    let bad_hex = rpc(
-        &mut stream,
-        4,
-        "blockchain.transaction.broadcast",
-        json!(["zz"]),
-    )
-    .await;
+    let bad_hex = rpc(&mut stream, 4, "blockchain.transaction.broadcast", json!(["zz"])).await;
     let hex_msg = bad_hex["error"]["message"].as_str().unwrap_or("");
     assert!(
         hex_msg.contains("hex") || hex_msg.contains("Invalid"),
@@ -1050,10 +718,7 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0x11; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0x11; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -1064,27 +729,12 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         }],
     };
     let miss_hex = bitcoin::consensus::encode::serialize_hex(&miss);
-    let bad_tx = rpc(
-        &mut stream,
-        5,
-        "blockchain.transaction.broadcast",
-        json!([miss_hex]),
-    )
-    .await;
+    let bad_tx = rpc(&mut stream, 5, "blockchain.transaction.broadcast", json!([miss_hex])).await;
     let tx_msg = bad_tx["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        tx_msg.contains("broadcast reject"),
-        "consensus-invalid broadcast with hub: {bad_tx}"
-    );
+    assert!(tx_msg.contains("broadcast reject"), "consensus-invalid broadcast with hub: {bad_tx}");
 
     let cb1 = rbitcoin_primitives::display_hash_hex(&coinbase_txids[0].to_byte_array());
-    let conf = rpc(
-        &mut stream,
-        8,
-        "blockchain.outpoint.get_status",
-        json!([cb1, 0]),
-    )
-    .await;
+    let conf = rpc(&mut stream, 8, "blockchain.outpoint.get_status", json!([cb1, 0])).await;
     assert_eq!(conf["result"]["spent"], true, "{conf}");
     assert_eq!(
         conf["result"]["height"].as_u64(),
@@ -1095,17 +745,9 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         conf["result"].get("spending_txid").is_none(),
         "confirmed spend omits spending_txid: {conf}"
     );
-    let pkg_hex_err = rpc(
-        &mut stream,
-        11,
-        "blockchain.transaction.broadcast_package",
-        json!([["zz"]]),
-    )
-    .await;
-    assert!(
-        pkg_hex_err.get("error").is_some(),
-        "package invalid hex: {pkg_hex_err}"
-    );
+    let pkg_hex_err =
+        rpc(&mut stream, 11, "blockchain.transaction.broadcast_package", json!([["zz"]])).await;
+    assert!(pkg_hex_err.get("error").is_some(), "package invalid hex: {pkg_hex_err}");
     let pkg_miss = rpc(
         &mut stream,
         9,
@@ -1136,32 +778,14 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         }],
     };
     let pkg_hex = bitcoin::consensus::encode::serialize_hex(&pkg);
-    let packed = rpc(
-        &mut stream,
-        6,
-        "blockchain.transaction.broadcast_package",
-        json!([[pkg_hex], true]),
-    )
-    .await;
-    assert_eq!(
-        packed["result"]["package_msg"].as_str(),
-        Some("success"),
-        "{packed}"
-    );
+    let packed =
+        rpc(&mut stream, 6, "blockchain.transaction.broadcast_package", json!([[pkg_hex], true]))
+            .await;
+    assert_eq!(packed["result"]["package_msg"].as_str(), Some("success"), "{packed}");
     let cb = rbitcoin_primitives::display_hash_hex(&cb2.to_byte_array());
-    let spent = rpc(
-        &mut stream,
-        7,
-        "blockchain.outpoint.get_status",
-        json!([cb, 0]),
-    )
-    .await;
+    let spent = rpc(&mut stream, 7, "blockchain.outpoint.get_status", json!([cb, 0])).await;
     assert_eq!(spent["result"]["spent"], true, "{spent}");
-    assert_eq!(
-        spent["result"]["height"].as_u64(),
-        Some(0),
-        "mempool spend height: {spent}"
-    );
+    assert_eq!(spent["result"]["height"].as_u64(), Some(0), "mempool spend height: {spent}");
     assert!(
         spent["result"]["spending_txid"].as_str().is_some(),
         "mempool spend spending_txid: {spent}"
@@ -1183,27 +807,12 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         }],
     };
     let pkg2_hex = bitcoin::consensus::encode::serialize_hex(&pkg2);
-    let packed2 = rpc(
-        &mut stream,
-        10,
-        "blockchain.transaction.broadcast_package",
-        json!([[pkg2_hex]]),
-    )
-    .await;
-    assert_eq!(
-        packed2["result"].as_str(),
-        Some("success"),
-        "non-verbose package: {packed2}"
-    );
+    let packed2 =
+        rpc(&mut stream, 10, "blockchain.transaction.broadcast_package", json!([[pkg2_hex]])).await;
+    assert_eq!(packed2["result"].as_str(), Some("success"), "non-verbose package: {packed2}");
 
     let pkg_txid = rbitcoin_primitives::display_hash_hex(&pkg.compute_txid().to_byte_array());
-    let verbose = rpc(
-        &mut stream,
-        12,
-        "blockchain.transaction.get",
-        json!([pkg_txid, true]),
-    )
-    .await;
+    let verbose = rpc(&mut stream, 12, "blockchain.transaction.get", json!([pkg_txid, true])).await;
     let got = &verbose["result"];
     assert!(got.get("blockhash").is_none(), "mempool verbose: {verbose}");
     assert_eq!(got["confirmations"], 0, "{verbose}");
@@ -1248,19 +857,13 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[0],
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: coinbase_txids[0], vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
         output: vec![
-            TxOut {
-                value: Amount::from_sat(value),
-                script_pubkey: create_spk.clone(),
-            },
+            TxOut { value: Amount::from_sat(value), script_pubkey: create_spk.clone() },
             TxOut {
                 value: Amount::from_sat(p2wpkh_sats),
                 script_pubkey: ScriptBuf::from_bytes(p2wpkh),
@@ -1280,10 +883,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: create.compute_txid(),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: create.compute_txid(), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -1347,10 +947,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     )
     .await;
     let denied_msg = denied["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        denied_msg.contains("1.4.2-asof"),
-        "asof tag before handshake: {denied}"
-    );
+    assert!(denied_msg.contains("1.4.2-asof"), "asof tag before handshake: {denied}");
 
     let ver = rpc(&mut stream, 2, "server.version", json!(["test", ASOF])).await;
     assert_eq!(ver["result"][1], ASOF, "{ver}");
@@ -1455,10 +1052,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     )
     .await;
     let unknown_msg = unknown["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        unknown_msg.contains("asof not on chain"),
-        "unknown asof: {unknown}"
-    );
+    assert!(unknown_msg.contains("asof not on chain"), "unknown asof: {unknown}");
 
     assert_esplora_asof_hides_later_spend(
         esplora.local_addr,
@@ -1477,11 +1071,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
     accept_and_connect_block(&q, &params, Height(104), &lag_blk, Milestone::NONE).unwrap();
     assert_eq!(q.tip_height(), Some(Height(104)));
-    assert_eq!(
-        q.sh_lag_heights(),
-        1,
-        "SH-off connect must leave visible SH behind tip"
-    );
+    assert_eq!(q.sh_lag_heights(), 1, "SH-off connect must leave visible SH behind tip");
     let lag_hash = lag_blk.block_hash().to_byte_array();
     let spend_hash = spend_blk.block_hash().to_byte_array();
     assert!(
@@ -1509,41 +1099,23 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     )
     .await;
     let ahead_msg = ahead["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        ahead_msg.contains("asof not on chain"),
-        "asof ahead of visible SH: {ahead}"
-    );
-    let (st, raw, body) = http_get_raw(
-        esplora.local_addr,
-        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
-    )
-    .await;
+    assert!(ahead_msg.contains("asof not on chain"), "asof ahead of visible SH: {ahead}");
+    let (st, raw, body) =
+        http_get_raw(esplora.local_addr, &format!("/scripthash/{sh}/utxo?asof={asof_spend}")).await;
     assert_eq!(st, 200, "asof at SH watermark utxo body={body}");
     assert_eq!(
         http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(),
         Some(asof_spend.as_str())
     );
-    assert_esplora_asof_dead(
-        esplora.local_addr,
-        &format!("/scripthash/{sh}/utxo?asof={asof_lag}"),
-    )
-    .await;
+    assert_esplora_asof_dead(esplora.local_addr, &format!("/scripthash/{sh}/utxo?asof={asof_lag}"))
+        .await;
 
     q.disconnect_tip().unwrap();
     q.set_sh_index_enabled(true);
     assert_eq!(q.tip_height(), Some(Height(103)));
 
-    let sub = rpc(
-        &mut stream,
-        15,
-        "blockchain.scripthash.subscribe",
-        json!([sh.clone()]),
-    )
-    .await;
-    let status_a = sub["result"]
-        .as_str()
-        .expect("subscribe status")
-        .to_string();
+    let sub = rpc(&mut stream, 15, "blockchain.scripthash.subscribe", json!([sh.clone()])).await;
+    let status_a = sub["result"].as_str().expect("subscribe status").to_string();
     assert_eq!(status_a.len(), 64, "{sub}");
 
     q.disconnect_tip().unwrap();
@@ -1558,10 +1130,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         })
         .expect("same-height replace notify");
     let push_b = read_notify(&mut stream, "same-height status B").await;
-    assert_eq!(
-        push_b["method"].as_str(),
-        Some("blockchain.scripthash.subscribe")
-    );
+    assert_eq!(push_b["method"].as_str(), Some("blockchain.scripthash.subscribe"));
     let status_b = push_b["params"][1].as_str().expect("status B").to_string();
     assert_ne!(
         status_a, status_b,
@@ -1619,38 +1188,21 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         .expect("disconnect spend notify");
     let push_u = read_notify(&mut stream, "unspend status").await;
     let status_u = push_u["params"][1].as_str().unwrap_or("");
-    assert_ne!(
-        status_u, status_a,
-        "disconnecting the spend must restatus: {push_u}"
-    );
+    assert_ne!(status_u, status_a, "disconnecting the spend must restatus: {push_u}");
 
-    let hist_u = rpc(
-        &mut stream,
-        17,
-        "blockchain.scripthash.get_history",
-        json!([sh.clone()]),
-    )
-    .await;
+    let hist_u =
+        rpc(&mut stream, 17, "blockchain.scripthash.get_history", json!([sh.clone()])).await;
     let hist_u_rows = hist_u["result"].as_array().unwrap();
     assert_eq!(hist_u_rows.len(), 1, "{hist_u}");
     assert_eq!(hist_u_rows[0]["tx_hash"], create_hex);
-    let utxo_u = rpc(
-        &mut stream,
-        18,
-        "blockchain.scripthash.listunspent",
-        json!([sh.clone()]),
-    )
-    .await;
+    let utxo_u =
+        rpc(&mut stream, 18, "blockchain.scripthash.listunspent", json!([sh.clone()])).await;
     let utxo_u_rows = utxo_u["result"].as_array().unwrap();
     assert_eq!(utxo_u_rows.len(), 1, "{utxo_u}");
     assert_eq!(utxo_u_rows[0]["tx_hash"], create_hex);
-    let asof_dead = rpc(
-        &mut stream,
-        19,
-        "blockchain.scripthash.get_balance",
-        json!([sh.clone(), tag_spend]),
-    )
-    .await;
+    let asof_dead =
+        rpc(&mut stream, 19, "blockchain.scripthash.get_balance", json!([sh.clone(), tag_spend]))
+            .await;
     let asof_dead_msg = asof_dead["error"]["message"].as_str().unwrap_or("");
     assert!(
         asof_dead_msg.contains("asof not on chain"),
@@ -1667,10 +1219,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         Some(asof_create.as_str()),
         "live stamp must be the create block, not the disconnected spend"
     );
-    assert_eq!(
-        http_header_value(&raw, "x-bitcoin-chain-tip-height").as_deref(),
-        Some("102")
-    );
+    assert_eq!(http_header_value(&raw, "x-bitcoin-chain-tip-height").as_deref(), Some("102"));
     let (st, _, body) = http_get_raw(esplora.local_addr, &format!("/tx/{spend_hex}/status")).await;
     assert_eq!(st, 200, "spend status after disconnect={body}");
     let spend_st: Value = serde_json::from_str(&body).unwrap();
@@ -1698,53 +1247,25 @@ async fn electrum_empty_chain_headers_subscribe_and_empty_scripthash() {
     let q = Arc::new(q);
     let (tip_tx, _) = broadcast::channel(4);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(cfg, q, params, tip_tx, None)
-        .await
-        .expect("electrum listen");
+    let handle = run_electrum(cfg, q, params, tip_tx, None).await.expect("electrum listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
 
     let sub = rpc(&mut stream, 1, "blockchain.headers.subscribe", json!([])).await;
     let sub_msg = sub["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        sub_msg.contains("no chain tip"),
-        "empty chain headers.subscribe: {sub}"
-    );
+    assert!(sub_msg.contains("no chain tip"), "empty chain headers.subscribe: {sub}");
 
     let sh = electrum_scripthash_hex(&[0x51]);
-    let hist = rpc(
-        &mut stream,
-        2,
-        "blockchain.scripthash.get_history",
-        json!([sh.clone()]),
-    )
-    .await;
+    let hist = rpc(&mut stream, 2, "blockchain.scripthash.get_history", json!([sh.clone()])).await;
     assert_eq!(hist["result"], json!([]), "{hist}");
 
-    let bal = rpc(
-        &mut stream,
-        3,
-        "blockchain.scripthash.get_balance",
-        json!([sh.clone()]),
-    )
-    .await;
+    let bal = rpc(&mut stream, 3, "blockchain.scripthash.get_balance", json!([sh.clone()])).await;
     assert_eq!(bal["result"]["confirmed"], 0, "{bal}");
 
-    let unspent = rpc(
-        &mut stream,
-        4,
-        "blockchain.scripthash.listunspent",
-        json!([sh.clone()]),
-    )
-    .await;
+    let unspent =
+        rpc(&mut stream, 4, "blockchain.scripthash.listunspent", json!([sh.clone()])).await;
     assert_eq!(unspent["result"], json!([]), "{unspent}");
 
-    let mem = rpc(
-        &mut stream,
-        5,
-        "blockchain.scripthash.get_mempool",
-        json!([sh]),
-    )
-    .await;
+    let mem = rpc(&mut stream, 5, "blockchain.scripthash.get_mempool", json!([sh])).await;
     assert_eq!(mem["result"], json!([]), "{mem}");
 
     handle.shutdown().await;
@@ -1916,9 +1437,7 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
     let q = Arc::new(q);
     let (tip_tx, _) = broadcast::channel(4);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(cfg, q, params, tip_tx, None)
-        .await
-        .expect("electrum listen");
+    let handle = run_electrum(cfg, q, params, tip_tx, None).await.expect("electrum listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
 
     let req = json!({
@@ -1936,11 +1455,7 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
     let result: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(result["id"], "scan");
     let map = result["result"].as_object().expect("result map");
-    assert_eq!(
-        map.len(),
-        1,
-        "JSON-RPC result must be one height, got {map:?}"
-    );
+    assert_eq!(map.len(), 1, "JSON-RPC result must be one height, got {map:?}");
     assert!(map.contains_key("1"), "{map:?}");
     assert_eq!(
         map["1"].as_object().map(|o| o.len()),
@@ -1961,10 +1476,7 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
         json!(rbitcoin_primitives::hex_encode(xonly.serialize())),
         "{h2_txs:?}"
     );
-    assert_eq!(
-        h2_txs[&spend_key]["output_pubkeys"]["0"][1],
-        json!(49_0000_0000_u64)
-    );
+    assert_eq!(h2_txs[&spend_key]["output_pubkeys"]["0"][1], json!(49_0000_0000_u64));
 
     read_line_timeout(&mut reader, &mut resp, "tweaks 3").await;
     let n3: Value = serde_json::from_str(&resp).unwrap();
@@ -1972,11 +1484,7 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
     let p3 = n3["params"][0].as_object().expect("notify 3");
     assert_eq!(p3.len(), 1);
     assert!(p3.contains_key("3"), "{p3:?}");
-    assert_eq!(
-        p3["3"].as_object().map(|o| o.len()),
-        Some(0),
-        "height 3 has no P2TR spend: {p3:?}"
-    );
+    assert_eq!(p3["3"].as_object().map(|o| o.len()), Some(0), "height 3 has no P2TR spend: {p3:?}");
 
     read_line_timeout(&mut reader, &mut resp, "tweaks done").await;
     let done: Value = serde_json::from_str(&resp).unwrap();
@@ -1990,25 +1498,13 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
     });
     let mut past_line = serde_json::to_string(&past).unwrap();
     past_line.push('\n');
-    reader
-        .get_mut()
-        .write_all(past_line.as_bytes())
-        .await
-        .unwrap();
+    reader.get_mut().write_all(past_line.as_bytes()).await.unwrap();
     read_line_timeout(&mut reader, &mut resp, "tweaks past result").await;
     let past_result: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(past_result["id"], "past");
     let past_map = past_result["result"].as_object().expect("past map");
-    assert_eq!(
-        past_map.len(),
-        1,
-        "start past tip is one empty height: {past_map:?}"
-    );
-    assert_eq!(
-        past_map["99"].as_object().map(|o| o.len()),
-        Some(0),
-        "{past_map:?}"
-    );
+    assert_eq!(past_map.len(), 1, "start past tip is one empty height: {past_map:?}");
+    assert_eq!(past_map["99"].as_object().map(|o| o.len()), Some(0), "{past_map:?}");
     read_line_timeout(&mut reader, &mut resp, "tweaks past done").await;
     let past_done: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(past_done["method"], "blockchain.tweaks.subscribe");
@@ -2030,9 +1526,7 @@ async fn electrum_max_connections_rejects_extra_client() {
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     cfg.limits.max_connections = 1;
     cfg.limits.idle_timeout = Duration::from_secs(30);
-    let handle = run_electrum(cfg, q, params, tip_tx, None)
-        .await
-        .expect("listen");
+    let handle = run_electrum(cfg, q, params, tip_tx, None).await.expect("listen");
     let held = TcpStream::connect(handle.local_addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     let mut second = TcpStream::connect(handle.local_addr).await.unwrap();
@@ -2046,10 +1540,7 @@ async fn electrum_max_connections_rejects_extra_client() {
         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {}
         Ok(Ok(n)) => {
             let s = std::str::from_utf8(&buf[..n]).unwrap_or("");
-            assert!(
-                !s.contains("\"result\""),
-                "second client must not get RPC result at cap: {s}"
-            );
+            assert!(!s.contains("\"result\""), "second client must not get RPC result at cap: {s}");
         }
     }
     drop(held);
@@ -2066,9 +1557,7 @@ async fn electrum_idle_timeout_disconnects_quiet_client() {
     let (tip_tx, _) = broadcast::channel(4);
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     cfg.limits.idle_timeout = Duration::from_millis(80);
-    let handle = run_electrum(cfg, q, params, tip_tx, None)
-        .await
-        .expect("listen");
+    let handle = run_electrum(cfg, q, params, tip_tx, None).await.expect("listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
     let mut buf = [0u8; 16];
     let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
@@ -2132,10 +1621,7 @@ fn direct_indexes_then_sh_bulk_at_tip() {
         script_hash(&[0x51])
     };
     let hist = q.scripthash_history(&sh).unwrap();
-    assert!(
-        !hist.is_empty(),
-        "scripthash history non-empty after SH bulk"
-    );
+    assert!(!hist.is_empty(), "scripthash history non-empty after SH bulk");
     q.flush().unwrap();
     drop(q);
 

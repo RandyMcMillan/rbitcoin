@@ -251,13 +251,7 @@ impl<T: Sync> OwnedWave<T> {
 
     pub(crate) fn finish(self) -> Result<(), ConsensusError> {
         self.wave.wait_done();
-        match self
-            .wave
-            .first_err
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
+        match self.wave.first_err.lock().unwrap_or_else(|p| p.into_inner()).take() {
             Some(e) => Err(e),
             None => Ok(()),
         }
@@ -284,9 +278,7 @@ pub(crate) fn start_for_each_owned<T: Sync>(
     f: fn(&T) -> Result<(), ConsensusError>,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
     if on_steal_worker() {
-        return Err(ConsensusError::BadBlock(
-            "try_for_each from a script worker",
-        ));
+        return Err(ConsensusError::BadBlock("try_for_each from a script worker"));
     }
     if items.is_empty() {
         return Ok(None);
@@ -296,10 +288,7 @@ pub(crate) fn start_for_each_owned<T: Sync>(
         return Ok(None);
     }
     let items = items.into_boxed_slice();
-    let ctx = Box::new(ApplyCtx {
-        items: items.as_ptr(),
-        f,
-    });
+    let ctx = Box::new(ApplyCtx { items: items.as_ptr(), f });
     unsafe fn apply<T>(ptr: *const (), i: usize) -> Result<(), ConsensusError> {
         let ctx = unsafe { &*(ptr as *const ApplyCtx<T>) };
         (ctx.f)(unsafe { &*ctx.items.add(i) })
@@ -310,10 +299,7 @@ pub(crate) fn start_for_each_owned<T: Sync>(
         in_wave: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
         first_err: Mutex::new(None),
-        apply: Apply {
-            f: apply::<T>,
-            ctx: (&*ctx as *const ApplyCtx<T>).cast(),
-        },
+        apply: Apply { f: apply::<T>, ctx: (&*ctx as *const ApplyCtx<T>).cast() },
         done: Mutex::new(false),
         done_cv: Condvar::new(),
     });
@@ -323,11 +309,7 @@ pub(crate) fn start_for_each_owned<T: Sync>(
         publish_waves(&g);
     }
     wake_steal_workers();
-    Ok(Some(OwnedWave {
-        _items: items,
-        _ctx: ctx,
-        wave,
-    }))
+    Ok(Some(OwnedWave { _items: items, _ctx: ctx, wave }))
 }
 
 /// Parallel map over `items` until the first error (or all succeed).
@@ -350,9 +332,7 @@ where
     F: Fn(&T) -> Result<(), ConsensusError> + Sync,
 {
     if on_steal_worker() {
-        return Err(ConsensusError::BadBlock(
-            "try_for_each from a script worker",
-        ));
+        return Err(ConsensusError::BadBlock("try_for_each from a script worker"));
     }
     if items.is_empty() {
         return Ok(());
@@ -380,10 +360,7 @@ where
         in_wave: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
         first_err: Mutex::new(None),
-        apply: Apply {
-            f: apply::<T, F>,
-            ctx: (&ctx as *const Ctx<T, F>).cast(),
-        },
+        apply: Apply { f: apply::<T, F>, ctx: (&ctx as *const Ctx<T, F>).cast() },
         done: Mutex::new(false),
         done_cv: Condvar::new(),
     });
@@ -401,11 +378,7 @@ where
         publish_waves_bg(&g);
     }
 
-    let err = wave
-        .first_err
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take();
+    let err = wave.first_err.lock().unwrap_or_else(|p| p.into_inner()).take();
     match err {
         Some(e) => Err(e),
         None => Ok(()),
@@ -427,10 +400,7 @@ static WORKER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 static IDLE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 fn take_detached_job(pool: &ScriptWorkers) -> Option<Job> {
-    pool.jobs
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pop_front()
+    pool.jobs.lock().unwrap_or_else(|p| p.into_inner()).pop_front()
 }
 
 fn steal_or_job(pool: &ScriptWorkers) -> bool {
@@ -470,38 +440,32 @@ fn workers() -> &'static ScriptWorkers {
         epoch: AtomicUsize::new(0),
     });
     SPAWN.get_or_init(|| {
-        let n = thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .max(1);
+        let n = thread::available_parallelism().map(|p| p.get()).unwrap_or(4).max(1);
         let mut threads = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
-            let Ok(h) = thread::Builder::new()
-                .name(format!("rbtc-scripts-{i}"))
-                .spawn(move || {
-                    ON_STEAL_WORKER.with(|c| c.set(true));
-                    loop {
-                        if steal_or_job(pool) {
-                            continue;
-                        }
-                        let epoch = pool.epoch.load(Ordering::Acquire);
-                        if steal_or_job(pool) {
-                            continue;
-                        }
-                        if pool.epoch.load(Ordering::Acquire) != epoch {
-                            continue;
-                        }
-                        #[cfg(test)]
-                        maybe_delay_park();
-                        #[cfg(test)]
-                        IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
-                        thread::park();
-                        #[cfg(test)]
-                        IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+            let Ok(h) = thread::Builder::new().name(format!("rbtc-scripts-{i}")).spawn(move || {
+                ON_STEAL_WORKER.with(|c| c.set(true));
+                loop {
+                    if steal_or_job(pool) {
+                        continue;
                     }
-                })
-            else {
+                    let epoch = pool.epoch.load(Ordering::Acquire);
+                    if steal_or_job(pool) {
+                        continue;
+                    }
+                    if pool.epoch.load(Ordering::Acquire) != epoch {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    maybe_delay_park();
+                    #[cfg(test)]
+                    IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
+                    thread::park();
+                    #[cfg(test)]
+                    IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                }
+            }) else {
                 continue;
             };
             threads.push(h.thread().clone());
@@ -627,10 +591,7 @@ mod tests {
             assert!(n >= 1);
             let k = k.min(n);
             let gate = Arc::new((Mutex::new(false), Condvar::new()));
-            let me = Self {
-                gate: Arc::clone(&gate),
-                _occupy: occupy,
-            };
+            let me = Self { gate: Arc::clone(&gate), _occupy: occupy };
             let entered = Arc::new(AtomicUsize::new(0));
             for _ in 0..k {
                 let entered = Arc::clone(&entered);
@@ -646,10 +607,7 @@ mod tests {
             }
             let start = Instant::now();
             while entered.load(Ordering::SeqCst) < k {
-                assert!(
-                    start.elapsed() < Duration::from_secs(2),
-                    "failed to occupy steal workers"
-                );
+                assert!(start.elapsed() < Duration::from_secs(2), "failed to occupy steal workers");
                 thread::sleep(Duration::from_millis(1));
             }
             me
@@ -727,10 +685,7 @@ mod tests {
         spawn_detached(move || {
             let _ = tx.send(42u32);
         });
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
-            42
-        );
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), 42);
     }
 
     #[test]
@@ -810,10 +765,7 @@ mod tests {
         let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
         let start = Instant::now();
         while idle_waiter_count() == 0 {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "free worker did not park"
-            );
+            assert!(start.elapsed() < Duration::from_secs(2), "free worker did not park");
             thread::sleep(Duration::from_millis(1));
         }
         let arm = DelayParkArm::arm();
@@ -837,10 +789,7 @@ mod tests {
         });
         let start = Instant::now();
         while waves_bg_snap().load().is_empty() {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "wave was not published"
-            );
+            assert!(start.elapsed() < Duration::from_secs(2), "wave was not published");
             thread::sleep(Duration::from_millis(1));
         }
         arm.go();
@@ -919,10 +868,7 @@ mod tests {
             assert_eq!(h.load(Ordering::Relaxed), 1, "index {i} not run once");
         }
         let claims = STEAL_CLAIMS.load(Ordering::Relaxed);
-        assert!(
-            (8..32).contains(&claims),
-            "expected ~8 chunks of 32 for 256 jobs, got {claims}"
-        );
+        assert!((8..32).contains(&claims), "expected ~8 chunks of 32 for 256 jobs, got {claims}");
     }
 
     #[test]
@@ -941,10 +887,7 @@ mod tests {
         .unwrap();
         assert_eq!(hits.load(Ordering::Relaxed), 256);
         let locks = STEAL_WAVES_LOCKS.load(Ordering::Relaxed);
-        assert_eq!(
-            locks, 0,
-            "steal_index took WAVES {locks} times (must be snapshot load only)"
-        );
+        assert_eq!(locks, 0, "steal_index took WAVES {locks} times (must be snapshot load only)");
     }
 
     #[test]
@@ -952,10 +895,7 @@ mod tests {
         let got =
             run_detached_join(|| try_for_each_parallel_idle(&[1u32, 2], |_| Ok(()))).expect("join");
         let err = got.expect_err("must refuse nested wait");
-        assert!(
-            format!("{err}").contains("try_for_each from a script worker"),
-            "{err}"
-        );
+        assert!(format!("{err}").contains("try_for_each from a script worker"), "{err}");
     }
 
     /// Occupy every steal worker in a detached job, publish an idle wave whose
@@ -992,10 +932,7 @@ mod tests {
         occupy.release();
         let start = Instant::now();
         while !job2.load(Ordering::SeqCst) {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "idle wave starved the detached job"
-            );
+            assert!(start.elapsed() < Duration::from_secs(2), "idle wave starved the detached job");
             thread::sleep(Duration::from_millis(1));
         }
         idle.join().expect("idle thread").expect("idle ok");
@@ -1090,25 +1027,15 @@ mod tests {
         let _steal = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
         let _occupy = OCCUPY.lock().unwrap_or_else(|p| p.into_inner());
         let hold = HoldJobs::arm();
-        let a = start_for_each_owned((0..64u32).collect(), hold_job)
-            .unwrap()
-            .expect("wave a");
+        let a = start_for_each_owned((0..64u32).collect(), hold_job).unwrap().expect("wave a");
         let start = Instant::now();
         while a.has_unclaimed() {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "first wave not fully claimed"
-            );
+            assert!(start.elapsed() < Duration::from_secs(2), "first wave not fully claimed");
             thread::sleep(Duration::from_millis(1));
         }
         assert!(!fg_has_unclaimed());
-        let b = start_for_each_owned((0..64u32).collect(), hold_job)
-            .unwrap()
-            .expect("wave b");
-        assert!(
-            !a.is_complete(),
-            "first wave still in_wave when second is published"
-        );
+        let b = start_for_each_owned((0..64u32).collect(), hold_job).unwrap().expect("wave b");
+        assert!(!a.is_complete(), "first wave still in_wave when second is published");
         assert!(b.has_unclaimed() || fg_has_unclaimed() || !a.is_complete());
         drop(hold);
         a.finish().unwrap();
@@ -1152,10 +1079,7 @@ mod tests {
         let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
         let arm = DelayClaimArm::arm();
         let wave = thread::spawn(|| {
-            start_for_each_owned((0..2u32).collect(), ok_u32)
-                .unwrap()
-                .expect("wave")
-                .finish()
+            start_for_each_owned((0..2u32).collect(), ok_u32).unwrap().expect("wave").finish()
         });
         let start = Instant::now();
         while DELAY_CLAIM_ENTERED.load(Ordering::SeqCst) == 0 {
@@ -1167,10 +1091,7 @@ mod tests {
         }
         let snap = waves_snap().load();
         assert!(!snap.is_empty(), "wave not published");
-        assert!(
-            !snap[0].is_complete(),
-            "is_complete during in_wave-before-next window"
-        );
+        assert!(!snap[0].is_complete(), "is_complete during in_wave-before-next window");
         arm.go();
         wave.join().expect("join").expect("wave ok");
         occupy.release();

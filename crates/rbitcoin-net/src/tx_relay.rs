@@ -66,18 +66,11 @@ struct FeeSnapshot {
 
 impl FeeSnapshot {
     fn empty(now: Instant) -> Self {
-        Self {
-            by_depth_btc_per_kb: HashMap::new(),
-            chunks: Vec::new(),
-            computed_at: now,
-        }
+        Self { by_depth_btc_per_kb: HashMap::new(), chunks: Vec::new(), computed_at: now }
     }
 
     fn rate_btc_per_kb(&self, depth: u32) -> f64 {
-        self.by_depth_btc_per_kb
-            .get(&depth)
-            .copied()
-            .unwrap_or(-1.0)
+        self.by_depth_btc_per_kb.get(&depth).copied().unwrap_or(-1.0)
     }
 
     fn histogram(&self) -> Vec<(u64, u64)> {
@@ -130,8 +123,7 @@ impl<'a> QueryUtxoProvider<'a> {
 
 impl UtxoProvider for QueryUtxoProvider<'_> {
     fn note_spender(&self, tx: &Transaction) {
-        self.need_create_mtp
-            .store(tx_has_bip68_time_lock(tx), Ordering::Relaxed);
+        self.need_create_mtp.store(tx_has_bip68_time_lock(tx), Ordering::Relaxed);
     }
 
     fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
@@ -171,11 +163,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         else {
             return ChainPrevout::KnownUnavailable;
         };
-        let value = if out.value < 0 {
-            Amount::ZERO
-        } else {
-            Amount::from_sat(out.value as u64)
-        };
+        let value = if out.value < 0 { Amount::ZERO } else { Amount::from_sat(out.value as u64) };
         let is_coinbase = match self.query.tx_input_at_fk(fk, &rec, 0) {
             Ok(i) => i.is_coinbase() || i.prev_index == u32::MAX,
             Err(_) => {
@@ -204,10 +192,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .unwrap_or(0)
         };
         ChainPrevout::Unspent(Coin {
-            txout: TxOut {
-                value,
-                script_pubkey: ScriptBuf::from_bytes(out.script),
-            },
+            txout: TxOut { value, script_pubkey: ScriptBuf::from_bytes(out.script) },
             create_height,
             create_mtp,
             is_coinbase,
@@ -220,10 +205,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
 pub const MEMPOOL_RECENT_CAP: usize = 32;
 
 fn package_rpc_retry(e: &AcceptError) -> bool {
-    matches!(
-        e,
-        AcceptError::Orphaned { .. } | AcceptError::Policy("min relay fee")
-    )
+    matches!(e, AcceptError::Orphaned { .. } | AcceptError::Policy("min relay fee"))
 }
 
 fn is_hard_recent_reject(e: &AcceptError) -> bool {
@@ -271,10 +253,7 @@ struct MempoolShIndex {
 
 impl MempoolShIndex {
     fn new() -> Self {
-        Self {
-            by_sh: HashMap::new(),
-            by_tx: HashMap::new(),
-        }
+        Self { by_sh: HashMap::new(), by_tx: HashMap::new() }
     }
 
     fn insert(&mut self, txid: Txid, shs: Vec<[u8; 32]>) {
@@ -370,11 +349,7 @@ struct RecentConfirmed {
 
 impl RecentConfirmed {
     fn new() -> Self {
-        Self {
-            order: VecDeque::new(),
-            txids: HashSet::new(),
-            wtxids: HashSet::new(),
-        }
+        Self { order: VecDeque::new(), txids: HashSet::new(), wtxids: HashSet::new() }
     }
 
     fn note_block(&mut self, txs: &[Transaction]) {
@@ -552,11 +527,7 @@ impl MempoolHub {
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
-        let unbroadcast = if persist {
-            load_unbroadcast_file(&dir_buf)
-        } else {
-            HashSet::new()
-        };
+        let unbroadcast = if persist { load_unbroadcast_file(&dir_buf) } else { HashSet::new() };
         let hub = Self {
             dir: dir_buf,
             inner: RwLock::new(mp),
@@ -564,9 +535,7 @@ impl MempoolHub {
             relay_enabled: AtomicBool::new(false),
             announce,
             inv_flush,
-            recent: Mutex::new(std::collections::VecDeque::with_capacity(
-                MEMPOOL_RECENT_CAP,
-            )),
+            recent: Mutex::new(std::collections::VecDeque::with_capacity(MEMPOOL_RECENT_CAP)),
             recent_confirmed: Mutex::new(RecentConfirmed::new()),
             recent_rejects: Mutex::new(HashSet::new()),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
@@ -703,10 +672,7 @@ impl MempoolHub {
         }
         let mut by_txid: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
         for op in ops {
-            by_txid
-                .entry(op.txid.to_byte_array())
-                .or_default()
-                .push(op.vout);
+            by_txid.entry(op.txid.to_byte_array()).or_default().push(op.vout);
         }
         let txids: Vec<[u8; 32]> = by_txid.keys().copied().collect();
         let Ok(hits) = self.query.store().get_fk_by_txid_batch(&txids) else {
@@ -719,10 +685,7 @@ impl MempoolHub {
             };
             for &vout in vouts {
                 if let Ok(rec) = self.query.tx_output_at_fk(fk, vout) {
-                    let op = OutPoint {
-                        txid: Txid::from_byte_array(tid),
-                        vout,
-                    };
+                    let op = OutPoint { txid: Txid::from_byte_array(tid), vout };
                     out.insert(op, script_hash(&rec.script));
                 }
             }
@@ -861,14 +824,10 @@ impl MempoolHub {
     }
 
     fn meter_accept_stages(&self, lock_us: u64, stages: rbitcoin_mempool::AcceptStageUs) {
-        self.meter_accept_lock_us
-            .fetch_add(lock_us, Ordering::Relaxed);
-        self.meter_accept_utxo_us
-            .fetch_add(stages.utxo_us, Ordering::Relaxed);
-        self.meter_accept_script_us
-            .fetch_add(stages.script_us, Ordering::Relaxed);
-        self.meter_accept_durable_us
-            .fetch_add(stages.durable_us, Ordering::Relaxed);
+        self.meter_accept_lock_us.fetch_add(lock_us, Ordering::Relaxed);
+        self.meter_accept_utxo_us.fetch_add(stages.utxo_us, Ordering::Relaxed);
+        self.meter_accept_script_us.fetch_add(stages.script_us, Ordering::Relaxed);
+        self.meter_accept_durable_us.fetch_add(stages.durable_us, Ordering::Relaxed);
     }
 
     /// Sample-and-reset mempool/relay counters for the tip-follow 5s DEBUG line.
@@ -900,17 +859,9 @@ impl MempoolHub {
     }
 
     fn push_recent(&self, tx: &Transaction, r: &AcceptResult) {
-        let value_sat: u64 = tx
-            .output
-            .iter()
-            .map(|o| o.value.to_sat())
-            .fold(0u64, |a, b| a.saturating_add(b));
-        let entry = RecentAccept {
-            txid: r.txid,
-            fee_sat: r.fee_sat,
-            weight: r.weight,
-            value_sat,
-        };
+        let value_sat: u64 =
+            tx.output.iter().map(|o| o.value.to_sat()).fold(0u64, |a, b| a.saturating_add(b));
+        let entry = RecentAccept { txid: r.txid, fee_sat: r.fee_sat, weight: r.weight, value_sat };
         let mut q = self.recent.lock().unwrap();
         q.push_back(entry);
         while q.len() > MEMPOOL_RECENT_CAP {
@@ -927,9 +878,7 @@ impl MempoolHub {
 
     /// Compact durable mempool files (reclaim DEAD slots / body holes).
     pub fn compact(&self) -> Result<(u32, usize), String> {
-        self.lock_write()
-            .compact()
-            .map_err(|e| format!("mempool compact: {e}"))
+        self.lock_write().compact().map_err(|e| format!("mempool compact: {e}"))
     }
 
     /// Enable/disable peer tx inv/accept (false during IBD catch-up).
@@ -1055,11 +1004,7 @@ impl MempoolHub {
 
     pub fn tx_inv_due(&self, wtxid: &Wtxid) -> bool {
         let now = self.relay_now_secs();
-        self.accept_at
-            .lock()
-            .unwrap()
-            .get(wtxid)
-            .is_some_and(|at| now.saturating_sub(*at) >= 30)
+        self.accept_at.lock().unwrap().get(wtxid).is_some_and(|at| now.saturating_sub(*at) >= 30)
     }
 
     /// Any live wtxid has passed the 30s INV age gate (mocktime when set,
@@ -1151,11 +1096,7 @@ impl MempoolHub {
 
     fn live_confirmed_strong(&self, live: &[Txid]) -> Vec<Txid> {
         let tid_bytes: Vec<[u8; 32]> = live.iter().map(|t| t.to_byte_array()).collect();
-        let hits = self
-            .query
-            .store()
-            .get_fk_by_txid_batch(&tid_bytes)
-            .unwrap_or_default();
+        let hits = self.query.store().get_fk_by_txid_batch(&tid_bytes).unwrap_or_default();
         let mut to_drop = Vec::new();
         for (tid_b, row) in hits {
             let Some((fk, _)) = row else { continue };
@@ -1271,17 +1212,11 @@ impl MempoolHub {
     pub fn tip_script_pres(
         &self,
         txs: &[Transaction],
-    ) -> (
-        std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
-        HashSet<[u8; 32]>,
-    ) {
+    ) -> (std::sync::Arc<[rbitcoin_query::TxPrecompute]>, HashSet<[u8; 32]>) {
         if self.lock_read().live_count() == 0 {
             return rbitcoin_query::pres_for_tip(txs, true, |_| false);
         }
-        let mut v: Vec<_> = txs
-            .iter()
-            .map(rbitcoin_query::TxPrecompute::from_tx_connect)
-            .collect();
+        let mut v: Vec<_> = txs.iter().map(rbitcoin_query::TxPrecompute::from_tx_connect).collect();
         let skip = {
             let g = self.lock_read();
             v.iter()
@@ -1302,16 +1237,12 @@ impl MempoolHub {
     }
 
     pub fn flush(&self) -> Result<(), String> {
-        self.lock_write()
-            .flush()
-            .map_err(|e| format!("mempool flush: {e}"))
+        self.lock_write().flush().map_err(|e| format!("mempool flush: {e}"))
     }
 
     /// Time-based sidecar persist (5 s, no fsync). No-op when clean or too soon.
     pub fn persist_due(&self) -> Result<(), String> {
-        self.lock_write()
-            .persist_due()
-            .map_err(|e| format!("mempool persist: {e}"))
+        self.lock_write().persist_due().map_err(|e| format!("mempool persist: {e}"))
     }
 
     pub fn contains(&self, txid: &Txid) -> bool {
@@ -1329,19 +1260,10 @@ impl MempoolHub {
         {
             return true;
         }
-        if self
-            .recent_confirmed
-            .try_lock()
-            .ok()
-            .is_some_and(|r| r.contains_txid(txid))
-        {
+        if self.recent_confirmed.try_lock().ok().is_some_and(|r| r.contains_txid(txid)) {
             return true;
         }
-        self.query
-            .tx_fk_by_txid_tip(&txid.to_byte_array())
-            .ok()
-            .flatten()
-            .is_some()
+        self.query.tx_fk_by_txid_tip(&txid.to_byte_array()).ok().flatten().is_some()
     }
 
     pub fn get_tx(&self, txid: &Txid) -> Option<Transaction> {
@@ -1350,10 +1272,7 @@ impl MempoolHub {
 
     /// Session getdata: never parks. Busy write → `None` (notfound this round).
     pub fn try_get_tx(&self, txid: &Txid) -> Option<Transaction> {
-        self.inner
-            .try_read()
-            .ok()
-            .and_then(|g| g.get_tx(txid).cloned())
+        self.inner.try_read().ok().and_then(|g| g.get_tx(txid).cloned())
     }
 
     /// Look up a live mempool tx by wtxid (BIP339 / compact v2).
@@ -1383,10 +1302,7 @@ impl MempoolHub {
         {
             return true;
         }
-        self.recent_confirmed
-            .try_lock()
-            .ok()
-            .is_some_and(|r| r.contains_wtxid(wtxid))
+        self.recent_confirmed.try_lock().ok().is_some_and(|r| r.contains_wtxid(wtxid))
     }
 
     /// Remember confirmed bodies for INV AlreadyHave (txid + wtxid).
@@ -1421,10 +1337,7 @@ impl MempoolHub {
 
     /// Session TX filter: never parks. Busy lock → `false` (re-ATMP).
     pub fn try_recent_reject(&self, wtxid: &Wtxid) -> bool {
-        self.recent_rejects
-            .try_lock()
-            .ok()
-            .is_some_and(|g| g.contains(wtxid))
+        self.recent_rejects.try_lock().ok().is_some_and(|g| g.contains(wtxid))
     }
 
     /// Confirmed tip snapshot for mempool structural checks (height + BIP113 MTP).
@@ -1488,14 +1401,7 @@ impl MempoolHub {
         let t_prep = Instant::now();
         let prep = {
             let g = self.lock_read();
-            g.prepare_admit(
-                tx,
-                utxo,
-                tip,
-                spec.fee_delta,
-                spec.report_orphans,
-                spec.min_relay,
-            )
+            g.prepare_admit(tx, utxo, tip, spec.fee_delta, spec.report_orphans, spec.min_relay)
         };
         if spec.time_prepare_lock {
             *lock_us = lock_us.saturating_add(t_prep.elapsed().as_micros() as u64);
@@ -1511,14 +1417,11 @@ impl MempoolHub {
         if let Err(e) =
             rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
         {
-            stages.script_us = stages
-                .script_us
-                .saturating_add(t_script.elapsed().as_micros() as u64);
+            stages.script_us =
+                stages.script_us.saturating_add(t_script.elapsed().as_micros() as u64);
             return Err(AcceptError::Script(e.to_string()));
         }
-        stages.script_us = stages
-            .script_us
-            .saturating_add(t_script.elapsed().as_micros() as u64);
+        stages.script_us = stages.script_us.saturating_add(t_script.elapsed().as_micros() as u64);
         Ok(prep)
     }
 
@@ -1663,10 +1566,8 @@ impl MempoolHub {
     }
 
     fn rollback_package_accepted(&self, accepted: &[AcceptResult]) {
-        let victims: Vec<Transaction> = accepted
-            .iter()
-            .flat_map(|r| r.replaced_txs.iter().cloned())
-            .collect();
+        let victims: Vec<Transaction> =
+            accepted.iter().flat_map(|r| r.replaced_txs.iter().cloned()).collect();
         let mut gone = Vec::new();
         {
             let mut g = self.lock_write();
@@ -1721,14 +1622,7 @@ impl MempoolHub {
         self.note_fee_flow_admit(r.weight, r.fee_sat);
         self.push_recent(tx, r);
         self.index_txid(r.txid, tx, prevouts);
-        let shs = self
-            .sh_index
-            .lock()
-            .unwrap()
-            .by_tx
-            .get(&r.txid)
-            .cloned()
-            .unwrap_or_default();
+        let shs = self.sh_index.lock().unwrap().by_tx.get(&r.txid).cloned().unwrap_or_default();
         self.publish_announce(r, shs);
         self.note_template_update();
         self.promote_orphans_staged(r.txid, utxo);
@@ -2021,19 +1915,8 @@ impl MempoolHub {
             for old in &r.replaced {
                 self.unindex_txid(old);
             }
-            self.index_txid(
-                r.txid,
-                tx,
-                prevouts.get(i).map(Vec::as_slice).unwrap_or(&[]),
-            );
-            let shs = self
-                .sh_index
-                .lock()
-                .unwrap()
-                .by_tx
-                .get(&r.txid)
-                .cloned()
-                .unwrap_or_default();
+            self.index_txid(r.txid, tx, prevouts.get(i).map(Vec::as_slice).unwrap_or(&[]));
+            let shs = self.sh_index.lock().unwrap().by_tx.get(&r.txid).cloned().unwrap_or_default();
             self.publish_announce(r, shs);
             self.promote_orphans_staged(r.txid, &utxo);
         }
@@ -2147,37 +2030,21 @@ impl MempoolHub {
     }
 
     pub fn add_orphan_announcer(&self, txid: &Txid, peer: u64) -> bool {
-        if self
-            .inner
-            .try_read()
-            .ok()
-            .is_none_or(|g| !g.orphanage.contains(txid))
-        {
+        if self.inner.try_read().ok().is_none_or(|g| !g.orphanage.contains(txid)) {
             return false;
         }
-        self.orphan_write(|g| g.orphanage.add_announcer(txid, peer))
-            .unwrap_or(false)
+        self.orphan_write(|g| g.orphanage.add_announcer(txid, peer)).unwrap_or(false)
     }
 
     pub fn add_orphan_announcer_wtxid(&self, wtxid: &Wtxid, peer: u64) -> bool {
-        if self
-            .inner
-            .try_read()
-            .ok()
-            .is_none_or(|g| !g.orphanage.contains_wtxid(wtxid))
-        {
+        if self.inner.try_read().ok().is_none_or(|g| !g.orphanage.contains_wtxid(wtxid)) {
             return false;
         }
-        self.orphan_write(|g| g.orphanage.add_announcer_wtxid(wtxid, peer))
-            .unwrap_or(false)
+        self.orphan_write(|g| g.orphanage.add_announcer_wtxid(wtxid, peer)).unwrap_or(false)
     }
 
     pub fn erase_orphans_for_peer(&self, peer: u64) {
-        let skip = self
-            .inner
-            .try_read()
-            .ok()
-            .is_some_and(|g| !g.orphanage.has_announcer(peer));
+        let skip = self.inner.try_read().ok().is_some_and(|g| !g.orphanage.has_announcer(peer));
         if skip {
             return;
         }
@@ -2288,11 +2155,7 @@ impl MempoolHub {
 
     /// True when entry_sequence < peer's last INV sequence.
     pub fn is_relay_servable(&self, wtxid: &Wtxid, last_inv_seq: u64) -> bool {
-        self.relay_seq
-            .lock()
-            .unwrap()
-            .get(wtxid)
-            .is_some_and(|s| *s < last_inv_seq)
+        self.relay_seq.lock().unwrap().get(wtxid).is_some_and(|s| *s < last_inv_seq)
     }
 
     /// Entry sequence for a live wtxid, if we assigned one.
@@ -2395,12 +2258,7 @@ impl MempoolHub {
     }
 
     pub fn fee_delta(&self, txid: &Txid) -> i64 {
-        self.fee_deltas
-            .lock()
-            .unwrap()
-            .get(txid)
-            .copied()
-            .unwrap_or(0)
+        self.fee_deltas.lock().unwrap().get(txid).copied().unwrap_or(0)
     }
 
     /// Snapshot of live txs (for Electrum / RPC) — clones bodies.
@@ -2410,9 +2268,7 @@ impl MempoolHub {
         g.graph
             .iter()
             .filter_map(|(txid, e)| {
-                g.get_tx(txid)
-                    .cloned()
-                    .map(|tx| (*txid, e.fee_sat, e.weight, tx))
+                g.get_tx(txid).cloned().map(|tx| (*txid, e.fee_sat, e.weight, tx))
             })
             .collect()
     }
@@ -2426,27 +2282,16 @@ impl MempoolHub {
     pub fn list_live_meta(&self) -> Vec<(Txid, u64, u64)> {
         self.meter_list_live_meta.fetch_add(1, Ordering::Relaxed);
         let g = self.lock_read();
-        g.graph
-            .iter()
-            .map(|(txid, e)| (*txid, e.fee_sat, e.weight))
-            .collect()
+        g.graph.iter().map(|(txid, e)| (*txid, e.fee_sat, e.weight)).collect()
     }
 
     /// Fee/weight for one live mempool txid (no live-set scan).
     pub fn get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
-        self.lock_read()
-            .graph
-            .get(txid)
-            .map(|e| (e.fee_sat, e.weight))
+        self.lock_read().graph.get(txid).map(|e| (e.fee_sat, e.weight))
     }
 
     pub fn try_get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
-        self.inner
-            .try_read()
-            .ok()?
-            .graph
-            .get(txid)
-            .map(|e| (e.fee_sat, e.weight))
+        self.inner.try_read().ok()?.graph.get(txid).map(|e| (e.fee_sat, e.weight))
     }
 
     /// Compact fill: siphash live txid/wtxid, clone **matching** bodies only.
@@ -2465,10 +2310,7 @@ impl MempoolHub {
         if short_ids.is_empty() {
             return Some(HashMap::new());
         }
-        Some(
-            self.try_cmpct_avail(header, nonce, version, short_ids, &[])?
-                .0,
-        )
+        Some(self.try_cmpct_avail(header, nonce, version, short_ids, &[])?.0)
     }
 
     /// Same `try_read` as compact clone: matching bodies plus fill-source sets.
@@ -2482,10 +2324,8 @@ impl MempoolHub {
         version: u32,
         short_ids: &[bitcoin::bip152::ShortId],
         prefill_wtxids: &[bitcoin::Wtxid],
-    ) -> Option<(
-        HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
-        crate::compact::CmpctFillSets,
-    )> {
+    ) -> Option<(HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>, crate::compact::CmpctFillSets)>
+    {
         use bitcoin::bip152::ShortId;
         use bitcoin::Wtxid;
         let needed: std::collections::HashSet<ShortId> = short_ids.iter().copied().collect();
@@ -2647,10 +2487,7 @@ impl MempoolHub {
     pub fn depends_spentby(&self, txid: &Txid) -> Option<(Vec<Txid>, Vec<Txid>)> {
         let g = self.lock_read();
         let e = g.graph.get(txid)?;
-        Some((
-            e.parents.iter().copied().collect(),
-            e.children.iter().copied().collect(),
-        ))
+        Some((e.parents.iter().copied().collect(), e.children.iter().copied().collect()))
     }
 
     /// Prefix-maximal mining chunks as `{weight, fee}` points (decreasing feerate).
@@ -2732,11 +2569,8 @@ impl MempoolHub {
         let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
         let g = self.lock_read();
         let c = g.graph.cluster_of_delta(txid, d)?;
-        let chunks = c
-            .chunks
-            .iter()
-            .map(|ch| (ch.fee_sat as i64, ch.weight, ch.txids.clone()))
-            .collect();
+        let chunks =
+            c.chunks.iter().map(|ch| (ch.fee_sat as i64, ch.weight, ch.txids.clone())).collect();
         Some((c.total_weight, c.members.len(), chunks))
     }
 
@@ -2845,11 +2679,7 @@ impl MempoolHub {
         }
         let mut kept = Vec::with_capacity(want.len());
         for txid in want {
-            if self
-                .query
-                .tx_fk_by_txid_tip(&txid.to_byte_array())?
-                .is_some()
-            {
+            if self.query.tx_fk_by_txid_tip(&txid.to_byte_array())?.is_some() {
                 continue;
             }
             kept.push(txid);
@@ -2866,10 +2696,7 @@ impl MempoolHub {
                 if script_hash(o.script_pubkey.as_bytes()) != *scripthash {
                     continue;
                 }
-                let op = OutPoint {
-                    txid,
-                    vout: vout as u32,
-                };
+                let op = OutPoint { txid, vout: vout as u32 };
                 if g.graph.mempool_utxo(&op) {
                     delta = delta.saturating_add(o.value.to_sat() as i64);
                 }
@@ -2929,10 +2756,7 @@ impl MempoolHub {
     pub fn fee_estimates_btc_per_kb(&self) -> Vec<(u32, f64)> {
         self.maybe_refresh_fee_snapshot();
         let snap = self.fee_snapshot.load_full();
-        FEE_SNAPSHOT_DEPTHS
-            .iter()
-            .map(|&d| (d, snap.rate_btc_per_kb(d)))
-            .collect()
+        FEE_SNAPSHOT_DEPTHS.iter().map(|&d| (d, snap.rate_btc_per_kb(d))).collect()
     }
 
     /// Weight (WU) ranking strictly above `rate_sat_per_kvb` (published chunks).
@@ -3001,10 +2825,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}"))
     }
 
@@ -3018,10 +2839,7 @@ mod tests {
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000 - fee),
-                script_pubkey: spk,
-            }],
+            output: vec![TxOut { value: Amount::from_sat(50_0000_0000 - fee), script_pubkey: spk }],
         }
     }
 
@@ -3116,10 +2934,7 @@ mod tests {
             let live_id = tx.compute_txid().to_byte_array();
             assert_eq!(skip.len(), 1);
             assert!(skip.contains(&live_id));
-            assert!(
-                pres[0].sha_prevouts.is_none(),
-                "live graph tx must skip sighash midstates"
-            );
+            assert!(pres[0].sha_prevouts.is_none(), "live graph tx must skip sighash midstates");
             assert!(
                 pres[1].sha_prevouts.is_some(),
                 "non-live must fill midstates after connect ids"
@@ -3130,14 +2945,8 @@ mod tests {
             drop(hub);
             let hub2 = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
             let reopen = hub2.sample_reset_perf();
-            assert_eq!(
-                reopen.get_coin, 0,
-                "SH reindex must use stored vin aux, not get_txout"
-            );
-            assert!(
-                !hub2.scripthash_mempool(&sh).is_empty(),
-                "reopen SH index from stored hashes"
-            );
+            assert_eq!(reopen.get_coin, 0, "SH reindex must use stored vin aux, not get_txout");
+            assert!(!hub2.scripthash_mempool(&sh).is_empty(), "reopen SH index from stored hashes");
             hub2.set_relay_enabled(true);
             assert_eq!(hub2.unbroadcast_count(), 1);
             let mut rx = hub2.subscribe_announces();
@@ -3160,10 +2969,7 @@ mod tests {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: parent.compute_txid(),
-                        vout: 0,
-                    },
+                    previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     witness: Witness::new(),
@@ -3193,10 +2999,7 @@ mod tests {
             hub.set_relay_enabled(true);
             let mut ann_rx = hub.subscribe_announces();
             let provider = QueryUtxoProvider::new(q.as_ref());
-            let op0 = OutPoint {
-                txid: cbs[3],
-                vout: 0,
-            };
+            let op0 = OutPoint { txid: cbs[3], vout: 0 };
             assert!(provider.get_txout(&op0).is_some());
             let parent = spend_true(cbs[3], 1_000, spk.clone());
             let pr = hub.accept_tx(&parent).expect("accept parent");
@@ -3210,10 +3013,7 @@ mod tests {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: parent.compute_txid(),
-                        vout: 0,
-                    },
+                    previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     witness: Witness::new(),
@@ -3260,10 +3060,7 @@ mod tests {
                 e1b >= 0.0 && e144b >= 0.0 && e1b >= e144b,
                 "after confirm, N=1 must stay ≥ N=144: e1={e1b} e144={e144b}"
             );
-            assert!(
-                !hub.contains_wtxid(&wtxid),
-                "wtxid index must drop with the live entry"
-            );
+            assert!(!hub.contains_wtxid(&wtxid), "wtxid index must drop with the live entry");
             assert!(hub.get_tx_by_wtxid(&wtxid).is_none());
             assert!(
                 !hub.is_relay_servable(&wtxid, u64::MAX),
@@ -3282,8 +3079,7 @@ mod tests {
             for (i, cbtxid) in cbs[5..8].iter().enumerate() {
                 let fee = 1_000u64 + i as u64;
                 fee_sum += fee as i64;
-                hub.accept_tx(&spend_true(*cbtxid, fee, spk.clone()))
-                    .expect("accept spend");
+                hub.accept_tx(&spend_true(*cbtxid, fee, spk.clone())).expect("accept spend");
             }
             let n = 3u64;
             let s = hub.sample_reset_perf();
@@ -3322,21 +3118,13 @@ mod tests {
             let wtxid = tx.compute_wtxid();
             {
                 let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
-                store
-                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, &[])
-                    .unwrap();
+                store.append_live_tx(&tx, &tid, &wtxid, 1_000, 400, &[]).unwrap();
                 store.flush().unwrap();
             }
             let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
             let s = hub.sample_reset_perf();
-            assert_eq!(
-                s.get_coin, 0,
-                "missing-aux fill must batch Class A, not get_txout"
-            );
-            assert!(
-                !hub.scripthash_mempool(&sh).is_empty(),
-                "batch-fill the vin that lacked aux"
-            );
+            assert_eq!(s.get_coin, 0, "missing-aux fill must batch Class A, not get_txout");
+            assert!(!hub.scripthash_mempool(&sh).is_empty(), "batch-fill the vin that lacked aux");
             let _ = std::fs::remove_dir_all(&mp);
         }
 
@@ -3380,10 +3168,7 @@ mod tests {
         hub.note_mock_now(1_000 + 3600 + 5);
         let trigger = spend_true(trigger_utxo, 3_000, spk);
         hub.accept_tx(&trigger).expect("trigger expires stale");
-        assert!(
-            !hub.contains(&parent.compute_txid()),
-            "parent must expire after mempoolexpiry"
-        );
+        assert!(!hub.contains(&parent.compute_txid()), "parent must expire after mempoolexpiry");
         assert!(
             !hub.contains(&other.compute_txid()),
             "sibling accepted before expiry must also expire"
@@ -3422,8 +3207,7 @@ mod tests {
         hub.note_mock_now(1_000);
         let _ = hub.sample_reset_perf();
         for (i, cb) in cbs.iter().enumerate() {
-            hub.accept_tx(&spend_true(*cb, 1_000 + i as u64, spk.clone()))
-                .expect("accept");
+            hub.accept_tx(&spend_true(*cb, 1_000 + i as u64, spk.clone())).expect("accept");
         }
         let s = hub.sample_reset_perf();
         assert_eq!(
@@ -3462,15 +3246,10 @@ mod tests {
         let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
         hub.set_relay_enabled(true);
         let _ = hub.sample_reset_perf();
-        hub.accept_tx(&spend_true(cbs[0], 1_000, spk.clone()))
-            .expect("a");
+        hub.accept_tx(&spend_true(cbs[0], 1_000, spk.clone())).expect("a");
         hub.accept_tx(&spend_true(cbs[1], 2_000, spk)).expect("b");
         let s = hub.sample_reset_perf();
-        assert_eq!(
-            s.tip_mtp, 1,
-            "same tip must compute MTP once (got {})",
-            s.tip_mtp
-        );
+        assert_eq!(s.tip_mtp, 1, "same tip must compute MTP once (got {})", s.tip_mtp);
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -3517,10 +3296,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: confirmed.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: confirmed.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -3537,17 +3313,10 @@ mod tests {
             "chain-spend index_txid must not re-Query the same prevout (got {})",
             s.get_coin
         );
-        assert_eq!(
-            s.get_coin_block_tx_fks, 0,
-            "non-coinbase get_coin must not call block_tx_fks"
-        );
-        assert_eq!(
-            s.get_coin_create_mtp, 0,
-            "no BIP68 time-lock must not compute create MTP"
-        );
+        assert_eq!(s.get_coin_block_tx_fks, 0, "non-coinbase get_coin must not call block_tx_fks");
+        assert_eq!(s.get_coin_create_mtp, 0, "no BIP68 time-lock must not compute create MTP");
         assert!(
-            !hub.scripthash_mempool(&script_hash(spk.as_bytes()))
-                .is_empty(),
+            !hub.scripthash_mempool(&script_hash(spk.as_bytes())).is_empty(),
             "output script must still hit SH overlay"
         );
         let err = hub.accept_tx(&confirmed).unwrap_err();
@@ -3556,10 +3325,7 @@ mod tests {
             "confirmed body must not park as orphan, got {err}"
         );
         assert_eq!(hub.orphan_count(), 0);
-        assert!(
-            hub.try_contains(&confirmed.compute_txid()),
-            "INV AlreadyHave for Class A txid"
-        );
+        assert!(hub.try_contains(&confirmed.compute_txid()), "INV AlreadyHave for Class A txid");
         assert!(
             !hub.try_contains_wtxid(&confirmed.compute_wtxid()),
             "wtxid AlreadyHave needs the recent-confirmed ring"
@@ -3581,18 +3347,12 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: confirmed.compute_txid(),
-                    vout: 99,
-                },
+                previous_output: OutPoint { txid: confirmed.compute_txid(), vout: 99 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: spk.clone(),
-            }],
+            output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: spk.clone() }],
         };
         let err = hub.accept_tx(&oob).unwrap_err();
         assert!(
@@ -3607,10 +3367,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: confirmed.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: confirmed.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -3631,25 +3388,16 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[1],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[1], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::from_consensus((1 << 22) | 1),
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_9999_0000),
-                script_pubkey: spk,
-            }],
+            output: vec![TxOut { value: Amount::from_sat(49_9999_0000), script_pubkey: spk }],
         };
         hub.accept_tx(&timed).expect("bip68 time-lock spend");
         let s = hub.sample_reset_perf();
-        assert!(
-            s.get_coin_create_mtp >= 1,
-            "BIP68 time-lock spend must compute create MTP"
-        );
+        assert!(s.get_coin_create_mtp >= 1, "BIP68 time-lock spend must compute create MTP");
         hub.evict_after_reorg();
         assert!(
             hub.get_live_meta(&timed.compute_txid()).is_some(),
@@ -3735,20 +3483,14 @@ mod tests {
         let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         hub.accept_tx(&tx).expect("accept");
         let w = tx.compute_wtxid();
-        assert!(
-            !hub.tx_inv_due(&w),
-            "fresh accept must not be due before 30s"
-        );
+        assert!(!hub.tx_inv_due(&w), "fresh accept must not be due before 30s");
         {
             let mut ats = hub.accept_at.lock().unwrap();
             let at = ats.get_mut(&w).expect("accept_at");
             *at = at.saturating_sub(30);
             hub.min_live_accept_at.store(*at, Ordering::Relaxed);
         }
-        assert!(
-            hub.tx_inv_due(&w),
-            "30s wall age must due when mocktime is unset"
-        );
+        assert!(hub.tx_inv_due(&w), "30s wall age must due when mocktime is unset");
         assert!(hub.any_tx_inv_due());
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
@@ -3804,10 +3546,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([9u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([9u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -3818,10 +3557,7 @@ mod tests {
             }],
         };
         let err = hub.test_accept(&tx).unwrap_err();
-        assert!(
-            matches!(err, AcceptError::MissingPrevout(_)),
-            "dry-run missing parent: {err}"
-        );
+        assert!(matches!(err, AcceptError::MissingPrevout(_)), "dry-run missing parent: {err}");
         assert_eq!(hub.orphan_count(), 0);
         let err = hub.accept_tx(&tx).unwrap_err();
         assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
@@ -3839,9 +3575,7 @@ mod tests {
         assert_eq!(hub.scripthash_unconfirmed_delta(&[0u8; 32]).unwrap(), 0);
         assert!(hub.list_live().is_empty());
         assert!(!hub.contains_wtxid(&Wtxid::from_byte_array([0u8; 32])));
-        assert!(hub
-            .get_tx_by_wtxid(&Wtxid::from_byte_array([0u8; 32]))
-            .is_none());
+        assert!(hub.get_tx_by_wtxid(&Wtxid::from_byte_array([0u8; 32])).is_none());
         assert_eq!(hub.remove_for_block(&[]), 0);
         assert_eq!(hub.reorg_reaccept(&[]), 0);
         hub.flush().unwrap();
@@ -3863,10 +3597,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([9u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([9u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -3902,10 +3633,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([9u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([9u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -3915,35 +3643,23 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        assert!(matches!(
-            hub.accept_tx(&tx),
-            Err(AcceptError::Orphaned { .. })
-        ));
+        assert!(matches!(hub.accept_tx(&tx), Err(AcceptError::Orphaned { .. })));
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let nonce = 1u64;
         let keys = ShortId::calculate_siphash_keys(&genesis.header, nonce);
         let sid = ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys);
-        let got = hub
-            .try_clone_matching_shortids(&genesis.header, nonce, 2, &[sid])
-            .expect("read lock");
+        let got =
+            hub.try_clone_matching_shortids(&genesis.header, nonce, 2, &[sid]).expect("read lock");
         let bodies = got.get(&sid).expect("orphan must fill compact short-id");
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0].compute_txid(), tx.compute_txid());
         let w = tx.compute_wtxid();
-        let (_map, fill) = hub
-            .try_cmpct_avail(&genesis.header, nonce, 2, &[sid], &[])
-            .expect("avail");
-        assert!(
-            fill.orphan.contains(&w),
-            "clone source is the reconstruct fill"
-        );
-        let (_empty, pref) = hub
-            .try_cmpct_avail(&genesis.header, nonce, 2, &[], &[w])
-            .expect("prefill classify");
-        assert!(
-            pref.orphan.contains(&w),
-            "prefill wtxids classified in the same read as clone"
-        );
+        let (_map, fill) =
+            hub.try_cmpct_avail(&genesis.header, nonce, 2, &[sid], &[]).expect("avail");
+        assert!(fill.orphan.contains(&w), "clone source is the reconstruct fill");
+        let (_empty, pref) =
+            hub.try_cmpct_avail(&genesis.header, nonce, 2, &[], &[w]).expect("prefill classify");
+        assert!(pref.orphan.contains(&w), "prefill wtxids classified in the same read as clone");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -3960,10 +3676,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([8u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([8u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -3978,13 +3691,9 @@ mod tests {
         let nonce = 3u64;
         let keys = ShortId::calculate_siphash_keys(&genesis.header, nonce);
         let sid = ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys);
-        let (_map, fill) = hub
-            .try_cmpct_avail(&genesis.header, nonce, 2, &[sid], &[])
-            .expect("avail");
-        assert!(
-            fill.extra.contains(&tx.compute_wtxid()),
-            "compact-seen extra must fill short-ids"
-        );
+        let (_map, fill) =
+            hub.try_cmpct_avail(&genesis.header, nonce, 2, &[sid], &[]).expect("avail");
+        assert!(fill.extra.contains(&tx.compute_wtxid()), "compact-seen extra must fill short-ids");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4018,41 +3727,26 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
             output: vec![
-                TxOut {
-                    value: Amount::from_sat(25_0000_0000),
-                    script_pubkey: spk.clone(),
-                },
-                TxOut {
-                    value: Amount::from_sat(25_0000_0000 - 200),
-                    script_pubkey: spk.clone(),
-                },
+                TxOut { value: Amount::from_sat(25_0000_0000), script_pubkey: spk.clone() },
+                TxOut { value: Amount::from_sat(25_0000_0000 - 200), script_pubkey: spk.clone() },
             ],
         };
         let parent_id = parent.compute_txid();
         assert!(
-            matches!(
-                hub.accept_tx(&parent),
-                Err(AcceptError::Policy("min relay fee"))
-            ),
+            matches!(hub.accept_tx(&parent), Err(AcceptError::Policy("min relay fee"))),
             "parent alone below min-relay"
         );
         let sib = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent_id,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent_id, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4063,36 +3757,23 @@ mod tests {
             }],
         };
         let sib_id = sib.compute_txid();
-        assert!(matches!(
-            hub.accept_tx(&sib),
-            Err(AcceptError::Orphaned { .. })
-        ));
+        assert!(matches!(hub.accept_tx(&sib), Err(AcceptError::Orphaned { .. })));
         assert_eq!(hub.orphan_count(), 1);
         let child = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent_id,
-                    vout: 1,
-                },
+                previous_output: OutPoint { txid: parent_id, vout: 1 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: spk,
-            }],
+            output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk }],
         };
-        hub.accept_tx(&child)
-            .expect("hub 1p1c must admit parent+child");
+        hub.accept_tx(&child).expect("hub 1p1c must admit parent+child");
         assert!(hub.contains(&parent_id));
         assert!(hub.contains(&child.compute_txid()));
-        assert!(
-            !hub.contains(&sib_id),
-            "1-sat sibling must not ride 1p1c promote at floor 0"
-        );
+        assert!(!hub.contains(&sib_id), "1-sat sibling must not ride 1p1c promote at floor 0");
         assert_eq!(hub.orphan_count(), 0);
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
@@ -4130,60 +3811,38 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
             output: vec![
-                TxOut {
-                    value: Amount::from_sat(25_0000_0000),
-                    script_pubkey: spk.clone(),
-                },
-                TxOut {
-                    value: Amount::from_sat(25_0000_0000 - 200),
-                    script_pubkey: spk.clone(),
-                },
+                TxOut { value: Amount::from_sat(25_0000_0000), script_pubkey: spk.clone() },
+                TxOut { value: Amount::from_sat(25_0000_0000 - 200), script_pubkey: spk.clone() },
             ],
         };
         let parent_id = parent.compute_txid();
         assert!(
-            matches!(
-                hub.accept_tx(&parent),
-                Err(AcceptError::Policy("min relay fee"))
-            ),
+            matches!(hub.accept_tx(&parent), Err(AcceptError::Policy("min relay fee"))),
             "parent alone below min-relay"
         );
         let child = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent_id,
-                    vout: 1,
-                },
+                previous_output: OutPoint { txid: parent_id, vout: 1 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: spk.clone(),
-            }],
+            output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk.clone() }],
         };
-        hub.accept_tx(&child)
-            .expect("hub 1p1c must admit parent+child");
+        hub.accept_tx(&child).expect("hub 1p1c must admit parent+child");
         let sib = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent_id,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent_id, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4208,10 +3867,7 @@ mod tests {
             "published spender must leave wtxid/relay maps"
         );
         assert!(hub.accept_time_txid(&sib_id).is_none());
-        assert!(
-            hub.template_updates() > tmpl,
-            "template must bump like remove_for_block_spent"
-        );
+        assert!(hub.template_updates() > tmpl, "template must bump like remove_for_block_spent");
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4246,10 +3902,7 @@ mod tests {
         let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let hub = MempoolHub::open_with_weight(&dir, Arc::new(q), 1_000_000).unwrap();
         hub.set_relay_enabled(true);
-        assert!(matches!(
-            hub.accept_package(&[]),
-            Err(AcceptError::PackageEmpty)
-        ));
+        assert!(matches!(hub.accept_package(&[]), Err(AcceptError::PackageEmpty)));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4265,10 +3918,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([0x44; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([0x44; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4316,20 +3966,14 @@ mod tests {
         hub.set_relay_enabled(true);
         let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
         assert!(
-            matches!(
-                hub.accept_tx(&parent),
-                Err(AcceptError::Policy("min relay fee"))
-            ),
+            matches!(hub.accept_tx(&parent), Err(AcceptError::Policy("min relay fee"))),
             "parent must fail min-relay alone"
         );
         let child = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4357,10 +4001,7 @@ mod tests {
         let hub = MempoolHub::open(&dir, q).unwrap();
         hub.set_relay_enabled(true);
         let cheap = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
-        assert!(matches!(
-            hub.accept_tx(&cheap),
-            Err(AcceptError::Policy("min relay fee"))
-        ));
+        assert!(matches!(hub.accept_tx(&cheap), Err(AcceptError::Policy("min relay fee"))));
         assert!(
             !hub.try_recent_reject(&cheap.compute_wtxid()),
             "min-relay is reconsiderable; must not skip a later ATMP"
@@ -4380,10 +4021,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        assert!(matches!(
-            hub.accept_tx(&coinbase),
-            Err(AcceptError::Coinbase)
-        ));
+        assert!(matches!(hub.accept_tx(&coinbase), Err(AcceptError::Coinbase)));
         assert!(
             hub.try_recent_reject(&coinbase.compute_wtxid()),
             "hard reject must land in recent_rejects"
@@ -4425,10 +4063,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4444,10 +4079,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: cbs[0], vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4462,32 +4094,18 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: high_id,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: high_id, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: spk,
-            }],
+            output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk }],
         };
         bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
-        let err = hub
-            .accept_package(&[high, bad_child])
-            .expect_err("annex child must fail");
-        assert!(
-            matches!(err, AcceptError::Policy("libre annex")),
-            "got {err}"
-        );
+        let err = hub.accept_package(&[high, bad_child]).expect_err("annex child must fail");
+        assert!(matches!(err, AcceptError::Policy("libre annex")), "got {err}");
         assert!(!hub.contains(&high_id));
-        assert!(
-            hub.contains(&low_id),
-            "hub package rollback must restore the RBF victim"
-        );
+        assert!(hub.contains(&low_id), "hub package rollback must restore the RBF victim");
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4497,10 +4115,7 @@ mod tests {
         let store_dir = tmp();
         let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let provider = QueryUtxoProvider::new(&q);
-        let op = OutPoint {
-            txid: Txid::from_byte_array([0xcd; 32]),
-            vout: 0,
-        };
+        let op = OutPoint { txid: Txid::from_byte_array([0xcd; 32]), vout: 0 };
         assert!(provider.get_txout(&op).is_none());
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4580,10 +4195,7 @@ mod tests {
         assert_eq!(bulk.len(), 11);
         assert!(bulk.iter().all(|(d, v)| *d >= 1 && *v < 0.0));
         // Second call hits cache (not dirty/stale immediately) — still consistent.
-        assert_eq!(
-            hub.estimate_fee_btc_per_kb(6),
-            hub.fee_estimates_btc_per_kb()[4].1
-        );
+        assert_eq!(hub.estimate_fee_btc_per_kb(6), hub.fee_estimates_btc_per_kb()[4].1);
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4600,11 +4212,7 @@ mod tests {
         hub.mark_fee_dirty();
         let bulk = hub.fee_estimates_btc_per_kb();
         let sat = |pairs: &[(u32, f64)], d: u32| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == d)
-                .map(|(_, v)| (*v * 100_000.0).round())
-                .unwrap()
+            pairs.iter().find(|(k, _)| *k == d).map(|(_, v)| (*v * 100_000.0).round()).unwrap()
         };
         let s1 = sat(&bulk, 1);
         let s144 = sat(&bulk, 144);
@@ -4640,16 +4248,9 @@ mod tests {
         hub.push_block_p10(1);
         hub.mark_fee_dirty();
         let bulk = hub.fee_estimates_btc_per_kb();
-        let v144 = bulk
-            .iter()
-            .find(|(k, _)| *k == 144)
-            .map(|(_, v)| *v)
-            .unwrap();
+        let v144 = bulk.iter().find(|(k, _)| *k == 144).map(|(_, v)| *v).unwrap();
         let min_btc = MempoolHub::relay_fee_btc_per_kb();
-        assert!(
-            v144 + 1e-12 >= min_btc,
-            "hist below min-relay must clamp: {v144} min={min_btc}"
-        );
+        assert!(v144 + 1e-12 >= min_btc, "hist below min-relay must clamp: {v144} min={min_btc}");
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4689,10 +4290,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([1u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4733,10 +4331,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([1u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([1u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4748,10 +4343,7 @@ mod tests {
         };
         let r = hub.accept_tx_async(tx).await;
         assert!(
-            matches!(
-                r,
-                Err(AcceptError::Orphaned { .. }) | Err(AcceptError::MissingPrevout(_))
-            ),
+            matches!(r, Err(AcceptError::Orphaned { .. }) | Err(AcceptError::MissingPrevout(_))),
             "async accept off reactor: {r:?}"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
@@ -4786,10 +4378,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([9u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([9u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -4955,9 +4544,8 @@ mod tests {
             }
             fn get_coin(&self, op: &OutPoint) -> Option<rbitcoin_mempool::Coin> {
                 let h = Arc::clone(&self.hub);
-                let write_held = thread::spawn(move || h.inner.try_read().is_err())
-                    .join()
-                    .expect("probe");
+                let write_held =
+                    thread::spawn(move || h.inner.try_read().is_err()).join().expect("probe");
                 if write_held {
                     self.write_hits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -5031,18 +4619,12 @@ mod tests {
         hub.set_relay_enabled(true);
         let entered = Arc::new(AtomicBool::new(false));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
-        let stall = StallUtxo {
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        };
+        let stall = StallUtxo { entered: Arc::clone(&entered), release: Arc::clone(&release) };
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([7u8; 32]),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array([7u8; 32]), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -5056,10 +4638,7 @@ mod tests {
         let join = thread::spawn(move || h.accept_with_utxo(&tx, &stall, None));
         let start = Instant::now();
         while !entered.load(Ordering::Acquire) {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "UTXO provider never entered"
-            );
+            assert!(start.elapsed() < Duration::from_secs(2), "UTXO provider never entered");
             thread::yield_now();
         }
         let miss = Wtxid::from_byte_array([0u8; 32]);

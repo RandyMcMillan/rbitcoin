@@ -53,12 +53,7 @@ pub fn sh_unique_hint_default(scale: HeadScale) -> u64 {
 #[inline]
 pub fn sh_per_shard_key_budget(unique_hint: u64, n_shards: usize) -> u64 {
     let n = n_shards.max(1) as u64;
-    unique_hint
-        .max(1)
-        .div_ceil(n)
-        .saturating_mul(5)
-        .div_ceil(4)
-        .max(1)
+    unique_hint.max(1).div_ceil(n).saturating_mul(5).div_ceil(4).max(1)
 }
 
 /// Shard index from the **high bits** of `scripthash[0]` (power-of-two `n_shards`).
@@ -150,9 +145,8 @@ fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
         for i in 0..n {
             let base = i * SH_HEAD_SLOT_SIZE;
             let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
-            let v: [u8; SH_HEAD_VALUE_LEN] = buf[base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
-                .try_into()
-                .unwrap();
+            let v: [u8; SH_HEAD_VALUE_LEN] =
+                buf[base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE].try_into().unwrap();
             if !is_empty_slot(&k, &v) {
                 unpack8_bytes(&v)?;
                 occupied += 1;
@@ -176,14 +170,7 @@ impl ScriptHashHead {
         file.set_logical_len(need)?;
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
         let _ = store_occ_sidecar(file.path(), 0);
-        Ok(Self {
-            file,
-            state: Mutex::new(HashState {
-                slots,
-                occupied: 0,
-                occ_known: true,
-            }),
-        })
+        Ok(Self { file, state: Mutex::new(HashState { slots, occupied: 0, occ_known: true }) })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
@@ -198,9 +185,7 @@ impl ScriptHashHead {
         }
         let slots = body / SH_HEAD_SLOT_SIZE as u64;
         if !slots.is_power_of_two() {
-            return Err(StoreError::Corrupt(
-                "scripthash head slots not power of two",
-            ));
+            return Err(StoreError::Corrupt("scripthash head slots not power of two"));
         }
         let (occupied, occ_known) = if body <= OCC_SCAN_BYTE_CAP {
             // Tiny heads: always walk slots so leftover pack8 Paged refuses on open.
@@ -220,14 +205,7 @@ impl ScriptHashHead {
             );
             (0, false)
         };
-        Ok(Self {
-            file,
-            state: Mutex::new(HashState {
-                slots,
-                occupied,
-                occ_known,
-            }),
-        })
+        Ok(Self { file, state: Mutex::new(HashState { slots, occupied, occ_known }) })
     }
 
     fn persist_occ(&self, occupied: u64) {
@@ -423,10 +401,8 @@ impl ScriptHashHead {
             for _ in 0..slots {
                 let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
                 let slot_key: ShHeadKey = table[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
-                let slot_v: [u8; SH_HEAD_VALUE_LEN] = table
-                    [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
-                    .try_into()
-                    .unwrap();
+                let slot_v: [u8; SH_HEAD_VALUE_LEN] =
+                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].try_into().unwrap();
                 if is_empty_slot(&slot_key, &slot_v) {
                     table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(key);
                     table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
@@ -476,10 +452,8 @@ impl ScriptHashHead {
             for i in 0..n {
                 let base = i * SH_HEAD_SLOT_SIZE;
                 let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] = buf
-                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
-                    .try_into()
-                    .unwrap();
+                let v: [u8; SH_HEAD_VALUE_LEN] =
+                    buf[base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE].try_into().unwrap();
                 if is_empty_slot(&k, &v) {
                     continue;
                 }
@@ -532,12 +506,7 @@ struct CachedChunk {
 
 impl<'a> SlotPageCache<'a> {
     fn new(head: &'a ScriptHashHead, slots: u64) -> Self {
-        Self {
-            head,
-            slots,
-            chunks: BTreeMap::new(),
-            chunk_loads: 0,
-        }
+        Self { head, slots, chunks: BTreeMap::new(), chunk_loads: 0 }
     }
 
     /// Probe-insert. When `allow_new` is false, only in-place updates of an
@@ -573,9 +542,8 @@ impl<'a> SlotPageCache<'a> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SH_HEAD_SLOT_SIZE;
         let k: ShHeadKey = chunk.data[rel..rel + SH_HEAD_KEY_LEN].try_into().unwrap();
-        let v: [u8; SH_HEAD_VALUE_LEN] = chunk.data[rel + SH_HEAD_KEY_LEN..rel + SH_HEAD_SLOT_SIZE]
-            .try_into()
-            .unwrap();
+        let v: [u8; SH_HEAD_VALUE_LEN] =
+            chunk.data[rel + SH_HEAD_KEY_LEN..rel + SH_HEAD_SLOT_SIZE].try_into().unwrap();
         Ok((k, v))
     }
 
@@ -606,14 +574,7 @@ impl<'a> SlotPageCache<'a> {
             let mut data = vec![0u8; len];
             self.head.file.read_at(off, &mut data)?;
             self.chunk_loads = self.chunk_loads.saturating_add(1);
-            self.chunks.insert(
-                chunk_idx,
-                CachedChunk {
-                    base_slot,
-                    data,
-                    dirty: false,
-                },
-            );
+            self.chunks.insert(chunk_idx, CachedChunk { base_slot, data, dirty: false });
         }
         Ok(self.chunks.get_mut(&chunk_idx).unwrap())
     }
@@ -697,9 +658,7 @@ impl ShardedScriptHashHead {
             return Ok(Self { shards });
         }
         if path.is_file() {
-            return Ok(Self {
-                shards: vec![ScriptHashHead::open(path)?],
-            });
+            return Ok(Self { shards: vec![ScriptHashHead::open(path)?] });
         }
         Err(StoreError::io(
             &path,
@@ -787,10 +746,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-shhead-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
@@ -816,10 +772,7 @@ mod tests {
         // Body just over OCC_SCAN_BYTE_CAP → skip full scan when .occ missing.
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-shhead-large-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(occ_sidecar_path(&path));
@@ -839,14 +792,8 @@ mod tests {
         let t0 = Instant::now();
         let h2 = ScriptHashHead::open(&path).unwrap();
         let open_ms = t0.elapsed().as_millis();
-        assert!(
-            !h2.is_known_empty(),
-            "missing .occ on large head must not report empty"
-        );
-        assert!(
-            open_ms < 2_000,
-            "open without .occ must skip full scan (took {open_ms}ms)"
-        );
+        assert!(!h2.is_known_empty(), "missing .occ on large head must not report empty");
+        assert!(open_ms < 2_000, "open without .occ must skip full scan (took {open_ms}ms)");
         // Lookups still work (probe, not occupancy).
         assert_eq!(h2.get(&key).unwrap().unwrap().inline_fks(), vec![Fk(1)]);
         let _ = std::fs::remove_file(&path);
@@ -857,10 +804,7 @@ mod tests {
     fn scripthash_head_insert_many_full_without_rehash() {
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-shhead-full-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_file(&path);
         let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
@@ -905,10 +849,7 @@ mod tests {
                 .set_len((FILE_HEADER_LEN + 3) as u64)
                 .unwrap();
         }
-        assert!(matches!(
-            ScriptHashHead::open(&path),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(ScriptHashHead::open(&path), Err(StoreError::Corrupt(_))));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -918,10 +859,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!(
             "rbitcoin-sh-sharded-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -946,8 +884,7 @@ mod tests {
         for i in 0u8..16 {
             let mut key = [0u8; 32];
             key[0] = i.wrapping_mul(0x40); // spread high bits
-            h.insert(&key, &ShHeadValue::inline_one(Fk(i as u64 + 1)))
-                .unwrap();
+            h.insert(&key, &ShHeadValue::inline_one(Fk(i as u64 + 1))).unwrap();
             assert_eq!(h.shard_index(&key), prefix_shard_of(&key, 4));
         }
         h.flush().unwrap();
@@ -981,10 +918,7 @@ mod tests {
         let bad = base.join("badnames");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("zz"), b"x").unwrap();
-        assert!(matches!(
-            ShardedScriptHashHead::open_for_role(&bad),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(ShardedScriptHashHead::open_for_role(&bad), Err(StoreError::Corrupt(_))));
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -175,10 +175,7 @@ fn finish_cell<R>(cell: &JobCell<R>, r: thread::Result<R>) {
 
 /// Same as [`run_on_tip_accept`] but the caller `.await`s (peer session).
 pub(crate) async fn run_on_tip_accept_async<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    let cell = Arc::new(JobCell {
-        result: Mutex::new(None),
-        waker: Mutex::new(None),
-    });
+    let cell = Arc::new(JobCell { result: Mutex::new(None), waker: Mutex::new(None) });
     let cell_w = Arc::clone(&cell);
     let job = erase_lifetime(Box::new(move || {
         begin_job();
@@ -321,9 +318,7 @@ mod tests {
         });
         let (caller, name) = task.await.expect("join worker task");
         assert!(
-            caller
-                .as_deref()
-                .is_some_and(|n| n.starts_with("tokio-rt-worker")),
+            caller.as_deref().is_some_and(|n| n.starts_with("tokio-rt-worker")),
             "spawned task must run on a tokio worker, got {caller:?}"
         );
         assert_eq!(name.as_deref(), Some(TIP_ACCEPT_THREAD_NAME));
@@ -362,10 +357,7 @@ mod tests {
             1u8
         })
         .await;
-        assert!(
-            progressed.is_ok(),
-            "JoinOnDrop must not park the tokio worker"
-        );
+        assert!(progressed.is_ok(), "JoinOnDrop must not park the tokio worker");
         {
             let (lock, cv) = &*release;
             *lock.lock().unwrap() = true;

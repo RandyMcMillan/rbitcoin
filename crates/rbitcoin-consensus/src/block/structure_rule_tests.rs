@@ -45,11 +45,7 @@ fn check_block_wire_junk_does_not_panic() {
 
 fn coinbase(height: u32) -> Transaction {
     // Consensus requires coinbase scriptSig length in 2..=100.
-    let mut ss = if height == 0 {
-        vec![0x00]
-    } else {
-        bip34_height_script(height)
-    };
+    let mut ss = if height == 0 { vec![0x00] } else { bip34_height_script(height) };
     while ss.len() < 2 {
         ss.push(0x00);
     }
@@ -75,10 +71,7 @@ fn non_coinbase_spend(n: u8) -> Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([n; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([n; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -119,14 +112,8 @@ fn structure_meters_split_txid_wtxid_walk() {
     validate_block_structure_with_pres(&b, &ctx_h(1), None, Some(&stats))
         .expect("witness block structure");
     let s = stats.take_window();
-    assert!(
-        s.stamp_struct_txid_ns > 0,
-        "one-pass hash must be metered: {s:?}"
-    );
-    assert!(
-        s.stamp_struct_walk_ns > 0,
-        "weight/sigops walks must be metered: {s:?}"
-    );
+    assert!(s.stamp_struct_txid_ns > 0, "one-pass hash must be metered: {s:?}");
+    assert!(s.stamp_struct_walk_ns > 0, "weight/sigops walks must be metered: {s:?}");
 }
 
 #[test]
@@ -137,12 +124,8 @@ fn structure_with_pres_skips_from_tx() {
     spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
     let mut b = block_with(vec![coinbase(1), spend]);
     apply_witness_commitment(&mut b);
-    let pres: std::sync::Arc<[TxPrecompute]> = b
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
+    let pres: std::sync::Arc<[TxPrecompute]> =
+        b.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
     let out = validate_block_structure_with_pres(
         &b,
         &ctx_h(1),
@@ -152,15 +135,9 @@ fn structure_with_pres_skips_from_tx() {
     .expect("stashed pres must still enforce merkle");
     assert_eq!(out.len(), pres.len());
     assert_eq!(out[0].txid, pres[0].txid);
-    assert!(
-        std::sync::Arc::ptr_eq(&out, &pres),
-        "with_pres must keep the caller Arc"
-    );
+    assert!(std::sync::Arc::ptr_eq(&out, &pres), "with_pres must keep the caller Arc");
     let s = stats.take_window();
-    assert_eq!(
-        s.stamp_struct_txid_ns, 0,
-        "with_pres must not from_tx: {s:?}"
-    );
+    assert_eq!(s.stamp_struct_txid_ns, 0, "with_pres must not from_tx: {s:?}");
     assert!(s.stamp_struct_walk_ns > 0, "merkle/weight still run: {s:?}");
 }
 
@@ -198,10 +175,7 @@ fn script_jobs_from_same_pres_slice_share_pre() {
 fn assert_bad_block(err: ConsensusError, needle: &str) {
     match err {
         ConsensusError::BadBlock(s) => {
-            assert!(
-                s.contains(needle),
-                "expected BadBlock containing {needle:?}, got {s:?}"
-            );
+            assert!(s.contains(needle), "expected BadBlock containing {needle:?}, got {s:?}");
         }
         other => panic!("expected BadBlock({needle:?}), got {other:?}"),
     }
@@ -210,10 +184,7 @@ fn assert_bad_block(err: ConsensusError, needle: &str) {
 fn assert_bad_tx(err: ConsensusError, needle: &str) {
     match err {
         ConsensusError::BadTx(s) => {
-            assert!(
-                s.contains(needle),
-                "expected BadTx containing {needle:?}, got {s:?}"
-            );
+            assert!(s.contains(needle), "expected BadTx containing {needle:?}, got {s:?}");
         }
         other => panic!("expected BadTx({needle:?}), got {other:?}"),
     }
@@ -239,10 +210,7 @@ fn set_coinbase_pad(block: &mut Block, data_len: usize) {
     spk.push(0x4e);
     spk.extend_from_slice(&(data_len as u32).to_le_bytes());
     spk.extend(std::iter::repeat_n(0x61, data_len));
-    let pad = TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let pad = TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) };
     let pad_at = block.txdata[0].output.iter().position(|o| {
         let b = o.script_pubkey.as_bytes();
         b.first() == Some(&0x6a) && (b.len() < 6 || b[..6] != COMMIT_MAGIC)
@@ -257,11 +225,7 @@ fn set_coinbase_pad(block: &mut Block, data_len: usize) {
 fn refresh_witness_commitment(block: &mut Block) {
     let reserved = [0u8; 32];
     block.txdata[0].input[0].witness = Witness::from_slice(&[reserved.as_slice()]);
-    let wtxids = block
-        .txdata
-        .iter()
-        .skip(1)
-        .map(|tx| tx.compute_wtxid().to_byte_array());
+    let wtxids = block.txdata.iter().skip(1).map(|tx| tx.compute_wtxid().to_byte_array());
     let spk = witness_commitment_script(wtxids, &reserved);
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     if let Some(out) = block.txdata[0].output.iter_mut().rev().find(|o| {
@@ -270,10 +234,9 @@ fn refresh_witness_commitment(block: &mut Block) {
     }) {
         out.script_pubkey = ScriptBuf::from_bytes(spk);
     } else {
-        block.txdata[0].output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(spk),
-        });
+        block.txdata[0]
+            .output
+            .push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     }
     block.header.merkle_root = block.compute_merkle_root().unwrap();
 }
@@ -294,26 +257,16 @@ fn extend_spend_witness_one_byte(block: &mut Block) {
 
 fn pad_stripped_to(block: &mut Block, target: usize) {
     let before = stripped_size(block);
-    assert!(
-        before < target,
-        "fixture already {before}, want pad to {target}"
-    );
+    assert!(before < target, "fixture already {before}, want pad to {target}");
     let guess = target.saturating_sub(before).saturating_sub(24).max(1);
     set_coinbase_pad(block, guess);
     let got = stripped_size(block);
     if got != target {
-        let adj = if got < target {
-            guess + (target - got)
-        } else {
-            guess.saturating_sub(got - target)
-        };
+        let adj =
+            if got < target { guess + (target - got) } else { guess.saturating_sub(got - target) };
         set_coinbase_pad(block, adj);
     }
-    assert_eq!(
-        stripped_size(block),
-        target,
-        "stripped pad missed target (before {before})"
-    );
+    assert_eq!(stripped_size(block), target, "stripped pad missed target (before {before})");
 }
 
 fn padded_spend(data_len: usize) -> Transaction {
@@ -326,10 +279,7 @@ fn padded_spend(data_len: usize) -> Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([7; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -395,10 +345,7 @@ fn bip30_rejects_unspent_connected_sibling() {
     )
     .expect_err("unspent sibling must trip BIP30");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("bad-txns-BIP30"),
-        "expected BIP30 reject, got {msg}"
-    );
+    assert!(msg.contains("bad-txns-BIP30"), "expected BIP30 reject, got {msg}");
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -412,11 +359,8 @@ fn s1_rejects_empty_txdata() {
 
 #[test]
 fn s2_rejects_non_coinbase_first() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
+    validate_block_structure(&block_with(vec![coinbase(0), non_coinbase_spend(1)]), &ctx_h(0))
+        .unwrap();
     let b = block_with(vec![non_coinbase_spend(1)]);
     let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
     assert_bad_block(err, "first tx not coinbase");
@@ -457,11 +401,7 @@ fn s4_rejects_overweight_block() {
         });
     }
     let b = block_with(txs);
-    assert!(
-        b.weight().to_wu() > 4_000_000,
-        "fixture weight {}",
-        b.weight().to_wu()
-    );
+    assert!(b.weight().to_wu() > 4_000_000, "fixture weight {}", b.weight().to_wu());
     let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
     match err {
         ConsensusError::BadBlock(s) => {
@@ -499,10 +439,7 @@ fn s4_weight_4_000_000_accepts_4_000_001_rejects() {
     extend_spend_witness_one_byte(&mut wblock);
     assert_eq!(weight_wu(&wblock), 4_000_001);
     assert!(stripped_size(&wblock) <= MAX_BLOCK_STRIPPED_SIZE);
-    assert_bad_block(
-        validate_block_structure(&wblock, &ctx_h(1)).unwrap_err(),
-        "weight",
-    );
+    assert_bad_block(validate_block_structure(&wblock, &ctx_h(1)).unwrap_err(), "weight");
 }
 
 #[test]
@@ -608,16 +545,10 @@ fn s8_rejects_wrong_witness_commitment() {
     // Fake commitment: OP_RETURN magic + zeros
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     let b = block_with(vec![cb, spend]);
     let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
-        "got {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")), "got {err:?}");
 }
 
 /// Mainnet height 1: witness banned (segwit @ 481824).
@@ -633,10 +564,7 @@ fn s8_mainnet_rejects_witness_before_segwit() {
     // Valid-looking commitment magic so we hit the pre-segwit ban first.
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     let b = block_with(vec![cb, spend]);
     let err = validate_block_structure(&b, &ctx).unwrap_err();
     assert!(
@@ -656,10 +584,7 @@ fn s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce() {
     let mut cb = coinbase(height);
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     let b = block_with(vec![cb, non_coinbase_spend(10)]);
     validate_block_structure(&b, &ctx)
         .expect("pre-segwit dummy commitment OP_RETURN is not bad-witness-nonce-size");
@@ -677,10 +602,7 @@ fn archive_structure_allows_witness_when_gates_off() {
     let mut cb = coinbase(1);
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     let b = block_with(vec![cb, spend]);
     // Wrong commitment → still structure-checked (not pre-segwit ban).
     let err = validate_block_structure(&b, &ctx).unwrap_err();
@@ -705,10 +627,7 @@ fn signet_height_1_segwit_active_allows_witness_path() {
     let mut cb = coinbase(1);
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     let b = block_with(vec![cb, spend]);
     let err = validate_block_structure(&b, &ctx).unwrap_err();
     // Fails commitment hash, not pre-segwit.
@@ -779,31 +698,13 @@ fn script_sigop_count_and_last_push_helpers() {
     assert_eq!(script_sigop_count(&[0x01, 0xff, 0xac], false), 1);
     // PUSHDATA1 / 2 / 4 skip
     assert_eq!(script_sigop_count(&[0x4c, 0x01, 0xab, 0xac], false), 1);
-    assert_eq!(
-        script_sigop_count(&[0x4d, 0x01, 0x00, 0xcd, 0xac], false),
-        1
-    );
-    assert_eq!(
-        script_sigop_count(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xee, 0xac], false),
-        1
-    );
+    assert_eq!(script_sigop_count(&[0x4d, 0x01, 0x00, 0xcd, 0xac], false), 1);
+    assert_eq!(script_sigop_count(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xee, 0xac], false), 1);
     // last_script_push variants
-    assert_eq!(
-        last_script_push(&[0x02, 0x11, 0x22]),
-        Some(&[0x11, 0x22][..])
-    );
-    assert_eq!(
-        last_script_push(&[0x4c, 0x02, 0xaa, 0xbb]),
-        Some(&[0xaa, 0xbb][..])
-    );
-    assert_eq!(
-        last_script_push(&[0x4d, 0x01, 0x00, 0x99]),
-        Some(&[0x99][..])
-    );
-    assert_eq!(
-        last_script_push(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0x77]),
-        Some(&[0x77][..])
-    );
+    assert_eq!(last_script_push(&[0x02, 0x11, 0x22]), Some(&[0x11, 0x22][..]));
+    assert_eq!(last_script_push(&[0x4c, 0x02, 0xaa, 0xbb]), Some(&[0xaa, 0xbb][..]));
+    assert_eq!(last_script_push(&[0x4d, 0x01, 0x00, 0x99]), Some(&[0x99][..]));
+    assert_eq!(last_script_push(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0x77]), Some(&[0x77][..]));
     assert_eq!(last_script_push(&[]), Some(&[][..]));
     // Program shape helpers
     let mut p2sh = vec![0xa9, 0x14];
@@ -902,14 +803,8 @@ fn s10_rejects_txouttotal_toolarge() {
     let half = 11_000_000 * 100_000_000u64; // 11M BTC each
     let mut cb = coinbase(0);
     cb.output = vec![
-        TxOut {
-            value: Amount::from_sat(half),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        },
-        TxOut {
-            value: Amount::from_sat(half),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        },
+        TxOut { value: Amount::from_sat(half), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) },
+        TxOut { value: Amount::from_sat(half), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) },
     ];
     let b = block_with(vec![cb]);
     let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
@@ -936,10 +831,7 @@ fn s8_accepts_witness_commitment_with_reserved_value() {
     let committed = sha256d::Hash::hash(&buf).to_byte_array();
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend_from_slice(&committed);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     let b = block_with(vec![cb, spend]);
     validate_block_structure(&b, &ctx_h(1)).expect("reserved witness commitment");
     let _ = leaves;
@@ -967,10 +859,8 @@ fn s8_rejects_empty_or_multi_item_coinbase_witness_reserved() {
     // Empty coinbase witness → bad-witness-nonce-size (not accept via zero probe).
     {
         let mut cb = coinbase(1);
-        cb.output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
-        });
+        cb.output
+            .push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk.clone()) });
         // witness empty
         let b = block_with(vec![cb, spend.clone()]);
         let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
@@ -983,10 +873,8 @@ fn s8_rejects_empty_or_multi_item_coinbase_witness_reserved() {
     // Multi-item stack with last = zeros matching commitment → still reject.
     {
         let mut cb = coinbase(1);
-        cb.output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
-        });
+        cb.output
+            .push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk.clone()) });
         cb.input[0].witness = Witness::from_slice(&[vec![0xff], reserved_zero.to_vec()]);
         let b = block_with(vec![cb, spend.clone()]);
         let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
@@ -999,10 +887,7 @@ fn s8_rejects_empty_or_multi_item_coinbase_witness_reserved() {
     // Control: exactly one 32-zero item + matching commitment → Ok.
     {
         let mut cb = coinbase(1);
-        cb.output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(spk),
-        });
+        cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
         cb.input[0].witness = Witness::from_slice(&[reserved_zero.as_slice()]);
         let b = block_with(vec![cb, spend]);
         validate_block_structure(&b, &ctx_h(1)).expect("single zero reserved OK");
@@ -1056,11 +941,7 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let b = block_with(vec![coinbase(1)]);
     spent.clear();
     creates.clear();
-    let tids: Vec<[u8; 32]> = b
-        .txdata
-        .iter()
-        .map(|t| t.compute_txid().to_byte_array())
-        .collect();
+    let tids: Vec<[u8; 32]> = b.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
     let bh = b.header.block_hash().to_byte_array();
     let err2 = assemble_block_prevouts(
         &q,
@@ -1085,11 +966,8 @@ fn assemble_rejects_empty_and_fk_mismatch() {
     let bad = block_with(vec![non_coinbase_spend(1)]);
     spent.clear();
     creates.clear();
-    let tids3: Vec<[u8; 32]> = bad
-        .txdata
-        .iter()
-        .map(|t| t.compute_txid().to_byte_array())
-        .collect();
+    let tids3: Vec<[u8; 32]> =
+        bad.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
     let bh3 = bad.header.block_hash().to_byte_array();
     let err3 = assemble_block_prevouts(
         &q,
@@ -1126,11 +1004,7 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
     let b = block_with(vec![coinbase(1)]);
-    let tids: Vec<[u8; 32]> = b
-        .txdata
-        .iter()
-        .map(|t| t.compute_txid().to_byte_array())
-        .collect();
+    let tids: Vec<[u8; 32]> = b.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
     let bh = b.header.block_hash().to_byte_array();
     let bip16 = bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, 0);
     let _ = q.confirm_stats().take_window();
@@ -1176,10 +1050,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: parent_txid,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: parent_txid, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1207,11 +1078,8 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
-    let create_txids: Vec<[u8; 32]> = block
-        .txdata
-        .iter()
-        .map(|t| t.compute_txid().to_byte_array())
-        .collect();
+    let create_txids: Vec<[u8; 32]> =
+        block.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
     let bh = block.header.block_hash().to_byte_array();
     let spend_fks = [Fk(1), Fk(2)];
     let err = assemble_block_prevouts(
@@ -1233,10 +1101,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     .err()
     .expect("unstamped parent must not head-recover");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("invariant") && msg.contains("lookup stage miss"),
-        "got {msg}"
-    );
+    assert!(msg.contains("invariant") && msg.contains("lookup stage miss"), "got {msg}");
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -1271,18 +1136,9 @@ fn accept_rejects_connect_spend_rules() {
     }
 
     let mut same_cb = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    let cb_op = OutPoint {
-        txid: same_cb.txdata[0].compute_txid(),
-        vout: 0,
-    };
-    same_cb
-        .txdata
-        .push(spend(cb_op, same_cb.txdata[0].output[0].value.to_sat()));
-    prepare_regtest_candidate(
-        &mut same_cb,
-        genesis.block_hash(),
-        genesis.header.time + 600,
-    );
+    let cb_op = OutPoint { txid: same_cb.txdata[0].compute_txid(), vout: 0 };
+    same_cb.txdata.push(spend(cb_op, same_cb.txdata[0].output[0].value.to_sat()));
+    prepare_regtest_candidate(&mut same_cb, genesis.block_hash(), genesis.header.time + 600);
     let err = accept_and_connect_block(&q, &params, Height(1), &same_cb, Milestone::NONE)
         .expect_err("same-block coinbase spend must be immature");
     match err {
@@ -1292,10 +1148,7 @@ fn accept_rejects_connect_spend_rules() {
 
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let op = OutPoint {
-        txid: b1.txdata[0].compute_txid(),
-        vout: 0,
-    };
+    let op = OutPoint { txid: b1.txdata[0].compute_txid(), vout: 0 };
 
     let mut dup = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
     dup.txdata.push(spend(op, 1_000));
@@ -1310,23 +1163,14 @@ fn accept_rejects_connect_spend_rules() {
     assert_eq!(q.tip_height(), Some(Height(1)));
 
     let parent = spend(op, 1_000);
-    let child = spend(
-        OutPoint {
-            txid: parent.compute_txid(),
-            vout: 0,
-        },
-        500,
-    );
+    let child = spend(OutPoint { txid: parent.compute_txid(), vout: 0 }, 500);
     let mut bad_order = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
     bad_order.txdata.push(child);
     bad_order.txdata.push(parent);
     prepare_regtest_candidate(&mut bad_order, b1.block_hash(), b1.header.time + 600);
     let err = accept_and_connect_block(&q, &params, Height(2), &bad_order, Milestone::NONE)
         .expect_err("child-before-parent");
-    assert!(
-        matches!(err, ConsensusError::MissingPrevout),
-        "child-before-parent: {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::MissingPrevout), "child-before-parent: {err:?}");
     assert_eq!(q.tip_height(), Some(Height(1)));
 
     let mut over = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
@@ -1334,10 +1178,7 @@ fn accept_rejects_connect_spend_rules() {
     prepare_regtest_candidate(&mut over, b1.block_hash(), b1.header.time + 600);
     let err = accept_and_connect_block(&q, &params, Height(2), &over, Milestone::NONE)
         .expect_err("in < out");
-    assert!(
-        matches!(err, ConsensusError::BadTx(s) if s.contains("in < out")),
-        "in < out: {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::BadTx(s) if s.contains("in < out")), "in < out: {err:?}");
     assert_eq!(q.tip_height(), Some(Height(1)));
 
     let (tip, time, _) = pad_empty_from(&q, &params, b1.block_hash(), b1.header.time, 2, 4, 0);
@@ -1411,21 +1252,11 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     let mut thin = SpendEdges::default();
     thin.insert(
         spend_fk.0,
-        vec![SpendEdge {
-            prev_txid: parent_txid,
-            vout: 0,
-            spend_fk,
-            create_fk: Fk(7),
-            vin: 0,
-        }],
+        vec![SpendEdge { prev_txid: parent_txid, vout: 0, spend_fk, create_fk: Fk(7), vin: 0 }],
     );
     let mut spent = OutPointSet::default();
     let mut creates = super::PendingCreates::default();
-    let tids: Vec<[u8; 32]> = b
-        .txdata
-        .iter()
-        .map(|t| t.compute_txid().to_byte_array())
-        .collect();
+    let tids: Vec<[u8; 32]> = b.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
     let bh = b.header.block_hash().to_byte_array();
     let err = assemble_block_prevouts(
         &q,
@@ -1490,18 +1321,12 @@ fn n1_assemble_cold_why_reasons() {
         }
         last_cb = block.txdata[0].compute_txid();
         accept_and_connect_block(&q, &params, Height(h), &block, ms).unwrap();
-        last_cb_fk = q
-            .tx_fk_by_txid(last_cb.as_byte_array())
-            .unwrap()
-            .expect("cb fk");
+        last_cb_fk = q.tx_fk_by_txid(last_cb.as_byte_array()).unwrap().expect("cb fk");
         tip = block.block_hash();
         tip_time = block.header.time;
     }
     let parent_txid = last_cb.to_byte_array();
-    let op = OutPoint {
-        txid: last_cb,
-        vout: 0,
-    };
+    let op = OutPoint { txid: last_cb, vout: 0 };
     let dummy_in = TxIn {
         previous_output: op,
         script_sig: ScriptBuf::new(),
@@ -1517,10 +1342,7 @@ fn n1_assemble_cold_why_reasons() {
 
     fn assert_lookup_miss(err: ConsensusError) {
         let msg = format!("{err}");
-        assert!(
-            msg.contains("invariant") && msg.contains("lookup stage miss"),
-            "got {msg}"
-        );
+        assert!(msg.contains("invariant") && msg.contains("lookup stage miss"), "got {msg}");
     }
 
     // ── null_fk: Optimistic must not recover via head ─────────────
@@ -1573,9 +1395,7 @@ fn n1_assemble_cold_why_reasons() {
         parents.put_resolved(last_cb_fk, rec, &[(0, out)], &[0], Some(true));
         // Ensure pin txid matches wire.
         assert_eq!(
-            parents
-                .get_parent_txout_parts(last_cb_fk, 0, |_, _, t| t)
-                .unwrap(),
+            parents.get_parent_txout_parts(last_cb_fk, 0, |_, _, t| t).unwrap(),
             parent_txid
         );
         resolve_prevout(
@@ -1623,10 +1443,7 @@ fn n1_assemble_cold_why_reasons() {
             Err(e) => e,
         };
         let msg = format!("{err}");
-        assert!(
-            msg.contains("invariant") && msg.contains("identity"),
-            "got {err}"
-        );
+        assert!(msg.contains("invariant") && msg.contains("identity"), "got {err}");
         let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
         assert_eq!(why, (0, 0, 1, 0), "mismatch why={why:?}");
     }
@@ -1639,9 +1456,7 @@ fn n1_assemble_cold_why_reasons() {
         let out = OutputRecord::unspent(1, vec![0x51]);
         parents.put_resolved(last_cb_fk, rec, &[(1, out)], &[1], Some(true));
         assert!(parents.contains(last_cb_fk));
-        assert!(parents
-            .get_parent_txout_parts(last_cb_fk, 0, |_, _, _| ())
-            .is_none());
+        assert!(parents.get_parent_txout_parts(last_cb_fk, 0, |_, _, _| ()).is_none());
         let err = match resolve_prevout(
             &empty_block,
             op,
@@ -1659,10 +1474,7 @@ fn n1_assemble_cold_why_reasons() {
             Err(e) => e,
         };
         let msg = format!("{err}");
-        assert!(
-            msg.contains("invariant") && msg.contains("incomplete outs"),
-            "got {err}"
-        );
+        assert!(msg.contains("invariant") && msg.contains("incomplete outs"), "got {err}");
         let why = confirm_phase_stats::sample_tl_assemble_cold_why_and_reset();
         assert_eq!(why, (0, 0, 0, 1), "vout_miss why={why:?}");
     }
@@ -1753,10 +1565,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: val,
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
+            output: vec![TxOut { value: val, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
         }
     }
 
@@ -1801,10 +1610,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
         let arcs = [(Height(h_spend), Arc::new(b_s1.clone()), None)];
         let stamped =
             confirm_wire_lookup_stamp(&q, &params, ms, &arcs, None).expect("lookup stamp");
-        assert!(
-            stamped.plan.is_none(),
-            "already-archived body must yield plan=None"
-        );
+        assert!(stamped.plan.is_none(), "already-archived body must yield plan=None");
         let mat =
             confirm_wire_load_from_plan(&q, &params, ms, stamped, None, &ScriptPreverified::new())
                 .expect("plan=None load pins denserels by range from stamp");
@@ -1913,18 +1719,12 @@ fn check_witness_wtxid_count_mismatch_via_structure() {
     // Commitment magic with zeros; coinbase witness empty → mismatch (no reserved).
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    cb.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     // Non-32 reserved last item cannot rescue.
     cb.input[0].witness = Witness::from_slice(&[vec![0x01, 0x02]]);
     let b = block_with(vec![cb, spend]);
     let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
-        "got {err:?}"
-    );
+    assert!(matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")), "got {err:?}");
 }
 
 /// BIP16 from precomputed prev MTP — no header walk, exception hash respected.
@@ -1932,28 +1732,13 @@ fn check_witness_wtxid_count_mismatch_via_structure() {
 fn bip16_from_prev_mtp_exception_and_time() {
     let p = Box::leak(Box::new(ChainParams::mainnet()));
     // Exception block never enables P2SH regardless of MTP.
-    assert!(!bip16_active_from_prev_mtp(
-        p,
-        170_000,
-        &BIP16_EXCEPTION_MAINNET,
-        u32::MAX,
-    ));
+    assert!(!bip16_active_from_prev_mtp(p, 170_000, &BIP16_EXCEPTION_MAINNET, u32::MAX,));
     // Buried: active even when prev MTP predates the historical BIP16 time.
     assert!(bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], 0));
     // At/after bip16_time → still active.
-    assert!(bip16_active_from_prev_mtp(
-        p,
-        170_000,
-        &[1u8; 32],
-        p.btc.bip16_time,
-    ));
+    assert!(bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], p.btc.bip16_time,));
     // Genesis height never.
-    assert!(!bip16_active_from_prev_mtp(
-        p,
-        0,
-        &[1u8; 32],
-        p.btc.bip16_time,
-    ));
+    assert!(!bip16_active_from_prev_mtp(p, 0, &[1u8; 32], p.btc.bip16_time,));
 }
 
 /// Confirm jobs share wire Arc — same Transaction address, no deep clone.
@@ -1964,10 +1749,7 @@ fn script_job_shared_tx_is_wire_pointer() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([7; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1989,10 +1771,7 @@ fn script_job_shared_tx_is_wire_pointer() {
         1,
         crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
     );
-    assert!(std::ptr::eq(
-        &*job.tx as *const Transaction,
-        &block.txdata[1] as *const Transaction
-    ));
+    assert!(std::ptr::eq(&*job.tx as *const Transaction, &block.txdata[1] as *const Transaction));
     assert_eq!(job.txid, tid);
 }
 
@@ -2007,19 +1786,13 @@ fn s14_stripped_size_1_000_000_accepts_1_000_001_rejects() {
     let mut over = block_with(vec![coinbase(0)]);
     pad_stripped_to(&mut over, MAX_BLOCK_STRIPPED_SIZE + 1);
     assert_eq!(stripped_size(&over), MAX_BLOCK_STRIPPED_SIZE + 1);
-    assert_bad_block(
-        validate_block_structure(&over, &ctx_h(0)).unwrap_err(),
-        "stripped",
-    );
+    assert_bad_block(validate_block_structure(&over, &ctx_h(0)).unwrap_err(), "stripped");
 }
 
 #[test]
 fn s15_rejects_empty_vin() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
+    validate_block_structure(&block_with(vec![coinbase(0), non_coinbase_spend(1)]), &ctx_h(0))
+        .unwrap();
     let empty = Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
@@ -2060,23 +1833,14 @@ fn s16_tx_stripped_size_1_000_000_accepts_1_000_001_rejects() {
 
     let over = padded_spend(data_ok + 1);
     assert!(over.base_size() > MAX_BLOCK_STRIPPED_SIZE);
-    assert_bad_tx(
-        check_tx_local(&over, over.base_size()).unwrap_err(),
-        "oversize",
-    );
+    assert_bad_tx(check_tx_local(&over, over.base_size()).unwrap_err(), "oversize");
 }
 
 #[test]
 fn s17_rejects_duplicate_outpoints() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
-    let op = OutPoint {
-        txid: bitcoin::Txid::from_byte_array([3; 32]),
-        vout: 0,
-    };
+    validate_block_structure(&block_with(vec![coinbase(0), non_coinbase_spend(1)]), &ctx_h(0))
+        .unwrap();
+    let op = OutPoint { txid: bitcoin::Txid::from_byte_array([3; 32]), vout: 0 };
     let dup = Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
@@ -2112,10 +1876,7 @@ fn s17_many_unique_outpoints_accept() {
         let mut tid = [0u8; 32];
         tid[..4].copy_from_slice(&i.to_le_bytes());
         input.push(TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array(tid),
-                vout: i,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array(tid), vout: i },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -2135,11 +1896,8 @@ fn s17_many_unique_outpoints_accept() {
 
 #[test]
 fn s18_rejects_non_coinbase_null_prevout() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
+    validate_block_structure(&block_with(vec![coinbase(0), non_coinbase_spend(1)]), &ctx_h(0))
+        .unwrap();
     let mixed = Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
@@ -2175,22 +1933,13 @@ fn s18_rejects_non_coinbase_null_prevout() {
 fn pres_has_witness_matches_block_walk() {
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     let gpres: Vec<TxPrecompute> = genesis.txdata.iter().map(TxPrecompute::from_tx).collect();
-    assert_eq!(
-        block_has_witness_from_pres(&gpres),
-        block_has_witness(&genesis)
-    );
+    assert_eq!(block_has_witness_from_pres(&gpres), block_has_witness(&genesis));
     assert!(!block_has_witness(&genesis));
 
     let mut wit = genesis.txdata[0].clone();
     wit.input[0].witness = Witness::from_slice(&[vec![0x01]]);
-    let block = Block {
-        header: genesis.header,
-        txdata: vec![wit],
-    };
+    let block = Block { header: genesis.header, txdata: vec![wit] };
     let wpres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
     assert!(block_has_witness(&block));
-    assert_eq!(
-        block_has_witness_from_pres(&wpres),
-        block_has_witness(&block)
-    );
+    assert_eq!(block_has_witness_from_pres(&wpres), block_has_witness(&block));
 }

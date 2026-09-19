@@ -44,10 +44,7 @@ fn spent_ovf_path(dir: &Path) -> Result<std::path::PathBuf, StoreError> {
 impl SpenderTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         let body = TableFile::create(dir.join(SPENT_OVF_NAME), TableKind::Spender)?;
-        Ok(Self {
-            body,
-            count: AtomicU64::new(0),
-        })
+        Ok(Self { body, count: AtomicU64::new(0) })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
@@ -61,10 +58,7 @@ impl SpenderTable {
             return Err(StoreError::Corrupt("spenders body size"));
         }
         let count = body_len / SPENDER_RECORD_LEN as u64;
-        Ok(Self {
-            body,
-            count: AtomicU64::new(count),
-        })
+        Ok(Self { body, count: AtomicU64::new(count) })
     }
 
     pub fn count(&self) -> u64 {
@@ -101,11 +95,7 @@ impl SpenderTable {
         self.body.read_at(Self::offset(id), &mut buf)?;
         let packed = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let (spend_tx, vin) = unpack_spent_field(packed)?;
-        Ok((
-            spend_tx,
-            vin,
-            Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
-        ))
+        Ok((spend_tx, vin, Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap()))))
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
@@ -126,28 +116,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-spender-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let t = SpenderTable::create(&dir).unwrap();
         assert!(dir.join("spent.ovf").exists(), "schema 17 name");
-        assert!(
-            !dir.join("spenders.body").exists(),
-            "legacy filename must not be created"
-        );
+        assert!(!dir.join("spenders.body").exists(), "legacy filename must not be created");
         let a = t.append(Fk(10), 3, Fk::NULL).unwrap();
         let b = t.append(Fk(11), 4, a).unwrap();
         assert_eq!(t.get(a).unwrap(), (Fk(10), 3, Fk::NULL));
         assert_eq!(t.get(b).unwrap(), (Fk(11), 4, a));
         assert_eq!(t.count(), 2);
-        assert!(matches!(
-            t.append(Fk::NULL, 0, Fk::NULL),
-            Err(StoreError::InvalidFk)
-        ));
+        assert!(matches!(t.append(Fk::NULL, 0, Fk::NULL), Err(StoreError::InvalidFk)));
         assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
         assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
         t.flush().unwrap();
@@ -171,10 +152,7 @@ mod tests {
     fn open_rejects_bad_body_size() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-spender-bad-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -189,10 +167,7 @@ mod tests {
             .unwrap()
             .set_len((FILE_HEADER_LEN + 3) as u64)
             .unwrap();
-        assert!(matches!(
-            SpenderTable::open(&dir),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(SpenderTable::open(&dir), Err(StoreError::Corrupt(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -200,10 +175,7 @@ mod tests {
     fn open_renames_leftover_spenders_body_to_spent_ovf() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-spender-legacy-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -226,10 +198,7 @@ mod tests {
     fn append_fk_or_vin_overflow_is_corrupt() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-spender-ovf-cap-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

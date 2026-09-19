@@ -52,20 +52,15 @@ impl Query {
             }
         }
 
-        let (header_fk, _rec) = self
-            .get_header_by_hash(header_hash)?
-            .ok_or(StoreError::NotFound)?;
+        let (header_fk, _rec) =
+            self.get_header_by_hash(header_hash)?.ok_or(StoreError::NotFound)?;
         let tx_fks = self
             .store
             .header_txs
             .get_list(header_fk)?
             .ok_or(StoreError::Corrupt("confirm without archived body"))?;
 
-        let prepared = ConfirmPrepared {
-            height,
-            header_fk,
-            tx_fks,
-        };
+        let prepared = ConfirmPrepared { height, header_fk, tx_fks };
         let out = self.confirm_blocks_run(std::slice::from_ref(&prepared))?;
         self.annotate_spends_for_confirmed(std::slice::from_ref(&prepared))?;
         Ok(out[0])
@@ -86,9 +81,7 @@ impl Query {
                         continue;
                     }
                     let create_fk = if inp.create_fk.is_null() {
-                        self.store
-                            .get_fk_by_txid_tip(&inp.prev_txid)?
-                            .unwrap_or(Fk::NULL)
+                        self.store.get_fk_by_txid_tip(&inp.prev_txid)?.unwrap_or(Fk::NULL)
                     } else {
                         inp.create_fk
                     };
@@ -100,9 +93,7 @@ impl Query {
                     if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
                         > off.saturating_add(len)
                     {
-                        return Err(StoreError::Corrupt(
-                            "invariant: confirm_block spend slot OOB",
-                        ));
+                        return Err(StoreError::Corrupt("invariant: confirm_block spend slot OOB"));
                     }
                     abs_edges.push((abs, create_fk, inp.prev_index, spend_fk, vin as u32));
                 }
@@ -113,9 +104,7 @@ impl Query {
         }
         let cold = self.store.put_spend_batch_by_abs_meta(&abs_edges)?;
         if !cold.is_empty() {
-            return Err(StoreError::Corrupt(
-                "invariant: confirm_block spend annotate abs cold",
-            ));
+            return Err(StoreError::Corrupt("invariant: confirm_block spend annotate abs cold"));
         }
         Ok(())
     }
@@ -199,10 +188,7 @@ impl Query {
         let mut confirmed_pairs = Vec::with_capacity(items.len());
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let contiguous = item
-                .tx_fks
-                .windows(2)
-                .all(|w| w[1].0 == w[0].0.saturating_add(1));
+            let contiguous = item.tx_fks.windows(2).all(|w| w[1].0 == w[0].0.saturating_add(1));
             if contiguous {
                 if let Some(&first) = item.tx_fks.first() {
                     self.store.strong_tx.set_strong_range(
@@ -219,17 +205,13 @@ impl Query {
             confirmed_pairs.push((item.height, item.header_fk));
             out.push(item.header_fk);
         }
-        crate::note_confirm(
-            &self.confirm_stats().strong_ns,
-            t_strong.elapsed().as_nanos() as u64,
-        );
+        crate::note_confirm(&self.confirm_stats().strong_ns, t_strong.elapsed().as_nanos() as u64);
 
         // Fence first: missing header_txs is Corrupt. Publishing confirmed[]
         // before extend would leave tip ahead of height_of (leftover TipOnly hole).
         let t_tip = std::time::Instant::now();
         for item in items {
-            self.store
-                .height_fence_extend(item.height, item.header_fk)?;
+            self.store.height_fence_extend(item.height, item.header_fk)?;
         }
         self.store.confirmed.set_many(&confirmed_pairs)?;
         // Do not forget pending here: drain may still be inserting tx.head
@@ -238,10 +220,7 @@ impl Query {
         // callers dequeue the body queue. Kill after this returns → tip durable;
         // kill before → BQ still holds blocks for re-drive.
         self.store.flush_class_c_tip()?;
-        crate::note_confirm(
-            &self.confirm_stats().tip_ns,
-            t_tip.elapsed().as_nanos() as u64,
-        );
+        crate::note_confirm(&self.confirm_stats().tip_ns, t_tip.elapsed().as_nanos() as u64);
 
         self.enqueue_sh_pending(items, create_pins)?;
 
@@ -277,11 +256,7 @@ impl Query {
                 &self.confirm_stats().sh_collect_ns,
                 t_collect.elapsed().as_nanos() as u64,
             );
-            jobs.push(ShPendingJob {
-                height: item.height,
-                header_fk: item.header_fk,
-                records,
-            });
+            jobs.push(ShPendingJob { height: item.height, header_fk: item.header_fk, records });
         }
         if jobs.is_empty() {
             return Ok(());
@@ -341,31 +316,12 @@ impl Query {
     }
 
     pub(crate) fn pending_sh_create_fks(&self, scripthash: &[u8; 32]) -> Vec<Fk> {
-        self.sh
-            .ram_head
-            .lock()
-            .unwrap()
-            .get(scripthash)
-            .cloned()
-            .unwrap_or_default()
+        self.sh.ram_head.lock().unwrap().get(scripthash).cloned().unwrap_or_default()
     }
 
     pub(crate) fn sh_pending_max_height(&self) -> Option<u32> {
-        let queued = self
-            .sh
-            .pending
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|j| j.height.0)
-            .max();
-        let applying = self
-            .sh
-            .applying
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|j| j.height.0);
+        let queued = self.sh.pending.lock().unwrap().iter().map(|j| j.height.0).max();
+        let applying = self.sh.applying.lock().unwrap().as_ref().map(|j| j.height.0);
         match (queued, applying) {
             (None, None) => None,
             (Some(a), None) | (None, Some(a)) => Some(a),
@@ -376,9 +332,7 @@ impl Query {
     /// Durable watermark plus pending jobs (RAM records already collected),
     /// never above the live tip (reorg may leave pending jobs until mempool reaccept).
     pub(crate) fn sh_visible_through_height(&self) -> Option<u32> {
-        let vis = self
-            .sh_indexed_through_height()
-            .max(self.sh_pending_max_height())?;
+        let vis = self.sh_indexed_through_height().max(self.sh_pending_max_height())?;
         self.tip_height().map(|tip| vis.min(tip.0))
     }
 
@@ -455,10 +409,7 @@ impl Query {
         if !self.enqueues_sh_writebehind() {
             return Ok(false);
         }
-        if self
-            .sh_indexed_through_height()
-            .is_some_and(|t| job.height.0 <= t)
-        {
+        if self.sh_indexed_through_height().is_some_and(|t| job.height.0 <= t) {
             return Ok(false);
         }
         if self.store.confirmed.get(job.height)? != Some(job.header_fk) {
@@ -482,10 +433,8 @@ impl Query {
                 tip_sh_max_fk = tip_sh_max_fk.max(r.create_tx_fk.0);
             }
             let mut heads = self.sh.heads.lock().unwrap();
-            let (n, timing) = self
-                .store
-                .scripthash
-                .put_create_batch_append(sh_creates, &mut heads)?;
+            let (n, timing) =
+                self.store.scripthash.put_create_batch_append(sh_creates, &mut heads)?;
             crate::note_confirm(&self.confirm_stats().sh_written_n, n as u64);
             let st = self.confirm_stats();
             st.add_sh_part(&st.sh_sort_ns, timing.sort_ns);
@@ -504,11 +453,8 @@ impl Query {
 
     pub fn drop_sh_pending_from(&self, height: Height) {
         let mut pending = self.sh.pending.lock().unwrap();
-        let dropped: Vec<ShPendingJob> = pending
-            .iter()
-            .filter(|job| job.height.0 >= height.0)
-            .cloned()
-            .collect();
+        let dropped: Vec<ShPendingJob> =
+            pending.iter().filter(|job| job.height.0 >= height.0).cloned().collect();
         pending.retain(|job| job.height.0 < height.0);
         drop(pending);
         let mut applying = self.sh.applying.lock().unwrap();
@@ -551,9 +497,7 @@ impl Query {
                 .store
                 .confirmed
                 .get(Height(h))?
-                .ok_or(StoreError::Corrupt(
-                    "invariant: confirmed height missing header",
-                ))?;
+                .ok_or(StoreError::Corrupt("invariant: confirmed height missing header"))?;
             let tx_fks = match self.store.header_txs.get_list(header_fk)? {
                 Some(tx_fks) => tx_fks,
                 None if h == tip.0 => break,
@@ -563,11 +507,7 @@ impl Query {
                     ));
                 }
             };
-            items.push(ConfirmPrepared {
-                height: Height(h),
-                header_fk,
-                tx_fks,
-            });
+            items.push(ConfirmPrepared { height: Height(h), header_fk, tx_fks });
         }
         if !items.is_empty() {
             self.enqueue_sh_pending(&items, None)?;
@@ -595,9 +535,7 @@ impl Query {
                 .store
                 .confirmed
                 .get(Height(h))?
-                .ok_or(StoreError::Corrupt(
-                    "invariant: confirmed height missing header",
-                ))?;
+                .ok_or(StoreError::Corrupt("invariant: confirmed height missing header"))?;
             let fks = match self.store.header_txs.get_list(header_fk)? {
                 Some(fks) => fks,
                 None if h == tip.0 => {
@@ -709,19 +647,14 @@ impl Query {
     }
 
     fn disconnect_tip_with(&self, drop_pending: bool) -> Result<(), QueryError> {
-        let height = self
-            .tip_height()
-            .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
+        let height = self.tip_height().ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let _appender = self.sh.appender.lock().unwrap();
         if drop_pending {
             self.drop_sh_pending_from(height);
         } else {
             self.clamp_sh_released_before(height);
         }
-        let hash = self
-            .header_at_height(height)?
-            .map(|(_, rec)| rec.hash)
-            .unwrap_or([0u8; 32]);
+        let hash = self.header_at_height(height)?.map(|(_, rec)| rec.hash).unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();

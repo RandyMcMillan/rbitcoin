@@ -61,12 +61,7 @@ async fn http_exchange(addr: SocketAddr, req: &str) -> (u16, String) {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
     (status, body)
 }
 
@@ -83,10 +78,7 @@ async fn http_get_raw(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let sep = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("http headers");
+    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("http headers");
     (status, buf[sep + 4..].to_vec())
 }
 
@@ -146,20 +138,14 @@ async fn pin_getblock_hash_oob_unknown_and_raw(
     assert_eq!(ok["result"], tip_hash, "{ok}");
     let oob = jsonrpc(rpc_addr, "getblockhash", json!([tip_height + 1])).await;
     assert_eq!(oob["error"]["code"], -8, "{oob}");
-    assert_eq!(
-        oob["error"]["message"], "Block height out of range",
-        "{oob}"
-    );
+    assert_eq!(oob["error"]["message"], "Block height out of range", "{oob}");
     let unknown = jsonrpc(rpc_addr, "getblock", json!(["00".repeat(32)])).await;
     assert_eq!(unknown["error"]["code"], -5, "{unknown}");
     assert_eq!(unknown["error"]["message"], "Block not found", "{unknown}");
     let v0 = jsonrpc(rpc_addr, "getblock", json!([tip_hash, 0])).await;
     let hex = v0["result"].as_str().expect("verbosity 0 hex");
     assert!(hex.len() > 160, "raw block hex: {v0}");
-    assert!(
-        hex.bytes().all(|b| b.is_ascii_hexdigit()),
-        "verbosity 0 must be hex: {v0}"
-    );
+    assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "verbosity 0 must be hex: {v0}");
 }
 
 struct TipWaiters {
@@ -174,10 +160,7 @@ async fn spawn_wait_and_gbt_longpoll(rpc_addr: SocketAddr, want_height: u64) -> 
     let start = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let start_hash = start["result"].as_str().expect("tip hash").to_string();
     let gbt = jsonrpc(rpc_addr, "getblocktemplate", json!([{"rules": ["segwit"]}])).await;
-    let lp = gbt["result"]["longpollid"]
-        .as_str()
-        .expect("longpollid")
-        .to_string();
+    let lp = gbt["result"]["longpollid"].as_str().expect("longpollid").to_string();
     let t0 = Instant::now();
     let stale = jsonrpc(
         rpc_addr,
@@ -207,12 +190,7 @@ async fn spawn_wait_and_gbt_longpoll(rpc_addr: SocketAddr, want_height: u64) -> 
         .await
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
-    TipWaiters {
-        wait_new,
-        wait_height,
-        wait_gbt,
-        start_hash,
-    }
+    TipWaiters { wait_new, wait_height, wait_gbt, start_hash }
 }
 
 impl TipWaiters {
@@ -235,10 +213,7 @@ impl TipWaiters {
             .expect("gbt longpoll timed out")
             .expect("gbt longpoll join");
         let lp = gbt["result"]["longpollid"].as_str().unwrap_or("");
-        assert!(
-            lp.starts_with(new_hash),
-            "current longpollid must wake on generate: {gbt}"
-        );
+        assert!(lp.starts_with(new_hash), "current longpollid must wake on generate: {gbt}");
     }
 }
 
@@ -284,11 +259,7 @@ async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n
     let (st, body, last) =
         esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/25")).await;
     assert_eq!(st, 200, "GET /txs/25: {body}");
-    assert_eq!(
-        last.len(),
-        n_tx.saturating_sub(25),
-        "last page shorter than 25: {body}"
-    );
+    assert_eq!(last.len(), n_tx.saturating_sub(25), "last page shorter than 25: {body}");
     assert!(last.len() < 25 && !last.is_empty(), "last page: {body}");
 
     let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/1")).await;
@@ -469,10 +440,7 @@ async fn pin_esplora_tx_json_unknown_coinbase(esplora_addr: SocketAddr, cb_txid:
     assert!(v0.get("scriptpubkey").is_some(), "{body}");
     assert!(v0.get("scriptpubkey_asm").is_some(), "{body}");
     assert_eq!(v0["scriptpubkey_type"], "unknown", "{body}");
-    assert!(
-        v0["scriptpubkey_asm"].as_str().unwrap().contains("OP_"),
-        "{body}"
-    );
+    assert!(v0["scriptpubkey_asm"].as_str().unwrap().contains("OP_"), "{body}");
     assert_eq!(full["vin"][0]["is_coinbase"], true, "{body}");
     assert!(full["vin"][0].get("scriptsig_asm").is_some(), "{body}");
 }
@@ -485,14 +453,8 @@ async fn pin_esplora_scripthash_pages(esplora_addr: SocketAddr) {
     let (st, body) = http_get(esplora_addr, &format!("/scripthash/{sh_hex}")).await;
     assert_eq!(st, 200, "{body}");
     let info: Value = serde_json::from_str(&body).unwrap();
-    assert!(
-        info["chain_stats"]["tx_count"].as_u64().unwrap() >= 1,
-        "{body}"
-    );
-    assert!(
-        info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 1,
-        "{body}"
-    );
+    assert!(info["chain_stats"]["tx_count"].as_u64().unwrap() >= 1, "{body}");
+    assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 1, "{body}");
 
     let (st, body, sum) =
         esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/txs/summary")).await;
@@ -513,20 +475,11 @@ async fn pin_esplora_scripthash_pages(esplora_addr: SocketAddr) {
     assert_eq!(st, 200, "{body}");
     assert!(!page1.is_empty(), "{body}");
     assert!(page1.len() <= 25, "{body}");
-    let last = page1[0]["txid"]
-        .as_str()
-        .expect("chain page txid")
-        .to_string();
-    let (st, body, page2) = esplora_json_array(
-        esplora_addr,
-        &format!("/scripthash/{sh_hex}/txs/chain/{last}"),
-    )
-    .await;
+    let last = page1[0]["txid"].as_str().expect("chain page txid").to_string();
+    let (st, body, page2) =
+        esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/txs/chain/{last}")).await;
     assert_eq!(st, 200, "{body}");
-    assert!(
-        page2.iter().all(|row| row["txid"] != last),
-        "cursor page must omit {last}: {body}"
-    );
+    assert!(page2.iter().all(|row| row["txid"] != last), "cursor page must omit {last}: {body}");
 
     let (st, body, combined) =
         esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/txs")).await;
@@ -543,18 +496,10 @@ async fn spawn_esplora_ws_want_blocks_and_track_tx(
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as WsMsg;
         let url = format!("ws://{esplora_addr}/v1/ws");
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .expect("esplora ws upgrade");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("esplora ws upgrade");
         tokio::time::sleep(Duration::from_millis(150)).await;
-        ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks"]}"#.into()))
-            .await
-            .unwrap();
-        ws.send(WsMsg::Text(
-            format!(r#"{{"track-tx":"{track_txid}"}}"#).into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks"]}"#.into())).await.unwrap();
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{track_txid}"}}"#).into())).await.unwrap();
         let mut saw = (false, false);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline && !(saw.0 && saw.1) {
@@ -581,18 +526,12 @@ fn acs_spend(prev: Txid, input_sat: u64, fee: u64, spk: ScriptBuf) -> Transactio
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: prev, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(input_sat - fee),
-            script_pubkey: spk,
-        }],
+        output: vec![TxOut { value: Amount::from_sat(input_sat - fee), script_pubkey: spk }],
     }
 }
 
@@ -618,10 +557,7 @@ fn op_return_output(data_len: usize) -> TxOut {
     script.push(0x4e);
     script.extend_from_slice(&(data_len as u32).to_le_bytes());
     script.resize(script.len() + data_len, 0x61);
-    TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(script),
-    }
+    TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(script) }
 }
 
 fn pad_tx_to_weight(mut tx: Transaction, want: u64) -> Transaction {
@@ -651,11 +587,7 @@ fn pad_tx_to_weight(mut tx: Transaction, want: u64) -> Transaction {
 }
 
 fn mempool_has(mem: &Value, txid: &str) -> bool {
-    mem["result"]
-        .as_array()
-        .expect("getrawmempool array")
-        .iter()
-        .any(|v| v.as_str() == Some(txid))
+    mem["result"].as_array().expect("getrawmempool array").iter().any(|v| v.as_str() == Some(txid))
 }
 
 fn pin_mined_parent_before_child(txs: &[Value], parent: &str, child: &str) {
@@ -677,9 +609,7 @@ fn pin_mined_parent_before_child(txs: &[Value], parent: &str, child: &str) {
 async fn pin_scantxoutset_drops_spent_coinbase(rpc_addr: SocketAddr, spent_cb: &str) {
     let scan = jsonrpc(rpc_addr, "scantxoutset", json!(["start", ["raw(51)"]])).await;
     assert_eq!(scan["result"]["success"], true, "{scan}");
-    let uns = scan["result"]["unspents"]
-        .as_array()
-        .expect("scantxoutset unspents");
+    let uns = scan["result"]["unspents"].as_array().expect("scantxoutset unspents");
     assert!(
         uns.iter().all(|u| u["txid"].as_str() != Some(spent_cb)),
         "spent coinbase must drop from scan: {scan}"
@@ -712,19 +642,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (coinbase_txid, rpc_cb, pkg_cb, exact_cb, chain_cb, cpfp_cb, relay_cb, rpc_cpfp_cb) = {
         let q = Query::open_or_create_tiny(td.store_path()).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _time, cbs) = pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            106,
-            8,
-        );
+        let (_tip, _time, cbs) =
+            pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, 106, 8);
         q.flush().unwrap();
-        (
-            cbs[0], cbs[1], cbs[2], cbs[3], cbs[4], cbs[5], cbs[6], cbs[7],
-        )
+        (cbs[0], cbs[1], cbs[2], cbs[3], cbs[4], cbs[5], cbs[6], cbs[7])
     };
 
     let electrum_addr = ephemeral_addr();
@@ -772,36 +693,16 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let rpc_wu = tx_wu(&rpc_spend);
     let exact_min = min_relay_fee_sat(rpc_wu);
     assert!(exact_min > 0, "acs_spend vsize must need a positive floor");
-    let under_min = acs_spend(
-        exact_cb,
-        50_0000_0000,
-        exact_min - 1,
-        ScriptBuf::from_bytes(vec![0x4f]),
-    );
-    let tma = jsonrpc(
-        rpc_addr,
-        "testmempoolaccept",
-        json!([[encode_tx(&under_min)]]),
-    )
-    .await;
+    let under_min =
+        acs_spend(exact_cb, 50_0000_0000, exact_min - 1, ScriptBuf::from_bytes(vec![0x4f]));
+    let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[encode_tx(&under_min)]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
-    assert_eq!(
-        tma["result"][0]["reject-reason"], "min relay fee not met",
-        "{tma}"
-    );
-    let at_min = acs_spend(
-        exact_cb,
-        50_0000_0000,
-        exact_min,
-        ScriptBuf::from_bytes(vec![0x4e]),
-    );
+    assert_eq!(tma["result"][0]["reject-reason"], "min relay fee not met", "{tma}");
+    let at_min = acs_spend(exact_cb, 50_0000_0000, exact_min, ScriptBuf::from_bytes(vec![0x4e]));
     let at_min_hex = encode_tx(&at_min);
     let at_min_txid = at_min.compute_txid().to_string();
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[at_min_hex.clone()]])).await;
-    assert_eq!(
-        tma["result"][0]["allowed"], true,
-        "exact 100 sat/kvB must meet min-relay: {tma}"
-    );
+    assert_eq!(tma["result"][0]["allowed"], true, "exact 100 sat/kvB must meet min-relay: {tma}");
     let sent_min = jsonrpc(rpc_addr, "sendrawtransaction", json!([at_min_hex])).await;
     assert_eq!(sent_min["result"], at_min_txid, "{sent_min}");
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[rpc_hex.clone()]])).await;
@@ -812,18 +713,12 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(mem_utxo["result"]["confirmations"], 0, "{mem_utxo}");
     assert_eq!(mem_utxo["result"]["coinbase"], false, "{mem_utxo}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    assert!(
-        mempool_has(&mem, &rpc_txid),
-        "getrawmempool missing sendraw {rpc_txid}: {mem}"
-    );
+    assert!(mempool_has(&mem, &rpc_txid), "getrawmempool missing sendraw {rpc_txid}: {mem}");
     let miss = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([0x11; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -838,10 +733,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let miss_hex = rbitcoin_primitives::hex_encode(&miss_raw);
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[miss_hex]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
-    assert_eq!(
-        tma["result"][0]["reject-reason"], "bad-txns-inputs-missingorspent",
-        "{tma}"
-    );
+    assert_eq!(tma["result"][0]["reject-reason"], "bad-txns-inputs-missingorspent", "{tma}");
 
     let spk = ScriptBuf::from_bytes(vec![0x52]);
     let spend = acs_spend(coinbase_txid, 50_0000_0000, 1_000, spk.clone());
@@ -867,14 +759,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(status_v["confirmed"], false, "{status_v}");
 
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    assert!(
-        mempool_has(&mem, &txid_hex),
-        "getrawmempool missing {txid_hex}: {mem}"
-    );
-    assert!(
-        mempool_has(&mem, &rpc_txid),
-        "getrawmempool dropped sendraw {rpc_txid}: {mem}"
-    );
+    assert!(mempool_has(&mem, &txid_hex), "getrawmempool missing {txid_hex}: {mem}");
+    assert!(mempool_has(&mem, &rpc_txid), "getrawmempool dropped sendraw {rpc_txid}: {mem}");
 
     let sh = electrum_scripthash_hex(spk.as_bytes());
     let mut el = TcpStream::connect(electrum_addr).await.unwrap();
@@ -900,20 +786,12 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         if row["tx_hash"] == txid_hex {
             assert!(row.get("fee").is_some(), "unconfirmed history fee: {row}");
         } else {
-            assert!(
-                row.get("fee").is_none(),
-                "confirmed history omits fee: {row}"
-            );
+            assert!(row.get("fee").is_none(), "confirmed history omits fee: {row}");
         }
     }
 
     let child_spk = ScriptBuf::from_bytes(vec![0x53]);
-    let child = acs_spend(
-        spend.compute_txid(),
-        50_0000_0000 - 1_000,
-        1_000,
-        child_spk.clone(),
-    );
+    let child = acs_spend(spend.compute_txid(), 50_0000_0000 - 1_000, 1_000, child_spk.clone());
     let child_hex = encode_tx(&child);
     let child_txid = child.compute_txid().to_string();
     let (st, body) = http_post(esplora_addr, "/tx", &child_hex).await;
@@ -921,13 +799,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(body, child_txid);
 
     let child_sh = electrum_scripthash_hex(child_spk.as_bytes());
-    let child_hist = electrum_rpc(
-        &mut el,
-        4,
-        "blockchain.scripthash.get_history",
-        json!([child_sh.clone()]),
-    )
-    .await;
+    let child_hist =
+        electrum_rpc(&mut el, 4, "blockchain.scripthash.get_history", json!([child_sh.clone()]))
+            .await;
     let child_row = child_hist["result"]
         .as_array()
         .expect("child history array")
@@ -937,13 +811,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(child_row["height"], -1, "{child_row}");
     let child_fee = child_row["fee"].as_i64().expect("mempool child fee");
     assert!(child_fee > 0, "mempool child fee: {child_row}");
-    let child_utxo = electrum_rpc(
-        &mut el,
-        24,
-        "blockchain.scripthash.listunspent",
-        json!([child_sh.clone()]),
-    )
-    .await;
+    let child_utxo =
+        electrum_rpc(&mut el, 24, "blockchain.scripthash.listunspent", json!([child_sh.clone()]))
+            .await;
     let utxo_row = child_utxo["result"]
         .as_array()
         .expect("child listunspent array")
@@ -951,13 +821,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         .find(|r| r["tx_hash"] == child_txid)
         .unwrap_or_else(|| panic!("listunspent missing child {child_txid}: {child_utxo}"));
     assert_eq!(utxo_row["height"], -1, "{utxo_row}");
-    let parent_utxo = electrum_rpc(
-        &mut el,
-        25,
-        "blockchain.scripthash.listunspent",
-        json!([sh]),
-    )
-    .await;
+    let parent_utxo =
+        electrum_rpc(&mut el, 25, "blockchain.scripthash.listunspent", json!([sh])).await;
     assert!(
         parent_utxo["result"]
             .as_array()
@@ -967,46 +832,24 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "child spend must drop the parent UTXO: {parent_utxo}"
     );
 
-    let child_mem = electrum_rpc(
-        &mut el,
-        5,
-        "blockchain.scripthash.get_mempool",
-        json!([child_sh]),
-    )
-    .await;
+    let child_mem =
+        electrum_rpc(&mut el, 5, "blockchain.scripthash.get_mempool", json!([child_sh])).await;
     let child_mem_row = child_mem["result"]
         .as_array()
         .expect("child mempool array")
         .iter()
         .find(|r| r["tx_hash"] == child_txid)
         .unwrap_or_else(|| panic!("get_mempool missing child {child_txid}: {child_mem}"));
-    assert_eq!(
-        child_mem_row["fee"].as_i64(),
-        Some(child_fee),
-        "{child_mem_row}"
-    );
+    assert_eq!(child_mem_row["fee"].as_i64(), Some(child_fee), "{child_mem_row}");
 
     let inc = incremental_rbf_fee_sat(rpc_wu);
     assert!(inc >= 1, "replacement must owe a positive incremental fee");
-    let low = acs_spend(
-        rpc_cb,
-        50_0000_0000,
-        1_000,
-        ScriptBuf::from_bytes(vec![0x55]),
-    );
+    let low = acs_spend(rpc_cb, 50_0000_0000, 1_000, ScriptBuf::from_bytes(vec![0x55]));
     let low_hex = encode_tx(&low);
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[low_hex.clone()]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
-    assert_eq!(
-        tma["result"][0]["reject-reason"], "insufficient fee",
-        "{tma}"
-    );
-    let short = acs_spend(
-        rpc_cb,
-        50_0000_0000,
-        1_000 + inc - 1,
-        ScriptBuf::from_bytes(vec![0x50]),
-    );
+    assert_eq!(tma["result"][0]["reject-reason"], "insufficient fee", "{tma}");
+    let short = acs_spend(rpc_cb, 50_0000_0000, 1_000 + inc - 1, ScriptBuf::from_bytes(vec![0x50]));
     assert_eq!(tx_wu(&short), rpc_wu, "RBF pair must share vsize");
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[encode_tx(&short)]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
@@ -1016,54 +859,26 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     );
     let rejected = jsonrpc(rpc_addr, "sendrawtransaction", json!([low_hex])).await;
     assert_eq!(rejected["error"]["code"], -26, "{rejected}");
-    assert_eq!(
-        rejected["error"]["message"], "insufficient fee",
-        "{rejected}"
-    );
+    assert_eq!(rejected["error"]["message"], "insufficient fee", "{rejected}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    assert!(
-        mempool_has(&mem, &rpc_txid),
-        "too-low RBF must leave the original: {mem}"
-    );
+    assert!(mempool_has(&mem, &rpc_txid), "too-low RBF must leave the original: {mem}");
 
-    let high = acs_spend(
-        rpc_cb,
-        50_0000_0000,
-        1_000 + inc,
-        ScriptBuf::from_bytes(vec![0x56]),
-    );
+    let high = acs_spend(rpc_cb, 50_0000_0000, 1_000 + inc, ScriptBuf::from_bytes(vec![0x56]));
     assert_eq!(tx_wu(&high), rpc_wu, "winning RBF must share vsize");
     let high_hex = encode_tx(&high);
     let high_txid = high.compute_txid().to_string();
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[high_hex.clone()]])).await;
     assert_eq!(tma["result"][0]["allowed"], true, "{tma}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    assert!(
-        mempool_has(&mem, &rpc_txid),
-        "testmempoolaccept must not RBF-evict: {mem}"
-    );
-    assert!(
-        !mempool_has(&mem, &high_txid),
-        "trial replacement must not remain: {mem}"
-    );
+    assert!(mempool_has(&mem, &rpc_txid), "testmempoolaccept must not RBF-evict: {mem}");
+    assert!(!mempool_has(&mem, &high_txid), "trial replacement must not remain: {mem}");
     let replaced = jsonrpc(rpc_addr, "sendrawtransaction", json!([high_hex])).await;
     assert_eq!(replaced["result"], high_txid, "{replaced}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    assert!(
-        mempool_has(&mem, &high_txid),
-        "replacement missing from mempool: {mem}"
-    );
-    assert!(
-        !mempool_has(&mem, &rpc_txid),
-        "replaced tx must leave mempool: {mem}"
-    );
+    assert!(mempool_has(&mem, &high_txid), "replacement missing from mempool: {mem}");
+    assert!(!mempool_has(&mem, &rpc_txid), "replaced tx must leave mempool: {mem}");
 
-    let pkg_parent = acs_spend(
-        pkg_cb,
-        50_0000_0000,
-        1_000,
-        ScriptBuf::from_bytes(vec![0x57]),
-    );
+    let pkg_parent = acs_spend(pkg_cb, 50_0000_0000, 1_000, ScriptBuf::from_bytes(vec![0x57]));
     let pkg_child = acs_spend(
         pkg_parent.compute_txid(),
         50_0000_0000 - 1_000,
@@ -1078,11 +893,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let pkg_v: Value = serde_json::from_str(&body).unwrap_or_else(|e| {
         panic!("POST /txs/package json: {e} body={body}");
     });
-    assert_eq!(
-        pkg_v["txids"],
-        json!([pkg_parent_txid.clone(), pkg_child_txid.clone()]),
-        "{pkg_v}"
-    );
+    assert_eq!(pkg_v["txids"], json!([pkg_parent_txid.clone(), pkg_child_txid.clone()]), "{pkg_v}");
 
     let submitted = jsonrpc(
         rpc_addr,
@@ -1096,16 +907,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "{submitted}"
     );
 
-    let too_many = format!(
-        "[{}]",
-        (0..26).map(|_| "\"00\"").collect::<Vec<_>>().join(",")
-    );
+    let too_many = format!("[{}]", (0..26).map(|_| "\"00\"").collect::<Vec<_>>().join(","));
     let (st, body) = http_post(esplora_addr, "/txs/package", &too_many).await;
     assert_eq!(st, 400, "{body}");
-    assert!(
-        body.contains("package too large"),
-        "26-tx HTTP package: {body}"
-    );
+    assert!(body.contains("package too large"), "26-tx HTTP package: {body}");
 
     let mut chain_txs = Vec::with_capacity(25);
     let mut prev = chain_cb;
@@ -1121,11 +926,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_post(esplora_addr, "/txs/package", &chain_body).await;
     assert_eq!(st, 200, "25-tx HTTP package: {body}");
     let chain_v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        chain_v["txids"].as_array().map(|a| a.len()),
-        Some(25),
-        "{chain_v}"
-    );
+    assert_eq!(chain_v["txids"].as_array().map(|a| a.len()), Some(25), "{chain_v}");
     let chain_last = chain_txs[24].compute_txid().to_string();
 
     const MAX_PKG_WU: u64 = 404_000;
@@ -1148,31 +949,18 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         203_000,
     );
     let fat_wu = tx_wu(&fat_a) + tx_wu(&fat_b);
-    assert!(
-        fat_wu > MAX_PKG_WU,
-        "padded package must exceed {MAX_PKG_WU}, got {fat_wu}"
-    );
+    assert!(fat_wu > MAX_PKG_WU, "padded package must exceed {MAX_PKG_WU}, got {fat_wu}");
     assert!(tx_wu(&fat_a) <= 400_000 && tx_wu(&fat_b) <= 400_000);
     let fat_body = json!([encode_tx(&fat_a), encode_tx(&fat_b)]).to_string();
     let (st, body) = http_post(esplora_addr, "/txs/package", &fat_body).await;
     assert_eq!(st, 400, "{body}");
-    assert!(
-        body.contains("package too large"),
-        "over-weight HTTP package: {body}"
-    );
+    assert!(body.contains("package too large"), "over-weight HTTP package: {body}");
 
     let cheap_parent = acs_spend(cpfp_cb, 50_0000_0000, 1, ScriptBuf::from_bytes(vec![0x51]));
-    let cheap_tma = jsonrpc(
-        rpc_addr,
-        "testmempoolaccept",
-        json!([[encode_tx(&cheap_parent)]]),
-    )
-    .await;
+    let cheap_tma =
+        jsonrpc(rpc_addr, "testmempoolaccept", json!([[encode_tx(&cheap_parent)]])).await;
     assert_eq!(cheap_tma["result"][0]["allowed"], false, "{cheap_tma}");
-    assert_eq!(
-        cheap_tma["result"][0]["reject-reason"], "min relay fee not met",
-        "{cheap_tma}"
-    );
+    assert_eq!(cheap_tma["result"][0]["reject-reason"], "min relay fee not met", "{cheap_tma}");
     let cpfp_child = acs_spend(
         cheap_parent.compute_txid(),
         50_0000_0000 - 1,
@@ -1193,43 +981,20 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
 
     let entry = jsonrpc(rpc_addr, "getmempoolentry", json!([pkg_child_txid.clone()])).await;
     assert_eq!(entry["result"]["ancestorcount"], 2, "{entry}");
-    assert_eq!(
-        entry["result"]["depends"],
-        json!([pkg_parent_txid.clone()]),
-        "{entry}"
-    );
-    let ancs = jsonrpc(
-        rpc_addr,
-        "getmempoolancestors",
-        json!([pkg_child_txid.clone()]),
-    )
-    .await;
+    assert_eq!(entry["result"]["depends"], json!([pkg_parent_txid.clone()]), "{entry}");
+    let ancs = jsonrpc(rpc_addr, "getmempoolancestors", json!([pkg_child_txid.clone()])).await;
     let anc_rows = ancs["result"].as_array().expect("ancestors array");
     assert!(
-        anc_rows
-            .iter()
-            .any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
+        anc_rows.iter().any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
         "getmempoolancestors missing parent: {ancs}"
     );
-    let desc = jsonrpc(
-        rpc_addr,
-        "getmempooldescendants",
-        json!([pkg_parent_txid.clone()]),
-    )
-    .await;
+    let desc = jsonrpc(rpc_addr, "getmempooldescendants", json!([pkg_parent_txid.clone()])).await;
     let desc_rows = desc["result"].as_array().expect("descendants array");
     assert!(
-        desc_rows
-            .iter()
-            .any(|v| v.as_str() == Some(pkg_child_txid.as_str())),
+        desc_rows.iter().any(|v| v.as_str() == Some(pkg_child_txid.as_str())),
         "getmempooldescendants missing child: {desc}"
     );
-    let cluster = jsonrpc(
-        rpc_addr,
-        "getmempoolcluster",
-        json!([pkg_child_txid.clone()]),
-    )
-    .await;
+    let cluster = jsonrpc(rpc_addr, "getmempoolcluster", json!([pkg_child_txid.clone()])).await;
     assert_eq!(cluster["result"]["txcount"], 2, "{cluster}");
     let spend = jsonrpc(
         rpc_addr,
@@ -1237,20 +1002,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         json!([[{"txid": pkg_cb.to_string(), "vout": 0}]]),
     )
     .await;
-    assert_eq!(
-        spend["result"][0]["spendingtxid"], pkg_parent_txid,
-        "{spend}"
-    );
+    assert_eq!(spend["result"][0]["spendingtxid"], pkg_parent_txid, "{spend}");
     let diagram = jsonrpc(rpc_addr, "getmempoolfeeratediagram", json!([])).await;
-    assert!(
-        diagram["result"].as_array().is_some_and(|a| !a.is_empty()),
-        "{diagram}"
-    );
+    assert!(diagram["result"].as_array().is_some_and(|a| !a.is_empty()), "{diagram}");
     let verbose = jsonrpc(rpc_addr, "getrawmempool", json!([true])).await;
-    assert_eq!(
-        verbose["result"][&pkg_child_txid]["ancestorcount"], 2,
-        "{verbose}"
-    );
+    assert_eq!(verbose["result"][&pkg_child_txid]["ancestorcount"], 2, "{verbose}");
 
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
     for tid in [
@@ -1270,18 +1026,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_get(esplora_addr, "/mempool").await;
     assert_eq!(st, 200, "GET /mempool: {body}");
     let mem_info: Value = serde_json::from_str(&body).unwrap();
-    assert!(
-        mem_info["count"].as_u64().unwrap_or(0) >= 30,
-        "live mempool count: {mem_info}"
-    );
+    assert!(mem_info["count"].as_u64().unwrap_or(0) >= 30, "live mempool count: {mem_info}");
     let (st, body) = http_get(esplora_addr, "/mempool/txids").await;
     assert_eq!(st, 200, "GET /mempool/txids: {body}");
     let txids_v: Value = serde_json::from_str(&body).unwrap();
     let txid_list = txids_v.as_array().expect("mempool/txids array");
     assert!(
-        txid_list
-            .iter()
-            .any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
+        txid_list.iter().any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
         "mempool/txids missing package parent: {body}"
     );
     let (st, body) = http_get(esplora_addr, "/mempool/recent").await;
@@ -1310,13 +1061,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_get(esplora_addr, "/fees/recommended").await;
     assert_eq!(st, 200, "GET /fees/recommended: {body}");
     let rec: Value = serde_json::from_str(&body).unwrap();
-    for key in [
-        "fastestFee",
-        "halfHourFee",
-        "hourFee",
-        "economyFee",
-        "minimumFee",
-    ] {
+    for key in ["fastestFee", "halfHourFee", "hourFee", "economyFee", "minimumFee"] {
         let n = rec[key].as_u64().unwrap_or(0);
         assert!(n >= 1, "{key} sat/vB: {body}");
     }
@@ -1332,11 +1077,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
-    assert_eq!(
-        mined["result"].as_array().map(|a| a.len()),
-        Some(1),
-        "{mined}"
-    );
+    assert_eq!(mined["result"].as_array().map(|a| a.len()), Some(1), "{mined}");
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
     assert_eq!(count["result"], 107, "{count}");
     let empty = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
@@ -1349,30 +1090,16 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         .expect("esplora ws timed out")
         .expect("esplora ws join");
     assert!(saw_block, "ws want:blocks must push the generate tip");
-    assert!(
-        saw_tx,
-        "ws track-tx must confirm {pkg_parent_txid} on generate"
-    );
+    assert!(saw_tx, "ws track-tx must confirm {pkg_parent_txid} on generate");
     let blk = jsonrpc(rpc_addr, "getblock", json!([tip["result"].clone(), 2])).await;
     let txs = blk["result"]["tx"].as_array().expect("mined tx array");
-    assert!(
-        txs.len() >= 30,
-        "coinbase + RBF + esplora + packages: {blk}"
-    );
+    assert!(txs.len() >= 30, "coinbase + RBF + esplora + packages: {blk}");
     pin_esplora_blocks_summaries(esplora_addr, 107, new_hash).await;
     pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
+    assert!(txs[0]["vin"][0].get("txid").is_some(), "verbosity 2 coinbase vin: {blk}");
+    assert!(txs[0]["vout"][0].get("value").is_some(), "verbosity 2 coinbase vout: {blk}");
     assert!(
-        txs[0]["vin"][0].get("txid").is_some(),
-        "verbosity 2 coinbase vin: {blk}"
-    );
-    assert!(
-        txs[0]["vout"][0].get("value").is_some(),
-        "verbosity 2 coinbase vout: {blk}"
-    );
-    assert!(
-        txs.iter()
-            .skip(1)
-            .any(|t| t["vin"][0].get("txid").is_some()),
+        txs.iter().skip(1).any(|t| t["vin"][0].get("txid").is_some()),
         "verbosity 2 spend vin: {blk}"
     );
     for tid in [
@@ -1385,19 +1112,14 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         &chain_last,
         &cpfp_parent_txid,
     ] {
-        assert!(
-            txs.iter().any(|t| t["txid"] == *tid),
-            "generate must include {tid}: {blk}"
-        );
+        assert!(txs.iter().any(|t| t["txid"] == *tid), "generate must include {tid}: {blk}");
     }
     pin_mined_parent_before_child(txs, &pkg_parent_txid, &pkg_child_txid);
     pin_scantxoutset_drops_spent_coinbase(rpc_addr, &cb_hex).await;
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
     pin_esplora_block_txids_merkle_and_outspend(esplora_addr, new_hash, &cb_txid, txs.len()).await;
-    let parent_hash = blk["result"]["previousblockhash"]
-        .as_str()
-        .expect("previousblockhash")
-        .to_string();
+    let parent_hash =
+        blk["result"]["previousblockhash"].as_str().expect("previousblockhash").to_string();
     pin_esplora_block_json_raw_status(esplora_addr, new_hash, &parent_hash, 107, txs.len()).await;
     pin_esplora_txid_raw_hex_merkleblock(esplora_addr, new_hash, &cb_txid).await;
     pin_esplora_block_height_and_header(esplora_addr, new_hash, 107).await;
@@ -1424,17 +1146,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     };
     let mut imm_raw = Vec::new();
     immature.consensus_encode(&mut imm_raw).unwrap();
-    let imm = jsonrpc(
-        rpc_addr,
-        "sendrawtransaction",
-        json!([rbitcoin_primitives::hex_encode(&imm_raw)]),
-    )
-    .await;
+    let imm =
+        jsonrpc(rpc_addr, "sendrawtransaction", json!([rbitcoin_primitives::hex_encode(&imm_raw)]))
+            .await;
     assert_eq!(imm["error"]["code"], -26, "{imm}");
-    assert_eq!(
-        imm["error"]["message"], "bad-txns-premature-spend-of-coinbase",
-        "{imm}"
-    );
+    assert_eq!(imm["error"]["message"], "bad-txns-premature-spend-of-coinbase", "{imm}");
 
     let relay_deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1450,12 +1166,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], false, "{chain}");
 
-    let relay_parent = acs_spend(
-        relay_cb,
-        50_0000_0000,
-        1_000,
-        ScriptBuf::from_bytes(vec![0x59]),
-    );
+    let relay_parent = acs_spend(relay_cb, 50_0000_0000, 1_000, ScriptBuf::from_bytes(vec![0x59]));
     let relay_child = acs_spend(
         relay_parent.compute_txid(),
         50_0000_0000 - 1_000,
@@ -1466,10 +1177,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let relay_child_txid = relay_child.compute_txid().to_string();
     let pkg_hexes = json!([encode_tx(&relay_parent), encode_tx(&relay_child)]);
     let capped = jsonrpc(rpc_addr, "submitpackage", json!([pkg_hexes.clone(), 1])).await;
-    assert_eq!(
-        capped["result"]["package_msg"], "transaction failed",
-        "{capped}"
-    );
+    assert_eq!(capped["result"]["package_msg"], "transaction failed", "{capped}");
     let cap_err = capped["result"]["tx-results"]
         .as_object()
         .and_then(|m| m.values().next())
@@ -1491,17 +1199,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         .and_then(|m| m.values().next())
         .cloned()
         .unwrap_or(json!(null));
-    assert!(
-        again_row.get("error").is_none(),
-        "already-in-mempool must not error: {again}"
-    );
+    assert!(again_row.get("error").is_none(), "already-in-mempool must not error: {again}");
 
-    let rpc_cpfp_parent = acs_spend(
-        rpc_cpfp_cb,
-        50_0000_0000,
-        1,
-        ScriptBuf::from_bytes(vec![0x51]),
-    );
+    let rpc_cpfp_parent =
+        acs_spend(rpc_cpfp_cb, 50_0000_0000, 1, ScriptBuf::from_bytes(vec![0x51]));
     let rpc_cpfp_child = acs_spend(
         rpc_cpfp_parent.compute_txid(),
         50_0000_0000 - 1,
@@ -1514,10 +1215,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         json!([[encode_tx(&rpc_cpfp_parent), encode_tx(&rpc_cpfp_child)]]),
     )
     .await;
-    assert_eq!(
-        rpc_cpfp["result"]["package_msg"], "success",
-        "RPC submitpackage CPFP: {rpc_cpfp}"
-    );
+    assert_eq!(rpc_cpfp["result"]["package_msg"], "success", "RPC submitpackage CPFP: {rpc_cpfp}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
     assert!(
         mempool_has(&mem, &rpc_cpfp_parent.compute_txid().to_string())
@@ -1532,16 +1230,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     )
     .await;
     let n26_msg = n26["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        n26_msg.contains("package too large"),
-        "RPC 26-tx package: {n26}"
-    );
-    let fat = jsonrpc(
-        rpc_addr,
-        "submitpackage",
-        json!([[encode_tx(&fat_a), encode_tx(&fat_b)]]),
-    )
-    .await;
+    assert!(n26_msg.contains("package too large"), "RPC 26-tx package: {n26}");
+    let fat =
+        jsonrpc(rpc_addr, "submitpackage", json!([[encode_tx(&fat_a), encode_tx(&fat_b)]])).await;
     let fat_msg = fat["error"]["message"]
         .as_str()
         .or_else(|| fat["result"]["package_msg"].as_str())

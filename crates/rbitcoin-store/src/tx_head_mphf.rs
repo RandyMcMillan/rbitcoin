@@ -53,12 +53,7 @@ pub(crate) fn group_assigned_pairs(pairs: &mut [(u64, u32)]) -> Result<AssignedK
     }
     keys.shrink_to_fit();
     values.shrink_to_fit();
-    Ok(AssignedKeys {
-        keys,
-        values,
-        mlt,
-        modulus,
-    })
+    Ok(AssignedKeys { keys, values, mlt, modulus })
 }
 
 pub fn mphf_path(base: &Path) -> PathBuf {
@@ -222,10 +217,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "rbitcoin-tx-mphf-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ))
     }
 
@@ -233,19 +225,13 @@ mod tests {
     fn shared_g_page_is_one_pread() {
         let dir = tmp("share");
         std::fs::create_dir_all(&dir).unwrap();
-        let keys: Vec<u64> = (0..4_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(3))
-            .collect();
+        let keys: Vec<u64> =
+            (0..4_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(3)).collect();
         let ram = BdzMphf::build(&keys).unwrap();
         let p = dir.join("t.mphf");
         ram.write_to(&p).unwrap();
         let fd = BdzMphf::read_from(&p).unwrap();
-        let page_of = |k: u64| {
-            fd.vertices(k)
-                .into_iter()
-                .map(|v| v / 1024)
-                .collect::<Vec<_>>()
-        };
+        let page_of = |k: u64| fd.vertices(k).into_iter().map(|v| v / 1024).collect::<Vec<_>>();
         let k0 = keys[0];
         let p0 = page_of(k0);
         let k1 = keys
@@ -327,22 +313,15 @@ mod tests {
             session.epoch(),
             0,
         );
-        session
-            .push_pread(leftover_fd, 0, &mut leftover_buf, ud)
-            .unwrap();
+        session.push_pread(leftover_fd, 0, &mut leftover_buf, ud).unwrap();
         session.submit().unwrap();
-        assert!(
-            session.in_flight() > 0,
-            "foreign SQE must still be pending when BDZ starts"
-        );
+        assert!(session.in_flight() > 0, "foreign SQE must still be pending when BDZ starts");
 
         let batch = {
             let mut ctx = IoCtx::held(&mut session);
-            fd_mphf
-                .index_batch(&keys[..8], &mut ctx)
-                .unwrap_or_else(|e| {
-                    panic!("held index_batch with leftover KIND_BULK_PREAD must drain, not {e}")
-                })
+            fd_mphf.index_batch(&keys[..8], &mut ctx).unwrap_or_else(|e| {
+                panic!("held index_batch with leftover KIND_BULK_PREAD must drain, not {e}")
+            })
         };
         session.drain_all().unwrap();
         assert_eq!(batch, serial);
@@ -355,9 +334,8 @@ mod tests {
         let dir = tmp("open");
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("000000");
-        let pairs: Vec<(u64, u32)> = (1..64u32)
-            .map(|i| (u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15), i))
-            .collect();
+        let pairs: Vec<(u64, u32)> =
+            (1..64u32).map(|i| (u64::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15), i)).collect();
         let h = TxHeadMphf::write(&base, &pairs).unwrap();
         assert_eq!(h.mphf.g_bytes_resident(), 0);
         assert!(!rel_path(&base).is_file());
@@ -365,9 +343,7 @@ mod tests {
         let slots = h.slots_for(&[pairs[0].0]).unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0], pairs[0].1 - 1);
-        let rels = h
-            .read_rels_batch(&slots, &mut crate::IoCtx::none())
-            .unwrap();
+        let rels = h.read_rels_batch(&slots, &mut crate::IoCtx::none()).unwrap();
         assert_eq!(rels[0][0], pairs[0].1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -375,19 +351,12 @@ mod tests {
     #[test]
     fn group_assigned_pairs_unique_and_bip30_newest() {
         assert!(group_assigned_pairs(&mut []).unwrap().keys.is_empty());
-        assert!(matches!(
-            group_assigned_pairs(&mut [(1, 0)]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(group_assigned_pairs(&mut [(1, 0)]), Err(StoreError::Corrupt(_))));
         let mut pairs = vec![(10u64, 2u32), (20, 1), (10, 5), (10, 3), (30, 4)];
         let g = group_assigned_pairs(&mut pairs).unwrap();
         assert_eq!(g.modulus, 5);
-        let mut got: Vec<(u64, u32)> = g
-            .keys
-            .iter()
-            .copied()
-            .zip(g.values.iter().copied())
-            .collect();
+        let mut got: Vec<(u64, u32)> =
+            g.keys.iter().copied().zip(g.values.iter().copied()).collect();
         got.sort_unstable();
         assert_eq!(got, vec![(10, 4), (20, 0), (30, 3)]);
         assert_eq!(g.mlt.get(&4), Some(&vec![3, 2]));
@@ -406,18 +375,12 @@ mod tests {
         assert!(!rel_path(&base).is_file());
         let slots = h.slots_for(&[key]).unwrap();
         assert_eq!(slots, vec![2]);
-        let rels = h
-            .read_rels_batch(&slots, &mut crate::IoCtx::none())
-            .unwrap();
+        let rels = h.read_rels_batch(&slots, &mut crate::IoCtx::none()).unwrap();
         assert_eq!(rels[0], vec![3, 1]);
         std::fs::write(rel_path(&base), [9u8; 4]).unwrap();
         let h2 = TxHeadMphf::open(&base).unwrap();
         assert!(!rel_path(&base).is_file());
-        assert_eq!(
-            h2.read_rels_batch(&slots, &mut crate::IoCtx::none())
-                .unwrap()[0],
-            vec![3, 1]
-        );
+        assert_eq!(h2.read_rels_batch(&slots, &mut crate::IoCtx::none()).unwrap()[0], vec![3, 1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

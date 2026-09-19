@@ -32,16 +32,11 @@ pub fn default_signet_challenge() -> ScriptBuf {
 /// its CompactSize length prefix, and uses the first four digest bytes.
 pub fn signet_magic(challenge: &Script) -> [u8; 4] {
     let encoded = serialize(&challenge.as_bytes().to_vec());
-    sha256d::Hash::hash(&encoded).to_byte_array()[..4]
-        .try_into()
-        .expect("four-byte digest prefix")
+    sha256d::Hash::hash(&encoded).to_byte_array()[..4].try_into().expect("four-byte digest prefix")
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
-        .collect()
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
 }
 
 /// Validate BIP325 signet block solution against `challenge`.
@@ -131,10 +126,7 @@ fn build_signet_txs(
         version: bitcoin::transaction::Version::non_standard(0),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: to_spend_txid,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: to_spend_txid, vout: 0 },
             script_sig,
             sequence: Sequence::ZERO,
             witness,
@@ -403,14 +395,8 @@ mod tests {
     #[test]
     fn custom_challenge_derives_expected_wire_magic() {
         let challenge = ScriptBuf::from_bytes(vec![0x51]);
-        assert_eq!(
-            signet_magic(challenge.as_script()),
-            [0x54, 0xd2, 0x6f, 0xbd]
-        );
-        assert_eq!(
-            signet_magic(default_signet_challenge().as_script()),
-            [0x0a, 0x03, 0xcf, 0x40]
-        );
+        assert_eq!(signet_magic(challenge.as_script()), [0x54, 0xd2, 0x6f, 0xbd]);
+        assert_eq!(signet_magic(default_signet_challenge().as_script()), [0x0a, 0x03, 0xcf, 0x40]);
     }
 
     #[test]
@@ -605,10 +591,7 @@ mod tests {
         let root = modified_merkle_root(&cb, &block).unwrap();
         assert_ne!(root.to_byte_array(), [0u8; 32]);
         // Odd: only coinbase
-        let solo = Block {
-            header: block.header,
-            txdata: vec![cb.clone()],
-        };
+        let solo = Block { header: block.header, txdata: vec![cb.clone()] };
         let r2 = modified_merkle_root(&cb, &solo).unwrap();
         assert_eq!(r2.to_byte_array(), cb.compute_txid().to_byte_array());
         let _ = cb;
@@ -672,10 +655,7 @@ mod tests {
                 sequence: Sequence::ZERO,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::ZERO,
-                script_pubkey: spk,
-            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: spk }],
         };
         let txid = to_spend.compute_txid();
         let to_sign = Transaction {
@@ -748,10 +728,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let multi = Block {
-            header: block.header,
-            txdata: vec![cb.clone(), dummy(1), dummy(2)],
-        };
+        let multi = Block { header: block.header, txdata: vec![cb.clone(), dummy(1), dummy(2)] };
         let root = modified_merkle_root(&cb, &multi).unwrap();
         assert_ne!(root.to_byte_array(), [0u8; 32]);
         let _ = cb;

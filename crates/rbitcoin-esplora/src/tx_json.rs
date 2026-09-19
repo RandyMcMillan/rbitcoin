@@ -26,9 +26,7 @@ pub fn tx_status_json_in(
     tx_fk: Fk,
     view: &rbitcoin_query::ChainView,
 ) -> Result<Value, QueryError> {
-    let confirmed = query
-        .store()
-        .is_confirmed_strong_at(tx_fk, Some(view.height.0))?;
+    let confirmed = query.store().is_confirmed_strong_at(tx_fk, Some(view.height.0))?;
     if !confirmed {
         return Ok(json!({ "confirmed": false }));
     }
@@ -149,21 +147,9 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
     let wire = query.reconstruct_tx(tx_fk)?;
     let status = tx_status_json(query, tx_fk)?;
     let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
-    let stored_txid = query
-        .store()
-        .txs
-        .body_txid(tx_fk)
-        .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
-    tx_json_from_wire(
-        query,
-        &wire,
-        network,
-        status,
-        &stored_inputs,
-        stored_txid,
-        None,
-        None,
-    )
+    let stored_txid =
+        query.store().txs.body_txid(tx_fk).unwrap_or_else(|_| wire.compute_txid().to_byte_array());
+    tx_json_from_wire(query, &wire, network, status, &stored_inputs, stored_txid, None, None)
 }
 
 /// Esplora tx JSON from a mempool wire body (not in Class A).
@@ -423,17 +409,11 @@ mod tests {
         // Truncated direct push → break with no complete last from this op.
         assert!(last_push_data(&[0x03, 0xaa]).is_none());
         // OP_PUSHDATA1
-        assert_eq!(
-            last_push_data(&[0x4c, 0x02, 0x11, 0x22]),
-            Some(&[0x11, 0x22][..])
-        );
+        assert_eq!(last_push_data(&[0x4c, 0x02, 0x11, 0x22]), Some(&[0x11, 0x22][..]));
         assert!(last_push_data(&[0x4c]).is_none()); // missing length
         assert!(last_push_data(&[0x4c, 0x05, 0x01]).is_none()); // truncated body
                                                                 // OP_PUSHDATA2
-        assert_eq!(
-            last_push_data(&[0x4d, 0x02, 0x00, 0x33, 0x44]),
-            Some(&[0x33, 0x44][..])
-        );
+        assert_eq!(last_push_data(&[0x4d, 0x02, 0x00, 0x33, 0x44]), Some(&[0x33, 0x44][..]));
         assert!(last_push_data(&[0x4d, 0x01]).is_none()); // short len field
         assert!(last_push_data(&[0x4d, 0x03, 0x00, 0x01]).is_none()); // short body
                                                                       // Non-push after push clears last.
@@ -479,10 +459,7 @@ mod tests {
         use rbitcoin_store::{script_hash, HeaderRecord, InputRecord, OutputRecord, TxRecord};
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-esplora-utxo-json-{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -570,10 +547,7 @@ mod tests {
                         && r["value"] == u.value
                 })
                 .expect("row");
-            let (_fk, rec) = q
-                .header_at_height(Height(u.height as u32))
-                .unwrap()
-                .unwrap();
+            let (_fk, rec) = q.header_at_height(Height(u.height as u32)).unwrap().unwrap();
             assert_eq!(row["status"]["confirmed"], true);
             assert_eq!(row["status"]["block_hash"], block_hash_hex(&rec.hash));
             assert_eq!(row["status"]["block_time"], rec.timestamp);
@@ -621,10 +595,7 @@ mod tests {
         use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-esplora-prevout-{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

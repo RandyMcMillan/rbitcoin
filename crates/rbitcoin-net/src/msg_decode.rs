@@ -16,17 +16,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Concurrent **block** payload decodes (Class A feed). Sized for IBD window.
 fn block_decode_permits() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_mul(8).max(64))
-        .unwrap_or(64)
+    std::thread::available_parallelism().map(|n| n.get().saturating_mul(8).max(64)).unwrap_or(64)
 }
 
 /// Concurrent **headers/notfound** decodes. Kept smaller so header storms cannot
 /// starve block deserialize (signet: drain flooded while arch_q=0 / writer idle).
 fn ctrl_decode_permits() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_mul(2).max(8))
-        .unwrap_or(8)
+    std::thread::available_parallelism().map(|n| n.get().saturating_mul(2).max(8)).unwrap_or(8)
 }
 
 fn block_decode_semaphore() -> &'static Arc<Semaphore> {
@@ -124,10 +120,7 @@ mod tests {
 
     #[test]
     fn decode_offload_light_and_spawn() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let msg = rt.block_on(decode_framed_offload(verack_frame())).unwrap();
         assert!(matches!(msg.payload(), NetworkMessage::Verack));
 

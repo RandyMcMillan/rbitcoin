@@ -35,10 +35,7 @@ fn utxos_spent(v: &Value) -> Result<Vec<TxOut>, String> {
     let mut out = Vec::with_capacity(arr.len());
     for u in arr {
         let spk = decode_hex(u.get("scriptPubKey").and_then(Value::as_str).ok_or("spk")?)?;
-        let sats = u
-            .get("amountSats")
-            .and_then(Value::as_i64)
-            .ok_or("amountSats")? as u64;
+        let sats = u.get("amountSats").and_then(Value::as_i64).ok_or("amountSats")? as u64;
         out.push(TxOut {
             value: Amount::from_sat(sats),
             script_pubkey: ScriptBuf::from_bytes(spk),
@@ -63,15 +60,8 @@ fn collect_leaves(node: &Value, out: &mut Vec<(usize, Vec<u8>, u8)>) -> Result<(
     }
     if let Some(obj) = node.as_object() {
         let id = obj.get("id").and_then(Value::as_i64).ok_or("leaf id")? as usize;
-        let script = decode_hex(
-            obj.get("script")
-                .and_then(Value::as_str)
-                .ok_or("leaf script")?,
-        )?;
-        let lv = obj
-            .get("leafVersion")
-            .and_then(Value::as_i64)
-            .ok_or("leafVersion")? as u8;
+        let script = decode_hex(obj.get("script").and_then(Value::as_str).ok_or("leaf script")?)?;
+        let lv = obj.get("leafVersion").and_then(Value::as_i64).ok_or("leafVersion")? as u8;
         out.push((id, script, lv));
         return Ok(());
     }
@@ -87,10 +77,8 @@ fn collect_leaves(node: &Value, out: &mut Vec<(usize, Vec<u8>, u8)>) -> Result<(
 fn unknown_leaf_spend(spk_hex: &str, script: &[u8], control_hex: &str) -> Result<(), String> {
     let spk = decode_hex(spk_hex)?;
     let control = decode_hex(control_hex)?;
-    let prevout = TxOut {
-        value: Amount::from_sat(50_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(50_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -118,11 +106,8 @@ fn core_bip341_wallet_vectors_all_rows() {
     let mut unknown_leaf = 0u32;
     let mut failures = Vec::new();
 
-    let key_path = root
-        .get("keyPathSpending")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let key_path =
+        root.get("keyPathSpending").and_then(Value::as_array).cloned().unwrap_or_default();
     for (vi, vec) in key_path.iter().enumerate() {
         let given = &vec["given"];
         let prevouts = match utxos_spent(&given["utxosSpent"]) {
@@ -206,11 +191,7 @@ fn core_bip341_wallet_vectors_all_rows() {
         }
     }
 
-    let spks = root
-        .get("scriptPubKey")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let spks = root.get("scriptPubKey").and_then(Value::as_array).cloned().unwrap_or_default();
     for (si, vec) in spks.iter().enumerate() {
         let tree = &vec["given"]["scriptTree"];
         let mut leaves = Vec::new();
@@ -220,10 +201,8 @@ fn core_bip341_wallet_vectors_all_rows() {
             continue;
         }
         let spk = vec["expected"]["scriptPubKey"].as_str().unwrap_or("");
-        let cbs = vec["expected"]["scriptPathControlBlocks"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let cbs =
+            vec["expected"]["scriptPathControlBlocks"].as_array().cloned().unwrap_or_default();
         for (id, script, lv) in leaves {
             if lv == 0xc0 {
                 continue;
@@ -271,8 +250,5 @@ fn core_bip341_fully_signed_tamper_rejects() {
     raw[last] ^= 0x01;
     let tx: Transaction = deserialize(&raw).expect("still a tx");
     let job = taproot_job(tx, prevouts);
-    assert!(
-        script::verify_job_all_inputs(&job).is_err(),
-        "tampered fullySignedTx must reject"
-    );
+    assert!(script::verify_job_all_inputs(&job).is_err(), "tampered fullySignedTx must reject");
 }

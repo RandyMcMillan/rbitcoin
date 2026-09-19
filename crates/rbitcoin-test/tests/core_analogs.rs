@@ -49,18 +49,14 @@ fn analog_milestone_and_mempool_persist() {
     {
         let hub = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
         hub.set_relay_enabled(true);
-        let r = hub
-            .accept_tx(&unconf)
-            .expect("accept unconfirmed spend of confirmed anyone-can-spend");
+        let r =
+            hub.accept_tx(&unconf).expect("accept unconfirmed spend of confirmed anyone-can-spend");
         assert_eq!(r.txid, want);
         hub.flush().expect("SIGTERM-equivalent flush");
         assert!(hub.contains(&want));
     }
     let hub2 = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
-    assert!(
-        hub2.contains(&want),
-        "flushed mempool must still hold the tx after reopen"
-    );
+    assert!(hub2.contains(&want), "flushed mempool must still hold the tx after reopen");
     assert_eq!(hub2.live_count(), 1);
     drop(hub2);
     let (tip, tip_time, h) =
@@ -93,28 +89,18 @@ fn analog_milestone_and_mempool_persist() {
     assert_eq!(q.tip_height(), Some(Height(h)));
 
     let ms_hi = Milestone { height: 1_000_000 };
-    let mut phantom = mine_regtest_block(
-        bad_block.block_hash(),
-        bad_block.header.time + 600,
-        h + 1,
-        vec![],
-    );
+    let mut phantom =
+        mine_regtest_block(bad_block.block_hash(), bad_block.header.time + 600, h + 1, vec![]);
     phantom.txdata.push(Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0xcd; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0xcd; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::new(),
-        }],
+        output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::new() }],
     });
     phantom.header.merkle_root = phantom.compute_merkle_root().unwrap();
     grind_regtest_pow(&mut phantom.header);
@@ -149,22 +135,14 @@ fn pin_restart_catchup_then_tip_purge(
         chain.spend_height + 5,
     );
     let spend_cb = |h: usize, sats: u64| {
-        spend_anyone_can_spend(
-            chain.blocks[h].txdata[0].compute_txid(),
-            0,
-            Amount::from_sat(sats),
-        )
+        spend_anyone_can_spend(chain.blocks[h].txdata[0].compute_txid(), 0, Amount::from_sat(sats))
     };
     let same = spend_cb(2, 49_0000_0000);
     let loser = spend_cb(3, 48_0000_0000);
     let winner = spend_cb(3, 47_0000_0000);
     let parent = spend_cb(4, 49_0000_0000);
     let child = spend_anyone_can_spend(parent.compute_txid(), 0, Amount::from_sat(48_0000_0000));
-    let extras = [
-        spend_cb(5, 49_0000_0000),
-        spend_cb(6, 49_0000_0000),
-        spend_cb(7, 49_0000_0000),
-    ];
+    let extras = [spend_cb(5, 49_0000_0000), spend_cb(6, 49_0000_0000), spend_cb(7, 49_0000_0000)];
     let same_id = same.compute_txid();
     let loser_id = loser.compute_txid();
     let parent_id = parent.compute_txid();
@@ -173,12 +151,8 @@ fn pin_restart_catchup_then_tip_purge(
     assert_ne!(loser_id, winner.compute_txid());
 
     let h = chain.spend_height + 6;
-    let blk = mine_regtest_block(
-        pad_tip,
-        pad_time + 600,
-        h,
-        vec![same.clone(), winner, parent.clone()],
-    );
+    let blk =
+        mine_regtest_block(pad_tip, pad_time + 600, h, vec![same.clone(), winner, parent.clone()]);
     {
         let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
         hub.set_relay_enabled(true);
@@ -227,22 +201,10 @@ fn pin_restart_catchup_then_tip_purge(
             "reopen after catch-up must load leftover txs before tip-mode purge"
         );
         hub.set_relay_enabled(true);
-        assert!(
-            !hub.contains(&same_id),
-            "same-txid confirmed leftover must drop at relay-on"
-        );
-        assert!(
-            !hub.contains(&loser_id),
-            "input-conflict leftover must drop at relay-on"
-        );
-        assert!(
-            !hub.contains(&parent_id),
-            "confirmed parent leftover must drop at relay-on"
-        );
-        assert!(
-            hub.contains(&child_id),
-            "child of a now-confirmed parent must stay"
-        );
+        assert!(!hub.contains(&same_id), "same-txid confirmed leftover must drop at relay-on");
+        assert!(!hub.contains(&loser_id), "input-conflict leftover must drop at relay-on");
+        assert!(!hub.contains(&parent_id), "confirmed parent leftover must drop at relay-on");
+        assert!(hub.contains(&child_id), "child of a now-confirmed parent must stay");
         assert!(hub.contains(leftover), "unrelated leftover must stay");
         for id in &extra_ids {
             assert!(hub.contains(id), "ballast leftover must stay (no compact)");
@@ -260,8 +222,7 @@ fn pin_restart_catchup_then_tip_purge(
         let mut strip = extra_ids;
         strip.push(child_id);
         assert_eq!(hub.remove_for_block(&strip), strip.len());
-        hub.flush()
-            .expect("restore singleton leftover for slots.tmp pin");
+        hub.flush().expect("restore singleton leftover for slots.tmp pin");
     }
 
     (blk.block_hash(), blk.header.time, h + 1)
@@ -272,10 +233,7 @@ fn pin_leftover_slots_tmp_and_truncated_body(mp_dir: &Path, q: &Arc<Query>, want
     assert!(mp_dir.join("slots.tmp").exists());
     let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
         .expect("open finishes leftover slots.tmp");
-    assert!(
-        !mp_dir.join("slots.tmp").exists(),
-        "leftover slots.tmp must be renamed away"
-    );
+    assert!(!mp_dir.join("slots.tmp").exists(), "leftover slots.tmp must be renamed away");
     assert_eq!(hub.live_count(), 1);
     assert!(hub.contains(want));
     drop(hub);
@@ -314,23 +272,14 @@ fn assert_query_open_refuses(store: &Path, needle: &str) {
     };
     let msg = err.to_string();
     assert!(msg.contains(needle), "expected {needle:?} in {msg}");
-    assert!(
-        store.join("txout.body").is_file(),
-        "Class A kept after {needle} refuse"
-    );
+    assert!(store.join("txout.body").is_file(), "Class A kept after {needle} refuse");
 }
 
 fn assert_query_rebuilds_from_class_a(store: &Path, b1: &bitcoin::Block, cb_txid: &[u8; 32]) {
     let q = Query::open_or_create_tiny(store).expect("torn current tx.head rebuilds from Class A");
     assert_eq!(q.tip_height(), Some(Height(2)));
-    assert!(
-        q.tx_head_occupied() >= 3,
-        "open must rebuild tx.head from Class A bodies"
-    );
-    assert!(
-        q.get_tx_by_txid(cb_txid).unwrap().is_some(),
-        "txid must resolve after head rebuild"
-    );
+    assert!(q.tx_head_occupied() >= 3, "open must rebuild tx.head from Class A bodies");
+    assert!(q.get_tx_by_txid(cb_txid).unwrap().is_some(), "txid must resolve after head rebuild");
     assert_reconstruct_eq(&q, 1, b1);
 }
 
@@ -369,17 +318,10 @@ fn analog_reconstruct_after_lost_head() {
 
     let q_clamp = Query::open_or_create_tiny(&store).unwrap();
     assert_eq!(q_clamp.tip_height(), Some(Height(2)));
-    let view = q_clamp
-        .pin_chain_view()
-        .unwrap()
-        .expect("Electrum/RPC chain_tip after crash-open");
+    let view = q_clamp.pin_chain_view().unwrap().expect("Electrum/RPC chain_tip after crash-open");
     assert_eq!(view.height, Height(2));
     assert_eq!(view.hash, b2.block_hash().to_byte_array());
-    let b3_fk = q_clamp
-        .get_tx_by_txid(&b3_cb)
-        .unwrap()
-        .expect("height-3 Class A kept")
-        .0;
+    let b3_fk = q_clamp.get_tx_by_txid(&b3_cb).unwrap().expect("height-3 Class A kept").0;
     assert!(
         !q_clamp.store().is_confirmed_strong(b3_fk).unwrap(),
         "leftover strong above clamped tip must not be confirmed"
@@ -392,14 +334,8 @@ fn analog_reconstruct_after_lost_head() {
 
     let q2 = Query::open_or_create_tiny(&store).unwrap();
     assert_eq!(q2.tip_height(), Some(Height(2)));
-    assert!(
-        q2.tx_head_occupied() >= 3,
-        "open must rebuild tx.head from Class A bodies"
-    );
-    assert!(
-        q2.get_tx_by_txid(&cb_txid).unwrap().is_some(),
-        "txid must resolve after head rebuild"
-    );
+    assert!(q2.tx_head_occupied() >= 3, "open must rebuild tx.head from Class A bodies");
+    assert!(q2.get_tx_by_txid(&cb_txid).unwrap().is_some(), "txid must resolve after head rebuild");
     assert_reconstruct_eq(&q2, 1, &b1);
     let rec = q2
         .reconstruct_block_at_height(Height(1))

@@ -29,11 +29,9 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
     let start = match params.as_array().and_then(|a| a.get(2)) {
         None | Some(Value::Null) => 0,
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
-        Some(Value::String(s)) if s.contains('-') => s
-            .split('-')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0),
+        Some(Value::String(s)) if s.contains('-') => {
+            s.split('-').next().and_then(|p| p.parse().ok()).unwrap_or(0)
+        }
         Some(Value::String(s)) => s.parse().unwrap_or(0),
         _ => 0,
     };
@@ -41,11 +39,7 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
         return Err("timestamp start not supported".into());
     }
     let mut labels = vec![0u32];
-    if let Some(arr) = params
-        .as_array()
-        .and_then(|a| a.get(3))
-        .and_then(|v| v.as_array())
-    {
+    if let Some(arr) = params.as_array().and_then(|a| a.get(3)).and_then(|v| v.as_array()) {
         for v in arr {
             if let Some(n) = v.as_u64() {
                 let n = n as u32;
@@ -60,13 +54,7 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
     }
     let start = start.min(tip.unwrap_or(start));
     let address = encode_sp_address(network, &scan, &spend);
-    Ok(SpSub {
-        scan,
-        spend,
-        start,
-        labels,
-        address,
-    })
+    Ok(SpSub { scan, spend, start, labels, address })
 }
 
 pub fn subscribe_result(sub: &SpSub) -> Value {
@@ -164,12 +152,8 @@ mod tests {
     fn parse_sub_labels_start_and_networks() {
         let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
         let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
-        let sub = parse_sub(
-            &json!([scan, spend, "12-20", [0, 1, 1]]),
-            Network::Bitcoin,
-            Some(100),
-        )
-        .unwrap();
+        let sub = parse_sub(&json!([scan, spend, "12-20", [0, 1, 1]]), Network::Bitcoin, Some(100))
+            .unwrap();
         assert_eq!(sub.start, 12);
         assert_eq!(sub.labels, vec![0, 1]);
         assert!(sub.address.starts_with("sp1"), "{}", sub.address);
@@ -188,11 +172,7 @@ mod tests {
             Ok(_) => panic!("spend"),
         };
         assert!(!bad_spend.is_empty(), "{bad_spend}");
-        let ts = match parse_sub(
-            &json!([scan, spend, 600_000_000]),
-            Network::Regtest,
-            Some(0),
-        ) {
+        let ts = match parse_sub(&json!([scan, spend, 600_000_000]), Network::Regtest, Some(0)) {
             Err(e) => e,
             Ok(_) => panic!("timestamp"),
         };
@@ -205,12 +185,8 @@ mod tests {
         assert!(too.contains("too many"), "{too}");
         let r = subscribe_result(&sub);
         assert_eq!(r["start_height"], 12);
-        let plain = parse_sub(
-            &json!([scan, spend, "12", ["x", 2]]),
-            Network::Regtest,
-            Some(20),
-        )
-        .unwrap();
+        let plain =
+            parse_sub(&json!([scan, spend, "12", ["x", 2]]), Network::Regtest, Some(20)).unwrap();
         assert_eq!(plain.start, 12);
         assert_eq!(plain.labels, vec![0, 2]);
         let clamp = parse_sub(&json!([scan, spend, 100]), Network::Regtest, Some(3)).unwrap();
@@ -235,11 +211,7 @@ mod tests {
         x32.copy_from_slice(&xonly);
         let hit = rbitcoin_consensus::TxTweak {
             tweak: tw33,
-            output_pubkeys: vec![rbitcoin_consensus::TaprootOut {
-                vout: 0,
-                xonly: x32,
-                value: 1,
-            }],
+            output_pubkeys: vec![rbitcoin_consensus::TaprootOut { vout: 0, xonly: x32, value: 1 }],
         };
         assert!(tx_matches(&sub, &hit));
         let miss = rbitcoin_consensus::TxTweak {

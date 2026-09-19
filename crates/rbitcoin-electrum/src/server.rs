@@ -272,12 +272,7 @@ pub async fn run_electrum(
         }
     });
 
-    Ok(ElectrumHandle {
-        local_addr,
-        shutdown,
-        tasks: vec![task],
-        clients,
-    })
+    Ok(ElectrumHandle { local_addr, shutdown, tasks: vec![task], clients })
 }
 
 /// Read one `\n`-terminated line with a hard byte cap (prevents OOM without newline).
@@ -777,11 +772,7 @@ fn silentpayments_unsubscribe(
 ) -> Result<Value, String> {
     let tip = query.tip_height().map(|h| h.0);
     let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
-    if conn
-        .sp_sub
-        .as_ref()
-        .is_some_and(|s| s.address == sub.address)
-    {
+    if conn.sp_sub.as_ref().is_some_and(|s| s.address == sub.address) {
         conn.sp_sub = None;
     }
     Ok(json!(sub.address))
@@ -879,15 +870,8 @@ where
     let wave = match wave_fut.await {
         Ok(v) => v,
         Err(e) => {
-            tweaks_sub_err(
-                writer,
-                peer,
-                &id,
-                params_v,
-                t0.elapsed().as_millis() as u64,
-                &e,
-            )
-            .await?;
+            tweaks_sub_err(writer, peer, &id, params_v, t0.elapsed().as_millis() as u64, &e)
+                .await?;
             return Ok(());
         }
     };
@@ -926,11 +910,7 @@ async fn tweaks_sub_err<W: AsyncWrite + Unpin>(
         wall_ms,
         Some(e),
     );
-    write_line(
-        writer,
-        &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
-    )
-    .await
+    write_line(writer, &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}})).await
 }
 
 fn tweaks_sub_ok_log(peer: &SocketAddr, params_v: &Value, wall_ms: u64) {
@@ -960,15 +940,8 @@ async fn serve_tweaks_empty_last<W: AsyncWrite + Unpin>(
         match crate::tweaks::height_map_json(query, chain, req.start, !req.historical, min_dust) {
             Ok(v) => v,
             Err(e) => {
-                tweaks_sub_err(
-                    writer,
-                    peer,
-                    id,
-                    params_v,
-                    t0.elapsed().as_millis() as u64,
-                    &e,
-                )
-                .await?;
+                tweaks_sub_err(writer, peer, id, params_v, t0.elapsed().as_millis() as u64, &e)
+                    .await?;
                 return Ok(());
             }
         };
@@ -1129,12 +1102,9 @@ fn restatus_notes(
     for sh in subs {
         let hit = match heights {
             None => true,
-            Some(hs) => hs.iter().any(|h| {
-                query
-                    .scripthash_touched_at_height(sh, Height(*h))
-                    .ok()
-                    .unwrap_or(false)
-            }),
+            Some(hs) => hs
+                .iter()
+                .any(|h| query.scripthash_touched_at_height(sh, Height(*h)).ok().unwrap_or(false)),
         };
         if !hit {
             continue;
@@ -1142,10 +1112,7 @@ fn restatus_notes(
         let status = if let Some(mp) = mempool {
             scripthash_status_full(query, mp, sh).ok()
         } else {
-            query
-                .scripthash_history(sh)
-                .ok()
-                .and_then(|h| scripthash_status(Some(query), &h).ok())
+            query.scripthash_history(sh).ok().and_then(|h| scripthash_status(Some(query), &h).ok())
         };
         if let Some(status) = status {
             out.push((*sh, status));
@@ -1390,9 +1357,7 @@ fn dispatch_with_join(
         }
         return Ok(json!([SERVER_VERSION, conn.protocol.as_str()]));
     }
-    dispatch_pinned(
-        method, params, query, config, chain, mempool, conn, None, false,
-    )
+    dispatch_pinned(method, params, query, config, chain, mempool, conn, None, false)
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -1467,9 +1432,7 @@ fn dispatch_pinned(
         }
         "blockchain.block.header" => {
             let height = param_u32(params, 0)?;
-            let hdr = query
-                .wire_header_at_height(Height(height))
-                .map_err(|e| e.to_string())?;
+            let hdr = query.wire_header_at_height(Height(height)).map_err(|e| e.to_string())?;
             Ok(json!(header_hex(&hdr)))
         }
         "blockchain.block.headers" => {
@@ -1507,8 +1470,7 @@ fn dispatch_pinned(
                 asof,
                 sh_join,
                 |q, view| {
-                    q.scripthash_history_filtered_in(&sh, &filter, view)
-                        .map_err(|e| e.to_string())
+                    q.scripthash_history_filtered_in(&sh, &filter, view).map_err(|e| e.to_string())
                 },
                 |q, slot, view| {
                     q.scripthash_history_filtered_slot_in(&sh, &filter, slot, view)
@@ -1542,24 +1504,16 @@ fn dispatch_pinned(
                 is_asof,
                 asof,
                 sh_join,
-                |q, view| {
-                    q.scripthash_balance_in(&sh, view)
-                        .map_err(|e| e.to_string())
-                },
+                |q, view| q.scripthash_balance_in(&sh, view).map_err(|e| e.to_string()),
                 |q, slot, view| {
-                    q.scripthash_balance_slot_in(&sh, slot, view)
-                        .map_err(|e| e.to_string())
+                    q.scripthash_balance_slot_in(&sh, slot, view).map_err(|e| e.to_string())
                 },
-                |q, slot| {
-                    q.scripthash_balance_slot(&sh, slot)
-                        .map_err(|e| e.to_string())
-                },
+                |q, slot| q.scripthash_balance_slot(&sh, slot).map_err(|e| e.to_string()),
             )?;
             if !is_asof && asof.is_none() {
                 if let Some(mp) = mempool {
-                    b.unconfirmed = mp
-                        .scripthash_unconfirmed_delta(&sh)
-                        .map_err(|e| e.to_string())?;
+                    b.unconfirmed =
+                        mp.scripthash_unconfirmed_delta(&sh).map_err(|e| e.to_string())?;
                 }
             }
             Ok(json!({"confirmed": b.confirmed, "unconfirmed": b.unconfirmed}))
@@ -1577,10 +1531,7 @@ fn dispatch_pinned(
                 is_asof,
                 asof,
                 sh_join,
-                |q, view| {
-                    q.scripthash_listunspent_in(&sh, view)
-                        .map_err(|e| e.to_string())
-                },
+                |q, view| q.scripthash_listunspent_in(&sh, view).map_err(|e| e.to_string()),
                 |q, slot, view| {
                     crate::unspent::scripthash_utxos_with_mempool_slot_in(
                         q, mempool, &sh, slot, view,
@@ -1617,9 +1568,8 @@ fn dispatch_pinned(
             let status = if let Some(mp) = mempool {
                 scripthash_status_full_slot(query, mp, &sh, sh_join)?
             } else {
-                let hist = query
-                    .scripthash_history_slot(&sh, sh_join)
-                    .map_err(|e| e.to_string())?;
+                let hist =
+                    query.scripthash_history_slot(&sh, sh_join).map_err(|e| e.to_string())?;
                 scripthash_status(Some(query), &hist)?
             };
             Ok(json!(status))
@@ -1630,16 +1580,10 @@ fn dispatch_pinned(
         }
         "blockchain.scripthash.get_mempool" => {
             let sh = param_scripthash(params, 0)?;
-            let items = mempool
-                .map(|m| m.scripthash_mempool(&sh))
-                .unwrap_or_default();
+            let items = mempool.map(|m| m.scripthash_mempool(&sh)).unwrap_or_default();
             let mut arr = Vec::with_capacity(items.len());
             for i in items {
-                if query
-                    .tx_fk_by_txid_tip(&i.txid)
-                    .map_err(|e| e.to_string())?
-                    .is_some()
-                {
+                if query.tx_fk_by_txid_tip(&i.txid).map_err(|e| e.to_string())?.is_some() {
                     continue;
                 }
                 arr.push(json!({
@@ -1652,11 +1596,8 @@ fn dispatch_pinned(
         }
         "blockchain.transaction.get" => {
             let txid = param_txid(params, 0)?;
-            let verbose = params
-                .as_array()
-                .and_then(|a| a.get(1))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let verbose =
+                params.as_array().and_then(|a| a.get(1)).and_then(|v| v.as_bool()).unwrap_or(false);
             if let Some((fk, _rec)) = query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
                 let confirmed_ok = if is_asof {
                     let view = pinned.ok_or_else(|| "asof not on chain".to_string())?;
@@ -1698,9 +1639,7 @@ fn dispatch_pinned(
                     return Err("asof not on chain".into());
                 }
             }
-            let proof = query
-                .merkle_proof(Height(height), &txid)
-                .map_err(|e| e.to_string())?;
+            let proof = query.merkle_proof(Height(height), &txid).map_err(|e| e.to_string())?;
             let merkle: Vec<String> = proof.merkle.iter().map(hash_hex_rev).collect();
             Ok(json!({
                 "block_height": proof.block_height,
@@ -1724,9 +1663,7 @@ fn dispatch_pinned(
             let tx: bitcoin::Transaction =
                 bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
             let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-            let r = mp
-                .accept_tx(&tx)
-                .map_err(|e| format!("broadcast reject: {e}"))?;
+            let r = mp.accept_tx(&tx).map_err(|e| format!("broadcast reject: {e}"))?;
             let _ = chain.network;
             Ok(json!(format!("{}", r.txid)))
         }
@@ -1736,17 +1673,13 @@ fn dispatch_pinned(
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
-            let verbose = params
-                .as_array()
-                .and_then(|a| a.get(1))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let verbose =
+                params.as_array().and_then(|a| a.get(1)).and_then(|v| v.as_bool()).unwrap_or(false);
             let mut txs = Vec::with_capacity(arr.len());
             let mut total_hex = 0usize;
             for h in arr {
-                let raw_hex = h
-                    .as_str()
-                    .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
+                let raw_hex =
+                    h.as_str().ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
                 total_hex = total_hex.saturating_add(raw_hex.len());
                 if total_hex > config.max_broadcast_hex {
                     return Err("package hex too large".into());
@@ -1760,9 +1693,8 @@ fn dispatch_pinned(
                 txs.push(tx);
             }
             let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-            let accepted = mp
-                .accept_package(&txs)
-                .map_err(|e| format!("broadcast_package reject: {e}"))?;
+            let accepted =
+                mp.accept_package(&txs).map_err(|e| format!("broadcast_package reject: {e}"))?;
             if verbose {
                 let mut tx_results = serde_json::Map::new();
                 for r in &accepted {
@@ -1810,9 +1742,7 @@ fn dispatch_pinned(
         "blockchain.transaction.id_from_pos" => id_from_pos(query, params),
         "blockchain.estimatefee" => {
             let target = param_u32(params, 0).unwrap_or(2);
-            let fee = mempool
-                .map(|m| m.estimate_fee_btc_per_kb(target))
-                .unwrap_or(-1.0);
+            let fee = mempool.map(|m| m.estimate_fee_btc_per_kb(target)).unwrap_or(-1.0);
             Ok(json!(fee))
         }
         "blockchain.relayfee" => {
@@ -1839,12 +1769,8 @@ fn dispatch_pinned(
 }
 
 fn tip_header_obj(query: &Query) -> Result<Value, String> {
-    let tip = query
-        .tip_height()
-        .ok_or_else(|| "no chain tip".to_string())?;
-    let hdr = query
-        .wire_header_at_height(tip)
-        .map_err(|e| e.to_string())?;
+    let tip = query.tip_height().ok_or_else(|| "no chain tip".to_string())?;
+    let hdr = query.wire_header_at_height(tip).map_err(|e| e.to_string())?;
     Ok(json!({
         "hex": header_hex(&hdr),
         "height": tip.0,
@@ -1922,10 +1848,7 @@ fn outpoint_status(
     params: &Value,
 ) -> Result<Value, String> {
     let (txid, vout) = param_outpoint(params)?;
-    if query
-        .is_outpoint_spent(&txid, vout)
-        .map_err(|e| e.to_string())?
-    {
+    if query.is_outpoint_spent(&txid, vout).map_err(|e| e.to_string())? {
         return Ok(json!({
             "txid": txid_hex(&txid),
             "vout": vout,
@@ -1935,10 +1858,7 @@ fn outpoint_status(
     }
     if let Some(mp) = mempool {
         use bitcoin::hashes::Hash;
-        let op = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array(txid),
-            vout,
-        };
+        let op = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array(txid), vout };
         if let Some(spend) = mp.spending_txid(&op) {
             return Ok(json!({
                 "txid": txid_hex(&txid),
@@ -1957,11 +1877,7 @@ fn outpoint_status(
 }
 
 fn protocol_string(parts: &[u32]) -> String {
-    parts
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(".")
+    parts.iter().map(ToString::to_string).collect::<Vec<_>>().join(".")
 }
 
 fn pick_dotted(cmin_s: &str, cmax_s: &str) -> Result<String, String> {
@@ -1980,10 +1896,7 @@ fn pick_dotted(cmin_s: &str, cmax_s: &str) -> Result<String, String> {
 }
 
 fn negotiate_protocol(params: &Value) -> Result<String, String> {
-    let pv = params
-        .as_array()
-        .and_then(|a| a.get(1))
-        .unwrap_or(&Value::Null);
+    let pv = params.as_array().and_then(|a| a.get(1)).unwrap_or(&Value::Null);
     if pv.is_null() {
         return Ok(PROTOCOL_MAX.to_string());
     }
@@ -1999,12 +1912,8 @@ fn negotiate_protocol(params: &Value) -> Result<String, String> {
     if range.len() != 2 {
         return Err("protocol_version range must be [min, max]".into());
     }
-    let a = range[0]
-        .as_str()
-        .ok_or("protocol_version range expected strings")?;
-    let b = range[1]
-        .as_str()
-        .ok_or("protocol_version range expected strings")?;
+    let a = range[0].as_str().ok_or("protocol_version range expected strings")?;
+    let b = range[1].as_str().ok_or("protocol_version range expected strings")?;
     if a == PROTOCOL_ASOF || b == PROTOCOL_ASOF {
         return Ok(PROTOCOL_ASOF.to_string());
     }
@@ -2046,14 +1955,8 @@ fn take_trailing_asof(
 /// - `to_height == -1` (or only `from_height`): open upper bound + mempool.
 /// - Finite exclusive `to_height`: confirmed `[from, to)` only — **no** mempool.
 fn parse_get_history_window(params: &Value) -> Result<(HistoryFilter, bool), String> {
-    let arr = params
-        .as_array()
-        .ok_or_else(|| "params expected array".to_string())?;
-    let from = if arr.len() >= 2 {
-        param_u32(params, 1)?
-    } else {
-        0
-    };
+    let arr = params.as_array().ok_or_else(|| "params expected array".to_string())?;
+    let from = if arr.len() >= 2 { param_u32(params, 1)? } else { 0 };
     let (to_excl, include_mempool) = if arr.len() >= 3 {
         let to = param_i64(params, 2)?;
         if to == -1 {
@@ -2108,11 +2011,8 @@ fn txid_hex(txid: &[u8; 32]) -> String {
 fn id_from_pos(query: &Query, params: &Value) -> Result<Value, String> {
     let height = param_u32(params, 0)?;
     let tx_pos = param_u32(params, 1)? as usize;
-    let want_merkle = params
-        .as_array()
-        .and_then(|a| a.get(2))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let want_merkle =
+        params.as_array().and_then(|a| a.get(2)).and_then(|v| v.as_bool()).unwrap_or(false);
     let txid = query.block_txid_at(Height(height), tx_pos).map_err(|e| {
         if matches!(e, StoreError::NotFound) {
             "pos out of range".to_string()
@@ -2123,9 +2023,7 @@ fn id_from_pos(query: &Query, params: &Value) -> Result<Value, String> {
     if !want_merkle {
         return Ok(json!(txid_hex(&txid)));
     }
-    let proof = query
-        .merkle_proof(Height(height), &txid)
-        .map_err(|e| e.to_string())?;
+    let proof = query.merkle_proof(Height(height), &txid).map_err(|e| e.to_string())?;
     let merkle: Vec<String> = proof.merkle.iter().map(hash_hex_rev).collect();
     Ok(json!({
         "tx_hash": txid_hex(&txid),
@@ -2153,11 +2051,7 @@ fn verbose_tx_json(
         obj["hash"] = json!(hash_hex_rev(&tx.compute_wtxid().to_byte_array()));
         obj["vin"] = Value::Array(tx.input.iter().map(verbose_vin).collect());
         obj["vout"] = Value::Array(
-            tx.output
-                .iter()
-                .enumerate()
-                .map(|(n, o)| verbose_vout(n, o, network))
-                .collect(),
+            tx.output.iter().enumerate().map(|(n, o)| verbose_vout(n, o, network)).collect(),
         );
     }
     match fk {
@@ -2198,11 +2092,7 @@ fn verbose_vin(input: &bitcoin::TxIn) -> Value {
         });
         if !input.witness.is_empty() {
             v["txinwitness"] = Value::Array(
-                input
-                    .witness
-                    .iter()
-                    .map(|w| json!(rbitcoin_primitives::hex_encode(w)))
-                    .collect(),
+                input.witness.iter().map(|w| json!(rbitcoin_primitives::hex_encode(w))).collect(),
             );
         }
         v
@@ -2295,12 +2185,7 @@ fn scripthash_status(
                     .ok_or_else(|| "header missing for confirmed history row".to_string())?;
                 Ok(rec.hash)
             })?;
-            s.push_str(&format!(
-                "{}:{}:{}:",
-                txid_hex(&i.txid),
-                i.height,
-                hash_hex_rev(&hash)
-            ));
+            s.push_str(&format!("{}:{}:{}:", txid_hex(&i.txid), i.height, hash_hex_rev(&hash)));
         } else {
             s.push_str(&format!("{}:{}:", txid_hex(&i.txid), i.height));
         }
@@ -2320,9 +2205,7 @@ fn scripthash_status_full_slot(
     sh: &[u8; 32],
     slot: &mut Option<ShJoinSlot>,
 ) -> Result<String, String> {
-    let mut hist = query
-        .scripthash_history_slot(sh, slot)
-        .map_err(|e| e.to_string())?;
+    let mut hist = query.scripthash_history_slot(sh, slot).map_err(|e| e.to_string())?;
     append_mempool_history(&mut hist, mp, sh);
     scripthash_status(Some(query), &hist)
 }

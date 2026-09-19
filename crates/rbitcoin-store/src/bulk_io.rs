@@ -109,9 +109,7 @@ pub(crate) fn parse_io_token_str(s: &str) -> Option<IoToken> {
 }
 
 fn parse_io_token() -> Option<IoToken> {
-    std::env::var("RBITCOIN_IO")
-        .ok()
-        .and_then(|s| parse_io_token_str(&s))
+    std::env::var("RBITCOIN_IO").ok().and_then(|s| parse_io_token_str(&s))
 }
 
 /// Backend [`crate::uring_session::UringSession::try_open`] should open.
@@ -160,10 +158,7 @@ pub fn bulk_io_workers() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4)
-                .clamp(1, 16)
+            std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).clamp(1, 16)
         })
         .max(1);
     WORKERS.store(n, Ordering::Relaxed);
@@ -187,12 +182,7 @@ pub fn pread_single(fd: IoHandle, offset: u64, buf: &mut [u8]) -> i32 {
     if buf.is_empty() {
         return 0;
     }
-    let mut ops = [ReadOp {
-        fd,
-        offset,
-        buf,
-        result: i32::MIN,
-    }];
+    let mut ops = [ReadOp { fd, offset, buf, result: i32::MIN }];
     pread_batch(&mut ops);
     ops[0].result
 }
@@ -621,12 +611,7 @@ mod tests {
     #[test]
     fn pwrite_batch_fail_unfilled_is_not_success() {
         let buf = [1u8; 4];
-        let mut ops = [WriteOp {
-            fd: dummy_handle(),
-            offset: 0,
-            buf: &buf,
-            result: i32::MIN,
-        }];
+        let mut ops = [WriteOp { fd: dummy_handle(), offset: 0, buf: &buf, result: i32::MIN }];
         assert!(!finish_pwrite_wave(&mut ops));
         assert_eq!(ops[0].result, -5);
         ops[0].result = 4;
@@ -647,10 +632,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-bulk-edge-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -663,21 +645,11 @@ mod tests {
 
         // Empty bufs
         let mut empty = [];
-        let mut ops = [ReadOp {
-            fd,
-            offset: 0,
-            buf: &mut empty[..],
-            result: i32::MIN,
-        }];
+        let mut ops = [ReadOp { fd, offset: 0, buf: &mut empty[..], result: i32::MIN }];
         pread_batch(&mut ops);
         assert_eq!(ops[0].result, 0);
 
-        let mut wops = [WriteOp {
-            fd,
-            offset: 0,
-            buf: &[],
-            result: i32::MIN,
-        }];
+        let mut wops = [WriteOp { fd, offset: 0, buf: &[], result: i32::MIN }];
         pwrite_batch(&mut wops);
         assert_eq!(wops[0].result, 0);
 
@@ -700,12 +672,7 @@ mod tests {
 
         // pread_one short read past EOF
         let mut past = [0u8; 16];
-        let mut ro = ReadOp {
-            fd,
-            offset: 10_000,
-            buf: &mut past,
-            result: i32::MIN,
-        };
+        let mut ro = ReadOp { fd, offset: 10_000, buf: &mut past, result: i32::MIN };
         pread_one(&mut ro);
         assert_eq!(ro.result, 0);
 
@@ -716,10 +683,7 @@ mod tests {
     fn pread_batch_roundtrip_tmpfile() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-uring-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -735,24 +699,9 @@ mod tests {
         let mut b2 = [0u8; 50];
         {
             let mut ops = [
-                ReadOp {
-                    fd,
-                    offset: 0,
-                    buf: &mut b0[..],
-                    result: i32::MIN,
-                },
-                ReadOp {
-                    fd,
-                    offset: 50,
-                    buf: &mut b1[..],
-                    result: i32::MIN,
-                },
-                ReadOp {
-                    fd,
-                    offset: 100,
-                    buf: &mut b2[..],
-                    result: i32::MIN,
-                },
+                ReadOp { fd, offset: 0, buf: &mut b0[..], result: i32::MIN },
+                ReadOp { fd, offset: 50, buf: &mut b1[..], result: i32::MIN },
+                ReadOp { fd, offset: 100, buf: &mut b2[..], result: i32::MIN },
             ];
             pread_batch(&mut ops);
             for op in &ops {
@@ -769,12 +718,7 @@ mod tests {
             let mut slices: Vec<&mut [u8]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
             let mut ops: Vec<ReadOp<'_>> = Vec::new();
             for (i, sl) in slices.iter_mut().enumerate() {
-                ops.push(ReadOp {
-                    fd,
-                    offset: i as u64,
-                    buf: sl,
-                    result: i32::MIN,
-                });
+                ops.push(ReadOp { fd, offset: i as u64, buf: sl, result: i32::MIN });
             }
             pread_batch(&mut ops);
             for (i, op) in ops.iter().enumerate() {
@@ -807,12 +751,7 @@ mod tests {
             let f = std::fs::File::open(&path).unwrap();
             let fd = crate::io_handle::IoHandle::from_file(&f);
             let mut b = [0u8; 4];
-            let mut ops = [ReadOp {
-                fd,
-                offset: 0,
-                buf: &mut b[..],
-                result: i32::MIN,
-            }];
+            let mut ops = [ReadOp { fd, offset: 0, buf: &mut b[..], result: i32::MIN }];
             pread_batch(&mut ops);
             assert_eq!(ops[0].result, 4);
             assert_eq!(&b, b"pool");
@@ -824,12 +763,7 @@ mod tests {
             )
             .expect("held pool");
             let mut b2 = [0u8; 4];
-            let mut ops2 = [ReadOp {
-                fd,
-                offset: 5,
-                buf: &mut b2[..],
-                result: i32::MIN,
-            }];
+            let mut ops2 = [ReadOp { fd, offset: 5, buf: &mut b2[..], result: i32::MIN }];
             assert!(
                 pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops2)
                     .expect("held pool pread"),
@@ -846,10 +780,7 @@ mod tests {
     fn held_pread_errno_on_live_ring_is_ok_true() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-held-errno-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -873,28 +804,15 @@ mod tests {
         let mut bad = [0u8; 4];
         let (used, r0, r1) = {
             let mut ops = [
-                ReadOp {
-                    fd: fd_ok,
-                    offset: 0,
-                    buf: &mut good[..],
-                    result: i32::MIN,
-                },
-                ReadOp {
-                    fd: fd_bad,
-                    offset: 0,
-                    buf: &mut bad[..],
-                    result: i32::MIN,
-                },
+                ReadOp { fd: fd_ok, offset: 0, buf: &mut good[..], result: i32::MIN },
+                ReadOp { fd: fd_bad, offset: 0, buf: &mut bad[..], result: i32::MIN },
             ];
             let used = pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops)
                 .expect("per-op errno on a live ring is not session death");
             (used, ops[0].result, ops[1].result)
         };
         assert!(used);
-        assert!(
-            !sess.is_poisoned(),
-            "write-only pread errno must not poison"
-        );
+        assert!(!sess.is_poisoned(), "write-only pread errno must not poison");
         assert_eq!(r0, 4);
         assert_eq!(&good, b"abcd");
         assert!(r1 < 0, "write-only pread must be errno, got {r1}");
@@ -906,10 +824,7 @@ mod tests {
     fn held_pread_poison_stays_fail_closed() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-held-poison-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -929,12 +844,7 @@ mod tests {
         });
         sess.poison();
         let mut b = [0u8; 4];
-        let mut ops = [ReadOp {
-            fd,
-            offset: 0,
-            buf: &mut b[..],
-            result: i32::MIN,
-        }];
+        let mut ops = [ReadOp { fd, offset: 0, buf: &mut b[..], result: i32::MIN }];
         match pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops) {
             Err(StoreError::Corrupt(m)) => {
                 assert!(m.contains("io_uring"), "{m}");
@@ -971,10 +881,7 @@ mod tests {
     fn pread_batch_fallback_matches() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-pread-fb-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -985,12 +892,7 @@ mod tests {
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut b = [0u8; 5];
         {
-            let mut ops = [ReadOp {
-                fd,
-                offset: 0,
-                buf: &mut b[..],
-                result: i32::MIN,
-            }];
+            let mut ops = [ReadOp { fd, offset: 0, buf: &mut b[..], result: i32::MIN }];
             pread_batch_fallback(&mut ops);
         }
         assert_eq!(&b, b"hello");
@@ -1001,10 +903,7 @@ mod tests {
     fn pwrite_batch_roundtrip_tmpfile() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-pwrite-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -1017,34 +916,15 @@ mod tests {
                 .unwrap();
             f.set_len(300).unwrap();
         }
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let d0 = [1u8; 50];
         let d1 = [2u8; 50];
         let d2 = [3u8; 50];
         let mut ops = [
-            WriteOp {
-                fd,
-                offset: 0,
-                buf: &d0[..],
-                result: i32::MIN,
-            },
-            WriteOp {
-                fd,
-                offset: 50,
-                buf: &d1[..],
-                result: i32::MIN,
-            },
-            WriteOp {
-                fd,
-                offset: 100,
-                buf: &d2[..],
-                result: i32::MIN,
-            },
+            WriteOp { fd, offset: 0, buf: &d0[..], result: i32::MIN },
+            WriteOp { fd, offset: 50, buf: &d1[..], result: i32::MIN },
+            WriteOp { fd, offset: 100, buf: &d2[..], result: i32::MIN },
         ];
         pwrite_batch(&mut ops);
         for op in &ops {
@@ -1066,10 +946,7 @@ mod tests {
     fn pread_batch_thread_local_reuse_matches_fallback() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-uring-tl-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -1089,18 +966,8 @@ mod tests {
             let mut b1 = [0u8; 32];
             {
                 let mut ops = [
-                    ReadOp {
-                        fd,
-                        offset: base as u64,
-                        buf: &mut b0[..],
-                        result: i32::MIN,
-                    },
-                    ReadOp {
-                        fd,
-                        offset: (base + 32) as u64,
-                        buf: &mut b1[..],
-                        result: i32::MIN,
-                    },
+                    ReadOp { fd, offset: base as u64, buf: &mut b0[..], result: i32::MIN },
+                    ReadOp { fd, offset: (base + 32) as u64, buf: &mut b1[..], result: i32::MIN },
                 ];
                 pread_batch(&mut ops);
                 assert_eq!(ops[0].result, 32, "wave={wave}");
@@ -1113,18 +980,8 @@ mod tests {
             let mut c0 = [0u8; 32];
             let mut c1 = [0u8; 32];
             let mut fops = [
-                ReadOp {
-                    fd,
-                    offset: base as u64,
-                    buf: &mut c0[..],
-                    result: i32::MIN,
-                },
-                ReadOp {
-                    fd,
-                    offset: (base + 32) as u64,
-                    buf: &mut c1[..],
-                    result: i32::MIN,
-                },
+                ReadOp { fd, offset: base as u64, buf: &mut c0[..], result: i32::MIN },
+                ReadOp { fd, offset: (base + 32) as u64, buf: &mut c1[..], result: i32::MIN },
             ];
             pread_batch_fallback(&mut fops);
             assert_eq!(&c0[..], &b0[..]);
@@ -1143,10 +1000,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-uring-pipe-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -1164,12 +1018,7 @@ mod tests {
             let mut slices: Vec<&mut [u8]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(N);
             for (i, sl) in slices.iter_mut().enumerate() {
-                ops.push(ReadOp {
-                    fd,
-                    offset: i as u64,
-                    buf: sl,
-                    result: i32::MIN,
-                });
+                ops.push(ReadOp { fd, offset: i as u64, buf: sl, result: i32::MIN });
             }
             pread_batch(&mut ops);
             for (i, op) in ops.iter().enumerate() {
@@ -1186,24 +1035,9 @@ mod tests {
         let mut b1 = [0u8; 1];
         {
             let mut ops2 = [
-                ReadOp {
-                    fd,
-                    offset: 0,
-                    buf: &mut b0[..],
-                    result: i32::MIN,
-                },
-                ReadOp {
-                    fd,
-                    offset: 0,
-                    buf: &mut empty[..],
-                    result: i32::MIN,
-                },
-                ReadOp {
-                    fd,
-                    offset: 1,
-                    buf: &mut b1[..],
-                    result: i32::MIN,
-                },
+                ReadOp { fd, offset: 0, buf: &mut b0[..], result: i32::MIN },
+                ReadOp { fd, offset: 0, buf: &mut empty[..], result: i32::MIN },
+                ReadOp { fd, offset: 1, buf: &mut b1[..], result: i32::MIN },
             ];
             pread_batch(&mut ops2);
             assert_eq!(ops2[0].result, 1);
@@ -1226,10 +1060,7 @@ mod tests {
         session.poison();
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-mid-wave-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("blob");
@@ -1242,27 +1073,15 @@ mod tests {
                 .unwrap();
             f.set_len(8).unwrap();
         }
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let payload = [0xABu8; 4];
-        let mut ops = [WriteOp {
-            fd,
-            offset: 0,
-            buf: &payload[..],
-            result: i32::MIN,
-        }];
+        let mut ops = [WriteOp { fd, offset: 0, buf: &payload[..], result: i32::MIN }];
         assert!(
             !pwrite_batch_on_session(&mut session, &mut ops, 1),
             "poisoned begin_batch must be batch-false"
         );
-        assert!(
-            io_uring_enabled(),
-            "mid-wave session false must not store URING_MODE=2"
-        );
+        assert!(io_uring_enabled(), "mid-wave session false must not store URING_MODE=2");
         pwrite_batch_fallback(&mut ops);
         assert_eq!(ops[0].result, 4);
         let mut got = [0u8; 4];

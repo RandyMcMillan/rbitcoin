@@ -24,19 +24,10 @@ impl TempDir {
 
     pub fn labeled(label: &str) -> std::io::Result<Self> {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let safe: String = label
             .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
             .collect();
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-{safe}-{}-{}-{}",

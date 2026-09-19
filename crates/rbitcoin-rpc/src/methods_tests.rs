@@ -71,20 +71,9 @@ fn help_and_getrpcinfo_list_every_dispatched_method() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect::<Vec<_>>();
-    for name in [
-        "generate",
-        "mockscheduler",
-        "addpeeraddress",
-        "getnodeaddresses",
-    ] {
-        assert!(
-            help_text.lines().any(|l| l == name),
-            "help missing {name}: {help_text}"
-        );
-        assert!(
-            listed.contains(&name),
-            "getrpcinfo.methods missing {name}: {listed:?}"
-        );
+    for name in ["generate", "mockscheduler", "addpeeraddress", "getnodeaddresses"] {
+        assert!(help_text.lines().any(|l| l == name), "help missing {name}: {help_text}");
+        assert!(listed.contains(&name), "getrpcinfo.methods missing {name}: {listed:?}");
         let err = dispatch(&ctx, name, vec![]).err();
         if let Some(e) = err {
             assert_ne!(
@@ -117,10 +106,7 @@ fn getorphantxs_is_hidden_and_lists_parked() {
     let (ctx, dir) = ctx_empty();
     let help_all = dispatch(&ctx, "help", vec![]).unwrap();
     let s = help_all.as_str().unwrap();
-    assert!(
-        !s.lines().any(|l| l == "getorphantxs"),
-        "getorphantxs must stay hidden from help()"
-    );
+    assert!(!s.lines().any(|l| l == "getorphantxs"), "getorphantxs must stay hidden from help()");
     let one = dispatch(&ctx, "help", vec![json!("getorphantxs")]).unwrap();
     let one_s = one.as_str().unwrap();
     assert!(one_s.contains("getorphantxs"));
@@ -137,20 +123,14 @@ fn getorphantxs_is_hidden_and_lists_parked() {
         .contains("Verbosity was boolean but only integer allowed"));
     let bad = dispatch(&ctx, "getorphantxs", vec![json!(-1)]).unwrap_err();
     assert_eq!(bad["code"], ERR_INVALID_PARAMETER);
-    assert!(bad["message"]
-        .as_str()
-        .unwrap()
-        .contains("Invalid verbosity value -1"));
+    assert!(bad["message"].as_str().unwrap().contains("Invalid verbosity value -1"));
 
     let mp = ctx.mempool.as_ref().unwrap();
     let tx = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([9u8; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([9u8; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -161,10 +141,7 @@ fn getorphantxs_is_hidden_and_lists_parked() {
         }],
     };
     let err = mp.accept_tx_from(&tx, Some(3)).unwrap_err();
-    assert!(
-        matches!(err, rbitcoin_net::AcceptError::Orphaned { .. }),
-        "{err}"
-    );
+    assert!(matches!(err, rbitcoin_net::AcceptError::Orphaned { .. }), "{err}");
     let ids = dispatch(&ctx, "getorphantxs", vec![]).unwrap();
     let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
     assert_eq!(ids, json!([txid]));
@@ -253,29 +230,17 @@ fn method_help_named_arms_and_unknown() {
         "preciousblock",
     ] {
         let h = super::method_help(m);
-        assert!(
-            h.starts_with(m),
-            "help for listed method {m} must start with the name: {h}"
-        );
-        assert!(
-            !h.starts_with("unknown method"),
-            "listed method {m} must not be unknown: {h}"
-        );
+        assert!(h.starts_with(m), "help for listed method {m} must start with the name: {h}");
+        assert!(!h.starts_with("unknown method"), "listed method {m} must not be unknown: {h}");
     }
-    assert_eq!(
-        super::method_help("not-a-method"),
-        "unknown method not-a-method"
-    );
+    assert_eq!(super::method_help("not-a-method"), "unknown method not-a-method");
 }
 
 #[test]
 fn getmempoolinfo_permitbaremultisig_is_always_true() {
     let (ctx, dir) = ctx_empty();
     let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
-    assert_eq!(
-        mem["permitbaremultisig"], true,
-        "Libre has no Core IsStandard bare-multisig gate"
-    );
+    assert_eq!(mem["permitbaremultisig"], true, "Libre has no Core IsStandard bare-multisig gate");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -352,10 +317,7 @@ fn getblockchaininfo_disk_and_progress() {
     assert_eq!(info["blocks"], 1);
     assert_eq!(info["headers"], 2);
     let p = info["verificationprogress"].as_f64().unwrap();
-    assert!(
-        p > 0.0 && p < 1.0,
-        "headers ahead of bodies → progress in (0, 1), got {p}"
-    );
+    assert!(p > 0.0 && p < 1.0, "headers ahead of bodies → progress in (0, 1), got {p}");
     assert!((p - 0.5).abs() < 1e-9, "1/2 == 0.5, got {p}");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -368,10 +330,7 @@ fn getblockchaininfo_ibd_follows_hub_not_stale_atomic() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     ctx.initial_block_download.store(false, Ordering::Relaxed);
     let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
-    assert_eq!(
-        info["initialblockdownload"], true,
-        "regtest genesis is older than 24h"
-    );
+    assert_eq!(info["initialblockdownload"], true, "regtest genesis is older than 24h");
     let (addr, _) = p2wpkh_regtest();
     dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
     ctx.initial_block_download.store(true, Ordering::Relaxed);
@@ -399,16 +358,10 @@ fn estimatesmartfee_core_param_gates() {
     let (ctx, dir) = ctx_empty();
     let e = dispatch(&ctx, "estimatesmartfee", vec![]).unwrap_err();
     assert_eq!(e["code"], ERR_MISC);
-    assert!(
-        e["message"].as_str().unwrap().contains("estimatesmartfee"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("estimatesmartfee"), "{e}");
     let e = dispatch(&ctx, "estimaterawfee", vec![]).unwrap_err();
     assert_eq!(e["code"], ERR_MISC);
-    assert!(
-        e["message"].as_str().unwrap().contains("estimaterawfee"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("estimaterawfee"), "{e}");
 
     let e = dispatch(&ctx, "estimatesmartfee", vec![json!("foo")]).unwrap_err();
     assert_eq!(e["code"], ERR_TYPE_ERROR);
@@ -430,19 +383,9 @@ fn estimatesmartfee_core_param_gates() {
     );
     let e = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("foo")]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid estimate_mode parameter"),
-        "{e}"
-    );
-    let e = dispatch(
-        &ctx,
-        "estimatesmartfee",
-        vec![json!(1), json!("ECONOMICAL"), json!(1)],
-    )
-    .unwrap_err();
+    assert!(e["message"].as_str().unwrap().contains("Invalid estimate_mode parameter"), "{e}");
+    let e = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), json!(1)])
+        .unwrap_err();
     assert_eq!(e["code"], ERR_MISC);
     assert!(e["message"].as_str().unwrap().contains("estimatesmartfee"));
 
@@ -462,23 +405,13 @@ fn estimatesmartfee_core_param_gates() {
 
     // Valid calls must succeed (empty mempool still returns an object).
     let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1)]).unwrap();
-    let _ = dispatch(
-        &ctx,
-        "estimatesmartfee",
-        vec![json!(1), json!("ECONOMICAL")],
-    )
-    .unwrap();
+    let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("ECONOMICAL")]).unwrap();
     let raw = dispatch(&ctx, "estimaterawfee", vec![json!(1)]).unwrap();
     assert!(raw.get("feerate").is_some(), "{raw}");
     assert!(raw.get("short").is_none(), "{raw}");
     let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1), json!(1)]).unwrap();
     let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("unset")]).unwrap();
-    let _ = dispatch(
-        &ctx,
-        "estimatesmartfee",
-        vec![json!(1), json!("conservative")],
-    )
-    .unwrap();
+    let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("conservative")]).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -506,10 +439,7 @@ fn getnetworkinfo_localrelay_follows_mempool_relay() {
     ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!("00")]).unwrap_err();
     let msg = e["message"].as_str().unwrap_or("");
-    assert!(
-        !msg.contains("relay disabled"),
-        "decode of 00 is not serving-only refuse, got {e}"
-    );
+    assert!(!msg.contains("relay disabled"), "decode of 00 is not serving-only refuse, got {e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -521,11 +451,7 @@ fn blocksonly_sendraw_admits_valid_tx() {
     let off = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
     assert_eq!(off["localrelay"], false, "{off}");
     let ok = dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
-    assert_eq!(
-        ok.as_str().unwrap(),
-        &spend.compute_txid().to_string(),
-        "{ok}"
-    );
+    assert_eq!(ok.as_str().unwrap(), &spend.compute_txid().to_string(), "{ok}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -567,45 +493,23 @@ fn generateblock_core_reject_shapes() {
 
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let op_true = "raw(51)";
-    dispatch(
-        &ctx,
-        "generatetodescriptor",
-        vec![json!(101), json!(op_true)],
-    )
-    .unwrap();
+    dispatch(&ctx, "generatetodescriptor", vec![json!(101), json!(op_true)]).unwrap();
 
     let missing = "0000000000000000000000000000000000000000000000000000000000000000";
-    let e = dispatch(
-        &ctx,
-        "generateblock",
-        vec![json!(op_true), json!([missing])],
-    )
-    .unwrap_err();
+    let e = dispatch(&ctx, "generateblock", vec![json!(op_true), json!([missing])]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
-    assert_eq!(
-        e["message"].as_str().unwrap(),
-        format!("Transaction {missing} not in mempool.")
-    );
+    assert_eq!(e["message"].as_str().unwrap(), format!("Transaction {missing} not in mempool."));
 
     let e = dispatch(&ctx, "generateblock", vec![json!(op_true), json!(["0000"])]).unwrap_err();
     assert_eq!(e["code"], ERR_DESERIALIZATION);
     assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("Transaction decode failed for 0000"),
+        e["message"].as_str().unwrap().starts_with("Transaction decode failed for 0000"),
         "{e}"
     );
 
     let e = dispatch(&ctx, "generateblock", vec![json!("1234"), json!([])]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid address or descriptor"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("Invalid address or descriptor"), "{e}");
 
     let ranged = "pkh(tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp/0/*)";
     let e = dispatch(&ctx, "generateblock", vec![json!(ranged), json!([])]).unwrap_err();
@@ -618,10 +522,7 @@ fn generateblock_core_reject_shapes() {
     let child_desc = "pkh(tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp/0'/0)";
     let e = dispatch(&ctx, "generateblock", vec![json!(child_desc), json!([])]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
-    assert_eq!(
-        e["message"].as_str().unwrap(),
-        "Cannot derive script without private keys"
-    );
+    assert_eq!(e["message"].as_str().unwrap(), "Cannot derive script without private keys");
 
     let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
     let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
@@ -646,37 +547,23 @@ fn generateblock_core_reject_shapes() {
             script_pubkey: true_spk.clone(),
         }],
     };
-    let parent_id = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&parent)))],
-    )
-    .unwrap();
+    let parent_id =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex_encode(serialize(&parent)))]).unwrap();
     let parent_txid = parent_id.as_str().unwrap().to_string();
     let child = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: parent.compute_txid(),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(cb_val - 3_000),
-            script_pubkey: true_spk,
-        }],
+        output: vec![TxOut { value: Amount::from_sat(cb_val - 3_000), script_pubkey: true_spk }],
     };
     let child_hex = hex_encode(serialize(&child));
-    let e = dispatch(
-        &ctx,
-        "generateblock",
-        vec![json!(op_true), json!([child_hex, parent_txid])],
-    )
-    .unwrap_err();
+    let e = dispatch(&ctx, "generateblock", vec![json!(op_true), json!([child_hex, parent_txid])])
+        .unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_ERROR);
     assert_eq!(
         e["message"].as_str().unwrap(),
@@ -758,18 +645,10 @@ fn unsupported_methods_error() {
     assert_eq!(e3["code"], ERR_METHOD_NOT_FOUND);
     assert_eq!(e3["message"], "Method not found");
     let help = dispatch(&ctx, "help", vec![]).unwrap();
-    assert!(!help
-        .as_str()
-        .unwrap()
-        .lines()
-        .any(|l| l == "syncwithvalidationinterfacequeue"));
+    assert!(!help.as_str().unwrap().lines().any(|l| l == "syncwithvalidationinterfacequeue"));
     let info = dispatch(&ctx, "getrpcinfo", vec![]).unwrap();
-    let listed: Vec<&str> = info["methods"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let listed: Vec<&str> =
+        info["methods"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
     assert!(!listed.contains(&"syncwithvalidationinterfacequeue"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -796,20 +675,11 @@ fn named_params_getblock_object() {
     let unknown =
         dispatch(&ctx, "help", named(json!({"random": "getblockchaininfo"}))).unwrap_err();
     assert_eq!(unknown["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        unknown["message"]
-            .as_str()
-            .unwrap()
-            .contains("Unknown named parameter"),
-        "{unknown}"
-    );
+    assert!(unknown["message"].as_str().unwrap().contains("Unknown named parameter"), "{unknown}");
 
     // Named height on empty store: accepted as params (not "named not supported").
     let gh = dispatch(&ctx, "getblockhash", named(json!({"height": 0}))).unwrap_err();
-    assert_ne!(
-        gh["message"].as_str().unwrap_or(""),
-        "named params not supported; use array"
-    );
+    assert_ne!(gh["message"].as_str().unwrap_or(""), "named params not supported; use array");
     assert_eq!(gh["code"], ERR_INVALID_PARAMETER); // height out of range
 
     let missing = dispatch(&ctx, "getblock", RpcParams::named(Default::default())).unwrap_err();
@@ -837,30 +707,16 @@ fn echo_positional_named_and_mixed_args() {
     assert_eq!(arg9_null, json!(vec![Value::Null; 10]));
 
     // AuthServiceProxy mixed: echo(0, 1, arg3=3, arg5=5)
-    let mixed = dispatch(
-        &ctx,
-        "echo",
-        named(json!({"args": [0, 1], "arg3": 3, "arg5": 5})),
-    )
-    .unwrap();
+    let mixed =
+        dispatch(&ctx, "echo", named(json!({"args": [0, 1], "arg3": 3, "arg5": 5}))).unwrap();
     assert_eq!(mixed, json!([0, 1, Value::Null, 3, Value::Null, 5]));
 
     let twice = dispatch(&ctx, "echo", named(json!({"args": [0, 1], "arg1": 1}))).unwrap_err();
     assert_eq!(twice["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        twice["message"]
-            .as_str()
-            .unwrap()
-            .contains("specified twice"),
-        "{twice}"
-    );
+    assert!(twice["message"].as_str().unwrap().contains("specified twice"), "{twice}");
 
-    let twice_null = dispatch(
-        &ctx,
-        "echo",
-        named(json!({"args": [0, null, 2], "arg1": 1})),
-    )
-    .unwrap_err();
+    let twice_null =
+        dispatch(&ctx, "echo", named(json!({"args": [0, null, 2], "arg1": 1}))).unwrap_err();
     assert_eq!(twice_null["code"], ERR_INVALID_PARAMETER);
 
     // Mixed positional `args` is echo-only; other methods reject the named key.
@@ -1035,10 +891,7 @@ fn chain_methods_against_mined_regtest() {
 
     let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
     let best_s = best.as_str().unwrap().to_string();
-    assert_eq!(
-        best_s, tip_display,
-        "getbestblockhash must be Core/display order, not internal"
-    );
+    assert_eq!(best_s, tip_display, "getbestblockhash must be Core/display order, not internal");
     let hash = dispatch(&ctx, "getblockhash", vec![json!(tip_h)]).unwrap();
     assert_eq!(hash.as_str().unwrap(), best_s);
     // Lookup must accept display-order hex from Core clients.
@@ -1049,12 +902,8 @@ fn chain_methods_against_mined_regtest() {
     let mr = hdr["merkleroot"].as_str().unwrap();
     assert_eq!(mr.len(), 64);
     assert_eq!(mr, hash_hex_display(&parse_hash32_display(mr).unwrap()));
-    let hdr_hex = dispatch(
-        &ctx,
-        "getblockheader",
-        vec![json!(best_s.clone()), json!(false)],
-    )
-    .unwrap();
+    let hdr_hex =
+        dispatch(&ctx, "getblockheader", vec![json!(best_s.clone()), json!(false)]).unwrap();
     assert!(hdr_hex.as_str().unwrap().len() > 10);
     for verb in [0u64, 1, 2] {
         let blk = dispatch(&ctx, "getblock", vec![json!(best_s.clone()), json!(verb)]).unwrap();
@@ -1082,19 +931,13 @@ fn chain_methods_against_mined_regtest() {
     let internal_hex = rbitcoin_primitives::hex_encode(txid_internal);
     if internal_hex != txid_display {
         let miss = dispatch(&ctx, "getrawtransaction", vec![json!(internal_hex)]);
-        assert!(
-            miss.is_err(),
-            "internal-order hex must not resolve as Core display txid"
-        );
+        assert!(miss.is_err(), "internal-order hex must not resolve as Core display txid");
     }
     let raw = dispatch(&ctx, "getrawtransaction", vec![json!(txid_display.clone())]).unwrap();
     assert!(raw.as_str().unwrap().len() > 20);
-    let verbose = dispatch(
-        &ctx,
-        "getrawtransaction",
-        vec![json!(txid_display.clone()), json!(true)],
-    )
-    .unwrap();
+    let verbose =
+        dispatch(&ctx, "getrawtransaction", vec![json!(txid_display.clone()), json!(true)])
+            .unwrap();
     assert_eq!(verbose["txid"], txid_display);
 
     let hex = serialize_hex(&tx);
@@ -1120,14 +963,8 @@ fn mempool_txid_lookups_do_not_list_live() {
     let (ctx, dir) = ctx_empty();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(
-        &ctx.query,
-        &params,
-        Height::GENESIS,
-        &genesis,
-        Milestone::NONE,
-    )
-    .unwrap();
+    accept_and_connect_block(&ctx.query, &params, Height::GENESIS, &genesis, Milestone::NONE)
+        .unwrap();
     const N_SPENDS: u32 = 3;
     let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
         &ctx.query,
@@ -1148,10 +985,7 @@ fn mempool_txid_lookups_do_not_list_live() {
             version: TxVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: *cbtxid,
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: *cbtxid, vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -1172,28 +1006,17 @@ fn mempool_txid_lookups_do_not_list_live() {
     assert!(entry["weight"].as_u64().unwrap() > 0);
     let raw = dispatch(&ctx, "getrawtransaction", vec![json!(want_hex.clone())]).unwrap();
     assert!(raw.as_str().unwrap().len() > 20);
-    let verb = dispatch(
-        &ctx,
-        "getrawtransaction",
-        vec![json!(want_hex), json!(true)],
-    )
-    .unwrap();
+    let verb = dispatch(&ctx, "getrawtransaction", vec![json!(want_hex), json!(true)]).unwrap();
     assert_eq!(verb["txid"], format!("{want}"));
 
     let s = mp.sample_reset_perf();
     assert_eq!(s.list_live, 0, "getrawtransaction must not list_live");
-    assert_eq!(
-        s.list_live_meta, 0,
-        "getmempoolentry must not list_live_meta"
-    );
+    assert_eq!(s.list_live_meta, 0, "getmempoolentry must not list_live_meta");
 
     let miss = dispatch(&ctx, "getmempoolentry", vec![json!("00".repeat(32))]).unwrap_err();
     assert_eq!(miss["message"], "Transaction not in mempool");
     let miss_raw = dispatch(&ctx, "getrawtransaction", vec![json!("11".repeat(32))]).unwrap_err();
-    assert_eq!(
-        miss_raw["message"],
-        "No such mempool or blockchain transaction"
-    );
+    assert_eq!(miss_raw["message"], "No such mempool or blockchain transaction");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1211,14 +1034,8 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     let (ctx, dir) = ctx_empty();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(
-        &ctx.query,
-        &params,
-        Height::GENESIS,
-        &genesis,
-        Milestone::NONE,
-    )
-    .unwrap();
+    accept_and_connect_block(&ctx.query, &params, Height::GENESIS, &genesis, Milestone::NONE)
+        .unwrap();
     let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
         &ctx.query,
         &params,
@@ -1236,10 +1053,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[0],
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: coinbase_txids[0], vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -1254,10 +1068,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: parent.compute_txid(),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -1291,27 +1102,18 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     assert_eq!(verbose[&parent_hex]["spentby"], json!([child_hex.clone()]));
 
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
-    assert_eq!(
-        info["unbroadcastcount"], 0,
-        "P2P-style accept is not a local unbroadcast"
-    );
+    assert_eq!(info["unbroadcastcount"], 0, "P2P-style accept is not a local unbroadcast");
 
     let local = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[1],
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: coinbase_txids[1], vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000 - 3_000),
-            script_pubkey: spk,
-        }],
+        output: vec![TxOut { value: Amount::from_sat(50_0000_0000 - 3_000), script_pubkey: spk }],
     };
     let local_hex_tx = serialize_hex(&local);
     let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(local_hex_tx)]).unwrap();
@@ -1326,10 +1128,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
 
     mp.mark_broadcast(&local.compute_txid());
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
-    assert_eq!(
-        info["unbroadcastcount"], 0,
-        "getdata/serve must clear unbroadcast"
-    );
+    assert_eq!(info["unbroadcastcount"], 0, "getdata/serve must clear unbroadcast");
     let local_entry = dispatch(&ctx, "getmempoolentry", vec![json!(local_hex)]).unwrap();
     assert_eq!(local_entry["unbroadcast"], false);
 
@@ -1350,9 +1149,7 @@ impl RpcRegtest for TestMiner {
         script_pubkey: ScriptBuf,
         extra_txs: Vec<Transaction>,
     ) -> Result<Vec<BlockHash>, String> {
-        self.0
-            .generate_to_script(nblocks, script_pubkey, extra_txs)
-            .map_err(|e| e.to_string())
+        self.0.generate_to_script(nblocks, script_pubkey, extra_txs).map_err(|e| e.to_string())
     }
 
     fn assemble_block_to_script(
@@ -1360,9 +1157,7 @@ impl RpcRegtest for TestMiner {
         script_pubkey: ScriptBuf,
         extra_txs: Vec<Transaction>,
     ) -> Result<Block, String> {
-        self.0
-            .assemble_block_to_script(script_pubkey, extra_txs)
-            .map_err(|e| e.to_string())
+        self.0.assemble_block_to_script(script_pubkey, extra_txs).map_err(|e| e.to_string())
     }
 
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome {
@@ -1429,12 +1224,7 @@ fn generate_refuses_on_mainnet() {
     let (mut ctx, dir, _hub) = ctx_regtest_hub();
     ctx.network = Network::Mainnet;
     let (addr, _) = p2wpkh_regtest();
-    for m in [
-        "generatetoaddress",
-        "generateblock",
-        "generate",
-        "setmocktime",
-    ] {
+    for m in ["generatetoaddress", "generateblock", "generate", "setmocktime"] {
         let e = match m {
             "generatetoaddress" => dispatch(&ctx, m, vec![json!(1), json!(addr.clone())]),
             "generateblock" => dispatch(&ctx, m, vec![json!(addr.clone()), json!([])]),
@@ -1444,10 +1234,7 @@ fn generate_refuses_on_mainnet() {
         }
         .unwrap_err();
         let msg = e["message"].as_str().unwrap_or("");
-        assert!(
-            msg.contains("regtest only"),
-            "{m} must refuse on mainnet: {e}"
-        );
+        assert!(msg.contains("regtest only"), "{m} must refuse on mainnet: {e}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1483,14 +1270,9 @@ fn generate_one_to_p2wpkh() {
     let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
     assert_eq!(best, arr[0]);
     let blk = dispatch(&ctx, "getblock", vec![best.clone(), json!(2)]).unwrap();
-    let hex = blk["tx"][0]["vout"][0]["scriptPubKey"]["hex"]
-        .as_str()
-        .unwrap();
+    let hex = blk["tx"][0]["vout"][0]["scriptPubKey"]["hex"].as_str().unwrap();
     assert_eq!(hex, rbitcoin_primitives::hex_encode(script.as_bytes()));
-    assert_eq!(
-        blk["tx"][0]["vout"][0]["scriptPubKey"]["address"],
-        json!(addr)
-    );
+    assert_eq!(blk["tx"][0]["vout"][0]["scriptPubKey"]["address"], json!(addr));
     // Core getblock(hash, False) is verbosity 0 (raw hex).
     let raw = dispatch(&ctx, "getblock", vec![best.clone(), json!(false)]).unwrap();
     assert!(raw.as_str().unwrap().len() > 160);
@@ -1498,12 +1280,8 @@ fn generate_one_to_p2wpkh() {
     let raw_tx = dispatch(&ctx, "getrawtransaction", vec![json!(cb_txid), json!(0)]).unwrap();
     assert!(raw_tx.as_str().unwrap().len() > 20);
     // Core third arg is a blockhash; we always have Class A — ignore it.
-    let same = dispatch(
-        &ctx,
-        "getrawtransaction",
-        vec![json!(cb_txid), json!(0), json!(best)],
-    )
-    .unwrap();
+    let same =
+        dispatch(&ctx, "getrawtransaction", vec![json!(cb_txid), json!(0), json!(best)]).unwrap();
     assert_eq!(same, raw_tx);
     let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
     assert_eq!(net["connections_in"], 0);
@@ -1592,26 +1370,14 @@ fn miniwallet_raw_scan_and_gettxout() {
     let waited = dispatch(&ctx, "waitforblockheight", vec![json!(2), json!(100)]).unwrap();
     assert_eq!(waited["height"], 2);
 
-    assert_eq!(
-        dispatch(&ctx, "scantxoutset", vec![json!("status")]).unwrap(),
-        Value::Null
-    );
-    assert_eq!(
-        dispatch(&ctx, "scantxoutset", vec![json!("abort")]).unwrap(),
-        json!(false)
-    );
+    assert_eq!(dispatch(&ctx, "scantxoutset", vec![json!("status")]).unwrap(), Value::Null);
+    assert_eq!(dispatch(&ctx, "scantxoutset", vec![json!("abort")]).unwrap(), json!(false));
     let empty = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([])]).unwrap();
     assert_eq!(empty["success"], true);
     assert_eq!(empty["unspents"].as_array().unwrap().len(), 0, "{empty}");
     let unknown = dispatch(&ctx, "scantxoutset", vec![json!("nope")]).unwrap_err();
     assert_eq!(unknown["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        unknown["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Invalid action"),
-        "{unknown}"
-    );
+    assert!(unknown["message"].as_str().unwrap_or("").contains("Invalid action"), "{unknown}");
 
     let idx = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
     assert_eq!(idx["txindex"]["synced"], true);
@@ -1629,31 +1395,15 @@ fn gettxout_disconnected_archive_row_is_null() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let (addr, _) = p2wpkh_regtest();
     dispatch(&ctx, "generatetoaddress", vec![json!(2), json!(addr)]).unwrap();
-    let tip = dispatch(&ctx, "getbestblockhash", vec![])
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_string();
+    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap().as_str().unwrap().to_string();
     let blk = dispatch(&ctx, "getblock", vec![json!(tip.clone()), json!(2)]).unwrap();
     let cb_txid = blk["tx"][0]["txid"].as_str().unwrap().to_string();
-    let live = dispatch(
-        &ctx,
-        "gettxout",
-        vec![json!(cb_txid.clone()), json!(0), json!(false)],
-    )
-    .unwrap();
+    let live =
+        dispatch(&ctx, "gettxout", vec![json!(cb_txid.clone()), json!(0), json!(false)]).unwrap();
     assert_eq!(live["coinbase"], true, "{live}");
     dispatch(&ctx, "invalidateblock", vec![json!(tip)]).unwrap();
-    let gone = dispatch(
-        &ctx,
-        "gettxout",
-        vec![json!(cb_txid), json!(0), json!(false)],
-    )
-    .unwrap();
-    assert!(
-        gone.is_null(),
-        "disconnected Class A row must not be a UTXO: {gone}"
-    );
+    let gone = dispatch(&ctx, "gettxout", vec![json!(cb_txid), json!(0), json!(false)]).unwrap();
+    assert!(gone.is_null(), "disconnected Class A row must not be a UTXO: {gone}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1668,12 +1418,7 @@ fn gettxout_leftover_is_connected_not_unconfirmed() {
         hidden.is_null(),
         "default include_mempool must hide mempool-spent confirmed out: {hidden}"
     );
-    let shown = dispatch(
-        &ctx,
-        "gettxout",
-        vec![json!(cb_txid), json!(0), json!(false)],
-    )
-    .unwrap();
+    let shown = dispatch(&ctx, "gettxout", vec![json!(cb_txid), json!(0), json!(false)]).unwrap();
     assert_eq!(shown["coinbase"], true, "{shown}");
     assert!(shown["confirmations"].as_u64().unwrap() >= 1, "{shown}");
     ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
@@ -1730,10 +1475,7 @@ fn spend_generated_coinbase(
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(keep_sat),
-            script_pubkey: script,
-        }],
+        output: vec![TxOut { value: Amount::from_sat(keep_sat), script_pubkey: script }],
     };
     (hex_encode(serialize(&spend)), spend)
 }
@@ -1761,10 +1503,7 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
     let (at_hex, _) =
         spend_generated_coinbase(ctx, 1, cb - max_fee, ScriptBuf::from_bytes(vec![0x51]));
     let ok = dispatch(ctx, "sendrawtransaction", vec![json!(at_hex)]).unwrap();
-    assert!(
-        ok.as_str().is_some(),
-        "exact default 10000 sat/vB must accept: {ok}"
-    );
+    assert!(ok.as_str().is_some(), "exact default 10000 sat/vB must accept: {ok}");
     let (over_hex, _) =
         spend_generated_coinbase(ctx, 2, cb - max_fee - 1, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(over_hex)]).unwrap_err();
@@ -1783,70 +1522,35 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     let (hex, spend) = spend_generated_coinbase(&ctx, 3, 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("maximum configured by user"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap_or("").contains("maximum configured by user"), "{e}");
     let tma = dispatch(&ctx, "testmempoolaccept", vec![json!([hex.clone()])]).unwrap();
     assert_eq!(tma[0]["allowed"], false, "{tma}");
     assert_eq!(tma[0]["reject-reason"], "max-fee-exceeded", "{tma}");
-    let tma0 = dispatch(
-        &ctx,
-        "testmempoolaccept",
-        vec![json!([hex.clone()]), json!(0)],
-    )
-    .unwrap();
+    let tma0 = dispatch(&ctx, "testmempoolaccept", vec![json!([hex.clone()]), json!(0)]).unwrap();
     assert_eq!(tma0[0]["allowed"], true, "{tma0}");
     ctx.mempool
         .as_ref()
         .unwrap()
         .accept_tx(&spend)
         .expect("P2P/admit path is not capped by RPC maxfeerate");
-    let ok = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex.clone()), json!(0)],
-    )
-    .unwrap();
+    let ok = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone()), json!(0)]).unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
     let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(100_000)]).unwrap_err();
     assert_eq!(over["code"], ERR_INVALID_PARAMETER, "{over}");
-    assert_eq!(
-        over["message"], "feerate >= 100000 sat/vB is not accepted",
-        "{over}"
-    );
+    assert_eq!(over["message"], "feerate >= 100000 sat/vB is not accepted", "{over}");
     let cb4 = generated_coinbase_value(&ctx, 4);
     let (modest_hex, modest) =
         spend_generated_coinbase(&ctx, 4, cb4 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
-    let ok99 = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(modest_hex), json!(99_999)],
-    )
-    .unwrap();
-    assert_eq!(
-        ok99.as_str().unwrap(),
-        &modest.compute_txid().to_string(),
-        "{ok99}"
-    );
+    let ok99 =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(modest_hex), json!(99_999)]).unwrap();
+    assert_eq!(ok99.as_str().unwrap(), &modest.compute_txid().to_string(), "{ok99}");
     pin_maxfeerate_json_shapes(&ctx);
     let cb5 = generated_coinbase_value(&ctx, 5);
     let (str_hex, str_tx) =
         spend_generated_coinbase(&ctx, 5, cb5 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
-    let ok_str = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(str_hex), json!("99999")],
-    )
-    .unwrap();
-    assert_eq!(
-        ok_str.as_str().unwrap(),
-        &str_tx.compute_txid().to_string(),
-        "{ok_str}"
-    );
+    let ok_str =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(str_hex), json!("99999")]).unwrap();
+    assert_eq!(ok_str.as_str().unwrap(), &str_tx.compute_txid().to_string(), "{ok_str}");
     let (huge_hex, _) = spend_generated_coinbase(&ctx, 6, 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let pkg_fee = dispatch(&ctx, "submitpackage", vec![json!([huge_hex])]).unwrap();
     assert_eq!(pkg_fee["package_msg"], "transaction failed", "{pkg_fee}");
@@ -1866,11 +1570,7 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
         .cloned()
         .unwrap_or(json!(null));
     assert!(row.get("error").is_none(), "already-in-mempool: {again}");
-    assert_eq!(
-        row["txid"].as_str().unwrap(),
-        &modest.compute_txid().to_string(),
-        "{again}"
-    );
+    assert_eq!(row["txid"].as_str().unwrap(), &modest.compute_txid().to_string(), "{again}");
     assert!(
         row.get("vsize").is_none() && row.get("fees").is_none(),
         "already-known package row is txid-only: {again}"
@@ -1882,26 +1582,10 @@ fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
     for (v, code, msg) in [
         (json!(-1), ERR_INVALID_PARAMETER, "Amount out of range"),
         (json!("-2"), ERR_INVALID_PARAMETER, "Amount out of range"),
-        (
-            json!(1.5),
-            ERR_INVALID_PARAMETER,
-            "maxfeerate must be an integer sat/vB",
-        ),
-        (
-            json!("nope"),
-            ERR_INVALID_PARAMETER,
-            "maxfeerate must be an integer sat/vB",
-        ),
-        (
-            json!(true),
-            ERR_TYPE_ERROR,
-            "maxfeerate is not a number or string",
-        ),
-        (
-            json!([]),
-            ERR_TYPE_ERROR,
-            "maxfeerate is not a number or string",
-        ),
+        (json!(1.5), ERR_INVALID_PARAMETER, "maxfeerate must be an integer sat/vB"),
+        (json!("nope"), ERR_INVALID_PARAMETER, "maxfeerate must be an integer sat/vB"),
+        (json!(true), ERR_TYPE_ERROR, "maxfeerate is not a number or string"),
+        (json!([]), ERR_TYPE_ERROR, "maxfeerate is not a number or string"),
     ] {
         let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v]).unwrap_err();
         assert_eq!(e["code"], code, "{e}");
@@ -1915,13 +1599,7 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
     let burn = 1_000u64;
     let (hex, spend) = mature_coinbase_spend(&ctx, burn, ScriptBuf::from_bytes(vec![0x6a]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("maxburnamount"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap_or("").contains("maxburnamount"), "{e}");
     let short = dispatch(
         &ctx,
         "sendrawtransaction",
@@ -1933,10 +1611,7 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
     )
     .unwrap_err();
     assert!(
-        short["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("maxburnamount"),
+        short["message"].as_str().unwrap_or("").contains("maxburnamount"),
         "amount−1 sat must reject: {short}"
     );
     pin_maxburn_json_shapes(&ctx, &hex);
@@ -1979,10 +1654,7 @@ fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
     )
     .unwrap_err();
     assert!(
-        n0["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("maxburnamount"),
+        n0["message"].as_str().unwrap_or("").contains("maxburnamount"),
         "numeric 0 BTC must still cap burn: {n0}"
     );
     let flt = dispatch(
@@ -1996,10 +1668,7 @@ fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
     )
     .unwrap_err();
     assert!(
-        flt["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("maxburnamount"),
+        flt["message"].as_str().unwrap_or("").contains("maxburnamount"),
         "float 0.0 BTC must still cap burn: {flt}"
     );
     let neg = dispatch(
@@ -2049,19 +1718,13 @@ fn submitpackage_child_fail_keeps_parent() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (parent_hex, parent) = mature_coinbase_spend(
-        &ctx,
-        50_0000_0000 - 1_000,
-        ScriptBuf::from_bytes(vec![0x51]),
-    );
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 50_0000_0000 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let bad = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: parent.compute_txid(),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]),
@@ -2072,18 +1735,11 @@ fn submitpackage_child_fail_keeps_parent() {
         }],
     };
     let bad_hex = hex_encode(serialize(&bad));
-    let pkg = dispatch(
-        &ctx,
-        "submitpackage",
-        vec![json!([parent_hex, bad_hex]), json!(0)],
-    )
-    .unwrap();
+    let pkg =
+        dispatch(&ctx, "submitpackage", vec![json!([parent_hex, bad_hex]), json!(0)]).unwrap();
     assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
     assert!(
-        ctx.mempool
-            .as_ref()
-            .unwrap()
-            .contains(&parent.compute_txid()),
+        ctx.mempool.as_ref().unwrap().contains(&parent.compute_txid()),
         "Core submitpackage keeps a successful parent when a later member fails"
     );
     assert!(
@@ -2134,10 +1790,7 @@ fn generate_selects_chained_mempool_parent_first() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: cb_txid,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: cb_txid, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -2153,10 +1806,7 @@ fn generate_selects_chained_mempool_parent_first() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: parent.compute_txid(),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -2166,12 +1816,8 @@ fn generate_selects_chained_mempool_parent_first() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let child_id = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&child)))],
-    )
-    .unwrap();
+    let child_id =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex_encode(serialize(&child)))]).unwrap();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
     let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
@@ -2180,12 +1826,7 @@ fn generate_selects_chained_mempool_parent_first() {
     assert_eq!(txids[1], parent_id);
     assert_eq!(txids[2], child_id);
 
-    let scan = dispatch(
-        &ctx,
-        "scantxoutset",
-        vec![json!("start"), json!(["raw(51)"])],
-    )
-    .unwrap();
+    let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!(["raw(51)"])]).unwrap();
     let uns = scan["unspents"].as_array().unwrap();
     let cb_hex = hash_hex_display(&cb_txid.to_byte_array());
     assert!(
@@ -2199,10 +1840,7 @@ fn generate_selects_chained_mempool_parent_first() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: immature_txid,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: immature_txid, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -2212,12 +1850,8 @@ fn generate_selects_chained_mempool_parent_first() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let e = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&bad)))],
-    )
-    .unwrap_err();
+    let e =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex_encode(serialize(&bad)))]).unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_REJECTED);
     assert_eq!(e["message"], "bad-txns-premature-spend-of-coinbase");
 
@@ -2275,12 +1909,8 @@ fn getblocktemplate_requires_segwit_and_shapes_empty_and_one_tx() {
             script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
         }],
     };
-    let tid = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&spend)))],
-    )
-    .unwrap();
+    let tid =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex_encode(serialize(&spend)))]).unwrap();
     let tmpl = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
     let txs = tmpl["transactions"].as_array().unwrap();
     assert_eq!(txs.len(), 1);
@@ -2407,31 +2037,15 @@ fn gbt_proposal_connect_chain_spend_and_value_needles() {
     );
     let cb_val =
         (blk1["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
-    let op = OutPoint {
-        txid: cb_txid,
-        vout: 0,
-    };
+    let op = OutPoint { txid: cb_txid, vout: 0 };
     let chain_out = gbt_chain_txout(&ctx, &op).expect("mature coinbase is chain-spendable");
     assert_eq!(chain_out.value.to_sat(), cb_val);
-    assert!(gbt_chain_txout(
-        &ctx,
-        &OutPoint {
-            txid: Txid::from_byte_array([0xab; 32]),
-            vout: 0
-        }
-    )
-    .is_none());
+    assert!(gbt_chain_txout(&ctx, &OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 })
+        .is_none());
 
-    let tip_s = dispatch(&ctx, "getbestblockhash", vec![])
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_string();
+    let tip_s = dispatch(&ctx, "getbestblockhash", vec![]).unwrap().as_str().unwrap().to_string();
     let raw = hex_decode(
-        dispatch(&ctx, "getblock", vec![json!(tip_s), json!(0)])
-            .unwrap()
-            .as_str()
-            .unwrap(),
+        dispatch(&ctx, "getblock", vec![json!(tip_s), json!(0)]).unwrap().as_str().unwrap(),
     )
     .unwrap();
     let mined: Block = deserialize(&raw).unwrap();
@@ -2508,10 +2122,7 @@ fn prevout_from_block_or_query_same_block_then_store() {
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let genesis = hub.query.reconstruct_block_at_height(Height(0)).unwrap();
     let cb = &genesis.txdata[0];
-    let op = OutPoint {
-        txid: cb.compute_txid(),
-        vout: 0,
-    };
+    let op = OutPoint { txid: cb.compute_txid(), vout: 0 };
     assert_eq!(
         crate::blockstats::prevout_from_block_or_query(&ctx, &genesis, &op).as_ref(),
         Some(&cb.output[0])
@@ -2522,10 +2133,7 @@ fn prevout_from_block_or_query_same_block_then_store() {
         Some(&cb.output[0]),
         "height-1 block must load genesis prevout from the store"
     );
-    let miss = OutPoint {
-        txid: cb.compute_txid(),
-        vout: 99,
-    };
+    let miss = OutPoint { txid: cb.compute_txid(), vout: 99 };
     assert!(crate::blockstats::prevout_from_block_or_query(&ctx, &h1, &miss).is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2533,17 +2141,11 @@ fn prevout_from_block_or_query_same_block_then_store() {
 #[test]
 fn prioritisetransaction_dummy_and_deprioritise_skips_generate() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    let e = dispatch(
-        &ctx,
-        "prioritisetransaction",
-        vec![json!("11".repeat(32)), json!(1), json!(0)],
-    )
-    .unwrap_err();
+    let e =
+        dispatch(&ctx, "prioritisetransaction", vec![json!("11".repeat(32)), json!(1), json!(0)])
+            .unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert!(e["message"]
-        .as_str()
-        .unwrap()
-        .contains("Priority is no longer supported"));
+    assert!(e["message"].as_str().unwrap().contains("Priority is no longer supported"));
 
     dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
     let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
@@ -2572,19 +2174,10 @@ fn prioritisetransaction_dummy_and_deprioritise_skips_generate() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let tid = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&spend)))],
-    )
-    .unwrap();
+    let tid =
+        dispatch(&ctx, "sendrawtransaction", vec![json!(hex_encode(serialize(&spend)))]).unwrap();
     let fee = 1_000i64;
-    dispatch(
-        &ctx,
-        "prioritisetransaction",
-        vec![tid.clone(), json!(0), json!(-fee)],
-    )
-    .unwrap();
+    dispatch(&ctx, "prioritisetransaction", vec![tid.clone(), json!(0), json!(-fee)]).unwrap();
     let pri = dispatch(&ctx, "getprioritisedtransactions", vec![]).unwrap();
     assert_eq!(pri[tid.as_str().unwrap()]["fee_delta"], -fee);
     assert_eq!(pri[tid.as_str().unwrap()]["in_mempool"], true);
@@ -2614,12 +2207,9 @@ fn prioritisetransaction_dummy_and_deprioritise_skips_generate() {
     // This test deprioritises the only live tx (modified fee ≤ 0), so the
     // diagram may be empty — still a JSON array.
     assert!(diagram.is_array(), "{diagram}");
-    let spend = dispatch(
-        &ctx,
-        "gettxspendingprevout",
-        vec![json!([{ "txid": cb_txid, "vout": 0 }])],
-    )
-    .unwrap();
+    let spend =
+        dispatch(&ctx, "gettxspendingprevout", vec![json!([{ "txid": cb_txid, "vout": 0 }])])
+            .unwrap();
     assert_eq!(spend[0]["spendingtxid"], tid);
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(info["optimal"], true);
@@ -2691,10 +2281,8 @@ fn submitblock_cheap_tx_rejects() {
     assert_eq!(r, json!("bad-blk-length"));
 
     let mut no_cb = mine_regtest_paying(prev, time + 1, 2, script.clone(), vec![]);
-    no_cb.txdata[0].input[0].previous_output = OutPoint {
-        txid: Txid::from_byte_array([0x11; 32]),
-        vout: 0,
-    };
+    no_cb.txdata[0].input[0].previous_output =
+        OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 0 };
     let r = dispatch(
         &ctx,
         "submitblock",
@@ -2720,10 +2308,7 @@ fn submitblock_cheap_tx_rejects() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: cb_txid,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: cb_txid, vout: 0 },
             script_sig: Default::default(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -2746,10 +2331,7 @@ fn submitblock_cheap_tx_rejects() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([0x22; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([0x22; 32]), vout: 0 },
             script_sig: Default::default(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -2778,11 +2360,7 @@ fn invalidate_reconsider_tip() {
     let (addr, script) = p2wpkh_regtest();
     dispatch(&ctx, "generatetoaddress", vec![json!(3), json!(addr)]).unwrap();
     assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
-    let tip = dispatch(&ctx, "getbestblockhash", vec![])
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_string();
+    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap().as_str().unwrap().to_string();
     dispatch(&ctx, "invalidateblock", vec![json!(tip.clone())]).unwrap();
     assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
     dispatch(&ctx, "reconsiderblock", vec![json!(tip.clone())]).unwrap();
@@ -2800,33 +2378,16 @@ fn invalidate_reconsider_tip() {
     )
     .unwrap();
     assert_eq!(parked, json!("inconclusive"), "{parked}");
-    assert_eq!(
-        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
-        json!(tip)
-    );
+    assert_eq!(dispatch(&ctx, "getbestblockhash", vec![]).unwrap(), json!(tip));
     let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
     let arr = tips.as_array().unwrap();
-    assert!(
-        arr.iter()
-            .any(|t| t["status"] == "active" && t["hash"] == tip),
-        "{tips}"
-    );
-    assert!(
-        arr.iter()
-            .any(|t| t["status"] == "valid-headers" && t["hash"] == sib_hex),
-        "{tips}"
-    );
+    assert!(arr.iter().any(|t| t["status"] == "active" && t["hash"] == tip), "{tips}");
+    assert!(arr.iter().any(|t| t["status"] == "valid-headers" && t["hash"] == sib_hex), "{tips}");
 
     dispatch(&ctx, "preciousblock", vec![json!(sib_hex.clone())]).unwrap();
-    assert_eq!(
-        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
-        json!(sib_hex)
-    );
+    assert_eq!(dispatch(&ctx, "getbestblockhash", vec![]).unwrap(), json!(sib_hex));
     dispatch(&ctx, "preciousblock", vec![json!(tip.clone())]).unwrap();
-    assert_eq!(
-        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
-        json!(tip)
-    );
+    assert_eq!(dispatch(&ctx, "getbestblockhash", vec![]).unwrap(), json!(tip));
 
     let h1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
     dispatch(&ctx, "preciousblock", vec![h1]).unwrap();
@@ -2840,11 +2401,7 @@ fn invalidate_reconsider_tip() {
     assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(miss["message"], "Block not found");
     let after_err = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
-    assert_eq!(
-        after_err,
-        json!(tip),
-        "not-found precious must not move tip"
-    );
+    assert_eq!(after_err, json!(tip), "not-found precious must not move tip");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2868,23 +2425,11 @@ fn submitheader_decode_and_prev_needles() {
     let bad_hex = "xx".repeat(80);
     let e = dispatch(&ctx, "submitheader", vec![json!(bad_hex)]).unwrap_err();
     assert_eq!(e["code"], ERR_DESERIALIZATION);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Block header decode failed"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("Block header decode failed"), "{e}");
     let short = "ff".repeat(78);
     let e = dispatch(&ctx, "submitheader", vec![json!(short)]).unwrap_err();
     assert_eq!(e["code"], ERR_DESERIALIZATION);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Block header decode failed"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("Block header decode failed"), "{e}");
 
     let orphan = serialize(&bitcoin::block::Header {
         version: bitcoin::block::Version::from_consensus(4),
@@ -2894,20 +2439,10 @@ fn submitheader_decode_and_prev_needles() {
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         nonce: 0,
     });
-    let e = dispatch(
-        &ctx,
-        "submitheader",
-        vec![json!(rbitcoin_primitives::hex_encode(orphan))],
-    )
-    .unwrap_err();
+    let e = dispatch(&ctx, "submitheader", vec![json!(rbitcoin_primitives::hex_encode(orphan))])
+        .unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_ERROR);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Must submit previous header"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("Must submit previous header"), "{e}");
 
     let (addr, _) = p2wpkh_regtest();
     dispatch(&ctx, "generatetoaddress", vec![json!(3), json!(addr)]).unwrap();
@@ -2922,10 +2457,7 @@ fn submitheader_decode_and_prev_needles() {
     )
     .unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_ERROR);
-    assert!(
-        e["message"].as_str().unwrap().contains("time-too-old"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("time-too-old"), "{e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2954,40 +2486,26 @@ fn submitheader_invalid_parent_keeps_one_header_tip() {
     dispatch(
         &ctx,
         "submitheader",
-        vec![json!(rbitcoin_primitives::hex_encode(serialize(
-            &parent.header
-        )))],
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&parent.header)))],
     )
     .unwrap();
     dispatch(
         &ctx,
         "submitheader",
-        vec![json!(rbitcoin_primitives::hex_encode(serialize(
-            &child.header
-        )))],
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&child.header)))],
     )
     .unwrap();
     let before = dispatch(&ctx, "getchaintips", vec![]).unwrap();
     let n_before = before.as_array().unwrap().len();
-    dispatch(
-        &ctx,
-        "submitblock",
-        vec![json!(rbitcoin_primitives::hex_encode(serialize(&parent)))],
-    )
-    .unwrap();
+    dispatch(&ctx, "submitblock", vec![json!(rbitcoin_primitives::hex_encode(serialize(&parent)))])
+        .unwrap();
     let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
     assert_eq!(
         tips.as_array().unwrap().len(),
         n_before,
         "rejecting the parent body must not add a second tip: {tips}"
     );
-    assert!(
-        tips.as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["status"] == "invalid"),
-        "{tips}"
-    );
+    assert!(tips.as_array().unwrap().iter().any(|t| t["status"] == "invalid"), "{tips}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3009,11 +2527,7 @@ fn submitheader_child_is_headers_only() {
     assert_eq!(info["headers"], 1);
     let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
     let arr = tips.as_array().unwrap();
-    assert!(
-        arr.iter()
-            .any(|t| t["status"] == "headers-only" && t["height"] == 1),
-        "{tips}"
-    );
+    assert!(arr.iter().any(|t| t["status"] == "headers-only" && t["height"] == 1), "{tips}");
     let miss = dispatch(&ctx, "invalidateblock", vec![json!("00".repeat(32))]).unwrap_err();
     assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(miss["message"], "Block not found");
@@ -3024,13 +2538,7 @@ fn submitheader_child_is_headers_only() {
 fn mockscheduler_rebroadcasts_unbroadcast() {
     let (ctx, dir) = ctx_empty();
     let e = dispatch(&ctx, "mockscheduler", vec![]).unwrap_err();
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("delta_seconds"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap_or("").contains("delta_seconds"), "{e}");
     let r = dispatch(&ctx, "mockscheduler", vec![json!(900)]).unwrap();
     assert!(r.is_null(), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -3081,11 +2589,7 @@ fn getdeploymentinfo_buried_from_params() {
     let d = buried_deployments(&over, 100);
     assert_eq!(d["csv"]["height"], 102);
     assert_eq!(d["csv"]["active"], false, "next block 101 < 102");
-    assert_eq!(
-        buried_deployments(&over, 101)["csv"]["active"],
-        true,
-        "next block 102 ≥ 102"
-    );
+    assert_eq!(buried_deployments(&over, 101)["csv"]["active"], true, "next block 102 ≥ 102");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3100,10 +2604,7 @@ fn setmocktime_generate_uses_mock() {
     let best = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
     let hdr = dispatch(&ctx, "getblockheader", vec![best]).unwrap();
     let t = hdr["time"].as_u64().unwrap();
-    assert!(
-        t >= mock && t < mock + 600,
-        "generate time {t} should honor mock {mock}"
-    );
+    assert!(t >= mock && t < mock + 600, "generate time {t} should honor mock {mock}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3220,12 +2721,7 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
             },
         ],
     };
-    dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&spend)))],
-    )
-    .unwrap();
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex_encode(serialize(&spend)))]).unwrap();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let tip_hash = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
     ctx.query.store().reset_tx_full_gets();
@@ -3237,9 +2733,7 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
     );
     let v1txs = v1["tx"].as_array().unwrap();
     assert_eq!(v1txs.len(), 2);
-    assert!(v1txs
-        .iter()
-        .all(|t| t.as_str().is_some_and(|s| s.len() == 64)));
+    assert!(v1txs.iter().all(|t| t.as_str().is_some_and(|s| s.len() == 64)));
     let v2 = dispatch(&ctx, "getblock", vec![tip_hash, json!(2)]).unwrap();
     assert!(v2["tx"][1]["vin"][0].get("txid").is_some());
     let tip_h = dispatch(&ctx, "getblockcount", vec![]).unwrap();
@@ -3284,10 +2778,7 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
     named.insert("hash_or_height".into(), json!(h));
     named.insert("stats".into(), json!(["minfee"]));
     let one = dispatch(&ctx, "getblockstats", RpcParams::named(named)).unwrap();
-    assert_eq!(
-        one.as_object().unwrap().keys().collect::<Vec<_>>(),
-        vec!["minfee"]
-    );
+    assert_eq!(one.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["minfee"]);
     assert_eq!(one["minfee"], got["minfee"]);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3304,30 +2795,19 @@ fn getblockstats_core_error_needles() {
     let e = dispatch(&ctx, "getblockstats", vec![json!(2)]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
     assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Target block height 2 after current tip 1"),
+        e["message"].as_str().unwrap().contains("Target block height 2 after current tip 1"),
         "{e}"
     );
     let e = dispatch(&ctx, "getblockstats", vec![json!(-1)]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert!(
-        e["message"]
-            .as_str()
-            .unwrap()
-            .contains("Target block height -1 is negative"),
-        "{e}"
-    );
+    assert!(e["message"].as_str().unwrap().contains("Target block height -1 is negative"), "{e}");
     let e = dispatch(&ctx, "getblockstats", vec![json!(1), json!(["asdfghjkl"])]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
     assert_eq!(e["message"], "Invalid selected statistic 'asdfghjkl'");
     let e = dispatch(
         &ctx,
         "getblockstats",
-        vec![json!(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-        )],
+        vec![json!("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")],
     )
     .unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY);
@@ -3345,12 +2825,8 @@ fn getblockstats_core_error_needles() {
     let child = mine_regtest_paying(prev, time, 2, script, vec![]);
     let hex = rbitcoin_primitives::hex_encode(serialize(&child));
     dispatch(&ctx, "submitheader", vec![json!(hex)]).unwrap();
-    let e = dispatch(
-        &ctx,
-        "getblockstats",
-        vec![json!(child.block_hash().to_string())],
-    )
-    .unwrap_err();
+    let e =
+        dispatch(&ctx, "getblockstats", vec![json!(child.block_hash().to_string())]).unwrap_err();
     assert_eq!(e["code"], ERR_MISC);
     assert_eq!(e["message"], "Block not available (not fully downloaded)");
 
@@ -3365,19 +2841,13 @@ fn testmempoolaccept_script_reject_maps_reason_and_details() {
 
     let err = "script: script verification failed: SIG_DER";
     let reason = accept_reject_reason(&err);
-    assert_eq!(
-        reason,
-        "mempool-script-verify-flag-failed (Non-canonical DER signature)"
-    );
+    assert_eq!(reason, "mempool-script-verify-flag-failed (Non-canonical DER signature)");
     let prev = Txid::from_byte_array([0x11; 32]);
     let tx = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: prev, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -3397,10 +2867,7 @@ fn testmempoolaccept_script_reject_maps_reason_and_details() {
     assert_eq!(details, want);
 
     for (token, paren) in [
-        (
-            "stack empty",
-            "Operation not valid with the current stack size",
-        ),
+        ("stack empty", "Operation not valid with the current stack size"),
         ("CLTV negative", "Negative locktime"),
         ("CLTV type", "Locktime requirement not satisfied"),
         ("CLTV", "Locktime requirement not satisfied"),
@@ -3491,14 +2958,10 @@ fn getpeerinfo_lists_registered_session() {
     // totalbytesrecv before the frame is complete.
     let wire = rbitcoin_net::WireBytes::new();
     live.attach_wire(wire.clone());
-    let before = dispatch(&ctx, "getnettotals", vec![]).unwrap()["totalbytesrecv"]
-        .as_u64()
-        .unwrap();
-    wire.recv
-        .fetch_add(12, std::sync::atomic::Ordering::Relaxed);
-    let mid = dispatch(&ctx, "getnettotals", vec![]).unwrap()["totalbytesrecv"]
-        .as_u64()
-        .unwrap();
+    let before =
+        dispatch(&ctx, "getnettotals", vec![]).unwrap()["totalbytesrecv"].as_u64().unwrap();
+    wire.recv.fetch_add(12, std::sync::atomic::Ordering::Relaxed);
+    let mid = dispatch(&ctx, "getnettotals", vec![]).unwrap()["totalbytesrecv"].as_u64().unwrap();
     assert_eq!(mid, before + 12);
     let pi = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
     assert_eq!(pi[0]["bytesrecv"].as_u64().unwrap(), mid);
@@ -3509,10 +2972,7 @@ fn getpeerinfo_lists_registered_session() {
     // rpc_net.py:100 — dual inbound+outbound is two connections, not
     // outbound-follow-only (ctx.connections stays 0 here).
     let inbound = hub.register(bind, addr, &ver, true, PeerConnType::Inbound);
-    assert_eq!(
-        dispatch(&ctx, "getconnectioncount", vec![]).unwrap(),
-        json!(2)
-    );
+    assert_eq!(dispatch(&ctx, "getconnectioncount", vec![]).unwrap(), json!(2));
     drop(inbound);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3575,13 +3035,8 @@ fn getpeerinfo_synced_heights_from_best_known() {
     let hub = PeerHub::new();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
-    let live = hub.register(
-        addr,
-        bind,
-        &test_version(0, 0),
-        false,
-        PeerConnType::OutboundFullRelay,
-    );
+    let live =
+        hub.register(addr, bind, &test_version(0, 0), false, PeerConnType::OutboundFullRelay);
     live.note_best_known(genesis);
     ctx.peers = Some(hub.clone());
     let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
@@ -3608,13 +3063,8 @@ fn getpeerinfo_synced_heights_via_query_without_chain() {
     let hub = PeerHub::new();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
-    let live = hub.register(
-        addr,
-        bind,
-        &test_version(0, 0),
-        false,
-        PeerConnType::OutboundFullRelay,
-    );
+    let live =
+        hub.register(addr, bind, &test_version(0, 0), false, PeerConnType::OutboundFullRelay);
     live.note_best_known(genesis);
     ctx.peers = Some(hub);
     let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
@@ -3641,13 +3091,8 @@ fn getpeerinfo_header_only_best_known_is_not_synced_blocks() {
     let hub = PeerHub::new();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
-    let live = hub.register(
-        addr,
-        bind,
-        &test_version(0, 0),
-        false,
-        PeerConnType::OutboundFullRelay,
-    );
+    let live =
+        hub.register(addr, bind, &test_version(0, 0), false, PeerConnType::OutboundFullRelay);
     live.note_best_known(child.block_hash());
     ctx.peers = Some(hub);
     let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
@@ -3675,13 +3120,7 @@ fn getpeerinfo_and_getnetworkinfo_timeoffset_from_version() {
         PeerConnType::OutboundFullRelay,
     );
     let inbound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500);
-    hub.register(
-        inbound_addr,
-        bind,
-        &test_version(1_700_000_099, 0),
-        true,
-        PeerConnType::Inbound,
-    );
+    hub.register(inbound_addr, bind, &test_version(1_700_000_099, 0), true, PeerConnType::Inbound);
     ctx.peers = Some(hub);
     let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
     let arr = r.as_array().unwrap();
@@ -3839,14 +3278,10 @@ fn getpeerinfo_sent_pingwait_and_limited_services() {
         "hub --trusted does not grant getpeerinfo.permissions"
     );
     let mut t = rbitcoin_net::NetPermTable::default();
-    t.whitelist
-        .push(rbitcoin_net::parse_whitelist("noban,out@127.0.0.1").expect("whitelist"));
+    t.whitelist.push(rbitcoin_net::parse_whitelist("noban,out@127.0.0.1").expect("whitelist"));
     hub.set_net_perms(t);
     let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
-    assert_eq!(
-        info.as_array().unwrap()[0]["permissions"],
-        json!(["noban", "download"])
-    );
+    assert_eq!(info.as_array().unwrap()[0]["permissions"], json!(["noban", "download"]));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3861,9 +3296,7 @@ fn getpeerinfo_mapped_as_when_asmap() {
 
     let (mut ctx, dir) = ctx_empty();
     let hub = PeerHub::new();
-    hub.set_asmap(Some(Arc::new(
-        AsMap::from_bytes(TWO_PREFIX_ASMAP.to_vec()).expect("fixture"),
-    )));
+    hub.set_asmap(Some(Arc::new(AsMap::from_bytes(TWO_PREFIX_ASMAP.to_vec()).expect("fixture"))));
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let ver = VersionMessage {
@@ -3907,28 +3340,17 @@ fn addpeeraddress_updates_addrman_without_rewriting_peers_file() {
     let am = Arc::new(Mutex::new(AddrMan::new()));
     ctx.addrman = Some(Arc::clone(&am));
 
-    let out = dispatch(
-        &ctx,
-        "addpeeraddress",
-        vec![json!("128.1.2.3"), json!(8333)],
-    )
-    .unwrap();
+    let out = dispatch(&ctx, "addpeeraddress", vec![json!("128.1.2.3"), json!(8333)]).unwrap();
     assert_eq!(out, json!({"success": true}));
     {
         let g = am.lock().unwrap();
         assert_eq!(g.len(), 1);
         assert!(g.peers().contains(&"128.1.2.3:8333".parse().unwrap()));
     }
-    assert!(
-        !peers_path.exists(),
-        "addpeeraddress must not rewrite peers on every call"
-    );
+    assert!(!peers_path.exists(), "addpeeraddress must not rewrite peers on every call");
 
     let named = RpcParams::named(
-        json!({"address": "129.0.0.1", "port": 8334, "tried": false})
-            .as_object()
-            .unwrap()
-            .clone(),
+        json!({"address": "129.0.0.1", "port": 8334, "tried": false}).as_object().unwrap().clone(),
     );
     let out = dispatch(&ctx, "addpeeraddress", named).unwrap();
     assert_eq!(out, json!({"success": true}));
@@ -3944,10 +3366,7 @@ fn getnodeaddresses_empty_named_filter_and_count() {
     use std::sync::Mutex;
 
     let (ctx, dir) = ctx_empty();
-    assert_eq!(
-        dispatch(&ctx, "getnodeaddresses", vec![]).unwrap(),
-        json!([])
-    );
+    assert_eq!(dispatch(&ctx, "getnodeaddresses", vec![]).unwrap(), json!([]));
     let bad_net = dispatch(&ctx, "getnodeaddresses", vec![json!(1), json!("notanet")]).unwrap_err();
     assert_eq!(bad_net["code"], ERR_INVALID_PARAMETER);
     let neg = dispatch(&ctx, "getnodeaddresses", vec![json!(-1)]).unwrap_err();
@@ -3959,12 +3378,7 @@ fn getnodeaddresses_empty_named_filter_and_count() {
     let (mut ctx, dir) = ctx_empty();
     let am = Arc::new(Mutex::new(AddrMan::new()));
     ctx.addrman = Some(Arc::clone(&am));
-    dispatch(
-        &ctx,
-        "addpeeraddress",
-        vec![json!("128.1.2.3"), json!(8333)],
-    )
-    .unwrap();
+    dispatch(&ctx, "addpeeraddress", vec![json!("128.1.2.3"), json!(8333)]).unwrap();
     dispatch(&ctx, "addpeeraddress", vec![json!("::1"), json!(8333)]).unwrap();
     let none = dispatch(&ctx, "getnodeaddresses", vec![]).unwrap();
     assert_eq!(none.as_array().unwrap().len(), 1);
@@ -3973,12 +3387,8 @@ fn getnodeaddresses_empty_named_filter_and_count() {
     let v4 = dispatch(&ctx, "getnodeaddresses", vec![json!(10), json!("ipv4")]).unwrap();
     assert_eq!(v4.as_array().unwrap().len(), 1);
     assert_eq!(v4[0]["network"], "ipv4");
-    let v6 = dispatch(
-        &ctx,
-        "getnodeaddresses",
-        named(json!({"count": 0, "network": "ipv6"})),
-    )
-    .unwrap();
+    let v6 =
+        dispatch(&ctx, "getnodeaddresses", named(json!({"count": 0, "network": "ipv6"}))).unwrap();
     assert_eq!(v6.as_array().unwrap().len(), 1);
     assert_eq!(v6[0]["network"], "ipv6");
     let onion = dispatch(&ctx, "getnodeaddresses", vec![json!(0), json!("onion")]).unwrap();
@@ -4029,12 +3439,10 @@ async fn addnode_two_nodes_see_each_other() {
         let pa = dispatch(&ctx_a, "getpeerinfo", vec![]).unwrap();
         let pb = dispatch(&ctx_b, "getpeerinfo", vec![]).unwrap();
         let a_ok = pa.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode1)/" && p["inbound"] == false)
+            a.iter().any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode1)/" && p["inbound"] == false)
         });
         let b_ok = pb.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode0)/" && p["inbound"] == true)
+            a.iter().any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode0)/" && p["inbound"] == true)
         });
         if a_ok && b_ok {
             saw = true;
@@ -4089,15 +3497,8 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
         "maxmempool must be the hub weight budget, not a hardcoded 300M"
     );
     let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
-    assert_ne!(
-        net["version"].as_u64(),
-        Some(270000),
-        "must not impersonate Bitcoin Core 27.0"
-    );
-    assert_eq!(
-        net["version"].as_u64(),
-        Some(rpc_client_version(env!("CARGO_PKG_VERSION"))),
-    );
+    assert_ne!(net["version"].as_u64(), Some(270000), "must not impersonate Bitcoin Core 27.0");
+    assert_eq!(net["version"].as_u64(), Some(rpc_client_version(env!("CARGO_PKG_VERSION"))),);
     assert_eq!(
         net["subversion"].as_str().unwrap(),
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str],)
@@ -4113,26 +3514,14 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
         500,
         "0.5.0 is the same mapping (not Core 27.0 / 270000)"
     );
-    assert_eq!(
-        rpc_client_version("0.5.1"),
-        501,
-        "0.5.1 patch is +1 on the Core-style integer"
-    );
-    assert_eq!(
-        rpc_client_version("0.5.99"),
-        599,
-        "0.5.99 is the in-tree pre-0.6.0 mapping"
-    );
+    assert_eq!(rpc_client_version("0.5.1"), 501, "0.5.1 patch is +1 on the Core-style integer");
+    assert_eq!(rpc_client_version("0.5.99"), 599, "0.5.99 is the in-tree pre-0.6.0 mapping");
     assert_eq!(
         rpc_client_version("0.6.0"),
         600,
         "0.6.0 is the same mapping (not Core 27.0 / 270000)"
     );
-    assert_eq!(
-        rpc_client_version("0.6.99"),
-        699,
-        "0.6.99 is the in-tree pre-0.7.0 mapping"
-    );
+    assert_eq!(rpc_client_version("0.6.99"), 699, "0.6.99 is the in-tree pre-0.7.0 mapping");
     assert_eq!(
         rpc_client_version("0.7.0"),
         700,
@@ -4147,10 +3536,7 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
     assert!(names.contains(&"NETWORK"));
     assert!(names.contains(&"WITNESS"));
     assert!(names.contains(&"P2P_V2"));
-    assert!(
-        !names.contains(&"NETWORK_LIMITED"),
-        "we do not advertise NETWORK_LIMITED: {names:?}"
-    );
+    assert!(!names.contains(&"NETWORK_LIMITED"), "we do not advertise NETWORK_LIMITED: {names:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4177,14 +3563,8 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
     let (ctx, dir) = ctx_empty();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(
-        &ctx.query,
-        &params,
-        Height::GENESIS,
-        &genesis,
-        Milestone::NONE,
-    )
-    .unwrap();
+    accept_and_connect_block(&ctx.query, &params, Height::GENESIS, &genesis, Milestone::NONE)
+        .unwrap();
     let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
         &ctx.query,
         &params,
@@ -4201,10 +3581,7 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[0],
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: coinbase_txids[0], vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -4219,18 +3596,12 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txids[0],
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: coinbase_txids[0], vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000 - 50_000),
-            script_pubkey: spk,
-        }],
+        output: vec![TxOut { value: Amount::from_sat(50_0000_0000 - 50_000), script_pubkey: spk }],
     };
     let high_hex = hex_encode(serialize(&high));
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([high_hex])]).unwrap();
@@ -4239,10 +3610,7 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
         mp.contains(&low.compute_txid()),
         "testmempoolaccept must not RBF-evict the live conflict"
     );
-    assert!(
-        !mp.contains(&high.compute_txid()),
-        "trial replacement must not remain in the mempool"
-    );
+    assert!(!mp.contains(&high.compute_txid()), "trial replacement must not remain in the mempool");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4259,10 +3627,7 @@ fn testmempoolaccept_missing_inputs_is_missingorspent() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([0x11; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -4275,22 +3640,14 @@ fn testmempoolaccept_missing_inputs_is_missingorspent() {
     let hex = hex_encode(serialize(&tx));
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
-    assert_eq!(
-        row[0]["reject-reason"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{row}"
-    );
+    assert_eq!(row[0]["reject-reason"], json!("bad-txns-inputs-missingorspent"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 0);
 
     ctx.mempool.as_ref().unwrap().accept_tx(&tx).unwrap_err();
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
-    assert_eq!(
-        row[0]["reject-reason"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{row}"
-    );
+    assert_eq!(row[0]["reject-reason"], json!("bad-txns-inputs-missingorspent"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4315,10 +3672,7 @@ fn decode_rpc_subset() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([1; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([1; 32]), vout: 0 },
             script_sig: script_sig.clone(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -4336,21 +3690,14 @@ fn decode_rpc_subset() {
         dec["vin"][0]["scriptSig"]["hex"],
         json!(rbitcoin_primitives::hex_encode(script_sig.as_bytes()))
     );
-    assert!(dec["vin"][0]["scriptSig"]["asm"]
-        .as_str()
-        .unwrap()
-        .contains("1"));
+    assert!(dec["vin"][0]["scriptSig"]["asm"].as_str().unwrap().contains("1"));
     assert_eq!(dec["vout"][0]["scriptPubKey"]["type"], json!("nonstandard"));
     assert!(dec["size"].as_u64().unwrap() > 0);
     assert!(dec["weight"].as_u64().unwrap() > 0);
     assert!(dec.get("vin").unwrap()[0].get("txinwitness").is_none());
 
-    let extra = dispatch(
-        &ctx,
-        "decoderawtransaction",
-        vec![json!(format!("{legacy_hex}00"))],
-    )
-    .unwrap_err();
+    let extra =
+        dispatch(&ctx, "decoderawtransaction", vec![json!(format!("{legacy_hex}00"))]).unwrap_err();
     assert_eq!(extra["code"], ERR_DESERIALIZATION);
     assert_eq!(extra["message"], json!("TX decode failed"));
 
@@ -4360,10 +3707,7 @@ fn decode_rpc_subset() {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([2; 32]),
-                vout: 1,
-            },
+            previous_output: OutPoint { txid: Txid::from_byte_array([2; 32]), vout: 1 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: wit,
@@ -4374,19 +3718,11 @@ fn decode_rpc_subset() {
         }],
     };
     let wit_hex = serialize_hex(&witness_tx);
-    let wit_ok = dispatch(
-        &ctx,
-        "decoderawtransaction",
-        vec![json!(wit_hex.clone()), json!(true)],
-    )
-    .unwrap();
+    let wit_ok =
+        dispatch(&ctx, "decoderawtransaction", vec![json!(wit_hex.clone()), json!(true)]).unwrap();
     assert_eq!(wit_ok["vin"][0]["txinwitness"], json!(["aa"]));
-    let wit_forced = dispatch(
-        &ctx,
-        "decoderawtransaction",
-        vec![json!(wit_hex), json!(false)],
-    )
-    .unwrap_err();
+    let wit_forced =
+        dispatch(&ctx, "decoderawtransaction", vec![json!(wit_hex), json!(false)]).unwrap_err();
     assert_eq!(wit_forced["code"], ERR_DESERIALIZATION);
     assert_eq!(wit_forced["message"], json!("TX decode failed"));
 
@@ -4417,12 +3753,9 @@ fn decode_rpc_subset() {
     assert!(valid["witness_program"].as_str().unwrap().len() == 40);
     assert!(valid.get("error_locations").is_none());
 
-    let p2sh = dispatch(
-        &ctx,
-        "validateaddress",
-        vec![json!("2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc")],
-    )
-    .unwrap();
+    let p2sh =
+        dispatch(&ctx, "validateaddress", vec![json!("2MzQwSSnBHWHqSAqtTVQ6v47XtaisrJa1Vc")])
+            .unwrap();
     assert_eq!(p2sh["isvalid"], json!(true));
     assert_eq!(p2sh["isscript"], json!(true));
     assert_eq!(p2sh["iswitness"], json!(false));
@@ -4458,10 +3791,7 @@ fn rpc_params_type_coercion_and_unknown_named() {
     assert_eq!(e["code"], ERR_INVALID_PARAMS);
     assert!(e["message"].as_str().unwrap().contains("must be a string"));
     let e = p.req_u64(0, "n").unwrap_err();
-    assert!(e["message"]
-        .as_str()
-        .unwrap()
-        .contains("must be an integer"));
+    assert!(e["message"].as_str().unwrap().contains("must be an integer"));
     let e = p.req(9, "height").unwrap_err();
     assert!(e["message"].as_str().unwrap().contains("height required"));
 
@@ -4483,47 +3813,26 @@ fn rpc_params_type_coercion_and_unknown_named() {
         .contains("must be a bool"));
     assert!(bad_opt.opt_str(0, "s").unwrap().is_some());
 
-    let extra = RpcParams::named(
-        json!({"blockhash": "aa", "foo": 1})
-            .as_object()
-            .cloned()
-            .unwrap(),
-    );
+    let extra =
+        RpcParams::named(json!({"blockhash": "aa", "foo": 1}).as_object().cloned().unwrap());
     let e = extra.reject_unknown(&["blockhash"]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert!(e["message"]
-        .as_str()
-        .unwrap()
-        .contains("Unknown named parameter foo"));
+    assert!(e["message"].as_str().unwrap().contains("Unknown named parameter foo"));
     extra.reject_unknown(&["blockhash", "foo"]).unwrap();
-    RpcParams::positional(vec![json!(1)])
-        .reject_unknown(&[])
-        .unwrap();
+    RpcParams::positional(vec![json!(1)]).reject_unknown(&[]).unwrap();
 
     let mixed = RpcParams::named(
-        json!({"args": ["from-args"], "verbose": true})
-            .as_object()
-            .cloned()
-            .unwrap(),
+        json!({"args": ["from-args"], "verbose": true}).as_object().cloned().unwrap(),
     );
-    assert!(
-        mixed.get(0, "hexstring").is_none(),
-        "args peel is echo-only, not RpcParams::named"
-    );
+    assert!(mixed.get(0, "hexstring").is_none(), "args peel is echo-only, not RpcParams::named");
     assert_eq!(mixed.opt_bool(1, "verbose").unwrap(), Some(true));
     assert_eq!(
-        mixed
-            .get(0, "args")
-            .and_then(|v| v.as_array())
-            .map(|a| a[0].as_str()),
+        mixed.get(0, "args").and_then(|v| v.as_array()).map(|a| a[0].as_str()),
         Some(Some("from-args"))
     );
 
     let args_not_array = RpcParams::named(
-        json!({"args": "not-array", "blockhash": "aa"})
-            .as_object()
-            .cloned()
-            .unwrap(),
+        json!({"args": "not-array", "blockhash": "aa"}).as_object().cloned().unwrap(),
     );
     assert_eq!(args_not_array.req_str(0, "blockhash").unwrap(), "aa");
 
@@ -4540,21 +3849,13 @@ fn rpc_params_type_coercion_and_unknown_named() {
         opt_verbosity(&RpcParams::positional(vec![json!(false)]), 0, "verbosity").unwrap(),
         0
     );
-    assert_eq!(
-        opt_verbosity(&RpcParams::positional(vec![json!(2)]), 0, "verbosity").unwrap(),
-        2
-    );
-    assert_eq!(
-        opt_verbosity(&RpcParams::empty(), 0, "verbosity").unwrap(),
-        1
-    );
-    assert!(
-        opt_verbosity(&RpcParams::positional(vec![json!("nope")]), 0, "verbosity").unwrap_err()
-            ["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be an integer")
-    );
+    assert_eq!(opt_verbosity(&RpcParams::positional(vec![json!(2)]), 0, "verbosity").unwrap(), 2);
+    assert_eq!(opt_verbosity(&RpcParams::empty(), 0, "verbosity").unwrap(), 1);
+    assert!(opt_verbosity(&RpcParams::positional(vec![json!("nope")]), 0, "verbosity")
+        .unwrap_err()["message"]
+        .as_str()
+        .unwrap()
+        .contains("must be an integer"));
 }
 
 #[test]
@@ -4595,22 +3896,10 @@ fn dispatch_wrong_json_types_are_param_errors() {
         ("getmempoolentry", vec![json!(0)], "must be a string"),
         ("stop", vec![json!("1")], "must be an integer"),
         ("gettxout", vec![json!(1), json!(0)], "must be a string"),
-        (
-            "prioritisetransaction",
-            vec![json!(1), json!(0), json!(1)],
-            "must be a string",
-        ),
-        (
-            "testmempoolaccept",
-            vec![json!("00")],
-            "rawtxs array required",
-        ),
+        ("prioritisetransaction", vec![json!(1), json!(0), json!(1)], "must be a string"),
+        ("testmempoolaccept", vec![json!("00")], "rawtxs array required"),
         ("submitpackage", vec![json!("00")], "package array required"),
-        (
-            "gettxspendingprevout",
-            vec![json!("00")],
-            "outputs array required",
-        ),
+        ("gettxspendingprevout", vec![json!("00")], "outputs array required"),
         ("waitforblock", vec![json!(1)], "must be a string"),
         ("waitforblockheight", vec![json!("1")], "must be an integer"),
         ("waitfornewblock", vec![json!("1")], "must be an integer"),
@@ -4632,20 +3921,14 @@ fn dispatch_wrong_json_types_are_param_errors() {
     .unwrap_err();
     assert!(wit["message"].as_str().unwrap().contains("must be a bool"));
 
-    let extra = dispatch(
-        &ctx,
-        "decoderawtransaction",
-        named(json!({"hexstring": "00", "nope": true})),
-    )
-    .unwrap_err();
+    let extra =
+        dispatch(&ctx, "decoderawtransaction", named(json!({"hexstring": "00", "nope": true})))
+            .unwrap_err();
     assert_eq!(extra["code"], ERR_INVALID_PARAMETER);
 
     let missing = dispatch(&ctx, "validateaddress", vec![]).unwrap_err();
     assert_eq!(missing["code"], ERR_INVALID_PARAMS);
-    assert!(missing["message"]
-        .as_str()
-        .unwrap()
-        .contains("address required"));
+    assert!(missing["message"].as_str().unwrap().contains("address required"));
     let _ = std::fs::remove_dir_all(&dir);
 
     let (ctx, dir, _hub) = ctx_regtest_hub();

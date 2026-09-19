@@ -52,9 +52,7 @@ fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), ConsensusErro
                 return Err(ConsensusError::Script("p2pkh scriptSig op".into()));
             }
             Instruction::Op(_) => {
-                return Err(ConsensusError::Script(
-                    "p2pkh scriptSig unexpected op".into(),
-                ));
+                return Err(ConsensusError::Script("p2pkh scriptSig unexpected op".into()));
             }
         }
     }

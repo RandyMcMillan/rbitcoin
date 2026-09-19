@@ -92,10 +92,7 @@ fn p2wpkh_bad_signature_rejects() {
     job.tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), pk.as_slice()]);
     let err = script::verify_job_all_inputs(&job).unwrap_err();
     let msg = err.to_string();
-    assert!(
-        msg.contains("p2wpkh ecdsa"),
-        "expected ecdsa failure, got {msg}"
-    );
+    assert!(msg.contains("p2wpkh ecdsa"), "expected ecdsa failure, got {msg}");
     // Operator diagnosis: failing spend identity on IBD logs.
     let txid = job.tx.compute_txid();
     assert!(
@@ -171,10 +168,8 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
 fn pretaproot_v1_witness_program_anyone_can_spend() {
     let mut spk = vec![0x51u8, 0x20];
     spk.extend_from_slice(&[0x42u8; 32]);
-    let prevout = TxOut {
-        value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -218,10 +213,7 @@ fn pretaproot_v1_witness_program_anyone_can_spend() {
 /// Empty scriptPubKey is not anyone-can-spend (Core: empty stack after eval → fail).
 #[test]
 fn empty_script_pubkey_rejects() {
-    let prevout = TxOut {
-        value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::new(),
-    };
+    let prevout = TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::new() };
     let tx = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -259,10 +251,7 @@ fn empty_script_pubkey_rejects() {
         },
         pre: std::sync::OnceLock::new(),
     };
-    assert!(
-        script::verify_job_all_inputs(&job).is_err(),
-        "empty spk + empty scriptSig must fail"
-    );
+    assert!(script::verify_job_all_inputs(&job).is_err(), "empty spk + empty scriptSig must fail");
 }
 
 /// Legacy P2SH with multi-push scriptSig must not die in nested-segwit probe
@@ -275,10 +264,8 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
     let mut spk = vec![0xa9, 0x14];
     spk.extend_from_slice(redeem_hash.as_byte_array());
     spk.push(0x87);
-    let prevout = TxOut {
-        value: Amount::from_sat(50_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(50_000), script_pubkey: ScriptBuf::from_bytes(spk) };
 
     // two pushes: dummy + redeem (must not error in try_p2sh_p2w*)
     let mut ss = Vec::new();
@@ -333,10 +320,7 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
 fn mainnet_block_183_high_s_p2pk_accepts() {
     use bitcoin::consensus::deserialize;
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     // Parent of the spend (2 outputs); spend uses vout=1.
     let prev: Transaction = deserialize(&hx(
@@ -383,10 +367,7 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
 fn mainnet_block_110300_sighash_type_zero_p2pkh() {
     use bitcoin::consensus::deserialize;
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     let prev: Transaction = deserialize(&hx(
         "01000000017fd8dfdb54b5212c4e3151a39f4ffe279fd7f238d516a2ca731529c095d97449010000008b483045022100b6a7fe5eea81894bbdd0df61043e42780543457fa5581ac1af023761a098e92202201d4752785be5f9d1b9f8d362b8cf3b05e298a78c4abff874b838bb500dcf2a120141042e3c4aeac1ffb1c86ce3621afb1ca92773e02badf0d4b1c836eb26bd27d0c2e59ffec3d6ab6b8bbeca81b0990ab5224ebdd73696c4255d1d0c6b3c518a1a053effffffff01404b4c00000000001976a914dc44b1164188067c3a32d4780f5996fa14a4f2d988ac00000000",
@@ -432,10 +413,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
     use bitcoin::consensus::deserialize;
     use bitcoin::secp256k1::ecdsa::Signature;
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     let prev: Transaction = deserialize(&hx(
         "0100000001ba988c49d024d5ec33b49f74071b2157b1530e1301c3210d92c5dc08e04b63d0010000008b48304502200f18c2d1fe6513b90f44513e975e05cc498e7f5a565b46c65b1d448734392c6f022100917766d14f2e9933eb269c83b3ad440ed8432da8beb5733f34046509e48b1d850141049ba39856eec011b79f1acb997760ed9d3f90d477077d17df2571d94b2fa2137bf0976d786b6aabc903746e269628b2c28e4b5db753845e5713a48ee7d6b97aafffffffff01c0c62d00000000001976a9147a2a3b481ca80c4ba7939c54d9278e50189d94f988ac00000000",
@@ -449,14 +427,8 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
     let ss = spend.input[0].script_sig.as_bytes();
     let n = ss[0] as usize;
     let der = &ss[1..1 + n - 1];
-    assert!(
-        Signature::from_der(der).is_err(),
-        "fixture must be non-strict"
-    );
-    assert!(
-        Signature::from_der_lax(der).is_ok(),
-        "fixture must be lax-parseable"
-    );
+    assert!(Signature::from_der(der).is_err(), "fixture must be non-strict");
+    assert!(Signature::from_der_lax(der).is_ok(), "fixture must be lax-parseable");
 
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
@@ -485,10 +457,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
 
     job.bip66_active = true;
     let err = script::verify_job_all_inputs(&job).expect_err("post-BIP66 must reject lax DER");
-    assert!(
-        err.to_string().contains("der"),
-        "expected der error, got {err}"
-    );
+    assert!(err.to_string().contains("der"), "expected der error, got {err}");
 }
 
 /// Unit: parse_der_sig strict vs lax.
@@ -567,10 +536,7 @@ fn secp256k1_lax_der_corpus_parses() {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
-        assert!(
-            Signature::from_der_lax(&der).is_ok(),
-            "lax parse failed for {hex}"
-        );
+        assert!(Signature::from_der_lax(&der).is_ok(), "lax parse failed for {hex}");
         // Append SIGHASH_ALL for our parse_der_sig helper.
         let mut with_ht = der;
         with_ht.push(0x01);
@@ -599,10 +565,7 @@ fn bip66_height_mainnet_documented() {
 fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
     use bitcoin::consensus::deserialize;
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     let prev: Transaction = deserialize(&hx(
         "010000000168781ca236d8e70e4af8285852defabeff61c73db259cbbbebdf7bdac918c234010000004847304402206d186984373e0b781b85f49334cc9a249ffd13a448a5d1732096b011a10063e102206d280df8f4b5e6805f48eb04601ca6d97edd78f2b2d1104dc577e08fd788c78001ffffffff02cce80900000000001976a914fe58bbf690824bdaffb0431a709c27d7bdb6105e88ac801a06000000000017a91419a7d869032368fd1f1e26e5e73a4ad0e474960e8700000000",
@@ -651,10 +614,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
     // With BIP16 on, redeem is 1-of-1 CHECKMULTISIG with empty stack → fail.
     job.bip16_active = true;
     let err = script::verify_job_all_inputs(&job).expect_err("post-BIP16 redeem needs sigs");
-    assert!(
-        err.to_string().contains("stack") || err.to_string().contains("script"),
-        "got {err}"
-    );
+    assert!(err.to_string().contains("stack") || err.to_string().contains("script"), "got {err}");
 }
 
 /// Mainnet height 163685: bare spend with **non-push scriptSig**
@@ -664,10 +624,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
 fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
     use bitcoin::consensus::deserialize;
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     let prev: Transaction = deserialize(&hx(
         "01000000017ea56cd68c74b4cd1a2f478f361b8a67c15a6629d73d95ef21d96ae213eb5b2d010000006a4730440220228e4deb3bc5b47fc526e2a7f5e9434a52616f8353b55dbc820ccb69d5fbded502206a2874f7f84b20015614694fe25c4d76f10e31571f03c240e3e4bbf1f9985be201210232abdc893e7f0631364d7fd01cb33d24da45329a00357b3a7886211ab414d55affffffff0230c11d00000000001976a914709dcb44da534c550dacf4296f75cba1ba3b317788acc0c62d000000000017142a9bc5447d664c1d0141392a842d23dba45c4f13b17500000000",
@@ -722,10 +679,7 @@ fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
 fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
     use bitcoin::consensus::deserialize;
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     // Parent of 70f7c15c… (vout 1 is the P2PKH being spent).
     let prev: Transaction = deserialize(&hx(
@@ -770,10 +724,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
 
     job.bip66_active = true;
     let err = script::verify_job_all_inputs(&job).expect_err("post-BIP66 must reject");
-    assert!(
-        err.to_string().contains("der"),
-        "expected der error, got {err}"
-    );
+    assert!(err.to_string().contains("der"), "expected der error, got {err}");
 }
 
 /// Mainnet height 443992 tx `5fec539b…`: P2SH redeem with multiple
@@ -785,10 +736,7 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
     use bitcoin::consensus::deserialize;
     use bitcoin::{Amount, ScriptBuf, TxOut};
     fn hx(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
     let spend: Transaction = deserialize(&hx(
         "01000000016aaa18f4ab91fab80ecda666c4def68b8b75cc6bb1169ecd81716eab03ff14d007000000fd8701483045022100ac4319cf798ab10d864ad5f206cd405b7a15957eef2b0094ab24ffcf2c28fbfb022012053c8142d9e4f832d85c6ce7dba82d44d011c7713fb584771fb8770da97c0c012102c8662aaa171b5c98fef66c02138165f600c7c5743380686958e395edf8eb36bf47304402202feedc3b54cd87868406e93ee650742b61ce39162d70b6fde5a805fd40a56c900220015970a2fc874c32edfcd6341981d35e5b019a14b17662e00f49e363db72b93c014cd22102fb6827937707bf432d85b094bc180ab93394ee013b3ecaafa04b9135e3ab6e50ad74926404162c5658b15167762103db22e387923ad0552e1c4a4355324313af85926d4266c0eaa86f02eb1e01b2d28763ac67762102c8662aaa171b5c98fef66c02138165f600c7c5743380686958e395edf8eb36bf886e6b6b0064ab05636f6e643175ac687664756c6c6e6b6bab05636f6e643275ac687664756c6c6e6b6bab05636f6e643375ac687664756c6c6e6b6bab05636f6e643475ac687664756c6c6e6b6bab05636f6e643575ac686868ffffffff01204e0000000000001976a914648a4310b84426f426398ef27e3388a4d2c05a2888ac342c5658",
@@ -833,10 +781,8 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
 #[test]
 fn cltv_in_scriptsig_with_op_true_spk_enforced() {
     // scriptSig: OP_1 CLTV; spk: OP_TRUE; locktime=0, seq non-final → CLTV fails (1 > 0).
-    let prevout = TxOut {
-        value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::ONE,
         lock_time: LockTime::ZERO,
@@ -875,10 +821,7 @@ fn cltv_in_scriptsig_with_op_true_spk_enforced() {
         pre: std::sync::OnceLock::new(),
     };
     let err = script::verify_job_all_inputs(&job).expect_err("CLTV in scriptSig must run");
-    assert!(
-        format!("{err}").contains("CLTV"),
-        "expected CLTV failure, got {err}"
-    );
+    assert!(format!("{err}").contains("CLTV"), "expected CLTV failure, got {err}");
 }
 
 /// BIP141: unknown witness version is anyone-can-spend when not discouraged.
@@ -887,10 +830,8 @@ fn unknown_witness_v16_accepts_without_discourage() {
     // OP_16 + 20-byte program (same shape as Core tx_valid #197 vin1).
     let mut spk = vec![0x60u8, 0x14];
     spk.extend_from_slice(&[0x4cu8; 20]);
-    let prevout = TxOut {
-        value: Amount::from_sat(2_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(2_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::ONE,
         lock_time: LockTime::ZERO,
@@ -935,10 +876,8 @@ fn unknown_witness_v16_accepts_without_discourage() {
 #[test]
 fn unknown_witness_v16_malleated_scriptsig() {
     let spk = vec![0x60u8, 0x02, 0x00, 0x01];
-    let prevout = TxOut {
-        value: Amount::from_sat(2_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(2_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::ONE,
         lock_time: LockTime::ZERO,
@@ -988,10 +927,8 @@ fn unknown_witness_v16_malleated_scriptsig() {
 fn unknown_witness_v16_discourage_rejects() {
     let mut spk = vec![0x60u8, 0x21];
     spk.extend_from_slice(&[0xffu8; 33]);
-    let prevout = TxOut {
-        value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::ONE,
         lock_time: LockTime::ZERO,
@@ -1041,10 +978,8 @@ fn p2wsh_oversized_witness_element_rejected() {
     let hash = bitcoin::hashes::sha256::Hash::hash(&redeem);
     let mut spk = vec![0x00u8, 0x20];
     spk.extend_from_slice(hash.as_byte_array());
-    let prevout = TxOut {
-        value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let oversized = vec![0u8; 521];
     let tx = Transaction {
         version: bitcoin::transaction::Version::ONE,
@@ -1111,10 +1046,8 @@ fn p2wsh_witness_script_larger_than_520_is_valid() {
     let hash = bitcoin::hashes::sha256::Hash::hash(&redeem);
     let mut spk = vec![0x00u8, 0x20];
     spk.extend_from_slice(hash.as_byte_array());
-    let prevout = TxOut {
-        value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    };
+    let prevout =
+        TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from_bytes(spk) };
     let tx = Transaction {
         version: bitcoin::transaction::Version::ONE,
         lock_time: LockTime::ZERO,

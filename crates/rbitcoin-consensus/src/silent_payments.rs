@@ -59,10 +59,7 @@ pub fn tweak_from_tx(tx: &Transaction, prevouts: &[TxOut]) -> Option<TxTweak> {
     if output_pubkeys.is_empty() {
         return None;
     }
-    if prevouts
-        .iter()
-        .any(|p| witness_version(p.script_pubkey.as_bytes()) > Some(1))
-    {
+    if prevouts.iter().any(|p| witness_version(p.script_pubkey.as_bytes()) > Some(1)) {
         return None;
     }
 
@@ -82,10 +79,7 @@ pub fn tweak_from_tx(tx: &Transaction, prevouts: &[TxOut]) -> Option<TxTweak> {
     let refs: Vec<&PublicKey> = keys.iter().collect();
     let a = PublicKey::combine_keys(&refs).ok()?;
     let tweak = input_hash_mul_a(tx, &a)?;
-    Some(TxTweak {
-        tweak,
-        output_pubkeys,
-    })
+    Some(TxTweak { tweak, output_pubkeys })
 }
 
 /// Prefer the thin index (no parent peeks). Hole / no table → [`tweaks_for_height`].
@@ -116,10 +110,7 @@ pub fn tweaks_at_height(
             return Ok(out);
         }
         Ok(None) => {
-            rbitcoin_log::debug!(
-                "sp_tweaks: naive fallback h={} (hole or index off)",
-                height.0
-            );
+            rbitcoin_log::debug!("sp_tweaks: naive fallback h={} (hole or index off)", height.0);
         }
         Err(e) => return Err(e.into()),
     }
@@ -172,11 +163,7 @@ pub fn backfill_sp_tweaks_cancellable(
             flush(&mut pending, &mut wrote)?;
             return Ok(wrote);
         };
-        let mut h = query
-            .sptweaks_next_height()
-            .unwrap_or(origin)
-            .0
-            .max(origin.0);
+        let mut h = query.sptweaks_next_height().unwrap_or(origin).0.max(origin.0);
         if h > tip.0 {
             flush(&mut pending, &mut wrote)?;
             return Ok(wrote);
@@ -231,10 +218,7 @@ fn maybe_log_sptweaks_backfill(
     let remain = snapshot.saturating_sub(h.saturating_sub(1));
     let secs = t0.elapsed().as_secs_f64().max(1e-3);
     let rate = wrote as f64 / secs;
-    rbitcoin_log::info!(
-        "{}",
-        format_sptweaks_progress(h, snapshot, rate, remain, t0.elapsed())
-    );
+    rbitcoin_log::info!("{}", format_sptweaks_progress(h, snapshot, rate, remain, t0.elapsed()));
 }
 
 pub(crate) fn format_sptweaks_progress(
@@ -326,16 +310,11 @@ pub fn tweaks_from_thin_and_body(
             continue;
         };
         let Some(outs) = outs else {
-            return Err(StoreError::Corrupt(
-                "invariant: thin tweak missing packed body",
-            ));
+            return Err(StoreError::Corrupt("invariant: thin tweak missing packed body"));
         };
         out.insert(
             *txid,
-            TxTweak {
-                tweak: *tweak,
-                output_pubkeys: taproot_outs_from_records(outs),
-            },
+            TxTweak { tweak: *tweak, output_pubkeys: taproot_outs_from_records(outs) },
         );
     }
     Ok(out)
@@ -353,11 +332,7 @@ fn taproot_outs_from_records(outputs: &[OutputRecord]) -> Vec<TaprootOut> {
         let mut xonly = [0u8; 32];
         xonly.copy_from_slice(&o.script[2..34]);
         let value = if o.value < 0 { 0 } else { o.value as u64 };
-        out.push(TaprootOut {
-            vout: i as u32,
-            xonly,
-            value,
-        });
+        out.push(TaprootOut { vout: i as u32, xonly, value });
     }
     out
 }
@@ -394,10 +369,7 @@ fn build_tx_and_prevouts(
         } else {
             bitcoin::Amount::from_sat(prev_value as u64)
         };
-        prevouts.push(TxOut {
-            value,
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(prev_script),
-        });
+        prevouts.push(TxOut { value, script_pubkey: bitcoin::ScriptBuf::from_bytes(prev_script) });
     }
     let mut txouts = Vec::with_capacity(outputs.len());
     for o in outputs {
@@ -406,10 +378,8 @@ fn build_tx_and_prevouts(
         } else {
             bitcoin::Amount::from_sat(o.value as u64)
         };
-        txouts.push(TxOut {
-            value,
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(o.script.clone()),
-        });
+        txouts
+            .push(TxOut { value, script_pubkey: bitcoin::ScriptBuf::from_bytes(o.script.clone()) });
     }
     Some((
         Transaction {
@@ -492,9 +462,7 @@ fn outpoint_bytes(op: &OutPoint) -> [u8; 36] {
 
 /// True when `tx` has at least one P2TR output (BIP-352 eligible to consider).
 pub(crate) fn tx_has_p2tr_output(tx: &Transaction) -> bool {
-    tx.output
-        .iter()
-        .any(|o| is_p2tr(o.script_pubkey.as_bytes()))
+    tx.output.iter().any(|o| is_p2tr(o.script_pubkey.as_bytes()))
 }
 
 fn taproot_outs(tx: &Transaction) -> Vec<TaprootOut> {
@@ -506,11 +474,7 @@ fn taproot_outs(tx: &Transaction) -> Vec<TaprootOut> {
         }
         let mut xonly = [0u8; 32];
         xonly.copy_from_slice(&spk[2..34]);
-        out.push(TaprootOut {
-            vout: i as u32,
-            xonly,
-            value: o.value.to_sat(),
-        });
+        out.push(TaprootOut { vout: i as u32, xonly, value: o.value.to_sat() });
     }
     out
 }
@@ -715,10 +679,8 @@ mod tests {
             let wit = match &v["txinwitness"] {
                 Value::String(s) => decode_witness(s),
                 Value::Array(items) => {
-                    let stacks: Vec<Vec<u8>> = items
-                        .iter()
-                        .filter_map(|x| x.as_str().map(hex_bytes))
-                        .collect();
+                    let stacks: Vec<Vec<u8>> =
+                        items.iter().filter_map(|x| x.as_str().map(hex_bytes)).collect();
                     let refs: Vec<&[u8]> = stacks.iter().map(|s| s.as_slice()).collect();
                     Witness::from_slice(&refs)
                 }
@@ -760,12 +722,7 @@ mod tests {
             });
         }
         (
-            Transaction {
-                version: TxVersion::TWO,
-                lock_time: LockTime::ZERO,
-                input,
-                output,
-            },
+            Transaction { version: TxVersion::TWO, lock_time: LockTime::ZERO, input, output },
             prevouts,
         )
     }
@@ -819,10 +776,7 @@ mod tests {
                         n += 1;
                     }
                 }
-                let unlabeled = given["labels"]
-                    .as_array()
-                    .map(|a| a.is_empty())
-                    .unwrap_or(true);
+                let unlabeled = given["labels"].as_array().map(|a| a.is_empty()).unwrap_or(true);
                 if unlabeled {
                     if let Some(scan_hex) = given["key_material"]["scan_priv_key"].as_str() {
                         if let Some(tweak_hex) = expected["tweak"].as_str() {
@@ -880,10 +834,8 @@ mod tests {
         };
         let mut v2 = vec![0x52, 0x14];
         v2.extend_from_slice(&[0u8; 20]);
-        let prev = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(v2),
-        }];
+        let prev =
+            vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes(v2) }];
         assert!(tweak_from_tx(&tx, &prev).is_none());
     }
 
@@ -1112,16 +1064,10 @@ mod tests {
             .unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
         let cancel = AtomicBool::new(true);
-        assert_eq!(
-            backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(),
-            0
-        );
+        assert_eq!(backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(), 0);
         assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
         cancel.store(false, Ordering::Relaxed);
-        assert_eq!(
-            backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(),
-            1
-        );
+        assert_eq!(backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(), 1);
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1168,13 +1114,9 @@ mod tests {
     fn tweaks_for_height_unknown_is_empty() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
-        assert!(tweaks_for_height(&q, &params, Height(0))
-            .unwrap()
-            .is_empty());
+        assert!(tweaks_for_height(&q, &params, Height(0)).unwrap().is_empty());
         let main = ChainParams::mainnet();
-        assert!(tweaks_for_height(&q, &main, Height(100))
-            .unwrap()
-            .is_empty());
+        assert!(tweaks_for_height(&q, &main, Height(100)).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1188,10 +1130,7 @@ mod tests {
             .unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         let thin0 = q.load_thin_tweaks(Height(0)).unwrap().expect("indexed");
-        assert!(
-            thin0.is_empty(),
-            "coinbase is not eligible — no Class A join"
-        );
+        assert!(thin0.is_empty(), "coinbase is not eligible — no Class A join");
 
         let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
@@ -1251,10 +1190,7 @@ mod tests {
         assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
 
         let n = backfill_sp_tweaks(&q, &params).unwrap();
-        assert_eq!(
-            n, 2,
-            "resume/restart backfill fills Direct gap origin..=tip"
-        );
+        assert_eq!(n, 2, "resume/restart backfill fills Direct gap origin..=tip");
         assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
         assert!(q.load_thin_tweaks(Height(0)).unwrap().is_some());
         assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
@@ -1293,10 +1229,7 @@ mod tests {
         );
 
         let n = backfill_sp_tweaks(&q, &params).unwrap();
-        assert_eq!(
-            n, 3,
-            "backfill fills origin..=live tip including skipped write"
-        );
+        assert_eq!(n, 3, "backfill fills origin..=live tip including skipped write");
         assert_eq!(q.sptweaks_next_height(), Some(Height(3)));
         assert!(q.load_thin_tweaks(Height(2)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1378,17 +1311,10 @@ mod tests {
         let n = backfill_sp_tweaks(&q, &params).unwrap();
         assert_eq!(n, 2);
         let rows = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
-        assert_eq!(
-            rows.len(),
-            1,
-            "ineligible txs must not be joined from Class A"
-        );
+        assert_eq!(rows.len(), 1, "ineligible txs must not be joined from Class A");
         assert_eq!(rows[0].txid, spend_txid);
         let indexed = tweaks_at_height(&q, &params, Height(1)).unwrap();
-        assert_eq!(
-            indexed.get(&spend_txid).unwrap().tweak,
-            naive.get(&spend_txid).unwrap().tweak
-        );
+        assert_eq!(indexed.get(&spend_txid).unwrap().tweak, naive.get(&spend_txid).unwrap().tweak);
         assert_eq!(
             indexed.get(&spend_txid).unwrap().output_pubkeys,
             naive.get(&spend_txid).unwrap().output_pubkeys
@@ -1489,10 +1415,7 @@ mod tests {
         assert!(naive.contains_key(&spend_txid));
         assert!(!naive.contains_key(&fat_txid));
         let only = tweaks_for_height(&q, &params, Height(1)).unwrap();
-        assert_eq!(
-            only.get(&spend_txid).unwrap().tweak,
-            naive.get(&spend_txid).unwrap().tweak
-        );
+        assert_eq!(only.get(&spend_txid).unwrap().tweak, naive.get(&spend_txid).unwrap().tweak);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

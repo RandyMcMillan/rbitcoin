@@ -35,12 +35,7 @@ pub struct ValidationContext<'a> {
 impl<'a> ValidationContext<'a> {
     /// Full structure + soft-fork gates at `height` (confirm / connect).
     pub fn at(params: &'a ChainParams, height: Height, milestone: Milestone) -> Self {
-        Self {
-            params,
-            height,
-            milestone,
-            enforce_height_gates: true,
-        }
+        Self { params, height, milestone, enforce_height_gates: true }
     }
 
     /// Archive prep: height-independent structure only (see [`Self::enforce_height_gates`]).
@@ -72,10 +67,7 @@ fn check_tx_local(tx: &Transaction, base_size: usize) -> Result<(), ConsensusErr
         if !tx.is_coinbase() && inp.previous_output.is_null() {
             return Err(ConsensusError::BadTx("bad-txns-prevout-null"));
         }
-        let key = (
-            inp.previous_output.txid.to_byte_array(),
-            inp.previous_output.vout,
-        );
+        let key = (inp.previous_output.txid.to_byte_array(), inp.previous_output.vout);
         if !seen.insert(key) {
             return Err(ConsensusError::BadTx("bad-txns-inputs-duplicate"));
         }
@@ -108,10 +100,7 @@ pub fn validate_block_structure_hashed(
     block: &Block,
     ctx: &ValidationContext<'_>,
 ) -> Result<Vec<[u8; 32]>, ConsensusError> {
-    Ok(validate_block_structure_precomputed(block, ctx)?
-        .into_iter()
-        .map(|p| p.txid)
-        .collect())
+    Ok(validate_block_structure_precomputed(block, ctx)?.into_iter().map(|p| p.txid).collect())
 }
 
 /// Structure checks plus per-tx [`TxPrecompute`] (one walk: txid/wtxid/weight/common SHA256).
@@ -169,12 +158,10 @@ pub fn validate_block_structure_with_pres(
 
     let t_walk = Instant::now();
     let tx_count_vi = bitcoin::consensus::encode::VarInt(n as u64).size();
-    let base = 80usize
-        .saturating_add(tx_count_vi)
-        .saturating_add(pres.iter().map(|p| p.base_size).sum());
-    let total = 80usize
-        .saturating_add(tx_count_vi)
-        .saturating_add(pres.iter().map(|p| p.total_size).sum());
+    let base =
+        80usize.saturating_add(tx_count_vi).saturating_add(pres.iter().map(|p| p.base_size).sum());
+    let total =
+        80usize.saturating_add(tx_count_vi).saturating_add(pres.iter().map(|p| p.total_size).sum());
     let weight_wu = (base.saturating_mul(3).saturating_add(total)) as u64;
     if base > MAX_BLOCK_STRIPPED_SIZE {
         return Err(ConsensusError::BadBlock("block stripped size too large"));
@@ -252,34 +239,22 @@ pub fn validate_block_structure_with_pres(
 }
 
 fn coinbase_has_witness_commitment(block: &Block) -> bool {
-    block
-        .txdata
-        .first()
-        .and_then(witness_commitment_vout_index)
-        .is_some()
+    block.txdata.first().and_then(witness_commitment_vout_index).is_some()
 }
 
 /// Last BIP141 `OP_RETURN` witness commitment (exact 38-byte `6a24aa21a9ed` prefix).
 pub(crate) fn witness_commitment_vout_index(coinbase: &Transaction) -> Option<usize> {
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    coinbase
-        .output
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(i, out)| {
-            let b = out.script_pubkey.as_bytes();
-            (b.len() >= 38 && b[..6] == MAGIC).then_some(i)
-        })
+    coinbase.output.iter().enumerate().rev().find_map(|(i, out)| {
+        let b = out.script_pubkey.as_bytes();
+        (b.len() >= 38 && b[..6] == MAGIC).then_some(i)
+    })
 }
 
 /// True if any input carries witness data.
 #[inline]
 pub fn block_has_witness(block: &Block) -> bool {
-    block
-        .txdata
-        .iter()
-        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+    block.txdata.iter().any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
 }
 
 /// Same as [`block_has_witness`] from [`TxPrecompute::has_witness`] (no second walk).
@@ -316,16 +291,11 @@ pub fn apply_witness_commitment(block: &mut Block) {
     }
     let reserved = [0u8; 32];
     block.txdata[0].input[0].witness = Witness::from_slice(&[reserved.to_vec()]);
-    let wtxids = block
-        .txdata
-        .iter()
-        .skip(1)
-        .map(|tx| tx.compute_wtxid().to_byte_array());
+    let wtxids = block.txdata.iter().skip(1).map(|tx| tx.compute_wtxid().to_byte_array());
     let spk = witness_commitment_script(wtxids, &reserved);
-    block.txdata[0].output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
+    block.txdata[0]
+        .output
+        .push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
     if let Some(root) = block.compute_merkle_root() {
         block.header.merkle_root = root;
     }
@@ -452,10 +422,7 @@ fn witness_sigops_one(inp: &bitcoin::TxIn, spk: &[u8]) -> u64 {
     if is_p2wpkh_program(program) {
         1
     } else if is_p2wsh_program(program) {
-        inp.witness
-            .last()
-            .map(|ws| script_sigop_count(ws, true))
-            .unwrap_or(0)
+        inp.witness.last().map(|ws| script_sigop_count(ws, true)).unwrap_or(0)
     } else {
         0
     }
@@ -534,9 +501,7 @@ fn check_witness_commitment_with_wtxids(
     if wit.len() != 1 {
         return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
     }
-    let reserved = wit
-        .nth(0)
-        .ok_or(ConsensusError::BadBlock("bad-witness-nonce-size"))?;
+    let reserved = wit.nth(0).ok_or(ConsensusError::BadBlock("bad-witness-nonce-size"))?;
     if reserved.len() != 32 {
         return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
     }
@@ -664,17 +629,13 @@ enum JobTxInner {
 impl JobTx {
     #[inline]
     pub(crate) fn owned(tx: Transaction) -> Self {
-        Self {
-            inner: JobTxInner::Owned(tx),
-        }
+        Self { inner: JobTxInner::Owned(tx) }
     }
 
     #[inline]
     pub(crate) fn shared(block: Arc<Block>, index: usize) -> Self {
         debug_assert!(index < block.txdata.len());
-        Self {
-            inner: JobTxInner::Shared { block, index },
-        }
+        Self { inner: JobTxInner::Shared { block, index } }
     }
 }
 
@@ -831,10 +792,7 @@ impl DerefMut for ScriptCheckJob {
 /// Confirm jobs borrow the lookup/structure slice; tests own an `Arc`.
 pub(crate) enum JobPre {
     Owned(std::sync::Arc<rbitcoin_query::TxPrecompute>),
-    Slice {
-        slice: std::sync::Arc<[rbitcoin_query::TxPrecompute]>,
-        idx: usize,
-    },
+    Slice { slice: std::sync::Arc<[rbitcoin_query::TxPrecompute]>, idx: usize },
 }
 
 impl ScriptCheckJob {
@@ -877,13 +835,7 @@ impl ScriptCheckJob {
         tx: JobTx,
         flags: ScriptVerifyFlags,
     ) -> Self {
-        Self {
-            txid,
-            prevouts,
-            tx,
-            flags,
-            pre: std::sync::OnceLock::new(),
-        }
+        Self { txid, prevouts, tx, flags, pre: std::sync::OnceLock::new() }
     }
 
     /// Confirm assemble: `slice[idx]` by refcount only (no `TxPrecompute` clone).
@@ -899,9 +851,7 @@ impl ScriptCheckJob {
 
     fn job_pre(&self) -> &JobPre {
         self.pre.get_or_init(|| {
-            JobPre::Owned(std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(
-                &self.tx,
-            )))
+            JobPre::Owned(std::sync::Arc::new(rbitcoin_query::TxPrecompute::from_tx(&self.tx)))
         })
     }
 
@@ -991,13 +941,7 @@ pub(crate) fn assemble_block_prevouts(
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
-        Vec<(
-            [u8; 32],
-            u32,
-            rbitcoin_primitives::Fk,
-            rbitcoin_primitives::Fk,
-            u32,
-        )>,
+        Vec<([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
         i64,
     ),
     ConsensusError,
@@ -1021,22 +965,14 @@ pub(crate) fn assemble_block_prevouts(
     let mut clk_job = 0u64;
     let mut fees = 0i64;
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
-        Vec::with_capacity(n_tx.saturating_sub(1))
-    } else {
-        Vec::new()
-    };
+    let mut script_jobs: Vec<ScriptCheckJob> =
+        if build_script_jobs { Vec::with_capacity(n_tx.saturating_sub(1)) } else { Vec::new() };
     let mut block_sigops_cost = match pres.and_then(|p| p.first()) {
         Some(p) => p.sigops.saturating_mul(4),
         None => legacy_sigop_count(&block.txdata[0]).saturating_mul(4),
     };
-    let mut spends: Vec<(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )> = Vec::with_capacity(n_tx.saturating_mul(2));
+    let mut spends: Vec<([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)> =
+        Vec::with_capacity(n_tx.saturating_mul(2));
 
     let t_loop = Instant::now();
 
@@ -1145,13 +1081,7 @@ fn assemble_non_cb_tx(
     spend_edges: &rbitcoin_query::SpendEdges,
     acc: &mut AsmPrevoutAcc,
     script_jobs: &mut Vec<ScriptCheckJob>,
-    spends: &mut Vec<(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )>,
+    spends: &mut Vec<([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
     fees: &mut i64,
     block_sigops_cost: &mut u64,
     build_script_jobs: bool,
@@ -1181,9 +1111,8 @@ fn assemble_non_cb_tx(
         Some(p) => p.sigops.saturating_mul(4),
         None => legacy_sigop_count(tx).saturating_mul(4),
     };
-    *block_sigops_cost = block_sigops_cost
-        .saturating_add(tx_legacy_sigops)
-        .saturating_add(tx_in_sigops);
+    *block_sigops_cost =
+        block_sigops_cost.saturating_add(tx_legacy_sigops).saturating_add(tx_in_sigops);
     if *block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
         return Err(ConsensusError::BadBlock("bad-blk-sigops"));
     }
@@ -1191,9 +1120,7 @@ fn assemble_non_cb_tx(
     if value_out > value_in {
         return Err(ConsensusError::BadTx("in < out"));
     }
-    *fees = fees
-        .checked_add(value_in - value_out)
-        .ok_or(ConsensusError::BadTx("fee overflow"))?;
+    *fees = fees.checked_add(value_in - value_out).ok_or(ConsensusError::BadTx("fee overflow"))?;
     if build_script_jobs {
         let t_job = Instant::now();
         let mut job = if let Some(w) = wire {
@@ -1249,21 +1176,12 @@ fn assemble_non_cb_inputs(
     batch_parents: &rbitcoin_query::BatchParents,
     spend_edges: &rbitcoin_query::SpendEdges,
     acc: &mut AsmPrevoutAcc,
-    spends: &mut Vec<(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )>,
+    spends: &mut Vec<([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
     build_script_jobs: bool,
 ) -> Result<(i64, Vec<TxOut>, u64), ConsensusError> {
     let mut value_in = 0i64;
-    let mut prevouts: Vec<TxOut> = if build_script_jobs {
-        Vec::with_capacity(tx.input.len())
-    } else {
-        Vec::new()
-    };
+    let mut prevouts: Vec<TxOut> =
+        if build_script_jobs { Vec::with_capacity(tx.input.len()) } else { Vec::new() };
     let edges = spend_fk.and_then(|fk| fk.get().and_then(|id| spend_edges.get(&id)));
     let mut tx_in_sigops = 0u64;
     for (ii, input) in tx.input.iter().enumerate() {
@@ -1329,9 +1247,8 @@ fn check_coinbase_subsidy(
             .checked_add(o.value.to_sat() as i64)
             .ok_or(ConsensusError::BadBlock("coinbase value overflow"))?;
     }
-    let max_cb = subsidy
-        .checked_add(fees)
-        .ok_or(ConsensusError::BadBlock("subsidy+fees overflow"))?;
+    let max_cb =
+        subsidy.checked_add(fees).ok_or(ConsensusError::BadBlock("subsidy+fees overflow"))?;
     if coinbase_out > max_cb {
         return Err(ConsensusError::BadBlock("coinbase excess value"));
     }
@@ -1390,13 +1307,7 @@ pub(crate) fn structural_validate_spends(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    spends: &[(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )],
+    spends: &[([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
     fees: i64,
     pending_spent: &mut rbitcoin_query::OutPointSet,
     batch_parents: &rbitcoin_query::BatchParents,
@@ -1468,13 +1379,7 @@ type OverlayMetaSkip = std::collections::HashMap<
 >;
 
 fn overlay_meta_skip_map(
-    spends: &[(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )],
+    spends: &[([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
     run_create_height: &FkMap<u32>,
 ) -> OverlayMetaSkip {
     let mut n: std::collections::HashMap<
@@ -1508,44 +1413,26 @@ fn overlay_meta_is_skip(
     skip.get(&(id, vout)) == Some(&(sfk, vin))
 }
 
-type StructuralAbsHeights = (
-    Vec<StructuralAbsJob>,
-    Vec<rbitcoin_primitives::Fk>,
-    U64Map<u32>,
-);
+type StructuralAbsHeights = (Vec<StructuralAbsJob>, Vec<rbitcoin_primitives::Fk>, U64Map<u32>);
 
 fn structural_abs_heights(
     query: &Query,
-    spends: &[(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )],
+    spends: &[([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
     batch_parents: &rbitcoin_query::BatchParents,
     run_create_height: &FkMap<u32>,
 ) -> Result<StructuralAbsHeights, ConsensusError> {
     let abs_jobs = batch_parents
-        .spend_abs_jobs(
-            spends
-                .iter()
-                .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
-        )
+        .spend_abs_jobs(spends.iter().map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)))
         .map_err(ConsensusError::from)?;
     let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
-        let mut v: Vec<rbitcoin_primitives::Fk> = abs_jobs
-            .iter()
-            .map(|(id, _, _, _, _)| rbitcoin_primitives::Fk(*id))
-            .collect();
+        let mut v: Vec<rbitcoin_primitives::Fk> =
+            abs_jobs.iter().map(|(id, _, _, _, _)| rbitcoin_primitives::Fk(*id)).collect();
         v.sort_unstable_by_key(|f| f.0);
         v.dedup();
         v
     };
-    let durable_heights = query
-        .store()
-        .tx_height_get_batch(&unique_create_fks)
-        .map_err(ConsensusError::from)?;
+    let durable_heights =
+        query.store().tx_height_get_batch(&unique_create_fks).map_err(ConsensusError::from)?;
     let height_by_id: U64Map<u32> = unique_create_fks
         .iter()
         .zip(durable_heights)
@@ -1614,15 +1501,10 @@ fn structural_load_durable_spent(
             }
         }
     }
-    let field_heights = query
-        .store()
-        .tx_height_get_batch(&field_fks)
-        .map_err(ConsensusError::from)?;
-    let field_h_by_id: U64Map<u32> = field_fks
-        .iter()
-        .zip(field_heights)
-        .filter_map(|(fk, h)| Some((fk.get()?, h?)))
-        .collect();
+    let field_heights =
+        query.store().tx_height_get_batch(&field_fks).map_err(ConsensusError::from)?;
+    let field_h_by_id: U64Map<u32> =
+        field_fks.iter().zip(field_heights).filter_map(|(fk, h)| Some((fk.get()?, h?))).collect();
     let mut durable_spent: DurableSpentSet = DurableSpentSet::with_hasher(Default::default());
     let mut multi_list_ns = 0u64;
     for (i, &(id, vout, abs, sfk, vin)) in disk_jobs.iter().enumerate() {
@@ -1641,10 +1523,8 @@ fn structural_load_durable_spent(
             &mut durable_spent,
         )?);
     }
-    let spent_strong_ns = t_strong
-        .elapsed()
-        .as_nanos()
-        .saturating_sub(multi_list_ns as u128) as u64;
+    let spent_strong_ns =
+        t_strong.elapsed().as_nanos().saturating_sub(multi_list_ns as u128) as u64;
     Ok((durable_spent, multi_list_ns, spent_strong_ns))
 }
 
@@ -1695,10 +1575,7 @@ fn structural_apply_one_meta(
     if field.is_null() {
         return Ok(0);
     }
-    let strong = query
-        .store()
-        .is_confirmed_strong_at(field, tip)
-        .map_err(ConsensusError::from)?;
+    let strong = query.store().is_confirmed_strong_at(field, tip).map_err(ConsensusError::from)?;
     if !strong {
         return Ok(0);
     }
@@ -1714,13 +1591,7 @@ fn structural_apply_one_meta(
 }
 
 fn structural_mark_pending(
-    spends: &[(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )],
+    spends: &[([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
     pending_spent: &mut rbitcoin_query::OutPointSet,
     durable_spent: &DurableSpentSet,
 ) -> Result<(), ConsensusError> {
@@ -1759,10 +1630,8 @@ fn structural_create_heights(
     let mut height_list: Vec<u32> = height_by_id.values().copied().collect();
     height_list.sort_unstable();
     height_list.dedup();
-    let coinbase_fk_by_height = query
-        .store()
-        .coinbase_fk_at_heights(&height_list)
-        .map_err(ConsensusError::from)?;
+    let coinbase_fk_by_height =
+        query.store().coinbase_fk_at_heights(&height_list).map_err(ConsensusError::from)?;
     for create_fk in unique_create_fks {
         let Some(id) = create_fk.get() else {
             continue;
@@ -1775,9 +1644,7 @@ fn structural_create_heights(
             continue;
         }
         let is_cb = batch_parents.get_parent_coinbase(*create_fk) == Some(true)
-            || coinbase_fk_by_height
-                .get(&durable_h)
-                .is_some_and(|cb| *cb == *create_fk);
+            || coinbase_fk_by_height.get(&durable_h).is_some_and(|cb| *cb == *create_fk);
         if is_cb && spend_height < durable_h.saturating_add(maturity) {
             return Err(ConsensusError::BadTx("coinbase immature"));
         }
@@ -1790,13 +1657,7 @@ fn structural_bip68(
     query: &Query,
     block: &Block,
     ctx: &ValidationContext<'_>,
-    spends: &[(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )],
+    spends: &[([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
     create_height_by_fk: &FkMap<u32>,
     mtp_cache: &mut U32Map<u32>,
 ) -> Result<(), ConsensusError> {
@@ -1805,20 +1666,15 @@ fn structural_bip68(
     }
     const DISABLE: u32 = 1 << 31;
     const TYPE_FLAG: u32 = 1 << 22;
-    let prev_mtp = if ctx.height.0 == 0 {
-        0
-    } else {
-        mtp_at(query, Height(ctx.height.0 - 1), mtp_cache)?
-    };
+    let prev_mtp =
+        if ctx.height.0 == 0 { 0 } else { mtp_at(query, Height(ctx.height.0 - 1), mtp_cache)? };
     let mut si = 0usize;
     let mut prev_heights: Vec<u32> = Vec::new();
     let mut coin_mtps: Vec<u32> = Vec::new();
     for tx in block.txdata.iter().skip(1) {
         let n_in = tx.input.len();
         if si + n_in > spends.len() {
-            return Err(ConsensusError::BadBlock(
-                "structural spends/tx input mismatch",
-            ));
+            return Err(ConsensusError::BadBlock("structural spends/tx input mismatch"));
         }
         let tx_spends = &spends[si..si + n_in];
         si += n_in;
@@ -1850,9 +1706,7 @@ fn structural_bip68(
         }
     }
     if si != spends.len() {
-        return Err(ConsensusError::BadBlock(
-            "structural spends/tx input mismatch",
-        ));
+        return Err(ConsensusError::BadBlock("structural spends/tx input mismatch"));
     }
     Ok(())
 }
@@ -1872,26 +1726,16 @@ fn reject_bip30_unspent_overwrite(
     {
         return Ok(());
     }
-    let create_txids: Vec<[u8; 32]> = block
-        .txdata
-        .iter()
-        .map(|tx| tx.compute_txid().to_byte_array())
-        .collect();
-    let hits = query
-        .store()
-        .get_fk_by_txid_batch(&create_txids)
-        .map_err(ConsensusError::from)?;
+    let create_txids: Vec<[u8; 32]> =
+        block.txdata.iter().map(|tx| tx.compute_txid().to_byte_array()).collect();
+    let hits = query.store().get_fk_by_txid_batch(&create_txids).map_err(ConsensusError::from)?;
     for (_txid, row) in hits {
         let Some((old_fk, _)) = row else {
             continue;
         };
         // Connected instance at *this* height is ourselves (re-validate /
         // already-confirmed fixture). BIP30 is an earlier unspent sibling.
-        if query
-            .store()
-            .tx_height_get(old_fk)
-            .map_err(ConsensusError::from)?
-            == Some(ctx.height.0)
+        if query.store().tx_height_get(old_fk).map_err(ConsensusError::from)? == Some(ctx.height.0)
         {
             continue;
         }
@@ -2090,10 +1934,7 @@ fn resolve_prevout(
                 txout: if need_script_buf {
                     o.clone()
                 } else {
-                    TxOut {
-                        value: o.value,
-                        script_pubkey: ScriptBuf::new(),
-                    }
+                    TxOut { value: o.value, script_pubkey: ScriptBuf::new() }
                 },
                 input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16, segwit),
                 create_fk: rbitcoin_primitives::Fk::NULL,
@@ -2129,19 +1970,12 @@ fn resolve_prevout(
                 }
             },
         ) {
-            Some(PinLook::Hit {
-                txout,
-                input_sigops,
-            }) => {
+            Some(PinLook::Hit { txout, input_sigops }) => {
                 acc.in_n = acc.in_n.saturating_add(1);
                 acc.batch_n = acc.batch_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_batch_hit();
-                return Ok(ResolvedPrevout {
-                    txout,
-                    input_sigops,
-                    create_fk: prev_fk,
-                });
+                return Ok(ResolvedPrevout { txout, input_sigops, create_fk: prev_fk });
             }
             Some(PinLook::Mismatch) => {
                 acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
@@ -2180,9 +2014,7 @@ mod overlay_meta_skip_tests {
     use rbitcoin_primitives::Fk;
 
     fn spends(rows: &[(u32, Fk, Fk, u32)]) -> Vec<([u8; 32], u32, Fk, Fk, u32)> {
-        rows.iter()
-            .map(|&(vout, sfk, cfk, vin)| ([0u8; 32], vout, sfk, cfk, vin))
-            .collect()
+        rows.iter().map(|&(vout, sfk, cfk, vin)| ([0u8; 32], vout, sfk, cfk, vin)).collect()
     }
 
     #[test]

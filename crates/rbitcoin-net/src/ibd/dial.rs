@@ -163,11 +163,7 @@ pub(crate) fn mature_relative_slow_samples(slots: &[PeerSlot]) -> Vec<RelativeSl
         if bps == 0 {
             continue;
         }
-        out.push(RelativeSlowSample {
-            peer_id: s.id,
-            bps,
-            has_inflight: !s.in_flight.is_empty(),
-        });
+        out.push(RelativeSlowSample { peer_id: s.id, bps, has_inflight: !s.in_flight.is_empty() });
     }
     out
 }
@@ -244,20 +240,11 @@ pub(crate) async fn dial_batch(
     connect_timeout: Duration,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> DialBatchResult {
-    let mut out = DialBatchResult {
-        slots: Vec::new(),
-        failed: Vec::new(),
-        attempted: Vec::new(),
-    };
+    let mut out = DialBatchResult { slots: Vec::new(), failed: Vec::new(), attempted: Vec::new() };
     if count == 0 || book.is_empty() {
         return out;
     }
-    let cancelled = || {
-        cancel
-            .as_ref()
-            .map(|c| c.load(Ordering::SeqCst))
-            .unwrap_or(false)
-    };
+    let cancelled = || cancel.as_ref().map(|c| c.load(Ordering::SeqCst)).unwrap_or(false);
 
     let candidates = book.take_dial_candidates(count, &already, occupied);
     out.attempted = candidates.clone();
@@ -274,10 +261,7 @@ pub(crate) async fn dial_batch(
         }
         let id = next_id.fetch_add(1, Ordering::Relaxed);
         let sinks = sinks.clone();
-        debug!(
-            "{}",
-            trying_connection_log(PeerConnType::OutboundFullRelay, addr)
-        );
+        debug!("{}", trying_connection_log(PeerConnType::OutboundFullRelay, addr));
         handles.push(tokio::spawn(async move {
             let fut = spawn_peer(id, addr, magic, local_addr, tip_h, sinks);
             match tokio::time::timeout(connect_timeout, fut).await {
@@ -397,10 +381,7 @@ pub(crate) fn ibd_header_locator(
             locator.push(t);
         }
     }
-    let rest = hub
-        .query
-        .locator_hashes()
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
+    let rest = hub.query.locator_hashes().map_err(|e| NetError::Consensus(e.to_string()))?;
     for h in rest {
         if !locator.contains(&h) {
             locator.push(h);
@@ -423,10 +404,7 @@ pub(crate) fn release_peer_block_work(
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
         s.alive = false;
         for h in s.in_flight.drain() {
-            let empty = inflight
-                .get_mut(&h)
-                .map(|e| e.remove_peer(peer))
-                .unwrap_or(false);
+            let empty = inflight.get_mut(&h).map(|e| e.remove_peer(peer)).unwrap_or(false);
             if empty {
                 inflight.remove(&h);
             }
@@ -595,16 +573,8 @@ pub(crate) fn disconnect_relative_slow_block_peers(
     };
     let addr = slot.addr;
     let n_work = slot.in_flight.len();
-    let bps = samples
-        .iter()
-        .find(|s| s.peer_id == id)
-        .map(|s| s.bps)
-        .unwrap_or(0);
-    let mut bps_list: Vec<u64> = samples
-        .iter()
-        .filter(|s| s.bps > 0)
-        .map(|s| s.bps)
-        .collect();
+    let bps = samples.iter().find(|s| s.peer_id == id).map(|s| s.bps).unwrap_or(0);
+    let mut bps_list: Vec<u64> = samples.iter().filter(|s| s.bps > 0).map(|s| s.bps).collect();
     bps_list.sort_unstable();
     let med = median_u64(&bps_list);
     let lo = bps_list.first().copied().unwrap_or(0);
@@ -659,14 +629,8 @@ mod tests {
 
     #[test]
     fn classify_dial_err_network_vs_incompatible() {
-        assert_eq!(
-            classify_dial_err(&NetError::V1Peer),
-            DialFailKind::Incompatible
-        );
-        assert_eq!(
-            classify_dial_err(&NetError::Bip324("x".into())),
-            DialFailKind::Incompatible
-        );
+        assert_eq!(classify_dial_err(&NetError::V1Peer), DialFailKind::Incompatible);
+        assert_eq!(classify_dial_err(&NetError::Bip324("x".into())), DialFailKind::Incompatible);
         assert_eq!(
             classify_dial_err(&NetError::Protocol("no v2 support")),
             DialFailKind::Incompatible
@@ -680,14 +644,8 @@ mod tests {
             DialFailKind::Incompatible
         );
         assert_eq!(classify_dial_err(&NetError::Timeout), DialFailKind::Network);
-        assert_eq!(
-            classify_dial_err(&NetError::Disconnected),
-            DialFailKind::Network
-        );
-        assert_eq!(
-            classify_dial_err(&NetError::Protocol("misbehavior")),
-            DialFailKind::Network
-        );
+        assert_eq!(classify_dial_err(&NetError::Disconnected), DialFailKind::Network);
+        assert_eq!(classify_dial_err(&NetError::Protocol("misbehavior")), DialFailKind::Network);
     }
 
     #[test]
@@ -715,10 +673,7 @@ mod tests {
         let mut cooldown = HashMap::new();
         let now = Instant::now();
         note_dead_without_block_bytes(&mut book, &mut cooldown, lemon, 0, now);
-        assert!(
-            book.flags(&lemon).failed_last_connect(),
-            "no block bytes → last-resort"
-        );
+        assert!(book.flags(&lemon).failed_last_connect(), "no block bytes → last-resort");
         assert_eq!(book.flags(&lemon).dial_tier(), 2);
         assert!(cooldown.contains_key(&lemon));
         let blocked = dial_blocked_addrs(&[], &cooldown, now);
@@ -735,11 +690,7 @@ mod tests {
     }
 
     fn samp(id: usize, bps: u64, inflight: bool) -> RelativeSlowSample {
-        RelativeSlowSample {
-            peer_id: id,
-            bps,
-            has_inflight: inflight,
-        }
+        RelativeSlowSample { peer_id: id, bps, has_inflight: inflight }
     }
 
     #[test]
@@ -900,10 +851,7 @@ mod tests {
         let slot = dummy_slot(0, good, true);
         let result = DialBatchResult {
             slots: vec![slot],
-            failed: vec![
-                (bad, DialFailKind::Network),
-                (inc, DialFailKind::Incompatible),
-            ],
+            failed: vec![(bad, DialFailKind::Network), (inc, DialFailKind::Incompatible)],
             attempted: vec![good, bad, inc],
         };
         apply_dial_result(&mut book, &result);
@@ -948,14 +896,8 @@ mod tests {
         let next = AtomicUsize::new(0);
         let (body_tx, _body_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
-        let sinks = PeerEventSinks {
-            body: body_tx,
-            ctrl: ctrl_tx,
-        };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let sinks = PeerEventSinks { body: body_tx, ctrl: ctrl_tx };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let r = rt.block_on(dial_batch(
             &book,
             &next,
@@ -1115,8 +1057,7 @@ mod tests {
         let dead = {
             let mut s = dummy_slot(0, addr(20), false);
             s.rate.sample(0, 0, true);
-            s.rate
-                .sample(RELSLOW_ACTIVE_MS, RELSLOW_ACTIVE_MS * 1_000, true);
+            s.rate.sample(RELSLOW_ACTIVE_MS, RELSLOW_ACTIVE_MS * 1_000, true);
             s
         };
         let young = {
@@ -1192,9 +1133,7 @@ mod tests {
 
         let mut mature = dummy_slot(1, addr(51), true);
         mature.rate.sample(0, 0, true);
-        mature
-            .rate
-            .sample(RELSLOW_ACTIVE_MS, RELSLOW_ACTIVE_MS * 10_000, true);
+        mature.rate.sample(RELSLOW_ACTIVE_MS, RELSLOW_ACTIVE_MS * 10_000, true);
         mature.in_flight.insert(h);
 
         let samples = mature_relative_slow_samples(&[young, mature]);
@@ -1224,26 +1163,11 @@ mod tests {
         assert!(until2 > t0 + STALL_ADDR_COOLDOWN);
         let d3 = record_stall_kick(&mut cooldown, &mut strikes, a, t0);
         assert_eq!(d3, STALL_ADDR_COOLDOWN_3);
-        expire_addr_cooldown(
-            &mut cooldown,
-            t0 + STALL_ADDR_COOLDOWN + Duration::from_secs(1),
-        );
-        assert!(
-            cooldown.contains_key(&a),
-            "second-kick 30m ban still holds after 10m+1s"
-        );
-        expire_addr_cooldown(
-            &mut cooldown,
-            t0 + STALL_ADDR_COOLDOWN_2 + Duration::from_secs(1),
-        );
-        assert!(
-            cooldown.contains_key(&a),
-            "third-kick 2h ban still holds after 30m+1s"
-        );
-        expire_addr_cooldown(
-            &mut cooldown,
-            t0 + STALL_ADDR_COOLDOWN_3 + Duration::from_secs(1),
-        );
+        expire_addr_cooldown(&mut cooldown, t0 + STALL_ADDR_COOLDOWN + Duration::from_secs(1));
+        assert!(cooldown.contains_key(&a), "second-kick 30m ban still holds after 10m+1s");
+        expire_addr_cooldown(&mut cooldown, t0 + STALL_ADDR_COOLDOWN_2 + Duration::from_secs(1));
+        assert!(cooldown.contains_key(&a), "third-kick 2h ban still holds after 30m+1s");
+        expire_addr_cooldown(&mut cooldown, t0 + STALL_ADDR_COOLDOWN_3 + Duration::from_secs(1));
         assert!(!cooldown.contains_key(&a));
     }
 }

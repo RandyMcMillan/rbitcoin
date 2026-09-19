@@ -122,22 +122,14 @@ fn socket_path(cfg: &CliConfig) -> PathBuf {
 }
 
 fn token_path(cfg: &CliConfig) -> PathBuf {
-    cfg.token_file
-        .clone()
-        .unwrap_or_else(|| cfg.datadir.join("rpc.token"))
+    cfg.token_file.clone().unwrap_or_else(|| cfg.datadir.join("rpc.token"))
 }
 
 fn parse_http_url(url: &str) -> Result<(String, u16), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    let (host, port) = rest
-        .rsplit_once(':')
-        .ok_or_else(|| format!("--rpc-url needs host:port (got {url})"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("invalid --rpc-url port in {url}"))?;
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).unwrap_or(url);
+    let (host, port) =
+        rest.rsplit_once(':').ok_or_else(|| format!("--rpc-url needs host:port (got {url})"))?;
+    let port: u16 = port.parse().map_err(|_| format!("invalid --rpc-url port in {url}"))?;
     if host.is_empty() {
         return Err(format!("invalid --rpc-url host in {url}"));
     }
@@ -199,10 +191,7 @@ fn rpc_http(
     }
     let v: Value = serde_json::from_str(&resp_body).map_err(|e| format!("rpc json: {e}"))?;
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("rpc error");
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("rpc error");
         let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
         return Err(format!("RPC error {code}: {msg}"));
     }
@@ -213,16 +202,13 @@ fn connect_unix(path: &Path) -> Result<socket2::Socket, String> {
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
         .map_err(|e| format!("unix socket: {e}"))?;
     let addr = socket2::SockAddr::unix(path).map_err(|e| format!("unix addr: {e}"))?;
-    sock.connect(&addr)
-        .map_err(|e| format!("connect {}: {e}", path.display()))?;
+    sock.connect(&addr).map_err(|e| format!("connect {}: {e}", path.display()))?;
     Ok(sock)
 }
 
 fn read_http(stream: &mut impl Read) -> Result<(u16, String), String> {
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read: {e}"))?;
+    stream.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
     let text = String::from_utf8_lossy(&buf);
     let (head, body) = text
         .split_once("\r\n\r\n")
@@ -319,10 +305,7 @@ mod tests {
     }
 
     fn tmp_datadir() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("rbitcoin-cli-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -492,17 +475,9 @@ mod tests {
             );
             s.write_all(resp.as_bytes()).unwrap();
         });
-        let code = cli_main([
-            "rbitcoin-cli",
-            "--datadir",
-            dir.to_str().unwrap(),
-            "getblockcount",
-        ]);
+        let code = cli_main(["rbitcoin-cli", "--datadir", dir.to_str().unwrap(), "getblockcount"]);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            exit_ok(code),
-            "unix getblockcount must succeed, got {code:?}"
-        );
+        assert!(exit_ok(code), "unix getblockcount must succeed, got {code:?}");
         let _ = h.join();
     }
 }

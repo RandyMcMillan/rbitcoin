@@ -66,12 +66,7 @@ impl WriteCreateLocRam {
         let bytes = (loc.len() as u64).saturating_mul(PAIR_BYTES);
         if let Some(old) = self.by_height.insert(
             pack_height,
-            LocPack {
-                keep_until,
-                base: start,
-                pairs: loc.to_vec(),
-                approx_bytes: bytes,
-            },
+            LocPack { keep_until, base: start, pairs: loc.to_vec(), approx_bytes: bytes },
         ) {
             self.approx_bytes = self.approx_bytes.saturating_sub(old.approx_bytes);
         }
@@ -171,11 +166,7 @@ mod tests {
     use rbitcoin_primitives::Fk;
 
     fn pair(n: u64) -> CreateLocPair {
-        CreateLocPair {
-            txout: (n * 10, 8),
-            spent: (n * 9, 8),
-            n_out: 1,
-        }
+        CreateLocPair { txout: (n * 10, 8), spent: (n * 9, 8), n_out: 1 }
     }
 
     fn fks(ids: &[u64]) -> Vec<Fk> {
@@ -239,10 +230,7 @@ mod tests {
         let mut m = WriteCreateLocRam::default();
         m.note(3, 3, &fks(&[10]), &loc(&[10]));
         prune(&mut m, 3);
-        assert!(
-            m.get(Fk(10)).is_some(),
-            "same-write prune must not drop the noting pack"
-        );
+        assert!(m.get(Fk(10)).is_some(), "same-write prune must not drop the noting pack");
         prune(&mut m, 4);
         assert!(m.get(Fk(10)).is_none());
         assert_eq!(m.size_snapshot(), (0, 0, 0));
@@ -251,17 +239,9 @@ mod tests {
     #[test]
     fn prune_drops_when_last_started_height_has_written() {
         let mut m = WriteCreateLocRam::default();
-        m.note(
-            360,
-            keep_until_at_note(360, Some(432)),
-            &fks(&[10]),
-            &loc(&[10]),
-        );
+        m.note(360, keep_until_at_note(360, Some(432)), &fks(&[10]), &loc(&[10]));
         prune(&mut m, 431);
-        assert!(
-            m.get(Fk(10)).is_some(),
-            "intervening writes below last started keep"
-        );
+        assert!(m.get(Fk(10)).is_some(), "intervening writes below last started keep");
         prune(&mut m, 432);
         assert!(
             m.get(Fk(10)).is_none(),
@@ -272,12 +252,7 @@ mod tests {
     #[test]
     fn prune_does_not_bump_keep_until() {
         let mut m = WriteCreateLocRam::default();
-        m.note(
-            360,
-            keep_until_at_note(360, Some(432)),
-            &fks(&[10]),
-            &loc(&[10]),
-        );
+        m.note(360, keep_until_at_note(360, Some(432)), &fks(&[10]), &loc(&[10]));
         prune(&mut m, 433);
         assert!(
             m.get(Fk(10)).is_none(),

@@ -63,10 +63,7 @@ fn verify_key_path(
     cache: &mut SighashCache<&Transaction>,
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
-    let sig_raw = input
-        .witness
-        .nth(0)
-        .ok_or_else(|| ConsensusError::Script("p2tr sig".into()))?;
+    let sig_raw = input.witness.nth(0).ok_or_else(|| ConsensusError::Script("p2tr sig".into()))?;
 
     let (sig_bytes, sighash_ty) = if sig_raw.len() == 64 {
         (sig_raw, TapSighashType::Default)
@@ -113,9 +110,8 @@ fn verify_script_path(
     output_key_bytes: &[u8],
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
-    let mut items: Vec<Vec<u8>> = (0..input.witness.len())
-        .filter_map(|i| input.witness.nth(i).map(|b| b.to_vec()))
-        .collect();
+    let mut items: Vec<Vec<u8>> =
+        (0..input.witness.len()).filter_map(|i| input.witness.nth(i).map(|b| b.to_vec())).collect();
 
     // Strip annex from the initial stack (still included in CHECKSIG sighash).
     if bip341_annex(&input.witness).is_some() {
@@ -188,14 +184,11 @@ mod bip341_tests {
         let (internal_xonly, _) = internal_kp.x_only_public_key();
 
         let leaf = ScriptBuf::from_bytes(leaf_bytes.to_vec());
-        let builder = TaprootBuilder::new()
-            .add_leaf(0, leaf.clone())
-            .expect("leaf");
+        let builder = TaprootBuilder::new().add_leaf(0, leaf.clone()).expect("leaf");
         let spend_info = builder.finalize(&secp, internal_xonly).expect("finalize");
         let output_key = spend_info.output_key().to_x_only_public_key();
-        let control = spend_info
-            .control_block(&(leaf.clone(), LeafVersion::TapScript))
-            .expect("control");
+        let control =
+            spend_info.control_block(&(leaf.clone(), LeafVersion::TapScript)).expect("control");
 
         assert!(control.verify_taproot_commitment(&secp, output_key, leaf.as_script()));
 
@@ -204,10 +197,8 @@ mod bip341_tests {
         wit.push(leaf.as_bytes());
         wit.push(ctrl.as_slice());
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -271,17 +262,12 @@ mod bip341_tests {
     fn script_path_rejects_tapscript_validation_weight() {
         let dummy = vec![0x01u8];
         let sigs3: [&[u8]; 3] = [&dummy, &dummy, &dummy];
-        let leaf3: Vec<u8> = [
-            0x01, 0xaa, 0xac, 0x75, 0x01, 0xaa, 0xac, 0x75, 0x01, 0xaa, 0xac,
-        ]
-        .to_vec();
+        let leaf3: Vec<u8> =
+            [0x01, 0xaa, 0xac, 0x75, 0x01, 0xaa, 0xac, 0x75, 0x01, 0xaa, 0xac].to_vec();
         let (job, _) = make_script_path_spend_with(&leaf3, &sigs3);
         let err = script::verify_job_all_inputs(&job).expect_err("3 CHECKSIGs over budget");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("validation weight"),
-            "expected validation weight, got {msg}"
-        );
+        assert!(msg.contains("validation weight"), "expected validation weight, got {msg}");
 
         let leaf1 = [0x01u8, 0xaa, 0xac];
         let (job, _) = make_script_path_spend_with(&leaf1, &[&dummy]);
@@ -407,10 +393,8 @@ mod bip341_tests {
         let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
         let output_key = tweaked.to_keypair().x_only_public_key().0;
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -428,9 +412,8 @@ mod bip341_tests {
 
         let mut cache = SighashCache::new(&tx);
         let prevouts = Prevouts::All(std::slice::from_ref(&prevout));
-        let sighash = cache
-            .taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
-            .unwrap();
+        let sighash =
+            cache.taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default).unwrap();
         let msg = Message::from_digest(sighash.to_byte_array());
         let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
         tx.input[0].witness = Witness::from_slice(&[sig.as_ref()]);
@@ -471,10 +454,8 @@ mod bip341_tests {
         let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
         let output_key = tweaked.to_keypair().x_only_public_key().0;
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -492,9 +473,8 @@ mod bip341_tests {
 
         let mut cache = SighashCache::new(&tx);
         let prevouts = Prevouts::All(std::slice::from_ref(&prevout));
-        let sighash = cache
-            .taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
-            .unwrap();
+        let sighash =
+            cache.taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default).unwrap();
         let msg = Message::from_digest(sighash.to_byte_array());
         let sig = secp.sign_schnorr_no_aux_rand(&msg, &tweaked.to_keypair());
         // Valid 64-byte form, then append illegal 0x00 sighash byte.
@@ -554,10 +534,8 @@ mod bip341_tests {
         let kp = Keypair::from_secret_key(&secp, &sk);
         let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
         let output_key = tweaked.to_keypair().x_only_public_key().0;
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -669,10 +647,8 @@ mod bip341_tests {
         let kp = Keypair::from_secret_key(&secp, &sk);
         let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
         let output_key = tweaked.to_keypair().x_only_public_key().0;
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let annex_bytes: &[u8] = &[0x50];
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -695,9 +671,8 @@ mod bip341_tests {
             .taproot_signature_hash(0, &prevouts, Some(annex), None, TapSighashType::Default)
             .unwrap();
         // Annex-less sighash differs.
-        let sh_no = cache
-            .taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
-            .unwrap();
+        let sh_no =
+            cache.taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default).unwrap();
         assert_ne!(sh, sh_no);
         let sig = secp.sign_schnorr_no_aux_rand(
             &Message::from_digest(sh.to_byte_array()),
@@ -752,19 +727,14 @@ mod bip341_tests {
         let internal_sk = SecretKey::from_slice(&[10u8; 32]).unwrap();
         let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
         let (internal_xonly, _) = internal_kp.x_only_public_key();
-        let builder = TaprootBuilder::new()
-            .add_leaf(0, leaf.clone())
-            .expect("leaf");
+        let builder = TaprootBuilder::new().add_leaf(0, leaf.clone()).expect("leaf");
         let spend_info = builder.finalize(&secp, internal_xonly).expect("finalize");
         let output_key = spend_info.output_key().to_x_only_public_key();
-        let control = spend_info
-            .control_block(&(leaf.clone(), LeafVersion::TapScript))
-            .expect("control");
+        let control =
+            spend_info.control_block(&(leaf.clone(), LeafVersion::TapScript)).expect("control");
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let annex_bytes: &[u8] = &[0x50, 0x00];
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -859,11 +829,8 @@ mod bip341_tests {
         // DFS order: left then right at depth 1.
         let left = ScriptBuf::from_bytes(vec![0x51, 0x51]); // OP_TRUE OP_TRUE (not used)
         let right = ScriptBuf::from_bytes(vec![0x51]); // OP_TRUE
-        let builder = TaprootBuilder::new()
-            .add_leaf(1, left)
-            .unwrap()
-            .add_leaf(1, right.clone())
-            .unwrap();
+        let builder =
+            TaprootBuilder::new().add_leaf(1, left).unwrap().add_leaf(1, right.clone()).unwrap();
         let spend_info = builder.finalize(&secp, internal_xonly).unwrap();
         let output_key = spend_info.output_key().to_x_only_public_key();
         let control = spend_info
@@ -872,10 +839,8 @@ mod bip341_tests {
         assert!(!control.merkle_branch.is_empty(), "expect sibling in path");
         assert!(control.verify_taproot_commitment(&secp, output_key, right.as_script()));
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -947,19 +912,14 @@ mod bip341_tests {
         let internal_sk = SecretKey::from_slice(&[13u8; 32]).unwrap();
         let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
         let (internal_xonly, _) = internal_kp.x_only_public_key();
-        let builder = TaprootBuilder::new()
-            .add_leaf(0, leaf.clone())
-            .expect("leaf");
+        let builder = TaprootBuilder::new().add_leaf(0, leaf.clone()).expect("leaf");
         let spend_info = builder.finalize(&secp, internal_xonly).expect("finalize");
         let output_key = spend_info.output_key().to_x_only_public_key();
-        let control = spend_info
-            .control_block(&(leaf.clone(), LeafVersion::TapScript))
-            .expect("control");
+        let control =
+            spend_info.control_block(&(leaf.clone(), LeafVersion::TapScript)).expect("control");
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -1005,12 +965,8 @@ mod bip341_tests {
         // Initial stack is witness order; top is last. CHECKSIGVERIFY consumes the
         // top sig first (against x1), then CHECKSIG uses the remaining (against x2).
         let ctrl = control.serialize();
-        let wit_items: [&[u8]; 4] = [
-            sig2.as_ref(),
-            sig1.as_ref(),
-            leaf.as_bytes(),
-            ctrl.as_slice(),
-        ];
+        let wit_items: [&[u8]; 4] =
+            [sig2.as_ref(), sig1.as_ref(), leaf.as_bytes(), ctrl.as_slice()];
         tx.input[0].witness = Witness::from_slice(&wit_items);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
@@ -1046,10 +1002,8 @@ mod bip341_tests {
         let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
         let output_key = tweaked.to_keypair().x_only_public_key().0;
 
-        let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: p2tr_spk(output_key),
-        };
+        let prevout =
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: p2tr_spk(output_key) };
         // 64 zero bytes is not a valid Schnorr sig for this key.
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,

@@ -14,11 +14,8 @@ use std::collections::HashMap;
 
 fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
     let bits = CompactTarget::from_consensus(0x207f_ffff);
-    let mut ss = if height == 0 {
-        vec![0x00]
-    } else {
-        rbitcoin_consensus::bip34_height_script(height)
-    };
+    let mut ss =
+        if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
     while ss.len() < 2 {
         ss.push(0x00);
     }
@@ -44,10 +41,7 @@ fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
         bits,
         nonce: 0,
     };
-    let mut block = Block {
-        header,
-        txdata: vec![coinbase],
-    };
+    let mut block = Block { header, txdata: vec![coinbase] };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let target = Target::from_compact(bits);
     for nonce in 0..u32::MAX {
@@ -80,11 +74,7 @@ fn parent_height_resolves_confirmed_tip_minus_one() {
         Some(2),
         "child of confirmed tip−1 must get height tip"
     );
-    assert_eq!(
-        parent_height(&empty, &hub, tip),
-        Some(3),
-        "child of tip still tip+1"
-    );
+    assert_eq!(parent_height(&empty, &hub, tip), Some(3), "child of tip still tip+1");
     let unknown = BlockHash::from_byte_array([0xab; 32]);
     assert_eq!(parent_height(&empty, &hub, unknown), None);
     let _ = std::fs::remove_dir_all(dir);

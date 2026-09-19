@@ -84,13 +84,7 @@ fn bip68_disable_flag_and_time_type() {
         200,
         (min_time as u32).saturating_sub(1)
     ));
-    assert!(sequence_locks_satisfied(
-        &tx,
-        &[100],
-        &[coin_mtp],
-        200,
-        min_time as u32 + 1
-    ));
+    assert!(sequence_locks_satisfied(&tx, &[100], &[coin_mtp], 200, min_time as u32 + 1));
 }
 
 /// Unresolved coin age (missing slice or height/MTP 0) must fail *closed*.
@@ -105,20 +99,8 @@ fn bip68_unresolved_coin_age_fails_closed() {
     // Height 0 = unresolved (not genesis spendable).
     assert!(!sequence_locks_satisfied(&tx_h, &[0], &[0], 110, 1_000_000));
     // Time-type with MTP 0 / missing.
-    assert!(!sequence_locks_satisfied(
-        &tx_t,
-        &[100],
-        &[0],
-        200,
-        1_000_000
-    ));
-    assert!(!sequence_locks_satisfied(
-        &tx_t,
-        &[100],
-        &[],
-        200,
-        1_000_000
-    ));
+    assert!(!sequence_locks_satisfied(&tx_t, &[100], &[0], 200, 1_000_000));
+    assert!(!sequence_locks_satisfied(&tx_t, &[100], &[], 200, 1_000_000));
     // Control: known ages still work.
     assert!(sequence_locks_satisfied(&tx_h, &[100], &[0], 110, 0));
 }

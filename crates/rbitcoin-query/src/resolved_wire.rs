@@ -22,18 +22,9 @@ pub struct ResolvedWire {
 impl ResolvedWire {
     /// Stamp `n_inputs` from the decoded block (tests / callers without enqueue meta).
     pub fn new(block: Arc<Block>, pres: Arc<[TxPrecompute]>) -> Self {
-        let n_inputs = block
-            .txdata
-            .iter()
-            .map(|tx| tx.input.len() as u32)
-            .fold(0u32, u32::saturating_add);
-        Self {
-            block,
-            pres,
-            n_inputs,
-            header_fk: 0,
-            spend_keys: Arc::from([]),
-        }
+        let n_inputs =
+            block.txdata.iter().map(|tx| tx.input.len() as u32).fold(0u32, u32::saturating_add);
+        Self { block, pres, n_inputs, header_fk: 0, spend_keys: Arc::from([]) }
     }
 }
 
@@ -55,17 +46,10 @@ mod tests {
     #[test]
     fn resolved_wire_stamps_n_inputs() {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let n = genesis
-            .txdata
-            .iter()
-            .map(|tx| tx.input.len() as u32)
-            .fold(0u32, u32::saturating_add);
-        let pres: Arc<[TxPrecompute]> = genesis
-            .txdata
-            .iter()
-            .map(TxPrecompute::from_tx)
-            .collect::<Vec<_>>()
-            .into();
+        let n =
+            genesis.txdata.iter().map(|tx| tx.input.len() as u32).fold(0u32, u32::saturating_add);
+        let pres: Arc<[TxPrecompute]> =
+            genesis.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
         let wire = ResolvedWire::new(Arc::new(genesis), pres);
         assert_eq!(wire.n_inputs, n);
         assert_eq!(n, 1);

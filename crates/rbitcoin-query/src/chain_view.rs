@@ -107,11 +107,7 @@ impl Query {
         if rec.hash != *hash {
             return Ok(None);
         }
-        Ok(Some(ChainView {
-            height,
-            hash: rec.hash,
-            header_fk,
-        }))
+        Ok(Some(ChainView { height, hash: rec.hash, header_fk }))
     }
 
     /// Pin, run `f`, return the body if that pin is still published; else retry.
@@ -186,10 +182,7 @@ impl Query {
             return Ok(None);
         }
         self.ensure_height_by_hash_index(tip)?;
-        let g = self
-            .height_by_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
         Ok(g.map.get(hash).copied().map(Height))
     }
 
@@ -207,10 +200,7 @@ impl Query {
     }
 
     fn ensure_height_by_hash_index_once(&self, tip: Height) -> Result<Option<Height>, QueryError> {
-        let mut g = self
-            .height_by_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
         if g.tip == Some(tip.0) {
             return Ok(None);
         }
@@ -224,10 +214,7 @@ impl Query {
                     };
                     adds.push((rec.hash, h));
                 }
-                crate::note_confirm(
-                    &self.confirm_stats().height_index_delta_n,
-                    adds.len() as u64,
-                );
+                crate::note_confirm(&self.confirm_stats().height_index_delta_n, adds.len() as u64);
                 for (hash, h) in adds {
                     g.map.insert(hash, h);
                 }
@@ -256,10 +243,7 @@ impl Query {
         g.map.clear();
         g.map.reserve(adds.len());
         crate::note_confirm(&self.confirm_stats().height_index_full_n, 1);
-        crate::note_confirm(
-            &self.confirm_stats().height_index_full_headers,
-            adds.len() as u64,
-        );
+        crate::note_confirm(&self.confirm_stats().height_index_full_headers, adds.len() as u64);
         for (hash, h) in adds {
             g.map.insert(hash, h);
         }
@@ -274,18 +258,13 @@ impl Query {
                 self.invalidate_height_by_hash_index();
                 Ok(None)
             }
-            _ => Err(StoreError::Corrupt(
-                "invariant: height_by_hash confirmed header missing",
-            )),
+            _ => Err(StoreError::Corrupt("invariant: height_by_hash confirmed header missing")),
         }
     }
 
     /// Drop height index (tests / multi-height reorg / offline confirmed rewrite).
     pub fn invalidate_height_by_hash_index(&self) {
-        let mut g = self
-            .height_by_hash
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.height_by_hash.lock().unwrap_or_else(|e| e.into_inner());
         g.tip = None;
         g.map.clear();
     }
@@ -330,9 +309,8 @@ impl Query {
         let mut h = tip.0 as i64;
         let mut step = 1i64;
         while h >= 0 {
-            let (_fk, rec) = self
-                .header_at_height(Height(h as u32))?
-                .ok_or(StoreError::NotFound)?;
+            let (_fk, rec) =
+                self.header_at_height(Height(h as u32))?.ok_or(StoreError::NotFound)?;
             out.push(BlockHash::from_byte_array(rec.hash));
             if out.len() >= 10 {
                 step *= 2;

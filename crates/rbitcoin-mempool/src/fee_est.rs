@@ -26,9 +26,8 @@ pub const LAMBDA_AT_NEAR: f64 = 2.0;
 pub const LAMBDA_AT_FAR: f64 = 1.0;
 
 /// Feerate bucket edges in sat/kvB (Libre min relay = 100). Last bucket is +∞.
-pub const FEE_BUCKET_EDGES_SAT_PER_KVB: &[u64] = &[
-    100, 200, 300, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
-];
+pub const FEE_BUCKET_EDGES_SAT_PER_KVB: &[u64] =
+    &[100, 200, 300, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000];
 
 /// Index of the bucket that contains `rate_sat_per_kvb` (0 = lowest).
 pub fn bucket_index(rate_sat_per_kvb: u64) -> usize {
@@ -126,11 +125,7 @@ pub fn projected_inflow_wu_above(
             FEE_BUCKET_EDGES_SAT_PER_KVB[i]
         } else {
             // Open top: treat as above last edge.
-            FEE_BUCKET_EDGES_SAT_PER_KVB
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1)
+            FEE_BUCKET_EDGES_SAT_PER_KVB.last().copied().unwrap_or(0).saturating_add(1)
         };
         if bucket_lo > rate_sat_per_kvb {
             sum = sum.saturating_add(inflow_wu_per_s_by_bucket[i].saturating_mul(horizon_secs));
@@ -352,10 +347,7 @@ mod tests {
         let cold = min_rate_for_capacity(stock, &vec![0u64; bucket_count()], 1, &rates).unwrap();
         let hot = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
         assert!(hot >= cold, "hot={hot} cold={cold}");
-        assert!(
-            hot >= 50_000,
-            "should clear high-inflow competitors, got {hot}"
-        );
+        assert!(hot >= 50_000, "should clear high-inflow competitors, got {hot}");
     }
 
     #[test]
@@ -406,10 +398,7 @@ mod tests {
         let warm: Vec<u64> = (1..=12).map(|i| i * 1_000).collect();
         let cold_p = historical_far_sat_kvb(&cold, 144).unwrap();
         let warm_p = historical_far_sat_kvb(&warm, 144).unwrap();
-        assert!(
-            warm_p > cold_p,
-            "12 samples use p85, 11 use median: warm={warm_p} cold={cold_p}"
-        );
+        assert!(warm_p > cold_p, "12 samples use p85, 11 use median: warm={warm_p} cold={cold_p}");
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 0), Some(1));
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 100), Some(5));
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 255), Some(5));
@@ -429,10 +418,7 @@ mod tests {
         assert!((lambda_mult(0.99) - 2.0).abs() < 1e-12);
         assert!((lambda_mult(0.90) - 1.0).abs() < 1e-12);
         assert_eq!(effective_capacity_wu(1), 3_200_000);
-        assert_eq!(
-            effective_capacity_wu(6),
-            (6.0_f64 * 4_000_000.0 * 0.95).round() as u64
-        );
+        assert_eq!(effective_capacity_wu(6), (6.0_f64 * 4_000_000.0 * 0.95).round() as u64);
     }
 
     #[test]
@@ -505,18 +491,9 @@ mod tests {
         assert_eq!(flow_for_depth(None, None, true, 6, min_r), None);
         assert_eq!(flow_for_depth(None, None, true, 144, min_r), None);
         assert_eq!(flow_for_depth(None, None, false, 1, min_r), None);
-        assert_eq!(
-            flow_for_depth(Some(5_000), None, true, 1, min_r),
-            Some(5_000)
-        );
+        assert_eq!(flow_for_depth(Some(5_000), None, true, 1, min_r), Some(5_000));
         assert_eq!(flow_for_depth(Some(5_000), None, true, 144, min_r), None);
-        assert_eq!(
-            flow_for_depth(Some(4_000), Some(3_000), true, 1, min_r),
-            Some(4_000)
-        );
-        assert_eq!(
-            flow_for_depth(None, Some(3_000), true, 144, min_r),
-            Some(3_000)
-        );
+        assert_eq!(flow_for_depth(Some(4_000), Some(3_000), true, 1, min_r), Some(4_000));
+        assert_eq!(flow_for_depth(None, Some(3_000), true, 144, min_r), Some(3_000));
     }
 }

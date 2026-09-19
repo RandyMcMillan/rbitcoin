@@ -131,9 +131,7 @@ pub fn sh_page_is_last(page: &[u8; SH_PAGE_SIZE]) -> Result<bool, StoreError> {
 pub fn sh_page_first_off(page: &[u8; SH_PAGE_SIZE]) -> Result<u64, StoreError> {
     let (last, off) = sh_page_read_packed(page)?;
     if !last {
-        return Err(StoreError::Corrupt(
-            "scripthash page: first_off on a non-last page",
-        ));
+        return Err(StoreError::Corrupt("scripthash page: first_off on a non-last page"));
     }
     Ok(off)
 }
@@ -181,22 +179,16 @@ pub fn sh_page_extent(page: &[u8; SH_PAGE_SIZE]) -> Result<Option<(u64, u32)>, S
         return Ok(None);
     }
     let base = u64::from_le_bytes(
-        page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8]
-            .try_into()
-            .unwrap(),
+        page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8].try_into().unwrap(),
     );
     let n = u32::from_le_bytes(
-        page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4]
-            .try_into()
-            .unwrap(),
+        page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4].try_into().unwrap(),
     );
     if n == 0 {
         return Err(StoreError::Corrupt("scripthash page: extent_n is 0"));
     }
     if !base.is_multiple_of(SH_PAGE_SIZE as u64) || base == 0 {
-        return Err(StoreError::Corrupt(
-            "scripthash page: extent_base not 4 KiB aligned",
-        ));
+        return Err(StoreError::Corrupt("scripthash page: extent_base not 4 KiB aligned"));
     }
     Ok(Some((base, n)))
 }
@@ -211,9 +203,7 @@ pub fn sh_page_set_extent(
         return Err(StoreError::Corrupt("scripthash page: extent_n is 0"));
     }
     if !extent_base.is_multiple_of(SH_PAGE_SIZE as u64) || extent_base == 0 {
-        return Err(StoreError::Corrupt(
-            "scripthash page: extent_base not 4 KiB aligned",
-        ));
+        return Err(StoreError::Corrupt("scripthash page: extent_base not 4 KiB aligned"));
     }
     page[SH_PAGE_OFF_VER] = SH_PAGE_EXTENT_VER;
     page[SH_PAGE_OFF_EXTENT_BASE..SH_PAGE_OFF_EXTENT_BASE + 8]
@@ -227,9 +217,7 @@ pub fn sh_page_extent_creates(page: &[u8; SH_PAGE_SIZE]) -> u32 {
         return 0;
     }
     u32::from_le_bytes(
-        page[SH_PAGE_OFF_EXTENT_CREATES..SH_PAGE_OFF_EXTENT_CREATES + 4]
-            .try_into()
-            .unwrap(),
+        page[SH_PAGE_OFF_EXTENT_CREATES..SH_PAGE_OFF_EXTENT_CREATES + 4].try_into().unwrap(),
     )
 }
 
@@ -243,9 +231,7 @@ pub fn sh_page_set_extent_creates(page: &mut [u8; SH_PAGE_SIZE], n: u32) {
 
 fn sh_page_write_stream(page: &mut [u8; SH_PAGE_SIZE], fks: &[u64]) -> Result<(), StoreError> {
     if fks.len() > u16::MAX as usize {
-        return Err(StoreError::Corrupt(
-            "scripthash page pack: entries exceed page capacity",
-        ));
+        return Err(StoreError::Corrupt("scripthash page pack: entries exceed page capacity"));
     }
     let off = sh_page_stream_off(page);
     match encode_fk_delta_stream_into(&mut page[off..], fks) {
@@ -253,9 +239,9 @@ fn sh_page_write_stream(page: &mut [u8; SH_PAGE_SIZE], fks: &[u64]) -> Result<()
             sh_page_set_n_fks(page, fks.len() as u16);
             Ok(())
         }
-        Err(StoreError::Corrupt("uleb128 dest short")) => Err(StoreError::Corrupt(
-            "scripthash page pack: entries exceed page capacity",
-        )),
+        Err(StoreError::Corrupt("uleb128 dest short")) => {
+            Err(StoreError::Corrupt("scripthash page pack: entries exceed page capacity"))
+        }
         Err(e) => Err(e),
     }
 }
@@ -281,11 +267,7 @@ pub fn sh_page_pack_extent_last_fks(
 /// Number of FKs stored in this page.
 #[inline]
 pub fn sh_page_n_fks(page: &[u8; SH_PAGE_SIZE]) -> Result<u16, StoreError> {
-    let n = u16::from_le_bytes(
-        page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2]
-            .try_into()
-            .unwrap(),
-    );
+    let n = u16::from_le_bytes(page[SH_PAGE_OFF_N_FKS..SH_PAGE_OFF_N_FKS + 2].try_into().unwrap());
     if n as usize > sh_page_stream_cap(page) {
         return Err(StoreError::Corrupt("scripthash page n_fks > capacity"));
     }
@@ -301,9 +283,7 @@ fn sh_page_require_delta(page: &[u8; SH_PAGE_SIZE]) -> Result<(), StoreError> {
     if ver == 0 && n == 0 {
         return Ok(());
     }
-    Err(StoreError::Corrupt(
-        "scripthash page leftover raw-u64; rematerialize",
-    ))
+    Err(StoreError::Corrupt("scripthash page leftover raw-u64; rematerialize"))
 }
 
 fn sh_page_stream(page: &[u8; SH_PAGE_SIZE]) -> &[u8] {
@@ -338,9 +318,7 @@ fn sh_page_stream_tail(page: &[u8; SH_PAGE_SIZE]) -> Result<(usize, Option<Fk>),
             return Err(StoreError::Corrupt("scripthash page stream overrun"));
         }
         if d == 0 {
-            return Err(StoreError::Corrupt(
-                "invariant: scripthash fk stream zero delta",
-            ));
+            return Err(StoreError::Corrupt("invariant: scripthash fk stream zero delta"));
         }
         last = last
             .checked_add(d)
@@ -469,9 +447,7 @@ pub fn sh_page_try_append(page: &mut [u8; SH_PAGE_SIZE], fk: Fk) -> Result<bool,
         return Err(StoreError::InvalidFk);
     }
     if fk.0 & SH_FLAG_BIT != 0 {
-        return Err(StoreError::Corrupt(
-            "scripthash: create_fk must have bit63 clear",
-        ));
+        return Err(StoreError::Corrupt("scripthash: create_fk must have bit63 clear"));
     }
     let (used, last) = sh_page_stream_tail(page)?;
     let n = sh_page_n_fks(page)? as usize;
@@ -537,10 +513,7 @@ mod tests {
         sh_page_pack_fks(&mut page, &fks, 8192).unwrap();
         assert_eq!(sh_page_n_fks(&page).unwrap() as usize, fks.len());
         assert_eq!(sh_page_next(&page).unwrap(), 8192);
-        assert_eq!(
-            &page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + stream.len()],
-            stream.as_slice()
-        );
+        assert_eq!(&page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + stream.len()], stream.as_slice());
         let wrapped = sh_page_entries(&page).unwrap();
         let mut into = Vec::new();
         sh_page_entries_into(&page, &mut into).unwrap();
@@ -594,10 +567,7 @@ mod tests {
         let ents: Vec<_> = (1u64..=600).map(Fk).collect();
         let mut big = [0u8; SH_PAGE_SIZE];
         sh_page_pack_fks(&mut big, &raw(&ents), 0).unwrap();
-        assert_eq!(
-            sh_page_last_fk(&big).unwrap(),
-            sh_page_entries(&big).unwrap().last().copied()
-        );
+        assert_eq!(sh_page_last_fk(&big).unwrap(), sh_page_entries(&big).unwrap().last().copied());
         assert_eq!(sh_page_last_fk(&big).unwrap(), Some(Fk(600)));
     }
 
@@ -612,10 +582,7 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            n > SH_PAGE_FK_CAP as u64,
-            "delta must beat 510 raw slots, n={n}"
-        );
+        assert!(n > SH_PAGE_FK_CAP as u64, "delta must beat 510 raw slots, n={n}");
         assert!(sh_page_n_fks(&page).unwrap() as u64 >= SH_PAGE_FK_CAP as u64);
         assert_eq!(sh_page_last_fk(&page).unwrap(), Some(Fk(n - 1)));
         assert!(!sh_page_try_append(&mut page, Fk(n)).unwrap());
@@ -706,10 +673,7 @@ mod tests {
         let fks: Vec<Fk> = (1..=n as u64).map(Fk).collect();
         assert!(n > SH_PAGE_EXTENT_STREAM_MAX);
         let chunks = sh_page_chunk_ranges(&fks).unwrap();
-        assert!(
-            chunks.len() >= 2,
-            "last page must split so ver=2 header fits, got {chunks:?}"
-        );
+        assert!(chunks.len() >= 2, "last page must split so ver=2 header fits, got {chunks:?}");
         let n_pages = chunks.len() as u32;
         let mut got = Vec::new();
         for (pi, &(start, end)) in chunks.iter().enumerate() {
@@ -788,11 +752,7 @@ mod tests {
         let mut pages = Vec::new();
         for (pi, &(start, end)) in chunks.iter().enumerate() {
             let off = base + (pi as u64) * (SH_PAGE_SIZE as u64);
-            let next = if pi + 1 < chunks.len() {
-                off + SH_PAGE_SIZE as u64
-            } else {
-                0
-            };
+            let next = if pi + 1 < chunks.len() { off + SH_PAGE_SIZE as u64 } else { 0 };
             let mut page = [0u8; SH_PAGE_SIZE];
             sh_page_pack_fks(&mut page, &raw(&fks[start..end]), next).unwrap();
             assert_eq!(sh_page_next(&page).unwrap(), next);

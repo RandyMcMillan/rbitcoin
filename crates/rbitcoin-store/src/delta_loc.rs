@@ -104,11 +104,7 @@ impl DeltaLoc {
             checkpoints: RwLock::new(Vec::new()),
             ovf_rows: RwLock::new(Vec::new()),
             count: AtomicU64::new(0),
-            missing: if stem == "inwit" {
-                INWIT_OVF_MISSING
-            } else {
-                CREATE_OVF_MISSING
-            },
+            missing: if stem == "inwit" { INWIT_OVF_MISSING } else { CREATE_OVF_MISSING },
         })
     }
 
@@ -146,11 +142,7 @@ impl DeltaLoc {
             checkpoints: RwLock::new(checkpoints),
             ovf_rows: RwLock::new(ovf_rows),
             count: AtomicU64::new(count),
-            missing: if stem == "inwit" {
-                INWIT_OVF_MISSING
-            } else {
-                CREATE_OVF_MISSING
-            },
+            missing: if stem == "inwit" { INWIT_OVF_MISSING } else { CREATE_OVF_MISSING },
         })
     }
 
@@ -166,11 +158,9 @@ impl DeltaLoc {
         if new_count == cur {
             return Ok(());
         }
-        self.loc
-            .set_logical_len(FILE_HEADER_LEN as u64 + new_count * 2)?;
+        self.loc.set_logical_len(FILE_HEADER_LEN as u64 + new_count * 2)?;
         let n_win = new_count / LOC_WINDOW;
-        self.off
-            .set_logical_len(FILE_HEADER_LEN as u64 + n_win * 8)?;
+        self.off.set_logical_len(FILE_HEADER_LEN as u64 + n_win * 8)?;
         {
             let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
             cps.truncate(n_win as usize);
@@ -183,8 +173,7 @@ impl DeltaLoc {
                 blob.extend_from_slice(&fk.to_le_bytes());
                 blob.extend_from_slice(&st.to_le_bytes());
             }
-            self.ovf
-                .set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
+            self.ovf.set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
             if !blob.is_empty() {
                 self.ovf.write_at(FILE_HEADER_LEN as u64, &blob)?;
             }
@@ -260,8 +249,7 @@ impl DeltaLoc {
                 cps.push(abs);
             }
         }
-        self.count
-            .store(base + starts.len() as u64, Ordering::Release);
+        self.count.store(base + starts.len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -382,17 +370,9 @@ pub(crate) fn pack_create_pair(
     if txout_strides == 0 {
         return Err(StoreError::Corrupt("invariant: create txout strides"));
     }
-    let s8 = if txout_strides >= 256 {
-        0u8
-    } else {
-        txout_strides as u8
-    };
+    let s8 = if txout_strides >= 256 { 0u8 } else { txout_strides as u8 };
     let n8 = if n_out >= 256 { 0u8 } else { n_out as u8 };
-    let ovf = if s8 == 0 || n8 == 0 {
-        Some((txout_strides, n_out))
-    } else {
-        None
-    };
+    let ovf = if s8 == 0 || n8 == 0 { Some((txout_strides, n_out)) } else { None };
     Ok((s8, n8, ovf))
 }
 
@@ -491,11 +471,7 @@ pub(crate) fn migrate_create_ovf_v22_if_needed(path: &Path) -> Result<(), StoreE
             return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
         }
         prev = fk;
-        payload.extend_from_slice(&encode_create_ovf_row(
-            fk,
-            u32::from(strides),
-            u32::from(n_out),
-        ));
+        payload.extend_from_slice(&encode_create_ovf_row(fk, u32::from(strides), u32::from(n_out)));
     }
     let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
     let mut blob = leading_header_bytes(TableKind::DeltaLoc, logical).to_vec();

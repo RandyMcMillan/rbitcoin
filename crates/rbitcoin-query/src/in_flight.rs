@@ -321,14 +321,8 @@ mod tests {
         assert!(m.get_create_fk(&ahead.tx().txid).is_some());
 
         m.prune_below_height(Some(6));
-        assert!(
-            m.get_create_fk(&confirmed.tx().txid).is_none(),
-            "height 5 is below noted 6"
-        );
-        assert!(
-            m.get_create_fk(&ahead.tx().txid).is_some(),
-            "height == noted keeps"
-        );
+        assert!(m.get_create_fk(&confirmed.tx().txid).is_none(), "height 5 is below noted 6");
+        assert!(m.get_create_fk(&ahead.tx().txid).is_some(), "height == noted keeps");
 
         m.prune_below_height(Some(7));
         assert!(m.is_empty());

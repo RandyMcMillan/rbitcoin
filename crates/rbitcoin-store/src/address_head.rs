@@ -141,10 +141,7 @@ impl HeadLayout {
         if !(MIN_BITS..=MAX_BITS).contains(&bits) {
             return Err(StoreError::Corrupt("address head bits out of range"));
         }
-        Ok(Self {
-            bits,
-            entry_bytes: entry_bytes_for_bits(bits),
-        })
+        Ok(Self { bits, entry_bytes: entry_bytes_for_bits(bits) })
     }
 
     pub fn with_entry_bytes(bits: u32, entry_bytes: u8) -> Result<Self, StoreError> {
@@ -152,15 +149,11 @@ impl HeadLayout {
             return Err(StoreError::Corrupt("address head bits out of range"));
         }
         if entry_bytes != 4 && entry_bytes != 8 {
-            return Err(StoreError::Corrupt(
-                "address head entry_bytes must be 4 or 8",
-            ));
+            return Err(StoreError::Corrupt("address head entry_bytes must be 4 or 8"));
         }
         // BITS ≥ 33 requires 8 B (u32 fk space insufficient at 0.80 load).
         if bits >= 33 && entry_bytes != 8 {
-            return Err(StoreError::Corrupt(
-                "address head bits>=33 requires 8-byte entries",
-            ));
+            return Err(StoreError::Corrupt("address head bits>=33 requires 8-byte entries"));
         }
         Ok(Self { bits, entry_bytes })
     }
@@ -191,9 +184,7 @@ pub fn entry_bytes_for_bits(bits: u32) -> u8 {
 /// First 8 bytes of txid as big-endian u64 (bit stream for page / h1).
 #[inline]
 fn key_be_u64(txid: &[u8; 32]) -> u64 {
-    u64::from_be_bytes([
-        txid[0], txid[1], txid[2], txid[3], txid[4], txid[5], txid[6], txid[7],
-    ])
+    u64::from_be_bytes([txid[0], txid[1], txid[2], txid[3], txid[4], txid[5], txid[6], txid[7]])
 }
 
 /// Page index from the **top** `(bits - 10)` bits of the txid (0 if bits ≤ 10).
@@ -224,11 +215,7 @@ pub fn h2_in_page(txid: &[u8; 32], bits: u32) -> u64 {
     let v = u64::from_be_bytes([
         txid[4], txid[5], txid[6], txid[7], txid[8], txid[9], txid[10], txid[11],
     ]);
-    let mask = if bits <= PAGE_SLOT_BITS {
-        (1u64 << bits) - 1
-    } else {
-        PAGE_SLOTS - 1
-    };
+    let mask = if bits <= PAGE_SLOT_BITS { (1u64 << bits) - 1 } else { PAGE_SLOTS - 1 };
     (v | 1) & mask
 }
 
@@ -298,11 +285,7 @@ pub struct ProbeCands {
 
 impl Default for ProbeCands {
     fn default() -> Self {
-        Self {
-            inline: [(0, 0); PROBE_CANDS_INLINE],
-            n: 0,
-            spill: Vec::new(),
-        }
+        Self { inline: [(0, 0); PROBE_CANDS_INLINE], n: 0, spill: Vec::new() }
     }
 }
 
@@ -325,9 +308,7 @@ impl ProbeCands {
 
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &(u32, u64)> {
-        self.inline[..self.n as usize]
-            .iter()
-            .chain(self.spill.iter())
+        self.inline[..self.n as usize].iter().chain(self.spill.iter())
     }
 }
 
@@ -369,21 +350,11 @@ pub fn hop_scan_page(
             break;
         };
         if e == 0 {
-            return ProbeRegionScan {
-                cands,
-                hit_empty: true,
-                depth_end: d,
-                empty_local: local,
-            };
+            return ProbeRegionScan { cands, hit_empty: true, depth_end: d, empty_local: local };
         }
         cands.push(d, e);
     }
-    ProbeRegionScan {
-        cands,
-        hit_empty: false,
-        depth_end: max_d,
-        empty_local: 0,
-    }
+    ProbeRegionScan { cands, hit_empty: false, depth_end: max_d, empty_local: 0 }
 }
 
 /// Global first slot of the probe page that holds `txid`.
@@ -438,23 +409,15 @@ pub fn insert_fk_into_page_buf(
     let scan = hop_scan_page(page_buf, entry_bytes, h1, h2, nslots, MAX_PROBE);
     for &(_d, e) in scan.cands.iter() {
         if e == new_u {
-            return Ok(InsertPageOutcome {
-                wrote_new: false,
-                depth: 0,
-            });
+            return Ok(InsertPageOutcome { wrote_new: false, depth: 0 });
         }
     }
     if !scan.hit_empty {
         note_probe_exhausted();
-        return Err(StoreError::Corrupt(
-            "address head probe exhausted on insert",
-        ));
+        return Err(StoreError::Corrupt("address head probe exhausted on insert"));
     }
     store_entry_in_page_buf(page_buf, scan.empty_local, entry_bytes, new_u)?;
-    Ok(InsertPageOutcome {
-        wrote_new: true,
-        depth: scan.depth_end,
-    })
+    Ok(InsertPageOutcome { wrote_new: true, depth: scan.depth_end })
 }
 
 /// Write LE create_fk into a page buffer at local slot index.
@@ -466,9 +429,8 @@ fn store_entry_in_page_buf(
     new: u64,
 ) -> Result<(), StoreError> {
     let es = entry_bytes as usize;
-    let off = (local as usize)
-        .checked_mul(es)
-        .ok_or(StoreError::Corrupt("page buf slot overflow"))?;
+    let off =
+        (local as usize).checked_mul(es).ok_or(StoreError::Corrupt("page buf slot overflow"))?;
     if off + es > page_buf.len() {
         return Err(StoreError::Corrupt("page buf slot out of range"));
     }
@@ -538,9 +500,7 @@ pub fn encode_layout_ext(layout: HeadLayout, generation: u64) -> [u8; 16] {
 /// Decode layout extension from the trailing footer (or fail for rebuild).
 pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError> {
     if &ext[0..4] != META_MAGIC {
-        return Err(StoreError::Corrupt(
-            "tx.head footer layout magic (rebuild tx.head)",
-        ));
+        return Err(StoreError::Corrupt("tx.head footer layout magic (rebuild tx.head)"));
     }
     let ver = u16::from_le_bytes([ext[4], ext[5]]);
     if ver != META_VERSION {
@@ -585,11 +545,7 @@ impl AddressHead {
         file.set_logical_len(need)?;
         file.zero_range(0, body_bytes)?;
         remove_legacy_meta_sidecar(&path);
-        Ok(Self {
-            file,
-            layout,
-            page_writes: AtomicU64::new(0),
-        })
+        Ok(Self { file, layout, page_writes: AtomicU64::new(0) })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
@@ -609,16 +565,10 @@ impl AddressHead {
             return Err(StoreError::Corrupt("address head size"));
         }
         if body != expect_body {
-            return Err(StoreError::Corrupt(
-                "address head size mismatch vs footer layout",
-            ));
+            return Err(StoreError::Corrupt("address head size mismatch vs footer layout"));
         }
         remove_legacy_meta_sidecar(&path);
-        Ok(Self {
-            file,
-            layout,
-            page_writes: AtomicU64::new(0),
-        })
+        Ok(Self { file, layout, page_writes: AtomicU64::new(0) })
     }
 
     /// Dirty probe-page write-backs since last take (instance stats).
@@ -675,12 +625,7 @@ impl AddressHead {
             use crate::bulk_io::{self, ReadOp};
             let fd = self.file.read_fd();
             let slice = &mut buf[..need];
-            let mut ops = [ReadOp {
-                fd,
-                offset: off,
-                buf: slice,
-                result: i32::MIN,
-            }];
+            let mut ops = [ReadOp { fd, offset: off, buf: slice, result: i32::MIN }];
             bulk_io::pread_batch(&mut ops);
             if ops[0].result < 0 {
                 return Err(StoreError::io(
@@ -829,11 +774,8 @@ impl AddressHead {
         let page_slots = page_slot_count(bits);
         let es_u = es as usize;
 
-        let mut order: Vec<(u64, usize)> = txids
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (page_base_for_txid(t, bits), i))
-            .collect();
+        let mut order: Vec<(u64, usize)> =
+            txids.iter().enumerate().map(|(i, t)| (page_base_for_txid(t, bits), i)).collect();
         order.sort_unstable_by_key(|&(p, i)| (p, i));
 
         let mut page_bases: Vec<u64> = Vec::new();
@@ -981,17 +923,13 @@ impl AddressHead {
                     let need = self.probe_page_need(page_base, page_slots);
 
                     if res < 0 {
-                        return Err(StoreError::io(
-                            path,
-                            std::io::Error::from_raw_os_error(-res),
-                        ));
+                        return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-res)));
                     }
 
                     let mut n = res as usize;
                     if n < need {
                         // Short — complete via libc pread (no nested TLS).
-                        self.file
-                            .read_at(self.entry_off(page_base), &mut bufs[slot][..need])?;
+                        self.file.read_at(self.entry_off(page_base), &mut bufs[slot][..need])?;
                         n = need;
                     }
                     n = n.min(need);
@@ -1124,10 +1062,7 @@ mod tests {
         // slot 2 empty
         let s = hop_scan_page(&buf, 4, 0, 1, 4, MAX_PROBE);
         assert!(s.hit_empty);
-        assert_eq!(
-            s.cands.iter().copied().collect::<Vec<_>>(),
-            vec![(0, 1), (1, 2)]
-        );
+        assert_eq!(s.cands.iter().copied().collect::<Vec<_>>(), vec![(0, 1), (1, 2)]);
         assert_eq!(s.depth_end, 2);
         assert_eq!(s.empty_local, 2);
     }
@@ -1143,10 +1078,7 @@ mod tests {
         }
         let s = hop_scan_page(&buf, 4, 0, 1, page_slots as u64, MAX_PROBE);
         assert_eq!(s.cands.len(), n);
-        assert_eq!(
-            s.cands.iter().last().copied(),
-            Some(((n as u32) - 1, n as u64))
-        );
+        assert_eq!(s.cands.iter().last().copied(), Some(((n as u32) - 1, n as u64)));
         let got: Vec<_> = s.cands.iter().copied().collect();
         let expect: Vec<_> = (0..n as u32).map(|d| (d, u64::from(d) + 1)).collect();
         assert_eq!(got, expect);
@@ -1290,10 +1222,7 @@ mod tests {
         // Capacity growth is segment roll, not bits-widen.
         let layout = default_layout(HeadScale::Tiny);
         assert_eq!(layout.bits, bits_for_scale(HeadScale::Tiny));
-        assert_eq!(
-            default_layout(HeadScale::Tiny).bits,
-            bits_for_scale(HeadScale::Tiny)
-        );
+        assert_eq!(default_layout(HeadScale::Tiny).bits, bits_for_scale(HeadScale::Tiny));
     }
 
     #[test]
@@ -1302,9 +1231,7 @@ mod tests {
         assert!(is_probe_exhausted_error(&e));
         assert!(!is_probe_exhausted_error(&StoreError::NotFound));
         assert!(is_store_corrupt_display(&e.to_string()));
-        assert!(is_store_corrupt_display(
-            "corrupt record: leftover identity broken"
-        ));
+        assert!(is_store_corrupt_display("corrupt record: leftover identity broken"));
         assert!(!is_store_corrupt_display("bad-txnmrklroot"));
     }
 
@@ -1467,9 +1394,7 @@ mod tests {
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         let _ = session.take_sqe_n();
         let mut ctx = IoCtx::held(&mut session);
-        let batch = h
-            .probe_fks_batch_ctx(&[txid], &mut ctx)
-            .expect("held-session probe");
+        let batch = h.probe_fks_batch_ctx(&[txid], &mut ctx).expect("held-session probe");
         session.drain_all().unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0], serial);
@@ -1514,10 +1439,7 @@ mod tests {
             let slot = page_base + local;
             let expected = read_slot(&h, slot);
             let from_bulk = entry_from_page_buf(&bulk[..n], local, es).unwrap_or(0);
-            assert_eq!(
-                from_bulk, expected,
-                "slot {slot} bulk={from_bulk} serial={expected}"
-            );
+            assert_eq!(from_bulk, expected, "slot {slot} bulk={from_bulk} serial={expected}");
         }
         // Slot region must not extend into trailing footer.
         // Probe path still finds inserts.
@@ -1622,10 +1544,7 @@ mod tests {
         // Idempotent re-insert.
         h.insert_many_in_place(&mut entries[..10]).unwrap();
         for (txid, fk) in &entries {
-            assert!(
-                probe_one(&h, txid).unwrap().contains(fk),
-                "missing after sole insert"
-            );
+            assert!(probe_one(&h, txid).unwrap().contains(fk), "missing after sole insert");
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
@@ -1687,10 +1606,7 @@ mod tests {
             txid[0] = (i & 0xff) as u8;
             txid[1] = ((i >> 8) & 0xff) as u8;
             txid[2] = 0xca;
-            assert!(
-                probe_one(&h, &txid).unwrap().contains(&Fk(i)),
-                "missing fk {i}"
-            );
+            assert!(probe_one(&h, &txid).unwrap().contains(&Fk(i)), "missing fk {i}");
         }
         // Idempotent re-insert of a subset.
         let mut again = Vec::new();
@@ -1829,10 +1745,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-ah-meta-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let meta = meta_path(&path);
         std::fs::write(&meta, b"x").unwrap();

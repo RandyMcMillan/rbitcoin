@@ -133,22 +133,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         init_api_log(&path).unwrap();
-        api_call(
-            "electrum",
-            "127.0.0.1:1",
-            "blockchain.tweaks.subscribe",
-            "[0,1,false]",
-            12,
-            None,
-        );
-        api_call(
-            "electrum",
-            "127.0.0.1:1",
-            "no.such",
-            "[]",
-            1,
-            Some("unknown method: no.such"),
-        );
+        api_call("electrum", "127.0.0.1:1", "blockchain.tweaks.subscribe", "[0,1,false]", 12, None);
+        api_call("electrum", "127.0.0.1:1", "no.such", "[]", 1, Some("unknown method: no.such"));
         close_api_log();
         let body = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);

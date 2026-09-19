@@ -12,9 +12,7 @@ pub struct RpcAuth {
 
 impl RpcAuth {
     pub fn new(token: impl Into<String>) -> Self {
-        Self {
-            token: token.into(),
-        }
+        Self { token: token.into() }
     }
 
     pub fn matches_token(&self, token: &str) -> bool {
@@ -35,9 +33,7 @@ pub fn resolve_rpc_auth(
     datadir: &Path,
     token_path: Option<&Path>,
 ) -> Result<(RpcAuth, PathBuf), String> {
-    let path = token_path
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| default_token_path(datadir));
+    let path = token_path.map(|p| p.to_path_buf()).unwrap_or_else(|| default_token_path(datadir));
     if path.is_file() {
         let auth = read_token_file(&path)?;
         return Ok((auth, path));
@@ -67,8 +63,7 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    f.write_all(auth.token.as_bytes())
-        .map_err(|e| format!("token write: {e}"))?;
+    f.write_all(auth.token.as_bytes()).map_err(|e| format!("token write: {e}"))?;
     f.sync_all().map_err(|e| format!("token sync: {e}"))?;
     Ok(auth)
 }
@@ -100,10 +95,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-rpc-auth-{n}"))
     }
 
@@ -116,10 +108,7 @@ mod tests {
         let b = read_token_file(&path).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.token.len(), 64);
-        assert!(a
-            .token
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a.token.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -158,14 +147,8 @@ mod tests {
         let a = RpcAuth::new("s3cret");
         assert!(a.matches_token("s3cret"));
         assert!(!a.matches_token("nope"));
-        assert_eq!(
-            default_socket_path(Path::new("/d")),
-            PathBuf::from("/d/rpc.sock")
-        );
-        assert_eq!(
-            default_token_path(Path::new("/d")),
-            PathBuf::from("/d/rpc.token")
-        );
+        assert_eq!(default_socket_path(Path::new("/d")), PathBuf::from("/d/rpc.sock"));
+        assert_eq!(default_token_path(Path::new("/d")), PathBuf::from("/d/rpc.token"));
     }
 
     #[test]

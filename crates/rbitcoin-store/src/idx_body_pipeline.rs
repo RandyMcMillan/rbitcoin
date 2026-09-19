@@ -46,14 +46,7 @@ pub struct IdxBodyJob {
 
 impl IdxBodyJob {
     pub fn new(id: u64, range: Option<(u64, u64)>) -> Self {
-        Self {
-            id,
-            range,
-            body: Vec::new(),
-            ok: false,
-            need_vouts: Vec::new(),
-            n_out: 0,
-        }
+        Self { id, range, body: Vec::new(), ok: false, need_vouts: Vec::new(), n_out: 0 }
     }
 
     pub fn from_fk(fk: Fk, range: Option<(u64, u64)>) -> Option<Self> {
@@ -120,11 +113,8 @@ fn group_body_peeks(windows: &[(u64, u64)]) -> Vec<(u64, u64, Vec<usize>)> {
     }
     let pages = |off: u64, len: u64| -> (u64, u64) {
         let lo = off / BODY_OS_PAGE;
-        let hi = if len == 0 {
-            lo
-        } else {
-            off.saturating_add(len).saturating_sub(1) / BODY_OS_PAGE
-        };
+        let hi =
+            if len == 0 { lo } else { off.saturating_add(len).saturating_sub(1) / BODY_OS_PAGE };
         (lo, hi)
     };
     let mut start = 0usize;
@@ -140,11 +130,7 @@ fn group_body_peeks(windows: &[(u64, u64)]) -> Vec<(u64, u64, Vec<usize>)> {
             continue;
         }
         let page_off = (min_off / BODY_OS_PAGE) * BODY_OS_PAGE;
-        groups.push((
-            page_off,
-            max_end.saturating_sub(page_off),
-            (start..i).collect(),
-        ));
+        groups.push((page_off, max_end.saturating_sub(page_off), (start..i).collect()));
         start = i;
         glo = plo;
         ghi = phi;
@@ -152,11 +138,7 @@ fn group_body_peeks(windows: &[(u64, u64)]) -> Vec<(u64, u64, Vec<usize>)> {
         max_end = off.saturating_add(len);
     }
     let page_off = (min_off / BODY_OS_PAGE) * BODY_OS_PAGE;
-    groups.push((
-        page_off,
-        max_end.saturating_sub(page_off),
-        (start..windows.len()).collect(),
-    ));
+    groups.push((page_off, max_end.saturating_sub(page_off), (start..windows.len()).collect()));
     groups
 }
 
@@ -197,13 +179,15 @@ fn pread_grouped_peeks(
     let groups = group_body_peeks(&windows);
     let mut bounce: Vec<Option<Vec<u8>>> = groups
         .iter()
-        .map(|(_, span, members)| {
-            if members.len() == 1 {
-                None
-            } else {
-                Some(vec![0u8; *span as usize])
-            }
-        })
+        .map(
+            |(_, span, members)| {
+                if members.len() == 1 {
+                    None
+                } else {
+                    Some(vec![0u8; *span as usize])
+                }
+            },
+        )
         .collect();
     // SAFETY: each SQE buffer is a distinct job.body slice (singleton) or bounce
     // allocation (merged). Dest windows do not overlap jobs in one wave.
@@ -218,28 +202,18 @@ fn pread_grouped_peeks(
             unsafe { std::slice::from_raw_parts_mut(ptr, d.len) }
         } else {
             let Some(buf) = bounce[g].as_mut() else {
-                return Err(StoreError::Corrupt(
-                    "invariant: merged body peek missing bounce",
-                ));
+                return Err(StoreError::Corrupt("invariant: merged body peek missing bounce"));
             };
             let ptr = buf.as_mut_ptr();
             // SAFETY: bounce[g] is unique to this merged group until after pread.
             unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) }
         };
-        ops.push(ReadOp {
-            fd: body_fd,
-            offset: off,
-            buf: slice,
-            result: i32::MIN,
-        });
+        ops.push(ReadOp { fd: body_fd, offset: off, buf: slice, result: i32::MIN });
     }
     bulk_io::pread_batch_backend(&mut ops, backend);
     for (g, ((page_off, _, members), ro)) in groups.iter().zip(ops.iter()).enumerate() {
         if ro.result < 0 {
-            return Err(StoreError::io(
-                body_path,
-                std::io::Error::from_raw_os_error(-ro.result),
-            ));
+            return Err(StoreError::io(body_path, std::io::Error::from_raw_os_error(-ro.result)));
         }
         let got = ro.result as usize;
         if let [wi] = members.as_slice() {
@@ -256,9 +230,7 @@ fn pread_grouped_peeks(
             continue;
         }
         let Some(buf) = bounce[g].as_ref() else {
-            return Err(StoreError::Corrupt(
-                "invariant: merged body peek missing bounce",
-            ));
+            return Err(StoreError::Corrupt("invariant: merged body peek missing bounce"));
         };
         for &wi in members {
             let d = &dests[wi];
@@ -395,10 +367,7 @@ fn extend_truncated_txout_jobs(
     }
     let extend_n = rest.len() as u64;
     rest.sort_unstable_by_key(|&(i, have)| {
-        jobs[i]
-            .range
-            .map(|(o, _)| o.saturating_add(have as u64))
-            .unwrap_or(0)
+        jobs[i].range.map(|(o, _)| o.saturating_add(have as u64)).unwrap_or(0)
     });
     let dests: Vec<PeekDest> = rest
         .iter()
@@ -460,11 +429,7 @@ mod tests {
         let mut script = vec![0x51, 0x20];
         script.extend_from_slice(&[0x11u8; 32]);
         let rec = OutputRecord::unspent(6_2500_0000, script.clone());
-        assert_eq!(
-            rec.encoded_len_exact() as u64,
-            35,
-            "6.25 BTC exp+mantissa+P2TR"
-        );
+        assert_eq!(rec.encoded_len_exact() as u64, 35, "6.25 BTC exp+mantissa+P2TR");
         let fat = OutputRecord::unspent(2_6843_5456, script);
         assert_eq!(
             fat.encoded_len_exact() as u64,
@@ -481,12 +446,7 @@ mod tests {
 
     #[test]
     fn group_sqe_singleton_is_job_window_not_page_span() {
-        let dests = [PeekDest {
-            job: 0,
-            off: 4000,
-            dest: 0,
-            len: 96,
-        }];
+        let dests = [PeekDest { job: 0, off: 4000, dest: 0, len: 96 }];
         let g = group_body_peeks(&[(4000, 96)]);
         assert_eq!(g.len(), 1);
         let (off, len, direct) = group_sqe(g[0].0, g[0].1, &g[0].2, &dests);
@@ -498,18 +458,8 @@ mod tests {
     #[test]
     fn group_sqe_merged_stays_page_span() {
         let dests = [
-            PeekDest {
-                job: 0,
-                off: 0,
-                dest: 0,
-                len: 91,
-            },
-            PeekDest {
-                job: 1,
-                off: 91,
-                dest: 0,
-                len: 91,
-            },
+            PeekDest { job: 0, off: 0, dest: 0, len: 91 },
+            PeekDest { job: 1, off: 91, dest: 0, len: 91 },
         ];
         let g = group_body_peeks(&[(0, 91), (91, 91)]);
         assert_eq!(g.len(), 1);
@@ -568,10 +518,7 @@ mod tests {
             for j in 0..(1 + (i % 3)) {
                 outs.push(OutputRecord::unspent(j as i64 + 1, vec![0x51, j]));
             }
-            fks.push(
-                t.put_full_batch_indexed(&[(tx, inputs, outs)], true)
-                    .unwrap()[0],
-            );
+            fks.push(t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0]);
         }
         fks
     }
@@ -649,9 +596,7 @@ mod tests {
         };
         let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
         let outs = vec![OutputRecord::unspent(1, vec![0x51; 6000])];
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         let (_off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
@@ -694,11 +639,7 @@ mod tests {
         for _ in 0..64 {
             let cur = t.body.body_published_len();
             let into = cur % BODY_OS_PAGE;
-            let room = if into == 0 {
-                BODY_OS_PAGE
-            } else {
-                BODY_OS_PAGE - into
-            };
+            let room = if into == 0 { BODY_OS_PAGE } else { BODY_OS_PAGE - into };
             if into != 0 && room >= room_lo && room <= room_hi {
                 return;
             }
@@ -722,8 +663,7 @@ mod tests {
             };
             let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
             let outs = vec![OutputRecord::unspent(1, vec![0x51; script_len])];
-            t.put_full_batch_indexed(&[(tx, inputs, outs)], true)
-                .unwrap();
+            t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap();
         }
         let cur = t.body.body_published_len();
         panic!(
@@ -737,9 +677,7 @@ mod tests {
     fn pipeline_outs_guess_full_when_late_vout_likely_spills() {
         let (dir, t) = temp_tx();
         let (tx, inputs, outs) = fat_many_outs(120);
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         let (off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         assert_eq!(outs_first_wave_len(off, full_len, &[119]), full_len);
@@ -769,9 +707,7 @@ mod tests {
         let (dir, t) = temp_tx();
         pad_until_page_room(&t, 8, 32);
         let (tx, inputs, outs) = fat_many_outs(80);
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         let (off, full_len) = t.body_range(fk).unwrap();
         let room = BODY_OS_PAGE - (off % BODY_OS_PAGE);
         assert!(room < 40, "room={room}");
@@ -802,9 +738,7 @@ mod tests {
         let (dir, t) = temp_tx();
         pad_until_page_room(&t, 200, 400);
         let (tx, inputs, outs) = fat_many_outs(80);
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         let (off, full_len) = t.body_range(fk).unwrap();
         let room = BODY_OS_PAGE - (off % BODY_OS_PAGE);
         assert!((200..=400).contains(&room), "room={room}");
@@ -836,9 +770,7 @@ mod tests {
     fn pipeline_outs_skips_extend_when_need_fits_first_page() {
         let (dir, t) = temp_tx();
         let (tx, inputs, outs) = fat_many_outs(80);
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         let (off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
@@ -846,10 +778,7 @@ mod tests {
         stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
-        assert_eq!(
-            jobs[0].body.len() as u64,
-            outs_first_wave_len(off, full_len, &[0])
-        );
+        assert_eq!(jobs[0].body.len() as u64, outs_first_wave_len(off, full_len, &[0]));
         assert_eq!(stats.extend_n, 0);
         assert_eq!(stats.guess_full_n, 0);
         let (meta, live, _) = crate::tx_table::decode_packed_tx_need_outs_with_spender_rels_secret(
@@ -869,9 +798,7 @@ mod tests {
     fn pipeline_outs_extends_when_need_past_first_page() {
         let (dir, t) = temp_tx();
         let (tx, inputs, outs) = fat_many_outs(80);
-        let fk = t
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = t.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         let (_off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
@@ -928,11 +855,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, fk)| {
-                let range = if i == 3 {
-                    Some((known_off, known_len))
-                } else {
-                    None
-                };
+                let range = if i == 3 { Some((known_off, known_len)) } else { None };
                 IdxBodyJob::new(fk.0, range)
             })
             .collect();
@@ -979,11 +902,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, fk)| {
-                let range = if i % 2 == 0 {
-                    Some(t.body_range(*fk).unwrap())
-                } else {
-                    None
-                };
+                let range = if i % 2 == 0 { Some(t.body_range(*fk).unwrap()) } else { None };
                 IdxBodyJob::new(fk.0, range)
             })
             .collect();
@@ -1062,11 +981,8 @@ mod tests {
         let ranges: Vec<_> = jobs.iter().map(|j| j.range).collect();
 
         // Wave 2: all ranges pre-known (skip idx) — confirm pin_new-ish path
-        let mut jobs2: Vec<IdxBodyJob> = fks
-            .iter()
-            .zip(ranges.iter())
-            .map(|(fk, r)| IdxBodyJob::new(fk.0, *r))
-            .collect();
+        let mut jobs2: Vec<IdxBodyJob> =
+            fks.iter().zip(ranges.iter()).map(|(fk, r)| IdxBodyJob::new(fk.0, *r)).collect();
         let t1 = Instant::now();
         stamp_txout(&t, &mut jobs2);
         run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Full).unwrap();

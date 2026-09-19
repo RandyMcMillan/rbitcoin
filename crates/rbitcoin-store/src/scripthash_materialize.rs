@@ -96,9 +96,7 @@ fn decode_unsorted_rec(rec: &[u8]) -> Result<([u8; 32], Fk), StoreError> {
     }
     let mut sh = [0u8; 32];
     sh[..SH_HEAD_KEY_LEN].copy_from_slice(&rec[..SH_HEAD_KEY_LEN]);
-    let fk = Fk(u64::from_le_bytes(
-        rec[SH_HEAD_KEY_LEN..].try_into().unwrap(),
-    ));
+    let fk = Fk(u64::from_le_bytes(rec[SH_HEAD_KEY_LEN..].try_into().unwrap()));
     Ok((sh, fk))
 }
 
@@ -113,12 +111,8 @@ fn seal_shard(
     let creates = pack.creates;
     let t_mphf = Instant::now();
     table.publish_packed_shard(shard, pack)?;
-    progress
-        .mphf_ns
-        .fetch_add(t_mphf.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    progress
-        .creates_published
-        .fetch_add(creates, Ordering::Relaxed);
+    progress.mphf_ns.fetch_add(t_mphf.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    progress.creates_published.fetch_add(creates, Ordering::Relaxed);
     progress.shards_published.fetch_add(1, Ordering::Relaxed);
     table.store_sharded_cold_progress(
         progress.keys_packed.load(Ordering::Relaxed),
@@ -170,10 +164,9 @@ fn plan_unsorted_collect(
         None => UnsortedCollectAction::Full,
         Some(d) if d >= class_a_last => UnsortedCollectAction::Skip,
         Some(_) if any_sealed_shards => UnsortedCollectAction::Skip,
-        Some(d) => UnsortedCollectAction::Append {
-            first: d.saturating_add(1).max(1),
-            last: class_a_last,
-        },
+        Some(d) => {
+            UnsortedCollectAction::Append { first: d.saturating_add(1).max(1), last: class_a_last }
+        }
     }
 }
 
@@ -257,10 +250,7 @@ fn ensure_unsorted_allocated(
     if write_len < UNSORTED_FLUSH_BYTES {
         return Ok(());
     }
-    let new_cap = need
-        .div_ceil(UNSORTED_ALLOC_STEP)
-        .saturating_mul(UNSORTED_ALLOC_STEP)
-        .max(need);
+    let new_cap = need.div_ceil(UNSORTED_ALLOC_STEP).saturating_mul(UNSORTED_ALLOC_STEP).max(need);
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -280,9 +270,7 @@ fn flush_unsorted_buf(sink: &UnsortedShardSink, buf: &mut Vec<u8>) -> Result<(),
         return Ok(());
     }
     if !buf.len().is_multiple_of(UNSORTED_REC_LEN) {
-        return Err(StoreError::Corrupt(
-            "scripthash unsorted shard buffer not a multiple of 24",
-        ));
+        return Err(StoreError::Corrupt("scripthash unsorted shard buffer not a multiple of 24"));
     }
     let n = buf.len() as u64;
     let mut g = sink.write.lock().unwrap();
@@ -308,10 +296,7 @@ fn write_unsorted_done(dir: &Path, last_fk: u64, per_shard: &[u64]) -> Result<()
     let dst = dir.join(UNSORTED_DONE_NAME);
     fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
     {
-        let f = OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| StoreError::io(&tmp, e))?;
+        let f = OpenOptions::new().write(true).open(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     }
     fs::rename(&tmp, &dst).map_err(|e| StoreError::io(&dst, e))?;
@@ -398,9 +383,9 @@ pub(crate) fn collect_unsorted_covering_class_a(
         UnsortedCollectAction::Full => {
             collect_unsorted_from_txs(&store.txs, dir, n_shards, 1, last, workers, false, cancel)
         }
-        UnsortedCollectAction::Append { first, last } => collect_unsorted_from_txs(
-            &store.txs, dir, n_shards, first, last, workers, true, cancel,
-        ),
+        UnsortedCollectAction::Append { first, last } => {
+            collect_unsorted_from_txs(&store.txs, dir, n_shards, first, last, workers, true, cancel)
+        }
     }
 }
 
@@ -443,10 +428,7 @@ fn collect_unsorted_from_txs(
         sinks.push(UnsortedShardSink {
             path,
             file,
-            write: Mutex::new(UnsortedShardWrite {
-                cursor,
-                allocated: cursor,
-            }),
+            write: Mutex::new(UnsortedShardWrite { cursor, allocated: cursor }),
         });
     }
 
@@ -561,9 +543,8 @@ fn collect_unsorted_from_txs(
         }
         for j in joins {
             if j.join().is_err() {
-                *first_err.lock().unwrap() = Some(StoreError::Corrupt(
-                    "scripthash unsorted collect worker panicked",
-                ));
+                *first_err.lock().unwrap() =
+                    Some(StoreError::Corrupt("scripthash unsorted collect worker panicked"));
             }
         }
         stop.store(true, Ordering::Relaxed);
@@ -580,16 +561,10 @@ fn collect_unsorted_from_txs(
     for sink in &sinks {
         let bytes = sink.write.lock().unwrap().cursor;
         if !bytes.is_multiple_of(UNSORTED_REC_LEN as u64) {
-            return Err(StoreError::Corrupt(
-                "scripthash unsorted shard size not a multiple of 24",
-            ));
+            return Err(StoreError::Corrupt("scripthash unsorted shard size not a multiple of 24"));
         }
-        sink.file
-            .set_len(bytes)
-            .map_err(|e| StoreError::io(&sink.path, e))?;
-        sink.file
-            .sync_all()
-            .map_err(|e| StoreError::io(&sink.path, e))?;
+        sink.file.set_len(bytes).map_err(|e| StoreError::io(&sink.path, e))?;
+        sink.file.sync_all().map_err(|e| StoreError::io(&sink.path, e))?;
         per_shard.push(bytes / UNSORTED_REC_LEN as u64);
     }
     write_unsorted_done(dir, last, &per_shard)?;
@@ -599,11 +574,7 @@ fn collect_unsorted_from_txs(
          append={append} elapsed={:?}",
         t0.elapsed()
     );
-    Ok(UnsortedShardCollect {
-        recs,
-        per_shard,
-        last_fk: last,
-    })
+    Ok(UnsortedShardCollect { recs, per_shard, last_fk: last })
 }
 
 fn rec_fk_le(rec: &[u8; UNSORTED_REC_LEN]) -> u64 {
@@ -623,9 +594,7 @@ fn sort_unique_unsorted_recs(bytes: &mut Vec<u8>) -> Result<(), StoreError> {
         let (recs, rem) = bytes.as_chunks_mut::<UNSORTED_REC_LEN>();
         debug_assert!(rem.is_empty());
         recs.sort_unstable_by(|a, b| {
-            a[..SH_HEAD_KEY_LEN]
-                .cmp(&b[..SH_HEAD_KEY_LEN])
-                .then(rec_fk_le(a).cmp(&rec_fk_le(b)))
+            a[..SH_HEAD_KEY_LEN].cmp(&b[..SH_HEAD_KEY_LEN]).then(rec_fk_le(a).cmp(&rec_fk_le(b)))
         });
         let mut w = 0usize;
         for r in 0..recs.len() {
@@ -692,15 +661,10 @@ fn pack_unsorted_shard(
     }
     let loop_wall = t_loop.elapsed().as_nanos() as u64;
     let pack_during_loop = session.pack_ns;
-    progress.merge_ns.fetch_add(
-        loop_wall.saturating_sub(pack_during_loop),
-        Ordering::Relaxed,
-    );
+    progress.merge_ns.fetch_add(loop_wall.saturating_sub(pack_during_loop), Ordering::Relaxed);
     let pack = session.finish_pack()?;
     progress.pack_ns.fetch_add(pack.pack_ns, Ordering::Relaxed);
-    progress
-        .body_flush_ns
-        .fetch_add(pack.body_flush_ns, Ordering::Relaxed);
+    progress.body_flush_ns.fetch_add(pack.body_flush_ns, Ordering::Relaxed);
     progress.keys_packed.fetch_add(pack.keys, Ordering::Relaxed);
     Ok(pack)
 }
@@ -737,11 +701,8 @@ pub fn materialize_sh_from_unsorted(
     cancel: Option<&AtomicBool>,
 ) -> Result<ShShardMaterialize, StoreError> {
     let n_shards = table.head_shard_count().max(1);
-    let jobs: Vec<usize> = table
-        .unsealed_main_shards()
-        .into_iter()
-        .filter(|s| *s < n_shards)
-        .collect();
+    let jobs: Vec<usize> =
+        table.unsealed_main_shards().into_iter().filter(|s| *s < n_shards).collect();
     if jobs.is_empty() {
         return Ok(ShShardMaterialize {
             creates: table.entry_count(),
@@ -759,12 +720,8 @@ pub fn materialize_sh_from_unsorted(
     let progress = MaterializeProgress::new();
     let already = (n_shards - jobs.len()) as u32;
     progress.shards_published.store(already, Ordering::Relaxed);
-    progress
-        .recs_packed
-        .store(table.entry_count(), Ordering::Relaxed);
-    progress
-        .creates_published
-        .store(table.entry_count(), Ordering::Relaxed);
+    progress.recs_packed.store(table.entry_count(), Ordering::Relaxed);
+    progress.creates_published.store(table.entry_count(), Ordering::Relaxed);
     let max_fk = AtomicU64::new(0);
     rbitcoin_log::info!(
         "store: scripthash unsorted pack start unsealed={} n_shards={n_shards} workers={workers}",
@@ -831,9 +788,7 @@ pub fn materialize_sh_from_unsorted(
             }
             for j in joins {
                 if j.join().is_err() {
-                    return Err(StoreError::Corrupt(
-                        "scripthash unsorted pack worker panicked",
-                    ));
+                    return Err(StoreError::Corrupt("scripthash unsorted pack worker panicked"));
                 }
             }
             let err = shared.err.lock().unwrap().take();
@@ -872,16 +827,9 @@ pub fn materialize_sh_unsorted_from_class_a(
     let table = &store.scripthash;
     let n_shards = table.head_shard_count().max(1);
     let dir = unsorted_shard_dir(store.path());
-    let collect_workers = if collect_workers == 0 {
-        unsorted_collect_workers()
-    } else {
-        collect_workers
-    };
-    let pack_workers = if pack_workers == 0 {
-        unsorted_pack_workers()
-    } else {
-        pack_workers
-    };
+    let collect_workers =
+        if collect_workers == 0 { unsorted_collect_workers() } else { collect_workers };
+    let pack_workers = if pack_workers == 0 { unsorted_pack_workers() } else { pack_workers };
 
     let unsealed = table.unsealed_main_shards();
     if unsealed.is_empty() && (!table.head_is_empty() || table.entry_count() > 0) {
@@ -1005,10 +953,7 @@ mod tests {
             .map(|c| {
                 let mut sh = [0u8; 32];
                 sh[..SH_HEAD_KEY_LEN].copy_from_slice(&c[..SH_HEAD_KEY_LEN]);
-                (
-                    sh,
-                    u64::from_le_bytes(c[SH_HEAD_KEY_LEN..].try_into().unwrap()),
-                )
+                (sh, u64::from_le_bytes(c[SH_HEAD_KEY_LEN..].try_into().unwrap()))
             })
             .collect()
     }
@@ -1023,26 +968,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-sh-unsink-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("00");
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
+        let file = OpenOptions::new().create(true).write(true).truncate(true).open(&path).unwrap();
         let sink = UnsortedShardSink {
             path: path.clone(),
             file,
-            write: Mutex::new(UnsortedShardWrite {
-                cursor: 0,
-                allocated: 0,
-            }),
+            write: Mutex::new(UnsortedShardWrite { cursor: 0, allocated: 0 }),
         };
         (dir, sink)
     }
@@ -1055,10 +989,7 @@ mod tests {
         flush_unsorted_buf(&sink, &mut a).unwrap();
         flush_unsorted_buf(&sink, &mut b).unwrap();
         let bytes = fs::read(&sink.path).unwrap();
-        assert_eq!(
-            recs_of(&bytes),
-            vec![(prefix_key(1), 1), (prefix_key(2), 2)]
-        );
+        assert_eq!(recs_of(&bytes), vec![(prefix_key(1), 1), (prefix_key(2), 2)]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1101,12 +1032,7 @@ mod tests {
         sort_unique_unsorted_recs(&mut bytes).unwrap();
         assert_eq!(
             recs_of(&bytes),
-            vec![
-                (prefix_key(6), 9),
-                (prefix_key(7), 2),
-                (prefix_key(7), 256),
-                (prefix_key(8), 1),
-            ],
+            vec![(prefix_key(6), 9), (prefix_key(7), 2), (prefix_key(7), 256), (prefix_key(8), 1),],
             "numeric fk order (256 after 2), drop null and duplicate (sh,fk)"
         );
         assert_eq!(unique_sh_key_count(&bytes), 3);
@@ -1115,10 +1041,7 @@ mod tests {
     #[test]
     fn sort_unique_unsorted_recs_rejects_torn_length() {
         let err = sort_unique_unsorted_recs(&mut vec![0u8; 39]).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Corrupt(m) if m.contains("multiple of 24")),
-            "got {err}"
-        );
+        assert!(matches!(err, StoreError::Corrupt(m) if m.contains("multiple of 24")), "got {err}");
     }
 
     #[test]
@@ -1131,10 +1054,7 @@ mod tests {
         assert_eq!(rec.len(), 24);
         assert_eq!(&rec[..16], &[0x11; 16]);
         assert_eq!(&rec[16..], &0x0102_0304_0506_0708u64.to_le_bytes());
-        assert!(
-            rec.iter().all(|&b| b != 0x22),
-            "must not store the trailing 16 hash bytes"
-        );
+        assert!(rec.iter().all(|&b| b != 0x22), "must not store the trailing 16 hash bytes");
     }
 
     #[test]
@@ -1147,10 +1067,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-sh-done-v2-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1172,22 +1089,13 @@ mod tests {
 
     #[test]
     fn plan_unsorted_collect_appends_only_when_no_shards() {
-        assert!(matches!(
-            plan_unsorted_collect(None, 10, false),
-            UnsortedCollectAction::Full
-        ));
-        assert!(matches!(
-            plan_unsorted_collect(Some(10), 10, false),
-            UnsortedCollectAction::Skip
-        ));
+        assert!(matches!(plan_unsorted_collect(None, 10, false), UnsortedCollectAction::Full));
+        assert!(matches!(plan_unsorted_collect(Some(10), 10, false), UnsortedCollectAction::Skip));
         assert!(matches!(
             plan_unsorted_collect(Some(4), 10, false),
             UnsortedCollectAction::Append { first: 5, last: 10 }
         ));
-        assert!(matches!(
-            plan_unsorted_collect(Some(4), 10, true),
-            UnsortedCollectAction::Skip
-        ));
+        assert!(matches!(plan_unsorted_collect(Some(4), 10, true), UnsortedCollectAction::Skip));
     }
 
     #[test]

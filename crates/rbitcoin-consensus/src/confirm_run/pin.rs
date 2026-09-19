@@ -53,12 +53,7 @@ fn spend_edges_from_plan<'a>(
     } else {
         (std::mem::take(&mut parent_pin.parent_vouts), true)
     };
-    Ok(PlanSpend {
-        spend_edges,
-        parent_vouts,
-        vouts_from_stamp,
-        batch_pin_by_id,
-    })
+    Ok(PlanSpend { spend_edges, parent_vouts, vouts_from_stamp, batch_pin_by_id })
 }
 
 fn spend_edges_from_stamp(
@@ -173,11 +168,7 @@ fn apply_plan_pins(
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
                 let tx = pin.tx();
-                let cb = if tx.input_count != 1 {
-                    Some(false)
-                } else {
-                    None
-                };
+                let cb = if tx.input_count != 1 { Some(false) } else { None };
                 let plan_range = parent_pin.body_range(*id);
                 if cb.is_some() || plan_range.is_some() {
                     batch_parents.refresh_pin_meta(fk, cb, plan_range, Vec::new());
@@ -191,11 +182,7 @@ fn apply_plan_pins(
                 still_need.insert(*id, need.clone());
                 continue;
             }
-            let cb = if pin.tx().input_count != 1 {
-                Some(false)
-            } else {
-                None
-            };
+            let cb = if pin.tx().input_count != 1 { Some(false) } else { None };
             let plan_range = parent_pin.body_range(*id);
             batch_parents.insert_create_pin(
                 fk,
@@ -244,10 +231,8 @@ fn denserels_by_stamped_range(
         return Ok((0, 0));
     }
     let n_range = range_jobs.len() as u64;
-    let (decoded, body_ns, dec_ns, extend_n, body_sqe_n, guess_full_n) = query
-        .store()
-        .get_outs_by_range_batch(&range_jobs)
-        .map_err(ConsensusError::from)?;
+    let (decoded, body_ns, dec_ns, extend_n, body_sqe_n, guess_full_n) =
+        query.store().get_outs_by_range_batch(&range_jobs).map_err(ConsensusError::from)?;
     let rng_ns = body_ns.saturating_add(dec_ns);
     if rng_ns > 0 {
         rbitcoin_query::note_confirm(&query.confirm_stats().cold_io_ns, rng_ns);
@@ -282,17 +267,11 @@ fn denserels_by_stamped_range(
         }
         if tx.txid == [0u8; 32] {
             tx.txid =
-                parent_pin
-                    .create_txid(id)
-                    .ok_or(ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: lookup stage miss (load parent create identity not stamped)",
-                    )))?;
+                parent_pin.create_txid(id).ok_or(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: lookup stage miss (load parent create identity not stamped)",
+                )))?;
         }
-        let cb = if tx.input_count != 1 {
-            Some(false)
-        } else {
-            None
-        };
+        let cb = if tx.input_count != 1 { Some(false) } else { None };
         batch_parents.insert_owned(fk, tx, live, need, cb, Some(range), sparse);
         still_need.remove(&id);
     }
@@ -320,12 +299,8 @@ pub(super) fn pin_for_wire_batch(
     let t_pin = Instant::now();
     let t_thin = Instant::now();
 
-    let PlanSpend {
-        spend_edges,
-        mut parent_vouts,
-        vouts_from_stamp,
-        batch_pin_by_id,
-    } = match plan {
+    let PlanSpend { spend_edges, mut parent_vouts, vouts_from_stamp, batch_pin_by_id } = match plan
+    {
         Some(p) => spend_edges_from_plan(p, parent_pin)?,
         None => {
             let (edges, vouts) = spend_edges_from_stamp(parent_pin, metas, wire_blocks);
@@ -345,13 +320,8 @@ pub(super) fn pin_for_wire_batch(
         }
     }
 
-    let plan_by_id = fill_pins(
-        &parent_vouts,
-        &batch_pin_by_id,
-        parent_pin,
-        in_flight,
-        query.confirm_stats(),
-    );
+    let plan_by_id =
+        fill_pins(&parent_vouts, &batch_pin_by_id, parent_pin, in_flight, query.confirm_stats());
 
     let mut batch_parents = rbitcoin_query::BatchParents::with_capacity(parent_vouts.len());
     let thin_ns = t_thin.elapsed().as_nanos() as u64;
@@ -390,10 +360,7 @@ pub(super) fn pin_for_wire_batch(
     {
         for (id, need) in &parent_vouts {
             let fk = rbitcoin_primitives::Fk(*id);
-            debug_assert!(
-                batch_parents.contains(fk),
-                "invariant: wire pin missing spent parent"
-            );
+            debug_assert!(batch_parents.contains(fk), "invariant: wire pin missing spent parent");
             debug_assert!(
                 need.is_empty() || batch_parents.pin_covered(fk, need),
                 "invariant: wire pin incomplete outs for spent parent"

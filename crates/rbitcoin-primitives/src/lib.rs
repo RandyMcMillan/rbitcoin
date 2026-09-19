@@ -31,20 +31,14 @@ pub fn rbitcoin_subversion(
         let c = c.as_ref();
         for ch in c.chars() {
             if matches!(ch, '/' | ':' | '(' | ')') || !ch.is_ascii() {
-                return Err(format!(
-                    "User Agent comment ({ch}) contains unsafe characters."
-                ));
+                return Err(format!("User Agent comment ({ch}) contains unsafe characters."));
             }
         }
     }
     let s = if comments.is_empty() {
         format!("/rbitcoin:{pkg_version}/")
     } else {
-        let joined = comments
-            .iter()
-            .map(|c| c.as_ref())
-            .collect::<Vec<_>>()
-            .join("; ");
+        let joined = comments.iter().map(|c| c.as_ref()).collect::<Vec<_>>().join("; ");
         format!("/rbitcoin:{pkg_version}({joined})/")
     };
     if s.len() > 256 {
@@ -194,9 +188,7 @@ impl Network {
             "test" | "testnet" | "testnet3" => Ok(Network::Testnet),
             "signet" => Ok(Network::Signet),
             "regtest" => Ok(Network::Regtest),
-            other => Err(ParseNetworkError {
-                input: other.to_string(),
-            }),
+            other => Err(ParseNetworkError { input: other.to_string() }),
         }
     }
 
@@ -386,18 +378,13 @@ mod tests {
 
     #[test]
     fn subversion_comments_and_rejects() {
-        assert_eq!(
-            rbitcoin_subversion("0.1.0", &[] as &[&str]).unwrap(),
-            "/rbitcoin:0.1.0/"
-        );
+        assert_eq!(rbitcoin_subversion("0.1.0", &[] as &[&str]).unwrap(), "/rbitcoin:0.1.0/");
         let s = rbitcoin_subversion("0.1.0", &["testnode0"]).unwrap();
         assert_eq!(s, "/rbitcoin:0.1.0(testnode0)/");
         assert_eq!(&s[s.len() - 12..s.len() - 1], "(testnode0)");
         let s = rbitcoin_subversion("0.1.0", &["testnode0", "foo"]).unwrap();
         assert_eq!(s, "/rbitcoin:0.1.0(testnode0; foo)/");
-        assert!(rbitcoin_subversion("0.1.0", &["a/b"])
-            .unwrap_err()
-            .contains("unsafe"));
+        assert!(rbitcoin_subversion("0.1.0", &["a/b"]).unwrap_err().contains("unsafe"));
         assert!(rbitcoin_subversion("0.1.0", &["a".repeat(256)])
             .unwrap_err()
             .contains("exceeds maximum"));

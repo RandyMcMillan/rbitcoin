@@ -46,10 +46,8 @@ pub(crate) fn verify_with_scripthash(
 
     let mut stack: Vec<Vec<u8>> = Vec::with_capacity(wit_len.saturating_sub(1));
     for i in 0..wit_len - 1 {
-        let item = input
-            .witness
-            .nth(i)
-            .ok_or_else(|| ConsensusError::Script("p2wsh witness".into()))?;
+        let item =
+            input.witness.nth(i).ok_or_else(|| ConsensusError::Script("p2wsh witness".into()))?;
         if item.len() > interpreter::MAX_SCRIPT_ELEMENT_SIZE {
             return Err(ConsensusError::Script("PUSH_SIZE".into()));
         }

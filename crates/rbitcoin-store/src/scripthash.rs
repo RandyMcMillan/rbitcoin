@@ -102,12 +102,7 @@ impl ColdProgress {
         let body_bump = u64::from_le_bytes(buf[12..20].try_into().unwrap());
         let live_count = u64::from_le_bytes(buf[20..28].try_into().unwrap());
         let keys_written = u64::from_le_bytes(buf[28..36].try_into().unwrap());
-        Ok(Some(Self {
-            next_shard,
-            body_bump,
-            live_count,
-            keys_written,
-        }))
+        Ok(Some(Self { next_shard, body_bump, live_count, keys_written }))
     }
 
     pub fn store(&self, store_dir: &Path) -> Result<(), StoreError> {
@@ -193,10 +188,7 @@ pub struct ScriptHashRecord {
 
 impl ScriptHashRecord {
     pub fn from_fk(scripthash: [u8; 32], create_tx_fk: Fk) -> Self {
-        Self {
-            scripthash,
-            create_tx_fk,
-        }
+        Self { scripthash, create_tx_fk }
     }
 
     pub fn is_tombstone(&self) -> bool {
@@ -222,9 +214,7 @@ struct AllocState {
 }
 
 fn largest_reloc_class_le(bytes: u64) -> Option<u8> {
-    (0..=SH_MAX_SLAB_CLASS)
-        .rev()
-        .find(|&c| slab_bytes(c) <= bytes)
+    (0..=SH_MAX_SLAB_CLASS).rev().find(|&c| slab_bytes(c) <= bytes)
 }
 
 fn push_free_head(
@@ -361,11 +351,8 @@ fn init_empty_body(body: &TableFile) -> Result<AllocState, StoreError> {
     let payload0 = payload_start(FILE_HEADER_LEN);
     body.ensure_capacity(payload0)?;
     body.set_logical_len(payload0)?;
-    let state = AllocState {
-        live_count: 0,
-        bump: payload0,
-        free_head: [0; SH_MAX_CLASS as usize + 1],
-    };
+    let state =
+        AllocState { live_count: 0, bump: payload0, free_head: [0; SH_MAX_CLASS as usize + 1] };
     write_alloc_header(body, &state)?;
     Ok(state)
 }
@@ -595,12 +582,7 @@ fn read_sh_page_bytes(
             }
             use crate::bulk_io::{self, ReadOp};
             let fd = body.read_fd();
-            let mut ops = [ReadOp {
-                fd,
-                offset: off,
-                buf,
-                result: i32::MIN,
-            }];
+            let mut ops = [ReadOp { fd, offset: off, buf, result: i32::MIN }];
             bulk_io::pread_batch(&mut ops);
             if ops[0].result < 0 {
                 return Err(StoreError::io(
@@ -715,16 +697,13 @@ fn collect_extent_then_tail(
         return collect_page_chain_linked(body, first, page_ios);
     }
     let last_in_ext = base.saturating_add(((n - 1) as u64).saturating_mul(SH_PAGE_SIZE as u64));
-    let (mut out, tail_off) = collect_page_chain_span(body, base, n, page_ios)?.ok_or(
-        StoreError::Corrupt("scripthash extent prefix next links broken"),
-    )?;
+    let (mut out, tail_off) = collect_page_chain_span(body, base, n, page_ios)?
+        .ok_or(StoreError::Corrupt("scripthash extent prefix next links broken"))?;
     if last_page == last_in_ext {
         return Ok(out);
     }
     if tail_off == 0 {
-        return Err(StoreError::Corrupt(
-            "scripthash extent last_page beyond extent with no tail",
-        ));
+        return Err(StoreError::Corrupt("scripthash extent last_page beyond extent with no tail"));
     }
     let mut prev_last = out.last().map(|fk| fk.0);
     let mut cur = [0u8; SH_PAGE_SIZE];
@@ -926,11 +905,8 @@ impl ScriptHashTable {
 
     fn reset_all_bodies(&self) -> Result<(), StoreError> {
         let payload0 = payload_start(FILE_HEADER_LEN);
-        let empty = AllocState {
-            live_count: 0,
-            bump: payload0,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
-        };
+        let empty =
+            AllocState { live_count: 0, bump: payload0, free_head: [0; SH_MAX_CLASS as usize + 1] };
         for (i, body) in self.bodies.iter().enumerate() {
             *self.allocs[i].lock().unwrap() = empty;
             write_alloc_header(body, &empty)?;
@@ -1019,13 +995,11 @@ impl ScriptHashTable {
 
     /// True when sorted main, ingest, and sealed ovf report no occupied keys.
     pub fn head_is_empty(&self) -> bool {
-        if self.sorted_main.iter().any(|s| {
-            s.read()
-                .unwrap()
-                .as_ref()
-                .map(|h| !h.is_empty())
-                .unwrap_or(false)
-        }) {
+        if self
+            .sorted_main
+            .iter()
+            .any(|s| s.read().unwrap().as_ref().map(|h| !h.is_empty()).unwrap_or(false))
+        {
             return false;
         }
         if !self.sealed_ovf.lock().unwrap().is_empty() {
@@ -1051,8 +1025,7 @@ impl ScriptHashTable {
         for slot in self.sorted_main.iter() {
             *slot.write().unwrap() = None;
         }
-        self.sorted_main_on
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.sorted_main_on.store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1064,21 +1037,13 @@ impl ScriptHashTable {
         let n = self.n_shards;
         let start = progress.next_shard as usize;
         if start > n {
-            return Err(StoreError::Corrupt(
-                "scripthash cold progress next_shard out of range",
-            ));
+            return Err(StoreError::Corrupt("scripthash cold progress next_shard out of range"));
         }
         let payload0 = payload_start(FILE_HEADER_LEN);
-        let sealed: Vec<bool> = self
-            .sorted_main
-            .iter()
-            .map(|s| s.read().unwrap().is_some())
-            .collect();
-        let empty = AllocState {
-            live_count: 0,
-            bump: payload0,
-            free_head: [0; SH_MAX_CLASS as usize + 1],
-        };
+        let sealed: Vec<bool> =
+            self.sorted_main.iter().map(|s| s.read().unwrap().is_some()).collect();
+        let empty =
+            AllocState { live_count: 0, bump: payload0, free_head: [0; SH_MAX_CLASS as usize + 1] };
         for i in 0..n {
             if sealed.get(i).copied().unwrap_or(false) {
                 continue;
@@ -1120,18 +1085,10 @@ impl ScriptHashTable {
         live_count: u64,
     ) -> Result<(), StoreError> {
         let n = self.n_shards;
-        let next = self
-            .sorted_main
-            .iter()
-            .position(|s| s.read().unwrap().is_none())
-            .unwrap_or(n) as u32;
-        ColdProgress {
-            next_shard: next,
-            body_bump: 0,
-            live_count,
-            keys_written,
-        }
-        .store(&self.store_dir)
+        let next =
+            self.sorted_main.iter().position(|s| s.read().unwrap().is_none()).unwrap_or(n) as u32;
+        ColdProgress { next_shard: next, body_bump: 0, live_count, keys_written }
+            .store(&self.store_dir)
     }
 
     /// Store directory containing `scripthash.body` / head (parent of body path).
@@ -1154,13 +1111,11 @@ impl ScriptHashTable {
         if self.entry_count() > 0 || !self.head_is_empty() {
             return true;
         }
-        if self.sorted_main.iter().any(|s| {
-            s.read()
-                .unwrap()
-                .as_ref()
-                .map(|h| !h.is_empty())
-                .unwrap_or(false)
-        }) {
+        if self
+            .sorted_main
+            .iter()
+            .any(|s| s.read().unwrap().as_ref().map(|h| !h.is_empty()).unwrap_or(false))
+        {
             return true;
         }
         if self.ingest.lock().unwrap().occupied() > 0 {
@@ -1182,12 +1137,7 @@ impl ScriptHashTable {
                 n = n.saturating_add(h.g_bytes_resident() as u64);
             }
         }
-        if let Some(l1) = self
-            .ovf_l1
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
+        if let Some(l1) = self.ovf_l1.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             n = n.saturating_add(l1.head.g_bytes_resident() as u64);
         }
         n
@@ -1200,12 +1150,7 @@ impl ScriptHashTable {
                 n = n.saturating_add(h.occ_bytes_resident() as u64);
             }
         }
-        if let Some(l1) = self
-            .ovf_l1
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
+        if let Some(l1) = self.ovf_l1.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             n = n.saturating_add(l1.head.occ_bytes_resident() as u64);
         }
         n
@@ -1218,10 +1163,7 @@ impl ScriptHashTable {
 
     /// Which head segment holds `scripthash` (if any).
     fn key_home(&self, scripthash: &[u8; 32]) -> Result<KeyHome, StoreError> {
-        Ok(self
-            .locate_head(scripthash)?
-            .map(|(_, h)| h)
-            .unwrap_or(KeyHome::Absent))
+        Ok(self.locate_head(scripthash)?.map(|(_, h)| h).unwrap_or(KeyHome::Absent))
     }
 
     /// Tip-mode probe: overflow first (ingest OA, then sealed ovf fuse), then main.
@@ -1275,10 +1217,7 @@ impl ScriptHashTable {
         home: KeyHome,
     ) -> Result<ShHeadValue, StoreError> {
         match val {
-            ShHeadValue::Paged {
-                first_page: 0,
-                last_page,
-            } if last_page != 0 => {
+            ShHeadValue::Paged { first_page: 0, last_page } if last_page != 0 => {
                 let first =
                     paged_first_from_last(self.body_for(key, home), last_page, &self.page_ios)?;
                 Ok(ShHeadValue::paged(first, last_page))
@@ -1288,15 +1227,13 @@ impl ScriptHashTable {
     }
 
     fn has_sorted_main(&self) -> bool {
-        self.sorted_main_on
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.sorted_main_on.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn install_sorted_main(&self, shard: usize, sealed: MphfHead) {
         if let Some(slot) = self.sorted_main.get(shard) {
             *slot.write().unwrap() = Some(sealed);
-            self.sorted_main_on
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.sorted_main_on.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -1579,11 +1516,8 @@ impl ScriptHashTable {
             let kh_early = home.get(&key).copied().unwrap_or(KeyHome::Absent);
             let max = self.last_create_fk_on(self.body_for(&key, kh_early), &cur)?;
             let max_u = max.map(|f| f.0).unwrap_or(0);
-            let add: Vec<Fk> = fk_vals
-                .into_iter()
-                .filter(|&fk| max.is_none() || fk > max_u)
-                .map(Fk)
-                .collect();
+            let add: Vec<Fk> =
+                fk_vals.into_iter().filter(|&fk| max.is_none() || fk > max_u).map(Fk).collect();
             if add.is_empty() {
                 continue;
             }
@@ -1918,10 +1852,7 @@ impl ScriptHashTable {
                 }
                 Ok(got)
             }
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
+            ShHeadValue::Paged { first_page, last_page } => {
                 let first = if *first_page != 0 {
                     *first_page
                 } else {
@@ -2018,10 +1949,7 @@ impl ScriptHashTable {
                 }
                 Ok(new_val)
             }
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
+            ShHeadValue::Paged { first_page, last_page } => {
                 let last =
                     self.append_fks_to_pages(body, alloc, *first_page, *last_page, new_ents)?;
                 Ok(ShHeadValue::paged(*first_page, last))
@@ -2169,11 +2097,7 @@ impl ScriptHashTable {
         let mut creates = crate::scripthash_pages::sh_page_extent_creates(&page);
         let mut extent = sh_page_extent(&page)?;
         let chain_first = {
-            let f = if sh_page_is_last(&page)? {
-                sh_page_first_off(&page)?
-            } else {
-                0
-            };
+            let f = if sh_page_is_last(&page)? { sh_page_first_off(&page)? } else { 0 };
             if f == 0 {
                 first_page
             } else {
@@ -2419,9 +2343,7 @@ impl ScriptHashTable {
             }
         }
         if !hit {
-            return Err(StoreError::Corrupt(
-                "scripthash: sealed ovf unlink missed home",
-            ));
+            return Err(StoreError::Corrupt("scripthash: sealed ovf unlink missed home"));
         }
         Ok(())
     }
@@ -2474,11 +2396,7 @@ impl ScriptHashTable {
             ));
         }
         let n_shards = self.n_shards.max(1);
-        let hint = if unique_hint == 0 {
-            sh_unique_hint_default(self.scale)
-        } else {
-            unique_hint
-        };
+        let hint = if unique_hint == 0 { sh_unique_hint_default(self.scale) } else { unique_hint };
         let key_budget = sh_per_shard_key_budget(hint, n_shards);
         let (bump, live_count, free_head) = {
             let a = self.allocs[0].lock().unwrap();
@@ -2578,17 +2496,11 @@ impl ScriptHashTable {
         let n_shards = self.n_shards.max(1);
         let start = progress.next_shard as usize;
         if start >= n_shards {
-            return Err(StoreError::Corrupt(
-                "scripthash bulk_session_resume: already complete",
-            ));
+            return Err(StoreError::Corrupt("scripthash bulk_session_resume: already complete"));
         }
         // Remaining shards must be empty for live install.
 
-        let hint = if unique_hint == 0 {
-            sh_unique_hint_default(self.scale)
-        } else {
-            unique_hint
-        };
+        let hint = if unique_hint == 0 { sh_unique_hint_default(self.scale) } else { unique_hint };
         let key_budget = sh_per_shard_key_budget(hint, n_shards);
         let payload0 = payload_start(FILE_HEADER_LEN);
         let bump = progress.body_bump.max(payload0);
@@ -2662,11 +2574,7 @@ impl ScriptHashTable {
             body.set_logical_len(bump)?;
         }
         let free_head = self.shard_alloc(shard).lock().unwrap().free_head;
-        let state = AllocState {
-            live_count,
-            bump,
-            free_head,
-        };
+        let state = AllocState { live_count, bump, free_head };
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
         Ok(())
@@ -2690,11 +2598,7 @@ impl ScriptHashTable {
         if bump > body.logical_len() {
             body.set_logical_len(bump)?;
         }
-        let state = AllocState {
-            live_count: live,
-            bump,
-            free_head,
-        };
+        let state = AllocState { live_count: live, bump, free_head };
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
         Ok(bump)
@@ -2784,12 +2688,8 @@ impl<'a> ScriptHashBulkSession<'a> {
 
     /// Creates including the open key's accepted FKs (status while a megakey streams).
     pub fn stream_creates_written(&self) -> u64 {
-        self.live_count.saturating_add(
-            self.open_key
-                .as_ref()
-                .map(|o| u64::from(o.n_total))
-                .unwrap_or(0),
-        )
+        self.live_count
+            .saturating_add(self.open_key.as_ref().map(|o| u64::from(o.n_total)).unwrap_or(0))
     }
 
     /// Unique keys packed so far.
@@ -2816,12 +2716,9 @@ impl<'a> ScriptHashBulkSession<'a> {
 
     #[cfg(test)]
     fn fk_scratch_capacity(&self) -> usize {
-        self.fk_scratch.capacity().max(
-            self.open_key
-                .as_ref()
-                .map(|o| o.buf.capacity())
-                .unwrap_or(0),
-        )
+        self.fk_scratch
+            .capacity()
+            .max(self.open_key.as_ref().map(|o| o.buf.capacity()).unwrap_or(0))
     }
 
     /// Head shards fully installed so far.
@@ -2854,11 +2751,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         if bump > body.logical_len() {
             body.set_logical_len(bump)?;
         }
-        let state = AllocState {
-            live_count,
-            bump,
-            free_head: self.free_head,
-        };
+        let state = AllocState { live_count, bump, free_head: self.free_head };
         write_alloc_header(body, &state)?;
         match self.active_shard {
             Some(si) => *self.table.shard_alloc(si).lock().unwrap() = state,
@@ -2870,9 +2763,7 @@ impl<'a> ScriptHashBulkSession<'a> {
     /// Seal the pack-only session into a remappable blob (no live head write).
     pub fn finish_pack(mut self) -> Result<ShShardPack, StoreError> {
         if !self.pack_only {
-            return Err(StoreError::Corrupt(
-                "scripthash finish_pack requires pack_shard_session",
-            ));
+            return Err(StoreError::Corrupt("scripthash finish_pack requires pack_shard_session"));
         }
         self.finish_key()?;
         self.flush_body()?;
@@ -2918,10 +2809,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             });
         }
         let add = {
-            let open = self
-                .open_key
-                .as_ref()
-                .expect("open_key after prepare_stream_key");
+            let open = self.open_key.as_ref().expect("open_key after prepare_stream_key");
             if let Some(prev) = open.last_fk {
                 if fk.0 == prev {
                     return Ok(());
@@ -2946,10 +2834,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                 uleb128_len(fk.0)
             }
         };
-        let open = self
-            .open_key
-            .as_mut()
-            .expect("open_key after prepare_stream_key");
+        let open = self.open_key.as_mut().expect("open_key after prepare_stream_key");
         open.stream_used = open.stream_used.saturating_add(add);
         open.buf.push(fk.0);
         open.last_fk = Some(fk.0);
@@ -2970,9 +2855,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         let r = self.finish_open_key();
         let elapsed = t0.elapsed().as_nanos() as u64;
         let flush_delta = self.body_flush_ns.saturating_sub(flush_before);
-        self.pack_ns = self
-            .pack_ns
-            .saturating_add(elapsed.saturating_sub(flush_delta));
+        self.pack_ns = self.pack_ns.saturating_add(elapsed.saturating_sub(flush_delta));
         r
     }
 
@@ -3017,9 +2900,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.keys_written = self.keys_written.saturating_add(1);
         let rec = (head_key_from_full(&open.key), pack8(&val)?);
         self.recs.push(rec);
-        self.peak_table_bytes = self
-            .peak_table_bytes
-            .max(self.recs.len().saturating_mul(24));
+        self.peak_table_bytes = self.peak_table_bytes.max(self.recs.len().saturating_mul(24));
         self.return_fk_scratch(open.buf);
         Ok(())
     }
@@ -3033,11 +2914,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut fks: Vec<u64> = entries
-            .iter()
-            .filter(|fk| !fk.is_null())
-            .map(|fk| fk.0)
-            .collect();
+        let mut fks: Vec<u64> = entries.iter().filter(|fk| !fk.is_null()).map(|fk| fk.0).collect();
         fks.sort_unstable();
         fks.dedup();
         for fk in fks {
@@ -3075,11 +2952,8 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn write_open_full_page_with_next(&mut self) -> Result<(), StoreError> {
-        let mut buf = self
-            .open_key
-            .as_mut()
-            .map(|o| std::mem::take(&mut o.buf))
-            .unwrap_or_default();
+        let mut buf =
+            self.open_key.as_mut().map(|o| std::mem::take(&mut o.buf)).unwrap_or_default();
         let off = self.write_page(&buf, true, None)?;
         buf.clear();
         if let Some(open) = self.open_key.as_mut() {
@@ -3104,11 +2978,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.flush_body()?;
         debug_assert!(self.body_buf.is_empty());
         let base = self.align_bump_for_page()?;
-        let next = if has_next {
-            base.saturating_add(SH_PAGE_SIZE as u64)
-        } else {
-            0
-        };
+        let next = if has_next { base.saturating_add(SH_PAGE_SIZE as u64) } else { 0 };
         let end = base.saturating_add(SH_PAGE_SIZE as u64);
         self.ensure_body_capacity(end)?;
         let mut page = [0u8; SH_PAGE_SIZE];
@@ -3279,10 +3149,7 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     fn write_body_bytes(&mut self, off: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        let sequential = off
-            == self
-                .body_write_off
-                .saturating_add(self.body_buf.len() as u64);
+        let sequential = off == self.body_write_off.saturating_add(self.body_buf.len() as u64);
         if sequential {
             self.body_buf.extend_from_slice(bytes);
             if self.body_buf.len() >= BULK_BODY_FLUSH {
@@ -3307,9 +3174,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.body().write_at(self.body_write_off, &self.body_buf)?;
         self.body_write_off = end;
         self.body_buf.clear();
-        self.body_flush_ns = self
-            .body_flush_ns
-            .saturating_add(t0.elapsed().as_nanos() as u64);
+        self.body_flush_ns = self.body_flush_ns.saturating_add(t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -3399,12 +3264,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.flush_active_shard()?;
         ColdProgress::clear(&self.progress_dir);
         self.finished = true;
-        Ok((
-            self.live_count,
-            self.keys_written,
-            self.body_flush_ns,
-            self.head_fill_ns,
-        ))
+        Ok((self.live_count, self.keys_written, self.body_flush_ns, self.head_fill_ns))
     }
 }
 
@@ -3445,10 +3305,9 @@ fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreE
 /// header field layout. Callers upgrade empty v1 → v2 or refuse durable v1.
 fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> {
     let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
-    let avail = body
-        .logical_len()
-        .saturating_sub(FILE_HEADER_LEN as u64)
-        .min(SH_ALLOC_HEADER_LEN as u64) as usize;
+    let avail =
+        body.logical_len().saturating_sub(FILE_HEADER_LEN as u64).min(SH_ALLOC_HEADER_LEN as u64)
+            as usize;
     if avail < 24 {
         return Err(StoreError::Corrupt(
             "scripthash body missing alloc header (expected hybrid SHAL; migrate v3 stores)",
@@ -3456,9 +3315,7 @@ fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> 
     }
     body.read_at(FILE_HEADER_LEN as u64, &mut buf[..avail])?;
     if buf[0..4] != SH_ALLOC_MAGIC {
-        return Err(StoreError::Corrupt(
-            "scripthash body not hybrid (no SHAL magic; run migrate)",
-        ));
+        return Err(StoreError::Corrupt("scripthash body not hybrid (no SHAL magic; run migrate)"));
     }
     let ver = u16::from_le_bytes([buf[4], buf[5]]);
     // v1 = schema-13 slabs; v2 = schema-14 pages; v3 = schema-15. Same fields.
@@ -3476,14 +3333,7 @@ fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> 
         *h = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         off += 8;
     }
-    Ok((
-        AllocState {
-            live_count,
-            bump,
-            free_head,
-        },
-        ver,
-    ))
+    Ok((AllocState { live_count, bump, free_head }, ver))
 }
 
 /// On-disk SHAL version field (after RBT1 file header).
@@ -3492,9 +3342,7 @@ fn read_alloc_version_on_disk(body: &TableFile) -> Result<u16, StoreError> {
     let mut buf = [0u8; 6];
     body.read_at(FILE_HEADER_LEN as u64, &mut buf)?;
     if buf[0..4] != SH_ALLOC_MAGIC {
-        return Err(StoreError::Corrupt(
-            "scripthash body not hybrid (no SHAL magic)",
-        ));
+        return Err(StoreError::Corrupt("scripthash body not hybrid (no SHAL magic)"));
     }
     Ok(u16::from_le_bytes([buf[4], buf[5]]))
 }

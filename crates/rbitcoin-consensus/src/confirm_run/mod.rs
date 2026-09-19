@@ -105,13 +105,7 @@ struct Prepared {
     tx_fks: Vec<rbitcoin_primitives::Fk>,
     jobs: Vec<ScriptCheckJob>,
     /// `(prev_txid, vout, spending_tx_fk, create_tx_fk, vin)`.
-    spends: Vec<(
-        [u8; 32],
-        u32,
-        rbitcoin_primitives::Fk,
-        rbitcoin_primitives::Fk,
-        u32,
-    )>,
+    spends: Vec<([u8; 32], u32, rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
     /// Total fees from assemble (for structural coinbase subsidy check).
     fees: i64,
     check_scripts: bool,
@@ -269,10 +263,8 @@ pub fn confirm_wire_run(
     milestone: Milestone,
     blocks: &[(Height, Block)],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let arcs: Vec<WireBlockIn> = blocks
-        .iter()
-        .map(|(h, b)| (*h, Arc::new(b.clone()), None))
-        .collect();
+    let arcs: Vec<WireBlockIn> =
+        blocks.iter().map(|(h, b)| (*h, Arc::new(b.clone()), None)).collect();
     confirm_wire_run_preverified(query, params, milestone, &arcs, &ScriptPreverified::new())
 }
 

@@ -40,10 +40,7 @@ pub(crate) struct CappedSet<T> {
 
 impl<T> CappedSet<T> {
     pub(crate) fn new() -> Self {
-        Self {
-            set: HashSet::new(),
-            fifo: VecDeque::new(),
-        }
+        Self { set: HashSet::new(), fifo: VecDeque::new() }
     }
 
     pub(crate) fn contains(&self, item: &T) -> bool
@@ -252,11 +249,8 @@ pub struct LivePeer {
 #[cfg(target_os = "linux")]
 fn tcp_has_peer_fin(tcp: &std::net::TcpStream) -> bool {
     use std::os::fd::AsRawFd;
-    let mut pfd = libc::pollfd {
-        fd: tcp.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLRDHUP,
-        revents: 0,
-    };
+    let mut pfd =
+        libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLIN | libc::POLLRDHUP, revents: 0 };
     // SAFETY: fd is a live TcpStream as_raw_fd, timeout 0.
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
     n >= 0 && pfd.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR) != 0
@@ -274,10 +268,7 @@ impl LivePeer {
     }
 
     pub fn has_wire(&self) -> bool {
-        self.wire_recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.wire_recv.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     pub fn raw_recv(&self) -> u64 {
@@ -300,32 +291,18 @@ impl LivePeer {
 
     pub fn note_recv(&self, cmd: &str, nbytes: u64) {
         let n = acct_bytes(cmd, nbytes);
-        *self
-            .recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += n;
+        *self.recv.lock().unwrap_or_else(|e| e.into_inner()).entry(cmd.into()).or_insert(0) += n;
     }
 
     /// Store an already-computed wire size (v2 `*other*` = contents + expansion).
     pub fn note_recv_raw(&self, cmd: &str, nbytes: u64) {
-        *self
-            .recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += nbytes;
+        *self.recv.lock().unwrap_or_else(|e| e.into_inner()).entry(cmd.into()).or_insert(0) +=
+            nbytes;
     }
 
     pub fn note_sent(&self, cmd: &str, nbytes: u64) {
         let n = acct_bytes(cmd, nbytes);
-        *self
-            .sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += n;
+        *self.sent.lock().unwrap_or_else(|e| e.into_inner()).entry(cmd.into()).or_insert(0) += n;
     }
 
     pub fn request_disconnect(&self) {
@@ -454,24 +431,15 @@ impl LivePeer {
     }
 
     fn take_writer_abort(&self) -> Option<tokio::task::AbortHandle> {
-        self.writer_abort
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.writer_abort.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn take_session_abort(&self) -> Option<tokio::task::AbortHandle> {
-        self.session_abort
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.session_abort.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn take_tcp_shutdown(&self) -> Option<std::net::TcpStream> {
-        self.tcp_shutdown
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.tcp_shutdown.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn clear_out_tx(&self) {
@@ -479,17 +447,11 @@ impl LivePeer {
     }
 
     pub fn note_failed_cmpct(&self, hash: BlockHash) {
-        self.failed_cmpct
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(hash);
+        self.failed_cmpct.lock().unwrap_or_else(|e| e.into_inner()).insert(hash);
     }
 
     pub fn has_failed_cmpct(&self, hash: &BlockHash) -> bool {
-        self.failed_cmpct
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(hash)
+        self.failed_cmpct.lock().unwrap_or_else(|e| e.into_inner()).contains(hash)
     }
 
     pub fn set_hb_to(&self, v: bool) {
@@ -501,10 +463,7 @@ impl LivePeer {
     }
 
     pub fn note_best_header_sent(&self, hash: BlockHash) {
-        *self
-            .best_header_sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(hash);
+        *self.best_header_sent.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
     }
 
     pub fn note_best_known(&self, hash: BlockHash) {
@@ -517,10 +476,7 @@ impl LivePeer {
 
     pub fn header_marks(&self) -> (Option<BlockHash>, Option<BlockHash>) {
         (
-            *self
-                .best_header_sent
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
+            *self.best_header_sent.lock().unwrap_or_else(|e| e.into_inner()),
             *self.best_known.lock().unwrap_or_else(|e| e.into_inner()),
         )
     }
@@ -534,10 +490,7 @@ impl LivePeer {
     }
 
     pub fn take_block_from_peer(&self, hash: &BlockHash) -> bool {
-        self.recently_from
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(hash)
+        self.recently_from.lock().unwrap_or_else(|e| e.into_inner()).remove(hash)
     }
 
     pub fn try_ask_headers_for_inv(&self) -> bool {
@@ -572,17 +525,11 @@ impl LivePeer {
     }
 
     pub fn note_announced_wtx(&self, wtxid: Wtxid) {
-        self.announced_wtx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(wtxid, 50_000);
+        self.announced_wtx.lock().unwrap_or_else(|e| e.into_inner()).insert(wtxid, 50_000);
     }
 
     pub fn has_announced_wtx(&self, wtxid: &Wtxid) -> bool {
-        self.announced_wtx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(wtxid)
+        self.announced_wtx.lock().unwrap_or_else(|e| e.into_inner()).contains(wtxid)
     }
 
     pub(crate) fn try_cmpct_fill(&self, hash: BlockHash) -> bool {
@@ -592,10 +539,7 @@ impl LivePeer {
         if !ph.try_cmpct_fill_slot(hash, self.inbound) {
             return false;
         }
-        self.taken_cmpct
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(hash);
+        self.taken_cmpct.lock().unwrap_or_else(|e| e.into_inner()).push(hash);
         true
     }
 
@@ -665,8 +609,7 @@ impl LivePeer {
     }
 
     pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
-        self.writer()
-            .is_some_and(|tx| tx.send(PeerOut::Msg(msg)).is_ok())
+        self.writer().is_some_and(|tx| tx.send(PeerOut::Msg(msg)).is_ok())
     }
 
     pub(crate) fn attach_out(&self, tx: mpsc::UnboundedSender<PeerOut>) {
@@ -674,10 +617,7 @@ impl LivePeer {
     }
 
     pub(crate) fn writer(&self) -> Option<mpsc::UnboundedSender<PeerOut>> {
-        self.out_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.out_tx.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn note_last_block(&self) {
@@ -685,8 +625,7 @@ impl LivePeer {
     }
 
     pub fn note_last_transaction(&self) {
-        self.last_transaction
-            .store(self.clock_now(), Ordering::Relaxed);
+        self.last_transaction.store(self.clock_now(), Ordering::Relaxed);
     }
 
     pub fn note_minfeefilter_sat_kvb(&self, sat_kvb: u64) {
@@ -701,10 +640,7 @@ impl LivePeer {
     }
 
     pub fn clear_block_inflight(&self, height: u32) {
-        self.inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|h| *h != height);
+        self.inflight.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != height);
     }
 
     pub fn minfeefilter_sat_kvb(&self) -> u64 {
@@ -712,15 +648,12 @@ impl LivePeer {
     }
 
     pub fn clock_now(&self) -> u64 {
-        self.owner
-            .upgrade()
-            .map(|h| h.now_secs())
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            })
+        self.owner.upgrade().map(|h| h.now_secs()).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        })
     }
 
     pub fn connected_at(&self) -> u64 {
@@ -745,25 +678,19 @@ impl LivePeer {
     /// CIDR/bind table plus operator `--trusted`.
     pub fn session_noban(&self) -> bool {
         self.peer_hub().is_some_and(|h| h.is_noban())
-            || self
-                .net_perm_flags()
-                .has(crate::net_permissions::NetPermissionFlags::NOBAN)
+            || self.net_perm_flags().has(crate::net_permissions::NetPermissionFlags::NOBAN)
     }
 
     /// CIDR/bind table plus operator `--relay` / `--always-relay`.
     pub fn session_relay_perm(&self) -> bool {
         self.peer_hub().is_some_and(|h| h.is_relay_perm())
-            || self
-                .net_perm_flags()
-                .has(crate::net_permissions::NetPermissionFlags::RELAY)
+            || self.net_perm_flags().has(crate::net_permissions::NetPermissionFlags::RELAY)
     }
 
     /// CIDR/bind table plus operator `--always-relay`.
     pub fn session_forcerelay(&self) -> bool {
         self.peer_hub().is_some_and(|h| h.is_forcerelay_perm())
-            || self
-                .net_perm_flags()
-                .has(crate::net_permissions::NetPermissionFlags::FORCE_RELAY)
+            || self.net_perm_flags().has(crate::net_permissions::NetPermissionFlags::FORCE_RELAY)
     }
 
     pub fn set_inv_gen_floor(&self, floor: u64) {
@@ -797,9 +724,7 @@ impl LivePeer {
         let start = self.ping_start_secs.load(Ordering::Relaxed);
         if nonce != 0 && now_secs > start.saturating_add(TIMEOUT_INTERVAL) {
             let elapsed = now_secs.saturating_sub(start) as f64;
-            return Some(PingAction::Timeout {
-                elapsed_secs: elapsed,
-            });
+            return Some(PingAction::Timeout { elapsed_secs: elapsed });
         }
         let queued = self.ping_queued.load(Ordering::Relaxed);
         let interval_due = nonce == 0 && now_secs > start.saturating_add(PING_INTERVAL);
@@ -879,10 +804,7 @@ impl LivePeer {
         let (bytesrecv, bytessent) = if self.has_wire() {
             (self.raw_recv(), self.raw_sent())
         } else {
-            (
-                bytesrecv_per_msg.values().sum(),
-                bytessent_per_msg.values().sum(),
-            )
+            (bytesrecv_per_msg.values().sum(), bytessent_per_msg.values().sum())
         };
         PeerInfo {
             id: self.id,
@@ -908,11 +830,7 @@ impl LivePeer {
             inv_to_send: self.inv_to_send(),
             bytesrecv,
             bytessent,
-            inflight: self
-                .inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            inflight: self.inflight.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             permissions: self
                 .owner
                 .upgrade()
@@ -947,12 +865,9 @@ fn rand_ping_nonce() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     static N: AtomicU64 = AtomicU64::new(1);
     let seq = N.fetch_add(1, Ordering::Relaxed);
-    let tick = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1);
-    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+    let tick =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
         | 1
 }
 
@@ -1058,11 +973,9 @@ pub struct PeerHub {
 
 fn canonical_bind(addr: SocketAddr) -> SocketAddr {
     match addr {
-        SocketAddr::V6(v6) => v6
-            .ip()
-            .to_ipv4_mapped()
-            .map(|v4| SocketAddr::from((v4, v6.port())))
-            .unwrap_or(addr),
+        SocketAddr::V6(v6) => {
+            v6.ip().to_ipv4_mapped().map(|v4| SocketAddr::from((v4, v6.port()))).unwrap_or(addr)
+        }
         v4 => v4,
     }
 }
@@ -1143,10 +1056,7 @@ impl PeerHub {
         inbound: bool,
         bind: SocketAddr,
     ) -> crate::net_permissions::NetPermissionFlags {
-        self.net_perms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .flags_for(addr.ip(), inbound, bind)
+        self.net_perms.lock().unwrap_or_else(|e| e.into_inner()).flags_for(addr.ip(), inbound, bind)
     }
 
     pub fn permission_strings(
@@ -1189,14 +1099,8 @@ impl PeerHub {
         if port == 0 {
             return Vec::new();
         }
-        let ips = self
-            .external_ips
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        ips.into_iter()
-            .map(|ip| (ip.to_string(), port, LOCAL_MANUAL))
-            .collect()
+        let ips = self.external_ips.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ips.into_iter().map(|ip| (ip.to_string(), port, LOCAL_MANUAL)).collect()
     }
 
     pub fn advertise_local_socket(&self) -> Option<SocketAddr> {
@@ -1242,10 +1146,7 @@ impl PeerHub {
         const CACHE_SECS: u64 = 24 * 60 * 60;
         let bind = canonical_bind(bind);
         let now = self.now_secs();
-        let mut cache = self
-            .addr_response_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.addr_response_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((cached_at, addrs)) = cache.get(&bind) {
             if now.saturating_sub(*cached_at) < CACHE_SECS {
                 return addrs.clone();
@@ -1279,10 +1180,7 @@ impl PeerHub {
         let mut out = Vec::with_capacity(cap);
         for &i in idxs.iter().take(cap) {
             let addr = entries[i].addr;
-            out.push((
-                now as u32,
-                bitcoin::p2p::address::Address::new(&addr, services),
-            ));
+            out.push((now as u32, bitcoin::p2p::address::Address::new(&addr, services)));
         }
         cache.insert(bind, (now, out.clone()));
         out
@@ -1290,26 +1188,16 @@ impl PeerHub {
 
     /// Core: register local version nonce while an outbound handshake is open.
     pub fn note_outbound_nonce(&self, nonce: u64) {
-        self.pending_outbound_nonces
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(nonce);
+        self.pending_outbound_nonces.lock().unwrap_or_else(|e| e.into_inner()).insert(nonce);
     }
 
     pub fn clear_outbound_nonce(&self, nonce: u64) {
-        self.pending_outbound_nonces
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&nonce);
+        self.pending_outbound_nonces.lock().unwrap_or_else(|e| e.into_inner()).remove(&nonce);
     }
 
     /// `false` means this inbound nonce matches an outbound handshake (self-connect).
     pub fn check_incoming_nonce(&self, nonce: u64) -> bool {
-        !self
-            .pending_outbound_nonces
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&nonce)
+        !self.pending_outbound_nonces.lock().unwrap_or_else(|e| e.into_inner()).contains(&nonce)
     }
 
     /// BIP152: at most two inbound `getblocktxn` plus one outbound for a hash.
@@ -1332,10 +1220,7 @@ impl PeerHub {
     }
 
     pub fn clear_cmpct_fill(&self, hash: BlockHash) {
-        self.cmpct_fills
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&hash);
+        self.cmpct_fills.lock().unwrap_or_else(|e| e.into_inner()).remove(&hash);
     }
 
     pub fn release_cmpct_fill(&self, hash: BlockHash, inbound: bool) {
@@ -1381,10 +1266,7 @@ impl PeerHub {
     }
 
     fn is_preferred_download(p: &LivePeer) -> bool {
-        matches!(
-            p.conn_type,
-            PeerConnType::OutboundFullRelay | PeerConnType::BlockRelay
-        )
+        matches!(p.conn_type, PeerConnType::OutboundFullRelay | PeerConnType::BlockRelay)
     }
 
     /// Core: only one initial headers-sync peer unless the tip is within 24h.
@@ -1423,10 +1305,7 @@ impl PeerHub {
         if peer.inv_asked_headers.load(Ordering::Relaxed) {
             return false;
         }
-        let mut last = self
-            .last_inv_headers_sync
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut last = self.last_inv_headers_sync.lock().unwrap_or_else(|e| e.into_inner());
         if *last == Some(hash) {
             return false;
         }
@@ -1448,10 +1327,7 @@ impl PeerHub {
             return;
         }
         let g = self.live.read().unwrap_or_else(|e| e.into_inner());
-        let n_preferred = g
-            .values()
-            .filter(|p| Self::is_preferred_download(p))
-            .count();
+        let n_preferred = g.values().filter(|p| Self::is_preferred_download(p)).count();
         for p in g.values() {
             if !p.sync_started.load(Ordering::Relaxed) {
                 continue;
@@ -1522,11 +1398,8 @@ impl PeerHub {
     }
 
     pub(crate) fn check_handshake_timeouts(&self, now: u64) {
-        let mut timed_out: Vec<Arc<LivePeer>> = self
-            .live_peers()
-            .into_iter()
-            .filter(|p| self.handshake_timed_out(p, now))
-            .collect();
+        let mut timed_out: Vec<Arc<LivePeer>> =
+            self.live_peers().into_iter().filter(|p| self.handshake_timed_out(p, now)).collect();
         timed_out.sort_unstable_by_key(|p| p.id);
         for p in &timed_out {
             let line = if p.v2_transport_ready() {
@@ -1608,9 +1481,7 @@ impl PeerHub {
         inbound: bool,
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
-        let _ = self
-            .next_id
-            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        let _ = self.next_id.fetch_max(id.saturating_add(1), Ordering::Relaxed);
         let services = service_flags_u64(ver.services);
         let connected_at = self.now_secs();
         let peer = Arc::new(LivePeer {
@@ -1671,37 +1542,23 @@ impl PeerHub {
             next_local_addr_send: AtomicU64::new(0),
             version_timestamp: ver.timestamp,
         });
-        self.live
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, Arc::clone(&peer));
+        self.live.write().unwrap_or_else(|e| e.into_inner()).insert(id, Arc::clone(&peer));
         rbitcoin_log::debug!("p2p: Added connection peer={id}");
         peer
     }
 
     pub fn unregister(&self, id: u64) {
-        if let Some(mp) = self
-            .mempool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(Weak::upgrade)
+        if let Some(mp) =
+            self.mempool.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Weak::upgrade)
         {
             mp.erase_orphans_for_peer(id);
         }
-        let removed = self
-            .live
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
+        let removed = self.live.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
         if let Some(p) = removed {
             p.release_all_cmpct();
             self.end_headers_sync(&p);
         }
-        self.hb_selected
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|x| *x != id);
+        self.hb_selected.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| *x != id);
     }
 
     pub fn live_peers(&self) -> Vec<Arc<LivePeer>> {
@@ -1764,29 +1621,19 @@ impl PeerHub {
     }
 
     pub fn get(&self, id: u64) -> Option<Arc<LivePeer>> {
-        self.live
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&id)
-            .cloned()
+        self.live.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
     }
 
     pub fn addnode(&self, addr: SocketAddr, cmd: &str) -> Result<(), String> {
         match cmd {
             "onetry" => self.dial(addr, PeerConnType::Manual),
             "add" => {
-                self.added
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(addr);
+                self.added.lock().unwrap_or_else(|e| e.into_inner()).insert(addr);
                 let _ = self.dial(addr, PeerConnType::Manual);
                 Ok(())
             }
             "remove" => {
-                self.added
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&addr);
+                self.added.lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
                 self.disconnect_addr(addr);
                 Ok(())
             }
@@ -1838,8 +1685,7 @@ impl PeerHub {
                         )));
                         p.pending_sendcmpct.store(0, Ordering::Relaxed);
                     } else {
-                        p.pending_sendcmpct
-                            .store(PendingSendCmpct::Lb as u8, Ordering::Relaxed);
+                        p.pending_sendcmpct.store(PendingSendCmpct::Lb as u8, Ordering::Relaxed);
                     }
                 }
             }
@@ -1848,15 +1694,11 @@ impl PeerHub {
         peer.set_hb_to(true);
         if let Some(out) = peer.writer() {
             let _ = out.send(PeerOut::Msg(NetworkMessage::SendCmpct(
-                bitcoin::p2p::message_compact_blocks::SendCmpct {
-                    send_compact: true,
-                    version: 2,
-                },
+                bitcoin::p2p::message_compact_blocks::SendCmpct { send_compact: true, version: 2 },
             )));
             peer.pending_sendcmpct.store(0, Ordering::Relaxed);
         } else {
-            peer.pending_sendcmpct
-                .store(PendingSendCmpct::Hb as u8, Ordering::Relaxed);
+            peer.pending_sendcmpct.store(PendingSendCmpct::Hb as u8, Ordering::Relaxed);
         }
     }
 
@@ -1870,17 +1712,11 @@ impl PeerHub {
     /// Outbound full-relay sessions eligible for stale-tip slot rotation.
     /// Empty when this hub is `noban` (functional keep-alive).
     pub fn outbound_full_relay_ids(&self) -> Vec<u64> {
-        self.outbound_full_relay_rows()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect()
+        self.outbound_full_relay_rows().into_iter().map(|(id, _)| id).collect()
     }
 
     pub fn outbound_full_relay_addrs(&self) -> Vec<SocketAddr> {
-        self.outbound_full_relay_rows()
-            .into_iter()
-            .map(|(_, a)| a)
-            .collect()
+        self.outbound_full_relay_rows().into_iter().map(|(_, a)| a).collect()
     }
 
     fn outbound_full_relay_rows(&self) -> Vec<(u64, SocketAddr)> {
@@ -1963,10 +1799,7 @@ impl PeerHub {
     pub fn disconnect_addr(&self, addr: SocketAddr) -> bool {
         let ids: Vec<u64> = {
             let g = self.live.read().unwrap_or_else(|e| e.into_inner());
-            g.values()
-                .filter(|p| p.addr == addr)
-                .map(|p| p.id)
-                .collect()
+            g.values().filter(|p| p.addr == addr).map(|p| p.id).collect()
         };
         let mut n = 0usize;
         for id in ids {
@@ -1980,8 +1813,7 @@ impl PeerHub {
     pub fn dial(&self, addr: SocketAddr, typ: PeerConnType) -> Result<(), String> {
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = g.as_ref().ok_or("no dialer attached")?;
-        tx.send(DialRequest { addr, typ })
-            .map_err(|_| "dialer closed".to_string())
+        tx.send(DialRequest { addr, typ }).map_err(|_| "dialer closed".to_string())
     }
 }
 
@@ -2017,8 +1849,7 @@ fn service_flags_u64(f: ServiceFlags) -> u64 {
 
 /// Parse Core `ip:port` / `[v6]:port`.
 pub fn parse_peer_addr(s: &str) -> Result<SocketAddr, NetError> {
-    s.parse()
-        .map_err(|_| NetError::Encode(format!("bad peer address {s}")))
+    s.parse().map_err(|_| NetError::Encode(format!("bad peer address {s}")))
 }
 
 #[cfg(test)]
@@ -2064,13 +1895,8 @@ mod tests {
     fn maybe_select_hb_writes_sendcmpct_when_writer_attached() {
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(
-            a,
-            a,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            true,
-            PeerConnType::Inbound,
-        );
+        let p =
+            hub.register(a, a, &ver("/rbitcoin:0.1.0(testnode0)/"), true, PeerConnType::Inbound);
         let (tx, mut rx) = mpsc::unbounded_channel();
         p.attach_out(tx);
         hub.maybe_select_hb(p.id);
@@ -2092,23 +1918,14 @@ mod tests {
         let peers: Vec<_> = (18444u16..18447)
             .map(|port| {
                 let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                hub.register(
-                    a,
-                    a,
-                    &ver("/rbitcoin:0.1.0(testnode0)/"),
-                    true,
-                    PeerConnType::Inbound,
-                )
+                hub.register(a, a, &ver("/rbitcoin:0.1.0(testnode0)/"), true, PeerConnType::Inbound)
             })
             .collect();
         for p in &peers {
             hub.maybe_select_hb(p.id);
             hub.maybe_select_hb(p.id);
             assert!(p.hb_to.load(Ordering::Relaxed));
-            assert_eq!(
-                p.pending_sendcmpct.load(Ordering::Relaxed),
-                PendingSendCmpct::Hb as u8
-            );
+            assert_eq!(p.pending_sendcmpct.load(Ordering::Relaxed), PendingSendCmpct::Hb as u8);
         }
         let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
         let fourth = hub.register(
@@ -2123,17 +1940,11 @@ mod tests {
             !peers[0].hb_to.load(Ordering::Relaxed),
             "oldest inbound must be evicted when a fourth inbound is selected"
         );
-        assert_eq!(
-            peers[0].pending_sendcmpct.load(Ordering::Relaxed),
-            PendingSendCmpct::Lb as u8
-        );
+        assert_eq!(peers[0].pending_sendcmpct.load(Ordering::Relaxed), PendingSendCmpct::Lb as u8);
         assert!(peers[1].hb_to.load(Ordering::Relaxed));
         assert!(peers[2].hb_to.load(Ordering::Relaxed));
         assert!(fourth.hb_to.load(Ordering::Relaxed));
-        assert_eq!(
-            fourth.pending_sendcmpct.load(Ordering::Relaxed),
-            PendingSendCmpct::Hb as u8
-        );
+        assert_eq!(fourth.pending_sendcmpct.load(Ordering::Relaxed), PendingSendCmpct::Hb as u8);
     }
 
     #[test]
@@ -2176,13 +1987,7 @@ mod tests {
         let peers: Vec<_> = (18444u16..18447)
             .map(|port| {
                 let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                hub.register(
-                    a,
-                    a,
-                    &ver("/rbitcoin:0.1.0(testnode0)/"),
-                    true,
-                    PeerConnType::Inbound,
-                )
+                hub.register(a, a, &ver("/rbitcoin:0.1.0(testnode0)/"), true, PeerConnType::Inbound)
             })
             .collect();
         for p in &peers {
@@ -2202,10 +2007,7 @@ mod tests {
             peers[0].hb_to.load(Ordering::Relaxed),
             "re-selected inbound must stay HB (Core LRU)"
         );
-        assert!(
-            !peers[1].hb_to.load(Ordering::Relaxed),
-            "oldest unre-selected inbound is evicted"
-        );
+        assert!(!peers[1].hb_to.load(Ordering::Relaxed), "oldest unre-selected inbound is evicted");
         assert!(peers[2].hb_to.load(Ordering::Relaxed));
         assert!(fourth.hb_to.load(Ordering::Relaxed));
     }
@@ -2216,13 +2018,7 @@ mod tests {
         let peers: Vec<_> = (18444u16..18447)
             .map(|port| {
                 let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                hub.register(
-                    a,
-                    a,
-                    &ver("/rbitcoin:0.1.0(testnode0)/"),
-                    true,
-                    PeerConnType::Inbound,
-                )
+                hub.register(a, a, &ver("/rbitcoin:0.1.0(testnode0)/"), true, PeerConnType::Inbound)
             })
             .collect();
         for p in &peers {
@@ -2332,8 +2128,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let mut local = std::net::TcpStream::connect(addr).unwrap();
         let (mut far, _) = listener.accept().unwrap();
-        far.set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
+        far.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
 
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
@@ -2386,17 +2181,10 @@ mod tests {
         hub.set_mock_now(1_700_000_003);
         let logs = rbitcoin_log::take_logs();
         rbitcoin_log::capture_logs(false);
+        assert!(p.stop.load(Ordering::SeqCst), "peertimeout must disconnect pre-verack");
+        assert!(hub.get(p.id).is_none(), "timed-out connecting peer is dropped");
         assert!(
-            p.stop.load(Ordering::SeqCst),
-            "peertimeout must disconnect pre-verack"
-        );
-        assert!(
-            hub.get(p.id).is_none(),
-            "timed-out connecting peer is dropped"
-        );
-        assert!(
-            logs.iter()
-                .any(|(_, m)| m.contains("V2 handshake timeout, disconnecting peer=0")),
+            logs.iter().any(|(_, m)| m.contains("V2 handshake timeout, disconnecting peer=0")),
             "expected V2 handshake timeout, got {logs:?}"
         );
     }
@@ -2423,17 +2211,11 @@ mod tests {
             .iter()
             .filter_map(|(_, m)| {
                 [0u64, 1, 2].into_iter().find(|id| {
-                    m.contains(&format!(
-                        "version handshake timeout, disconnecting peer={id}"
-                    ))
+                    m.contains(&format!("version handshake timeout, disconnecting peer={id}"))
                 })
             })
             .collect();
-        assert_eq!(
-            got,
-            vec![0, 1, 2],
-            "timeout needles before TCP close, id order, got {logs:?}"
-        );
+        assert_eq!(got, vec![0, 1, 2], "timeout needles before TCP close, id order, got {logs:?}");
     }
 
     #[test]
@@ -2457,13 +2239,9 @@ mod tests {
         let err = crate::peer::fail_if_handshake_timed_out(&policy);
         let logs = rbitcoin_log::take_logs();
         rbitcoin_log::capture_logs(false);
+        assert!(matches!(err, Err(crate::error::NetError::Timeout)), "got {err:?}");
         assert!(
-            matches!(err, Err(crate::error::NetError::Timeout)),
-            "got {err:?}"
-        );
-        assert!(
-            logs.iter()
-                .any(|(_, m)| m.contains("version handshake timeout, disconnecting peer=0")),
+            logs.iter().any(|(_, m)| m.contains("version handshake timeout, disconnecting peer=0")),
             "pre-verack ping vs mocktime must still log the needle, got {logs:?}"
         );
     }
@@ -2618,13 +2396,8 @@ mod tests {
     fn session_heartbeat_keeps_sole_preferred_headers_sync_peer() {
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let outbound = hub.register(
-            a,
-            a,
-            &ver("/rbitcoin:0.1.0/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
+        let outbound =
+            hub.register(a, a, &ver("/rbitcoin:0.1.0/"), false, PeerConnType::OutboundFullRelay);
         let wall = hub.now_secs();
         let start = wall.saturating_sub(16 * 60);
         assert!(hub.try_start_headers_sync(&outbound, start, start));
@@ -2646,8 +2419,7 @@ mod tests {
         let hub = PeerHub::new();
         if via_cidr {
             let mut t = crate::NetPermTable::default();
-            t.whitelist
-                .push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
+            t.whitelist.push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
             hub.set_net_perms(t);
         } else {
             hub.set_noban(true);
@@ -2655,13 +2427,8 @@ mod tests {
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
         let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let _outbound = hub.register(
-            b,
-            b,
-            &ver("/rbitcoin:0.1.0/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
+        let _outbound =
+            hub.register(b, b, &ver("/rbitcoin:0.1.0/"), false, PeerConnType::OutboundFullRelay);
         if via_cidr {
             assert!(!hub.is_noban(), "CIDR noban must not set hub --trusted");
             assert!(inbound.session_noban());
@@ -2696,21 +2463,14 @@ mod tests {
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
-        hub.register(
-            a,
-            bind,
-            &ver("/rbitcoin:0.1.0/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
+        hub.register(a, bind, &ver("/rbitcoin:0.1.0/"), false, PeerConnType::OutboundFullRelay);
         hub.set_noban(true);
         assert!(
             hub.snapshot()[0].permissions.is_empty(),
             "hub --trusted is a DoS bypass, not getpeerinfo.permissions"
         );
         let mut t = crate::NetPermTable::default();
-        t.whitelist
-            .push(crate::parse_whitelist("noban,out@127.0.0.1").unwrap());
+        t.whitelist.push(crate::parse_whitelist("noban,out@127.0.0.1").unwrap());
         hub.set_net_perms(t);
         assert_eq!(hub.snapshot()[0].permissions, ["noban", "download"]);
     }
@@ -2734,20 +2494,13 @@ mod tests {
             PeerConnType::Inbound,
         );
         let mut t = crate::NetPermTable::default();
-        t.whitelist
-            .push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
+        t.whitelist.push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
         hub.set_net_perms(t);
         assert!(!hub.is_noban(), "a CIDR grant must not set hub --trusted");
         assert!(local.session_noban());
-        assert!(
-            !other.session_noban(),
-            "non-matching inbound must not inherit CIDR noban"
-        );
+        assert!(!other.session_noban(), "non-matching inbound must not inherit CIDR noban");
         hub.set_noban(true);
-        assert!(
-            other.session_noban(),
-            "operator --trusted still covers every session"
-        );
+        assert!(other.session_noban(), "operator --trusted still covers every session");
     }
 
     #[test]
@@ -2774,10 +2527,7 @@ mod tests {
         assert_eq!(hub.snapshot()[0].pingwait, Some(3.0));
 
         let short = p.on_pong(&[], hub.now_secs()).expect("short");
-        assert!(
-            short.starts_with("p2p: pong peer=0: Short payload"),
-            "{short}"
-        );
+        assert!(short.starts_with("p2p: pong peer=0: Short payload"), "{short}");
         assert!(p
             .on_pong(&0u64.to_le_bytes(), hub.now_secs())
             .unwrap()
@@ -2789,9 +2539,7 @@ mod tests {
         let wrong = (nonce.wrapping_sub(1)).to_le_bytes();
         let mm = p.on_pong(&wrong, hub.now_secs() + 121).unwrap();
         assert!(mm.contains("Nonce mismatch"), "{mm}");
-        let zero = p
-            .on_pong(&0u64.to_le_bytes(), hub.now_secs() + 121)
-            .unwrap();
+        let zero = p.on_pong(&0u64.to_le_bytes(), hub.now_secs() + 121).unwrap();
         assert!(zero.contains("Nonce zero"), "{zero}");
 
         let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs() + 250).unwrap() else {
@@ -2860,20 +2608,9 @@ mod tests {
         let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
         let c = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3);
         let _in = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let out = hub.register(
-            b,
-            b,
-            &ver("/rbitcoin:0.1.0/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
-        let _br = hub.register(
-            c,
-            c,
-            &ver("/rbitcoin:0.1.0/"),
-            false,
-            PeerConnType::BlockRelay,
-        );
+        let out =
+            hub.register(b, b, &ver("/rbitcoin:0.1.0/"), false, PeerConnType::OutboundFullRelay);
+        let _br = hub.register(c, c, &ver("/rbitcoin:0.1.0/"), false, PeerConnType::BlockRelay);
         let ids = hub.outbound_full_relay_ids();
         assert_eq!(ids, vec![out.id]);
         hub.set_noban(true);
@@ -2897,9 +2634,7 @@ mod tests {
     }
 
     fn addr_ips(v: &[(u32, Address)]) -> Vec<IpAddr> {
-        v.iter()
-            .filter_map(|(_, a)| a.socket_addr().ok().map(|s| s.ip()))
-            .collect()
+        v.iter().filter_map(|(_, a)| a.socket_addr().ok().map(|s| s.ip())).collect()
     }
 
     #[test]
@@ -2917,10 +2652,7 @@ mod tests {
         assert_eq!(a.len(), 1000);
         assert_eq!(b.len(), 1000);
         assert_eq!(c.len(), 1000);
-        assert_eq!(
-            a, mapped,
-            "IPv4-mapped IPv6 must share the clearnet cache key"
-        );
+        assert_eq!(a, mapped, "IPv4-mapped IPv6 must share the clearnet cache key");
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);

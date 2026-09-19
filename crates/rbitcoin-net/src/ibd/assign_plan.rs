@@ -164,121 +164,36 @@ mod tests {
 
     #[test]
     fn densify_slots_tip_hole_is_zero_for_all() {
-        assert_eq!(
-            densify_slots_for_peer(16, true, Some(10_000_000), Some(1_000_000), false),
-            0
-        );
+        assert_eq!(densify_slots_for_peer(16, true, Some(10_000_000), Some(1_000_000), false), 0);
         assert_eq!(densify_slots_for_peer(16, true, None, None, true), 0);
     }
 
     #[test]
     fn densify_slots_tight_pack_stays_half() {
-        assert_eq!(
-            densify_slots_for_peer(16, false, Some(1_500_000), Some(1_000_000), true),
-            8
-        );
-        assert_eq!(
-            densify_slots_for_peer(16, false, Some(2_000_000), Some(1_000_000), true),
-            8
-        );
+        assert_eq!(densify_slots_for_peer(16, false, Some(1_500_000), Some(1_000_000), true), 8);
+        assert_eq!(densify_slots_for_peer(16, false, Some(2_000_000), Some(1_000_000), true), 8);
     }
 
     #[test]
     fn densify_slots_fast_outlier_gets_full() {
-        assert_eq!(
-            densify_slots_for_peer(16, false, Some(2_000_000), Some(1_000_000), false),
-            16
-        );
-        assert_eq!(
-            densify_slots_for_peer(16, false, Some(1_500_000), Some(1_000_000), false),
-            8
-        );
-        assert_eq!(
-            densify_slots_for_peer(16, false, None, Some(1_000_000), false),
-            8
-        );
-        assert_eq!(
-            densify_slots_for_peer(16, false, Some(2_000_000), None, false),
-            8
-        );
+        assert_eq!(densify_slots_for_peer(16, false, Some(2_000_000), Some(1_000_000), false), 16);
+        assert_eq!(densify_slots_for_peer(16, false, Some(1_500_000), Some(1_000_000), false), 8);
+        assert_eq!(densify_slots_for_peer(16, false, None, Some(1_000_000), false), 8);
+        assert_eq!(densify_slots_for_peer(16, false, Some(2_000_000), None, false), 8);
     }
 
     /// 292k re-admit vs tip-chatter skip.
     #[test]
     fn enqueue_header_readmit_skips_inflight_pending_and_past_tip() {
         // Known, drained, still needed above tip.
-        assert!(should_enqueue_header(
-            false,
-            false,
-            false,
-            false,
-            false,
-            Some(1),
-            Some(0),
-        ));
-        assert!(!should_enqueue_header(
-            true,
-            false,
-            false,
-            false,
-            false,
-            Some(1),
-            Some(0),
-        ));
-        assert!(!should_enqueue_header(
-            false,
-            true,
-            false,
-            false,
-            false,
-            Some(1),
-            Some(0),
-        ));
-        assert!(!should_enqueue_header(
-            false,
-            false,
-            true,
-            false,
-            false,
-            Some(1),
-            Some(0),
-        ));
-        assert!(!should_enqueue_header(
-            false,
-            false,
-            false,
-            true,
-            false,
-            Some(1),
-            Some(0),
-        ));
-        assert!(!should_enqueue_header(
-            false,
-            false,
-            false,
-            false,
-            true,
-            Some(1),
-            Some(0),
-        ));
-        assert!(!should_enqueue_header(
-            false,
-            false,
-            false,
-            false,
-            false,
-            Some(5),
-            Some(5),
-        ));
-        assert!(!should_enqueue_header(
-            false,
-            false,
-            false,
-            false,
-            false,
-            Some(4),
-            Some(5),
-        ));
+        assert!(should_enqueue_header(false, false, false, false, false, Some(1), Some(0),));
+        assert!(!should_enqueue_header(true, false, false, false, false, Some(1), Some(0),));
+        assert!(!should_enqueue_header(false, true, false, false, false, Some(1), Some(0),));
+        assert!(!should_enqueue_header(false, false, true, false, false, Some(1), Some(0),));
+        assert!(!should_enqueue_header(false, false, false, true, false, Some(1), Some(0),));
+        assert!(!should_enqueue_header(false, false, false, false, true, Some(1), Some(0),));
+        assert!(!should_enqueue_header(false, false, false, false, false, Some(5), Some(5),));
+        assert!(!should_enqueue_header(false, false, false, false, false, Some(4), Some(5),));
     }
 
     /// ordered set remove + compact ghosts (one surface).

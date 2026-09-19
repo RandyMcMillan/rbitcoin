@@ -90,10 +90,7 @@ fn signals_unknown(version: &i32, bit: i32) -> bool {
 
 /// Warning strings for RPC `warnings` arrays.
 pub fn warning_strings(query: &Query, network: Network) -> Vec<String> {
-    active_unknown_bits(query, network)
-        .into_iter()
-        .map(unknown_rules_warning)
-        .collect()
+    active_unknown_bits(query, network).into_iter().map(unknown_rules_warning).collect()
 }
 
 #[cfg(test)]
@@ -109,10 +106,7 @@ mod tests {
 
     #[test]
     fn warning_text_matches_core() {
-        assert_eq!(
-            unknown_rules_warning(27),
-            "Unknown new rules activated (versionbit 27)"
-        );
+        assert_eq!(unknown_rules_warning(27), "Unknown new rules activated (versionbit 27)");
     }
 
     #[test]

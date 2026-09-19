@@ -84,18 +84,12 @@ pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight:
                 cf,
                 cw,
             ),
-            None => (
-                1, vsize, fee, 1, vsize, fee, modified, modified, modified, weight,
-            ),
+            None => (1, vsize, fee, 1, vsize, fee, modified, modified, modified, weight),
         };
     let (depends, spentby) = match mp.depends_spentby(txid) {
         Some((d, s)) => (
-            d.into_iter()
-                .map(|t| hash_hex_display(&t.to_byte_array()))
-                .collect::<Vec<_>>(),
-            s.into_iter()
-                .map(|t| hash_hex_display(&t.to_byte_array()))
-                .collect::<Vec<_>>(),
+            d.into_iter().map(|t| hash_hex_display(&t.to_byte_array())).collect::<Vec<_>>(),
+            s.into_iter().map(|t| hash_hex_display(&t.to_byte_array())).collect::<Vec<_>>(),
         ),
         None => (Vec::new(), Vec::new()),
     };
@@ -143,10 +137,8 @@ pub(crate) fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     };
     let live = mp.list_live_meta();
     if !verbose {
-        let ids: Vec<String> = live
-            .iter()
-            .map(|(t, _, _)| hash_hex_display(&t.to_byte_array()))
-            .collect();
+        let ids: Vec<String> =
+            live.iter().map(|(t, _, _)| hash_hex_display(&t.to_byte_array())).collect();
         if want_seq {
             return Ok(json!({
                 "txids": ids,
@@ -169,10 +161,7 @@ pub(crate) fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Va
     params.reject_unknown(&["txid"])?;
     let hex = params.req_str(0, "txid")?;
     let want = parse_hash32_display(hex)?;
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
         let wtxid = mp
@@ -185,19 +174,13 @@ pub(crate) fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Va
         }
         return Ok(entry);
     }
-    Err(rpc_error(
-        ERR_INVALID_ADDRESS_OR_KEY,
-        "Transaction not in mempool",
-    ))
+    Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"))
 }
 
 pub(crate) fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "verbose", "verbosity", "blockhash"])?;
     let hex = params.req_str(0, "txid")?;
-    let verbose = match params
-        .get(1, "verbose")
-        .or_else(|| params.get(1, "verbosity"))
-    {
+    let verbose = match params.get(1, "verbose").or_else(|| params.get(1, "verbosity")) {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         Some(v) => json_u64(v)
@@ -225,18 +208,11 @@ pub(crate) fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<
         .get_tx_by_txid(&want)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         .ok_or_else(|| rpc_error(ERR_MISC, "No such mempool or blockchain transaction"))?;
-    let tx = ctx
-        .query
-        .reconstruct_tx(fk)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let tx = ctx.query.reconstruct_tx(fk).map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     if !verbose {
         return Ok(json!(serialize_hex(&tx)));
     }
-    Ok(tx_to_json(
-        &tx,
-        Some(json!({ "in_mempool": false })),
-        rpc_btc_network(ctx.network),
-    ))
+    Ok(tx_to_json(&tx, Some(json!({ "in_mempool": false })), rpc_btc_network(ctx.network)))
 }
 
 /// Default RPC-submit cap: 10_000 sat/vB. `0` is unlimited.
@@ -259,9 +235,7 @@ fn parse_rpc_btc_to_sat(s: &str) -> Result<u64, Value> {
     let whole: u64 = if whole_s.is_empty() {
         0
     } else {
-        whole_s
-            .parse()
-            .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"))?
+        whole_s.parse().map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"))?
     };
     if frac_s.len() > 8 {
         return Err(rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"));
@@ -273,8 +247,7 @@ fn parse_rpc_btc_to_sat(s: &str) -> Result<u64, Value> {
     let frac_n: u64 = if frac.is_empty() {
         0
     } else {
-        frac.parse()
-            .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"))?
+        frac.parse().map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"))?
     };
     Ok(whole.saturating_mul(100_000_000).saturating_add(frac_n))
 }
@@ -294,10 +267,7 @@ fn amount_sat_from_json(v: &Value) -> Result<u64, Value> {
             parse_rpc_btc_to_sat(&n.to_string())
         }
         Value::String(s) => parse_rpc_btc_to_sat(s),
-        _ => Err(rpc_error(
-            ERR_TYPE_ERROR,
-            "Amount is not a number or string",
-        )),
+        _ => Err(rpc_error(ERR_TYPE_ERROR, "Amount is not a number or string")),
     }
 }
 
@@ -331,10 +301,7 @@ fn sat_vb_from_json(v: &Value) -> Result<u64, Value> {
                 }
                 return Ok(i as u64);
             }
-            Err(rpc_error(
-                ERR_INVALID_PARAMETER,
-                "maxfeerate must be an integer sat/vB",
-            ))
+            Err(rpc_error(ERR_INVALID_PARAMETER, "maxfeerate must be an integer sat/vB"))
         }
         Value::String(s) => {
             let t = s.trim();
@@ -342,16 +309,10 @@ fn sat_vb_from_json(v: &Value) -> Result<u64, Value> {
                 return Err(rpc_error(ERR_INVALID_PARAMETER, "Amount out of range"));
             }
             t.parse::<u64>().map_err(|_| {
-                rpc_error(
-                    ERR_INVALID_PARAMETER,
-                    "maxfeerate must be an integer sat/vB",
-                )
+                rpc_error(ERR_INVALID_PARAMETER, "maxfeerate must be an integer sat/vB")
             })
         }
-        _ => Err(rpc_error(
-            ERR_TYPE_ERROR,
-            "maxfeerate is not a number or string",
-        )),
+        _ => Err(rpc_error(ERR_TYPE_ERROR, "maxfeerate is not a number or string")),
     }
 }
 
@@ -366,10 +327,7 @@ fn fee_exceeds_max(fee_sat: u64, weight: u64, max_sat_vb: u64) -> bool {
 fn prevout_value_sat(ctx: &RpcContext, op: &OutPoint) -> Option<u64> {
     if let Some(mp) = ctx.mempool.as_ref() {
         if let Some(parent) = mp.get_tx(&op.txid) {
-            return parent
-                .output
-                .get(op.vout as usize)
-                .map(|o| o.value.to_sat());
+            return parent.output.get(op.vout as usize).map(|o| o.value.to_sat());
         }
     }
     let want = op.txid.to_byte_array();
@@ -409,16 +367,12 @@ fn fold_tx_fee_sat(
 }
 
 fn tx_output_sum_sat(tx: &Transaction) -> Option<u64> {
-    tx.output
-        .iter()
-        .try_fold(0u64, |a, o| a.checked_add(o.value.to_sat()))
+    tx.output.iter().try_fold(0u64, |a, o| a.checked_add(o.value.to_sat()))
 }
 
 fn tx_fee_sat_from_prevouts(ctx: &RpcContext, tx: &Transaction) -> TxFeeLook {
     fold_tx_fee_sat(
-        tx.input
-            .iter()
-            .map(|inp| prevout_value_sat(ctx, &inp.previous_output)),
+        tx.input.iter().map(|inp| prevout_value_sat(ctx, &inp.previous_output)),
         tx_output_sum_sat(tx),
     )
 }
@@ -459,10 +413,7 @@ pub(crate) fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result
     let max_feerate = opt_maxfeerate_sat_vb(params, 1)?;
     let max_burn = opt_maxburn_sat(params, 2)?;
     let tx = decode_tx_hex(hex)?;
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     if burn_exceeds_max(&tx, max_burn) {
         return Err(rpc_error(ERR_INVALID_PARAMETER, MAX_BURN_MSG));
     }
@@ -545,9 +496,7 @@ pub(crate) fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
         return "min relay fee not met".into();
     }
     if let Some(rest) = s.strip_prefix("script: ") {
-        let rest = rest
-            .strip_prefix("script verification failed: ")
-            .unwrap_or(rest);
+        let rest = rest.strip_prefix("script verification failed: ").unwrap_or(rest);
         let paren = rbitcoin_consensus::script_flag_paren(rest);
         return format!("mempool-script-verify-flag-failed ({paren})");
     }
@@ -585,15 +534,10 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
     let arr = params
         .get_array(0, "rawtxs")
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtxs array required"))?;
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let mut decoded = Vec::new();
     for v in arr {
-        let hex = v
-            .as_str()
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtx hex required"))?;
+        let hex = v.as_str().ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtx hex required"))?;
         decoded.push(decode_tx_hex(hex)?);
     }
     let mut ids = std::collections::HashSet::new();
@@ -731,10 +675,7 @@ pub(crate) fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Val
         if !matches!(th, Value::Null) && json_u64(th).is_none() && th.as_f64().is_none() {
             return Err(rpc_error(
                 ERR_TYPE_ERROR,
-                format!(
-                    "JSON value of type {} is not of expected type number",
-                    json_type_name(th)
-                ),
+                format!("JSON value of type {} is not of expected type number", json_type_name(th)),
             ));
         }
     }
@@ -776,10 +717,7 @@ pub(crate) fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Res
     if txid_s.len() != 64 {
         return Err(rpc_error(
             ERR_INVALID_PARAMETER,
-            format!(
-                "txid must be of length 64 (not {}, for '{txid_s}')",
-                txid_s.len()
-            ),
+            format!("txid must be of length 64 (not {}, for '{txid_s}')", txid_s.len()),
         ));
     }
     if !txid_s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -802,24 +740,15 @@ pub(crate) fn prioritisetransaction(ctx: &RpcContext, params: &RpcParams) -> Res
             ));
         }
     }
-    let fee_delta = params
-        .get(2, "fee_delta")
-        .and_then(json_i64)
-        .ok_or_else(|| {
-            if params.get(2, "fee_delta").is_some() {
-                rpc_error(
-                    ERR_TYPE_ERROR,
-                    "JSON value of type string is not of expected type number",
-                )
-            } else {
-                rpc_error(ERR_INVALID_PARAMS, "fee_delta required")
-            }
-        })?;
+    let fee_delta = params.get(2, "fee_delta").and_then(json_i64).ok_or_else(|| {
+        if params.get(2, "fee_delta").is_some() {
+            rpc_error(ERR_TYPE_ERROR, "JSON value of type string is not of expected type number")
+        } else {
+            rpc_error(ERR_INVALID_PARAMS, "fee_delta required")
+        }
+    })?;
     let txid = Txid::from_byte_array(parse_hash32_display(txid_s)?);
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "no mempool"))?;
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "no mempool"))?;
     mp.prioritise_tx(txid, fee_delta);
     Ok(json!(true))
 }
@@ -857,15 +786,9 @@ pub(crate) fn getmempoolcluster(ctx: &RpcContext, params: &RpcParams) -> Result<
     params.reject_unknown(&["txid"])?;
     let hex = params.req_str(0, "txid")?;
     let tid = Txid::from_byte_array(parse_hash32_display(hex)?);
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let Some((weight, count, chunks)) = mp.cluster_rpc(&tid) else {
-        return Err(rpc_error(
-            ERR_INVALID_ADDRESS_OR_KEY,
-            "Transaction not in mempool",
-        ));
+        return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"));
     };
     let chunks_json: Vec<Value> = chunks
         .into_iter()
@@ -905,26 +828,13 @@ pub(crate) fn mempool_relatives(
     ancestors: bool,
 ) -> Result<Value, Value> {
     let tid = Txid::from_byte_array(parse_hash32_display(hex)?);
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    let ids = if ancestors {
-        mp.ancestor_txids(&tid)
-    } else {
-        mp.descendant_txids(&tid)
-    };
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let ids = if ancestors { mp.ancestor_txids(&tid) } else { mp.descendant_txids(&tid) };
     let Some(ids) = ids else {
-        return Err(rpc_error(
-            ERR_INVALID_ADDRESS_OR_KEY,
-            "Transaction not in mempool",
-        ));
+        return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"));
     };
     if !verbose {
-        let hexes: Vec<String> = ids
-            .iter()
-            .map(|t| hash_hex_display(&t.to_byte_array()))
-            .collect();
+        let hexes: Vec<String> = ids.iter().map(|t| hash_hex_display(&t.to_byte_array())).collect();
         return Ok(json!(hexes));
     }
     let live = mp.list_live_meta();
@@ -968,24 +878,17 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     let arr = params
         .get_array(0, "package")
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package array required"))?;
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
+    let mp = ctx.mempool.as_ref().ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     if !mp.relay_enabled() {
-        return Err(rpc_error(
-            ERR_MISC,
-            "mempool relay disabled (still in IBD or tip not ready)",
-        ));
+        return Err(rpc_error(ERR_MISC, "mempool relay disabled (still in IBD or tip not ready)"));
     }
     if arr.len() > MempoolHub::max_package_count() {
         return Err(rpc_error(ERR_INVALID_PARAMS, "package too large"));
     }
     let mut txs = Vec::with_capacity(arr.len());
     for v in arr {
-        let hex = v
-            .as_str()
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package hex required"))?;
+        let hex =
+            v.as_str().ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package hex required"))?;
         txs.push(decode_tx_hex(hex)?);
     }
     if let Err(e) = MempoolHub::check_package_shape(&txs) {
@@ -1099,10 +1002,7 @@ pub(crate) fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Resu
                 .and_then(|x| x.as_u64())
                 .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "vout required"))? as u32;
         let want = parse_hash32_display(txid)?;
-        let op = OutPoint {
-            txid: Txid::from_byte_array(want),
-            vout,
-        };
+        let op = OutPoint { txid: Txid::from_byte_array(want), vout };
         let mut row = json!({
             "txid": txid,
             "vout": vout,
@@ -1141,10 +1041,8 @@ pub(crate) fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value
     };
     let snaps = mp.orphan_snapshot();
     if verbosity == 0 {
-        let ids: Vec<String> = snaps
-            .iter()
-            .map(|s| hash_hex_display(&s.tx.compute_txid().to_byte_array()))
-            .collect();
+        let ids: Vec<String> =
+            snaps.iter().map(|s| hash_hex_display(&s.tx.compute_txid().to_byte_array())).collect();
         return Ok(json!(ids));
     }
     let mut out = Vec::with_capacity(snaps.len());

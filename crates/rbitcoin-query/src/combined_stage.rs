@@ -52,11 +52,8 @@ pub struct CombinedCreate {
         Vec<u32>,
     )>,
     /// When `mode == OutsDenserels`, decoded meta/outs/denserels (avoid re-decode on pin).
-    pub decoded_outs: Option<(
-        rbitcoin_store::TxRecord,
-        Vec<rbitcoin_store::OutputRecord>,
-        Vec<u32>,
-    )>,
+    pub decoded_outs:
+        Option<(rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>, Vec<u32>)>,
 }
 
 /// Load creates by fk via loc→body, decode once.
@@ -75,15 +72,11 @@ pub fn load_creates_once(
     if fks.is_empty() {
         return Ok(Vec::new());
     }
-    let mut jobs: Vec<IdxBodyJob> = fks
-        .iter()
-        .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
-        .collect();
+    let mut jobs: Vec<IdxBodyJob> =
+        fks.iter().map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None)).collect();
     store.idx_body_pipeline(&mut jobs, mode)?;
     let mut inwit_jobs: Vec<IdxBodyJob> = if mode == IdxBodyMode::Full {
-        fks.iter()
-            .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
-            .collect()
+        fks.iter().map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None)).collect()
     } else {
         Vec::new()
     };
@@ -184,10 +177,7 @@ mod tests {
             OutputRecord::unspent(10, vec![0x76, 0xa9, seed]),
             OutputRecord::unspent(20, vec![0x51]),
         ];
-        q.store()
-            .txs
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0]
+        q.store().txs.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0]
     }
 
     /// Drive shipped `load_creates_once` (wire pin + SH).
@@ -201,17 +191,9 @@ mod tests {
         assert!(body_ok_reads() >= 1, "combined path must body-fetch");
         // Schema 13: identity lives in txid.body / plan RAM, not body prefix.
         let c = &creates[0];
-        let t = c
-            .decoded_full
-            .as_ref()
-            .map(|(tx, _, _, _)| tx.txid)
-            .unwrap_or([0u8; 32]);
+        let t = c.decoded_full.as_ref().map(|(tx, _, _, _)| tx.txid).unwrap_or([0u8; 32]);
         // Full decode leaves zero unless filled; sidefile holds identity.
-        let tid = if t == [0u8; 32] {
-            q.store().txs.body_txid(c.fk).unwrap()
-        } else {
-            t
-        };
+        let tid = if t == [0u8; 32] { q.store().txs.body_txid(c.fk).unwrap() } else { t };
         assert_ne!(tid, [0u8; 32], "sidefile must supply identity");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -223,10 +205,7 @@ mod tests {
         let fk = put_tx(&q, 7);
         let creates = load_creates_once(q.store(), &[fk], IdxBodyMode::Outs).unwrap();
         assert_eq!(creates.len(), 1);
-        assert!(
-            creates[0].decoded_outs.is_some(),
-            "decode must succeed for pin"
-        );
+        assert!(creates[0].decoded_outs.is_some(), "decode must succeed for pin");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -234,16 +213,11 @@ mod tests {
     fn block_queue_via_query_enqueue_reopen_empty() {
         let (dir, q) = temp_query();
         let payload = b"ibd-block-payload-bytes".to_vec();
-        let id = q
-            .block_queue_enqueue(42, [0xCDu8; 32], 7, &payload)
-            .unwrap();
+        let id = q.block_queue_enqueue(42, [0xCDu8; 32], 7, &payload).unwrap();
         assert_eq!(q.block_queue_stats().2, 1);
         let _ = id;
         assert!(q.block_queue_has_height(42));
-        assert_eq!(
-            q.block_queue_payload(42).unwrap().as_deref(),
-            Some(payload.as_slice())
-        );
+        assert_eq!(q.block_queue_payload(42).unwrap().as_deref(), Some(payload.as_slice()));
         // Confirm-write hook: dequeue by height.
         assert_eq!(q.block_queue_dequeue_height(42).unwrap(), 1);
         assert_eq!(q.block_queue_stats().2, 0);
@@ -272,10 +246,7 @@ mod tests {
         assert_eq!(q.block_queue_stats().2, 1);
         assert!(q.block_queue_has_height(2));
         assert!(!q.block_queue_has_height(1));
-        assert_eq!(
-            q.block_queue_payload(2).unwrap().as_deref(),
-            Some(p2.as_slice())
-        );
+        assert_eq!(q.block_queue_payload(2).unwrap().as_deref(), Some(p2.as_slice()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -285,10 +256,7 @@ mod tests {
         let (dir, q) = temp_query();
         let wire = b"ram-payload".to_vec();
         q.block_queue_enqueue(10, [0xAAu8; 32], 1, &wire).unwrap();
-        assert_eq!(
-            q.block_queue_payload(10).unwrap().as_deref(),
-            Some(wire.as_slice())
-        );
+        assert_eq!(q.block_queue_payload(10).unwrap().as_deref(), Some(wire.as_slice()));
         assert!(q.block_queue_has_height(10));
         assert_eq!(q.block_queue_stats().2, 1, "peek does not dequeue");
         assert!(q.block_queue_payload(999).unwrap().is_none());
@@ -306,28 +274,16 @@ mod tests {
         // 5 blk/s × 60s → window 300.
         assert_eq!(soft_confirm_window_n(Some(5.0)), 300);
         assert_eq!(soft_confirm_window_n(None), 0);
-        assert_eq!(
-            soft_confirm_window_n(Some(2.0)),
-            (2.0 * BQ_SOFT_CONFIRM_SECS).ceil() as u32
-        );
+        assert_eq!(soft_confirm_window_n(Some(2.0)), (2.0 * BQ_SOFT_CONFIRM_SECS).ceil() as u32);
 
         let free = BQ_SOFT_FREE_BYTES;
         let over = free + 1;
         // Under free: full densify_hi regardless of rate.
-        assert_eq!(
-            soft_densify_band_hi(100, 1000, free, Some(0.1), u64::MAX, None),
-            1000
-        );
+        assert_eq!(soft_densify_band_hi(100, 1000, free, Some(0.1), u64::MAX, None), 1000);
         assert!(!soft_assign_restricted(free));
         // densify_hi < path_lo edge (empty band).
-        assert_eq!(
-            soft_densify_band_hi(50, 40, free, Some(1.0), u64::MAX, None),
-            40
-        );
-        assert_eq!(
-            soft_densify_band_hi(50, 40, over, Some(1.0), u64::MAX, None),
-            40
-        );
+        assert_eq!(soft_densify_band_hi(50, 40, free, Some(1.0), u64::MAX, None), 40);
+        assert_eq!(soft_densify_band_hi(50, 40, over, Some(1.0), u64::MAX, None), 40);
         // Over free: confirm window only.
         assert_eq!(
             soft_densify_band_hi(100, 1000, over, Some(0.1), u64::MAX, None),
@@ -379,17 +335,11 @@ mod tests {
         q.block_queue_enqueue(1, [1u8; 32], 1, &chunk).unwrap();
         q.block_queue_enqueue(2, [2u8; 32], 2, &chunk).unwrap();
         assert!(q.block_queue_stats().1 > BQ_SOFT_FREE_BYTES);
-        assert!(
-            q.block_queue_update_soft_pressure(None),
-            "bytes over free floor → restricted"
-        );
+        assert!(q.block_queue_update_soft_pressure(None), "bytes over free floor → restricted");
         // Drop one chunk → under free floor → unrestricted.
         q.block_queue_dequeue_height(1).unwrap();
         assert!(q.block_queue_stats().1 < BQ_SOFT_FREE_BYTES);
-        assert!(
-            !q.block_queue_update_soft_pressure(None),
-            "bytes under free floor → unrestricted"
-        );
+        assert!(!q.block_queue_update_soft_pressure(None), "bytes under free floor → unrestricted");
 
         // Soft restriction must never block peer offer / enqueue (request-limited only).
         let chunk2 = vec![0u8; 80 * 1024 * 1024];
@@ -477,10 +427,7 @@ mod tests {
         );
         assert!(q.block_queue_take_raw(15).is_some());
         assert_eq!(q.block_queue_unresolved_heights(10, &none, 8), vec![13, 14]);
-        assert_eq!(
-            q.block_queue_unresolved_heights(16, &none, 8),
-            vec![16, 17, 18, 19]
-        );
+        assert_eq!(q.block_queue_unresolved_heights(16, &none, 8), vec![16, 17, 18, 19]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -507,18 +454,14 @@ mod tests {
     fn wave_intake_does_not_clone_raw_for_asked_set() {
         let (dir, q) = temp_query();
         for h in 0..64u32 {
-            q.block_queue_enqueue(h, [h as u8; 32], 1, &[h as u8; 64])
-                .unwrap();
+            q.block_queue_enqueue(h, [h as u8; 32], 1, &[h as u8; 64]).unwrap();
         }
         let asked: Vec<u32> = (0..64).collect();
         let _ = q.block_queue_take_raw_clone_n();
         let intake = q.block_queue_wave_intake(&asked);
         assert_eq!(intake.raw.len(), 64, "all still-raw heights classified");
         assert_eq!(intake.raw[0].0, 0);
-        assert_eq!(
-            intake.raw[0].2, 1,
-            "enqueue header_fk rides the intake stamp"
-        );
+        assert_eq!(intake.raw[0].2, 1, "enqueue header_fk rides the intake stamp");
         assert_eq!(
             q.block_queue_take_raw_clone_n(),
             0,
@@ -527,11 +470,7 @@ mod tests {
         for &h in asked.iter().take(16) {
             assert!(q.block_queue_raw_payload(h).unwrap().is_some());
         }
-        assert_eq!(
-            q.block_queue_take_raw_clone_n(),
-            16,
-            "only the decode prefix may clone"
-        );
+        assert_eq!(q.block_queue_take_raw_clone_n(), 16, "only the decode prefix may clone");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -561,15 +500,10 @@ mod tests {
         let intake = q.block_queue_wave_intake(&[7, 8]);
         assert_eq!(intake.raw.len(), 2);
         assert!(intake.resolved.is_empty());
-        q.block_queue_promote_wave(vec![(7, wire.clone(), 64)])
-            .unwrap();
+        q.block_queue_promote_wave(vec![(7, wire.clone(), 64)]).unwrap();
         assert!(q.block_queue_raw_payload(7).unwrap().is_none());
         assert!(q.block_queue_payload(7).unwrap().unwrap().is_empty());
-        assert_eq!(
-            q.block_queue_stats().1,
-            64 + 6,
-            "charge 64 + leftover raw wire-8"
-        );
+        assert_eq!(q.block_queue_stats().1, 64 + 6, "charge 64 + leftover raw wire-8");
         let got = q.block_queue_resolved(7).expect("resolved");
         assert_eq!(got.block.header.time, 1);
         let intake2 = q.block_queue_wave_intake(&[7, 8]);
@@ -598,11 +532,7 @@ mod tests {
             output_start_fk: Fk::NULL,
             output_count: 1,
         };
-        let inputs = vec![InputRecord::coinbase(
-            u32::MAX,
-            script.clone(),
-            vec![vec![9]],
-        )];
+        let inputs = vec![InputRecord::coinbase(u32::MAX, script.clone(), vec![vec![9]])];
         let outs = vec![OutputRecord::unspent(1, script.clone())];
         let mut plain = Vec::new();
         rbitcoin_store::encode_packed_tx_with_secret(&tx, &inputs, &outs, &mut plain, None);
@@ -615,28 +545,17 @@ mod tests {
             Some(q.store().txs.store_secret()),
         );
         assert_ne!(plain, obf);
-        let fk = q
-            .store()
-            .txs
-            .put_full_batch_indexed(&[(tx, inputs, outs)], true)
-            .unwrap()[0];
+        let fk = q.store().txs.put_full_batch_indexed(&[(tx, inputs, outs)], true).unwrap()[0];
         reset_body_ok_reads();
         let creates = load_creates_once(q.store(), &[fk], IdxBodyMode::Full).unwrap();
         assert_eq!(creates.len(), 1);
         assert!(
-            !creates[0]
-                .raw
-                .windows(script.len())
-                .any(|w| w == script.as_slice()),
+            !creates[0].raw.windows(script.len()).any(|w| w == script.as_slice()),
             "plaintext script must not appear on disk"
         );
         let (_dtx, _ins, douts, _) = decode_packed_tx_with_spender_rels_secret(
             &creates[0].raw,
-            creates[0]
-                .decoded_full
-                .as_ref()
-                .map(|(tx, _, _, _)| tx.output_count)
-                .unwrap_or(1),
+            creates[0].decoded_full.as_ref().map(|(tx, _, _, _)| tx.output_count).unwrap_or(1),
             Some(q.store().txs.store_secret()),
         )
         .unwrap();

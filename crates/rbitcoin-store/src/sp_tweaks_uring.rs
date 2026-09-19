@@ -51,15 +51,9 @@ fn jobs_from_ranges(ranges: &[Option<(u64, u64)>], cap: Option<usize>) -> Vec<Pr
                     Some(c) => (*len as usize).min(c).max(1),
                     None => (*len as usize).max(1),
                 };
-                PreadJob {
-                    off: *off,
-                    buf: vec![0u8; n],
-                }
+                PreadJob { off: *off, buf: vec![0u8; n] }
             }
-            _ => PreadJob {
-                off: 0,
-                buf: Vec::new(),
-            },
+            _ => PreadJob { off: 0, buf: Vec::new() },
         })
         .collect()
 }
@@ -165,18 +159,12 @@ fn empty_rec(txid: [u8; 32]) -> TxRecord {
 /// **outside** the TLS ring. Body preads are the machine.
 pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreError> {
     if fks.is_empty() {
-        return Ok(TweakWave {
-            txs: Vec::new(),
-            parents: U64Map::default(),
-        });
+        return Ok(TweakWave { txs: Vec::new(), parents: U64Map::default() });
     }
 
     let loc = table.create_loc_range_batch(fks)?;
     let txout_ranges: Vec<Option<(u64, u64)>> = loc.iter().map(|p| p.map(|x| x.txout)).collect();
-    let n_outs: Vec<u32> = loc
-        .iter()
-        .map(|p| p.map(|x| x.n_out).unwrap_or(0))
-        .collect();
+    let n_outs: Vec<u32> = loc.iter().map(|p| p.map(|x| x.n_out).unwrap_or(0)).collect();
     let mut txs: Vec<LoadedTweakTx> = Vec::with_capacity(fks.len());
     for &fk in fks {
         let txid = table.body_txid(fk).unwrap_or([0u8; 32]);
@@ -213,12 +201,8 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
         txs[i].rec = rec;
     }
 
-    let p2tr_i: Vec<usize> = txs
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.need_inwit)
-        .map(|(i, _)| i)
-        .collect();
+    let p2tr_i: Vec<usize> =
+        txs.iter().enumerate().filter(|(_, t)| t.need_inwit).map(|(i, _)| i).collect();
     if !p2tr_i.is_empty() {
         let inwit_fks: Vec<Fk> = p2tr_i.iter().map(|&i| txs[i].fk).collect();
         let inwit_ranges = table.inwit_loc.range_batch(&inwit_fks)?;
@@ -264,10 +248,7 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
     if !missing.is_empty() {
         let loc = table.create_loc_range_batch(&missing)?;
         let pr: Vec<Option<(u64, u64)>> = loc.iter().map(|p| p.map(|x| x.txout)).collect();
-        let pn: Vec<u32> = loc
-            .iter()
-            .map(|p| p.map(|x| x.n_out).unwrap_or(0))
-            .collect();
+        let pn: Vec<u32> = loc.iter().map(|p| p.map(|x| x.n_out).unwrap_or(0)).collect();
         let mut jobs = jobs_from_ranges(&pr, None);
         run_stage(
             table.body.body_read_fd(),

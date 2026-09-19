@@ -87,18 +87,12 @@ mod tests {
         assert!(cfg.source().is_none());
 
         let init = NodeError::Init("peer-timeout must be a positive integer.".into());
-        assert_eq!(
-            format!("{init}"),
-            "Error: peer-timeout must be a positive integer."
-        );
+        assert_eq!(format!("{init}"), "Error: peer-timeout must be a positive integer.");
         assert!(init.source().is_none());
 
         let fut = NodeError::FutureTip;
         assert_eq!(format!("{fut}"), FUTURE_BLOCK_DB_MSG);
-        assert!(
-            format!("{fut}").contains("more than two hours ahead of the node clock"),
-            "{fut}"
-        );
+        assert!(format!("{fut}").contains("more than two hours ahead of the node clock"), "{fut}");
         assert!(
             !format!("{fut}").contains("reindex-chainstate"),
             "operator text must not name Core -reindex-chainstate: {fut}"
@@ -129,13 +123,7 @@ mod tests {
     #[test]
     fn tip_too_far_in_future_is_strictly_beyond_two_hours() {
         assert!(!tip_too_far_in_future(1_000, 1_000));
-        assert!(!tip_too_far_in_future(
-            1_000 + MAX_FUTURE_BLOCK_TIME as u32,
-            1_000
-        ));
-        assert!(tip_too_far_in_future(
-            1_000 + MAX_FUTURE_BLOCK_TIME as u32 + 1,
-            1_000
-        ));
+        assert!(!tip_too_far_in_future(1_000 + MAX_FUTURE_BLOCK_TIME as u32, 1_000));
+        assert!(tip_too_far_in_future(1_000 + MAX_FUTURE_BLOCK_TIME as u32 + 1, 1_000));
     }
 }

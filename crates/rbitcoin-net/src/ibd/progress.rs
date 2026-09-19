@@ -99,9 +99,7 @@ pub(crate) fn claim_ready(
     }
     // Must be **this** hash at the height — first-wins BQ of a different block
     // is not claim-ready (mainnet tip+1 wrong-wire thrash / permanent hole).
-    hub.query
-        .block_queue_hash_at_height(height)
-        .is_some_and(|h| h == hash.to_byte_array())
+    hub.query.block_queue_hash_at_height(height).is_some_and(|h| h == hash.to_byte_array())
 }
 
 /// Count heights from tip+1 until the next in-hand body (fetch gap).
@@ -184,11 +182,7 @@ pub(crate) struct TipRateTracker {
 
 impl TipRateTracker {
     pub(crate) fn new() -> Self {
-        Self {
-            rate_ema: None,
-            last: None,
-            first_at: None,
-        }
+        Self { rate_ema: None, last: None, first_at: None }
     }
 
     /// Record a sample (call once per centralized status tick).
@@ -201,11 +195,7 @@ impl TipRateTracker {
             // Ignore zero/negative clock skew; tiny dt would explode inst rate.
             if dt >= 0.5 {
                 let inst = tip.saturating_sub(tip0) as f64 / dt;
-                let inst = if inst.is_finite() && inst >= 0.0 {
-                    inst
-                } else {
-                    0.0
-                };
+                let inst = if inst.is_finite() && inst >= 0.0 { inst } else { 0.0 };
                 self.rate_ema = Some(match self.rate_ema {
                     None => inst,
                     Some(prev) => {
@@ -333,35 +323,16 @@ mod tests {
         assert!(line.contains(" hole="), "{line}");
         assert!(line.contains(" soft="), "{line}");
         assert!(line.contains(" RAM="), "{line}");
-        assert!(
-            !line.contains(" bq n="),
-            "count lives in soft= only: {line}"
-        );
+        assert!(!line.contains(" bq n="), "count lives in soft= only: {line}");
         assert!(!line.contains(" disk="), "queue is RAM not disk: {line}");
-        assert!(
-            !line.contains("pending_ram="),
-            "no RAM overflow meter: {line}"
-        );
+        assert!(!line.contains("pending_ram="), "no RAM overflow meter: {line}");
         assert!(line.contains("ready="), "{line}");
         assert!(line.contains("scriptq"), "{line}");
         // Retired dual-track progress tokens forbidden.
-        assert!(
-            !line.contains("arch_hwm"),
-            "must not report retired arch_hwm: {line}"
-        );
-        assert!(
-            !line.contains("lead="),
-            "must not report retired lead=: {line}"
-        );
-        assert!(
-            !line.contains("arch="),
-            "must not report retired arch= rate token: {line}"
-        );
-        assert_eq!(
-            line.matches("/s)").count(),
-            1,
-            "only tip rate on progress line: {line}"
-        );
+        assert!(!line.contains("arch_hwm"), "must not report retired arch_hwm: {line}");
+        assert!(!line.contains("lead="), "must not report retired lead=: {line}");
+        assert!(!line.contains("arch="), "must not report retired arch= rate token: {line}");
+        assert_eq!(line.matches("/s)").count(), 1, "only tip rate on progress line: {line}");
         let slow = format_progress_line(&ProgressLineInput {
             pct: 1,
             tip: 10,
@@ -378,10 +349,7 @@ mod tests {
         });
         assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
         assert!(slow.contains("bq soft=0/256 RAM=0MiB"), "{slow}");
-        assert!(
-            !slow.contains("arch_hwm") && !slow.contains("lead="),
-            "{slow}"
-        );
+        assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
     }
 
     #[test]
@@ -393,18 +361,9 @@ mod tests {
 
         let free = BQ_SOFT_FREE_BYTES;
         let over = free + 1;
-        assert_eq!(
-            soft_densify_band_hi(10, 5000, free, Some(5.0), u64::MAX, None),
-            5000
-        );
-        assert_eq!(
-            soft_densify_band_hi(10, 5000, over, Some(5.0), u64::MAX, None),
-            309
-        );
-        assert_eq!(
-            soft_densify_band_hi(10, 5000, over, None, u64::MAX, None),
-            10
-        );
+        assert_eq!(soft_densify_band_hi(10, 5000, free, Some(5.0), u64::MAX, None), 5000);
+        assert_eq!(soft_densify_band_hi(10, 5000, over, Some(5.0), u64::MAX, None), 309);
+        assert_eq!(soft_densify_band_hi(10, 5000, over, None, u64::MAX, None), 10);
         assert!(!soft_assign_restricted(free));
         assert!(soft_assign_restricted(over));
     }
@@ -447,10 +406,7 @@ mod tests {
         let mut done = TipRateTracker::new();
         let t0 = Instant::now();
         done.push(t0, 100);
-        assert_eq!(
-            done.eta_string(t0 + Duration::from_secs(30), 100, 100),
-            "done"
-        );
+        assert_eq!(done.eta_string(t0 + Duration::from_secs(30), 100, 100), "done");
     }
 
     #[test]
@@ -485,10 +441,7 @@ mod tests {
 
         let p = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
         assert_eq!(p.tip, 0);
-        assert_eq!(
-            p.tip_hole, 3,
-            "zombie pending at h=3 still counts as fetch hole"
-        );
+        assert_eq!(p.tip_hole, 3, "zombie pending at h=3 still counts as fetch hole");
 
         // Zombie pending at tip+1 → still hole (must re-getdata).
         body.mark_pending(h1);
@@ -517,9 +470,7 @@ mod tests {
         // BQ claim-ready at tip+1 stops hole after reset body.
         let mut body2 = BodyPresence::new();
         body2.mark_missing(h1);
-        hub.query
-            .block_queue_enqueue(1, h1.to_byte_array(), 1, b"x")
-            .unwrap();
+        hub.query.block_queue_enqueue(1, h1.to_byte_array(), 1, b"x").unwrap();
         assert!(claim_ready(&hub, &mut body2, 1, &h1));
         let hole_ready = tip_fetch_hole(&hub, &h2h, &mut body2);
         assert_eq!(hole_ready, 0, "BQ-ready tip+1 → hole=0");
@@ -579,10 +530,7 @@ mod tests {
         cold.push(t0, 0);
         cold.push(t0 + Duration::from_secs(5), 50);
         assert!(cold.eta_rate(t0 + Duration::from_secs(5)).is_none());
-        assert_eq!(
-            cold.eta_string(t0 + Duration::from_secs(5), 50, 1_000_000),
-            "eta=?"
-        );
+        assert_eq!(cold.eta_string(t0 + Duration::from_secs(5), 50, 1_000_000), "eta=?");
 
         let mut steady = TipRateTracker::new();
         for i in 0u32..=60 {
@@ -606,13 +554,7 @@ mod tests {
         for i in 0u32..=40 {
             warm.push(t0 + Duration::from_secs(u64::from(i) * 2), i * 2);
         }
-        assert_eq!(
-            warm.eta_string(t0 + Duration::from_secs(100), 10_000, 100),
-            "done"
-        );
-        assert_eq!(
-            warm.eta_string(t0 + Duration::from_secs(100), 100, 100),
-            "done"
-        );
+        assert_eq!(warm.eta_string(t0 + Duration::from_secs(100), 10_000, 100), "done");
+        assert_eq!(warm.eta_string(t0 + Duration::from_secs(100), 100, 100), "done");
     }
 }

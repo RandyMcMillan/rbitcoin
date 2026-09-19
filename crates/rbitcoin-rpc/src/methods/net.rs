@@ -5,11 +5,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 
 pub(crate) fn getnettotals(ctx: &RpcContext) -> Value {
-    let (recv, sent) = ctx
-        .peers
-        .as_ref()
-        .map(|h| h.byte_totals())
-        .unwrap_or((0, 0));
+    let (recv, sent) = ctx.peers.as_ref().map(|h| h.byte_totals()).unwrap_or((0, 0));
     let timemillis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -33,11 +29,7 @@ pub(crate) fn getpeerinfo(ctx: &RpcContext) -> Value {
     let Some(hub) = ctx.peers.as_ref() else {
         return json!([]);
     };
-    let rows: Vec<Value> = hub
-        .snapshot()
-        .into_iter()
-        .map(|p| peerinfo_json(ctx, p))
-        .collect();
+    let rows: Vec<Value> = hub.snapshot().into_iter().map(|p| peerinfo_json(ctx, p)).collect();
     json!(rows)
 }
 
@@ -45,22 +37,14 @@ fn peer_header_height(ctx: &RpcContext, hash: &bitcoin::BlockHash) -> Option<i64
     if let Some(c) = ctx.chain.as_ref() {
         return c.header_height(hash).map(i64::from);
     }
-    ctx.query
-        .height_of_hash(&hash.to_byte_array())
-        .ok()
-        .flatten()
-        .map(|h| i64::from(h.0))
+    ctx.query.height_of_hash(&hash.to_byte_array()).ok().flatten().map(|h| i64::from(h.0))
 }
 
 fn peer_block_connected(ctx: &RpcContext, hash: &bitcoin::BlockHash) -> bool {
     if let Some(c) = ctx.chain.as_ref() {
         return c.is_connected(hash);
     }
-    ctx.query
-        .height_of_hash(&hash.to_byte_array())
-        .ok()
-        .flatten()
-        .is_some()
+    ctx.query.height_of_hash(&hash.to_byte_array()).ok().flatten().is_some()
 }
 
 fn outbound_median_time_offset(rows: &[rbitcoin_net::PeerInfo]) -> i64 {
@@ -88,11 +72,7 @@ pub(crate) fn peerinfo_json(ctx: &RpcContext, p: rbitcoin_net::PeerInfo) -> Valu
     let (synced_headers, synced_blocks) = match p.best_known {
         Some(h) => {
             let height = peer_header_height(ctx, &h).unwrap_or(-1);
-            let blocks = if peer_block_connected(ctx, &h) {
-                height
-            } else {
-                -1
-            };
+            let blocks = if peer_block_connected(ctx, &h) { height } else { -1 };
             (height, blocks)
         }
         None => (-1, -1),
@@ -167,9 +147,7 @@ pub(crate) fn services_names(bits: u64) -> Vec<&'static str> {
 }
 
 pub(crate) fn require_peers(ctx: &RpcContext) -> Result<&rbitcoin_net::PeerHub, Value> {
-    ctx.peers
-        .as_deref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "P2P session table not attached"))
+    ctx.peers.as_deref().ok_or_else(|| rpc_error(ERR_MISC, "P2P session table not attached"))
 }
 
 pub(crate) fn addnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -220,8 +198,7 @@ pub(crate) fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
         .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
     let typ =
         rbitcoin_net::PeerConnType::parse(typ_s).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e))?;
-    hub.addconnection(addr, typ)
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
+    hub.addconnection(addr, typ).map_err(|e| rpc_error(ERR_MISC, e))?;
     Ok(json!({
         "address": address,
         "connection_type": typ.as_str(),
@@ -237,19 +214,16 @@ pub(crate) fn addpeeraddress(ctx: &RpcContext, params: &RpcParams) -> Result<Val
     if port > u64::from(u16::MAX) {
         return Err(rpc_error(ERR_INVALID_PARAMS, "JSON integer out of range"));
     }
-    let ip: std::net::IpAddr = address
-        .parse()
-        .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid IP address"))?;
+    let ip: std::net::IpAddr =
+        address.parse().map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid IP address"))?;
     let addr = std::net::SocketAddr::new(ip, port as u16);
     let Some(am) = ctx.addrman.as_ref() else {
         return Err(rpc_error(ERR_MISC, "addrman not available"));
     };
     // RAM-only: do not rewrite peers on every call (p2p_getaddr_caching fills
     // via this RPC). The node still persists addrman on shutdown / catch-up.
-    let added = am
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .add_learned(addr, rbitcoin_net::MAX_ADDR_MAN);
+    let added =
+        am.lock().unwrap_or_else(|e| e.into_inner()).add_learned(addr, rbitcoin_net::MAX_ADDR_MAN);
     Ok(json!({ "success": added }))
 }
 
@@ -263,10 +237,7 @@ pub(crate) fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<V
             let n = json_i64(v)
                 .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "count must be an integer"))?;
             if n < 0 {
-                return Err(rpc_error(
-                    ERR_INVALID_PARAMETER,
-                    "Address count out of range",
-                ));
+                return Err(rpc_error(ERR_INVALID_PARAMETER, "Address count out of range"));
             }
             n as u64
         }

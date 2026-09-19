@@ -207,10 +207,7 @@ pub fn accept_and_connect_block_preverified(
     let hash = block.block_hash().to_byte_array();
     if let Some(h) = query.height_of_hash(&hash).map_err(ConsensusError::from)? {
         if h == height {
-            if let Some((fk, _)) = query
-                .get_header_by_hash(&hash)
-                .map_err(ConsensusError::from)?
-            {
+            if let Some((fk, _)) = query.get_header_by_hash(&hash).map_err(ConsensusError::from)? {
                 confirm_run::finish_post_commit(query, height.0, &hash)?;
                 return Ok(fk);
             }
@@ -232,13 +229,11 @@ pub fn accept_and_connect_block_preverified(
     // Write skipped heights ≤ tip (idempotent race). A body we just ran
     // through lookup/load must have a header — missing is an invariant, not
     // a soft NotFound (inflated confirmed[] used to hit this on tip+1).
-    query
-        .get_header_by_hash(&hash)
-        .map_err(ConsensusError::from)?
-        .map(|(fk, _)| fk)
-        .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+    query.get_header_by_hash(&hash).map_err(ConsensusError::from)?.map(|(fk, _)| fk).ok_or(
+        ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: confirm write skipped but header missing",
-        )))
+        )),
+    )
 }
 
 fn class_a_header_and_txids(
@@ -301,13 +296,9 @@ pub fn commit_class_a_run(
         let fk = query.ensure_header(&header).map_err(ConsensusError::from)?;
         owned.push((fk, Arc::new(block.clone()), txids));
     }
-    let refs: Vec<WirePlanNeed<'_>> = owned
-        .iter()
-        .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
-        .collect();
-    query
-        .archive_class_a_from_wire(&refs)
-        .map_err(ConsensusError::from)?;
+    let refs: Vec<WirePlanNeed<'_>> =
+        owned.iter().map(|(fk, b, ids)| (*fk, b, ids.as_slice())).collect();
+    query.archive_class_a_from_wire(&refs).map_err(ConsensusError::from)?;
     Ok(())
 }
 
@@ -318,10 +309,7 @@ pub fn prepare_block_for_archive(
     block: &Block,
 ) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
     let hash = block.block_hash().to_byte_array();
-    if query
-        .is_block_archived(&hash)
-        .map_err(ConsensusError::from)?
-    {
+    if query.is_block_archived(&hash).map_err(ConsensusError::from)? {
         // Standalone archive helper (not confirm pipeline): one hash pass here.
         return block_to_apply(query, &block.header, &block.txdata);
     }
@@ -369,11 +357,7 @@ mod coverage_tests {
     }
 
     fn mine_regtest(prev: BlockHash, time: u32, height: u32, extras: Vec<Transaction>) -> Block {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            bip34_height_script(height)
-        };
+        let mut ss = if height == 0 { vec![0x00] } else { bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }

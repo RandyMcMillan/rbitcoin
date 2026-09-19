@@ -43,10 +43,7 @@ pub const FILE_HEADER_LEN: usize = 16;
 
 /// Sibling `{filename}.tmp` next to `path` (keeps compound suffixes like `.idx`).
 pub(crate) fn tmp_sidecar_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("file"))
-        .to_os_string();
+    let mut name = path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("file")).to_os_string();
     name.push(".tmp");
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
@@ -56,9 +53,7 @@ pub(crate) fn tmp_sidecar_path(path: &Path) -> PathBuf {
 
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub(crate) fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_synced_tmp_file(path, |f| {
-        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
-    })
+    write_synced_tmp_file(path, |f| f.write_all(bytes).map_err(|e| StoreError::io(path, e)))
 }
 
 /// Stream `write` into a sibling tmp, `sync_all`, then rename over `path`.
@@ -219,10 +214,8 @@ fn set_file_len(file: &File, path: &Path, new_len: u64) -> Result<(), StoreError
 impl TableFile {
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
-        let file = table_open_opts()
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| StoreError::io(&path, e))?;
+        let file =
+            table_open_opts().create_new(true).open(&path).map_err(|e| StoreError::io(&path, e))?;
 
         let header = encode_leading_header(kind, FILE_HEADER_LEN as u64);
         let initial = FILE_HEADER_LEN as u64 + 64;
@@ -252,10 +245,8 @@ impl TableFile {
         kind: TableKind,
     ) -> Result<Self, StoreError> {
         let path = path.into();
-        let file = table_open_opts()
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| StoreError::io(&path, e))?;
+        let file =
+            table_open_opts().create_new(true).open(&path).map_err(|e| StoreError::io(&path, e))?;
         let initial = TRAILING_FOOTER_LEN as u64;
         set_file_len(&file, &path, initial)?;
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
@@ -281,9 +272,7 @@ impl TableFile {
         data_bytes: u64,
     ) -> Result<(Self, [u8; 16]), StoreError> {
         let path = path.into();
-        let file = table_open_opts()
-            .open(&path)
-            .map_err(|e| StoreError::io(&path, e))?;
+        let file = table_open_opts().open(&path).map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
         let expect = data_bytes.saturating_add(TRAILING_FOOTER_LEN as u64);
         if file_len < expect {
@@ -300,10 +289,7 @@ impl TableFile {
         }
         let got = u16::from_le_bytes([footer[6], footer[7]]);
         if got != kind.as_u16() {
-            return Err(StoreError::BadKind {
-                expected: kind.as_u16(),
-                got,
-            });
+            return Err(StoreError::BadKind { expected: kind.as_u16(), got });
         }
         let mut trailing_ext = [0u8; 16];
         trailing_ext.copy_from_slice(&footer[16..32]);
@@ -339,20 +325,13 @@ impl TableFile {
         kind: TableKind,
     ) -> Result<(PathBuf, u64), StoreError> {
         let path = path.into();
-        let file = table_open_opts()
-            .open(&path)
-            .map_err(|e| StoreError::io(&path, e))?;
+        let file = table_open_opts().open(&path).map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
         if file_len < TRAILING_FOOTER_LEN as u64 {
             return Err(StoreError::Corrupt("trailing-header table short"));
         }
         let mut footer = [0u8; TRAILING_FOOTER_LEN];
-        handle_pread_all(
-            &file,
-            &path,
-            file_len - TRAILING_FOOTER_LEN as u64,
-            &mut footer,
-        )?;
+        handle_pread_all(&file, &path, file_len - TRAILING_FOOTER_LEN as u64, &mut footer)?;
         if footer[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
@@ -362,10 +341,7 @@ impl TableFile {
         }
         let got = u16::from_le_bytes([footer[6], footer[7]]);
         if got != kind.as_u16() {
-            return Err(StoreError::BadKind {
-                expected: kind.as_u16(),
-                got,
-            });
+            return Err(StoreError::BadKind { expected: kind.as_u16(), got });
         }
         let logical = u64::from_le_bytes(footer[8..16].try_into().unwrap());
         if logical < TRAILING_FOOTER_LEN as u64 || logical > file_len {
@@ -377,9 +353,7 @@ impl TableFile {
 
     pub fn set_trailing_ext(&mut self, ext: [u8; 16]) -> Result<(), StoreError> {
         if !self.trailing_header {
-            return Err(StoreError::Corrupt(
-                "set_trailing_ext on leading-header file",
-            ));
+            return Err(StoreError::Corrupt("set_trailing_ext on leading-header file"));
         }
         self.trailing_ext = ext;
         let logical = self.published_len.load(Ordering::Acquire);
@@ -403,9 +377,7 @@ impl TableFile {
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
-        let file = table_open_opts()
-            .open(&path)
-            .map_err(|e| StoreError::io(&path, e))?;
+        let file = table_open_opts().open(&path).map_err(|e| StoreError::io(&path, e))?;
 
         let mut header = [0u8; FILE_HEADER_LEN];
         handle_pread_all(&file, &path, 0, &mut header)?;
@@ -418,10 +390,7 @@ impl TableFile {
         }
         let got = u16::from_le_bytes([header[6], header[7]]);
         if got != kind.as_u16() {
-            return Err(StoreError::BadKind {
-                expected: kind.as_u16(),
-                got,
-            });
+            return Err(StoreError::BadKind { expected: kind.as_u16(), got });
         }
 
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
@@ -470,11 +439,8 @@ impl TableFile {
 
     /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
-        let min = if self.trailing_header {
-            TRAILING_FOOTER_LEN as u64
-        } else {
-            FILE_HEADER_LEN as u64
-        };
+        let min =
+            if self.trailing_header { TRAILING_FOOTER_LEN as u64 } else { FILE_HEADER_LEN as u64 };
         if logical < min {
             return Err(StoreError::Corrupt("logical length below header"));
         }
@@ -494,14 +460,9 @@ impl TableFile {
     /// Slot/data length excluding the header or trailing footer.
     #[inline]
     pub fn data_len(&self) -> u64 {
-        let overhead = if self.trailing_header {
-            TRAILING_FOOTER_LEN as u64
-        } else {
-            FILE_HEADER_LEN as u64
-        };
-        self.published_len
-            .load(Ordering::Acquire)
-            .saturating_sub(overhead)
+        let overhead =
+            if self.trailing_header { TRAILING_FOOTER_LEN as u64 } else { FILE_HEADER_LEN as u64 };
+        self.published_len.load(Ordering::Acquire).saturating_sub(overhead)
     }
 
     /// Complete pread of `buf.len()` bytes or error (no partial success).
@@ -597,11 +558,7 @@ impl TableFile {
     /// Ensure the file covers at least `need` bytes (fallocate / set_len only).
     /// Idx / dense u32 tables: grow in ~1 MiB steps, not 256 MiB slabs.
     pub fn set_grow_tight(&self, tight: bool) {
-        self.set_grow_policy(if tight {
-            GrowPolicy::Tight1MiB
-        } else {
-            GrowPolicy::Slab
-        });
+        self.set_grow_policy(if tight { GrowPolicy::Tight1MiB } else { GrowPolicy::Slab });
     }
 
     pub fn set_grow_policy(&self, policy: GrowPolicy) {
@@ -645,10 +602,7 @@ impl TableFile {
             }
             c
         } else {
-            need.saturating_add(headroom)
-                .div_ceil(step)
-                .saturating_mul(step)
-                .max(need)
+            need.saturating_add(headroom).div_ceil(step).saturating_mul(step).max(need)
         };
         self.grow_to(new_cap)
     }
@@ -694,9 +648,7 @@ impl TableFile {
     fn persist_hwm(&self, logical: u64) -> Result<(), StoreError> {
         let bytes = logical.to_le_bytes();
         let hwm_off = if self.trailing_header {
-            logical
-                .saturating_sub(TRAILING_FOOTER_LEN as u64)
-                .saturating_add(8)
+            logical.saturating_sub(TRAILING_FOOTER_LEN as u64).saturating_add(8)
         } else {
             8
         };
@@ -724,11 +676,7 @@ impl TableFile {
         }
         let logical = self.published_len.load(Ordering::Acquire);
         self.persist_logical_len(logical)?;
-        self.file
-            .lock()
-            .unwrap()
-            .sync_data()
-            .map_err(|e| StoreError::io(&self.path, e))?;
+        self.file.lock().unwrap().sync_data().map_err(|e| StoreError::io(&self.path, e))?;
         self.needs_sync.store(false, Ordering::Release);
         Ok(())
     }
@@ -805,10 +753,7 @@ pub fn ensure_nofile_budget() -> (u64, u64) {
 pub fn ensure_nofile_budget_at_least(want_soft: u64) -> (u64, u64) {
     #[cfg(unix)]
     {
-        let mut rlim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
+        let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
             rbitcoin_log::warn!(
                 "store: getrlimit(NOFILE) failed: {}",
@@ -865,10 +810,7 @@ fn try_fallocate(file: &File, len: u64) -> std::io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (file, len);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "fallocate unavailable",
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "fallocate unavailable"))
     }
 }
 
@@ -886,10 +828,7 @@ fn try_punch_hole(file: &File, offset: u64, len: u64) -> std::io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (file, offset, len);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "punch hole unavailable",
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "punch hole unavailable"))
     }
 }
 
@@ -912,10 +851,7 @@ mod advise_tests {
         let on_disk = std::fs::metadata(&path).unwrap().len();
         // need ≈ 16+2048; tight grow is need+1MiB, never a 64–256 MiB slab.
         assert!(on_disk > 2048);
-        assert!(
-            on_disk < 2 * 1024 * 1024,
-            "tight grow should stay near 1 MiB, got {on_disk}"
-        );
+        assert!(on_disk < 2 * 1024 * 1024, "tight grow should stay near 1 MiB, got {on_disk}");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1002,8 +938,7 @@ mod advise_tests {
         f2.read_at(FILE_HEADER_LEN as u64, &mut got).unwrap();
         assert_eq!(got, payload);
         f2.ensure_capacity(4096).unwrap();
-        f2.write_at(FILE_HEADER_LEN as u64 + 32, &[0xCD; 8])
-            .unwrap();
+        f2.write_at(FILE_HEADER_LEN as u64 + 32, &[0xCD; 8]).unwrap();
         drop(f2);
         let f3 = TableFile::open(&path, TableKind::ScriptHash).unwrap();
         let mut tail = [0u8; 8];
@@ -1018,9 +953,7 @@ mod advise_tests {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
-        let _stress = TEST_MMAP_STRESS_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _stress = TEST_MMAP_STRESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-epoch-stress-{id}"));
@@ -1110,13 +1043,9 @@ mod advise_tests {
         let off64 = FILE_HEADER_LEN as u64 + 8;
         f.write_at(off32, &0x1122_3344u32.to_le_bytes()).unwrap();
         assert_eq!(f.load_u32_le(off32).unwrap(), 0x1122_3344);
-        f.write_at(off64, &0x0102_0304_0506_0708u64.to_le_bytes())
-            .unwrap();
+        f.write_at(off64, &0x0102_0304_0506_0708u64.to_le_bytes()).unwrap();
         assert_eq!(f.load_u64_le(off64).unwrap(), 0x0102_0304_0506_0708);
-        assert!(matches!(
-            f.load_u32_le(off32 + 1),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(f.load_u32_le(off32 + 1), Err(StoreError::Corrupt(_))));
         assert!(matches!(f.load_u32_le(10_000), Err(StoreError::Corrupt(_))));
         f.zero_range(0, 0).unwrap();
         f.zero_range(FILE_HEADER_LEN as u64 + 32, 16).unwrap();
@@ -1131,15 +1060,8 @@ mod advise_tests {
         {
             let bad = std::env::temp_dir().join(format!("rbitcoin-file-bad-{id}"));
             let _ = std::fs::remove_file(&bad);
-            std::fs::write(
-                &bad,
-                b"XXXX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-            )
-            .unwrap();
-            assert!(matches!(
-                TableFile::open(&bad, TableKind::TxOut),
-                Err(StoreError::BadMagic)
-            ));
+            std::fs::write(&bad, b"XXXX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+            assert!(matches!(TableFile::open(&bad, TableKind::TxOut), Err(StoreError::BadMagic)));
             let _ = std::fs::remove_file(&bad);
         }
         {
@@ -1147,8 +1069,7 @@ mod advise_tests {
             let _ = std::fs::remove_file(&th);
             let f = TableFile::create_trailing_header(&th, TableKind::HashHead).unwrap();
             let data_bytes = 64u64;
-            f.set_logical_len(data_bytes + TRAILING_FOOTER_LEN as u64)
-                .unwrap();
+            f.set_logical_len(data_bytes + TRAILING_FOOTER_LEN as u64).unwrap();
             f.write_at(0, &[0xABu8; 64]).unwrap();
             f.flush().unwrap();
             drop(f);
@@ -1217,10 +1138,7 @@ mod advise_tests {
             let lead = std::env::temp_dir().join(format!("rbitcoin-file-lead-{id}"));
             let _ = std::fs::remove_file(&lead);
             let mut f = TableFile::create(&lead, TableKind::TxOut).unwrap();
-            assert!(matches!(
-                f.set_trailing_ext([0; 16]),
-                Err(StoreError::Corrupt(_))
-            ));
+            assert!(matches!(f.set_trailing_ext([0; 16]), Err(StoreError::Corrupt(_))));
             drop(f);
             let _ = std::fs::remove_file(&lead);
         }
@@ -1261,10 +1179,8 @@ mod advise_tests {
         ));
         let good = dir.join("good");
         let f = TableFile::create_trailing_header(&good, TableKind::TxOut).unwrap();
-        f.ensure_capacity(4096 + TRAILING_FOOTER_LEN as u64)
-            .unwrap();
-        f.set_logical_len(4096 + TRAILING_FOOTER_LEN as u64)
-            .unwrap();
+        f.ensure_capacity(4096 + TRAILING_FOOTER_LEN as u64).unwrap();
+        f.set_logical_len(4096 + TRAILING_FOOTER_LEN as u64).unwrap();
         drop(f);
         let (_f2, _ext) =
             TableFile::open_trailing_header_from_end(&good, TableKind::TxOut).unwrap();
@@ -1274,26 +1190,18 @@ mod advise_tests {
         ));
         let good2 = dir.join("good2");
         let f = TableFile::create_trailing_header(&good2, TableKind::TxOut).unwrap();
-        f.ensure_capacity(1024 + TRAILING_FOOTER_LEN as u64)
-            .unwrap();
-        f.set_logical_len(1024 + TRAILING_FOOTER_LEN as u64)
-            .unwrap();
+        f.ensure_capacity(1024 + TRAILING_FOOTER_LEN as u64).unwrap();
+        f.set_logical_len(1024 + TRAILING_FOOTER_LEN as u64).unwrap();
         drop(f);
         let (_f3, _) = TableFile::open_trailing_header(&good2, TableKind::TxOut, 1024).unwrap();
         assert!(TableFile::open_trailing_header(&good2, TableKind::TxOut, 50_000).is_err());
         let path = dir.join("normal");
         let f = TableFile::create(&path, TableKind::TxOut).unwrap();
-        f.write_at(FILE_HEADER_LEN as u64, &[1, 2, 3, 4, 5, 6, 7, 8])
-            .unwrap();
+        f.write_at(FILE_HEADER_LEN as u64, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let u = f.load_u32_le(FILE_HEADER_LEN as u64).unwrap();
         assert_eq!(u, u32::from_le_bytes([1, 2, 3, 4]));
-        f.write_at(FILE_HEADER_LEN as u64, &0x1122_3344u32.to_le_bytes())
-            .unwrap();
-        f.write_at(
-            FILE_HEADER_LEN as u64,
-            &0x0102_0304_0506_0708u64.to_le_bytes(),
-        )
-        .unwrap();
+        f.write_at(FILE_HEADER_LEN as u64, &0x1122_3344u32.to_le_bytes()).unwrap();
+        f.write_at(FILE_HEADER_LEN as u64, &0x0102_0304_0506_0708u64.to_le_bytes()).unwrap();
         let _ = f.load_u64_le(FILE_HEADER_LEN as u64).unwrap();
         f.zero_range(FILE_HEADER_LEN as u64, 8).unwrap();
         f.set_logical_len(FILE_HEADER_LEN as u64 + 8).unwrap();

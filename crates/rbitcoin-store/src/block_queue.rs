@@ -225,11 +225,7 @@ impl BlockQueue {
             QueuedBody::Promoted { .. } => return None,
         };
         let e = self.index.get(&id)?;
-        let out = TakenRaw {
-            hash: e.hash,
-            header_fk: e.header_fk,
-            payload,
-        };
+        let out = TakenRaw { hash: e.hash, header_fk: e.header_fk, payload };
         self.bytes = self.bytes.saturating_sub(out.payload.len() as u64);
         let _ = self.dequeue(id);
         Some(out)
@@ -323,17 +319,11 @@ impl BlockQueue {
     }
 
     fn entry_for_height(&self, height: u32) -> Option<&IndexEntry> {
-        self.height_to_id
-            .get(&height)
-            .and_then(|id| self.index.get(id))
+        self.height_to_id.get(&height).and_then(|id| self.index.get(id))
     }
 
     fn entry_mut_for_height(&mut self, height: u32) -> Result<&mut IndexEntry, StoreError> {
-        let id = self
-            .height_to_id
-            .get(&height)
-            .copied()
-            .ok_or(StoreError::NotFound)?;
+        let id = self.height_to_id.get(&height).copied().ok_or(StoreError::NotFound)?;
         self.index.get_mut(&id).ok_or(StoreError::NotFound)
     }
 
@@ -344,9 +334,7 @@ impl BlockQueue {
     }
 
     pub fn is_resolve_complete(&self, height: u32) -> bool {
-        self.entry_for_height(height)
-            .map(|e| e.resolve_complete)
-            .unwrap_or(false)
+        self.entry_for_height(height).map(|e| e.resolve_complete).unwrap_or(false)
     }
 
     /// Hash of the first queue entry at `height`, if any (no payload clone).
@@ -378,10 +366,7 @@ impl BlockQueue {
 
     /// True when `height` still holds a raw (unpromoted) payload. No clone.
     pub fn has_raw(&self, height: u32) -> bool {
-        matches!(
-            self.entry_for_height(height).map(|e| &e.body),
-            Some(QueuedBody::Raw(_))
-        )
+        matches!(self.entry_for_height(height).map(|e| &e.body), Some(QueuedBody::Raw(_)))
     }
 
     /// Clone one still-raw payload by height. Promoted / missing → `None`.
@@ -437,10 +422,7 @@ impl BlockQueue {
     }
 
     pub fn promoted_count(&self) -> usize {
-        self.index
-            .values()
-            .filter(|e| matches!(e.body, QueuedBody::Promoted { .. }))
-            .count()
+        self.index.values().filter(|e| matches!(e.body, QueuedBody::Promoted { .. })).count()
     }
 
     pub fn mark_resolve_complete_wave(&mut self, heights: &[u32]) -> Result<usize, StoreError> {
@@ -511,8 +493,7 @@ mod tests {
         let dir = temp();
         let mut q = BlockQueue::open_or_create(&dir).unwrap();
         let big = vec![0u8; 65 * 1024 * 1024];
-        q.enqueue(1, [9u8; 32], 1, &big)
-            .expect("enqueue has no byte ceiling");
+        q.enqueue(1, [9u8; 32], 1, &big).expect("enqueue has no byte ceiling");
         assert_eq!(q.count(), 1);
         let legacy = dir.join("block_queue");
         std::fs::create_dir_all(&legacy).unwrap();
@@ -748,11 +729,7 @@ mod tests {
         let raw = q.raw_payloads(&[10, 11, 99]);
         assert_eq!(raw.len(), 2);
         assert_eq!(q.promote_wave(&[(10, 16), (11, 8)]).unwrap(), 2);
-        assert_eq!(
-            q.bytes(),
-            16 + 8 + 1,
-            "promoted charge replaces raw; 12 stays raw"
-        );
+        assert_eq!(q.bytes(), 16 + 8 + 1, "promoted charge replaces raw; 12 stays raw");
         assert!(q.get_by_height(10).unwrap().unwrap().payload.is_empty());
         assert!(q.get_by_height(11).unwrap().unwrap().payload.is_empty());
         assert_eq!(q.get_by_height(12).unwrap().unwrap().payload, b"c");

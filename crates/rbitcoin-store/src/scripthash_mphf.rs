@@ -83,9 +83,7 @@ impl MphfHead {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.val_file
-            .sync_data()
-            .map_err(|e| StoreError::io(val_path(&self.base), e))
+        self.val_file.sync_data().map_err(|e| StoreError::io(val_path(&self.base), e))
     }
 
     pub fn write_pack8(
@@ -115,8 +113,7 @@ impl MphfHead {
                 .append(true)
                 .open(&staging)
                 .map_err(|e| StoreError::io(&staging, e))?;
-            f.write_all(&tags)
-                .map_err(|e| StoreError::io(&staging, e))?;
+            f.write_all(&tags).map_err(|e| StoreError::io(&staging, e))?;
             f.sync_all().map_err(|e| StoreError::io(&staging, e))?;
         }
         std::fs::rename(&staging, &mp).map_err(|e| StoreError::io(&mp, e))?;
@@ -142,21 +139,11 @@ impl MphfHead {
         if meta.len() != n.saturating_mul(8) {
             return Err(StoreError::Corrupt("sh mphf: val length"));
         }
-        let mphf_len = mphf_file
-            .metadata()
-            .map_err(|e| StoreError::io(&mp, e))?
-            .len();
+        let mphf_len = mphf_file.metadata().map_err(|e| StoreError::io(&mp, e))?.len();
         if mphf_len != tags_off + n.saturating_mul(8) {
             return Err(StoreError::Corrupt("sh mphf: tag length"));
         }
-        Ok(Self {
-            base,
-            mphf_file,
-            val_file,
-            mphf,
-            tags_off,
-            preads: AtomicU64::new(0),
-        })
+        Ok(Self { base, mphf_file, val_file, mphf, tags_off, preads: AtomicU64::new(0) })
     }
 
     pub fn get(&self, key: &ShHeadKey) -> Result<Option<ShHeadValue>, StoreError> {
@@ -226,10 +213,7 @@ fn pread_file_exact(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result
             return Err(std::io::Error::last_os_error());
         }
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "pread short",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"));
         }
         done += n as usize;
     }
@@ -245,10 +229,7 @@ fn pwrite_file(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
         if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "pwrite returned 0",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite returned 0"));
         }
         done += n as usize;
     }
@@ -265,10 +246,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-sh-mphf-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -292,10 +270,7 @@ mod tests {
         let raw = std::fs::read(mphf_path(&base)).unwrap();
         assert_eq!(&raw[0..4], b"BDZ3");
         let compact = BdzMphf::read_compact_from(&mphf_path(&base)).unwrap();
-        assert_eq!(
-            raw.len() as u64,
-            compact.trailer_off() + (recs.len() as u64) * 8
-        );
+        assert_eq!(raw.len() as u64, compact.trailer_off() + (recs.len() as u64) * 8);
         assert_eq!(h.get(&key(1)).unwrap().unwrap(), a);
         assert_eq!(h.get(&key(2)).unwrap().unwrap(), b);
         assert!(h.get(&key(9)).unwrap().is_none());
@@ -325,11 +300,7 @@ mod tests {
         assert!(h.update_value(&key(4), &slab).unwrap());
         assert!(!h.update_value(&key(5), &slab).unwrap());
         match h.get(&key(4)).unwrap().unwrap() {
-            ShHeadValue::Slab {
-                class: 0,
-                used: 2,
-                off: 4096,
-            } => {}
+            ShHeadValue::Slab { class: 0, used: 2, off: 4096 } => {}
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);

@@ -43,10 +43,7 @@ impl std::fmt::Debug for NodeHandle {
         f.debug_struct("NodeHandle")
             .field("config", &self.config)
             .field("network", &self.config.network)
-            .field(
-                "mempool_gen",
-                &self.mempool.as_ref().map(|m| m.generation()),
-            )
+            .field("mempool_gen", &self.mempool.as_ref().map(|m| m.generation()))
             .finish()
     }
 }
@@ -59,8 +56,7 @@ impl NodeHandle {
     pub fn shutdown(self) -> Result<(), NodeError> {
         self.query.flush()?;
         if let Some(mp) = &self.mempool {
-            mp.flush()
-                .map_err(|e| NodeError::Config(format!("mempool flush: {e}")))?;
+            mp.flush().map_err(|e| NodeError::Config(format!("mempool flush: {e}")))?;
         }
         Ok(())
     }
@@ -76,10 +72,7 @@ pub struct Shutdown {
 
 impl Shutdown {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            flag: Arc::new(AtomicBool::new(false)),
-            notify: Notify::new(),
-        })
+        Arc::new(Self { flag: Arc::new(AtomicBool::new(false)), notify: Notify::new() })
     }
 
     pub fn request(&self) {
@@ -257,11 +250,7 @@ pub async fn run_p2p_with_handle(
             .add_listen(*extra)
             .await
             .map_err(|e| NodeError::Config(format!("p2p extra listen {extra}: {e}")))?;
-        info!(
-            "rbitcoin-node listening on {} ({})",
-            bound,
-            config.network.as_str()
-        );
+        info!("rbitcoin-node listening on {} ({})", bound, config.network.as_str());
     }
     node.hub.set_minimum_chain_work(config.minimum_chain_work);
     if let Some(secs) = config.max_tip_age_secs {
@@ -286,9 +275,7 @@ pub async fn run_p2p_with_handle(
         match parse_btc_to_sat(s) {
             Ok(sat) => node.hub.set_block_min_tx_fee_sat_kvb(sat),
             Err(e) => {
-                return Err(NodeError::Config(format!(
-                    "bad --block-min-tx-fee {s}: {e}"
-                )));
+                return Err(NodeError::Config(format!("bad --block-min-tx-fee {s}: {e}")));
             }
         }
     }
@@ -323,8 +310,7 @@ pub async fn run_p2p_with_handle(
         if let Some(h) = expiry_hours {
             mp.set_expiry_hours(h);
         }
-        hub.attach_mempool(mp.clone())
-            .map_err(|_| "mempool already attached".to_string())?;
+        hub.attach_mempool(mp.clone()).map_err(|_| "mempool already attached".to_string())?;
         let gen = mp.generation();
         let live = mp.live_count();
         Ok::<_, String>((mp, gen, live))
@@ -339,8 +325,7 @@ pub async fn run_p2p_with_handle(
     }
     node.peers.set_listen_port(listen.port());
     if !config.listen.external_ips.is_empty() {
-        node.peers
-            .set_external_ips(config.listen.external_ips.clone());
+        node.peers.set_external_ips(config.listen.external_ips.clone());
     }
     if immediate_relay {
         node.peers.set_noban(true);
@@ -358,22 +343,14 @@ pub async fn run_p2p_with_handle(
         config.mempool.max_weight
     );
 
-    info!(
-        "rbitcoin-node listening on {} ({})",
-        node.local_addr,
-        config.network.as_str()
-    );
+    info!("rbitcoin-node listening on {} ({})", node.local_addr, config.network.as_str());
 
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {
-        Some(spawn_sh_writebehind(
-            Arc::clone(&node.hub.query),
-            Arc::clone(&shutdown.flag),
-            {
-                let sd = Arc::clone(&shutdown);
-                move || sd.request()
-            },
-        ))
+        Some(spawn_sh_writebehind(Arc::clone(&node.hub.query), Arc::clone(&shutdown.flag), {
+            let sd = Arc::clone(&shutdown);
+            move || sd.request()
+        }))
     } else {
         None
     };
@@ -398,10 +375,7 @@ pub async fn run_p2p_with_handle(
             am
         }
         Err(e) => {
-            warn!(
-                "peers: load {}: {e} — starting empty book",
-                peers_path.display()
-            );
+            warn!("peers: load {}: {e} — starting empty book", peers_path.display());
             AddrMan::new()
         }
     };
@@ -412,10 +386,7 @@ pub async fn run_p2p_with_handle(
         addrman.add(*c);
     }
     if should_resolve_default_seeds(&config) {
-        info!(
-            "ibd: resolving DNS/fixed seeds for {}…",
-            config.network.as_str()
-        );
+        info!("ibd: resolving DNS/fixed seeds for {}…", config.network.as_str());
         let n_before = addrman.len();
         addrman.inject(rbitcoin_net::resolve_all_seeds(config.network));
         info!(
@@ -458,11 +429,8 @@ pub async fn run_p2p_with_handle(
     let mut tip_follow_ready = false;
     let mut sh_tip_ready = false;
     if catch_up.is_complete() && !shutdown.requested() {
-        let gates = enter_tip_mode(
-            &node.hub.query,
-            Some(Arc::clone(&shutdown.flag)),
-            config.shindex,
-        );
+        let gates =
+            enter_tip_mode(&node.hub.query, Some(Arc::clone(&shutdown.flag)), config.shindex);
         tip_follow_ready = gates.tip_follow_ready;
         sh_tip_ready = gates.sh_tip_ready;
         if tip_follow_ready && !shutdown.requested() {
@@ -630,11 +598,7 @@ pub async fn run_p2p_with_handle(
     if (config.rpc.socket || config.rpc.listen.is_some()) && !shutdown.requested() {
         let rcfg = RpcConfig {
             listen: config.rpc.listen,
-            socket_path: if config.rpc.socket {
-                Some(config.rpc_socket_path())
-            } else {
-                None
-            },
+            socket_path: if config.rpc.socket { Some(config.rpc_socket_path()) } else { None },
             datadir: config.datadir.path.clone(),
             network: config.network,
             token_path: Some(config.rpc_token_path()),
@@ -667,8 +631,7 @@ pub async fn run_p2p_with_handle(
             Ok(h) => {
                 h.initial_block_download
                     .store(!tip_follow_ready || node.hub.in_ibd(), Ordering::SeqCst);
-                h.connections
-                    .store(node.follow_live_count() as u64, Ordering::Relaxed);
+                h.connections.store(node.follow_live_count() as u64, Ordering::Relaxed);
                 info!(
                     "rpc: listening tcp={:?} sock={:?} token={}",
                     h.local_addr,
@@ -690,9 +653,7 @@ pub async fn run_p2p_with_handle(
     }
 
     if tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
-        let deadline = config
-            .max_run_secs
-            .map(|s| Instant::now() + Duration::from_secs(s));
+        let deadline = config.max_run_secs.map(|s| Instant::now() + Duration::from_secs(s));
         let mut last_tip = node.tip_height().unwrap_or(0);
         let mut seed_offset = targets.len().min(max_out.min(3));
         let started = Instant::now();
@@ -755,12 +716,10 @@ pub async fn run_p2p_with_handle(
                     shutdown.request();
                     break;
                 }
-                h.connections
-                    .store(node.follow_live_count() as u64, Ordering::Relaxed);
+                h.connections.store(node.follow_live_count() as u64, Ordering::Relaxed);
                 let minwork = tip_meets_min_work(&config, &node.hub);
                 let ibd = node.hub.in_ibd();
-                h.initial_block_download
-                    .store(!minwork || ibd, Ordering::SeqCst);
+                h.initial_block_download.store(!minwork || ibd, Ordering::SeqCst);
                 let want_relay = !config.mempool.blocksonly && minwork && !ibd;
                 if want_relay != mempool.relay_enabled() {
                     mempool_blocking(&mempool, move |mp| mp.set_relay_enabled(want_relay)).await?;
@@ -769,8 +728,7 @@ pub async fn run_p2p_with_handle(
                     } else {
                         info!("ibd: entering IBD — pausing tx relay");
                     }
-                    node.peers
-                        .queue_feefilter_all(node.hub.feefilter_sat_kvb() as i64);
+                    node.peers.queue_feefilter_all(node.hub.feefilter_sat_kvb() as i64);
                 }
             }
             if matches!(wake, TipFollowWake::Stop) {
@@ -789,10 +747,8 @@ pub async fn run_p2p_with_handle(
                 if enabled(Level::Debug) {
                     let live = mempool_blocking(&mempool, MempoolHub::live_count).await?;
                     let follow_live = node.follow_live_count();
-                    let acc_avg = mp
-                        .accept_us
-                        .checked_div(mp.accepts + mp.rejects)
-                        .unwrap_or(mp.accept_us);
+                    let acc_avg =
+                        mp.accept_us.checked_div(mp.accepts + mp.rejects).unwrap_or(mp.accept_us);
                     let esp_avg = esp_us.checked_div(esp_n).unwrap_or(0);
                     let el_avg = el_us.checked_div(el_n).unwrap_or(0);
                     let serve_s = format_serve_perf(&serve);
@@ -875,20 +831,15 @@ pub async fn run_p2p_with_handle(
             if stale_follow_needs_room(follow_live, max_out) {
                 let ids = node.peers.outbound_full_relay_ids();
                 let addrs = node.peers.outbound_full_relay_addrs();
-                let groups: Vec<u64> = addrs
-                    .iter()
-                    .map(|a| netgroup(*a, addrman.asmap()))
-                    .collect();
+                let groups: Vec<u64> =
+                    addrs.iter().map(|a| netgroup(*a, addrman.asmap())).collect();
                 let salt = node.hub.clock.now_secs();
                 let Some(evict_id) = rbitcoin_net::pick_stale_follow_evict(&ids, salt, &groups)
                 else {
                     continue;
                 };
                 node.peers.disconnect_id(evict_id);
-                info!(
-                    "node: stale tip — replacing outbound {evict_id} with {}",
-                    extra[0]
-                );
+                info!("node: stale tip — replacing outbound {evict_id} with {}", extra[0]);
             }
             for peer in extra {
                 if shutdown.requested() {
@@ -963,11 +914,7 @@ pub async fn run_p2p_with_handle(
     if let Err(e) = addrman.save(&peers_path) {
         warn!("peers: final save {}: {e}", peers_path.display());
     } else {
-        info!(
-            "peers: saved {} address(es) to {}",
-            addrman.len(),
-            peers_path.display()
-        );
+        info!("peers: saved {} address(es) to {}", addrman.len(), peers_path.display());
     }
 
     for e in electrum_handles {
@@ -1057,15 +1004,11 @@ pub(crate) enum CatchUp {
 
 impl CatchUp {
     pub(crate) fn complete() -> Self {
-        Self::Complete {
-            dial_failed_all: false,
-        }
+        Self::Complete { dial_failed_all: false }
     }
 
     pub(crate) fn complete_dial_failed() -> Self {
-        Self::Complete {
-            dial_failed_all: true,
-        }
+        Self::Complete { dial_failed_all: true }
     }
 
     pub(crate) fn is_complete(self) -> bool {
@@ -1073,12 +1016,7 @@ impl CatchUp {
     }
 
     pub(crate) fn dial_failed_all(self) -> bool {
-        matches!(
-            self,
-            Self::Complete {
-                dial_failed_all: true
-            }
-        )
+        matches!(self, Self::Complete { dial_failed_all: true })
     }
 }
 
@@ -1179,10 +1117,7 @@ async fn run_ibd_or_skip(
     let catch_up = match node.sync_cancellable(ibd_targets, ibd_cfg, cancel).await {
         Ok(n) => {
             if shutdown.requested() {
-                warn!(
-                    "ibd: catch-up interrupted accepted≈{n} tip={:?}",
-                    node.tip_height()
-                );
+                warn!("ibd: catch-up interrupted accepted≈{n} tip={:?}", node.tip_height());
             } else {
                 let tip = node.tip_height().unwrap_or(0);
                 if tip == 0 && n == 0 {
@@ -1223,11 +1158,7 @@ async fn run_ibd_or_skip(
     if let Err(e) = addrman.save(peers_path) {
         warn!("peers: save {}: {e}", peers_path.display());
     } else {
-        info!(
-            "peers: saved {} address(es) to {}",
-            addrman.len(),
-            peers_path.display()
-        );
+        info!("peers: saved {} address(es) to {}", addrman.len(), peers_path.display());
     }
     catch_up
 }
@@ -1305,15 +1236,7 @@ async fn start_electrum_if_ready(
     let max_conn = ecfg.limits.max_connections;
     let max_line = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();
-    match run_electrum(
-        ecfg,
-        q,
-        params.clone(),
-        electrum_tip_tx,
-        Some(Arc::clone(mempool)),
-    )
-    .await
-    {
+    match run_electrum(ecfg, q, params.clone(), electrum_tip_tx, Some(Arc::clone(mempool))).await {
         Ok(h) => {
             info!(
                 "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
@@ -1352,12 +1275,8 @@ async fn start_esplora_if_ready(
     };
     let (esplora_tip_tx, _) = broadcast::channel::<TipEvent>(64);
     let hub_tips = hub.subscribe_tips();
-    let bridge = spawn_hub_tip_bridge(
-        hub_tips,
-        esplora_tip_tx.clone(),
-        Arc::clone(&shutdown.flag),
-        Some,
-    );
+    let bridge =
+        spawn_hub_tip_bridge(hub_tips, esplora_tip_tx.clone(), Arc::clone(&shutdown.flag), Some);
     let mut ecfg = EsploraConfig::with_network(addr, btc_net);
     if enable_block_template {
         let q = Arc::clone(&hub.query);
@@ -1383,10 +1302,7 @@ async fn start_esplora_if_ready(
                 alert_fired: Arc::new(AtomicBool::new(false)),
             };
             gbt_template(&ctx).map_err(|v| {
-                v.get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("block-template")
-                    .to_string()
+                v.get("message").and_then(|m| m.as_str()).unwrap_or("block-template").to_string()
             })
         })));
     }
@@ -1445,10 +1361,7 @@ pub(crate) fn enter_tip_mode(
             query.index_mode()
         );
         info!("node: tip-follow ready without scripthash (shindex off); Electrum/Esplora disabled");
-        return TipModeGates {
-            tip_follow_ready: true,
-            sh_tip_ready: false,
-        };
+        return TipModeGates { tip_follow_ready: true, sh_tip_ready: false };
     }
 
     if query.sh_use_writebehind() {
@@ -1466,10 +1379,7 @@ pub(crate) fn enter_tip_mode(
             query.scripthash_entry_count()
         );
         info!("node: tip-mode complete — safe to start Electrum");
-        return TipModeGates {
-            tip_follow_ready: true,
-            sh_tip_ready: true,
-        };
+        return TipModeGates { tip_follow_ready: true, sh_tip_ready: true };
     }
 
     info!("node: scripthash bulk materialize from Class A (Direct collect, then Tip)…");
@@ -1503,10 +1413,7 @@ pub(crate) fn enter_tip_mode(
         }
     };
     if !sh_ok {
-        return TipModeGates {
-            tip_follow_ready: true,
-            sh_tip_ready: false,
-        };
+        return TipModeGates { tip_follow_ready: true, sh_tip_ready: false };
     }
 
     query.enter_tip_index_mode();
@@ -1521,10 +1428,7 @@ pub(crate) fn enter_tip_mode(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
              Electrum deferred until drain succeeds (restart finalize); tip follow on"
         );
-        return TipModeGates {
-            tip_follow_ready: true,
-            sh_tip_ready: false,
-        };
+        return TipModeGates { tip_follow_ready: true, sh_tip_ready: false };
     }
 
     info!(
@@ -1532,10 +1436,7 @@ pub(crate) fn enter_tip_mode(
         query.scripthash_entry_count()
     );
     info!("node: tip-mode complete — safe to start Electrum");
-    TipModeGates {
-        tip_follow_ready: true,
-        sh_tip_ready: true,
-    }
+    TipModeGates { tip_follow_ready: true, sh_tip_ready: true }
 }
 
 /// Production IBD knobs for a single-peer catch-up retry (stale tip, incomplete catch-up).
@@ -1543,11 +1444,7 @@ pub(crate) fn enter_tip_mode(
 /// Uses [`IbdConfig::default`] (window 1024, stall 30s, connect 8s, …) — not
 /// [`IbdConfig::for_test`], which is only for unit/integration test harnesses.
 fn catch_up_retry_config(peers: std::sync::Arc<std::sync::Mutex<AddrMan>>) -> IbdConfig {
-    IbdConfig {
-        target_peers: 1,
-        peers: Some(peers),
-        ..IbdConfig::default()
-    }
+    IbdConfig { target_peers: 1, peers: Some(peers), ..IbdConfig::default() }
 }
 
 /// Tip-follow supervisor wake. A 5s perf tick or 50ms RPC-stop tick must not
@@ -1614,17 +1511,11 @@ pub(crate) fn load_asmap(datadir: &Path, configured: Option<&Path>) -> Option<Ar
             Some(Arc::new(m))
         }
         Ok(None) => {
-            warn!(
-                "Sanity check of asmap file {} failed — using prefix netgroups",
-                path.display()
-            );
+            warn!("Sanity check of asmap file {} failed — using prefix netgroups", path.display());
             None
         }
         Err(e) => {
-            warn!(
-                "Failed to open asmap file {}: {e} — using prefix netgroups",
-                path.display()
-            );
+            warn!("Failed to open asmap file {}: {e} — using prefix netgroups", path.display());
             None
         }
     }
@@ -1698,9 +1589,7 @@ fn resolve_seednode(raw: &str, network: Network) -> Result<SocketAddr, String> {
     if let Ok(a) = raw.parse::<SocketAddr>() {
         return Ok(a);
     }
-    let ip: std::net::IpAddr = raw
-        .parse()
-        .map_err(|e| format!("bad seednode address: {e}"))?;
+    let ip: std::net::IpAddr = raw.parse().map_err(|e| format!("bad seednode address: {e}"))?;
     Ok(SocketAddr::new(ip, default_port(network)))
 }
 
@@ -1735,10 +1624,7 @@ mod tests {
         let mut am = AddrMan::new();
         am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 1)), 8333));
         am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 0, 1)), 8333));
-        let connect = vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            8333,
-        )];
+        let connect = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8333)];
         let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
         assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), connect);
     }
@@ -1760,10 +1646,7 @@ mod tests {
     fn load_asmap_missing_configured_is_none() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-asmap-miss-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load_asmap(&dir, Some(Path::new("no-such-asmap"))).is_none());
@@ -1775,19 +1658,13 @@ mod tests {
     fn load_asmap_valid_tiny_file() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-asmap-ok-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ip_asn.dat");
         std::fs::write(&path, rbitcoin_net::TWO_PREFIX_ASMAP).unwrap();
         let m = load_asmap(&dir, None).expect("default ip_asn.dat");
-        assert_eq!(
-            m.mapped_as(std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 0, 0))),
-            1
-        );
+        assert_eq!(m.mapped_as(std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 0, 0))), 1);
         let rel = load_asmap(&dir, Some(Path::new("ip_asn.dat"))).expect("relative asmap");
         assert_eq!(rel.len(), m.len());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1797,10 +1674,7 @@ mod tests {
     fn load_asmap_truncated_is_none() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-asmap-bad-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.dat");
@@ -1866,10 +1740,7 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            saw_poll,
-            "stale interval must produce Poll while perf ticks every 15ms"
-        );
+        assert!(saw_poll, "stale interval must produce Poll while perf ticks every 15ms");
     }
 
     #[test]
@@ -1880,18 +1751,8 @@ mod tests {
 
     #[test]
     fn catch_up_ok_with_blocks_is_complete() {
-        assert_eq!(
-            catch_up_after_ok(3, 3, false),
-            CatchUp::Complete {
-                dial_failed_all: false
-            }
-        );
-        assert_eq!(
-            catch_up_after_ok(0, 1, false),
-            CatchUp::Complete {
-                dial_failed_all: false
-            }
-        );
+        assert_eq!(catch_up_after_ok(3, 3, false), CatchUp::Complete { dial_failed_all: false });
+        assert_eq!(catch_up_after_ok(0, 1, false), CatchUp::Complete { dial_failed_all: false });
         assert!(CatchUp::complete().is_complete());
         assert!(!CatchUp::complete().dial_failed_all());
         assert!(!CatchUp::Incomplete.is_complete());
@@ -1901,9 +1762,7 @@ mod tests {
     fn catch_up_err_with_tip_indexes_dials_failed() {
         assert_eq!(
             catch_up_after_err(10, true, false),
-            CatchUp::Complete {
-                dial_failed_all: true
-            }
+            CatchUp::Complete { dial_failed_all: true }
         );
         assert!(CatchUp::complete_dial_failed().dial_failed_all());
         assert_eq!(catch_up_after_err(10, false, false), CatchUp::Incomplete);
@@ -2015,10 +1874,7 @@ mod tests {
     #[test]
     fn enter_tip_mode_reenables_indexes() {
         use rbitcoin_query::IndexMode;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-mode-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
@@ -2043,10 +1899,7 @@ mod tests {
         use rbitcoin_query::IndexMode;
         use rbitcoin_store::{next_run_path, write_sorted_run};
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-wb-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("store");
@@ -2058,11 +1911,7 @@ mod tests {
         let count_before = q.scripthash_entry_count();
         let tip_max = q.store().txs.count();
         let lag = tip_max.saturating_sub(2).max(1);
-        std::fs::write(
-            store.join(rbitcoin_store::INCLUDE_HWM_NAME),
-            lag.to_le_bytes(),
-        )
-        .unwrap();
+        std::fs::write(store.join(rbitcoin_store::INCLUDE_HWM_NAME), lag.to_le_bytes()).unwrap();
 
         let runs_dir = store.join("scripthash.runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
@@ -2091,10 +1940,7 @@ mod tests {
     #[test]
     fn enter_tip_mode_collects_while_direct_then_tip() {
         use rbitcoin_query::IndexMode;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-collect-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
@@ -2116,10 +1962,7 @@ mod tests {
     #[test]
     fn enter_tip_mode_shindex_off_skips_sh_and_enables_follow() {
         use rbitcoin_query::IndexMode;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-nosh-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
@@ -2129,10 +1972,7 @@ mod tests {
 
         let g = enter_tip_mode(&q, None, false);
         assert!(g.tip_follow_ready, "tip follow must not wait on SH");
-        assert!(
-            !g.sh_tip_ready,
-            "Electrum gate stays closed without shindex"
-        );
+        assert!(!g.sh_tip_ready, "Electrum gate stays closed without shindex");
         assert_eq!(q.index_mode(), IndexMode::Tip);
         assert!(!q.sh_index_enabled());
 
@@ -2142,10 +1982,7 @@ mod tests {
     #[test]
     fn enter_tip_mode_disable_after_on_leaves_sh_tables() {
         use rbitcoin_query::IndexMode;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-sh-off-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("store");
@@ -2188,10 +2025,7 @@ mod tests {
         sd.request();
         assert!(sd.requested());
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-node-{nanos}"));
         let cfg = tiny_regtest(&dir);
         let handle = run_node(cfg).expect("run_node");
@@ -2209,10 +2043,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_no_peers_exits_after_catchup() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = false;
@@ -2247,10 +2078,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_milestone_and_electrum() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-el-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = false;
@@ -2268,10 +2096,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_with_esplora_listen() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-esp-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = false;
@@ -2287,10 +2112,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_with_handle_updates_status_atomics() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-handle-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = false;
@@ -2303,9 +2125,7 @@ mod tests {
         let shutdown = Shutdown::new();
         let sd = Arc::clone(&shutdown);
 
-        let task = tokio::spawn(async move {
-            run_p2p_with_handle(handle, sd).await
-        });
+        let task = tokio::spawn(async move { run_p2p_with_handle(handle, sd).await });
 
         // Give the node a moment to start the tip-follow loop.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2326,10 +2146,7 @@ mod tests {
     #[tokio::test]
     async fn run_p2p_bad_connect_peer_still_exits() {
         // Explicit dead --connect so IBD/follow attempts are exercised, then exit.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-conn-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = false;
@@ -2346,10 +2163,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_missing_asmap_still_starts() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-asmap-miss-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = false;
@@ -2364,10 +2178,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_valid_asmap_starts() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-asmap-ok-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ip_asn.dat"), rbitcoin_net::TWO_PREFIX_ASMAP).unwrap();
@@ -2384,10 +2195,7 @@ mod tests {
     #[test]
     fn enter_tip_mode_warns_on_leftover_runs_dir() {
         use rbitcoin_query::IndexMode;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-leftover-{nanos}"));
         std::fs::create_dir_all(dir.join("store")).unwrap();
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
@@ -2403,10 +2211,7 @@ mod tests {
     fn node_handle_shutdown_with_mempool() {
         use rbitcoin_net::MempoolHub;
         use std::sync::Arc;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-handle-mp-{nanos}"));
         let cfg = tiny_regtest(&dir);
         let mut handle = run_node(cfg).expect("run_node");
@@ -2423,10 +2228,7 @@ mod tests {
     #[tokio::test]
     async fn run_p2p_with_peers_file_and_electrum() {
         use rbitcoin_net::AddrMan;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-peers-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         // Non-empty peers book so load path logs address count.
@@ -2452,10 +2254,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_p2p_corrupt_peers_and_dead_connect() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-badpeers-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         // Corrupt peers file → load error branch starts empty book.
@@ -2489,10 +2288,7 @@ mod tests {
     /// `use_seeds=true` on regtest resolves empty seed set (covers seed inject path).
     #[tokio::test]
     async fn run_p2p_use_seeds_regtest_empty() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-seeds-{nanos}"));
         let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
         cfg.listen.use_seeds = true; // regtest: resolve_all_seeds → empty
@@ -2508,10 +2304,7 @@ mod tests {
     /// Electrum bind failure (port already taken / invalid) → warn path, still exits.
     #[tokio::test]
     async fn run_p2p_electrum_bind_fail_warns() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-el-fail-{nanos}"));
         // Hold a port so electrum bind fails.
         let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

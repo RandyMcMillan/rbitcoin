@@ -60,18 +60,13 @@ impl SealedFuse8 {
         }
         let filter = BinaryFuse8::try_from_keys(keys)
             .map_err(|_| StoreError::Corrupt("binary fuse8 build failed (dup keys?)"))?;
-        Ok(Self {
-            filter: Some(filter),
-        })
+        Ok(Self { filter: Some(filter) })
     }
 
     /// Membership test (no FN for keys passed to [`Self::build`]).
     #[inline]
     pub fn contains(&self, key: u64) -> bool {
-        self.filter
-            .as_ref()
-            .map(|f| f.contains(key))
-            .unwrap_or(false)
+        self.filter.as_ref().map(|f| f.contains(key)).unwrap_or(false)
     }
 
     /// Fingerprint array length (bytes).
@@ -81,25 +76,18 @@ impl SealedFuse8 {
 
     /// Heap-owned fingerprint bytes (0 when mapped from the sealed file).
     pub fn fingerprint_heap_bytes(&self) -> usize {
-        self.filter
-            .as_ref()
-            .map(|f| f.fingerprint_heap_bytes())
-            .unwrap_or(0)
+        self.filter.as_ref().map(|f| f.fingerprint_heap_bytes()).unwrap_or(0)
     }
 
     /// Write current (v2) layout.
     pub fn write_to(&self, path: &Path) -> Result<(), StoreError> {
-        let filter = self
-            .filter
-            .as_ref()
-            .ok_or(StoreError::Corrupt("fuse8 write missing filter"))?;
+        let filter =
+            self.filter.as_ref().ok_or(StoreError::Corrupt("fuse8 write missing filter"))?;
         let body = encode_body(filter);
         let mut f = File::create(path).map_err(|e| StoreError::io(path, e))?;
         f.write_all(MAGIC).map_err(|e| StoreError::io(path, e))?;
-        f.write_all(&VERSION_V2.to_le_bytes())
-            .map_err(|e| StoreError::io(path, e))?;
-        f.write_all(&(body.len() as u64).to_le_bytes())
-            .map_err(|e| StoreError::io(path, e))?;
+        f.write_all(&VERSION_V2.to_le_bytes()).map_err(|e| StoreError::io(path, e))?;
+        f.write_all(&(body.len() as u64).to_le_bytes()).map_err(|e| StoreError::io(path, e))?;
         f.write_all(&body).map_err(|e| StoreError::io(path, e))?;
         f.sync_all().map_err(|e| StoreError::io(path, e))?;
         Ok(())
@@ -191,9 +179,7 @@ fn parse_v2_geometry(payload: &[u8]) -> Result<V2Geometry, StoreError> {
     }
     let min_fp = (segment_count_length as u64).saturating_add(2 * u64::from(segment_length));
     if (fp_len as u64) < min_fp {
-        return Err(StoreError::Corrupt(
-            "fuse8 fingerprints shorter than hash geometry",
-        ));
+        return Err(StoreError::Corrupt("fuse8 fingerprints shorter than hash geometry"));
     }
     Ok(V2Geometry {
         seed,
@@ -232,10 +218,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("rbitcoin-fuse8-{n}"));
         let _ = std::fs::create_dir_all(&p);
         p
@@ -244,9 +227,7 @@ mod tests {
     fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
         let geo = parse_v2_geometry(payload)?;
         let fingerprints = Fingerprints::Heap(
-            payload[geo.fp_off..geo.fp_off + geo.fp_len]
-                .to_vec()
-                .into_boxed_slice(),
+            payload[geo.fp_off..geo.fp_off + geo.fp_len].to_vec().into_boxed_slice(),
         );
         Ok(BinaryFuse8 {
             seed: geo.seed,
@@ -271,9 +252,8 @@ mod tests {
 
     #[test]
     fn no_false_negatives_and_roundtrip() {
-        let keys: Vec<u64> = (0..10_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7))
-            .collect();
+        let keys: Vec<u64> =
+            (0..10_000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7)).collect();
         let f = SealedFuse8::build(&keys).unwrap();
         for &k in &keys {
             assert!(f.contains(k), "FN on {k}");
@@ -308,11 +288,7 @@ mod tests {
 
         let dir = tmp();
         let path = dir.join("bad.fuse8");
-        std::fs::write(
-            &path,
-            b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        )
-        .unwrap();
+        std::fs::write(&path, b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
         assert!(matches!(open_file(&path), Err(StoreError::Corrupt(_))));
         let mut bad_ver = Vec::from(*MAGIC);
         bad_ver.extend_from_slice(&99u32.to_le_bytes());
@@ -468,11 +444,7 @@ mod tests {
         std::fs::write(&path, &raw).unwrap();
         assert!(open_file(&path).is_err());
         // Bad magic.
-        std::fs::write(
-            &path,
-            b"XXXX\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        )
-        .unwrap();
+        std::fs::write(&path, b"XXXX\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
         assert!(open_file(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

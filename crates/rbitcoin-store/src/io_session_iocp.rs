@@ -75,11 +75,7 @@ impl IocpEngine {
                 std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32),
             ));
         }
-        Ok(Self {
-            port,
-            ready: VecDeque::new(),
-            associated: HashSet::new(),
-        })
+        Ok(Self { port, ready: VecDeque::new(), associated: HashSet::new() })
     }
 
     fn associate(&mut self, handle: IoHandle) -> Result<(), StoreError> {
@@ -116,14 +112,7 @@ impl IocpEngine {
         buf: &mut [u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
-        self.issue(
-            handle,
-            offset,
-            buf.as_mut_ptr(),
-            buf.len(),
-            user_data,
-            false,
-        )
+        self.issue(handle, offset, buf.as_mut_ptr(), buf.len(), user_data, false)
     }
 
     pub(crate) fn push_pwrite(
@@ -133,14 +122,7 @@ impl IocpEngine {
         buf: &[u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
-        self.issue(
-            handle,
-            offset,
-            buf.as_ptr() as *mut u8,
-            buf.len(),
-            user_data,
-            true,
-        )
+        self.issue(handle, offset, buf.as_ptr() as *mut u8, buf.len(), user_data, true)
     }
 
     fn issue(
@@ -214,11 +196,7 @@ impl IocpEngine {
                 return;
             }
             let boxed = unsafe { Box::from_raw(ov) };
-            let res = if ok == 0 {
-                -(unsafe { GetLastError() } as i32)
-            } else {
-                xfer as i32
-            };
+            let res = if ok == 0 { -(unsafe { GetLastError() } as i32) } else { xfer as i32 };
             self.ready.push_back((boxed.user_data, res));
             if timeout_ms == 0 {
                 // drain ready without blocking again
@@ -296,10 +274,7 @@ mod tests {
         let mut eng = IocpEngine::open(8).unwrap();
         let err = eng.associate(h).unwrap_err();
         let s = err.to_string();
-        assert!(
-            s.contains("FILE_FLAG_OVERLAPPED"),
-            "expected overlapped hint, got {s}"
-        );
+        assert!(s.contains("FILE_FLAG_OVERLAPPED"), "expected overlapped hint, got {s}");
         drop(f);
         let _ = std::fs::remove_file(&path);
     }
@@ -338,12 +313,7 @@ mod tests {
             for _ in 0..2 {
                 scope.spawn(|| {
                     let mut buf = [0u8; 5];
-                    let mut ops = [ReadOp {
-                        fd: h,
-                        offset: 0,
-                        buf: &mut buf,
-                        result: i32::MIN,
-                    }];
+                    let mut ops = [ReadOp { fd: h, offset: 0, buf: &mut buf, result: i32::MIN }];
                     pread_batch(&mut ops);
                     assert!(
                         ops[0].result >= 5,

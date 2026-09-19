@@ -22,9 +22,7 @@ pub const BQ_ASSIGN_STOP_BYTES: u64 = 1024 * 1024 * 1024;
 ///
 /// Rate unknown / non-positive → `0` (no densify ahead when restricted).
 pub fn soft_confirm_window_n(rate_blocks_per_s: Option<f64>) -> u32 {
-    let rate = rate_blocks_per_s
-        .filter(|r| r.is_finite() && *r > 1e-9)
-        .unwrap_or(0.0);
+    let rate = rate_blocks_per_s.filter(|r| r.is_finite() && *r > 1e-9).unwrap_or(0.0);
     (rate * BQ_SOFT_CONFIRM_SECS).ceil() as u32
 }
 
@@ -50,11 +48,7 @@ pub fn bq_assign_stop_bytes() -> u64 {
     }
     if let Ok(s) = std::env::var("RBITCOIN_BLOCK_QUEUE_GB") {
         if let Ok(n) = s.parse::<u64>() {
-            return if n == 0 {
-                u64::MAX
-            } else {
-                n.saturating_mul(1024 * 1024 * 1024)
-            };
+            return if n == 0 { u64::MAX } else { n.saturating_mul(1024 * 1024 * 1024) };
         }
     }
     BQ_ASSIGN_STOP_BYTES

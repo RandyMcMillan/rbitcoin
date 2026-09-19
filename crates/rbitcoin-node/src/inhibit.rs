@@ -20,14 +20,7 @@ impl SuspendInhibit {
         // `--what`: block automatic sleep and idle; leave lid/power-key alone
         // so the operator can still force power-off intentionally.
         let mut child = match Command::new("systemd-inhibit")
-            .args([
-                "--what=sleep:idle",
-                "--who=rbitcoin-node",
-                "--why",
-                why,
-                "--mode=block",
-                "cat",
-            ])
+            .args(["--what=sleep:idle", "--who=rbitcoin-node", "--why", why, "--mode=block", "cat"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

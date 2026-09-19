@@ -41,9 +41,7 @@ fn decode_zstd(path: &Path) -> Vec<u8> {
         ruzstd::decoding::StreamingDecoder::new_with_max_window_size(f, FIXTURE_ZSTD_WINDOW)
             .unwrap_or_else(|e| panic!("zstd {path:?}: {e}"));
     let mut out = Vec::new();
-    decoder
-        .read_to_end(&mut out)
-        .unwrap_or_else(|e| panic!("zstd read {path:?}: {e}"));
+    decoder.read_to_end(&mut out).unwrap_or_else(|e| panic!("zstd read {path:?}: {e}"));
     out
 }
 
@@ -61,10 +59,7 @@ fn prevouts_from_json_zst(path: &Path) -> Vec<TxOut> {
             let txout = &u["txout"];
             let sats = txout["value"].as_u64().expect("value sats");
             let spk = decode_hex(txout["script_pubkey"].as_str().expect("spk")).expect("spk hex");
-            TxOut {
-                value: Amount::from_sat(sats),
-                script_pubkey: ScriptBuf::from_bytes(spk),
-            }
+            TxOut { value: Amount::from_sat(sats), script_pubkey: ScriptBuf::from_bytes(spk) }
         })
         .collect()
 }
@@ -79,10 +74,7 @@ fn oversized_866342(mut block: Block) -> Block {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0u8; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0u8; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -94,19 +86,12 @@ fn oversized_866342(mut block: Block) -> Block {
     };
     block.txdata.insert(1, extra);
     let reserved = {
-        let w = block.txdata[0].input[0]
-            .witness
-            .nth(0)
-            .expect("coinbase reserved");
+        let w = block.txdata[0].input[0].witness.nth(0).expect("coinbase reserved");
         let mut a = [0u8; 32];
         a.copy_from_slice(w);
         a
     };
-    let wtxids = block
-        .txdata
-        .iter()
-        .skip(1)
-        .map(|tx| tx.compute_wtxid().to_byte_array());
+    let wtxids = block.txdata.iter().skip(1).map(|tx| tx.compute_wtxid().to_byte_array());
     let spk = witness_commitment_script(wtxids, &reserved);
     const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     let pos = block.txdata[0]
@@ -126,10 +111,7 @@ fn oversized_866342(mut block: Block) -> Block {
 fn block_866342_structure_scripts_and_overweight() {
     let t0 = Instant::now();
     let block = load_block();
-    assert_eq!(
-        block.block_hash(),
-        BLOCK_HASH.parse::<BlockHash>().expect("hash")
-    );
+    assert_eq!(block.block_hash(), BLOCK_HASH.parse::<BlockHash>().expect("hash"));
     assert_eq!(block.weight().to_wu(), HAPPY_WEIGHT_WU);
 
     let ctx = ctx();
@@ -137,11 +119,7 @@ fn block_866342_structure_scripts_and_overweight() {
 
     let prevouts = prevouts_from_json_zst(&fixture_dir().join("spent_utxos.zst"));
     let n_in: usize = block.txdata.iter().skip(1).map(|tx| tx.input.len()).sum();
-    assert_eq!(
-        prevouts.len(),
-        n_in,
-        "spent_utxos must map 1:1 onto non-coinbase inputs"
-    );
+    assert_eq!(prevouts.len(), n_in, "spent_utxos must map 1:1 onto non-coinbase inputs");
 
     let n_tx = block.txdata.len();
     let fat = oversized_866342(block.clone());
@@ -162,10 +140,7 @@ fn block_866342_structure_scripts_and_overweight() {
             crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
         );
         crate::script::verify_job_all_inputs(&job).unwrap_or_else(|e| {
-            panic!(
-                "866342 scripts tx index {i} txid={} {e}",
-                arc.txdata[i].compute_txid()
-            )
+            panic!("866342 scripts tx index {i} txid={} {e}", arc.txdata[i].compute_txid())
         });
     }
     assert!(stxos.next().is_none(), "leftover spent_utxos");

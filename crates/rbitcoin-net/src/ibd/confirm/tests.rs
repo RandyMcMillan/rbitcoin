@@ -37,11 +37,7 @@ fn prune_inflight_drops_below_wave_drain_fence_keeps_equal() {
     log.prune_below_height(Some(9));
     assert_eq!(log.entry_count(), 16, "noted 9: height 10 is not below");
     log.prune_below_height(Some(10));
-    assert_eq!(
-        log.entry_count(),
-        16,
-        "equality keeps (drop is strictly below)"
-    );
+    assert_eq!(log.entry_count(), 16, "equality keeps (drop is strictly below)");
     log.prune_below_height(Some(11));
     assert_eq!(log.pack_count(), 0);
 }
@@ -99,9 +95,8 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
     let hub = Arc::new(hub0);
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
+    let gen_time =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header.time;
     let maturity = params.coinbase_maturity();
     let (tip, tip_time, cbs) =
         pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
@@ -110,18 +105,12 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: prev, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+        output: vec![TxOut { value: val, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
     };
     let h_parent = maturity + 2;
     let parent = mine_regtest_paying(
@@ -166,17 +155,11 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
+                        panic!("timeout waiting for tip={want} (have {:?})", hub.tip_height());
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
+                    panic!("confirm engine exited before tip={want} (have {:?})", hub.tip_height());
                 }
             }
         }
@@ -186,12 +169,7 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
     // Production path is BQ raw → lookup take → loadq (not feed.note_wire).
     use bitcoin::consensus::encode::serialize;
     hub.query
-        .block_queue_enqueue(
-            h_parent,
-            parent.block_hash().to_byte_array(),
-            1,
-            &serialize(&parent),
-        )
+        .block_queue_enqueue(h_parent, parent.block_hash().to_byte_array(), 1, &serialize(&parent))
         .unwrap();
     feed.note(h_parent, parent.block_hash());
     wait_tip(h_parent);
@@ -234,9 +212,8 @@ fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
     let hub = Arc::new(hub0);
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
+    let gen_time =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header.time;
     let maturity = params.coinbase_maturity();
     let (tip, tip_time, cbs) =
         pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
@@ -245,18 +222,12 @@ fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: prev, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+        output: vec![TxOut { value: val, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
     };
     let h_parent = maturity + 2;
     let parent = mine_regtest_paying(
@@ -303,17 +274,11 @@ fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
+                        panic!("timeout waiting for tip={want} (have {:?})", hub.tip_height());
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
+                    panic!("confirm engine exited before tip={want} (have {:?})", hub.tip_height());
                 }
             }
         }
@@ -367,9 +332,8 @@ fn confirm_engine_pins_spend_after_later_wave_intervening_write() {
     let hub = Arc::new(hub0);
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
+    let gen_time =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header.time;
     let maturity = params.coinbase_maturity();
     let (tip, tip_time, cbs) =
         pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
@@ -378,18 +342,12 @@ fn confirm_engine_pins_spend_after_later_wave_intervening_write() {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: prev, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+        output: vec![TxOut { value: val, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
     };
     let h_parent = maturity + 2;
     let parent = mine_regtest_paying(
@@ -434,26 +392,18 @@ fn confirm_engine_pins_spend_after_later_wave_intervening_write() {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
+                        panic!("timeout waiting for tip={want} (have {:?})", hub.tip_height());
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
+                    panic!("confirm engine exited before tip={want} (have {:?})", hub.tip_height());
                 }
             }
         }
     };
 
     let enqueue = |h: u32, b: &bitcoin::Block| {
-        hub.query
-            .block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b))
-            .unwrap();
+        hub.query.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b)).unwrap();
         feed.note(h, b.block_hash());
     };
 
@@ -498,9 +448,8 @@ fn confirm_engine_pins_spend_when_lookup_ahead_of_write() {
     let hub = Arc::new(hub0);
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
+    let gen_time =
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header.time;
     let maturity = params.coinbase_maturity();
     let (tip, tip_time, cbs) =
         pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
@@ -509,18 +458,12 @@ fn confirm_engine_pins_spend_when_lookup_ahead_of_write() {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: prev, vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+        output: vec![TxOut { value: val, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
     };
     let h_parent = maturity + 2;
     let parent = mine_regtest_paying(
@@ -565,17 +508,11 @@ fn confirm_engine_pins_spend_when_lookup_ahead_of_write() {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
+                        panic!("timeout waiting for tip={want} (have {:?})", hub.tip_height());
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
+                    panic!("confirm engine exited before tip={want} (have {:?})", hub.tip_height());
                 }
             }
         }
@@ -611,9 +548,7 @@ fn confirm_engine_pins_spend_when_lookup_ahead_of_write() {
     };
 
     let enqueue = |h: u32, b: &bitcoin::Block| {
-        hub.query
-            .block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b))
-            .unwrap();
+        hub.query.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b)).unwrap();
         feed.note(h, b.block_hash());
     };
 
@@ -742,22 +677,13 @@ fn split_wave_into_load_batches_is_eight_by_8000() {
     );
     assert_eq!(parts, vec![1, 1, 1, 1, 1, 1, 1, 1]);
     // Exactly 8000 does not stop; two 8000-input blocks are one batch.
-    assert_eq!(
-        split_wave_into_load_batches_kind(&[8000, 8000], &[], 8000, 144),
-        vec![2]
-    );
+    assert_eq!(split_wave_into_load_batches_kind(&[8000, 8000], &[], 8000, 144), vec![2]);
     // Empty / single megablock.
     assert!(split_wave_into_load_batches_kind(&[], &[], 8000, 144).is_empty());
-    assert_eq!(
-        split_wave_into_load_batches_kind(&[50_000], &[], 8000, 144),
-        vec![1]
-    );
+    assert_eq!(split_wave_into_load_batches_kind(&[50_000], &[], 8000, 144), vec![1]);
     // 144 thin blocks then 144 more → two hard-cap batches.
     let thin = vec![1u32; 288];
-    assert_eq!(
-        split_wave_into_load_batches_kind(&thin, &[], 8000, 144),
-        vec![144, 144]
-    );
+    assert_eq!(split_wave_into_load_batches_kind(&thin, &[], 8000, 144), vec![144, 144]);
 }
 
 #[test]
@@ -766,10 +692,7 @@ fn split_wave_into_load_batches_stops_at_has_body_change() {
     // Crash prefix already-bodied, suffix need-body: two batches.
     let counts = [1u32, 1, 1, 1, 1];
     let has_body = [true, true, false, false, false];
-    assert_eq!(
-        split_wave_into_load_batches_kind(&counts, &has_body, 8000, 144),
-        vec![2, 3]
-    );
+    assert_eq!(split_wave_into_load_batches_kind(&counts, &has_body, 8000, 144), vec![2, 3]);
     // Kind flip inside an 8000-input pack still splits (do not glue kinds).
     assert_eq!(
         split_wave_into_load_batches_kind(&[4000, 4000], &[true, false], 8000, 144),
@@ -781,10 +704,7 @@ fn split_wave_into_load_batches_stops_at_has_body_change() {
         vec![2]
     );
     assert!(split_wave_into_load_batches_kind(&[], &[], 8000, 144).is_empty());
-    assert_eq!(
-        split_wave_into_load_batches_kind(&[50_000], &[true], 8000, 144),
-        vec![1]
-    );
+    assert_eq!(split_wave_into_load_batches_kind(&[50_000], &[true], 8000, 144), vec![1]);
 }
 
 #[test]
@@ -792,18 +712,10 @@ fn last_sent_load_batch_carries_wave_drain_fence() {
     use super::{load_batches_from_wave, split_wave_into_load_batches_kind};
     use rbitcoin_query::{BatchParentIds, ResolvedWire, TxPrecompute};
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let pres: Arc<[TxPrecompute]> = genesis
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
+    let pres: Arc<[TxPrecompute]> =
+        genesis.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
     let mk = |h: u32| {
-        (
-            h,
-            [h as u8; 32],
-            ResolvedWire::new(Arc::new(genesis.clone()), Arc::clone(&pres)),
-        )
+        (h, [h as u8; 32], ResolvedWire::new(Arc::new(genesis.clone()), Arc::clone(&pres)))
     };
     let items: Vec<_> = (1..=5).map(mk).collect();
     let parts = split_wave_into_load_batches_kind(&[1, 1, 1, 1, 1], &[], 2, 2);
@@ -908,10 +820,7 @@ fn chunk_parent_ids_vouts_are_per_chunk() {
                 version: TxVersion::ONE,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: Txid::from_byte_array(parent),
-                        vout: 0,
-                    },
+                    previous_output: OutPoint { txid: Txid::from_byte_array(parent), vout: 0 },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::new(),
@@ -924,18 +833,10 @@ fn chunk_parent_ids_vouts_are_per_chunk() {
         ],
     };
     let empty = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let pres_spend: Arc<[TxPrecompute]> = spend
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
-    let pres_empty: Arc<[TxPrecompute]> = empty
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
+    let pres_spend: Arc<[TxPrecompute]> =
+        spend.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
+    let pres_empty: Arc<[TxPrecompute]> =
+        empty.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
     let mut wire0 = ResolvedWire::new(Arc::new(spend), pres_spend);
     wire0.spend_keys = Arc::from([(parent, 0)]);
     let mut wire1 = ResolvedWire::new(Arc::new(empty), pres_empty);
@@ -962,10 +863,7 @@ fn chunk_parent_ids_vouts_are_per_chunk() {
         !ignored_wire.need_vouts.contains_key(&7),
         "empty spend_keys must not walk ResolvedWire.block inputs"
     );
-    assert!(
-        Arc::ptr_eq(&a.ids, &b.ids),
-        "chunks share the wave IdMap Arc"
-    );
+    assert!(Arc::ptr_eq(&a.ids, &b.ids), "chunks share the wave IdMap Arc");
 }
 
 #[test]
@@ -977,12 +875,8 @@ fn load_recv_is_lookup_order() {
     let (tx, rx) = mpsc::sync_channel::<LoadBatch>(8);
     let mk = |h: u32| {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let pres: Arc<[TxPrecompute]> = genesis
-            .txdata
-            .iter()
-            .map(TxPrecompute::from_tx)
-            .collect::<Vec<_>>()
-            .into();
+        let pres: Arc<[TxPrecompute]> =
+            genesis.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
         (h, [h as u8; 32], ResolvedWire::new(Arc::new(genesis), pres))
     };
     tx.send(LoadBatch {
@@ -1013,18 +907,10 @@ fn load_stamp_items_keep_pres() {
     use super::{load_stamp_items, LoadBatch};
     use rbitcoin_query::{ResolvedWire, TxPrecompute};
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let pres: Arc<[TxPrecompute]> = genesis
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
+    let pres: Arc<[TxPrecompute]> =
+        genesis.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
     let lb = LoadBatch {
-        items: vec![(
-            1,
-            [1u8; 32],
-            ResolvedWire::new(Arc::new(genesis), Arc::clone(&pres)),
-        )],
+        items: vec![(1, [1u8; 32], ResolvedWire::new(Arc::new(genesis), Arc::clone(&pres)))],
         parent_ids: None,
         drop_inflight_below: None,
         epoch: 0,
@@ -1032,10 +918,7 @@ fn load_stamp_items_keep_pres() {
     let items = load_stamp_items(lb.items.into_iter().map(|(h, _, w)| (h, w.block, w.pres)));
     assert_eq!(items.len(), 1);
     let got = items[0].2.as_ref().expect("load must pass lookup pres");
-    assert!(
-        Arc::ptr_eq(got, &pres),
-        "stamp input must keep the LoadBatch pres Arc"
-    );
+    assert!(Arc::ptr_eq(got, &pres), "stamp input must keep the LoadBatch pres Arc");
 }
 
 #[test]
@@ -1044,13 +927,8 @@ fn lookup_blocks_when_loadq_full() {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::sync_channel::<LoadBatch>(LOAD_QUEUE_CAP_DEFAULT);
     for _ in 0..LOAD_QUEUE_CAP_DEFAULT {
-        tx.send(LoadBatch {
-            items: vec![],
-            parent_ids: None,
-            drop_inflight_below: None,
-            epoch: 0,
-        })
-        .unwrap();
+        tx.send(LoadBatch { items: vec![], parent_ids: None, drop_inflight_below: None, epoch: 0 })
+            .unwrap();
     }
     assert!(
         tx.try_send(LoadBatch {
@@ -1063,13 +941,8 @@ fn lookup_blocks_when_loadq_full() {
         "9th send must wait / fail while loadq is full"
     );
     let _ = rx.recv().unwrap();
-    tx.send(LoadBatch {
-        items: vec![],
-        parent_ids: None,
-        drop_inflight_below: None,
-        epoch: 0,
-    })
-    .unwrap();
+    tx.send(LoadBatch { items: vec![], parent_ids: None, drop_inflight_below: None, epoch: 0 })
+        .unwrap();
 }
 
 #[test]
@@ -1096,10 +969,7 @@ fn block_input_count_sums_tx_inputs() {
                 witness: Witness::new(),
             })
             .collect(),
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::new(),
-        }],
+        output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::new() }],
     };
     let header = Header {
         version: Version::from_consensus(4),
@@ -1109,17 +979,10 @@ fn block_input_count_sums_tx_inputs() {
         bits: CompactTarget::from_consensus(0x207fffff),
         nonce: 0,
     };
-    let block = Block {
-        header,
-        txdata: vec![mk_tx(1), mk_tx(3), mk_tx(2)],
-    };
+    let block = Block { header, txdata: vec![mk_tx(1), mk_tx(3), mk_tx(2)] };
     assert_eq!(super::block_input_count(&block), 6);
-    let pres: Arc<[TxPrecompute]> = block
-        .txdata
-        .iter()
-        .map(TxPrecompute::from_tx)
-        .collect::<Vec<_>>()
-        .into();
+    let pres: Arc<[TxPrecompute]> =
+        block.txdata.iter().map(TxPrecompute::from_tx).collect::<Vec<_>>().into();
     let wire = ResolvedWire::new(Arc::new(block), pres);
     assert_eq!(wire.n_inputs, 6);
 }
@@ -1150,13 +1013,7 @@ fn claim_feed_wave_and_skip_confirmed() {
     assert_eq!(run.len(), 32);
     assert_eq!(run[0], 101);
     assert_eq!(*run.last().unwrap(), 132);
-    let run = claim_feed_run(
-        10,
-        32,
-        200,
-        |h| (10..=50).contains(&h),
-        |h| h == 10 || h == 11,
-    );
+    let run = claim_feed_run(10, 32, 200, |h| (10..=50).contains(&h), |h| h == 10 || h == 11);
     assert_eq!(run.first().copied(), Some(12));
     assert_eq!(run.len(), 32);
 }
@@ -1247,15 +1104,8 @@ fn thr_stats_add_is_local() {
     let w = stats.take_window();
     assert!(w.thr_write_work_ns >= 25_000_000);
     confirm_thr_stats::add_write_work(&stats, Duration::ZERO);
-    assert_eq!(
-        stats.take_window().thr_write_work_ns,
-        0,
-        "zero duration is a no-op"
-    );
-    assert_eq!(
-        confirm_thr_stats::script_work_from_verify_ns(2_000),
-        Duration::from_nanos(2_000)
-    );
+    assert_eq!(stats.take_window().thr_write_work_ns, 0, "zero duration is a no-op");
+    assert_eq!(confirm_thr_stats::script_work_from_verify_ns(2_000), Duration::from_nanos(2_000));
 }
 
 #[test]
@@ -1266,10 +1116,7 @@ fn stamp_reject_names_leftover_unresolved() {
     assert!(msg.contains("unresolved"), "{msg}");
     assert!(msg.contains("leftover_n="), "{msg}");
     assert!(msg.contains("leftover_hit="), "{msg}");
-    assert!(
-        !msg.contains("corrupt"),
-        "must not look like store wipe: {msg}"
-    );
+    assert!(!msg.contains("corrupt"), "must not look like store wipe: {msg}");
     assert_eq!(
         stamp_reject_operator_msg(
             "unexpected previous header",
@@ -1296,10 +1143,7 @@ fn stamp_reject_names_union_miss_txid() {
     assert!(msg.contains("miss_on=head"), "{msg}");
     assert!(msg.contains("miss_cands=0"), "{msg}");
     let disp = bitcoin::Txid::from_byte_array(raw).to_string();
-    assert!(
-        msg.contains(&disp),
-        "operator line must name display txid {disp}: {msg}"
-    );
+    assert!(msg.contains(&disp), "operator line must name display txid {disp}: {msg}");
 }
 
 /// note / requeue / finish lifecycle (duplicate scripts bug + re-queue).
@@ -1318,10 +1162,7 @@ fn feed_note_requeue_finish_surface() {
     feed.note(100, bh(1));
     {
         let g = feed.inner.lock().unwrap();
-        assert!(
-            g.ready.is_empty(),
-            "inflight height must not re-enter ready"
-        );
+        assert!(g.ready.is_empty(), "inflight height must not re-enter ready");
         assert!(g.inflight.contains(&100));
     }
 
@@ -1355,18 +1196,9 @@ fn queue_depth_log_and_caps_surface() {
     assert_eq!(format_queue_depth("write", 0, 2), "write<0/2");
     assert_eq!(format_queue_depth("script", 1, 2), "script=1/2");
     assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
-    assert_eq!(
-        format_conf_q(0, 0, 1, 8, 2, 2),
-        "loadq<0/8 scriptq<0/2 writeq=1/2"
-    );
-    assert_eq!(
-        format_conf_q(3, 1, 0, 8, 2, 2),
-        "loadq=3/8 scriptq=1/2 writeq<0/2"
-    );
-    assert_eq!(
-        format_conf_q(0, 0, 0, 8, 2, 2),
-        "loadq<0/8 scriptq<0/2 writeq<0/2"
-    );
+    assert_eq!(format_conf_q(0, 0, 1, 8, 2, 2), "loadq<0/8 scriptq<0/2 writeq=1/2");
+    assert_eq!(format_conf_q(3, 1, 0, 8, 2, 2), "loadq=3/8 scriptq=1/2 writeq<0/2");
+    assert_eq!(format_conf_q(0, 0, 0, 8, 2, 2), "loadq<0/8 scriptq<0/2 writeq<0/2");
 
     let caps = super::confirm_queue_caps();
     assert_eq!(caps.script, super::SCRIPT_QUEUE_CAP_DEFAULT);
@@ -1378,24 +1210,11 @@ fn queue_depth_log_and_caps_surface() {
     }
     assert_eq!(
         format_conf_q(0, 0, 0, caps.load, caps.script, caps.write),
-        format!(
-            "loadq<0/{} scriptq<0/{} writeq<0/{}",
-            caps.load, caps.script, caps.write
-        )
+        format!("loadq<0/{} scriptq<0/{} writeq<0/{}", caps.load, caps.script, caps.write)
     );
     assert_eq!(
-        format_conf_q(
-            caps.load,
-            caps.script,
-            caps.write,
-            caps.load,
-            caps.script,
-            caps.write
-        ),
-        format!(
-            "loadq={0}/{0} scriptq={1}/{1} writeq={2}/{2}",
-            caps.load, caps.script, caps.write
-        )
+        format_conf_q(caps.load, caps.script, caps.write, caps.load, caps.script, caps.write),
+        format!("loadq={0}/{0} scriptq={1}/{1} writeq={2}/{2}", caps.load, caps.script, caps.write)
     );
 }
 
@@ -1523,10 +1342,7 @@ fn offer_confirm_ready_walks_height_map() {
     feed.finish([1]);
     max_arch = 0;
     let n5 = offer_confirm_ready(&feed, &h2h3, &mut body, &hub, &mut max_arch, &shared);
-    assert_eq!(
-        n5, 0,
-        "Class A without body queue must not note confirm feed"
-    );
+    assert_eq!(n5, 0, "Class A without body queue must not note confirm feed");
 
     // Zombie pending without BQ is still not claim-ready.
     body.mark_pending(h1);
@@ -1540,13 +1356,7 @@ fn offer_confirm_ready_walks_height_map() {
 fn claim_feed_skips_inflight_and_confirmed_in_helper() {
     // Pure claim helper: inflight-like skip is modeled by already_confirmed.
     // Heights 1..=10 present; skip 1,2,5 → claim 3,4,6,7,8,9,10 (7).
-    let run = claim_feed_run(
-        1,
-        8,
-        100,
-        |h| (1..=10).contains(&h),
-        |h| h == 1 || h == 2 || h == 5,
-    );
+    let run = claim_feed_run(1, 8, 100, |h| (1..=10).contains(&h), |h| h == 1 || h == 2 || h == 5);
     assert_eq!(run.first().copied(), Some(3));
     assert!(!run.contains(&5));
     assert_eq!(run, vec![3, 4, 6, 7, 8, 9, 10]);
@@ -1620,10 +1430,7 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     assert!(super::pack_stop_after(0, 144, 8000, 144));
     assert!(super::pack_stop_after(8001, 1, 8000, 144));
     assert!(!super::pack_stop_after(8000, 1, 8000, 144));
-    assert_eq!(
-        super::confirm_batch_max_inputs(),
-        super::CONFIRM_BATCH_INPUTS_DEFAULT
-    );
+    assert_eq!(super::confirm_batch_max_inputs(), super::CONFIRM_BATCH_INPUTS_DEFAULT);
     assert_eq!(super::write_drain_max_parts(20), 20);
     assert_eq!(super::write_drain_max_parts(4), 4);
     assert_eq!(super::write_drain_max_parts(3), 3);
@@ -1637,14 +1444,8 @@ fn write_batch_is_stale_after_tip_moves() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("write-stale");
     hub.ensure_genesis().unwrap();
     assert!(!write_batch_is_stale(&hub, 1), "tip+1 is live");
-    assert!(
-        write_batch_is_stale(&hub, 0),
-        "already-confirmed height is stale"
-    );
-    assert!(
-        write_batch_is_stale(&hub, 2),
-        "ahead of tip+1 is not the live batch"
-    );
+    assert!(write_batch_is_stale(&hub, 0), "already-confirmed height is stale");
+    assert!(write_batch_is_stale(&hub, 2), "ahead of tip+1 is not the live batch");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1728,11 +1529,7 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         1,
     )
     .unwrap();
-    assert_eq!(
-        feed_one.isolate_until(),
-        u32::MAX,
-        "single-block consensus stays blacklistable"
-    );
+    assert_eq!(feed_one.isolate_until(), u32::MAX, "single-block consensus stays blacklistable");
     match rx.try_recv() {
         Ok(ConfirmEvent::Reject {
             class: ConfirmRejectClass::ConsensusInvalid,
@@ -1754,11 +1551,7 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         8,
     )
     .unwrap();
-    assert_eq!(
-        feed_fault.isolate_until(),
-        u32::MAX,
-        "engine fault is not a cascade isolate"
-    );
+    assert_eq!(feed_fault.isolate_until(), u32::MAX, "engine fault is not a cascade isolate");
 }
 
 #[test]
@@ -1786,11 +1579,7 @@ fn isolate_clears_only_after_original_batch_last_height() {
         "first n=1 accept must not re-pack the rest of the failed wave"
     );
     feed.release_isolate_if_tip(106);
-    assert_eq!(
-        feed.isolate_until(),
-        107,
-        "tip still below last height of the wave"
-    );
+    assert_eq!(feed.isolate_until(), 107, "tip still below last height of the wave");
     feed.release_isolate_if_tip(107);
     assert_eq!(
         feed.isolate_until(),
@@ -1820,17 +1609,9 @@ fn isolate_clears_only_after_original_batch_last_height() {
         1,
     )
     .unwrap();
-    assert_eq!(
-        feed_n1.isolate_until(),
-        107,
-        "n=1 consensus reject must not clear isolate"
-    );
+    assert_eq!(feed_n1.isolate_until(), 107, "n=1 consensus reject must not clear isolate");
     feed_n1.clear();
-    assert_eq!(
-        feed_n1.isolate_until(),
-        u32::MAX,
-        "rewind clear drops isolate"
-    );
+    assert_eq!(feed_n1.isolate_until(), u32::MAX, "rewind clear drops isolate");
 }
 
 #[test]
@@ -1842,10 +1623,7 @@ fn plan_epoch_stale_after_clear() {
     }
     assert!(!feed.plan_epoch_stale(1), "claimed at live epoch");
     feed.clear();
-    assert!(
-        feed.plan_epoch_stale(1),
-        "in-channel plan claimed before rewind is stale"
-    );
+    assert!(feed.plan_epoch_stale(1), "in-channel plan claimed before rewind is stale");
     assert!(!feed.plan_epoch_stale(99), "unknown height is not stale");
 }
 
@@ -1887,18 +1665,12 @@ fn from_net_maps_wire_and_string_classes() {
     use super::ConfirmRejectClass;
     use crate::error::NetError;
 
-    assert_eq!(
-        ConfirmRejectClass::from_net(&NetError::Cancelled),
-        ConfirmRejectClass::Cancelled
-    );
+    assert_eq!(ConfirmRejectClass::from_net(&NetError::Cancelled), ConfirmRejectClass::Cancelled);
     assert_eq!(
         ConfirmRejectClass::from_net(&NetError::Mutated("x".into())),
         ConfirmRejectClass::SoftWire
     );
-    assert_eq!(
-        ConfirmRejectClass::from_net(&NetError::BadPrev),
-        ConfirmRejectClass::SoftWire
-    );
+    assert_eq!(ConfirmRejectClass::from_net(&NetError::BadPrev), ConfirmRejectClass::SoftWire);
     assert_eq!(
         ConfirmRejectClass::from_net(&NetError::ConnectFailed {
             hash: [0u8; 32],
@@ -1910,10 +1682,7 @@ fn from_net_maps_wire_and_string_classes() {
         ConfirmRejectClass::from_net(&NetError::Consensus("fk mismatch".into())),
         ConfirmRejectClass::Cascade
     );
-    assert_eq!(
-        ConfirmRejectClass::from_net(&NetError::Timeout),
-        ConfirmRejectClass::Cascade
-    );
+    assert_eq!(ConfirmRejectClass::from_net(&NetError::Timeout), ConfirmRejectClass::Cascade);
 }
 
 #[test]
@@ -1925,29 +1694,14 @@ fn requeue_on_uring_recover_credits_then_skips_non_fault() {
         let mut g = feed.inner.lock().unwrap();
         g.inflight.insert(7);
     }
-    assert!(super::requeue_on_uring_recover(
-        &q,
-        &feed,
-        true,
-        "test",
-        std::iter::once((7, hash)),
-    ));
+    assert!(super::requeue_on_uring_recover(&q, &feed, true, "test", std::iter::once((7, hash)),));
     {
         let g = feed.inner.lock().unwrap();
         assert!(g.ready.contains_key(&7));
         assert!(!g.inflight.contains(&7));
     }
-    assert!(!super::requeue_on_uring_recover(
-        &q,
-        &feed,
-        false,
-        "test",
-        std::iter::empty(),
-    ));
-    assert_eq!(
-        q.uring_recover("again"),
-        rbitcoin_query::UringRecover::Exhausted
-    );
+    assert!(!super::requeue_on_uring_recover(&q, &feed, false, "test", std::iter::empty(),));
+    assert_eq!(q.uring_recover("again"), rbitcoin_query::UringRecover::Exhausted);
 }
 
 #[test]
@@ -2061,12 +1815,7 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
     };
     hub.query.connect_block(Height(1), &h1, &[ta1]).unwrap();
     let spend_fk = hub.query.block_tx_fks(Height(1)).unwrap()[0];
-    let (multi, field, _vin) = hub
-        .query
-        .store()
-        .txs
-        .get_output_spender_meta(create_fk, 0)
-        .unwrap();
+    let (multi, field, _vin) = hub.query.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
     assert!(!multi);
     assert!(field.is_null());
     hub.query.set_spend_index(true);
@@ -2078,19 +1827,13 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
     assert!(hub.is_connected(&BlockHash::from_byte_array(hash1)));
 
     let hfk1 = hub.query.get_header_by_hash(&hash1).unwrap().unwrap().0;
-    hub.query
-        .block_queue_offer(1, hash1, hfk1.0, &[0u8; 80])
-        .unwrap();
+    hub.query.block_queue_offer(1, hash1, hfk1.0, &[0u8; 80]).unwrap();
     assert!(hub.query.block_queue_has_height(1));
 
     finish_connected_write_after_session_fault(&hub.query, &[(1, hash1)]).expect("in-place finish");
 
-    let (multi2, field2, _vin2) = hub
-        .query
-        .store()
-        .txs
-        .get_output_spender_meta(create_fk, 0)
-        .unwrap();
+    let (multi2, field2, _vin2) =
+        hub.query.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
     assert!(!multi2);
     assert_eq!(field2, spend_fk);
     assert_eq!(hub.query.block_queue_dequeue_height(1).unwrap(), 1);
@@ -2112,8 +1855,7 @@ fn load_fail_rewind_reoffers_tail_to_bq() {
     plan.planned_fks = vec![Fk(body0.saturating_add(10).max(10))];
     st.note_lookup_ok(&plan, 10, [1u8; 32]);
     let pin = test_pin(body0.saturating_add(10).max(10));
-    st.in_flight
-        .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(10));
+    st.in_flight.note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(10));
     assert!(st.in_flight.entry_count() > 0);
 
     let feed = ConfirmFeed::new();
@@ -2127,16 +1869,8 @@ fn load_fail_rewind_reoffers_tail_to_bq() {
     let hash = body.block_hash();
     hub.query.set_lookup_taken_hi(Some(11));
     load_fail_rewind_wave(&feed, &hub, &mut st, 10, std::iter::once((11, hash, &body)));
-    assert_eq!(
-        st.in_flight.entry_count(),
-        0,
-        "pin/stamp fail must clear_all"
-    );
-    assert_eq!(
-        feed.epoch(),
-        1,
-        "epoch bump drops in-channel same-wave loadq"
-    );
+    assert_eq!(st.in_flight.entry_count(), 0, "pin/stamp fail must clear_all");
+    assert_eq!(feed.epoch(), 1, "epoch bump drops in-channel same-wave loadq");
     assert_eq!(
         hub.query.lookup_taken_hi(),
         hub.tip_height(),
@@ -2158,10 +1892,7 @@ fn load_fail_rewind_reoffers_tail_to_bq() {
     );
     let g = feed.inner.lock().unwrap();
     assert!(!g.ready.contains_key(&10));
-    assert!(
-        !g.ready.contains_key(&11),
-        "production lookup does not read feed.ready wire"
-    );
+    assert!(!g.ready.contains_key(&11), "production lookup does not read feed.ready wire");
 }
 
 #[test]
@@ -2201,8 +1932,7 @@ fn load_session_fault_after_note_lookup_ok_clears_speculative_fks() {
     plan.planned_fks = vec![Fk(body0.saturating_add(10).max(10))];
     st.note_lookup_ok(&plan, 1, [1u8; 32]);
     let pin = test_pin(body0.saturating_add(10).max(10));
-    st.in_flight
-        .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(1));
+    st.in_flight.note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(1));
     assert!(st.next_tx_start > durable);
     assert!(st.in_flight.entry_count() > 0);
     st.on_uring_recover(&hub);

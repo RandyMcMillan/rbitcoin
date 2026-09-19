@@ -28,15 +28,12 @@ use std::sync::RwLock;
 
 /// Packed dirty generation: `0` is clean. `set` bumps; flush CASes back to `0`.
 pub(crate) fn dirty_epoch_bump(epoch: &AtomicU64) {
-    let _ = epoch.fetch_update(Ordering::Release, Ordering::Relaxed, |e| {
-        Some(e.wrapping_add(1).max(1))
-    });
+    let _ = epoch
+        .fetch_update(Ordering::Release, Ordering::Relaxed, |e| Some(e.wrapping_add(1).max(1)));
 }
 
 pub(crate) fn dirty_epoch_try_clean(epoch: &AtomicU64, e0: u64) -> bool {
-    epoch
-        .compare_exchange(e0, 0, Ordering::Release, Ordering::Relaxed)
-        .is_ok()
+    epoch.compare_exchange(e0, 0, Ordering::Release, Ordering::Relaxed).is_ok()
 }
 
 const ELEM: u64 = 8;
@@ -170,12 +167,10 @@ impl ArrayTable {
             for i in len..index {
                 self.file.write_at(Self::offset(i), &0u64.to_le_bytes())?;
             }
-            self.file
-                .write_at(Self::offset(index), &value.to_le_bytes())?;
+            self.file.write_at(Self::offset(index), &value.to_le_bytes())?;
             self.len.store(index + 1, Ordering::Release);
         } else {
-            self.file
-                .write_at(Self::offset(index), &value.to_le_bytes())?;
+            self.file.write_at(Self::offset(index), &value.to_le_bytes())?;
         }
         Ok(())
     }
@@ -217,8 +212,7 @@ impl ArrayTable {
             self.len.store(new_len, Ordering::Release);
         }
         for &(index, value) in pairs {
-            self.file
-                .write_at(Self::offset(index), &value.to_le_bytes())?;
+            self.file.write_at(Self::offset(index), &value.to_le_bytes())?;
         }
         Ok(())
     }
@@ -249,9 +243,7 @@ impl ArrayTable {
     /// In-RAM L2 image bytes (0 when FdOnly).
     pub fn l2_resident_bytes(&self) -> u64 {
         let g = self.data.read().unwrap_or_else(|e| e.into_inner());
-        g.as_ref()
-            .map(|v| (v.len() as u64).saturating_mul(ELEM))
-            .unwrap_or(0)
+        g.as_ref().map(|v| (v.len() as u64).saturating_mul(ELEM)).unwrap_or(0)
     }
 
     fn note_flush_clean(&self, e0: u64) {
@@ -342,10 +334,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "rbitcoin-array-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ))
     }
 
@@ -554,11 +543,7 @@ mod tests {
         t.flush().unwrap();
         drop(t);
         let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
-        assert_eq!(
-            t.get(0).unwrap(),
-            want,
-            "set that races flush must still persist"
-        );
+        assert_eq!(t.get(0).unwrap(), want, "set that races flush must still persist");
         let _ = std::fs::remove_file(&path);
     }
 }

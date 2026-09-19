@@ -18,15 +18,11 @@ fn load_array() -> Vec<Value> {
     let path = super::core_fixture::stage_core_json("sighash.json");
     let s = fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing {path:?}: {e}"));
     let v: Value = serde_json::from_str(&s).expect("sighash.json");
-    v.as_array()
-        .cloned()
-        .unwrap_or_else(|| panic!("sighash.json: root not array"))
+    v.as_array().cloned().unwrap_or_else(|| panic!("sighash.json: root not array"))
 }
 
 fn json_i64(v: &Value) -> Option<i64> {
-    v.as_i64()
-        .or_else(|| v.as_u64().map(|n| n as i64))
-        .or_else(|| v.as_f64().map(|n| n as i64))
+    v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)).or_else(|| v.as_f64().map(|n| n as i64))
 }
 
 fn sighash_row(cells: &[Value]) -> Result<sha256d::Hash, String> {
@@ -60,10 +56,7 @@ fn core_sighash_all_rows() {
         if cells.len() < 5 || !cells[0].is_string() || cells[0].as_str() == Some("") {
             continue;
         }
-        if cells[0]
-            .as_str()
-            .is_some_and(|s| s.starts_with("raw_transaction"))
-        {
+        if cells[0].as_str().is_some_and(|s| s.starts_with("raw_transaction")) {
             continue;
         }
         total += 1;

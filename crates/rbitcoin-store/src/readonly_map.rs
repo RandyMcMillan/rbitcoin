@@ -56,13 +56,7 @@ impl ReadonlyMap {
 
     fn map_file(path: &Path, file: File, map_len: usize) -> Result<Self, StoreError> {
         let ptr = map_readonly(&file, map_len).map_err(|e| StoreError::io(path, e))?;
-        Ok(Self {
-            ptr,
-            map_len,
-            fp_off: 0,
-            fp_len: map_len,
-            _file: file,
-        })
+        Ok(Self { ptr, map_len, fp_off: 0, fp_len: map_len, _file: file })
     }
 
     pub fn as_file_bytes(&self) -> &[u8] {
@@ -96,14 +90,7 @@ impl Drop for ReadonlyMap {
 fn map_readonly(file: &File, len: usize) -> std::io::Result<*mut u8> {
     use std::os::fd::AsRawFd;
     let ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            file.as_raw_fd(),
-            0,
-        )
+        libc::mmap(ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
     };
     if ptr == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error());
@@ -195,10 +182,7 @@ mod tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-romap-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p

@@ -192,10 +192,7 @@ impl RpcParams {
     }
 
     pub fn named(named: serde_json::Map<String, Value>) -> Self {
-        Self {
-            pos: Vec::new(),
-            named: Some(named),
-        }
+        Self { pos: Vec::new(), named: Some(named) }
     }
 
     pub fn get(&self, index: usize, name: &str) -> Option<&Value> {
@@ -279,13 +276,11 @@ impl RpcParams {
 }
 
 pub(crate) fn json_u64(v: &Value) -> Option<u64> {
-    v.as_u64()
-        .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+    v.as_u64().or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
 }
 
 pub(crate) fn json_i64(v: &Value) -> Option<i64> {
-    v.as_i64()
-        .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+    v.as_i64().or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
 }
 
 /// Core `getblock` verbosity: integer, or bool (`false` → 0, `true` → 1).
@@ -318,16 +313,9 @@ pub fn dispatch(
     method: &str,
     params: impl Into<RpcParams>,
 ) -> Result<Value, Value> {
-    let id = ctx
-        .active
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .enter(method);
+    let id = ctx.active.lock().unwrap_or_else(|e| e.into_inner()).enter(method);
     let out = dispatch_inner(ctx, method, params.into());
-    ctx.active
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .leave(id);
+    ctx.active.lock().unwrap_or_else(|e| e.into_inner()).leave(id);
     out
 }
 
@@ -462,27 +450,24 @@ pub(crate) fn dispatch_inner(
 pub(crate) fn help(params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["command"])?;
     if let Some(v) = params.get(0, "command") {
-        let m = v
-            .as_str()
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "command must be a string"))?;
+        let m =
+            v.as_str().ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "command must be a string"))?;
         return Ok(json!(method_help(m)));
     }
     Ok(json!(METHOD_LIST.join("\n")))
 }
 
 /// Core `echo` names (`rpc_named_arguments.py`).
-const ECHO_NAMES: [&str; 10] = [
-    "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9",
-];
+const ECHO_NAMES: [&str; 10] =
+    ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9"];
 
 /// Return params as a positional array (operator testing RPC).
 ///
 /// AuthServiceProxy mixed: `{args: [0, 1], arg3: 3}` → `[0, 1, null, 3]`.
 /// Named-only `arg9` sizes the array to 10 with null holes.
 pub(crate) fn echo(params: &RpcParams) -> Result<Value, Value> {
-    const ECHO_ALLOWED: [&str; 11] = [
-        "args", "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9",
-    ];
+    const ECHO_ALLOWED: [&str; 11] =
+        ["args", "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9"];
     params.reject_unknown(&ECHO_ALLOWED)?;
 
     let mut pos = params.pos.clone();
@@ -517,11 +502,7 @@ pub(crate) fn echo(params: &RpcParams) -> Result<Value, Value> {
         }
     }
 
-    let mut max_idx: Option<usize> = if pos.is_empty() {
-        None
-    } else {
-        Some(pos.len() - 1)
-    };
+    let mut max_idx: Option<usize> = if pos.is_empty() { None } else { Some(pos.len() - 1) };
     if let Some(m) = &params.named {
         for (i, name) in ECHO_NAMES.iter().enumerate() {
             if m.contains_key(*name) {
@@ -805,9 +786,7 @@ pub(crate) fn rpc_client_version(semver: &str) -> u64 {
     let maj: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let min: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let pat: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    maj.saturating_mul(10_000)
-        .saturating_add(min.saturating_mul(100))
-        .saturating_add(pat)
+    maj.saturating_mul(10_000).saturating_add(min.saturating_mul(100)).saturating_add(pat)
 }
 
 pub(crate) fn chain_name(n: Network) -> &'static str {

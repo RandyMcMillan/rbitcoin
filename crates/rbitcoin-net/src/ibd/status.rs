@@ -65,12 +65,8 @@ impl Default for LoopStats {
 
 impl LoopStats {
     pub(crate) fn confirm_begin(&self, first_height: u32, batch_n: u32, batch_inputs: u32) {
-        *self.confirm_live.lock().unwrap() = Some(ConfirmLive {
-            first_height,
-            batch_n,
-            batch_inputs,
-            started: Instant::now(),
-        });
+        *self.confirm_live.lock().unwrap() =
+            Some(ConfirmLive { first_height, batch_n, batch_inputs, started: Instant::now() });
     }
 
     pub(crate) fn confirm_end(&self) {
@@ -80,12 +76,7 @@ impl LoopStats {
     /// `(first_height, batch_n, batch_inputs, elapsed_ms)` if a confirm batch is running.
     pub(crate) fn confirm_live_snap(&self) -> Option<(u32, u32, u32, u64)> {
         self.confirm_live.lock().unwrap().as_ref().map(|l| {
-            (
-                l.first_height,
-                l.batch_n,
-                l.batch_inputs,
-                l.started.elapsed().as_millis() as u64,
-            )
+            (l.first_height, l.batch_n, l.batch_inputs, l.started.elapsed().as_millis() as u64)
         })
     }
 
@@ -135,10 +126,7 @@ impl LoopSample {
         Self::ms(self.status_scan_ns)
     }
     pub(crate) fn confirm_us_per_block(&self) -> u64 {
-        self.confirm_ns
-            .checked_div(self.confirm_blocks)
-            .unwrap_or(0)
-            / 1000
+        self.confirm_ns.checked_div(self.confirm_blocks).unwrap_or(0) / 1000
     }
     /// Which phase dominated wall time this window (for one-glance diagnosis).
     pub(crate) fn dominant(&self) -> &'static str {

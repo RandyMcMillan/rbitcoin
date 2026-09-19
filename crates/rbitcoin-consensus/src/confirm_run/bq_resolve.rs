@@ -214,10 +214,7 @@ pub fn confirm_bq_resolve_wave_capped(
     }
 
     if let Some(&first) = selected.first() {
-        let path_lo = query
-            .tip_height()
-            .map(|h| h.0.saturating_add(1))
-            .unwrap_or(0);
+        let path_lo = query.tip_height().map(|h| h.0.saturating_add(1)).unwrap_or(0);
         let win = query.soft_confirm_window();
         let filling = win >= 144 && (query.block_queue_count() as u32) < win;
         let more_remain = selected.len() < heights.len() || filling;
@@ -302,9 +299,7 @@ pub fn confirm_bq_resolve_wave_capped(
         if let Some((_, _, w)) = wires.last_mut() {
             w.spend_keys = Arc::from(spends);
         }
-        stats.collect_ns = stats
-            .collect_ns
-            .saturating_add(t_col.elapsed().as_nanos() as u64);
+        stats.collect_ns = stats.collect_ns.saturating_add(t_col.elapsed().as_nanos() as u64);
         done.push(h);
     }
 
@@ -322,10 +317,7 @@ pub fn confirm_bq_resolve_wave_capped(
     }
 
     if !need.is_empty() {
-        let rows = query
-            .store()
-            .get_fk_by_txid_batch(&need)
-            .map_err(ConsensusError::from)?;
+        let rows = query.store().get_fk_by_txid_batch(&need).map_err(ConsensusError::from)?;
         for (txid, row) in rows {
             if let Some((fk, pair)) = row {
                 layer.insert(txid, (fk, pair.txout));
@@ -354,9 +346,7 @@ pub fn confirm_bq_resolve_wave_capped(
         items.push((h, hash, wire));
     }
     if !promote.is_empty() {
-        query
-            .block_queue_promote_wave(promote)
-            .map_err(ConsensusError::from)?;
+        query.block_queue_promote_wave(promote).map_err(ConsensusError::from)?;
     }
     stats.heights = items.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
@@ -367,12 +357,7 @@ pub fn confirm_bq_resolve_wave_capped(
         stats.head_ns,
         stats.spent_ns,
     );
-    Ok(BqResolveWave {
-        stats,
-        items,
-        drain_fence_hi,
-        parent_ids,
-    })
+    Ok(BqResolveWave { stats, items, drain_fence_hi, parent_ids })
 }
 
 /// Dequeue BQ rows and bump `lookup_taken_hi` after a successful loadq send.
@@ -381,9 +366,7 @@ pub fn take_wave_items_for_load(
     items: &[(u32, [u8; 32], ResolvedWire)],
 ) -> Result<(), ConsensusError> {
     for (h, _, _) in items {
-        query
-            .block_queue_dequeue_height(*h)
-            .map_err(ConsensusError::from)?;
+        query.block_queue_dequeue_height(*h).map_err(ConsensusError::from)?;
         query.set_lookup_taken_hi(Some(*h));
     }
     Ok(())
@@ -444,19 +427,12 @@ mod tests {
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value,
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
+            output: vec![TxOut { value, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
         }
     }
 
     fn coinbase_tx(height: u32) -> Transaction {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            crate::bip34_height_script(height)
-        };
+        let mut ss = if height == 0 { vec![0x00] } else { crate::bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }
@@ -503,15 +479,9 @@ mod tests {
     #[test]
     fn wire_input_count_matches_serialized_block() {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let n: u32 = genesis
-            .txdata
-            .iter()
-            .map(|tx| tx.input.len() as u32)
-            .fold(0u32, u32::saturating_add);
-        assert_eq!(
-            rbitcoin_store::block_wire_input_count(&serialize(&genesis)),
-            n
-        );
+        let n: u32 =
+            genesis.txdata.iter().map(|tx| tx.input.len() as u32).fold(0u32, u32::saturating_add);
+        assert_eq!(rbitcoin_store::block_wire_input_count(&serialize(&genesis)), n);
         let g_cb = genesis.txdata[0].compute_txid();
         let b1 = mine_with_txs(
             genesis.block_hash(),
@@ -519,11 +489,8 @@ mod tests {
             1,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
         );
-        let n1: u32 = b1
-            .txdata
-            .iter()
-            .map(|tx| tx.input.len() as u32)
-            .fold(0u32, u32::saturating_add);
+        let n1: u32 =
+            b1.txdata.iter().map(|tx| tx.input.len() as u32).fold(0u32, u32::saturating_add);
         assert_eq!(rbitcoin_store::block_wire_input_count(&serialize(&b1)), n1);
         assert!(n1 >= 2, "coinbase + spend");
     }
@@ -537,19 +504,13 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![
                 TxIn {
-                    previous_output: OutPoint {
-                        txid: prev,
-                        vout: 0,
-                    },
+                    previous_output: OutPoint { txid: prev, vout: 0 },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::new(),
                 },
                 TxIn {
-                    previous_output: OutPoint {
-                        txid: prev,
-                        vout: 1,
-                    },
+                    previous_output: OutPoint { txid: prev, vout: 1 },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
                     witness: Witness::new(),
@@ -579,10 +540,7 @@ mod tests {
         let spends = push_resolve_keys(&params, height, &block, &pres, &skip, &mut keys);
         assert_eq!(keys.len(), 1);
         assert!(keys.contains(&prev.to_byte_array()));
-        assert_eq!(
-            spends,
-            vec![(prev.to_byte_array(), 0), (prev.to_byte_array(), 1),]
-        );
+        assert_eq!(spends, vec![(prev.to_byte_array(), 0), (prev.to_byte_array(), 1),]);
         let mut skip_same = HashSet::with_hasher(BuildHasherDefault::default());
         skip_same.insert(prev.to_byte_array());
         let mut keys2: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
@@ -616,20 +574,15 @@ mod tests {
             2,
             vec![spend_op_true(h1_create, 0, Amount::from_sat(48_0000_0000))],
         );
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
-        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
+        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2)).unwrap();
         let wave = resolve_wave(&q, &params, Milestone::NONE, &[1, 2]);
         assert_eq!(wave.items.len(), 2);
         assert_eq!(
             wave.stats.keys, 1,
             "same-wave h=1 create must not be TipOnly need; archived genesis still is"
         );
-        assert!(
-            wave.stats.hits >= 1,
-            "archived genesis parent must still TipOnly-hit"
-        );
+        assert!(wave.stats.hits >= 1, "archived genesis parent must still TipOnly-hit");
         let h1 = h1_create.to_byte_array();
         assert!(
             wave.parent_ids.get(&h1).is_none(),
@@ -661,10 +614,8 @@ mod tests {
             2,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(48_0000_0000))],
         );
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
-        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
+        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2)).unwrap();
 
         let wave = resolve_wave(&q, &params, Milestone::NONE, &[1, 2]);
         let st = wave.stats;
@@ -681,15 +632,10 @@ mod tests {
             st.head_ns
         );
         let g = g_cb.to_byte_array();
-        let (fk, _body, spent, n_out) = wave
-            .parent_ids
-            .get(&g)
-            .expect("genesis coinbase must be a TipOnly skeleton hit");
+        let (fk, _body, spent, n_out) =
+            wave.parent_ids.get(&g).expect("genesis coinbase must be a TipOnly skeleton hit");
         assert!(!fk.is_null());
-        assert!(
-            spent.is_some(),
-            "archived parent must carry spent range on the skeleton"
-        );
+        assert!(spent.is_some(), "archived parent must carry spent range on the skeleton");
         assert_eq!(n_out, Some(1), "loc n_out on TipOnly skeleton");
         take_emitted(&q, &wave);
         assert!(!q.block_queue_has_height(1));
@@ -717,8 +663,7 @@ mod tests {
             vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
         );
         let expect_txid = TxPrecompute::from_tx(&b1.txdata[1]).txid;
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
         let wave = resolve_wave(&q, &params, Milestone { height: 100 }, &[1]);
         assert_eq!(wave.items.len(), 1);
         let spend_pre = &wave.items[0].2.pres[1];
@@ -741,8 +686,7 @@ mod tests {
         for h in 1..=9u32 {
             time += 600;
             let b = mine_empty_regtest(prev, time, h);
-            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
-                .unwrap();
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b)).unwrap();
             prev = b.block_hash();
             heights.push(h);
         }
@@ -752,10 +696,7 @@ mod tests {
             "lookup wave must outgrow the old 8-height cap (soft 64000 inputs / hard 1080 blocks)"
         );
         take_emitted(&q, &wave);
-        assert!(
-            !q.block_queue_has_height(1),
-            "take after send dequeues the BQ row"
-        );
+        assert!(!q.block_queue_has_height(1), "take after send dequeues the BQ row");
         assert!(q.block_queue_resolved(1).is_none());
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -782,36 +723,22 @@ mod tests {
         const MAX_IN: u32 = BQ_RESOLVE_WAVE_MAX_INPUTS;
         const MAX_BL: usize = BQ_RESOLVE_WAVE_MAX_BLOCKS;
         // far unresolved (beyond first half of win) + fat + short → hold
-        assert!(bq_resolve_wave_hold_partial(
-            330, 180, 4_000, 1, 100, 191, false, MAX_IN, MAX_BL
-        ));
+        assert!(bq_resolve_wave_hold_partial(330, 180, 4_000, 1, 100, 191, false, MAX_IN, MAX_BL));
         // above min, gap in the first half of the window → emit (load needs it)
-        assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 9_000, 2, 100, 190, true, MAX_IN, MAX_BL
-        ));
-        assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 9_000, 2, 100, 100, true, MAX_IN, MAX_BL
-        ));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 9_000, 2, 100, 190, true, MAX_IN, MAX_BL));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 9_000, 2, 100, 100, true, MAX_IN, MAX_BL));
         // fat BQ + full input wave → emit
         assert!(!bq_resolve_wave_hold_partial(
             330, 180, 64_100, 16, 100, 250, true, MAX_IN, MAX_BL
         ));
         // fat BQ + full block cap → emit
-        assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 1, 1080, 100, 250, true, MAX_IN, MAX_BL
-        ));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 1, 1080, 100, 250, true, MAX_IN, MAX_BL));
         // thin BQ + short wave, nothing more to join → emit
-        assert!(!bq_resolve_wave_hold_partial(
-            50, 180, 4_000, 1, 100, 250, false, MAX_IN, MAX_BL
-        ));
+        assert!(!bq_resolve_wave_hold_partial(50, 180, 4_000, 1, 100, 250, false, MAX_IN, MAX_BL));
         // rate unknown (win=0), nothing more to join → emit
-        assert!(!bq_resolve_wave_hold_partial(
-            330, 0, 4_000, 1, 100, 250, false, MAX_IN, MAX_BL
-        ));
+        assert!(!bq_resolve_wave_hold_partial(330, 0, 4_000, 1, 100, 250, false, MAX_IN, MAX_BL));
         // nothing collected
-        assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 0, 0, 100, 100, true, MAX_IN, MAX_BL
-        ));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 0, 0, 100, 100, true, MAX_IN, MAX_BL));
         // Hard min 8000: hold a thin *far* layer when more BQ heights can
         // still join. A single block at the load frontier (tip+1) must emit.
         assert!(
@@ -830,13 +757,9 @@ mod tests {
             !bq_resolve_wave_hold_partial(0, 180, 4_000, 1, 100, 100, false, MAX_IN, MAX_BL),
             "last available thin wave must emit (tip / empty BQ)"
         );
-        assert!(!bq_resolve_wave_hold_partial(
-            0, 180, 8_000, 2, 100, 100, true, MAX_IN, MAX_BL
-        ));
+        assert!(!bq_resolve_wave_hold_partial(0, 180, 8_000, 2, 100, 100, true, MAX_IN, MAX_BL));
         // remaining-loadq cap counts as at_max so a packed remaining=1 wave emits
-        assert!(!bq_resolve_wave_hold_partial(
-            330, 180, 8_001, 2, 100, 250, true, 8_000, 144
-        ));
+        assert!(!bq_resolve_wave_hold_partial(330, 180, 8_001, 2, 100, 250, true, 8_000, 144));
     }
 
     #[test]
@@ -850,8 +773,7 @@ mod tests {
         for h in 1..=8u32 {
             time += 600;
             let b = mine_empty_regtest(prev, time, h);
-            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
-                .unwrap();
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b)).unwrap();
             prev = b.block_hash();
         }
         for h in 1..=7u32 {
@@ -866,20 +788,10 @@ mod tests {
             st.decode_ns, 0,
             "hold must not consensus_decode; n_inputs is stamped at enqueue"
         );
-        assert_eq!(
-            st.precompute_ns, 0,
-            "hold must not TxPrecompute::from_tx_wire"
-        );
-        assert_eq!(
-            q.block_queue_take_raw_clone_n(),
-            0,
-            "hold must not clone raw payload"
-        );
+        assert_eq!(st.precompute_ns, 0, "hold must not TxPrecompute::from_tx_wire");
+        assert_eq!(q.block_queue_take_raw_clone_n(), 0, "hold must not clone raw payload");
         assert!(!q.block_queue_is_resolve_complete(8));
-        assert!(
-            q.block_queue_has_height(8),
-            "hold leaves raw on BQ until the wave emits"
-        );
+        assert!(q.block_queue_has_height(8), "hold leaves raw on BQ until the wave emits");
         assert!(q.block_queue_raw_payload(8).unwrap().is_some());
         assert!(q.block_queue_resolved(8).is_none());
 
@@ -901,8 +813,7 @@ mod tests {
         for h in 1..=20u32 {
             time += 600;
             let b = mine_empty_regtest(prev, time, h);
-            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
-                .unwrap();
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b)).unwrap();
             prev = b.block_hash();
         }
         for h in 2..=20u32 {
@@ -930,8 +841,7 @@ mod tests {
         for h in 1..=10u32 {
             time += 600;
             let b = mine_empty_regtest(prev, time, h);
-            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
-                .unwrap();
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b)).unwrap();
             prev = b.block_hash();
         }
         // IBD-sized window, BQ still filling (10 < 180). Height 1 is tip+1.
@@ -958,8 +868,7 @@ mod tests {
         for h in 1..=20u32 {
             time += 600;
             let b = mine_empty_regtest(prev, time, h);
-            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b))
-                .unwrap();
+            q.block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(&b)).unwrap();
             prev = b.block_hash();
         }
         for h in 1..=10u32 {
@@ -1003,10 +912,8 @@ mod tests {
             2,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(48_0000_0000))],
         );
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
-        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
+        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2)).unwrap();
         let w1 = resolve_wave(&q, &params, Milestone::NONE, &[1]);
         assert!(w1.stats.hits >= 1);
         assert!(w1.parent_ids.get(&g_cb.to_byte_array()).is_some());
@@ -1037,8 +944,7 @@ mod tests {
             1,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(49_0000_0000))],
         );
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
         let wave = resolve_wave(&q, &params, Milestone::NONE, &[1]);
         assert!(wave.stats.hits >= 1);
         let g = g_cb.to_byte_array();
@@ -1054,10 +960,7 @@ mod tests {
             q.confirm_stats(),
         )
         .expect("stamp helper after wave");
-        assert_eq!(
-            ext.head_need_n, 0,
-            "skeleton path must not leftover-probe tx.head"
-        );
+        assert_eq!(ext.head_need_n, 0, "skeleton path must not leftover-probe tx.head");
         let inflight = rbitcoin_query::InFlight::new();
         let pipe = crate::WireLoadPipeline {
             path_lo: 1,
@@ -1078,12 +981,7 @@ mod tests {
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
                 .expect("stamp after wave");
         let plan = stamped.plan.expect("new body needs a plan");
-        let inp = plan
-            .edges
-            .values()
-            .flatten()
-            .find(|e| e.vout != u32::MAX)
-            .expect("spend");
+        let inp = plan.edges.values().flatten().find(|e| e.vout != u32::MAX).expect("spend");
         assert_eq!(inp.prev_txid, g_cb.to_byte_array());
         assert!(!inp.create_fk.is_null());
         let _ = std::fs::remove_dir_all(&path);
@@ -1108,10 +1006,8 @@ mod tests {
             2,
             vec![spend_op_true(g_cb, 0, Amount::from_sat(48_0000_0000))],
         );
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
-        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
+        q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2)).unwrap();
         // Caller skipped height 2 (claimed / inflight) — only resolve 1.
         let st = resolve_and_take(&q, &params, &[1]);
         assert_eq!(st.heights, 1);
@@ -1210,12 +1106,7 @@ mod tests {
                 .expect("in-flight parent must stamp until tip covers the parent height")
         };
         let plan = stamped.plan.expect("plan");
-        let inp = plan
-            .edges
-            .values()
-            .flatten()
-            .find(|e| e.vout != u32::MAX)
-            .expect("spend");
+        let inp = plan.edges.values().flatten().find(|e| e.vout != u32::MAX).expect("spend");
         assert_eq!(inp.create_fk, parent_fk);
         log.prune_below_height(Some(2));
         assert!(
@@ -1237,16 +1128,9 @@ mod tests {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
 
-        q.store()
-            .confirmed
-            .set(Height(1), rbitcoin_primitives::Fk(2))
-            .unwrap();
+        q.store().confirmed.set(Height(1), rbitcoin_primitives::Fk(2)).unwrap();
         assert_eq!(q.tip_height(), Some(Height(1)));
-        assert_eq!(
-            q.fence_tip_height(),
-            Some(0),
-            "production torn publish: tip leads fence"
-        );
+        assert_eq!(q.fence_tip_height(), Some(0), "production torn publish: tip leads fence");
 
         let parent_txid = [0x33u8; 32];
         let parent_fk = rbitcoin_primitives::Fk(99);
@@ -1300,12 +1184,7 @@ mod tests {
                 .expect("in-flight parent must stamp while confirmed tip leads the fence")
         };
         let plan = stamped.plan.expect("plan");
-        let inp = plan
-            .edges
-            .values()
-            .flatten()
-            .find(|e| e.vout != u32::MAX)
-            .expect("spend");
+        let inp = plan.edges.values().flatten().find(|e| e.vout != u32::MAX).expect("spend");
         assert_eq!(inp.create_fk, parent_fk);
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -1334,12 +1213,7 @@ mod tests {
         let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
             .expect("leftover connected parent must TipOnly-head, not invariant");
         let plan = stamped.plan.expect("new body needs a plan");
-        let inp = plan
-            .edges
-            .values()
-            .flatten()
-            .find(|e| e.vout != u32::MAX)
-            .expect("spend tx");
+        let inp = plan.edges.values().flatten().find(|e| e.vout != u32::MAX).expect("spend tx");
         assert_eq!(inp.prev_txid, g_cb.to_byte_array());
         assert_eq!(inp.create_fk, expect_fk);
         let _ = std::fs::remove_dir_all(&path);
@@ -1372,10 +1246,7 @@ mod tests {
             }],
         };
         let txids = vec![child.compute_txid().to_byte_array()];
-        let block = std::sync::Arc::new(bitcoin::Block {
-            header: b1.header,
-            txdata: vec![child],
-        });
+        let block = std::sync::Arc::new(bitcoin::Block { header: b1.header, txdata: vec![child] });
         let err = q
             .archive_plan_batch_from_wire(
                 &[(rbitcoin_primitives::Fk(1), &block, txids.as_slice())],
@@ -1403,8 +1274,7 @@ mod tests {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
+        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1)).unwrap();
         resolve_and_take(&q, &params, &[1]);
         assert!(!q.block_queue_has_height(1));
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
@@ -1438,17 +1308,13 @@ mod tests {
             time += 600;
             let b = mine_empty_regtest(prev, time, h);
             prev = b.block_hash();
-            q.block_queue_enqueue(h, prev.to_byte_array(), 1, &serialize(&b))
-                .unwrap();
+            q.block_queue_enqueue(h, prev.to_byte_array(), 1, &serialize(&b)).unwrap();
             heights.push(h);
         }
         let df_before = q.drain_and_fence_hi();
         let wave = resolve_wave(&q, &params, Milestone::NONE, &heights);
         assert_eq!(wave.items.len(), 4);
-        assert_eq!(
-            wave.drain_fence_hi, df_before,
-            "wave must snapshot drain+fence before TipOnly"
-        );
+        assert_eq!(wave.drain_fence_hi, df_before, "wave must snapshot drain+fence before TipOnly");
         assert!(
             q.lookup_taken_hi().is_none(),
             "resolve must not bump taken_hi before load-batch send; got {:?}",
@@ -1459,10 +1325,7 @@ mod tests {
             Some(4),
             "resolve wave must bump started_hi at start of TipOnly"
         );
-        assert!(
-            q.block_queue_has_height(4),
-            "unsent wave tail must stay on the BQ"
-        );
+        assert!(q.block_queue_has_height(4), "unsent wave tail must stay on the BQ");
         assert!(
             q.block_queue_resolved(4).is_some(),
             "unsent tail is parked decoded (no re-decode)"
@@ -1470,11 +1333,7 @@ mod tests {
         q.block_queue_dequeue_height(1).unwrap();
         q.set_lookup_taken_hi(Some(1));
         assert_eq!(q.lookup_taken_hi(), Some(1));
-        assert_eq!(
-            q.lookup_started_hi(),
-            Some(4),
-            "take must not rewind started_hi"
-        );
+        assert_eq!(q.lookup_started_hi(), Some(4), "take must not rewind started_hi");
         assert!(!q.block_queue_has_height(1));
         assert!(q.block_queue_has_height(4));
         let _ = std::fs::remove_dir_all(&path);

@@ -63,12 +63,7 @@ pub(crate) struct DrainBudget {
 
 impl DrainBudget {
     pub(crate) fn new(hard: Duration) -> Self {
-        Self {
-            hard,
-            zero: Duration::ZERO,
-            elapsed: Duration::ZERO,
-            since_slow_log: Duration::ZERO,
-        }
+        Self { hard, zero: Duration::ZERO, elapsed: Duration::ZERO, since_slow_log: Duration::ZERO }
     }
 
     pub(crate) fn with_defaults() -> Self {
@@ -175,9 +170,7 @@ pub struct IoCtx<'a> {
 impl<'a> IoCtx<'a> {
     #[inline]
     pub fn held(session: &'a mut UringSession) -> Self {
-        Self {
-            session: Some(session),
-        }
+        Self { session: Some(session) }
     }
 
     #[inline]
@@ -207,45 +200,26 @@ thread_local! {
 /// [`UringSession::take_sqe_n`] when the test already holds the session.
 #[cfg(test)]
 pub fn tls_take_sqe_n() -> u64 {
-    SESSION.with(|cell| {
-        cell.borrow_mut()
-            .as_mut()
-            .map(|s| s.take_sqe_n())
-            .unwrap_or(0)
-    })
+    SESSION.with(|cell| cell.borrow_mut().as_mut().map(|s| s.take_sqe_n()).unwrap_or(0))
 }
 
 /// Nonzero-rw_flags SQE count on the thread-local session (0 if none).
 #[cfg(test)]
 pub fn tls_take_sqe_rw_nonzero() -> u64 {
-    SESSION.with(|cell| {
-        cell.borrow_mut()
-            .as_mut()
-            .map(|s| s.take_sqe_rw_nonzero())
-            .unwrap_or(0)
-    })
+    SESSION.with(|cell| cell.borrow_mut().as_mut().map(|s| s.take_sqe_rw_nonzero()).unwrap_or(0))
 }
 
 /// Largest pwrite SQE on the thread-local session (0 if none).
 #[cfg(test)]
 pub fn tls_take_max_pwrite_len() -> u32 {
-    SESSION.with(|cell| {
-        cell.borrow_mut()
-            .as_mut()
-            .map(|s| s.take_max_pwrite_len())
-            .unwrap_or(0)
-    })
+    SESSION.with(|cell| cell.borrow_mut().as_mut().map(|s| s.take_max_pwrite_len()).unwrap_or(0))
 }
 
 /// Largest pwrite count in one `begin_batch` window on the TLS session (0 if none).
 #[cfg(test)]
 pub fn tls_take_max_batch_pwrite_n() -> u32 {
-    SESSION.with(|cell| {
-        cell.borrow_mut()
-            .as_mut()
-            .map(|s| s.take_max_batch_pwrite_n())
-            .unwrap_or(0)
-    })
+    SESSION
+        .with(|cell| cell.borrow_mut().as_mut().map(|s| s.take_max_batch_pwrite_n()).unwrap_or(0))
 }
 
 /// Run `f` with TLS / `try_open` opening `kind` (does not nest a session).
@@ -685,8 +659,7 @@ impl UringSession {
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
-                ring.submit()
-                    .map_err(|_| StoreError::Corrupt("io_uring submit failed"))?;
+                ring.submit().map_err(|_| StoreError::Corrupt("io_uring submit failed"))?;
                 Ok(())
             }
             SessionBackend::Pool(_) => Ok(()),
@@ -713,9 +686,7 @@ impl UringSession {
                     cq.overflow()
                 };
                 ring.completion().sync();
-                ring.completion()
-                    .map(|cqe| (cqe.user_data(), cqe.result()))
-                    .collect::<Vec<_>>()
+                ring.completion().map(|cqe| (cqe.user_data(), cqe.result())).collect::<Vec<_>>()
             }
             SessionBackend::Pool(pool) => pool.harvest_ready(),
             #[cfg(windows)]
@@ -776,9 +747,7 @@ impl UringSession {
     }
 
     fn note_slow_drain(&self, waited: Duration) {
-        URING_METERS
-            .slow_drain
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        URING_METERS.slow_drain.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
         rbitcoin_log::warn!(
@@ -901,8 +870,7 @@ impl UringSession {
     }
 
     fn note_invariant(&self, kind: UringInvariant) {
-        kind.counter()
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kind.counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
         rbitcoin_log::warn!(
@@ -1049,10 +1017,7 @@ impl std::ops::DerefMut for DrainOnDrop<'_> {
 /// Full-length CQE or `StoreError::io`. Short success is not a soft miss.
 pub(crate) fn require_full_cqe(res: i32, want: usize, path: &Path) -> Result<(), StoreError> {
     if res < 0 {
-        return Err(StoreError::io(
-            path,
-            std::io::Error::from_raw_os_error(-res),
-        ));
+        return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-res)));
     }
     if res as usize != want {
         return Err(StoreError::io(
@@ -1064,21 +1029,15 @@ pub(crate) fn require_full_cqe(res: i32, want: usize, path: &Path) -> Result<(),
 }
 
 pub fn note_uring_recover() {
-    URING_METERS
-        .recover_n
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    URING_METERS.recover_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn uring_slow_drain_count() -> u64 {
-    URING_METERS
-        .slow_drain
-        .load(std::sync::atomic::Ordering::Relaxed)
+    URING_METERS.slow_drain.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn uring_recover_count() -> u64 {
-    URING_METERS
-        .recover_n
-        .load(std::sync::atomic::Ordering::Relaxed)
+    URING_METERS.recover_n.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Run `f` with this **OS thread's** long-lived io_uring session.
@@ -1258,8 +1217,7 @@ impl UringInvariant {
 }
 
 pub(crate) fn note_uring_invariant(kind: UringInvariant) {
-    kind.counter()
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    kind.counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("unnamed");
     rbitcoin_log::warn!(
@@ -1572,13 +1530,9 @@ mod tests {
 
     #[test]
     fn uring_meter_bump_and_take() {
-        let before = uring_meters()
-            .unexpected_cqe
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let before = uring_meters().unexpected_cqe.load(std::sync::atomic::Ordering::Relaxed);
         note_uring_invariant(UringInvariant::UnexpectedCqe);
-        let after = uring_meters()
-            .unexpected_cqe
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let after = uring_meters().unexpected_cqe.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before);
     }
 
@@ -1714,9 +1668,7 @@ mod tests {
         let mut session = UringSession::try_open(32).expect("uring");
         let mut bufs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 4096]).collect();
         for (i, b) in bufs.iter_mut().enumerate() {
-            session
-                .push_pread(fd, 0, b.as_mut_slice(), i as u64)
-                .expect("push");
+            session.push_pread(fd, 0, b.as_mut_slice(), i as u64).expect("push");
         }
         session.sync_submission();
         let _ = session.submit();
@@ -1741,10 +1693,8 @@ mod tests {
         use std::io::Write;
         use std::os::fd::AsRawFd;
 
-        let path = std::env::temp_dir().join(format!(
-            "rbitcoin-uring-drain-unsynced-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir()
+            .join(format!("rbitcoin-uring-drain-unsynced-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1758,9 +1708,7 @@ mod tests {
 
         let mut session = UringSession::try_open(32).expect("uring");
         let mut buf = vec![0u8; 64];
-        session
-            .push_pread(fd, 0, buf.as_mut_slice(), 1)
-            .expect("push");
+        session.push_pread(fd, 0, buf.as_mut_slice(), 1).expect("push");
         assert!(session.in_flight() > 0);
         session.drain_all().expect("drain unsynced SQEs");
         assert_eq!(session.in_flight(), 0);
@@ -1805,11 +1753,7 @@ mod tests {
         session.submit().unwrap();
         assert!(session.in_flight() > 0);
         session.begin_batch().unwrap();
-        assert_eq!(
-            session.in_flight(),
-            0,
-            "begin_batch must drain leftover before bumping epoch"
-        );
+        assert_eq!(session.in_flight(), 0, "begin_batch must drain leftover before bumping epoch");
         assert_ne!(session.epoch(), epoch0);
         assert_eq!(&buf, &[0x11, 0x22, 0x33, 0x44]);
         let _ = std::fs::remove_file(&path);
@@ -1832,10 +1776,7 @@ mod tests {
         assert!(session.is_poisoned());
         let mut buf = [0u8; 1];
         let r = session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0));
-        assert!(
-            r.is_err(),
-            "push after undrainable leftover must fail, got {r:?}"
-        );
+        assert!(r.is_err(), "push after undrainable leftover must fail, got {r:?}");
         let _ = std::fs::remove_file(&path);
     }
 

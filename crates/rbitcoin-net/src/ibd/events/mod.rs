@@ -131,9 +131,7 @@ pub(crate) fn drain_ready_peer_and_body_events(
         }
     }
 
-    loop_stats
-        .drain_ns
-        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    loop_stats.drain_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     loop_stats.drain_events.fetch_add(events, Ordering::Relaxed);
     Ok(true)
 }
@@ -256,9 +254,8 @@ fn on_empty_headers(st: &mut IbdWorkState, hub: &ChainHub) {
         st.headers_done = true;
     } else if lag > 2 {
         if should_log_empty_headers_lag(st.empty_header_streak) {
-            let known = st
-                .max_ready_height
-                .max(st.hash_height.values().copied().max().unwrap_or(0));
+            let known =
+                st.max_ready_height.max(st.hash_height.values().copied().max().unwrap_or(0));
             if st.ordered_set.is_empty() {
                 warn!(
                     "ibd: empty headers but lag={lag} behind max_peer_height={} (known≈{known}, tip={tip_h}) — keep header sync",
@@ -324,19 +321,9 @@ pub(crate) fn apply_peer_event(
 ) {
     match ev {
         PeerEvent::Headers { peer, headers } => apply_headers_event(st, hub, peer, headers),
-        PeerEvent::BlockFramed {
-            peer,
-            hash,
-            payload,
-        } => apply_block_framed(
-            st,
-            hub,
-            archive_write_next,
-            confirm_feed,
-            peer,
-            hash,
-            payload,
-        ),
+        PeerEvent::BlockFramed { peer, hash, payload } => {
+            apply_block_framed(st, hub, archive_write_next, confirm_feed, peer, hash, payload)
+        }
         PeerEvent::BlockDecodeFailed { peer, hash } => apply_block_decode_failed(st, peer, hash),
         PeerEvent::NotFound { peer, hashes } => apply_notfound(st, peer, hashes),
         PeerEvent::Addrs { peer, addrs } => {
@@ -444,10 +431,7 @@ fn apply_block_framed(
         return;
     }
     let raw = hash.to_byte_array();
-    match hub
-        .query
-        .block_queue_offer(height, raw, header_fk.0, &payload)
-    {
+    match hub.query.block_queue_offer(height, raw, header_fk.0, &payload) {
         Ok(_offer) => {
             let _ = try_complete_awaiting_reorg(st, hub);
         }
@@ -476,11 +460,7 @@ fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         for h in &hashes {
             s.in_flight.remove(h);
-            let empty = st
-                .inflight
-                .get_mut(h)
-                .map(|e| e.remove_peer(peer))
-                .unwrap_or(false);
+            let empty = st.inflight.get_mut(h).map(|e| e.remove_peer(peer)).unwrap_or(false);
             if empty {
                 st.inflight.remove(h);
             }
@@ -529,10 +509,7 @@ pub(crate) fn inject_learned_addrs(
         }
     }
     if added > 0 {
-        rbitcoin_log::debug!(
-            "ibd: peer[{from_peer}] taught {added} addr(s); book={}",
-            book.len()
-        );
+        rbitcoin_log::debug!("ibd: peer[{from_peer}] taught {added} addr(s); book={}", book.len());
     }
 }
 
@@ -570,13 +547,7 @@ pub(crate) fn apply_confirm_events(
                     f.release_isolate_if_tip(tip);
                 }
             }
-            super::confirm::ConfirmEvent::Reject {
-                height,
-                hash,
-                class,
-                err,
-                batch_len,
-            } => {
+            super::confirm::ConfirmEvent::Reject { height, hash, class, err, batch_len } => {
                 apply_confirm_reject(
                     st,
                     height,
@@ -679,8 +650,7 @@ fn apply_soft_wire_reject(
     if bad_prev {
         st.headers_done = false;
         if let Some(h) = hub {
-            st.reorg
-                .register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(hash));
+            st.reorg.register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(hash));
             let rewound = super::reorg::maybe_rewind_to_best_work(st, h).unwrap_or(false);
             if rewound {
                 return;
@@ -731,19 +701,14 @@ fn apply_cascade_reject(
     // Leave the body queue: the plan was stale, the wire is still good.
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     const CASCADE_HALT_AFTER: u8 = 3;
-    let tip = hub
-        .and_then(|h| h.tip_hash())
-        .map(|t| t.to_byte_array())
-        .unwrap_or([0u8; 32]);
+    let tip = hub.and_then(|h| h.tip_hash()).map(|t| t.to_byte_array()).unwrap_or([0u8; 32]);
     let n = match st.cascade_at {
         Some((h, t, c)) if h == hash && t == tip => c.saturating_add(1),
         _ => 1u8,
     };
     st.cascade_at = Some((hash, tip, n));
     if n >= CASCADE_HALT_AFTER {
-        st.halt = Some(format!(
-            "cascade repeated {n}× @{height} {hash} (tip unchanged): {err}"
-        ));
+        st.halt = Some(format!("cascade repeated {n}× @{height} {hash} (tip unchanged): {err}"));
         warn!(
             "ibd: confirm reject cascade halt @{height} {hash}: {err} ({n} at same tip, not blacklisted)"
         );
@@ -803,8 +768,7 @@ fn apply_consensus_invalid_reject(
     }
     if let Some(h) = hub {
         for t in super::reorg::competing_valid_header_tips(st, h) {
-            st.reorg
-                .register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(t));
+            st.reorg.register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(t));
         }
         let rewound = super::reorg::maybe_rewind_to_best_work(st, h).unwrap_or(false);
         if !rewound {

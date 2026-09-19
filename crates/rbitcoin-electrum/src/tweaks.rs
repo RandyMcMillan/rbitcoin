@@ -53,11 +53,7 @@ pub fn parse_req(params: &Value) -> Result<TweakReq, String> {
     let start = param_u32(params, 0)?;
     let count = param_u32(params, 1).unwrap_or(1).max(1);
     let historical = param_bool(params, 2).unwrap_or(false);
-    Ok(TweakReq {
-        start,
-        count,
-        historical,
-    })
+    Ok(TweakReq { start, count, historical })
 }
 
 /// Inclusive last height to serve (`start` if `count==1`), not past tip.
@@ -93,11 +89,7 @@ pub fn height_map_json(
     if tip.is_none_or(|t| h > t) || !chain.taproot_active_at(h) {
         return Ok(empty_height_json(h));
     }
-    let limits = ThinTweakRangeLimits {
-        max_heights: 1,
-        max_eligible: usize::MAX,
-        cut_through,
-    };
+    let limits = ThinTweakRangeLimits { max_heights: 1, max_eligible: usize::MAX, cut_through };
     match query.load_thin_tweaks_range(Height(h), limits) {
         Ok(mut batch) if !batch.is_empty() => {
             let rows = batch.pop().map(|(_, r)| r).unwrap_or_default();
@@ -179,10 +171,7 @@ where
 
 /// Serve budgets plus Cake cut-through when `historical` is false.
 pub fn subscribe_serve_limits(historical: bool) -> ThinTweakRangeLimits {
-    ThinTweakRangeLimits {
-        cut_through: !historical,
-        ..ThinTweakRangeLimits::default()
-    }
+    ThinTweakRangeLimits { cut_through: !historical, ..ThinTweakRangeLimits::default() }
 }
 
 /// First JSON-RPC height plus remaining notifies of the same thin wave.
@@ -233,10 +222,8 @@ pub fn first_subscribe_wave(
     }
     let (h0, rows0) = &thin[0];
     debug_assert_eq!(*h0, start);
-    let rest_notifies = thin[1..]
-        .iter()
-        .map(|(h, rows)| thin_height_notify_json(*h, rows, min_dust))
-        .collect();
+    let rest_notifies =
+        thin[1..].iter().map(|(h, rows)| thin_height_notify_json(*h, rows, min_dust)).collect();
     Ok(FirstWave {
         result_json: encode_thin_height_json(*h0, rows0, min_dust),
         rest_notifies,
@@ -273,10 +260,7 @@ pub fn remaining_notify_lines(
     min_dust: u64,
 ) -> Result<NotifyWave, String> {
     if start > last {
-        return Ok(NotifyWave {
-            lines: Vec::new(),
-            consumed: 0,
-        });
+        return Ok(NotifyWave { lines: Vec::new(), consumed: 0 });
     }
     if let Some(end) = pre_taproot_wave_last(start, last, chain.taproot_height()) {
         let consumed = end.saturating_sub(start).saturating_add(1);
@@ -288,13 +272,7 @@ pub fn remaining_notify_lines(
     let thin = load_thin_batch(query, start, last, limits)?;
     if thin.is_empty() {
         return Ok(NotifyWave {
-            lines: vec![height_notify_json(
-                query,
-                chain,
-                start,
-                limits.cut_through,
-                min_dust,
-            )?],
+            lines: vec![height_notify_json(query, chain, start, limits.cut_through, min_dust)?],
             consumed: 1,
         });
     }
@@ -322,13 +300,8 @@ pub fn load_thin_batch(
         return Ok(Vec::new());
     }
     let max_h = last.saturating_sub(start).saturating_add(1);
-    let limits = ThinTweakRangeLimits {
-        max_heights: limits.max_heights.min(max_h),
-        ..limits
-    };
-    let batch = query
-        .load_thin_tweaks_range(Height(start), limits)
-        .map_err(|e| e.to_string())?;
+    let limits = ThinTweakRangeLimits { max_heights: limits.max_heights.min(max_h), ..limits };
+    let batch = query.load_thin_tweaks_range(Height(start), limits).map_err(|e| e.to_string())?;
     Ok(batch.into_iter().map(|(h, rows)| (h.0, rows)).collect())
 }
 
@@ -370,9 +343,7 @@ fn retain_unspent_taproot(
             };
             if !t.output_pubkeys.is_empty() {
                 let vouts: Vec<u32> = t.output_pubkeys.iter().map(|o| o.vout).collect();
-                let live = query
-                    .unspent_create_vouts(fk, &vouts)
-                    .map_err(|e| e.to_string())?;
+                let live = query.unspent_create_vouts(fk, &vouts).map_err(|e| e.to_string())?;
                 rbitcoin_store::keep_unspent_vout_subsequence(&mut t.output_pubkeys, &live, |o| {
                     o.vout
                 });
@@ -562,10 +533,10 @@ fn param_u32(params: &Value, idx: usize) -> Result<u32, String> {
 }
 
 fn param_bool(params: &Value, idx: usize) -> Option<bool> {
-    params.as_array().and_then(|a| a.get(idx)).and_then(|v| {
-        v.as_bool()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    })
+    params
+        .as_array()
+        .and_then(|a| a.get(idx))
+        .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
 }
 
 #[cfg(test)]
@@ -601,10 +572,7 @@ mod tests {
 
     #[test]
     fn subscribe_serve_limits_matches_query_default() {
-        assert_eq!(
-            subscribe_serve_limits(true),
-            ThinTweakRangeLimits::default()
-        );
+        assert_eq!(subscribe_serve_limits(true), ThinTweakRangeLimits::default());
         assert_eq!(subscribe_serve_limits(true).max_eligible, 16384);
         assert_eq!(subscribe_serve_limits(true).max_heights, 128);
         assert!(!subscribe_serve_limits(true).cut_through);
@@ -614,14 +582,7 @@ mod tests {
     #[test]
     fn parse_req_historical_defaults_false() {
         let r = parse_req(&json!([10, 3])).unwrap();
-        assert_eq!(
-            r,
-            TweakReq {
-                start: 10,
-                count: 3,
-                historical: false
-            }
-        );
+        assert_eq!(r, TweakReq { start: 10, count: 3, historical: false });
         let h = parse_req(&json!([10, 3, true])).unwrap();
         assert!(h.historical);
         let c = parse_req(&json!([0, 1, false])).unwrap();
@@ -641,10 +602,7 @@ mod tests {
     fn pre_taproot_wave_covers_1024_then_stops_at_activation() {
         assert_eq!(pre_taproot_wave_last(0, 10, 709_632), Some(10));
         assert_eq!(pre_taproot_wave_last(0, 2_000, 709_632), Some(1023));
-        assert_eq!(
-            pre_taproot_wave_last(709_000, 800_000, 709_632),
-            Some(709_631)
-        );
+        assert_eq!(pre_taproot_wave_last(709_000, 800_000, 709_632), Some(709_631));
         assert_eq!(pre_taproot_wave_last(709_632, 800_000, 709_632), None);
         assert_eq!(pre_taproot_wave_last(0, 100, 0), None);
     }
@@ -732,10 +690,7 @@ mod tests {
             assert!(v["params"][0][&h].as_object().unwrap().is_empty(), "{v}");
         }
         let thin1 = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
-        assert_eq!(
-            encode_thin_height_json(1, &thin1, DEFAULT_TWEAKS_MIN_DUST),
-            wave.result_json
-        );
+        assert_eq!(encode_thin_height_json(1, &thin1, DEFAULT_TWEAKS_MIN_DUST), wave.result_json);
 
         let main = ChainParams::mainnet();
         let pre = first_subscribe_wave(
@@ -832,9 +787,7 @@ mod tests {
         assert_eq!(map.len(), 7, "{v}");
         for h in 1u32..=7 {
             assert!(
-                map.get(&h.to_string())
-                    .and_then(|x| x.as_object())
-                    .is_some_and(|o| o.is_empty()),
+                map.get(&h.to_string()).and_then(|x| x.as_object()).is_some_and(|o| o.is_empty()),
                 "{v}"
             );
         }
@@ -1046,11 +999,7 @@ mod tests {
         tweak[1] = 0xaa;
         let mut txid = [0u8; 32];
         txid[0] = 0x11;
-        let row = rbitcoin_query::ThinTweakRow {
-            txid,
-            tweak,
-            p2tr: vec![(1, [0x5f; 32], 5410)],
-        };
+        let row = rbitcoin_query::ThinTweakRow { txid, tweak, p2tr: vec![(1, [0x5f; 32], 5410)] };
         let s = encode_thin_height_json(850_000, &[row], 0);
         let v: Value = serde_json::from_str(&s).unwrap();
         let t = TxTweak {
@@ -1128,10 +1077,7 @@ mod tests {
         let ends = write_ends.lock().unwrap();
         assert_eq!(starts.len(), 2);
         assert_eq!(ends.len(), 2);
-        assert!(
-            starts[1] < ends[0],
-            "wave 1 load must start before wave 0 write returns"
-        );
+        assert!(starts[1] < ends[0], "wave 1 load must start before wave 0 write returns");
     }
 
     fn dust_row(txid0: u8, p2tr: Vec<(u32, [u8; 32], u64)>) -> ThinTweakRow {
@@ -1165,10 +1111,8 @@ mod tests {
 
     #[test]
     fn omit_dust_546_matches_cake_electrs_leq() {
-        let rows = vec![
-            dust_row(1, vec![(0, [0xaa; 32], 546)]),
-            dust_row(2, vec![(0, [0xbb; 32], 547)]),
-        ];
+        let rows =
+            vec![dust_row(1, vec![(0, [0xaa; 32], 546)]), dust_row(2, vec![(0, [0xbb; 32], 547)])];
         let s = encode_thin_height_json(1, &rows, 546);
         let v: Value = serde_json::from_str(&s).unwrap();
         let txs = v["1"].as_object().unwrap();

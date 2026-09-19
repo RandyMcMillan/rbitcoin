@@ -22,9 +22,7 @@ pub fn lock_busy_msg(dir: &Path) -> String {
 
 /// Exclusive-lock the process datadir.
 pub fn lock_node_dirs(config: &NodeConfig) -> Result<DirLocks, NodeError> {
-    Ok(DirLocks {
-        _files: vec![lock_dir(config.datadir.path())?],
-    })
+    Ok(DirLocks { _files: vec![lock_dir(config.datadir.path())?] })
 }
 
 fn lock_dir(dir: &Path) -> Result<File, NodeError> {
@@ -35,10 +33,7 @@ fn lock_dir(dir: &Path) -> Result<File, NodeError> {
             Err(LockBusy) => Err(NodeError::Locked(dir.to_path_buf())),
         },
         Err(e) if is_lock_busy_io(&e) => Err(NodeError::Locked(dir.to_path_buf())),
-        Err(source) => Err(NodeError::Datadir {
-            path: path.clone(),
-            source,
-        }),
+        Err(source) => Err(NodeError::Datadir { path: path.clone(), source }),
     }
 }
 
@@ -98,10 +93,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("rbitcoin-dirlock-{n}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -118,10 +110,7 @@ mod tests {
             NodeError::Locked(ref p) => assert_eq!(*p, dir, "locked {p:?}"),
             other => panic!("expected Locked, got {other}"),
         }
-        assert!(
-            format!("{err}").contains("Cannot obtain a lock on directory"),
-            "{err}"
-        );
+        assert!(format!("{err}").contains("Cannot obtain a lock on directory"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -130,10 +119,7 @@ mod tests {
         let dir = tmp();
         let cfg = NodeConfig::default().with_datadir(&dir).with_tiny_heads();
         let _held = lock_node_dirs(&cfg).expect("lock");
-        assert!(
-            !dir.join("blocks").exists(),
-            "rbitcoin has no Core blocks/ product"
-        );
+        assert!(!dir.join("blocks").exists(), "rbitcoin has no Core blocks/ product");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

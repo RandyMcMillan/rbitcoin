@@ -28,22 +28,14 @@ pub struct ThinTweakRangeLimits {
 
 impl Default for ThinTweakRangeLimits {
     fn default() -> Self {
-        Self {
-            max_heights: 128,
-            max_eligible: 16384,
-            cut_through: false,
-        }
+        Self { max_heights: 128, max_eligible: 16384, cut_through: false }
     }
 }
 
 fn require_thin_body_range(r: Option<(u64, u64)>) -> Result<(u64, u64), StoreError> {
     match r {
-        None => Err(StoreError::Corrupt(
-            "invariant: thin tweak eligible body missing",
-        )),
-        Some((_, 0)) => Err(StoreError::Corrupt(
-            "invariant: thin tweak eligible body empty",
-        )),
+        None => Err(StoreError::Corrupt("invariant: thin tweak eligible body missing")),
+        Some((_, 0)) => Err(StoreError::Corrupt("invariant: thin tweak eligible body empty")),
         Some((off, len)) => Ok((off, len)),
     }
 }
@@ -62,13 +54,7 @@ fn wave_join_is_dense(elig_count: usize, first_id: u64, last_id: u64) -> bool {
 fn thin_join_txids_and_loc(
     store: &Store,
     elig_fks: &[Fk],
-) -> Result<
-    (
-        Vec<Option<[u8; 32]>>,
-        Vec<Option<rbitcoin_store::CreateLocPair>>,
-    ),
-    StoreError,
-> {
+) -> Result<(Vec<Option<[u8; 32]>>, Vec<Option<rbitcoin_store::CreateLocPair>>), StoreError> {
     let Some(first_id) = elig_fks.first().and_then(|f| f.get()) else {
         return Err(StoreError::InvalidFk);
     };
@@ -81,9 +67,7 @@ fn thin_join_txids_and_loc(
         let all_loc = store.tx_create_loc_range_batch(&span_fks)?;
         let n = (last_id - first_id + 1) as usize;
         if all_txids.len() != n || all_loc.len() != n {
-            return Err(StoreError::Corrupt(
-                "invariant: thin tweak dense join length mismatch",
-            ));
+            return Err(StoreError::Corrupt("invariant: thin tweak dense join length mismatch"));
         }
         let mut txids = Vec::with_capacity(elig_fks.len());
         let mut loc = Vec::with_capacity(elig_fks.len());
@@ -151,11 +135,7 @@ fn thin_tweak_height_plans(
             break;
         }
         elig_total = elig_total.saturating_add(add);
-        plans.push(HeightPlan {
-            height: meta[i].0,
-            first_id: meta[i].1,
-            elig,
-        });
+        plans.push(HeightPlan { height: meta[i].0, first_id: meta[i].1, elig });
     }
     Ok(plans)
 }
@@ -169,8 +149,7 @@ impl Query {
     ///
     /// Does **not** gate Electrum: naive walk remains when off / hole.
     pub fn set_sptweaks_enabled(&self, on: bool, origin: Height) -> Result<(), QueryError> {
-        self.sptweaks_origin
-            .store(origin.0, AtomicOrdering::Release);
+        self.sptweaks_origin.store(origin.0, AtomicOrdering::Release);
         if on {
             self.ensure_sp_tweaks(origin)?;
         }
@@ -182,8 +161,7 @@ impl Query {
         let mut g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
             *g = Some(SpTweaksTable::open_or_create(self.store.path(), origin)?);
-            self.sptweaks_origin
-                .store(origin.0, AtomicOrdering::Release);
+            self.sptweaks_origin.store(origin.0, AtomicOrdering::Release);
         }
         Ok(())
     }
@@ -221,9 +199,7 @@ impl Query {
         match self.store.confirmed.get(height)? {
             None => return Ok(()),
             Some(fk) if fk != header_fk => {
-                return Err(StoreError::Corrupt(
-                    "sp_tweaks put header is not confirmed tip",
-                ));
+                return Err(StoreError::Corrupt("sp_tweaks put header is not confirmed tip"));
             }
             Some(_) => {}
         }
@@ -254,9 +230,7 @@ impl Query {
             match self.store.confirmed.get(*height)? {
                 None => return Ok(()),
                 Some(fk) if fk != *header_fk => {
-                    return Err(StoreError::Corrupt(
-                        "sp_tweaks put header is not confirmed tip",
-                    ));
+                    return Err(StoreError::Corrupt("sp_tweaks put header is not confirmed tip"));
                 }
                 Some(_) => {}
             }
@@ -332,10 +306,8 @@ impl Query {
             }
         }
 
-        let mut out_rows: Vec<Vec<ThinTweakRow>> = plans
-            .iter()
-            .map(|p| Vec::with_capacity(p.elig.len()))
-            .collect();
+        let mut out_rows: Vec<Vec<ThinTweakRow>> =
+            plans.iter().map(|p| Vec::with_capacity(p.elig.len())).collect();
 
         let loc_pairs: Vec<Option<rbitcoin_store::CreateLocPair>> = if elig_fks.is_empty() {
             Vec::new()
@@ -350,35 +322,27 @@ impl Query {
             }
             let span_len = span_end - span_off;
             let mut span_buf = Vec::new();
-            self.store
-                .txs
-                .with_body_span_into(span_off, span_len, &mut span_buf, |raw| {
-                    for (i, p) in loc.iter().enumerate() {
-                        let pair = p.as_ref().ok_or(StoreError::Corrupt(
-                            "invariant: thin tweak eligible loc missing",
-                        ))?;
-                        let (off, len) = pair.txout;
-                        let rel = (off - span_off) as usize;
-                        let sl = raw.get(rel..rel.saturating_add(len as usize)).ok_or(
-                            StoreError::Corrupt(
-                                "invariant: thin tweak eligible body span truncated",
-                            ),
-                        )?;
-                        let Some(txid) = txids.get(i).copied().flatten() else {
-                            return Err(StoreError::Corrupt(
-                                "invariant: thin tweak eligible txid missing",
-                            ));
-                        };
-                        let (pi, ei) = tag[i];
-                        let p2tr = self.store.txs.packed_p2tr_from_raw(sl, pair.n_out)?;
-                        out_rows[pi].push(ThinTweakRow {
-                            txid,
-                            tweak: plans[pi].elig[ei].1,
-                            p2tr,
-                        });
-                    }
-                    Ok(())
-                })?;
+            self.store.txs.with_body_span_into(span_off, span_len, &mut span_buf, |raw| {
+                for (i, p) in loc.iter().enumerate() {
+                    let pair = p
+                        .as_ref()
+                        .ok_or(StoreError::Corrupt("invariant: thin tweak eligible loc missing"))?;
+                    let (off, len) = pair.txout;
+                    let rel = (off - span_off) as usize;
+                    let sl = raw.get(rel..rel.saturating_add(len as usize)).ok_or(
+                        StoreError::Corrupt("invariant: thin tweak eligible body span truncated"),
+                    )?;
+                    let Some(txid) = txids.get(i).copied().flatten() else {
+                        return Err(StoreError::Corrupt(
+                            "invariant: thin tweak eligible txid missing",
+                        ));
+                    };
+                    let (pi, ei) = tag[i];
+                    let p2tr = self.store.txs.packed_p2tr_from_raw(sl, pair.n_out)?;
+                    out_rows[pi].push(ThinTweakRow { txid, tweak: plans[pi].elig[ei].1, p2tr });
+                }
+                Ok(())
+            })?;
             self.note_thin_tweak_body_bytes(span_len);
             loc
         };
@@ -386,9 +350,7 @@ impl Query {
         if limits.cut_through && !elig_fks.is_empty() {
             let n_rows: usize = out_rows.iter().map(Vec::len).sum();
             if n_rows != elig_fks.len() {
-                return Err(StoreError::Corrupt(
-                    "invariant: thin cut_through row/fk count",
-                ));
+                return Err(StoreError::Corrupt("invariant: thin cut_through row/fk count"));
             }
             if loc_pairs.len() != elig_fks.len() {
                 return Err(StoreError::Corrupt("invariant: spent_range_batch length"));
@@ -401,9 +363,7 @@ impl Query {
                     vouts.clear();
                     vouts.extend(rows[r].p2tr.iter().map(|p| p.0));
                     let spent = loc_pairs[i].as_ref().map(|p| p.spent);
-                    let live = self
-                        .store
-                        .unspent_create_vouts(elig_fks[i], &vouts, spent)?;
+                    let live = self.store.unspent_create_vouts(elig_fks[i], &vouts, spent)?;
                     i += 1;
                     rbitcoin_store::keep_unspent_vout_subsequence(&mut rows[r].p2tr, &live, |p| {
                         p.0
@@ -422,11 +382,7 @@ impl Query {
             }
         }
 
-        Ok(plans
-            .into_iter()
-            .zip(out_rows)
-            .map(|(p, rows)| (p.height, rows))
-            .collect())
+        Ok(plans.into_iter().zip(out_rows).map(|(p, rows)| (p.height, rows)).collect())
     }
 }
 
@@ -485,13 +441,8 @@ mod tests {
                 }],
             )
             .unwrap();
-        let err = q
-            .put_sp_tweaks_block(Height(0), Fk(fk0.0.wrapping_add(1)), &[None])
-            .unwrap_err();
-        assert!(
-            format!("{err}").contains("sp_tweaks put header is not confirmed tip"),
-            "{err}"
-        );
+        let err = q.put_sp_tweaks_block(Height(0), Fk(fk0.0.wrapping_add(1)), &[None]).unwrap_err();
+        assert!(format!("{err}").contains("sp_tweaks put header is not confirmed tip"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -626,9 +577,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let err = q
-            .put_sp_tweaks_block(Height(0), Fk(99), &[None])
-            .unwrap_err();
+        let err = q.put_sp_tweaks_block(Height(0), Fk(99), &[None]).unwrap_err();
         assert!(
             matches!(err, QueryError::Corrupt(m) if m.contains("not confirmed tip")),
             "{err:?}"
@@ -693,18 +642,13 @@ mod tests {
         tw_a[0] = 0x02;
         let mut tw_b = [0x03; 33];
         tw_b[0] = 0x03;
-        q.put_sp_tweaks_block(Height(1), header_fk, &[Some(tw_a), None, Some(tw_b)])
-            .unwrap();
+        q.put_sp_tweaks_block(Height(1), header_fk, &[Some(tw_a), None, Some(tw_b)]).unwrap();
 
         let fks = q.block_tx_fks(Height(1)).unwrap();
         let elig_a = q.store().tx_inwit_range(fks[0]).unwrap();
         let fat = q.store().tx_inwit_range(fks[1]).unwrap();
         let elig_b = q.store().tx_inwit_range(fks[2]).unwrap();
-        assert!(
-            fat.1 > 8_000,
-            "fat ineligible inwit row too small: {}",
-            fat.1
-        );
+        assert!(fat.1 > 8_000, "fat ineligible inwit row too small: {}", fat.1);
         let elig_sum = elig_a.1.saturating_add(elig_b.1);
         assert!(
             fat.1 > elig_sum.saturating_mul(2),
@@ -728,11 +672,7 @@ mod tests {
             "thin serve must not read fat ineligible body (read={read} elig={elig_sum} fat={})",
             fat.1
         );
-        assert!(
-            read < fat.1,
-            "read {read} must be smaller than the skipped fat row {}",
-            fat.1
-        );
+        assert!(read < fat.1, "read {read} must be smaller than the skipped fat row {}", fat.1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -831,16 +771,11 @@ mod tests {
         tw_a[0] = 0x02;
         let mut tw_b = [0x03; 33];
         tw_b[0] = 0x03;
-        q.put_sp_tweaks_block(Height(1), header_fk, &[Some(tw_a), None, Some(tw_b)])
-            .unwrap();
+        q.put_sp_tweaks_block(Height(1), header_fk, &[Some(tw_a), None, Some(tw_b)]).unwrap();
 
         let fks = q.block_tx_fks(Height(1)).unwrap();
         let mid_txout = q.store().txs.body_range(fks[1]).unwrap();
-        assert!(
-            mid_txout.1 >= 4096,
-            "ineligible txout too small to observe span: {}",
-            mid_txout.1
-        );
+        assert!(mid_txout.1 >= 4096, "ineligible txout too small to observe span: {}", mid_txout.1);
         let elig_txout = q
             .store()
             .txs
@@ -941,9 +876,7 @@ mod tests {
         q.put_sp_tweaks_block(Height(2), fk2, &[Some(tw2)]).unwrap();
 
         // Contiguous 0..=2: height 0 empty eligible, 1 and 2 one each.
-        let batch = q
-            .load_thin_tweaks_range(Height(0), ThinTweakRangeLimits::default())
-            .unwrap();
+        let batch = q.load_thin_tweaks_range(Height(0), ThinTweakRangeLimits::default()).unwrap();
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].0, Height(0));
         assert!(batch[0].1.is_empty());
@@ -1005,9 +938,7 @@ mod tests {
             .load_thin_tweaks_range(Height(3), ThinTweakRangeLimits::default())
             .unwrap()
             .is_empty());
-        let only2 = q
-            .load_thin_tweaks_range(Height(2), ThinTweakRangeLimits::default())
-            .unwrap();
+        let only2 = q.load_thin_tweaks_range(Height(2), ThinTweakRangeLimits::default()).unwrap();
         assert_eq!(only2.len(), 1);
         assert_eq!(only2[0].0, Height(2));
 
@@ -1090,9 +1021,7 @@ mod tests {
         q.put_sp_tweaks_block(Height(1), fk1, &[Some(tw)]).unwrap();
         let elig_fk = q.block_tx_fks(Height(1)).unwrap()[0];
 
-        let full = q
-            .load_thin_tweaks_range(Height(1), ThinTweakRangeLimits::default())
-            .unwrap();
+        let full = q.load_thin_tweaks_range(Height(1), ThinTweakRangeLimits::default()).unwrap();
         assert_eq!(full[0].1[0].p2tr.len(), 2);
 
         let h2 = header(2, fk1, Some(h1.hash));
@@ -1127,10 +1056,7 @@ mod tests {
         let kept = q
             .load_thin_tweaks_range(
                 Height(1),
-                ThinTweakRangeLimits {
-                    cut_through: true,
-                    ..ThinTweakRangeLimits::default()
-                },
+                ThinTweakRangeLimits { cut_through: true, ..ThinTweakRangeLimits::default() },
             )
             .unwrap();
         assert_eq!(kept[0].1.len(), 1);
@@ -1140,10 +1066,7 @@ mod tests {
         let hist = q
             .load_thin_tweaks_range(
                 Height(1),
-                ThinTweakRangeLimits {
-                    cut_through: false,
-                    ..ThinTweakRangeLimits::default()
-                },
+                ThinTweakRangeLimits { cut_through: false, ..ThinTweakRangeLimits::default() },
             )
             .unwrap();
         assert_eq!(hist[0].1[0].p2tr.len(), 2);
@@ -1181,10 +1104,7 @@ mod tests {
         let gone = q
             .load_thin_tweaks_range(
                 Height(1),
-                ThinTweakRangeLimits {
-                    cut_through: true,
-                    ..ThinTweakRangeLimits::default()
-                },
+                ThinTweakRangeLimits { cut_through: true, ..ThinTweakRangeLimits::default() },
             )
             .unwrap();
         assert!(gone[0].1.is_empty(), "all-spent eligible tx is omitted");

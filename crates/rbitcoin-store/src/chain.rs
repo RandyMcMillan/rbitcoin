@@ -12,15 +12,11 @@ pub struct ConfirmedTable {
 
 impl ConfirmedTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            arr: ArrayTable::create(dir.join("confirmed.body"), TableKind::Confirmed)?,
-        })
+        Ok(Self { arr: ArrayTable::create(dir.join("confirmed.body"), TableKind::Confirmed)? })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            arr: ArrayTable::open(dir.join("confirmed.body"), TableKind::Confirmed)?,
-        })
+        Ok(Self { arr: ArrayTable::open(dir.join("confirmed.body"), TableKind::Confirmed)? })
     }
 
     pub fn l2_resident_bytes(&self) -> u64 {
@@ -157,9 +153,7 @@ impl StrongTxTable {
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let bits = crate::file::TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
-        let body = bits
-            .logical_len()
-            .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
+        let body = bits.logical_len().saturating_sub(crate::file::FILE_HEADER_LEN as u64);
         let n_bits = body.saturating_mul(8);
         let mut v = vec![0u8; body as usize];
         if body > 0 {
@@ -218,8 +212,7 @@ impl StrongTxTable {
         drop(guard);
         if need_bytes > cur_bytes {
             let zeros = vec![0u8; (need_bytes - cur_bytes) as usize];
-            self.bits
-                .write_at(crate::file::FILE_HEADER_LEN as u64 + cur_bytes, &zeros)?;
+            self.bits.write_at(crate::file::FILE_HEADER_LEN as u64 + cur_bytes, &zeros)?;
         }
         self.n_bits.store(need_bits, Ordering::Release);
         Ok(())
@@ -298,11 +291,7 @@ impl StrongTxTable {
     ) -> Result<(), StoreError> {
         let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
         if header_fk.is_null() || count == 0 {
-            return if count == 0 {
-                Ok(())
-            } else {
-                Err(StoreError::InvalidFk)
-            };
+            return if count == 0 { Ok(()) } else { Err(StoreError::InvalidFk) };
         }
         let start = id - 1;
         let end = start + u64::from(count);
@@ -355,8 +344,7 @@ impl StrongTxTable {
                 let n = (full_end - full_start) as usize;
                 let fill = if on { 0xffu8 } else { 0u8 };
                 let blob = vec![fill; n];
-                self.bits
-                    .write_at(crate::file::FILE_HEADER_LEN as u64 + full_start, &blob)?;
+                self.bits.write_at(crate::file::FILE_HEADER_LEN as u64 + full_start, &blob)?;
                 bit = full_end * 8;
             }
         }
@@ -454,10 +442,7 @@ impl StrongTxTable {
             let byte_off = bit / 8;
             let nbytes = end_bit.div_ceil(8).saturating_sub(byte_off);
             let take = (nbytes as usize).min(CHUNK);
-            self.bits.read_at(
-                crate::file::FILE_HEADER_LEN as u64 + byte_off,
-                &mut buf[..take],
-            )?;
+            self.bits.read_at(crate::file::FILE_HEADER_LEN as u64 + byte_off, &mut buf[..take])?;
             let base_bit = byte_off * 8;
             for (i, &b) in buf[..take].iter().enumerate() {
                 if b == 0 {
@@ -494,8 +479,7 @@ impl StrongTxTable {
             return Ok(());
         }
         drop(guard);
-        self.bits
-            .read_at(crate::file::FILE_HEADER_LEN as u64 + byte_off, dst)
+        self.bits.read_at(crate::file::FILE_HEADER_LEN as u64 + byte_off, dst)
     }
 
     /// True when every fk in `[first, first+count)` is strong.
@@ -511,8 +495,7 @@ impl StrongTxTable {
     /// Bytes written by the last [`Self::flush_dirty`].
     #[cfg(test)]
     pub(crate) fn last_flush_write_bytes(&self) -> u64 {
-        self.last_flush_bytes
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.last_flush_bytes.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Persist dirty L2 bit image. Prefers append-only byte suffix writes.
@@ -530,19 +513,14 @@ impl StrongTxTable {
         let disk = self.disk_bytes.load(Ordering::Acquire);
         let dirty_lo = self.dirty_lo_bit.load(Ordering::Acquire);
 
-        let dirty_byte = if dirty_lo == u64::MAX {
-            body_len
-        } else {
-            dirty_lo / 8
-        };
+        let dirty_byte = if dirty_lo == u64::MAX { body_len } else { dirty_lo / 8 };
 
         if body_len > disk && dirty_byte >= disk {
             let suffix = v[disk as usize..].to_vec();
             drop(guard);
             let n = suffix.len() as u64;
             if !suffix.is_empty() {
-                self.bits
-                    .write_at(crate::file::FILE_HEADER_LEN as u64 + disk, &suffix)?;
+                self.bits.write_at(crate::file::FILE_HEADER_LEN as u64 + disk, &suffix)?;
             }
             self.disk_bytes.store(body_len, Ordering::Release);
             if crate::array_table::dirty_epoch_try_clean(&self.dirty_epoch, e0) {
@@ -557,8 +535,7 @@ impl StrongTxTable {
         drop(guard);
         let n = suffix.len() as u64;
         if !suffix.is_empty() {
-            self.bits
-                .write_at(crate::file::FILE_HEADER_LEN as u64 + from, &suffix)?;
+            self.bits.write_at(crate::file::FILE_HEADER_LEN as u64 + from, &suffix)?;
         }
         if body_len != disk {
             let logical = crate::file::FILE_HEADER_LEN as u64 + body_len;
@@ -591,10 +568,7 @@ mod strong_tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-strong-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -718,10 +692,7 @@ mod strong_tests {
         }
         let t = StrongTxTable::open(&dir).unwrap();
         assert!(t.is_strong(Fk(1)).unwrap());
-        assert!(
-            !t.is_strong(Fk(9)).unwrap(),
-            "unflushed strong must not survive"
-        );
+        assert!(!t.is_strong(Fk(9)).unwrap(), "unflushed strong must not survive");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -734,10 +705,7 @@ mod strong_tests {
         t.set_strong_range(Fk(1), 80_000, Fk(1)).unwrap();
         t.flush_dirty().unwrap();
         let first = t.last_flush_write_bytes();
-        assert!(
-            first >= 10_000,
-            "first flush should persist the full image, got {first}"
-        );
+        assert!(first >= 10_000, "first flush should persist the full image, got {first}");
 
         // Flip only the last allocated bit — dirty_lo is near the end.
         t.set_unstrong(Fk(80_000)).unwrap();
@@ -814,22 +782,10 @@ mod strong_tests {
         // past allocated → no-op
         t.set_unstrong(Fk(9999)).unwrap();
         t.set_unstrong_range(Fk(9000), 10).unwrap();
-        assert!(matches!(
-            t.set_strong(Fk::NULL, Fk(1)),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            t.set_strong(Fk(1), Fk::NULL),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            t.set_strong_range(Fk::NULL, 1, Fk(1)),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            t.set_strong_range(Fk(1), 1, Fk::NULL),
-            Err(StoreError::InvalidFk)
-        ));
+        assert!(matches!(t.set_strong(Fk::NULL, Fk(1)), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.set_strong(Fk(1), Fk::NULL), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.set_strong_range(Fk::NULL, 1, Fk(1)), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.set_strong_range(Fk(1), 1, Fk::NULL), Err(StoreError::InvalidFk)));
         assert!(matches!(t.is_strong(Fk::NULL), Err(StoreError::InvalidFk)));
         t.flush_async().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -844,10 +800,7 @@ mod chain_table_tests {
         let p = std::env::temp_dir().join(format!(
             "rbitcoin-chain-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -865,31 +818,18 @@ mod chain_table_tests {
         assert_eq!(c.tip_height(), Some(Height(1)));
         assert_eq!(c.get(Height(0)).unwrap(), Some(Fk(1)));
         c.set_many(&[]).unwrap();
-        c.set_many(&[(Height(2), Fk(3)), (Height(3), Fk(4))])
-            .unwrap();
+        c.set_many(&[(Height(2), Fk(3)), (Height(3), Fk(4))]).unwrap();
         assert_eq!(c.tip_height(), Some(Height(3)));
-        assert!(matches!(
-            c.set(Height(4), Fk::NULL),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            c.set_many(&[(Height(5), Fk::NULL)]),
-            Err(StoreError::InvalidFk)
-        ));
+        assert!(matches!(c.set(Height(4), Fk::NULL), Err(StoreError::InvalidFk)));
+        assert!(matches!(c.set_many(&[(Height(5), Fk::NULL)]), Err(StoreError::InvalidFk)));
         c.disconnect_tip(Height(3)).unwrap();
         assert_eq!(c.tip_height(), Some(Height(2)));
-        assert!(matches!(
-            c.disconnect_tip(Height(0)),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(c.disconnect_tip(Height(0)), Err(StoreError::Corrupt(_))));
         c.disconnect_tip(Height(2)).unwrap();
         c.disconnect_tip(Height(1)).unwrap();
         c.disconnect_tip(Height(0)).unwrap();
         assert!(c.tip_height().is_none());
-        assert!(matches!(
-            c.disconnect_tip(Height(0)),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(c.disconnect_tip(Height(0)), Err(StoreError::Corrupt(_))));
         c.flush().unwrap();
         c.flush_async().unwrap();
 
@@ -898,56 +838,28 @@ mod chain_table_tests {
         assert!(ht.get_range(Fk(1)).unwrap().is_none());
         ht.put_range(Fk(1), Fk(100), 3).unwrap();
         assert_eq!(ht.get_range(Fk(1)).unwrap(), Some((Fk(100), 3)));
-        assert_eq!(
-            ht.get_list(Fk(1)).unwrap().unwrap(),
-            vec![Fk(100), Fk(101), Fk(102)]
-        );
+        assert_eq!(ht.get_list(Fk(1)).unwrap().unwrap(), vec![Fk(100), Fk(101), Fk(102)]);
         assert!(ht.has_body(Fk(1)).unwrap());
         assert!(!ht.has_body(Fk(2)).unwrap());
         ht.put_list(Fk(2), &[Fk(200), Fk(201)]).unwrap();
-        assert!(matches!(
-            ht.put_list(Fk(3), &[]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(ht.put_list(Fk(3), &[]), Err(StoreError::Corrupt(_))));
         // Non-contiguous triggers debug_assert in debug builds; only empty is a
         // stable Err path under RUSTFLAGS=-Dwarnings debug tests.
-        assert!(matches!(
-            ht.put_range(Fk::NULL, Fk(1), 1),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            ht.put_range(Fk(3), Fk::NULL, 1),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            ht.put_range(Fk(3), Fk(1), 0),
-            Err(StoreError::InvalidFk)
-        ));
+        assert!(matches!(ht.put_range(Fk::NULL, Fk(1), 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(ht.put_range(Fk(3), Fk::NULL, 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(ht.put_range(Fk(3), Fk(1), 0), Err(StoreError::InvalidFk)));
         ht.put_lists_batch(&[]).unwrap();
-        ht.put_lists_batch(&[(Fk(3), &[Fk(300)] as &[_]), (Fk(4), &[Fk(400), Fk(401)])])
-            .unwrap();
-        assert!(matches!(
-            ht.put_lists_batch(&[(Fk(5), &[] as &[_])]),
-            Err(StoreError::Corrupt(_))
-        ));
+        ht.put_lists_batch(&[(Fk(3), &[Fk(300)] as &[_]), (Fk(4), &[Fk(400), Fk(401)])]).unwrap();
+        assert!(matches!(ht.put_lists_batch(&[(Fk(5), &[] as &[_])]), Err(StoreError::Corrupt(_))));
         ht.put_ranges_batch(&[]).unwrap();
         ht.put_ranges_batch(&[(Fk(5), Fk(500), 2)]).unwrap();
-        assert!(matches!(
-            ht.put_ranges_batch(&[(Fk::NULL, Fk(1), 1)]),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(
-            ht.put_ranges_batch(&[(Fk(6), Fk::NULL, 1)]),
-            Err(StoreError::InvalidFk)
-        ));
+        assert!(matches!(ht.put_ranges_batch(&[(Fk::NULL, Fk(1), 1)]), Err(StoreError::InvalidFk)));
+        assert!(matches!(ht.put_ranges_batch(&[(Fk(6), Fk::NULL, 1)]), Err(StoreError::InvalidFk)));
         assert_eq!(ht.count_bodies().unwrap(), 5);
         assert!(matches!(ht.get_range(Fk::NULL), Err(StoreError::InvalidFk)));
 
         // clear_body: drop association without freeing tx rows (merkle soft-reget path).
-        assert!(matches!(
-            ht.clear_body(Fk::NULL),
-            Err(StoreError::InvalidFk)
-        ));
+        assert!(matches!(ht.clear_body(Fk::NULL), Err(StoreError::InvalidFk)));
         assert!(!ht.clear_body(Fk(99)).unwrap(), "no body → false");
         assert!(ht.clear_body(Fk(1)).unwrap(), "had body → true");
         assert!(!ht.has_body(Fk(1)).unwrap());
@@ -959,10 +871,7 @@ mod chain_table_tests {
         drop(ht);
         let ht = HeaderTxsTable::open(&dir).unwrap();
         assert_eq!(ht.get_range(Fk(5)).unwrap(), Some((Fk(500), 2)));
-        assert!(
-            !ht.has_body(Fk(1)).unwrap(),
-            "clear_body durable after reopen"
-        );
+        assert!(!ht.has_body(Fk(1)).unwrap(), "clear_body durable after reopen");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1010,9 +919,7 @@ impl HeaderTxsTable {
     }
 
     pub fn l2_resident_bytes(&self) -> u64 {
-        self.first
-            .l2_resident_bytes()
-            .saturating_add(self.count.l2_resident_bytes())
+        self.first.l2_resident_bytes().saturating_add(self.count.l2_resident_bytes())
     }
 
     /// Store a contiguous range. `tx_fks` must be non-empty and contiguous.
@@ -1021,15 +928,10 @@ impl HeaderTxsTable {
             return Err(StoreError::Corrupt("empty header tx list"));
         }
         debug_assert!(
-            tx_fks
-                .windows(2)
-                .all(|w| w[1].0 == w[0].0.saturating_add(1)),
+            tx_fks.windows(2).all(|w| w[1].0 == w[0].0.saturating_add(1)),
             "header_txs must be contiguous"
         );
-        if !tx_fks
-            .windows(2)
-            .all(|w| w[1].0 == w[0].0.saturating_add(1))
-        {
+        if !tx_fks.windows(2).all(|w| w[1].0 == w[0].0.saturating_add(1)) {
             return Err(StoreError::Corrupt("header_txs not contiguous"));
         }
         self.put_range(header_fk, tx_fks[0], tx_fks.len() as u32)
@@ -1056,10 +958,7 @@ impl HeaderTxsTable {
             if tx_fks.is_empty() {
                 return Err(StoreError::Corrupt("empty header tx list"));
             }
-            if !tx_fks
-                .windows(2)
-                .all(|w| w[1].0 == w[0].0.saturating_add(1))
-            {
+            if !tx_fks.windows(2).all(|w| w[1].0 == w[0].0.saturating_add(1)) {
                 return Err(StoreError::Corrupt("header_txs not contiguous"));
             }
             let id = header_fk.get().ok_or(StoreError::InvalidFk)?;

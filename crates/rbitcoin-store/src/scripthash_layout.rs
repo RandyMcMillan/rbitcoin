@@ -114,10 +114,7 @@ impl ShHeadValue {
     }
 
     pub fn paged(first_page: u64, last_page: u64) -> Self {
-        ShHeadValue::Paged {
-            first_page,
-            last_page,
-        }
+        ShHeadValue::Paged { first_page, last_page }
     }
 
     pub fn extent(last_page: u64) -> Self {
@@ -255,9 +252,7 @@ mod tests {
         assert!(slab.is_slab());
         assert!(!slab.is_paged());
 
-        assert!(unpack8(pack8(&ShHeadValue::Empty).unwrap())
-            .unwrap()
-            .is_empty());
+        assert!(unpack8(pack8(&ShHeadValue::Empty).unwrap()).unwrap().is_empty());
     }
 
     #[test]
@@ -309,14 +304,8 @@ mod tests {
             ShHeadValue::Extent { last_page: 8192 } => {}
             other => panic!("{other:?}"),
         }
-        assert!(matches!(
-            pack8(&ShHeadValue::extent(0)),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            unpack8(3u64 << SH8_MODE_SHIFT),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(pack8(&ShHeadValue::extent(0)), Err(StoreError::Corrupt(_))));
+        assert!(matches!(unpack8(3u64 << SH8_MODE_SHIFT), Err(StoreError::Corrupt(_))));
     }
 
     #[test]
@@ -337,10 +326,7 @@ mod tests {
         assert!(!one.is_paged());
         let two = ShHeadValue::slab(0, 2, 4096);
         assert_eq!(two.used(), 2);
-        let zero_inline = ShHeadValue::Inline {
-            entries: [Fk::NULL; SH_INLINE_CAP],
-            used: 0,
-        };
+        let zero_inline = ShHeadValue::Inline { entries: [Fk::NULL; SH_INLINE_CAP], used: 0 };
         assert!(matches!(pack8(&zero_inline), Err(StoreError::Corrupt(_))));
         let paged = ShHeadValue::paged(4096, 8192);
         assert_eq!(paged.used(), u32::MAX);
@@ -357,10 +343,7 @@ mod tests {
     #[test]
     fn unpack8_bad_mode_errors() {
         let slab_used_inline = (1u64 << SH8_MODE_SHIFT) | (4096 & SH8_OFF_MASK);
-        assert!(matches!(
-            unpack8(slab_used_inline),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(unpack8(slab_used_inline), Err(StoreError::Corrupt(_))));
         match unpack8(2u64 << SH8_MODE_SHIFT) {
             Err(StoreError::Corrupt(m)) => assert_eq!(m, INDEX_REFUSE_PAGED_SH),
             other => panic!("mode 10 must be INDEX_REFUSE_PAGED_SH, got {other:?}"),

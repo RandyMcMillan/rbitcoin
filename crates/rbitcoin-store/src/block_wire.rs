@@ -184,19 +184,13 @@ mod tests {
     #[test]
     fn coinbase_and_multi_input() {
         assert_eq!(block_wire_input_count(&block(&[coinbase_tx(1)])), 1);
-        assert_eq!(
-            block_wire_input_count(&block(&[coinbase_tx(1), coinbase_tx(3)])),
-            4
-        );
+        assert_eq!(block_wire_input_count(&block(&[coinbase_tx(1), coinbase_tx(3)])), 4);
     }
 
     #[test]
     fn witness_flag_counts_vin_not_stack() {
         assert_eq!(block_wire_input_count(&block(&[witness_tx(2)])), 2);
-        assert_eq!(
-            block_wire_input_count(&block(&[coinbase_tx(1), witness_tx(2)])),
-            3
-        );
+        assert_eq!(block_wire_input_count(&block(&[coinbase_tx(1), witness_tx(2)])), 3);
     }
 
     #[test]

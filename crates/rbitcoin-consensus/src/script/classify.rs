@@ -123,17 +123,12 @@ mod tests {
         });
         assert_eq!(classify(p2sh.as_script()), ScriptKind::P2sh);
 
-        assert!(is_anyone_can_spend(
-            ScriptBuf::from_bytes(vec![0x51]).as_script()
-        ));
+        assert!(is_anyone_can_spend(ScriptBuf::from_bytes(vec![0x51]).as_script()));
         // Empty is bare consensus-eval, not anyone-can-spend (Core parity).
         assert!(!is_anyone_can_spend(ScriptBuf::new().as_script()));
         assert_eq!(classify(ScriptBuf::new().as_script()), ScriptKind::Bare);
         // OP_2..OP_15 bare branch (not ACS).
-        assert_eq!(
-            classify(ScriptBuf::from_bytes(vec![0x52]).as_script()),
-            ScriptKind::Bare
-        );
+        assert_eq!(classify(ScriptBuf::from_bytes(vec![0x52]).as_script()), ScriptKind::Bare);
 
         // BIP141 witness programs.
         let mut v16 = vec![0x60u8, 0x14];

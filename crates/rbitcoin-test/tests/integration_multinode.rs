@@ -23,14 +23,9 @@ use std::time::Duration;
 
 async fn start_node(dir: &TempDir) -> P2PNode {
     let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
-    P2PNode::start(
-        "127.0.0.1:0".parse().unwrap(),
-        q,
-        ChainParams::regtest(),
-        Milestone::NONE,
-    )
-    .await
-    .expect("listen")
+    P2PNode::start("127.0.0.1:0".parse().unwrap(), q, ChainParams::regtest(), Milestone::NONE)
+        .await
+        .expect("listen")
 }
 
 async fn start_node_inbound(dir: &TempDir, max_inbound: usize) -> P2PNode {
@@ -56,27 +51,15 @@ fn open_padded_query(dir: &TempDir) -> Query {
     let genesis = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
     let last = params.coinbase_maturity() + 1;
-    pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        last,
-    );
+    pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, last);
     q
 }
 
 async fn start_padded(dir: &TempDir) -> P2PNode {
     let q = open_padded_query(dir);
-    P2PNode::start(
-        "127.0.0.1:0".parse().unwrap(),
-        q,
-        ChainParams::regtest(),
-        Milestone::NONE,
-    )
-    .await
-    .expect("listen")
+    P2PNode::start("127.0.0.1:0".parse().unwrap(), q, ChainParams::regtest(), Milestone::NONE)
+        .await
+        .expect("listen")
 }
 
 async fn wait_ms_until(
@@ -126,9 +109,7 @@ async fn seed_chain(node: &P2PNode, blocks: u32) {
 
 /// IBD from a single peer (test helper).
 async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
-    node.sync(&[peer], IbdConfig::for_test())
-        .await
-        .expect("ibd sync")
+    node.sync(&[peer], IbdConfig::for_test()).await.expect("ibd sync")
 }
 
 fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
@@ -143,9 +124,7 @@ fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
 /// plus confirm OS threads (overlapping abort under llvm-cov heap-corrupts).
 async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
 }
 
 const RPC_BEARER: &str = "Bearer pass"; // `{datadir}/rpc.token` written by the tests
@@ -211,10 +190,7 @@ async fn electrum_rpc(
         + "\n";
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .await
-        .expect("electrum read");
+    BufReader::new(stream).read_line(&mut line).await.expect("electrum read");
     serde_json::from_str(line.trim())
         .unwrap_or_else(|e| panic!("electrum {method} json: {e} body={line}"))
 }
@@ -231,17 +207,8 @@ async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf);
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let status = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
     (status, body)
 }
 
@@ -261,18 +228,13 @@ async fn two_node_header_and_block_sync() {
         let peer = start_node(&peer_dir).await;
         let n = sync_ibd(&peer, seed.local_addr).await;
         assert!(n >= 1, "downloaded {n}");
-        peer.wait_height(1, Duration::from_secs(5))
-            .await
-            .expect("tip");
+        peer.wait_height(1, Duration::from_secs(5)).await.expect("tip");
 
         // IBD confirm writes Class C tip; RAM BlockCache may stay cold.
         assert_eq!(peer.query.tip_height(), Some(Height(1)));
         assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
         let write = peer.query.confirm_stats().last_write_phases();
-        assert!(
-            write.n_blocks >= 1,
-            "IBD write meter must move on the peer: {write:?}"
-        );
+        assert!(write.n_blocks >= 1, "IBD write meter must move on the peer: {write:?}");
 
         seed.shutdown().await;
         peer.shutdown().await;
@@ -303,10 +265,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
 
         let mut book = AddrMan::new();
         for i in 0..5_000u32 {
-            book.add(std::net::SocketAddr::from((
-                [(i >> 8) as u8, (i & 0xff) as u8, 1, 1],
-                8333,
-            )));
+            book.add(std::net::SocketAddr::from(([(i >> 8) as u8, (i & 0xff) as u8, 1, 1], 8333)));
         }
         seed.peers.set_addrman(Arc::new(Mutex::new(book)));
 
@@ -316,10 +275,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             .await
             .expect("follow_from must return after handshake")
             .expect("follow handshake");
-        assert!(
-            peer.follow_live_count() >= 1,
-            "outbound session must stay live after follow_from"
-        );
+        assert!(peer.follow_live_count() >= 1, "outbound session must stay live after follow_from");
         seed.peers
             .addconnection(dummy.local_addr, PeerConnType::OutboundFullRelay)
             .expect("preferred outbound for stall");
@@ -332,12 +288,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
                         && !p.subver.is_empty()
                 })
             },
-            || {
-                format!(
-                    "seed outbound to dummy must complete (seed={:?})",
-                    seed.peers.snapshot()
-                )
-            },
+            || format!("seed outbound to dummy must complete (seed={:?})", seed.peers.snapshot()),
         )
         .await;
 
@@ -349,16 +300,9 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             .find(|p| p.inbound && !p.subver.is_empty())
             .expect("seed inbound after handshake");
         let ping = inbound.bytesrecv_per_msg.get("ping").copied().unwrap_or(0);
-        assert_eq!(
-            ping, 32,
-            "one 8-byte ping (acct +24), not a second interval ping: {ping}"
-        );
-        let outbound = peer
-            .peers
-            .snapshot()
-            .into_iter()
-            .find(|p| !p.inbound)
-            .expect("outbound session");
+        assert_eq!(ping, 32, "one 8-byte ping (acct +24), not a second interval ping: {ping}");
+        let outbound =
+            peer.peers.snapshot().into_iter().find(|p| !p.inbound).expect("outbound session");
         let pong = outbound.bytesrecv_per_msg.get("pong").copied().unwrap_or(0);
         assert!(pong >= 29, "connect_nodes pong bytes {pong}");
         assert!(
@@ -374,12 +318,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
                     !p.inbound && p.handshake_complete() && p.queue_msg(NetworkMessage::GetAddr)
                 })
             },
-            || {
-                format!(
-                    "follower outbound must take GetAddr (peer={:?})",
-                    peer.peers.snapshot()
-                )
-            },
+            || format!("follower outbound must take GetAddr (peer={:?})", peer.peers.snapshot()),
         )
         .await;
         wait_ms_until(
@@ -389,12 +328,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
                     !p.inbound && p.bytesrecv_per_msg.get("addrv2").copied().unwrap_or(0) > 0
                 })
             },
-            || {
-                format!(
-                    "full-relay GetAddr must return addrv2 (peer={:?})",
-                    peer.peers.snapshot()
-                )
-            },
+            || format!("full-relay GetAddr must return addrv2 (peer={:?})", peer.peers.snapshot()),
         )
         .await;
         let bind = seed
@@ -420,13 +354,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         seed.peers.set_mock_now(now + 40 * 60);
         wait_ms_until(
             3_000,
-            || {
-                !seed
-                    .peers
-                    .snapshot()
-                    .into_iter()
-                    .any(|p| p.inbound && !p.subver.is_empty())
-            },
+            || !seed.peers.snapshot().into_iter().any(|p| p.inbound && !p.subver.is_empty()),
             || {
                 format!(
                     "stalling headers-sync inbound must drop when a preferred outbound exists \
@@ -459,9 +387,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         seed.peers.set_addrman(Arc::new(Mutex::new(one)));
 
         let magic = bitcoin::p2p::Magic::from(bitcoin::Network::Regtest).to_bytes();
-        let mut raw = tokio::net::TcpStream::connect(seed.local_addr)
-            .await
-            .expect("tcp to seed");
+        let mut raw = tokio::net::TcpStream::connect(seed.local_addr).await.expect("tcp to seed");
         raw.write_all(&magic).await.expect("write v1 magic");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let mut saw_connecting = false;
@@ -490,9 +416,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
 
         let seed_addr = seed.local_addr;
         let mut obsolete = rbitcoin_net::V2PlainSession::outbound_bip324(
-            tokio::net::TcpStream::connect(seed_addr)
-                .await
-                .expect("obsolete VERSION dial"),
+            tokio::net::TcpStream::connect(seed_addr).await.expect("obsolete VERSION dial"),
         )
         .await
         .expect("obsolete VERSION BIP324");
@@ -522,9 +446,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         wait_v2_eof(&mut obsolete, "obsolete VERSION must close the peer").await;
 
         let mut pre_verack = rbitcoin_net::V2PlainSession::outbound_bip324(
-            tokio::net::TcpStream::connect(seed_addr)
-                .await
-                .expect("pre-verack ping dial"),
+            tokio::net::TcpStream::connect(seed_addr).await.expect("pre-verack ping dial"),
         )
         .await
         .expect("pre-verack BIP324");
@@ -557,28 +479,15 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             )
             .await
             .expect("write ping prior to verack");
-        wait_v2_eof(
-            &mut pre_verack,
-            "pre-verack ping must close at peertimeout=1",
-        )
-        .await;
+        wait_v2_eof(&mut pre_verack, "pre-verack ping must close at peertimeout=1").await;
 
-        for id in peer
-            .peers
-            .snapshot()
-            .into_iter()
-            .filter(|p| !p.inbound)
-            .map(|p| p.id)
-        {
+        for id in peer.peers.snapshot().into_iter().filter(|p| !p.inbound).map(|p| p.id) {
             peer.peers.disconnect_id(id);
         }
         let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let follow_in = seed
-                .peers
-                .snapshot()
-                .into_iter()
-                .any(|p| p.inbound && !p.subver.is_empty());
+            let follow_in =
+                seed.peers.snapshot().into_iter().any(|p| p.inbound && !p.subver.is_empty());
             if !follow_in {
                 break;
             }
@@ -590,9 +499,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
 
         let t = seed.peers.now_secs();
         seed.peers.set_mock_now(t + 24 * 60 * 60 + 1);
-        peer.peers
-            .addconnection(seed.local_addr, PeerConnType::AddrFetch)
-            .expect("addrfetch dial");
+        peer.peers.addconnection(seed.local_addr, PeerConnType::AddrFetch).expect("addrfetch dial");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let seed_got_getaddr = seed
@@ -623,11 +530,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             .find(|p| p.conn_type == PeerConnType::AddrFetch)
             .expect("AddrFetch session");
         assert_eq!(
-            fetch
-                .bytessent_per_msg
-                .get("getheaders")
-                .copied()
-                .unwrap_or(0),
+            fetch.bytessent_per_msg.get("getheaders").copied().unwrap_or(0),
             0,
             "AddrFetch must not GetHeaders: {:?}",
             fetch.bytessent_per_msg
@@ -686,20 +589,14 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             .await
             .expect("follow_from handshake")
             .expect("follow");
-        assert!(
-            peer.follow_live_count() >= 1,
-            "outbound follow must stay live"
-        );
+        assert!(peer.follow_live_count() >= 1, "outbound follow must stay live");
 
         let h_empty = mine_on(&seed, pad_h + 1);
         peer.wait_tip_hash(h_empty, Duration::from_secs(5))
             .await
             .expect("first tip via headers/inv");
         assert!(
-            peer.peers
-                .snapshot()
-                .into_iter()
-                .any(|p| !p.inbound && p.bip152_hb_to),
+            peer.peers.snapshot().into_iter().any(|p| !p.inbound && p.bip152_hb_to),
             "HB sendcmpct(1) must be decided before the new tip is visible \
              (peer={:?} seed={:?})",
             peer.peers.snapshot(),
@@ -707,12 +604,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         );
         wait_ms_until(
             3_000,
-            || {
-                seed.peers
-                    .snapshot()
-                    .into_iter()
-                    .any(|p| p.inbound && p.bip152_hb_from)
-            },
+            || seed.peers.snapshot().into_iter().any(|p| p.inbound && p.bip152_hb_from),
             || {
                 format!(
                     "seed inbound must see sendcmpct(1) after first tip \
@@ -724,12 +616,8 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         )
         .await;
 
-        let cb1 = seed
-            .query
-            .reconstruct_block_at_height(Height(1))
-            .unwrap()
-            .txdata[0]
-            .compute_txid();
+        let cb1 =
+            seed.query.reconstruct_block_at_height(Height(1)).unwrap().txdata[0].compute_txid();
         let extra = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
         let tip = seed.hub.tip_hash().expect("tip");
         let tip_time = seed.hub.tip_header().expect("tip time").time;
@@ -779,18 +667,10 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             .expect("2-tx compact via getblocktxn");
         assert_eq!(peer.query.tip_height(), Some(Height(pad_h + 2)));
 
-        let cb3 = seed
-            .query
-            .reconstruct_block_at_height(Height(3))
-            .unwrap()
-            .txdata[0]
-            .compute_txid();
-        let cb4 = seed
-            .query
-            .reconstruct_block_at_height(Height(4))
-            .unwrap()
-            .txdata[0]
-            .compute_txid();
+        let cb3 =
+            seed.query.reconstruct_block_at_height(Height(3)).unwrap().txdata[0].compute_txid();
+        let cb4 =
+            seed.query.reconstruct_block_at_height(Height(4)).unwrap().txdata[0].compute_txid();
         let bait = spend_anyone_can_spend(cb3, 0, Amount::from_sat(49_0000_0000));
         let honest_extra = spend_anyone_can_spend(cb4, 0, Amount::from_sat(49_0000_0000));
         let bait_txid = bait.compute_txid();
@@ -938,12 +818,8 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
             .unwrap_or(0);
 
-        let cb2 = seed
-            .query
-            .reconstruct_block_at_height(Height(2))
-            .unwrap()
-            .txdata[0]
-            .compute_txid();
+        let cb2 =
+            seed.query.reconstruct_block_at_height(Height(2)).unwrap().txdata[0].compute_txid();
         let parent = spend_anyone_can_spend(cb2, 0, Amount::from_sat(49_0000_0000));
         let child =
             spend_anyone_can_spend(parent.compute_txid(), 0, Amount::from_sat(48_0000_0000));
@@ -1026,10 +902,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             .find(|p| p.inbound)
             .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
             .unwrap_or(0);
-        assert_eq!(
-            getdata_after_inv, getdata_parked,
-            "parked orphan INV must not GetData"
-        );
+        assert_eq!(getdata_after_inv, getdata_parked, "parked orphan INV must not GetData");
 
         wait_ms_until(
             3_000,
@@ -1072,11 +945,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
 
         use bitcoin::p2p::message_blockdata::GetBlocksMessage;
         use bitcoin::p2p::message_bloom::{BloomFlags, FilterLoad};
-        let genesis = seed
-            .query
-            .reconstruct_block_at_height(Height::GENESIS)
-            .unwrap()
-            .block_hash();
+        let genesis = seed.query.reconstruct_block_at_height(Height::GENESIS).unwrap().block_hash();
         let inv_before = peer
             .peers
             .snapshot()
@@ -1155,12 +1024,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             },
         )
         .await;
-        let bloom = FilterLoad {
-            filter: vec![],
-            hash_funcs: 1,
-            tweak: 0,
-            flags: BloomFlags::None,
-        };
+        let bloom = FilterLoad { filter: vec![], hash_funcs: 1, tweak: 0, flags: BloomFlags::None };
         wait_ms_until(
             3_000,
             || {
@@ -1181,13 +1045,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         .await;
         wait_ms_until(
             3_000,
-            || {
-                !seed
-                    .peers
-                    .snapshot()
-                    .into_iter()
-                    .any(|p| p.inbound && !p.subver.is_empty())
-            },
+            || !seed.peers.snapshot().into_iter().any(|p| p.inbound && !p.subver.is_empty()),
             || {
                 format!(
                     "filterload must disconnect the seeder inbound (seed={:?} peer={:?})",
@@ -1214,10 +1072,7 @@ fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {
     mp.set_relay_enabled(true);
     assert!(node.hub.attach_mempool(mp).is_ok(), "attach mempool once");
     node.hub.set_max_tip_age_secs(u64::MAX);
-    assert!(
-        !node.hub.in_ibd(),
-        "maxtipage must leave IBD so P2P tx accept runs"
-    );
+    assert!(!node.hub.in_ibd(), "maxtipage must leave IBD so P2P tx accept runs");
 }
 
 /// Outbound feeler: VERSION completes, then the session closes (no live follow).
@@ -1293,9 +1148,7 @@ async fn p2p_feeler_completes_and_closes() {
         let dummy_dir = TempDir::new().unwrap();
         let seed = start_node(&seed_dir).await;
         let dummy = start_node(&dummy_dir).await;
-        seed.peers
-            .addconnection(dummy.local_addr, PeerConnType::Feeler)
-            .expect("feeler dial");
+        seed.peers.addconnection(dummy.local_addr, PeerConnType::Feeler).expect("feeler dial");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1317,17 +1170,9 @@ async fn p2p_feeler_completes_and_closes() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         rbitcoin_log::capture_logs(false);
-        assert_eq!(
-            seed.follow_live_count(),
-            0,
-            "feeler must not stay as a follow session"
-        );
+        assert_eq!(seed.follow_live_count(), 0, "feeler must not stay as a follow session");
         assert!(
-            !dummy
-                .peers
-                .snapshot()
-                .into_iter()
-                .any(|p| p.inbound && !p.subver.is_empty()),
+            !dummy.peers.snapshot().into_iter().any(|p| p.inbound && !p.subver.is_empty()),
             "feeler must not leave a completed inbound on the dummy: {:?}",
             dummy.peers.snapshot()
         );
@@ -1388,27 +1233,16 @@ async fn p2p_inbound_full_rejects_extra() {
             );
         }
 
-        let n = seed
-            .peers
-            .snapshot()
-            .into_iter()
-            .filter(|p| p.inbound && !p.subver.is_empty())
-            .count();
+        let n =
+            seed.peers.snapshot().into_iter().filter(|p| p.inbound && !p.subver.is_empty()).count();
         assert_eq!(
             n,
             1,
             "first inbound must stay; extra must be refused: {:?}",
             seed.peers.snapshot()
         );
-        assert!(
-            a.follow_live_count() >= 1,
-            "first outbound follow must stay live"
-        );
-        assert_eq!(
-            b.follow_live_count(),
-            0,
-            "rejected follow must not stay live"
-        );
+        assert!(a.follow_live_count() >= 1, "first outbound follow must stay live");
+        assert_eq!(b.follow_live_count(), 0, "rejected follow must not stay live");
 
         seed.shutdown().await;
         a.shutdown().await;
@@ -1434,44 +1268,25 @@ async fn serve_after_restart_via_reconstruct() {
 
         // Restart seeder on same store — cache is empty; serve must use reconstruct.
         let seed = start_node(&seed_dir).await;
-        assert!(
-            seed.cache.is_empty(),
-            "restarted seeder must not rely on warm RAM cache"
-        );
+        assert!(seed.cache.is_empty(), "restarted seeder must not rely on warm RAM cache");
         assert_eq!(seed.query.tip_height(), Some(Height(10)));
         pin_restart_empty_and_same_process_bq_residue(&seed);
 
         let peer = start_node(&peer_dir).await;
         let n = sync_ibd(&peer, seed.local_addr).await;
         assert!(n >= 10, "downloaded {n}");
-        peer.wait_height(10, Duration::from_secs(10))
-            .await
-            .expect("tip");
+        peer.wait_height(10, Duration::from_secs(10)).await.expect("tip");
 
         assert_eq!(peer.query.tip_height(), Some(Height(10)));
-        let peer_tip = peer
-            .query
-            .header_at_height(Height(10))
-            .unwrap()
-            .unwrap()
-            .1
-            .hash;
+        let peer_tip = peer.query.header_at_height(Height(10)).unwrap().unwrap().1.hash;
         assert_eq!(peer_tip, tip_hash.to_byte_array());
 
         // Peer can reconstruct every height from its own store.
         for h in 0..=10u32 {
-            let b = peer
-                .query
-                .reconstruct_block_at_height(Height(h))
-                .expect("peer reconstruct");
+            let b = peer.query.reconstruct_block_at_height(Height(h)).expect("peer reconstruct");
             assert_eq!(
                 b.header.block_hash().to_byte_array(),
-                peer.query
-                    .header_at_height(Height(h))
-                    .unwrap()
-                    .unwrap()
-                    .1
-                    .hash
+                peer.query.header_at_height(Height(h)).unwrap().unwrap().1.hash
             );
         }
 
@@ -1485,51 +1300,22 @@ async fn serve_after_restart_via_reconstruct() {
 }
 
 fn pin_restart_empty_and_same_process_bq_residue(seed: &P2PNode) {
-    assert_eq!(
-        seed.query.block_queue_count(),
-        0,
-        "restart RAM body queue is empty"
-    );
+    assert_eq!(seed.query.block_queue_count(), 0, "restart RAM body queue is empty");
     let tip = seed.hub.tip_height().expect("seed tip");
     let below = tip.saturating_sub(1);
-    let below_hash = seed
-        .query
-        .header_at_height(Height(below))
-        .unwrap()
-        .expect("below-tip header")
-        .1
-        .hash;
-    seed.query
-        .block_queue_offer(below, below_hash, 0, b"stale")
-        .unwrap();
-    seed.query
-        .block_queue_offer(tip + 1, [0xAB; 32], 0, b"")
-        .unwrap();
-    seed.query
-        .block_queue_offer(tip + 2, [0xCD; 32], 0, b"wire")
-        .unwrap();
-    seed.query
-        .block_queue_offer(u32::MAX, [0x11; 32], 0, b"unk")
-        .unwrap();
+    let below_hash =
+        seed.query.header_at_height(Height(below)).unwrap().expect("below-tip header").1.hash;
+    seed.query.block_queue_offer(below, below_hash, 0, b"stale").unwrap();
+    seed.query.block_queue_offer(tip + 1, [0xAB; 32], 0, b"").unwrap();
+    seed.query.block_queue_offer(tip + 2, [0xCD; 32], 0, b"wire").unwrap();
+    seed.query.block_queue_offer(u32::MAX, [0x11; 32], 0, b"unk").unwrap();
 
     let n = rehydrate_block_queue_residue(&seed.hub).expect("same-process rehydrate");
     assert_eq!(n, 1, "only above-tip wire is ready");
-    assert!(
-        !seed.query.block_queue_has_height(below),
-        "drop at/below tip"
-    );
-    assert!(
-        !seed.query.block_queue_has_height(tip + 1),
-        "empty payload skip"
-    );
-    assert!(
-        seed.query.block_queue_has_height(tip + 2),
-        "keep above-tip wire"
-    );
-    assert!(
-        seed.query.block_queue_has_height(u32::MAX),
-        "unknown height stays queued"
-    );
+    assert!(!seed.query.block_queue_has_height(below), "drop at/below tip");
+    assert!(!seed.query.block_queue_has_height(tip + 1), "empty payload skip");
+    assert!(seed.query.block_queue_has_height(tip + 2), "keep above-tip wire");
+    assert!(seed.query.block_queue_has_height(u32::MAX), "unknown height stays queued");
     let _ = seed.query.block_queue_dequeue_height(tip + 2);
     let _ = seed.query.block_queue_dequeue_height(u32::MAX);
 }
@@ -1589,10 +1375,7 @@ async fn ibd_two_peers() {
             .await
             .expect("ibd");
         assert!(n >= 8, "accepted {n}");
-        client
-            .wait_height(8, Duration::from_secs(10))
-            .await
-            .expect("tip");
+        client.wait_height(8, Duration::from_secs(10)).await.expect("tip");
         assert_eq!(client.query.tip_height(), Some(Height(8)));
         assert_eq!(client.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
 
@@ -1618,10 +1401,8 @@ async fn ibd_skips_dead_peer() {
 
     let peer = start_node(&peer_dir).await;
     let bad: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let n = peer
-        .sync(&[bad, seed.local_addr], IbdConfig::for_test())
-        .await
-        .expect("ibd with bad+good");
+    let n =
+        peer.sync(&[bad, seed.local_addr], IbdConfig::for_test()).await.expect("ibd with bad+good");
     assert!(n >= 4, "downloaded {n}");
     peer.wait_height(4, Duration::from_secs(5)).await.unwrap();
 
@@ -1642,30 +1423,17 @@ async fn tip_follow_after_ibd() {
 
         let mut peer = start_node(&peer_dir).await;
         sync_ibd(&peer, seed.local_addr).await;
-        peer.wait_height(5, Duration::from_secs(10))
-            .await
-            .expect("ibd");
+        peer.wait_height(5, Duration::from_secs(10)).await.expect("ibd");
         peer.follow_from(seed.local_addr).await.expect("follow");
-        assert!(
-            peer.follow_live_count() >= 1,
-            "outbound follow session should be live"
-        );
+        assert!(peer.follow_live_count() >= 1, "outbound follow session should be live");
 
         let tip = seed.cache.tip_hash().unwrap();
-        let tip_time = seed
-            .query
-            .header_at_height(Height(5))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
+        let tip_time = seed.query.header_at_height(Height(5)).unwrap().unwrap().1.timestamp;
         let b6 = mine_regtest_block(tip, tip_time + 600, 6, vec![]);
         let h6 = b6.block_hash();
         seed.ingest_block(6, b6).unwrap();
 
-        peer.wait_tip_hash(h6, Duration::from_secs(10))
-            .await
-            .expect("tip follow");
+        peer.wait_tip_hash(h6, Duration::from_secs(10)).await.expect("tip follow");
         assert_eq!(peer.query.tip_height(), Some(Height(6)));
 
         seed.shutdown().await;
@@ -1691,18 +1459,10 @@ async fn tip_follow_getheaders_catches_missed_blocks() {
 
         let mut peer = start_node(&peer_dir).await;
         sync_ibd(&peer, seed.local_addr).await;
-        peer.wait_height(5, Duration::from_secs(10))
-            .await
-            .expect("ibd");
+        peer.wait_height(5, Duration::from_secs(10)).await.expect("ibd");
 
         let mut tip = seed.hub.tip_hash().unwrap();
-        let mut tip_time = seed
-            .query
-            .header_at_height(Height(5))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
+        let mut tip_time = seed.query.header_at_height(Height(5)).unwrap().unwrap().1.timestamp;
         let mut last = tip;
         for h in 6..=9 {
             let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
@@ -1715,9 +1475,7 @@ async fn tip_follow_getheaders_catches_missed_blocks() {
         assert_eq!(seed.query.tip_height(), Some(Height(9)));
 
         peer.follow_from(seed.local_addr).await.expect("follow");
-        peer.wait_tip_hash(last, Duration::from_secs(15))
-            .await
-            .expect("getheaders gap fill");
+        peer.wait_tip_hash(last, Duration::from_secs(15)).await.expect("getheaders gap fill");
         assert_eq!(peer.query.tip_height(), Some(Height(9)));
         assert_eq!(peer.follow_live_count(), 1);
 
@@ -1753,22 +1511,10 @@ async fn reorg_to_longer_branch() {
     assert_eq!(hub.tip_height(), Some(4));
 
     // Fork from height 2: build longer branch 3',4',5',6'
-    let fork_parent = hub
-        .query
-        .header_at_height(Height(2))
-        .unwrap()
-        .unwrap()
-        .1
-        .hash;
+    let fork_parent = hub.query.header_at_height(Height(2)).unwrap().unwrap().1.hash;
     let mut branch = Vec::new();
     let mut p = BlockHash::from_byte_array(fork_parent);
-    let mut t = hub
-        .query
-        .header_at_height(Height(2))
-        .unwrap()
-        .unwrap()
-        .1
-        .timestamp;
+    let mut t = hub.query.header_at_height(Height(2)).unwrap().unwrap().1.timestamp;
     for h in 3..=6u32 {
         // Distinct nonces via time offset so hashes differ from original chain
         let b = mine_regtest_block(p, t + 601, h, vec![]);
@@ -1834,17 +1580,11 @@ fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
     assert_eq!(hub.tip_height(), Some(3));
     assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
     assert_eq!(
-        hub.query
-            .reconstruct_block_at_height(Height(3))
-            .unwrap()
-            .block_hash(),
+        hub.query.reconstruct_block_at_height(Height(3)).unwrap().block_hash(),
         w3.block_hash()
     );
     assert_eq!(
-        hub.query
-            .reconstruct_block_at_height(Height(2))
-            .unwrap()
-            .block_hash(),
+        hub.query.reconstruct_block_at_height(Height(2)).unwrap().block_hash(),
         winner[1].block_hash()
     );
 }
@@ -1862,12 +1602,7 @@ fn pin_competing_spend_extends_without_multi_fail(
     use rbitcoin_net::AcceptOutcome;
     use rbitcoin_test::mine::spend_anyone_can_spend;
 
-    let fork_rec = hub
-        .query
-        .header_at_height(Height(fork_h))
-        .unwrap()
-        .unwrap()
-        .1;
+    let fork_rec = hub.query.header_at_height(Height(fork_h)).unwrap().unwrap().1;
     let fork_parent = BlockHash::from_byte_array(fork_rec.hash);
     let fork_time = fork_rec.timestamp;
 
@@ -1881,11 +1616,7 @@ fn pin_competing_spend_extends_without_multi_fail(
     let mut p = fork_parent;
     let mut t = fork_time;
     for (i, h) in (fork_h + 1..=fork_h + 3).enumerate() {
-        let extra = if i == 0 {
-            vec![spend_b.clone()]
-        } else {
-            vec![]
-        };
+        let extra = if i == 0 { vec![spend_b.clone()] } else { vec![] };
         let b = mine_regtest_block(p, t + 601 + i as u32, h, extra);
         p = b.block_hash();
         t = b.header.time;
@@ -1903,9 +1634,8 @@ fn pin_competing_spend_extends_without_multi_fail(
 
     let spend_c = spend_anyone_can_spend(cb1, 0, Amount::from_sat(47_0000_0000));
     let double = mine_regtest_block(p, t + 600, fork_h + 4, vec![spend_c]);
-    let err = hub
-        .accept_block(double)
-        .expect_err("double-spend of multi+strong coinbase must fail");
+    let err =
+        hub.accept_block(double).expect_err("double-spend of multi+strong coinbase must fail");
     let msg = err.to_string();
     assert!(
         !msg.contains("multi-spender"),
@@ -1919,9 +1649,7 @@ fn pin_competing_spend_extends_without_multi_fail(
     );
 
     let ext = mine_regtest_block(p, t + 600, fork_h + 4, vec![]);
-    let o = hub
-        .accept_block(ext)
-        .expect("tip extension after multi-list reorg must succeed");
+    let o = hub.accept_block(ext).expect("tip extension after multi-list reorg must succeed");
     match o {
         AcceptOutcome::Accepted { height } => assert_eq!(height, fork_h + 4),
         other => panic!("expected Accepted, got {other:?}"),
@@ -1943,12 +1671,7 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         "disconnected stem must be valid-fork: {tips:?}"
     );
 
-    let p_prev = hub
-        .query
-        .header_at_height(Height(tip_h - 1))
-        .unwrap()
-        .unwrap()
-        .1;
+    let p_prev = hub.query.header_at_height(Height(tip_h - 1)).unwrap().unwrap().1;
     let p_prev_hash = BlockHash::from_byte_array(p_prev.hash);
     let sibling = mine_regtest_block(p_prev_hash, p_prev.timestamp + 900, tip_h, vec![]);
     assert!(matches!(
@@ -1959,30 +1682,21 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
     pin_held_sixteen_vs_seventeen(hub, p_prev_hash, p_prev.timestamp, tip_h);
     let tips = hub.chaintips();
     assert!(
-        tips.iter()
-            .any(|t| t.status == "valid-headers" && t.hash == sibling.block_hash()),
+        tips.iter().any(|t| t.status == "valid-headers" && t.hash == sibling.block_hash()),
         "{tips:?}"
     );
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
     hub.precious_block(sibling.block_hash()).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), sibling.block_hash());
-    let h1 = BlockHash::from_byte_array(
-        hub.query
-            .header_at_height(Height(1))
-            .unwrap()
-            .unwrap()
-            .1
-            .hash,
-    );
+    let h1 =
+        BlockHash::from_byte_array(hub.query.header_at_height(Height(1)).unwrap().unwrap().1.hash);
     hub.precious_block(h1).unwrap();
     assert_eq!(
         hub.tip_hash().unwrap(),
         sibling.block_hash(),
         "precious of less work must not activate"
     );
-    let err = hub
-        .precious_block(BlockHash::from_byte_array([0xab; 32]))
-        .unwrap_err();
+    let err = hub.precious_block(BlockHash::from_byte_array([0xab; 32])).unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
 }
 
@@ -2001,17 +1715,11 @@ fn pin_held_sixteen_vs_seventeen(
         let b = mine_regtest_block(parent, timestamp.saturating_add(910 + i), height, vec![]);
         let h = b.block_hash();
         assert!(
-            matches!(
-                hub.accept_received_block(b).unwrap(),
-                AcceptOutcome::IgnoredWeaker
-            ),
+            matches!(hub.accept_received_block(b).unwrap(), AcceptOutcome::IgnoredWeaker),
             "equal-work sibling {i} must park"
         );
         hashes.push(h);
-        assert!(
-            hub.held_body(&h).is_some(),
-            "sibling {i} must stay held (product cap 320)"
-        );
+        assert!(hub.held_body(&h).is_some(), "sibling {i} must stay held (product cap 320)");
     }
     assert!(
         hub.held_body(&hashes[0]).is_some(),
@@ -2019,15 +1727,8 @@ fn pin_held_sixteen_vs_seventeen(
     );
     assert!(hub.held_body(&hashes[16]).is_some());
     assert!(hub.held_body_count() >= 17);
-    let parked = hub
-        .chaintips()
-        .into_iter()
-        .filter(|t| t.status == "valid-headers")
-        .count();
-    assert!(
-        parked >= 16,
-        "16 equal-work siblings as valid-headers, got {parked}"
-    );
+    let parked = hub.chaintips().into_iter().filter(|t| t.status == "valid-headers").count();
+    assert!(parked >= 16, "16 equal-work siblings as valid-headers, got {parked}");
 }
 
 /// Same-height competing tip with more work wins; then multi-block reorg to a
@@ -2054,12 +1755,7 @@ fn reorg_same_height_then_multi_block_branch() {
     pin_competing_spend_extends_without_multi_fail(&hub, cb1, last_pad);
     let tip_h = hub.tip_height().unwrap();
 
-    let parent_rec = hub
-        .query
-        .header_at_height(Height(tip_h - 1))
-        .unwrap()
-        .unwrap()
-        .1;
+    let parent_rec = hub.query.header_at_height(Height(tip_h - 1)).unwrap().unwrap().1;
     let parent = BlockHash::from_byte_array(parent_rec.hash);
     let t_parent = parent_rec.timestamp;
 
@@ -2076,21 +1772,9 @@ fn reorg_same_height_then_multi_block_branch() {
     }
 
     let fork_parent_h = tip_h - 2;
-    let fork_parent = hub
-        .query
-        .header_at_height(Height(fork_parent_h))
-        .unwrap()
-        .unwrap()
-        .1
-        .hash;
+    let fork_parent = hub.query.header_at_height(Height(fork_parent_h)).unwrap().unwrap().1.hash;
     let mut p = BlockHash::from_byte_array(fork_parent);
-    let mut t = hub
-        .query
-        .header_at_height(Height(fork_parent_h))
-        .unwrap()
-        .unwrap()
-        .1
-        .timestamp;
+    let mut t = hub.query.header_at_height(Height(fork_parent_h)).unwrap().unwrap().1.timestamp;
     let mut branch = Vec::new();
     let lo = tip_h - 1;
     let hi = tip_h + 2;
@@ -2143,10 +1827,7 @@ async fn pin_blocksonly_relay_off_after_ibd(rpc_addr: SocketAddr) {
     assert_eq!(mem["result"]["relay_enabled"], false, "{mem}");
     let raw = jsonrpc(rpc_addr, "sendrawtransaction", json!(["00"])).await;
     let msg = raw["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        !msg.contains("relay disabled"),
-        "RPC sendraw must admit while -blocksonly, got {raw}"
-    );
+    assert!(!msg.contains("relay disabled"), "RPC sendraw must admit while -blocksonly, got {raw}");
 }
 
 async fn pin_blocksonly_electrum_esplora_broadcast(
@@ -2160,12 +1841,7 @@ async fn pin_blocksonly_electrum_esplora_broadcast(
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use serde_json::json;
 
-    let junk = electrum_rpc(
-        electrum_addr,
-        "blockchain.transaction.broadcast",
-        json!(["zz"]),
-    )
-    .await;
+    let junk = electrum_rpc(electrum_addr, "blockchain.transaction.broadcast", json!(["zz"])).await;
     let junk_msg = junk["error"]["message"].as_str().unwrap_or("");
     assert!(
         !junk_msg.contains("mempool not available") && !junk_msg.contains("relay disabled"),
@@ -2180,10 +1856,7 @@ async fn pin_blocksonly_electrum_esplora_broadcast(
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0x11; 32]),
-                vout: 0,
-            },
+            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0x11; 32]), vout: 0 },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -2194,12 +1867,8 @@ async fn pin_blocksonly_electrum_esplora_broadcast(
         }],
     };
     let miss_hex = serialize_hex(&miss);
-    let bad = electrum_rpc(
-        electrum_addr,
-        "blockchain.transaction.broadcast",
-        json!([miss_hex]),
-    )
-    .await;
+    let bad =
+        electrum_rpc(electrum_addr, "blockchain.transaction.broadcast", json!([miss_hex])).await;
     let bad_msg = bad["error"]["message"].as_str().unwrap_or("");
     assert!(
         bad_msg.contains("broadcast reject"),
@@ -2211,10 +1880,7 @@ async fn pin_blocksonly_electrum_esplora_broadcast(
     );
 
     let (st, body) = http_post(esplora_addr, "/tx", "zz").await;
-    assert_ne!(
-        st, 503,
-        "esplora POST /tx must not be hub-missing: {st} {body}"
-    );
+    assert_ne!(st, 503, "esplora POST /tx must not be hub-missing: {st} {body}");
     assert!(
         !body.contains("mempool not available") && !body.contains("relay disabled"),
         "esplora POST /tx junk: {st} {body}"
@@ -2264,12 +1930,7 @@ async fn pin_blocksonly_seeder_tx_disconnects(
                     && p.queue_msg(NetworkMessage::Tx(dummy.clone()))
             })
         },
-        || {
-            format!(
-                "seed inbound must queue unsolicited tx (seed={:?})",
-                seed_peers.snapshot()
-            )
-        },
+        || format!("seed inbound must queue unsolicited tx (seed={:?})", seed_peers.snapshot()),
     )
     .await;
     let gone_deadline = Instant::now() + Duration::from_secs(5);
@@ -2352,10 +2013,7 @@ async fn node_run_p2p_short() {
                 rows[0]["startingheight"].as_i64().unwrap() >= 0,
                 "handshake-complete startingheight must not be connecting dummy -1: {peers}"
             );
-            assert!(
-                rows[0]["timeoffset"].as_i64().is_some(),
-                "peer timeoffset: {peers}"
-            );
+            assert!(rows[0]["timeoffset"].as_i64().is_some(), "peer timeoffset: {peers}");
             assert_eq!(
                 rows[0]["startingheight"].as_i64(),
                 Some(3),
@@ -2372,9 +2030,7 @@ async fn node_run_p2p_short() {
                 "synced_blocks follows best_known, not startingheight: {peers}"
             );
             assert!(
-                rows[0]["servicesnames"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty()),
+                rows[0]["servicesnames"].as_array().is_some_and(|a| !a.is_empty()),
                 "servicesnames: {peers}"
             );
 
@@ -2388,21 +2044,14 @@ async fn node_run_p2p_short() {
                 "getnetworkinfo.timeoffset: {net}"
             );
             let totals = jsonrpc(rpc_addr, "getnettotals", json!([])).await;
-            assert!(
-                totals["result"]["totalbytesrecv"].as_u64().unwrap_or(0) > 0,
-                "{totals}"
-            );
+            assert!(totals["result"]["totalbytesrecv"].as_u64().unwrap_or(0) > 0, "{totals}");
             let ping = jsonrpc(rpc_addr, "ping", json!([])).await;
             assert!(ping["result"].is_null(), "{ping}");
             pin_blocksonly_relay_off_after_ibd(rpc_addr).await;
             pin_blocksonly_electrum_esplora_broadcast(electrum_addr, esplora_addr).await;
 
-            let inbound = jsonrpc(
-                rpc_addr,
-                "addconnection",
-                json!([seed_addr.to_string(), "inbound"]),
-            )
-            .await;
+            let inbound =
+                jsonrpc(rpc_addr, "addconnection", json!([seed_addr.to_string(), "inbound"])).await;
             assert!(
                 inbound["error"]["message"]
                     .as_str()
@@ -2414,10 +2063,7 @@ async fn node_run_p2p_short() {
             let miss_id = jsonrpc(rpc_addr, "disconnectnode", json!({"nodeid": 99})).await;
             assert!(miss_id["error"].is_object(), "unknown nodeid: {miss_id}");
             let miss_empty = jsonrpc(rpc_addr, "disconnectnode", json!([])).await;
-            assert!(
-                miss_empty["error"].is_object(),
-                "empty disconnectnode: {miss_empty}"
-            );
+            assert!(miss_empty["error"].is_object(), "empty disconnectnode: {miss_empty}");
 
             let disc = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
             assert!(disc["error"].is_null(), "{disc}");
@@ -2433,19 +2079,14 @@ async fn node_run_p2p_short() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
 
-            let added = jsonrpc(
-                rpc_addr,
-                "addnode",
-                json!([seed_addr.to_string(), "onetry"]),
-            )
-            .await;
+            let added =
+                jsonrpc(rpc_addr, "addnode", json!([seed_addr.to_string(), "onetry"])).await;
             assert!(added["error"].is_null(), "{added}");
             let re_deadline = Instant::now() + Duration::from_secs(8);
             loop {
                 let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
                 let ok = peers["result"].as_array().is_some_and(|rows| {
-                    rows.iter()
-                        .any(|p| p["inbound"] == false && p["connection_type"] == "manual")
+                    rows.iter().any(|p| p["inbound"] == false && p["connection_type"] == "manual")
                 });
                 if ok {
                     break;
@@ -2494,13 +2135,7 @@ async fn mocktime_generate_keeps_ponging_peer() {
         wait_ms_until(
             3_000,
             || !a.peers.snapshot().is_empty() && !b.peers.snapshot().is_empty(),
-            || {
-                format!(
-                    "connected a={:?} b={:?}",
-                    a.peers.snapshot(),
-                    b.peers.snapshot()
-                )
-            },
+            || format!("connected a={:?} b={:?}", a.peers.snapshot(), b.peers.snapshot()),
         )
         .await;
 

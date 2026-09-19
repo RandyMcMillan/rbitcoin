@@ -16,9 +16,7 @@ pub struct PendingHeadInserts {
 
 impl PendingHeadInserts {
     pub fn new() -> Self {
-        Self {
-            queued: Mutex::new(Vec::new()),
-        }
+        Self { queued: Mutex::new(Vec::new()) }
     }
 
     pub fn len(&self) -> usize {

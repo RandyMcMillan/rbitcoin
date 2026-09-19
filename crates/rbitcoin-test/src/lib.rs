@@ -20,9 +20,7 @@ pub struct TestDatadir {
 
 impl TestDatadir {
     pub fn new() -> std::io::Result<Self> {
-        Ok(Self {
-            dir: TempDir::new()?,
-        })
+        Ok(Self { dir: TempDir::new()? })
     }
 
     pub fn path(&self) -> PathBuf {

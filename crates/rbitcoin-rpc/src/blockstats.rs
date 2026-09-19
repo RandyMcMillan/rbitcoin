@@ -26,8 +26,7 @@ pub fn is_unspendable(script: &[u8]) -> bool {
 /// Consensus-serialized `CTxOut` size (value + compact script).
 pub fn txout_serialized_size(out: &TxOut) -> i64 {
     let mut buf = Vec::new();
-    out.consensus_encode(&mut buf)
-        .expect("TxOut consensus encode is infallible");
+    out.consensus_encode(&mut buf).expect("TxOut consensus encode is infallible");
     buf.len() as i64
 }
 
@@ -111,10 +110,7 @@ impl BlockStats {
         m.insert("avgfeerate".into(), json!(self.avgfeerate));
         m.insert("avgtxsize".into(), json!(self.avgtxsize));
         m.insert("blockhash".into(), json!(self.blockhash.clone()));
-        m.insert(
-            "feerate_percentiles".into(),
-            json!(self.feerate_percentiles.to_vec()),
-        );
+        m.insert("feerate_percentiles".into(), json!(self.feerate_percentiles.to_vec()));
         m.insert("height".into(), json!(self.height));
         m.insert("ins".into(), json!(self.ins));
         m.insert("maxfee".into(), json!(self.maxfee));
@@ -139,14 +135,8 @@ impl BlockStats {
         m.insert("txs".into(), json!(self.txs));
         m.insert("utxo_increase".into(), json!(self.utxo_increase));
         m.insert("utxo_size_inc".into(), json!(self.utxo_size_inc));
-        m.insert(
-            "utxo_increase_actual".into(),
-            json!(self.utxo_increase_actual),
-        );
-        m.insert(
-            "utxo_size_inc_actual".into(),
-            json!(self.utxo_size_inc_actual),
-        );
+        m.insert("utxo_increase_actual".into(), json!(self.utxo_increase_actual));
+        m.insert("utxo_size_inc_actual".into(), json!(self.utxo_size_inc_actual));
         m
     }
 
@@ -238,11 +228,7 @@ pub fn compute_block_stats(
             total_out += output_value;
             let fee = input_value.saturating_sub(output_value);
             totalfee += fee;
-            let feerate = if tx_weight > 0 {
-                fee.saturating_mul(4) / tx_weight
-            } else {
-                0
-            };
+            let feerate = if tx_weight > 0 { fee.saturating_mul(4) / tx_weight } else { 0 };
             fees.push(fee);
             sizes.push(tx_size);
             feerate_weights.push((feerate, tx_weight));
@@ -272,16 +258,8 @@ pub fn compute_block_stats(
         mintxsize = 0;
     }
     let avgfee = if n_non_cb > 0 { totalfee / n_non_cb } else { 0 };
-    let avgfeerate = if total_weight > 0 {
-        totalfee.saturating_mul(4) / total_weight
-    } else {
-        0
-    };
-    let avgtxsize = if n_non_cb > 0 {
-        total_size / n_non_cb
-    } else {
-        0
-    };
+    let avgfeerate = if total_weight > 0 { totalfee.saturating_mul(4) / total_weight } else { 0 };
+    let avgtxsize = if n_non_cb > 0 { total_size / n_non_cb } else { 0 };
 
     Ok(BlockStats {
         avgfee,
@@ -335,10 +313,7 @@ fn parse_stats(params: &RpcParams) -> Result<Vec<String>, Value> {
             }
             Ok(out)
         }
-        Some(_) => Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "Invalid parameter, expected array",
-        )),
+        Some(_) => Err(rpc_error(ERR_INVALID_PARAMETER, "Invalid parameter, expected array")),
     }
 }
 
@@ -359,10 +334,7 @@ fn parse_hash_or_height(v: &Value) -> Result<HashOrHeight, Value> {
             .map_err(|_| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
         return Ok(HashOrHeight::Hash(h));
     }
-    Err(rpc_error(
-        ERR_INVALID_PARAMETER,
-        "hash_or_height must be a hash string or height",
-    ))
+    Err(rpc_error(ERR_INVALID_PARAMETER, "hash_or_height must be a hash string or height"))
 }
 
 pub(crate) fn prevout_from_block_or_query(
@@ -392,13 +364,7 @@ fn prevout_map_for_block(
     for tx in &block.txdata {
         let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
-            map.insert(
-                OutPoint {
-                    txid: tid,
-                    vout: vout as u32,
-                },
-                o.clone(),
-            );
+            map.insert(OutPoint { txid: tid, vout: vout as u32 }, o.clone());
         }
     }
     let Ok(fks) = ctx.query.block_tx_fks(height) else {
@@ -447,10 +413,7 @@ fn stats_for_connected(
     let subsidy = rbitcoin_consensus::block_subsidy(height.0, &params);
     let parents = prevout_map_for_block(ctx, height, block);
     compute_block_stats(height.0, block, mediantime, subsidy, |op| {
-        parents
-            .get(op)
-            .cloned()
-            .or_else(|| prevout_from_block_or_query(ctx, block, op))
+        parents.get(op).cloned().or_else(|| prevout_from_block_or_query(ctx, block, op))
     })
     .map_err(|e| rpc_error(ERR_MISC, e))
 }
@@ -489,11 +452,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
             (height, block)
         }
         HashOrHeight::Hash(hash) => {
-            match ctx
-                .query
-                .height_of_hash(&hash)
-                .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-            {
+            match ctx.query.height_of_hash(&hash).map_err(|e| rpc_error(ERR_MISC, e.to_string()))? {
                 Some(height) => {
                     let block = ctx
                         .query
@@ -566,10 +525,7 @@ mod unit_tests {
             s.push(0xac);
             s
         });
-        let out = TxOut {
-            value: Amount::from_sat(50_0000_0000),
-            script_pubkey: script,
-        };
+        let out = TxOut { value: Amount::from_sat(50_0000_0000), script_pubkey: script };
         assert_eq!(txout_serialized_size(&out) + PER_UTXO_OVERHEAD, 117);
         assert!(!is_unspendable(out.script_pubkey.as_bytes()));
         assert!(is_unspendable(&[0x6a, 0x01, 0x21]));

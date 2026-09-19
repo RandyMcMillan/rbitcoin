@@ -30,11 +30,7 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             return;
         }
     };
-    info!(
-        "ibd: resume seed graph n={} (store walk {:?})",
-        path.len(),
-        t0.elapsed()
-    );
+    info!("ibd: resume seed graph n={} (store walk {:?})", path.len(), t0.elapsed());
     if path.is_empty() {
         return;
     }
@@ -99,10 +95,7 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             st.height_to_hash
                 .get(&e.height.saturating_sub(1))
                 .copied()
-                .or_else(|| {
-                    tip.filter(|(th, _)| e.height == th.saturating_add(1))
-                        .map(|(_, h)| h)
-                })
+                .or_else(|| tip.filter(|(th, _)| e.height == th.saturating_add(1)).map(|(_, h)| h))
                 .unwrap_or(BlockHash::from_byte_array([0u8; 32]))
         };
         let on_path = st.try_set_path_slot(hash, e.height, prev, tip);
@@ -146,11 +139,7 @@ fn plant_find_valid_child(
 ) -> Option<(BlockHash, u32, BlockHash)> {
     let tip_hash = hub.tip_hash()?;
     let tip_h = hub.tip_height().unwrap_or(0);
-    let expect = if hub.tip_height().is_none() {
-        0u32
-    } else {
-        tip_h.saturating_add(1)
-    };
+    let expect = if hub.tip_height().is_none() { 0u32 } else { tip_h.saturating_add(1) };
     if let Some(&cur) = st.height_to_hash.get(&expect) {
         if !st.reorg.invalid.contains(cur.to_byte_array()) && !st.body.is_rejected(&cur) {
             return None;
@@ -218,12 +207,10 @@ fn plant_commit_header(
 }
 
 fn plant_hash_at_height(st: &IbdWorkState, ht: u32) -> Option<BlockHash> {
-    st.height_to_hash.get(&ht).copied().or_else(|| {
-        st.hash_height
-            .iter()
-            .find(|(_, &hht)| hht == ht)
-            .map(|(h, _)| *h)
-    })
+    st.height_to_hash
+        .get(&ht)
+        .copied()
+        .or_else(|| st.hash_height.iter().find(|(_, &hht)| hht == ht).map(|(h, _)| *h))
 }
 
 fn plant_next_connected(
@@ -265,11 +252,8 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
         }
     }
     if tips.is_empty() {
-        if let Some((&h, _)) = st
-            .hash_height
-            .iter()
-            .filter(|(h, _)| live(h))
-            .max_by_key(|(_, &ht)| ht)
+        if let Some((&h, _)) =
+            st.hash_height.iter().filter(|(h, _)| live(h)).max_by_key(|(_, &ht)| ht)
         {
             tips.push(h);
         }
@@ -282,12 +266,8 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
 /// Competing `hash_height` entries are not path work — hard reset must not
 /// promote them onto `ordered`.
 pub(crate) fn path_hashes_above_tip(st: &IbdWorkState, tip_h: u32) -> Vec<(u32, BlockHash)> {
-    let mut above: Vec<(u32, BlockHash)> = st
-        .height_to_hash
-        .iter()
-        .filter(|(&ht, _)| ht > tip_h)
-        .map(|(&ht, &h)| (ht, h))
-        .collect();
+    let mut above: Vec<(u32, BlockHash)> =
+        st.height_to_hash.iter().filter(|(&ht, _)| ht > tip_h).map(|(&ht, &h)| (ht, h)).collect();
     above.sort_by_key(|(ht, _)| *ht);
     above
 }
@@ -401,10 +381,7 @@ mod tests {
                 bits,
                 nonce: 0,
             };
-            let mut block = Block {
-                header,
-                txdata: vec![coinbase(height)],
-            };
+            let mut block = Block { header, txdata: vec![coinbase(height)] };
             block.header.merkle_root = block.compute_merkle_root().unwrap();
             let target = Target::from_compact(bits);
             for nonce in 0..u32::MAX {
@@ -566,10 +543,7 @@ mod tests {
                 bits,
                 nonce: 0,
             };
-            let mut block = Block {
-                header,
-                txdata: vec![coinbase(height)],
-            };
+            let mut block = Block { header, txdata: vec![coinbase(height)] };
             block.header.merkle_root = block.compute_merkle_root().unwrap();
             let target = Target::from_compact(bits);
             for nonce in 0..u32::MAX {
@@ -663,10 +637,7 @@ mod tests {
                 bits,
                 nonce: 0,
             };
-            let mut block = Block {
-                header,
-                txdata: vec![coinbase],
-            };
+            let mut block = Block { header, txdata: vec![coinbase] };
             block.header.merkle_root = block.compute_merkle_root().unwrap();
             let target = Target::from_compact(bits);
             for nonce in 0..u32::MAX {

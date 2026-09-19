@@ -207,12 +207,7 @@ fn parse_permission_flags(s: &str, allow_out: bool) -> Result<ParsedFlags, Strin
     } else if flags == NetPermissionFlags::NONE {
         return Err(format!("Only direction was set, no permissions: '{s}'"));
     }
-    Ok(ParsedFlags {
-        flags,
-        inbound,
-        outbound,
-        offset: at + 1,
-    })
+    Ok(ParsedFlags { flags, inbound, outbound, offset: at + 1 })
 }
 
 fn parse_subnet(net: &str) -> Result<Subnet, String> {
@@ -254,21 +249,14 @@ fn parse_subnet(net: &str) -> Result<Subnet, String> {
 pub fn parse_whitelist(s: &str) -> Result<WhitelistGrant, String> {
     let p = parse_permission_flags(s, true)?;
     let subnet = parse_subnet(&s[p.offset..])?;
-    Ok(WhitelistGrant {
-        subnet,
-        flags: p.flags,
-        inbound: p.inbound,
-        outbound: p.outbound,
-    })
+    Ok(WhitelistGrant { subnet, flags: p.flags, inbound: p.inbound, outbound: p.outbound })
 }
 
 pub fn parse_whitebind(s: &str) -> Result<WhitebindGrant, String> {
     let p = parse_permission_flags(s, false)?;
     let bind = &s[p.offset..];
     if bind.contains('/') {
-        return Err(format!(
-            "Cannot resolve --net-permission-bind address: '{bind}'"
-        ));
+        return Err(format!("Cannot resolve --net-permission-bind address: '{bind}'"));
     }
     let addr: SocketAddr = bind.parse().map_err(|_| {
         if !bind.contains(':') {
@@ -278,14 +266,9 @@ pub fn parse_whitebind(s: &str) -> Result<WhitebindGrant, String> {
         }
     })?;
     if addr.port() == 0 {
-        return Err(format!(
-            "Need to specify a port with --net-permission-bind: '{bind}'"
-        ));
+        return Err(format!("Need to specify a port with --net-permission-bind: '{bind}'"));
     }
-    Ok(WhitebindGrant {
-        addr,
-        flags: p.flags,
-    })
+    Ok(WhitebindGrant { addr, flags: p.flags })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -320,11 +303,7 @@ impl NetPermTable {
     }
 
     pub fn strings_for(&self, ip: IpAddr, inbound: bool, bind: SocketAddr) -> Vec<String> {
-        self.flags_for(ip, inbound, bind)
-            .to_strings()
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        self.flags_for(ip, inbound, bind).to_strings().into_iter().map(str::to_string).collect()
     }
 }
 
@@ -348,10 +327,7 @@ mod tests {
         assert!(g.inbound);
         assert!(!g.outbound);
         let flags = apply_implicit(g.flags, true, false);
-        assert_eq!(
-            flags.to_strings(),
-            ["noban", "relay", "mempool", "download"]
-        );
+        assert_eq!(flags.to_strings(), ["noban", "relay", "mempool", "download"]);
     }
 
     #[test]
@@ -373,10 +349,7 @@ mod tests {
     fn whitelistforcerelay_adds_forcerelay() {
         let g = parse_whitelist("127.0.0.1").unwrap();
         let flags = apply_implicit(g.flags, true, true);
-        assert_eq!(
-            flags.to_strings(),
-            ["noban", "forcerelay", "relay", "mempool", "download"]
-        );
+        assert_eq!(flags.to_strings(), ["noban", "forcerelay", "relay", "mempool", "download"]);
     }
 
     #[test]
@@ -390,25 +363,14 @@ mod tests {
         let g = parse_whitelist("all@127.0.0.1").unwrap();
         assert_eq!(
             g.flags.to_strings(),
-            [
-                "bloomfilter",
-                "noban",
-                "forcerelay",
-                "relay",
-                "mempool",
-                "download",
-                "addr"
-            ]
+            ["bloomfilter", "noban", "forcerelay", "relay", "mempool", "download", "addr"]
         );
     }
 
     #[test]
     fn direction_only_is_init_error() {
         let err = parse_whitelist("in,out@127.0.0.1").unwrap_err();
-        assert!(
-            err.contains("Only direction was set, no permissions"),
-            "{err}"
-        );
+        assert!(err.contains("Only direction was set, no permissions"), "{err}");
     }
 
     #[test]
@@ -420,19 +382,13 @@ mod tests {
     #[test]
     fn whitelist_port_is_invalid_netmask() {
         let err = parse_whitelist("noban@127.0.0.1:230").unwrap_err();
-        assert!(
-            err.contains("Invalid netmask specified in --net-permission"),
-            "{err}"
-        );
+        assert!(err.contains("Invalid netmask specified in --net-permission"), "{err}");
     }
 
     #[test]
     fn whitebind_cidr_cannot_resolve() {
         let err = parse_whitebind("noban@127.0.0.1/10").unwrap_err();
-        assert!(
-            err.contains("Cannot resolve --net-permission-bind address"),
-            "{err}"
-        );
+        assert!(err.contains("Cannot resolve --net-permission-bind address"), "{err}");
     }
 
     #[test]
@@ -476,10 +432,7 @@ mod tests {
             outbound: wl.outbound,
         });
         let s = t.strings_for(ip(), true, bind());
-        assert_eq!(
-            s,
-            ["bloomfilter", "noban", "forcerelay", "relay", "download"]
-        );
+        assert_eq!(s, ["bloomfilter", "noban", "forcerelay", "relay", "download"]);
     }
 
     #[test]
@@ -508,12 +461,8 @@ mod tests {
         assert!(g.subnet.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
         assert!(!g.subnet.contains(ip()));
         let g = parse_whitelist("noban@2001:db8::/32").unwrap();
-        assert!(g
-            .subnet
-            .contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
-        assert!(!g
-            .subnet
-            .contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
+        assert!(g.subnet.contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        assert!(!g.subnet.contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
         let g = parse_whitelist("noban@[::1]/128").unwrap();
         assert!(g.subnet.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
         let err = parse_whitelist("noban@::1/129").unwrap_err();
@@ -523,20 +472,11 @@ mod tests {
     #[test]
     fn whitebind_port_zero_and_missing() {
         let err = parse_whitebind("noban@127.0.0.1").unwrap_err();
-        assert!(
-            err.contains("Need to specify a port with --net-permission-bind"),
-            "{err}"
-        );
+        assert!(err.contains("Need to specify a port with --net-permission-bind"), "{err}");
         let err = parse_whitebind("noban@127.0.0.1:0").unwrap_err();
-        assert!(
-            err.contains("Need to specify a port with --net-permission-bind"),
-            "{err}"
-        );
+        assert!(err.contains("Need to specify a port with --net-permission-bind"), "{err}");
         let err = parse_whitebind("noban@not-an-addr:18444").unwrap_err();
-        assert!(
-            err.contains("Cannot resolve --net-permission-bind address"),
-            "{err}"
-        );
+        assert!(err.contains("Cannot resolve --net-permission-bind address"), "{err}");
     }
 
     #[test]

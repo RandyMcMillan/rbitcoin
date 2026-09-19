@@ -70,8 +70,7 @@ impl Query {
     /// Confirm SH write-behind enqueue: Tip + shindex on.
     #[inline]
     pub fn enqueues_sh_writebehind(&self) -> bool {
-        self.index_mode()
-            .enqueues_sh_writebehind(self.sh_index_enabled())
+        self.index_mode().enqueues_sh_writebehind(self.sh_index_enabled())
     }
 
     /// Enable or disable scripthash indexing for subsequent Class C / tip work.
@@ -285,9 +284,7 @@ impl Query {
             ));
         }
         let tip_max = self.store.txs.count();
-        let n = self
-            .sh_run
-            .finalize_and_unsorted_materialize_cancellable(&self.store, cancel)?;
+        let n = self.sh_run.finalize_and_unsorted_materialize_cancellable(&self.store, cancel)?;
         if n == 0 && !self.store.scripthash.has_durable_index() && tip_max > 0 {
             return Err(StoreError::Corrupt(
                 "scripthash unsorted-shards materialize finished empty while Class A creates remain",
@@ -323,11 +320,7 @@ impl Query {
             self.store.scripthash.include_hwm(),
             self.sh_run.sealed_max_create_fk(),
         );
-        let first = if floor == 0 {
-            1
-        } else {
-            floor.saturating_add(1)
-        };
+        let first = if floor == 0 { 1 } else { floor.saturating_add(1) };
         if last < first {
             return Ok(0);
         }
@@ -339,17 +332,13 @@ impl Query {
         while lo <= last {
             let hi = lo.saturating_add(CHUNK.saturating_sub(1)).min(last);
             let mut recs = Vec::new();
-            self.store
-                .txs
-                .for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
-                    recs.push(ScriptHashRecord::from_fk(sh, fk));
-                    Ok(())
-                })?;
+            self.store.txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
+                recs.push(ScriptHashRecord::from_fk(sh, fk));
+                Ok(())
+            })?;
             if !recs.is_empty() {
                 total = total.saturating_add(recs.len() as u64);
-                self.store
-                    .scripthash
-                    .put_create_batch_append(&recs, &mut heads)?;
+                self.store.scripthash.put_create_batch_append(&recs, &mut heads)?;
             }
             lo = hi.saturating_add(1);
         }
@@ -508,10 +497,7 @@ mod tests {
         let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-direct-no-runs");
         seed_direct_chain(&q, 4);
         assert!(q.sh_index_enabled());
-        assert!(
-            !q.sh_run_enabled(),
-            "Direct must not start an IBD SH run worker"
-        );
+        assert!(!q.sh_run_enabled(), "Direct must not start an IBD SH run worker");
         assert_eq!(q.scripthash_run_count(), 0);
         assert!(
             !q.store.scripthash.has_durable_index(),
@@ -558,10 +544,7 @@ mod tests {
             high_seal,
             "include_hwm must bootstrap from SEAL"
         );
-        assert!(
-            !q.store.scripthash.entries(&sh0).unwrap().is_empty(),
-            "durable head must remain"
-        );
+        assert!(!q.store.scripthash.entries(&sh0).unwrap().is_empty(), "durable head must remain");
         assert!(q.store.scripthash.entry_count() >= count_before);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -578,13 +561,8 @@ mod tests {
         let high_seal = 1_400_000_000u64;
         store_seal(&runs_dir, high_seal).unwrap();
         q.sh_run.refresh_seal();
-        write_sorted_run(
-            &next_run_path(&runs_dir, 1),
-            40,
-            40,
-            &leftover_run_rec(0xab, 99),
-        )
-        .unwrap();
+        write_sorted_run(&next_run_path(&runs_dir, 1), 40, 40, &leftover_run_rec(0xab, 99))
+            .unwrap();
 
         let _ = q.finalize_sh_runs().unwrap();
         assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
@@ -606,10 +584,7 @@ mod tests {
         let result = q.finalize_sh_runs();
         std::env::remove_var("RBITCOIN_SH_FORCE_REBUILD");
         let n_mat = result.expect("finalize after FORCE must not fail empty");
-        assert!(
-            n_mat > 0,
-            "materialize must load Class A creates, got {n_mat}"
-        );
+        assert!(n_mat > 0, "materialize must load Class A creates, got {n_mat}");
         assert!(
             q.store.scripthash.has_durable_index(),
             "head must not stay empty after FORCE collect+pack"
@@ -629,11 +604,7 @@ mod tests {
             "unsorted-shards must settle SH"
         );
         assert!(q.store.scripthash.has_durable_index());
-        assert_eq!(
-            q.scripthash_run_count(),
-            0,
-            "unsorted-shards must not leave catalog runs"
-        );
+        assert_eq!(q.scripthash_run_count(), 0, "unsorted-shards must not leave catalog runs");
         assert!(
             !rbitcoin_store::unsorted_shard_dir(q.store.path()).exists()
                 || std::fs::read_dir(rbitcoin_store::unsorted_shard_dir(q.store.path()))
@@ -657,11 +628,7 @@ mod tests {
         seed_direct_chain(&q, 3);
         q.enter_direct_index_mode().unwrap();
         q.sh_run.refresh_seal();
-        assert_eq!(
-            q.sh_run.sealed_max_create_fk(),
-            0,
-            "Direct enter must not Class A collect"
-        );
+        assert_eq!(q.sh_run.sealed_max_create_fk(), 0, "Direct enter must not Class A collect");
         assert_eq!(q.scripthash_run_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -730,11 +697,7 @@ mod tests {
         assert!(tip_max >= 6);
 
         let lag = tip_max.saturating_sub(3).max(1);
-        std::fs::write(
-            dir.join(rbitcoin_store::INCLUDE_HWM_NAME),
-            lag.to_le_bytes(),
-        )
-        .unwrap();
+        std::fs::write(dir.join(rbitcoin_store::INCLUDE_HWM_NAME), lag.to_le_bytes()).unwrap();
         assert!(
             q.store.scripthash.include_hwm() < tip_max,
             "planted HWM lag hwm={} tip_max={tip_max}",
@@ -743,19 +706,11 @@ mod tests {
 
         let runs_dir = dir.join("scripthash.runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
-        write_sorted_run(
-            &next_run_path(&runs_dir, 50),
-            40,
-            40,
-            &leftover_run_rec(0xee, 99),
-        )
-        .unwrap();
+        write_sorted_run(&next_run_path(&runs_dir, 50), 40, 40, &leftover_run_rec(0xee, 99))
+            .unwrap();
         assert!(q.sh_run.on_disk_run_count() > 0);
         assert!(!q.sh_is_tip_ready(), "strict HWM/run check is still false");
-        assert!(
-            q.sh_use_writebehind(),
-            "durable head must choose write-behind even when HWM lags"
-        );
+        assert!(q.sh_use_writebehind(), "durable head must choose write-behind even when HWM lags");
 
         let n1 = q.finalize_sh_runs().unwrap();
         assert_eq!(n1, 0, "must not collect onto a live head");
@@ -794,8 +749,7 @@ mod tests {
         let tip_fk = q.store.confirmed.get(Height(tip_h)).unwrap().unwrap();
         let tip_hash = q.store.get_header(tip_fk).unwrap().hash;
         let (header, ta) = coinbase_block(tip_h + 1, tip_fk, Some(tip_hash));
-        q.connect_block(Height(tip_h + 1), &header, &[ta])
-            .expect("tip connect");
+        q.connect_block(Height(tip_h + 1), &header, &[ta]).expect("tip connect");
 
         let tip_max_after = q.store.txs.count();
         assert!(tip_max_after > tip_max_before);
@@ -812,10 +766,7 @@ mod tests {
                 || q.sh_run.sealed_max_create_fk() > seal_before,
             "SEAL must advance with tip durable writes"
         );
-        assert!(
-            q.sh_is_tip_ready(),
-            "after tip follow block, still tip-ready"
-        );
+        assert!(q.sh_is_tip_ready(), "after tip follow block, still tip-ready");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -886,10 +837,7 @@ mod tests {
         assert!(q.store.scripthash.has_durable_index());
         assert!(q.sh_is_tip_ready());
         extend_direct_chain(&q, 2);
-        assert!(
-            !q.sh_is_tip_ready(),
-            "new Class A after seal must lag honest include_hwm"
-        );
+        assert!(!q.sh_is_tip_ready(), "new Class A after seal must lag honest include_hwm");
         let _ = q.finalize_sh_runs().unwrap();
         let sh_new = rbitcoin_store::script_hash(&[0x51, 3]);
         assert!(

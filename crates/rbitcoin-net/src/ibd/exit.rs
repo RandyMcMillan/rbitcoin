@@ -16,8 +16,7 @@ pub(crate) fn path_high_water(st: &IbdWorkState, tip_h: u32) -> u32 {
 
 /// How far the connected work path lags peer-advertised height.
 pub(crate) fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
-    st.max_peer_height
-        .saturating_sub(path_high_water(st, tip_h))
+    st.max_peer_height.saturating_sub(path_high_water(st, tip_h))
 }
 
 /// `height_to_hash` already holds the connecting header at tip+1.
@@ -31,9 +30,7 @@ fn on_path_inflight(st: &IbdWorkState) -> bool {
         if st.ordered_set.contains(h) {
             return true;
         }
-        st.hash_height
-            .get(h)
-            .is_some_and(|&ht| st.is_on_path(h, ht))
+        st.hash_height.get(h).is_some_and(|&ht| st.is_on_path(h, ht))
     })
 }
 
@@ -188,24 +185,15 @@ mod tests {
         let mut mid = IbdWorkState::new(Vec::new(), None, Some(161_249));
         mid.max_peer_height = 958_820;
         mid.max_ready_height = 161_000;
-        assert_eq!(
-            all_peers_dead_action(&mid, 161_249, false, 0),
-            AllPeersDead::GiveUpMidCatchup
-        );
-        assert_eq!(
-            all_peers_dead_action(&mid, 161_249, true, 0),
-            AllPeersDead::WaitRedial
-        );
+        assert_eq!(all_peers_dead_action(&mid, 161_249, false, 0), AllPeersDead::GiveUpMidCatchup);
+        assert_eq!(all_peers_dead_action(&mid, 161_249, true, 0), AllPeersDead::WaitRedial);
 
         // Caught up with no peers → complete.
         let mut done = IbdWorkState::new(Vec::new(), None, Some(100));
         done.max_peer_height = 100;
         done.max_ready_height = 100;
         done.headers_done = true;
-        assert_eq!(
-            all_peers_dead_action(&done, 100, false, 0),
-            AllPeersDead::CatchupComplete
-        );
+        assert_eq!(all_peers_dead_action(&done, 100, false, 0), AllPeersDead::CatchupComplete);
 
         // Path drain + empty-EOF completes even if advertised height is far
         // ahead (less-work fork / bogus LastBlock). Still asking if not EOF.
@@ -225,10 +213,7 @@ mod tests {
         zero.headers_done = false;
         assert!(!ibd_caught_up(&zero, 0));
         assert!(!ibd_caught_up(&zero, 0));
-        assert_eq!(
-            all_peers_dead_action(&zero, 0, false, 0),
-            AllPeersDead::GiveUpMidCatchup
-        );
+        assert_eq!(all_peers_dead_action(&zero, 0, false, 0), AllPeersDead::GiveUpMidCatchup);
 
         // Dark redial budget exhausted while redial still marked in-flight.
         assert_eq!(
@@ -244,8 +229,7 @@ mod tests {
         assert!(path_drained(&busy));
         use bitcoin::hashes::Hash;
         use bitcoin::BlockHash;
-        busy.ordered
-            .push_back(BlockHash::from_byte_array([1u8; 32]));
+        busy.ordered.push_back(BlockHash::from_byte_array([1u8; 32]));
         assert!(!path_drained(&busy));
         assert!(!ibd_caught_up(&busy, 10));
 
@@ -268,9 +252,7 @@ mod tests {
         at_horizon.max_ready_height = 964_108;
         at_horizon.headers_done = true;
         for i in 1u8..=7 {
-            at_horizon
-                .inflight
-                .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
+            at_horizon.inflight.insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
         }
         assert!(path_drained(&at_horizon));
         assert!(ibd_caught_up(&at_horizon, 964_108));
@@ -304,31 +286,24 @@ mod tests {
         assert!(should_log_empty_headers_lag(64));
         assert!(should_log_empty_headers_lag(128));
         // 21 peers × 8 empties would have logged ~5× if streak reset every 8.
-        let logs: u32 = (1..=200)
-            .filter(|&s| should_log_empty_headers_lag(s))
-            .count() as u32;
+        let logs: u32 = (1..=200).filter(|&s| should_log_empty_headers_lag(s)).count() as u32;
         assert!(logs <= 5, "expected sparse logs in 200 empties, got {logs}");
 
         assert!(should_rerequest_headers_on_empty_lag(1));
         assert!(!should_rerequest_headers_on_empty_lag(2));
         assert!(should_rerequest_headers_on_empty_lag(8));
         assert!(should_rerequest_headers_on_empty_lag(16));
-        let regets: u32 = (1..=64)
-            .filter(|&s| should_rerequest_headers_on_empty_lag(s))
-            .count() as u32;
+        let regets: u32 =
+            (1..=64).filter(|&s| should_rerequest_headers_on_empty_lag(s)).count() as u32;
         assert_eq!(regets, 9); // 1,8,16,...,64
 
         // Full store reseed is sparser than getheaders (O(headers) walk).
         assert!(should_reseed_work_path_on_empty_lag(1, true));
         assert!(!should_reseed_work_path_on_empty_lag(8, true));
         assert!(should_reseed_work_path_on_empty_lag(64, true));
-        let reseeds: u32 = (1..=64)
-            .filter(|&s| should_reseed_work_path_on_empty_lag(s, true))
-            .count() as u32;
-        assert!(
-            reseeds < regets,
-            "reseed={reseeds} must be rarer than reget={regets}"
-        );
+        let reseeds: u32 =
+            (1..=64).filter(|&s| should_reseed_work_path_on_empty_lag(s, true)).count() as u32;
+        assert!(reseeds < regets, "reseed={reseeds} must be rarer than reget={regets}");
 
         // Live ordered path already has locator tips — do not walk the header graph.
         assert!(!should_reseed_work_path_on_empty_lag(1, false));
@@ -337,16 +312,10 @@ mod tests {
 
         // Already-known 1-header at tip must not re-getheaders (storm).
         assert!(!should_advance_locator_after_known_batch(0, 0, false, true));
-        assert!(!should_advance_locator_after_known_batch(
-            0, 0, false, false
-        ));
+        assert!(!should_advance_locator_after_known_batch(0, 0, false, false));
         // Live path + full window still advances.
-        assert!(should_advance_locator_after_known_batch(
-            8_000, 0, true, false
-        ));
-        assert!(should_advance_locator_after_known_batch(
-            8_000, 10, false, false
-        ));
+        assert!(should_advance_locator_after_known_batch(8_000, 0, true, false));
+        assert!(should_advance_locator_after_known_batch(8_000, 10, false, false));
 
         // Empty path at horizon: no fan (finish sync / SH / tip follow).
         let mut at = IbdWorkState::new(Vec::new(), None, Some(100));
@@ -358,8 +327,7 @@ mod tests {
         near.max_peer_height = 102;
         near.max_ready_height = 100;
         near.record_height(h(0x2a), 101);
-        near.inflight
-            .insert(h(0x2a), super::super::state::InflightReq::new(0));
+        near.inflight.insert(h(0x2a), super::super::state::InflightReq::new(0));
         assert_eq!(empty_path_header_fan(&near, 100, 29), 0);
         // Mid-sync empty: fan (cap 4); one peer if on-path getdata already inflight.
         let mut mid = IbdWorkState::new(Vec::new(), None, Some(100));
@@ -367,8 +335,7 @@ mod tests {
         mid.max_ready_height = 100;
         assert_eq!(empty_path_header_fan(&mid, 100, 29), 4);
         mid.record_height(h(0x2a), 101);
-        mid.inflight
-            .insert(h(0x2a), super::super::state::InflightReq::new(0));
+        mid.inflight.insert(h(0x2a), super::super::state::InflightReq::new(0));
         assert_eq!(empty_path_header_fan(&mid, 100, 29), 1);
         let mut few = IbdWorkState::new(Vec::new(), None, Some(100));
         few.max_peer_height = 200;
@@ -395,9 +362,7 @@ mod tests {
         for i in 1u8..=7 {
             let hash = h(i);
             explore.inflight.insert(hash, InflightReq::new(0));
-            explore
-                .reorg
-                .register_explore(std::iter::once(hash), Some(hash));
+            explore.reorg.register_explore(std::iter::once(hash), Some(hash));
         }
         assert!(
             ibd_caught_up(&explore, tip),
@@ -412,10 +377,7 @@ mod tests {
         for i in 1u8..=7 {
             orphans.inflight.insert(h(i), InflightReq::new(0));
         }
-        assert!(
-            ibd_caught_up(&orphans, tip),
-            "orphan inflight at horizon must not block catch-up"
-        );
+        assert!(ibd_caught_up(&orphans, tip), "orphan inflight at horizon must not block catch-up");
 
         // Competing hash_height above tip must not zero lag or complete two short.
         let mut fork = IbdWorkState::new(Vec::new(), None, Some(100));
@@ -473,20 +435,14 @@ mod tests {
         zero.max_peer_height = 958_900;
         zero.max_ready_height = 0;
         assert!(!ibd_caught_up(&zero, 0));
-        assert_eq!(
-            all_peers_dead_action(&zero, 0, false, 0),
-            AllPeersDead::GiveUpMidCatchup
-        );
+        assert_eq!(all_peers_dead_action(&zero, 0, false, 0), AllPeersDead::GiveUpMidCatchup);
 
         // Dead peers at horizon with empty remainder → complete.
         let mut done = IbdWorkState::new(Vec::new(), None, Some(100));
         done.max_peer_height = 100;
         done.max_ready_height = 100;
         done.headers_done = true;
-        assert_eq!(
-            all_peers_dead_action(&done, 100, false, 0),
-            AllPeersDead::CatchupComplete
-        );
+        assert_eq!(all_peers_dead_action(&done, 100, false, 0), AllPeersDead::CatchupComplete);
 
         // Still asking: inflated start_height, no empty-EOF yet.
         let mut signet = IbdWorkState::new(Vec::new(), None, Some(2000));
@@ -548,8 +504,7 @@ mod tests {
         st.max_ready_height = 100;
         st.headers_done = true;
         for i in 1u8..=7 {
-            st.inflight
-                .insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
+            st.inflight.insert(BlockHash::from_byte_array([i; 32]), InflightReq::new(0));
         }
         assert_eq!(header_lag_behind_peers(&st, 100), 5);
         assert!(

@@ -163,10 +163,7 @@ fn body_rejected_subset_of_consensus_invalid() {
         ("consensus: script verification failed: script false", true),
         ("consensus: prevout already spent on best chain", true),
         ("consensus: pow invalid", true),
-        (
-            "tx put_full_batch fk mismatch (plan not committed in order)",
-            false,
-        ),
+        ("tx put_full_batch fk mismatch (plan not committed in order)", false),
         ("connect height not tip+1", false),
         ("consensus: bad block: merkle root mismatch", false),
         (
@@ -179,11 +176,7 @@ fn body_rejected_subset_of_consensus_invalid() {
     for (i, (err, must_reject)) in cases.iter().enumerate() {
         let hash = h(i as u8 + 1);
         apply_confirm_reject(&mut st, 11, hash, err, None, None);
-        assert_eq!(
-            st.body.is_rejected(&hash),
-            *must_reject,
-            "rejected({err}) want {must_reject}"
-        );
+        assert_eq!(st.body.is_rejected(&hash), *must_reject, "rejected({err}) want {must_reject}");
     }
 }
 
@@ -202,10 +195,7 @@ fn multi_block_consensus_invalid_does_not_blacklist_first_hash() {
         8,
         None,
     );
-    assert!(
-        !st.body.is_rejected(&hash),
-        "batch-first hash must not be blacklisted"
-    );
+    assert!(!st.body.is_rejected(&hash), "batch-first hash must not be blacklisted");
     assert!(!st.reorg.invalid.contains(hash.to_byte_array()));
 }
 
@@ -271,10 +261,7 @@ fn confirm_reject_blacklist_surface() {
         None,
         None,
     );
-    assert!(
-        !st.body.is_rejected(&hash),
-        "denserels layout miss is engine-fault, not blacklist"
-    );
+    assert!(!st.body.is_rejected(&hash), "denserels layout miss is engine-fault, not blacklist");
     assert!(st.engine_fault_seen.contains(&hash));
     assert!(st.halt.is_none());
     apply_confirm_reject(
@@ -317,10 +304,7 @@ fn confirm_reject_blacklist_surface() {
         None,
         None,
     );
-    assert!(
-        !st.body.is_rejected(&hash),
-        "fk mismatch is cascade requeue, not blacklist"
-    );
+    assert!(!st.body.is_rejected(&hash), "fk mismatch is cascade requeue, not blacklist");
 
     // Merkle mismatch (corrupt Class A reconstruct) → soft re-get, not blacklist.
     // Drive clear_archived_body when a Query is present (production IBD path).
@@ -338,10 +322,7 @@ fn confirm_reject_blacklist_surface() {
     };
     let hfk = q.put_header(&hdr).unwrap();
     // Associate a dummy Class A range so clear_body has something to drop.
-    q.store()
-        .header_txs
-        .put_range(hfk, rbitcoin_primitives::Fk(1), 1)
-        .unwrap();
+    q.store().header_txs.put_range(hfk, rbitcoin_primitives::Fk(1), 1).unwrap();
     assert!(q.store().header_txs.has_body(hfk).unwrap());
 
     let mut st = IbdWorkState::new(Vec::new(), None, Some(938_453));
@@ -407,10 +388,7 @@ fn confirm_reject_blacklist_surface() {
         !st.body.is_rejected(&hash),
         "missing retarget first header must soft, not permanent-blacklist tip+1"
     );
-    assert!(
-        st.ordered_set.contains(&hash),
-        "soft path leaves ordered path intact"
-    );
+    assert!(st.ordered_set.contains(&hash), "soft path leaves ordered path intact");
 
     // prevout-spent: permanent if it reaches here (write should skip-accept
     // when already committed; soft was a race bandaid).
@@ -507,12 +485,8 @@ fn bad_prev_gathers_winner_via_bq_by_hash() {
     let ext = mine(win.block_hash(), 1_300_000_300, 2);
     hub.ensure_header(&ext.header).unwrap();
     // Winner on BQ under a free height key (tip height already dequeued after confirm).
-    hub.query
-        .block_queue_offer(1, win.block_hash().to_byte_array(), 0, &serialize(&win))
-        .unwrap();
-    hub.query
-        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
-        .unwrap();
+    hub.query.block_queue_offer(1, win.block_hash().to_byte_array(), 0, &serialize(&win)).unwrap();
+    hub.query.block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext)).unwrap();
     assert!(hub
         .query
         .block_queue_payload_by_hash(&win.block_hash().to_byte_array())
@@ -616,9 +590,7 @@ fn exploration_apply_win_held_ext_only_in_bq() {
     hub.ensure_header(&ext.header).unwrap();
 
     // Ext only in BQ (height tip+1) — not held. Win held as same-height sibling.
-    hub.query
-        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
-        .unwrap();
+    hub.query.block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext)).unwrap();
     assert!(hub
         .query
         .block_queue_payload_by_hash(&ext.block_hash().to_byte_array())
@@ -638,8 +610,7 @@ fn exploration_apply_win_held_ext_only_in_bq() {
     st.ordered_set.insert(win.block_hash());
     st.ordered_set.insert(ext.block_hash());
     st.reorg.hold_body(win.clone());
-    st.reorg
-        .register_explore([win.block_hash(), ext.block_hash()], Some(ext.block_hash()));
+    st.reorg.register_explore([win.block_hash(), ext.block_hash()], Some(ext.block_hash()));
     // Ext is registered explore and not held — apply must not care.
     assert!(
         st.reorg.need_getdata().contains(&ext.block_hash()),
@@ -742,9 +713,7 @@ fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
     hub.ensure_header(&w3.header).unwrap();
     // Full path bodies available via BQ-by-hash.
     for (ht, b) in [(1u32, &w1), (2, &w2), (3, &w3)] {
-        hub.query
-            .block_queue_offer(ht, b.block_hash().to_byte_array(), 0, &serialize(b))
-            .unwrap();
+        hub.query.block_queue_offer(ht, b.block_hash().to_byte_array(), 0, &serialize(b)).unwrap();
     }
     let mut st = IbdWorkState::new(Vec::new(), Some(l2.block_hash()), Some(2));
     apply_confirm_reject(
@@ -755,11 +724,7 @@ fn multi_hop_bad_prev_applies_when_full_path_bodies_ready() {
         Some(hub.query.as_ref()),
         Some(&hub),
     );
-    assert_eq!(
-        hub.tip_height(),
-        Some(0),
-        "rewind to LCA, do not accept_branch"
-    );
+    assert_eq!(hub.tip_height(), Some(0), "rewind to LCA, do not accept_branch");
     assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
     assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
 
@@ -858,9 +823,7 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
     hub.ensure_header(&w3.header).unwrap();
 
     // Only tip+1 body available (W3); mids W1/W2 missing — log shape.
-    hub.query
-        .block_queue_offer(3, w3.block_hash().to_byte_array(), 0, &serialize(&w3))
-        .unwrap();
+    hub.query.block_queue_offer(3, w3.block_hash().to_byte_array(), 0, &serialize(&w3)).unwrap();
 
     let mut st = IbdWorkState::new(Vec::new(), Some(l2.block_hash()), Some(2));
     apply_confirm_reject(
@@ -877,10 +840,7 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
     assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
 
     assert!(st.reorg.need_getdata().is_empty());
-    assert!(
-        !st.body.is_missing(&w3.block_hash()),
-        "must not mark_missing the winning-path hash"
-    );
+    assert!(!st.body.is_missing(&w3.block_hash()), "must not mark_missing the winning-path hash");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1010,11 +970,8 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
 
     // Resume seed as IBD does after open (mainnet explore_need log).
     let (cmd_tx, _rx) = mpsc::unbounded_channel();
-    let task = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .spawn(async {});
+    let task =
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().spawn(async {});
     let slot = PeerSlot {
         id: 0,
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444),
@@ -1031,11 +988,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     let mut st = IbdWorkState::new(vec![slot], hub.tip_hash(), hub.tip_height());
     seed_work_path_from_store(&mut st, &hub);
 
-    assert_eq!(
-        hub.tip_hash(),
-        Some(gen),
-        "resume seed must rewind the loser tip to the LCA"
-    );
+    assert_eq!(hub.tip_hash(), Some(gen), "resume seed must rewind the loser tip to the LCA");
     assert_eq!(hub.tip_height(), Some(0));
     assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
     assert_eq!(st.height_to_hash.get(&2), Some(&w2.block_hash()));
@@ -1070,11 +1023,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 0,
-            hash: w1.block_hash(),
-            payload: serialize(&w1),
-        },
+        PeerEvent::BlockFramed { peer: 0, hash: w1.block_hash(), payload: serialize(&w1) },
         &write_next,
         &mut book,
         local,
@@ -1082,9 +1031,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     );
     assert!(
         hub.query.block_queue_has_height(1)
-            || hub
-                .query
-                .block_queue_has_hash(&w1.block_hash().to_byte_array()),
+            || hub.query.block_queue_has_hash(&w1.block_hash().to_byte_array()),
         "W1 must land in the body queue as a linear tip+1"
     );
     assert_ne!(hub.tip_hash().unwrap(), l2.block_hash());
@@ -1193,11 +1140,8 @@ fn zombie_pending_mid_at_confirmed_height_never_reget() {
     hub.ensure_header(&w3.header).unwrap();
 
     let (cmd_tx, _rx) = mpsc::unbounded_channel();
-    let task = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .spawn(async {});
+    let task =
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().spawn(async {});
     let slot = PeerSlot {
         id: 0,
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
@@ -1293,10 +1237,7 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
             bits,
             nonce: 0,
         };
-        let mut block = bitcoin::Block {
-            header,
-            txdata: vec![coinbase(height)],
-        };
+        let mut block = bitcoin::Block { header, txdata: vec![coinbase(height)] };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let target = Target::from_compact(bits);
         for nonce in 0..u32::MAX {
@@ -1326,9 +1267,7 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
     // Winning sibling body held by hash (cannot share tip height BQ slot).
     // Ext body on BQ at tip+1 — the real BadPrev wire shape.
     let wire = serialize(&ext);
-    hub.query
-        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &wire)
-        .unwrap();
+    hub.query.block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &wire).unwrap();
 
     let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
     st.ordered.push_back(ext.block_hash());
@@ -1346,11 +1285,7 @@ fn bad_prev_competing_path_reorgs_via_apply_confirm_reject() {
         Some(hub.query.as_ref()),
         Some(&hub),
     );
-    assert_eq!(
-        hub.tip_height(),
-        Some(0),
-        "rewind to LCA even if winner body is held"
-    );
+    assert_eq!(hub.tip_height(), Some(0), "rewind to LCA even if winner body is held");
     assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
     assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
     assert_ne!(hub.tip_hash().unwrap(), pre_tip);
@@ -1432,9 +1367,7 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
     hub.ensure_header(&win.header).unwrap();
     let ext = mine(win.block_hash(), 1_300_000_300, 2);
     hub.ensure_header(&ext.header).unwrap();
-    hub.query
-        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
-        .unwrap();
+    hub.query.block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext)).unwrap();
 
     let mut st = IbdWorkState::new(Vec::new(), Some(lose.block_hash()), Some(1));
     // No winner held — CompetingPath awaits densify.
@@ -1446,11 +1379,7 @@ fn bad_prev_awaits_winner_body_then_reorgs_when_held() {
         Some(hub.query.as_ref()),
         Some(&hub),
     );
-    assert_eq!(
-        hub.tip_height(),
-        Some(0),
-        "rewind does not wait for winner body"
-    );
+    assert_eq!(hub.tip_height(), Some(0), "rewind does not wait for winner body");
     assert_eq!(st.height_to_hash.get(&1), Some(&win.block_hash()));
     assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
 
@@ -1531,9 +1460,7 @@ fn bad_prev_after_take_raw_classifies() {
     hub.ensure_header(&win.header).unwrap();
     let ext = mine(win.block_hash(), 1_300_000_300, 2);
     hub.ensure_header(&ext.header).unwrap();
-    hub.query
-        .block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext))
-        .unwrap();
+    hub.query.block_queue_offer(2, ext.block_hash().to_byte_array(), 0, &serialize(&ext)).unwrap();
     assert!(hub.query.block_queue_take_raw(2).is_some());
     hub.query.set_lookup_taken_hi(Some(2));
     assert!(
@@ -1697,10 +1624,7 @@ fn post_lookup_reject_rewinds_taken_hi() {
     for &(err, rewind) in cases {
         hub.query.set_lookup_taken_hi(Some(2));
         hub.query.set_lookup_started_hi(Some(2));
-        assert!(
-            hub.query.lookup_already_taken(2),
-            "precondition: height 2 is taken before {err}"
-        );
+        assert!(hub.query.lookup_already_taken(2), "precondition: height 2 is taken before {err}");
         apply_confirm_reject(&mut st, 2, hash, err, Some(hub.query.as_ref()), Some(&hub));
         if rewind {
             assert_eq!(
@@ -1713,16 +1637,9 @@ fn post_lookup_reject_rewinds_taken_hi() {
                 tip,
                 "{err} must rewind started_hi with taken_hi"
             );
-            assert!(
-                !hub.query.lookup_already_taken(2),
-                "{err} must not leave height 2 as in-hand"
-            );
+            assert!(!hub.query.lookup_already_taken(2), "{err} must not leave height 2 as in-hand");
         } else {
-            assert_eq!(
-                hub.query.lookup_taken_hi(),
-                Some(2),
-                "Cancelled must not rewind taken_hi"
-            );
+            assert_eq!(hub.query.lookup_taken_hi(), Some(2), "Cancelled must not rewind taken_hi");
         }
     }
 }
@@ -1753,21 +1670,10 @@ fn engine_fault_loc_hole_does_not_isolate_or_rewind() {
         8,
         Some(&feed),
     );
-    assert_eq!(
-        feed.isolate_until(),
-        u32::MAX,
-        "EngineFault must not enter single-block isolate"
-    );
-    assert_eq!(
-        hub.query.lookup_taken_hi(),
-        Some(2),
-        "EngineFault must not rewind taken_hi"
-    );
+    assert_eq!(feed.isolate_until(), u32::MAX, "EngineFault must not enter single-block isolate");
+    assert_eq!(hub.query.lookup_taken_hi(), Some(2), "EngineFault must not rewind taken_hi");
     assert_eq!(hub.query.lookup_started_hi(), Some(2));
-    assert!(
-        st.halt.is_none(),
-        "first engine fault requeues, does not halt"
-    );
+    assert!(st.halt.is_none(), "first engine fault requeues, does not halt");
 }
 
 /// Wire-path soft budget charged on receive must release on script reject
@@ -1840,11 +1746,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: h(9),
-            payload: vec![0u8; 80],
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: h(9), payload: vec![0u8; 80] },
         &write_next,
         &mut book,
         local,
@@ -1859,8 +1761,7 @@ fn apply_peer_event_body_and_control_surface() {
     st.body.mark_archived(class_a_hash);
     st.record_height(class_a_hash, 1);
     st.height_to_hash.insert(1, class_a_hash);
-    st.header_fks
-        .insert(class_a_hash, rbitcoin_primitives::Fk(1));
+    st.header_fks.insert(class_a_hash, rbitcoin_primitives::Fk(1));
     st.slots[0].in_flight.insert(class_a_hash);
     st.inflight.insert(class_a_hash, InflightReq::new(1));
     // Minimal framed payload (header prefix + empty body is enough for offer).
@@ -1869,11 +1770,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: class_a_hash,
-            payload,
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: class_a_hash, payload },
         &write_next,
         &mut book,
         local,
@@ -1893,10 +1790,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockDecodeFailed {
-            peer: 1,
-            hash: h(9),
-        },
+        PeerEvent::BlockDecodeFailed { peer: 1, hash: h(9) },
         &write_next,
         &mut book,
         local,
@@ -1910,10 +1804,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![hdr],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![hdr] },
         &write_next,
         &mut book,
         local,
@@ -1928,10 +1819,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![] },
         &write_next,
         &mut book,
         local,
@@ -1945,10 +1833,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::NotFound {
-            peer: 1,
-            hashes: vec![h(3)],
-        },
+        PeerEvent::NotFound { peer: 1, hashes: vec![h(3)] },
         &write_next,
         &mut book,
         local,
@@ -1960,11 +1845,7 @@ fn apply_peer_event_body_and_control_surface() {
     inject_learned_addrs(&mut book, &[], local, 1);
     inject_learned_addrs(
         &mut book,
-        &[
-            addr(2),
-            local,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1),
-        ],
+        &[addr(2), local, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)],
         local,
         1,
     );
@@ -1976,10 +1857,7 @@ fn apply_peer_event_body_and_control_surface() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Dead {
-            peer: 1,
-            reason: "bye".into(),
-        },
+        PeerEvent::Dead { peer: 1, reason: "bye".into() },
         &write_next,
         &mut book,
         local,
@@ -2077,10 +1955,7 @@ fn apply_peer_event_repeat_headers_skips_ensure_header_fk() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![h1, h2, h3],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![h1, h2, h3] },
         &write_next,
         &mut book,
         local,
@@ -2096,10 +1971,7 @@ fn apply_peer_event_repeat_headers_skips_ensure_header_fk() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![h1, h2, h3],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![h1, h2, h3] },
         &write_next,
         &mut book,
         local,
@@ -2189,11 +2061,8 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
         }
     }
     fn coinbase(height: u32) -> Transaction {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            rbitcoin_consensus::bip34_height_script(height)
-        };
+        let mut ss =
+            if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }
@@ -2221,10 +2090,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
             bits: CompactTarget::from_consensus(0x207fffff),
             nonce: n,
         };
-        let mut b = Block {
-            header,
-            txdata: vec![coinbase(height)],
-        };
+        let mut b = Block { header, txdata: vec![coinbase(height)] };
         b.header.merkle_root = b.compute_merkle_root().unwrap();
         rbitcoin_consensus::grind_regtest_pow(&mut b.header);
         b
@@ -2247,16 +2113,11 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     let b1 = shell(gen, 1, 1);
     let h1 = b1.block_hash();
     st.record_height(h1, 1);
-    st.header_fks
-        .insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
+    st.header_fks.insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: h1,
-            payload: ser(&b1),
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: h1, payload: ser(&b1) },
         &write_next,
         &mut book,
         local,
@@ -2268,11 +2129,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: h1,
-            payload: ser(&b1),
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: h1, payload: ser(&b1) },
         &write_next,
         &mut book,
         local,
@@ -2283,26 +2140,18 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     let b2 = shell(h1, 2, 2);
     let h2 = b2.block_hash();
     st.record_height(h2, 2);
-    st.header_fks
-        .insert(h2, hub.ensure_header_fk(&b2.header).unwrap());
+    st.header_fks.insert(h2, hub.ensure_header_fk(&b2.header).unwrap());
     hub.query.set_lookup_taken_hi(Some(2));
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: h2,
-            payload: ser(&b2),
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: h2, payload: ser(&b2) },
         &write_next,
         &mut book,
         local,
         None,
     );
-    assert!(
-        !st.body.is_pending(&h2),
-        "taken height must not mark_pending (zombie re-race)"
-    );
+    assert!(!st.body.is_pending(&h2), "taken height must not mark_pending (zombie re-race)");
     assert!(!hub.query.block_queue_has_height(2));
     hub.query.set_lookup_taken_hi(None);
 
@@ -2313,11 +2162,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: far_hash,
-            payload: ser(&far),
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: far_hash, payload: ser(&far) },
         &write_next,
         &mut book,
         local,
@@ -2334,10 +2179,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
         apply_peer_event(
             &mut st,
             &hub,
-            PeerEvent::Headers {
-                peer: 1,
-                headers: vec![],
-            },
+            PeerEvent::Headers { peer: 1, headers: vec![] },
             &write_next,
             &mut book,
             local,
@@ -2355,19 +2197,13 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![] },
         &write_next,
         &mut book,
         local,
         None,
     );
-    assert!(
-        st.headers_done,
-        "empty-EOF latches even when advertised height is far ahead"
-    );
+    assert!(st.headers_done, "empty-EOF latches even when advertised height is far ahead");
 
     use super::super::MAX_PEER_POOL;
     for i in 0..MAX_PEER_POOL {
@@ -2387,12 +2223,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
 
     let (body_tx, mut body_rx) = mpsc::unbounded_channel();
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
-    body_tx
-        .send(PeerEvent::BlockDecodeFailed {
-            peer: 1,
-            hash: h(0x88),
-        })
-        .unwrap();
+    body_tx.send(PeerEvent::BlockDecodeFailed { peer: 1, hash: h(0x88) }).unwrap();
     ctrl_tx
         .send(PeerEvent::Addrs {
             peer: 1,
@@ -2412,12 +2243,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
         None,
     )
     .unwrap();
-    assert!(
-        stats
-            .drain_events
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= 1
-    );
+    assert!(stats.drain_events.load(std::sync::atomic::Ordering::Relaxed) >= 1);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2468,11 +2294,8 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
         }
     }
     fn coinbase(height: u32) -> Transaction {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            rbitcoin_consensus::bip34_height_script(height)
-        };
+        let mut ss =
+            if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }
@@ -2500,10 +2323,7 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
             bits: CompactTarget::from_consensus(0x207fffff),
             nonce: n,
         };
-        let mut b = Block {
-            header,
-            txdata: vec![coinbase(height)],
-        };
+        let mut b = Block { header, txdata: vec![coinbase(height)] };
         b.header.merkle_root = b.compute_merkle_root().unwrap();
         rbitcoin_consensus::grind_regtest_pow(&mut b.header);
         b
@@ -2522,8 +2342,7 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
     let b1 = shell(gen, 1, 1);
     let h1 = b1.block_hash();
     st.record_height(h1, 1);
-    st.header_fks
-        .insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
+    st.header_fks.insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
     st.slots[0].in_flight.insert(h1);
     st.inflight.insert(h1, InflightReq::new(1));
 
@@ -2532,11 +2351,7 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: h1,
-            payload,
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: h1, payload },
         &write_next,
         &mut book,
         local,
@@ -2552,11 +2367,7 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::BlockFramed {
-            peer: 1,
-            hash: h1,
-            payload: payload2,
-        },
+        PeerEvent::BlockFramed { peer: 1, hash: h1, payload: payload2 },
         &write_next,
         &mut book,
         local,
@@ -2631,10 +2442,7 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![hdr],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![hdr] },
         &write_next,
         &mut book,
         local,
@@ -2655,42 +2463,29 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![hdr],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![hdr] },
         &write_next,
         &mut book,
         local,
         None,
     );
-    assert!(
-        st.ordered_set.contains(&hash),
-        "known header must re-enter ordered after tip drain"
-    );
+    assert!(st.ordered_set.contains(&hash), "known header must re-enter ordered after tip drain");
     assert_eq!(st.ordered.len(), 1);
 
     // Inflight getdata: announce again must not re-queue (tip storm).
     st.ordered.clear();
     st.ordered_set.clear();
-    st.inflight
-        .insert(hash, super::super::state::InflightReq::new(1));
+    st.inflight.insert(hash, super::super::state::InflightReq::new(1));
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![hdr],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![hdr] },
         &write_next,
         &mut book,
         local,
         None,
     );
-    assert!(
-        !st.ordered_set.contains(&hash),
-        "inflight hash must not re-enter ordered"
-    );
+    assert!(!st.ordered_set.contains(&hash), "inflight hash must not re-enter ordered");
     st.inflight.clear();
 
     // Pending BQ wire: same.
@@ -2698,19 +2493,13 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![hdr],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![hdr] },
         &write_next,
         &mut book,
         local,
         None,
     );
-    assert!(
-        !st.ordered_set.contains(&hash),
-        "pending hash must not re-enter ordered"
-    );
+    assert!(!st.ordered_set.contains(&hash), "pending hash must not re-enter ordered");
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -2783,10 +2572,7 @@ fn path_slot_first_wins_chained_via_headers() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![a],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![a] },
         &write_next,
         &mut book,
         local,
@@ -2795,29 +2581,16 @@ fn path_slot_first_wins_chained_via_headers() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![b],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![b] },
         &write_next,
         &mut book,
         local,
         None,
     );
-    assert_eq!(
-        st.height_to_hash.get(&1).copied(),
-        Some(ha),
-        "first chained header keeps the slot"
-    );
+    assert_eq!(st.height_to_hash.get(&1).copied(), Some(ha), "first chained header keeps the slot");
     assert!(st.known_headers.contains(&hb));
-    assert!(
-        !st.ordered_set.contains(&hb),
-        "later sibling must not enter ordered"
-    );
-    assert!(
-        !st.is_on_path(&hb, 1),
-        "competitor is hash_height-only, not path occupancy"
-    );
+    assert!(!st.ordered_set.contains(&hb), "later sibling must not enter ordered");
+    assert!(!st.is_on_path(&hb, 1), "competitor is hash_height-only, not path occupancy");
     assert!(
         st.reorg.explore_need_hashes().contains(&hb),
         "occupied-height sibling registers explore, not path"
@@ -2827,10 +2600,7 @@ fn path_slot_first_wins_chained_via_headers() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![dummy_header(gen, 3)],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![dummy_header(gen, 3)] },
         &write_next,
         &mut book,
         local,
@@ -2847,10 +2617,7 @@ fn path_slot_first_wins_chained_via_headers() {
     apply_peer_event(
         &mut st,
         &hub,
-        PeerEvent::Headers {
-            peer: 1,
-            headers: vec![ext],
-        },
+        PeerEvent::Headers { peer: 1, headers: vec![ext] },
         &write_next,
         &mut book,
         local,
@@ -2998,16 +2765,10 @@ fn heavier_fork_invalid_mid_does_not_blacklist_weaker() {
     for (i, blk) in a.iter().enumerate() {
         st.hash_height.insert(blk.block_hash(), (i as u32) + 1);
     }
-    st.reorg.register_explore(
-        std::iter::empty::<BlockHash>(),
-        Some(b_fork[9].block_hash()),
-    );
+    st.reorg.register_explore(std::iter::empty::<BlockHash>(), Some(b_fork[9].block_hash()));
     assert!(super::super::reorg::maybe_rewind_to_best_work(&mut st, &hub).unwrap());
     assert_eq!(hub.tip_height(), Some(0), "rewound to LCA");
-    assert!(
-        !st.ordered.is_empty(),
-        "ordered must be planted after rewind"
-    );
+    assert!(!st.ordered.is_empty(), "ordered must be planted after rewind");
 
     hub.accept_block(b_fork[0].clone()).unwrap();
     hub.accept_block(b_fork[1].clone()).unwrap();
@@ -3028,19 +2789,10 @@ fn heavier_fork_invalid_mid_does_not_blacklist_weaker() {
     assert!(!st.body.is_rejected(&b_fork[0].block_hash()));
     assert!(!st.body.is_rejected(&b_fork[1].block_hash()));
     for blk in &a {
-        assert!(
-            !st.body.is_rejected(&blk.block_hash()),
-            "weaker fork A must not be blacklisted"
-        );
+        assert!(!st.body.is_rejected(&blk.block_hash()), "weaker fork A must not be blacklisted");
     }
-    assert!(st
-        .reorg
-        .invalid
-        .contains(b_fork[2].block_hash().to_byte_array()));
-    assert!(!st
-        .reorg
-        .invalid
-        .contains(b_fork[0].block_hash().to_byte_array()));
+    assert!(st.reorg.invalid.contains(b_fork[2].block_hash().to_byte_array()));
+    assert!(!st.reorg.invalid.contains(b_fork[0].block_hash().to_byte_array()));
     assert_eq!(
         hub.tip_height(),
         Some(0),
@@ -3062,9 +2814,7 @@ fn heavier_fork_invalid_mid_does_not_blacklist_weaker() {
     );
     for blk in &a {
         assert!(
-            hub.query
-                .is_block_archived(&blk.block_hash().to_byte_array())
-                .unwrap(),
+            hub.query.is_block_archived(&blk.block_hash().to_byte_array()).unwrap(),
             "fork A Class A bodies stay eligible for linear confirm"
         );
     }
@@ -3171,8 +2921,7 @@ fn heavier_fork_valid_does_not_blacklist_loser() {
     st.record_height(b1.block_hash(), 1);
     st.record_height(b2.block_hash(), 2);
     st.record_height(b3.block_hash(), 3);
-    st.reorg
-        .register_explore(std::iter::empty::<BlockHash>(), Some(b3.block_hash()));
+    st.reorg.register_explore(std::iter::empty::<BlockHash>(), Some(b3.block_hash()));
     assert!(super::super::reorg::maybe_rewind_to_best_work(&mut st, &hub).unwrap());
     hub.accept_block(b1.clone()).unwrap();
     hub.accept_block(b2.clone()).unwrap();

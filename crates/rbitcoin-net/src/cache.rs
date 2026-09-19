@@ -40,10 +40,7 @@ impl BlockCache {
     }
 
     pub fn with_body_depth(body_depth: usize) -> Self {
-        Self {
-            inner: RwLock::new(Inner::default()),
-            body_depth: body_depth.max(1),
-        }
+        Self { inner: RwLock::new(Inner::default()), body_depth: body_depth.max(1) }
     }
 
     pub fn tip_height(&self) -> Option<u32> {
@@ -76,21 +73,11 @@ impl BlockCache {
     }
 
     pub fn get_header(&self, hash: &BlockHash) -> Option<Header> {
-        self.inner
-            .read()
-            .unwrap()
-            .by_hash
-            .get(hash)
-            .map(|b| b.header)
+        self.inner.read().unwrap().by_hash.get(hash).map(|b| b.header)
     }
 
     pub fn hash_at_height(&self, height: u32) -> Option<BlockHash> {
-        self.inner
-            .read()
-            .unwrap()
-            .chain
-            .get(height as usize)
-            .copied()
+        self.inner.read().unwrap().chain.get(height as usize).copied()
     }
 
     pub fn header_at_height(&self, height: u32) -> Option<Header> {
@@ -196,12 +183,7 @@ impl BlockCache {
             }
         }
         let mut out = Vec::new();
-        for h in g
-            .chain
-            .iter()
-            .skip(start)
-            .take(crate::codec::MAX_HEADERS_RESULTS)
-        {
+        for h in g.chain.iter().skip(start).take(crate::codec::MAX_HEADERS_RESULTS) {
             if let Some(b) = g.by_hash.get(h) {
                 out.push(b.header);
                 if *h == stop && stop.to_byte_array() != [0u8; 32] {

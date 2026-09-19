@@ -101,9 +101,7 @@ pub fn enabled(level: Level) -> bool {
 /// recognizable level token wins. Missing/invalid → leave current max unchanged
 /// and return `false`.
 pub fn init_from_env() -> bool {
-    let raw = std::env::var("RBITCOIN_LOG")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .ok();
+    let raw = std::env::var("RBITCOIN_LOG").or_else(|_| std::env::var("RUST_LOG")).ok();
     let Some(raw) = raw else {
         return false;
     };
@@ -263,9 +261,7 @@ mod tests {
     /// Global log level is process-wide; serialize tests that call `init*`.
     fn lock_log_init() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -323,22 +319,13 @@ mod tests {
         let logs = take_logs();
         capture_logs(false);
         init(Level::Info);
+        assert!(logs.iter().any(|(l, m)| *l == Level::Error && m.contains("shown 1")), "{logs:?}");
         assert!(
-            logs.iter()
-                .any(|(l, m)| *l == Level::Error && m.contains("shown 1")),
-            "{logs:?}"
-        );
-        assert!(
-            logs.iter()
-                .any(|(l, m)| *l == Level::Error && m.contains("bold shown")),
+            logs.iter().any(|(l, m)| *l == Level::Error && m.contains("bold shown")),
             "{logs:?}"
         );
         // Capture is independent of enabled(); Info is recorded but not emitted.
-        assert!(
-            logs.iter()
-                .any(|(l, m)| *l == Level::Info && m.contains("hidden")),
-            "{logs:?}"
-        );
+        assert!(logs.iter().any(|(l, m)| *l == Level::Info && m.contains("hidden")), "{logs:?}");
     }
 
     #[test]
@@ -351,13 +338,11 @@ mod tests {
         capture_logs(false);
         init(Level::Info);
         assert!(
-            logs.iter()
-                .any(|(l, m)| *l == Level::Info && m.contains("ibd: sizes")),
+            logs.iter().any(|(l, m)| *l == Level::Info && m.contains("ibd: sizes")),
             "{logs:?}"
         );
         assert!(
-            logs.iter()
-                .any(|(l, m)| *l == Level::Debug && m.contains("ibd: perf")),
+            logs.iter().any(|(l, m)| *l == Level::Debug && m.contains("ibd: perf")),
             "{logs:?}"
         );
     }

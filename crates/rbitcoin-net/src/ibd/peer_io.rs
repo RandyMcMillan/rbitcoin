@@ -255,10 +255,8 @@ pub(crate) async fn spawn_peer(
                             move |msg| {
                                 match msg.into_payload() {
                                     NetworkMessage::Headers(h) => {
-                                        sinks_d.send_ctrl(PeerEvent::Headers {
-                                            peer: id,
-                                            headers: h,
-                                        });
+                                        sinks_d
+                                            .send_ctrl(PeerEvent::Headers { peer: id, headers: h });
                                     }
                                     NetworkMessage::NotFound(inv) => {
                                         let hashes: Vec<BlockHash> = inv
@@ -313,17 +311,12 @@ pub(crate) async fn spawn_peer(
                         if e.kind() == std::io::ErrorKind::UnexpectedEof
                             || e.kind() == std::io::ErrorKind::ConnectionReset =>
                     {
-                        sinks_r.send_body(PeerEvent::Dead {
-                            peer: id,
-                            reason: format!("eof: {e}"),
-                        });
+                        sinks_r
+                            .send_body(PeerEvent::Dead { peer: id, reason: format!("eof: {e}") });
                         break;
                     }
                     Err(e) => {
-                        sinks_r.send_body(PeerEvent::Dead {
-                            peer: id,
-                            reason: e.to_string(),
-                        });
+                        sinks_r.send_body(PeerEvent::Dead { peer: id, reason: e.to_string() });
                         break;
                     }
                 }
@@ -410,10 +403,7 @@ pub(crate) async fn spawn_peer(
             }
         });
 
-        let mut guard = PeerIoTasks {
-            reader: reader_task,
-            writer: writer_task,
-        };
+        let mut guard = PeerIoTasks { reader: reader_task, writer: writer_task };
         tokio::select! {
             _ = &mut guard.reader => {}
             _ = &mut guard.writer => {}
@@ -522,12 +512,8 @@ mod tests {
         assert!(!services_useful_for_ibd(ServiceFlags::NETWORK_LIMITED));
         assert!(!services_useful_for_ibd(ServiceFlags::P2P_V2));
         assert!(!services_useful_for_ibd(ServiceFlags::NONE));
-        assert!(services_useful_for_ibd(
-            ServiceFlags::NETWORK | ServiceFlags::P2P_V2
-        ));
-        assert!(services_useful_for_ibd(
-            ServiceFlags::NETWORK_LIMITED | ServiceFlags::P2P_V2
-        ));
+        assert!(services_useful_for_ibd(ServiceFlags::NETWORK | ServiceFlags::P2P_V2));
+        assert!(services_useful_for_ibd(ServiceFlags::NETWORK_LIMITED | ServiceFlags::P2P_V2));
 
         let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         assert!(usable_dial_addr(&good));
@@ -576,26 +562,11 @@ mod tests {
     fn event_sinks_send_body_and_ctrl() {
         let (body_tx, mut body_rx) = mpsc::unbounded_channel();
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
-        let sinks = PeerEventSinks {
-            body: body_tx,
-            ctrl: ctrl_tx,
-        };
-        sinks.send_body(PeerEvent::Dead {
-            peer: 1,
-            reason: "x".into(),
-        });
-        sinks.send_ctrl(PeerEvent::Headers {
-            peer: 1,
-            headers: vec![],
-        });
-        assert!(matches!(
-            body_rx.try_recv().unwrap(),
-            PeerEvent::Dead { .. }
-        ));
-        assert!(matches!(
-            ctrl_rx.try_recv().unwrap(),
-            PeerEvent::Headers { .. }
-        ));
+        let sinks = PeerEventSinks { body: body_tx, ctrl: ctrl_tx };
+        sinks.send_body(PeerEvent::Dead { peer: 1, reason: "x".into() });
+        sinks.send_ctrl(PeerEvent::Headers { peer: 1, headers: vec![] });
+        assert!(matches!(body_rx.try_recv().unwrap(), PeerEvent::Dead { .. }));
+        assert!(matches!(ctrl_rx.try_recv().unwrap(), PeerEvent::Headers { .. }));
     }
 
     #[test]
@@ -612,10 +583,8 @@ mod tests {
         let net_v2 = Address::new(&good, v2_net);
         let limited_only = Address::new(&limited_sa, ServiceFlags::NETWORK_LIMITED);
         let limited_v2 = Address::new(&limited_sa, v2_limited);
-        let unusable = Address::new(
-            &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333),
-            v2_net,
-        );
+        let unusable =
+            Address::new(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333), v2_net);
         let out = socket_addrs_from_addr(&[
             (1, no_svc),
             (2, net_only),
@@ -651,13 +620,7 @@ mod tests {
             port: 0,
         };
         let out2 = socket_addrs_from_addrv2(&[v2_good, v2_net_only, v2_bad_svc, v2_zero_port]);
-        assert_eq!(
-            out2,
-            vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
-                18444
-            )]
-        );
+        assert_eq!(out2, vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 18444)]);
 
         let v6_multi =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8333);

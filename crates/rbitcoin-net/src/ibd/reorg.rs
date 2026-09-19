@@ -40,18 +40,10 @@ pub fn classify_bad_prev(
         // Same as tip — not a competing reorg signal (should not be BadPrev).
         return BadPrevClass::CorruptWire { wire_prev };
     }
-    let known = hub
-        .query
-        .get_header_by_hash(&wire_prev.to_byte_array())
-        .ok()
-        .flatten()
-        .is_some()
+    let known = hub.query.get_header_by_hash(&wire_prev.to_byte_array()).ok().flatten().is_some()
         || hub.has_block(&wire_prev);
     if known {
-        BadPrevClass::CompetingPath {
-            winning_prev: wire_prev,
-            losing_tip: tip_hash,
-        }
+        BadPrevClass::CompetingPath { winning_prev: wire_prev, losing_tip: tip_hash }
     } else {
         BadPrevClass::CorruptWire { wire_prev }
     }
@@ -136,11 +128,7 @@ impl IbdReorgState {
 
     /// Hashes densify/getdata should still pull for incomplete exploration.
     pub fn need_getdata(&self) -> Vec<BlockHash> {
-        self.explore_need
-            .iter()
-            .copied()
-            .filter(|h| !self.held_bodies.contains(h))
-            .collect()
+        self.explore_need.iter().copied().filter(|h| !self.held_bodies.contains(h)).collect()
     }
 }
 
@@ -213,10 +201,8 @@ pub(crate) fn parent_hash_of(
     if rec.prev_fk.is_null() {
         return Ok(Some(BlockHash::from_byte_array([0u8; 32])));
     }
-    let parent = hub
-        .query
-        .get_header(rec.prev_fk)
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
+    let parent =
+        hub.query.get_header(rec.prev_fk).map_err(|e| NetError::Consensus(e.to_string()))?;
     Ok(Some(BlockHash::from_byte_array(parent.hash)))
 }
 
@@ -228,9 +214,7 @@ fn header_work_of(hub: &ChainHub, hash: BlockHash) -> Result<Option<bitcoin::Wor
     else {
         return Ok(None);
     };
-    Ok(Some(
-        Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work(),
-    ))
+    Ok(Some(Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work()))
 }
 
 fn our_work_from_lca(hub: &ChainHub, lca_height: u32) -> Result<bitcoin::Work, NetError> {
@@ -327,10 +311,7 @@ fn connecting_hashes_heavier_disconnected_n(
         .height_of_hash(&join.to_byte_array())
         .map_err(|e| NetError::Consensus(e.to_string()))?
     {
-        if let Ok(next) = hub
-            .query
-            .wire_header_at_height(Height(jh.0.saturating_add(1)))
-        {
+        if let Ok(next) = hub.query.wire_header_at_height(Height(jh.0.saturating_add(1))) {
             if next.block_hash() == path[0] {
                 return Ok(None);
             }
@@ -409,10 +390,7 @@ pub fn consider_disconnected_heavier(
             continue;
         }
         if let Some(path) = connecting_hashes_heavier_disconnected(hub, h)? {
-            if path
-                .iter()
-                .any(|p| st.reorg.invalid.contains(p.to_byte_array()))
-            {
+            if path.iter().any(|p| st.reorg.invalid.contains(p.to_byte_array())) {
                 continue;
             }
             return apply_header_rewind(st, hub, &path);
@@ -538,10 +516,7 @@ pub(crate) fn maybe_rewind_to_best_work(
             continue;
         }
         if let Some(path) = connecting_hashes_heavier_disconnected(hub, cand)? {
-            if path
-                .iter()
-                .any(|h| st.reorg.invalid.contains(h.to_byte_array()))
-            {
+            if path.iter().any(|h| st.reorg.invalid.contains(h.to_byte_array())) {
                 continue;
             }
             return apply_header_rewind(st, hub, &path);
@@ -586,10 +561,7 @@ pub(crate) fn apply_header_rewind(
             path.len()
         );
     } else {
-        info!(
-            "ibd: most-work header plant at lca={lca_h} (winning path {} header(s))",
-            path.len()
-        );
+        info!("ibd: most-work header plant at lca={lca_h} (winning path {} header(s))", path.len());
     }
     st.clear_path_above(lca_h);
     hub.query.set_lookup_taken_hi(Some(lca_h));
@@ -604,11 +576,7 @@ pub(crate) fn apply_header_rewind(
         if !hub.is_connected(hash) && st.ordered_set.insert(*hash) {
             st.ordered.push_back(*hash);
         }
-        if hub
-            .query
-            .is_block_archived(&hash.to_byte_array())
-            .unwrap_or(false)
-        {
+        if hub.query.is_block_archived(&hash.to_byte_array()).unwrap_or(false) {
             st.body.mark_archived(*hash);
         }
         prev = *hash;
@@ -639,11 +607,8 @@ mod tests {
     }
 
     fn coinbase(height: u32) -> Transaction {
-        let mut ss = if height == 0 {
-            vec![0x00]
-        } else {
-            rbitcoin_consensus::bip34_height_script(height)
-        };
+        let mut ss =
+            if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
         while ss.len() < 2 {
             ss.push(0x00);
         }
@@ -673,10 +638,7 @@ mod tests {
             bits,
             nonce: 0,
         };
-        let mut block = Block {
-            header,
-            txdata: vec![coinbase(height)],
-        };
+        let mut block = Block { header, txdata: vec![coinbase(height)] };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let target = Target::from_compact(bits);
         for nonce in 0..u32::MAX {
@@ -715,10 +677,7 @@ mod tests {
         assert_eq!(tip, lose.block_hash());
 
         match classify_bad_prev(&hub, win.block_hash(), tip) {
-            BadPrevClass::CompetingPath {
-                winning_prev,
-                losing_tip,
-            } => {
+            BadPrevClass::CompetingPath { winning_prev, losing_tip } => {
                 assert_eq!(winning_prev, win.block_hash());
                 assert_eq!(losing_tip, lose.block_hash());
             }
@@ -761,15 +720,9 @@ mod tests {
         let w2 = mine(w1.block_hash(), 1_500_060_200, 2);
         hub.ensure_header(&w2.header).unwrap();
         let path = header_hashes_to_best_ancestor(&hub, w2.block_hash()).unwrap();
-        assert_eq!(
-            path,
-            vec![w1.block_hash(), w2.block_hash()],
-            "oldest-first mid path to LCA"
-        );
+        assert_eq!(path, vec![w1.block_hash(), w2.block_hash()], "oldest-first mid path to LCA");
         // Already on best chain → empty.
-        assert!(header_hashes_to_best_ancestor(&hub, l1.block_hash())
-            .unwrap()
-            .is_empty());
+        assert!(header_hashes_to_best_ancestor(&hub, l1.block_hash()).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -815,10 +768,7 @@ mod tests {
         for k in &held_keys {
             st_cap.register_explore([*k], None);
         }
-        let still = held_keys
-            .iter()
-            .filter(|k| !st_cap.need_getdata().contains(k))
-            .count();
+        let still = held_keys.iter().filter(|k| !st_cap.need_getdata().contains(k)).count();
         assert_eq!(
             still,
             IbdReorgState::HELD_CAP,
@@ -866,9 +816,7 @@ mod tests {
         let l3 = mine(l2.block_hash(), 1_500_060_300, 3);
         hub.ensure_header(&l3.header).unwrap();
         assert!(
-            connecting_hashes_heavier_disconnected(&hub, l3.block_hash())
-                .unwrap()
-                .is_none(),
+            connecting_hashes_heavier_disconnected(&hub, l3.block_hash()).unwrap().is_none(),
             "child of current tip is a normal extension, not a connecting search"
         );
 
@@ -877,12 +825,7 @@ mod tests {
             .expect("heavier winner that does not connect at tip must name a path");
         assert_eq!(
             path,
-            vec![
-                w1.block_hash(),
-                w2.block_hash(),
-                w3.block_hash(),
-                w4.block_hash()
-            ],
+            vec![w1.block_hash(), w2.block_hash(), w3.block_hash(), w4.block_hash()],
             "path must be winner mids from LCA, not the loser tip+1"
         );
         assert!(!path.contains(&l3.block_hash()));
@@ -937,10 +880,7 @@ mod tests {
         reorg.hold_body(w1.clone());
         reorg.hold_body(w2.clone());
         reorg.hold_body(w3.clone());
-        assert!(
-            reorg.need_getdata().is_empty(),
-            "held connecting prefix satisfies explore need"
-        );
+        assert!(reorg.need_getdata().is_empty(), "held connecting prefix satisfies explore need");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -970,11 +910,7 @@ mod tests {
         st.record_height(w4.block_hash(), 4);
         st.max_ordered_height = 4;
         assert!(consider_disconnected_heavier(&mut st, &hub).unwrap());
-        assert_eq!(
-            hub.tip_height(),
-            Some(0),
-            "competing tip+1 must rewind to the LCA"
-        );
+        assert_eq!(hub.tip_height(), Some(0), "competing tip+1 must rewind to the LCA");
         assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
         assert_eq!(st.height_to_hash.get(&2), Some(&w2.block_hash()));
         assert!(
@@ -1006,9 +942,7 @@ mod tests {
         }
         let last = ahead.last().unwrap().1;
         assert!(
-            connecting_hashes_heavier_disconnected(&hub, last)
-                .unwrap()
-                .is_none(),
+            connecting_hashes_heavier_disconnected(&hub, last).unwrap().is_none(),
             "far header on the same chain as tip is not a disconnected fork"
         );
         let mut st =

@@ -77,9 +77,6 @@ mod tests {
         assert_eq!(script_sigop_count(&[0x4d, 0xac], false), 0);
         assert_eq!(script_sigop_count(&[0x4e, 0xac], false), 0);
         assert_eq!(script_sigop_count(&[0x4d, 0xac, 0xad], false), 0);
-        assert_eq!(
-            script_sigop_count(&[0x4d, 0x01, 0x00, 0xcd, 0xac], false),
-            1
-        );
+        assert_eq!(script_sigop_count(&[0x4d, 0x01, 0x00, 0xcd, 0xac], false), 1);
     }
 }

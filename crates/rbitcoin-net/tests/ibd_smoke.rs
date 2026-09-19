@@ -23,11 +23,8 @@ fn tmp_dir(label: &str) -> rbitcoin_store::testutil::TempDir {
 }
 
 fn coinbase(height: u32) -> Transaction {
-    let mut ss = if height == 0 {
-        vec![0x00]
-    } else {
-        rbitcoin_consensus::bip34_height_script(height)
-    };
+    let mut ss =
+        if height == 0 { vec![0x00] } else { rbitcoin_consensus::bip34_height_script(height) };
     while ss.len() < 2 {
         ss.push(0x00);
     }
@@ -57,10 +54,7 @@ fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
         bits,
         nonce: 0,
     };
-    let mut block = Block {
-        header,
-        txdata: vec![coinbase(height)],
-    };
+    let mut block = Block { header, txdata: vec![coinbase(height)] };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let target = Target::from_compact(bits);
     for nonce in 0..u32::MAX {
@@ -74,21 +68,14 @@ fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
 
 async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
 }
 
 async fn start_node(dir: &std::path::Path) -> P2PNode {
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
-    P2PNode::start(
-        "127.0.0.1:0".parse().unwrap(),
-        q,
-        ChainParams::regtest(),
-        Milestone::NONE,
-    )
-    .await
-    .expect("listen")
+    P2PNode::start("127.0.0.1:0".parse().unwrap(), q, ChainParams::regtest(), Milestone::NONE)
+        .await
+        .expect("listen")
 }
 
 fn seed_chain(node: &P2PNode, blocks: u32) {
@@ -125,9 +112,7 @@ async fn ibd_cancellable_exits_when_flag_set() {
     let mut cfg = IbdConfig::for_test();
     cfg.target_peers = 1;
     // Cancelled IBD should return Ok (partial) or complete if race finishes first.
-    let _ = peer
-        .sync_cancellable(&[seed.local_addr], cfg, Some(cancel))
-        .await;
+    let _ = peer.sync_cancellable(&[seed.local_addr], cfg, Some(cancel)).await;
 
     seed.shutdown().await;
     peer.shutdown().await;

@@ -45,10 +45,7 @@ impl TipSeal {
         if !p.exists() {
             return Ok(None);
         }
-        let mut f = OpenOptions::new()
-            .read(true)
-            .open(&p)
-            .map_err(|e| StoreError::io(&p, e))?;
+        let mut f = OpenOptions::new().read(true).open(&p).map_err(|e| StoreError::io(&p, e))?;
         let mut buf = [0u8; Self::BYTES];
         f.read_exact(&mut buf).map_err(|e| StoreError::io(&p, e))?;
         if buf[0..4] != STORE_MAGIC {
@@ -164,9 +161,7 @@ impl Store {
         let Ok(rec) = self.headers.get(fk) else {
             return Ok(());
         };
-        let prev_gen = TipSeal::load(self.path())?
-            .map(|s| s.generation)
-            .unwrap_or(0);
+        let prev_gen = TipSeal::load(self.path())?.map(|s| s.generation).unwrap_or(0);
         let seal = TipSeal {
             tip_height: tip.0,
             tip_hash: rec.hash,
@@ -233,11 +228,7 @@ impl Store {
             report.tip_before = Some(tip.0);
         }
         // Core `-checkblocks=0` (and negatives mapped to 0 by the node) = all.
-        let lo = if n == 0 {
-            0
-        } else {
-            tip.0.saturating_sub(n.saturating_sub(1))
-        };
+        let lo = if n == 0 { 0 } else { tip.0.saturating_sub(n.saturating_sub(1)) };
         let tx_count = self.txs.count();
         let mut last_good: Option<u32> = if lo == 0 { None } else { Some(lo - 1) };
         // Heights below the window are assumed good for shrink baseline when lo > 0.
@@ -302,10 +293,8 @@ impl Store {
             }
         } else {
             let parent_h = Height(height.0 - 1);
-            let Some(parent_fk) = self
-                .confirmed
-                .get(parent_h)
-                .map_err(|_| "parent confirmed read")?
+            let Some(parent_fk) =
+                self.confirmed.get(parent_h).map_err(|_| "parent confirmed read")?
             else {
                 return Err("parent confirmed null");
             };
@@ -452,10 +441,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let p = std::env::temp_dir().join(format!("rbitcoin-integrity-{n}"));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -503,8 +489,7 @@ mod tests {
         };
         let ins = vec![InputRecord::coinbase(u32::MAX, vec![salt], vec![])];
         let outs = vec![OutputRecord::unspent(50, vec![0x51])];
-        s.put_tx_full_batch_indexed(&[(rec, ins, outs)], true)
-            .unwrap()[0]
+        s.put_tx_full_batch_indexed(&[(rec, ins, outs)], true).unwrap()[0]
     }
 
     #[test]
@@ -571,9 +556,7 @@ mod tests {
         let g_fk = s.put_header(&g).unwrap();
         s.confirmed.set(Height(0), g_fk).unwrap();
         s.flush_class_c_tip().unwrap();
-        let seal = TipSeal::load(s.path())
-            .unwrap()
-            .expect("seal after tip barrier");
+        let seal = TipSeal::load(s.path()).unwrap().expect("seal after tip barrier");
         assert_eq!(seal.tip_height, 0);
         assert_eq!(seal.tip_hash, g.hash);
 
@@ -647,10 +630,7 @@ mod tests {
         s.strong_tx.set_unstrong(tip_tx).unwrap();
 
         let r = s.revalidate_tip_window_n(6).unwrap();
-        assert_eq!(
-            r.first_bad_reason,
-            Some("strong bits missing in tip window")
-        );
+        assert_eq!(r.first_bad_reason, Some("strong bits missing in tip window"));
         assert!(r.tip_shrunk, "must shrink: {r:?}");
         assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
         assert_eq!(
@@ -688,17 +668,12 @@ mod tests {
         assert_eq!(n, 4, "four real confirmed heights");
         let extra = 20u64;
         let zeros = vec![0u8; (extra * 8) as usize];
-        f.write_at(crate::file::FILE_HEADER_LEN as u64 + n * 8, &zeros)
-            .unwrap();
+        f.write_at(crate::file::FILE_HEADER_LEN as u64 + n * 8, &zeros).unwrap();
         f.flush().unwrap();
         drop(f);
 
         let s = Store::open_tiny(&dir).unwrap();
-        assert_eq!(
-            s.confirmed.tip_height(),
-            Some(Height(23)),
-            "HWM includes 20 trailing nulls"
-        );
+        assert_eq!(s.confirmed.tip_height(), Some(Height(23)), "HWM includes 20 trailing nulls");
         let r = s.revalidate_tip_window_n(6).unwrap();
         assert_eq!(
             s.confirmed.tip_height(),
@@ -768,9 +743,7 @@ mod tests {
         let g_fk = s.put_header(&g).unwrap();
         s.confirmed.set(Height(0), g_fk).unwrap();
         s.flush_class_c_tip().unwrap();
-        let mut seal = TipSeal::load(s.path())
-            .unwrap()
-            .expect("seal after tip barrier");
+        let mut seal = TipSeal::load(s.path()).unwrap().expect("seal after tip barrier");
         seal.tip_hash = [0xff; 32];
         seal.store(s.path()).unwrap();
         let r = s.revalidate_tip_window_n(6).unwrap();
@@ -802,10 +775,7 @@ mod tests {
         s.headers.flush().unwrap();
 
         let r6 = s.revalidate_tip_window_n(6).unwrap();
-        assert!(
-            r6.is_clean(),
-            "default window must not see height-1 poison: {r6:?}"
-        );
+        assert!(r6.is_clean(), "default window must not see height-1 poison: {r6:?}");
         assert_eq!(s.confirmed.tip_height(), Some(Height(9)));
 
         let r0 = s.revalidate_tip_window_n(0).unwrap();

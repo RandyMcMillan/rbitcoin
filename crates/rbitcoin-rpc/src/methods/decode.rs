@@ -21,10 +21,7 @@ pub(crate) fn decodescript(ctx: &RpcContext, params: &RpcParams) -> Result<Value
     params.reject_unknown(&["hexstring"])?;
     let hex = params.req_str(0, "hexstring")?;
     let raw = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-    Ok(script_pubkey_json(
-        &ScriptBuf::from_bytes(raw),
-        rpc_btc_network(ctx.network),
-    ))
+    Ok(script_pubkey_json(&ScriptBuf::from_bytes(raw), rpc_btc_network(ctx.network)))
 }
 
 pub(crate) fn validateaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -56,10 +53,7 @@ pub(crate) fn validateaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Va
     if let Some(wp) = addr.witness_program() {
         if let Some(m) = obj.as_object_mut() {
             m.insert("witness_version".into(), json!(wp.version().to_num()));
-            m.insert(
-                "witness_program".into(),
-                json!(hex_encode(wp.program().as_bytes())),
-            );
+            m.insert("witness_program".into(), json!(hex_encode(wp.program().as_bytes())));
         }
     }
     Ok(obj)

@@ -28,12 +28,7 @@ impl Default for FeeFlowMeter {
 impl FeeFlowMeter {
     pub fn new(now: Instant) -> Self {
         let n = bucket_count();
-        Self {
-            admit_wu_s: vec![0.0; n],
-            last: now,
-            start: now,
-            admit_events: 0,
-        }
+        Self { admit_wu_s: vec![0.0; n], last: now, start: now, admit_events: 0 }
     }
 
     pub fn is_warm(&self, now: Instant) -> bool {
@@ -48,10 +43,7 @@ impl FeeFlowMeter {
     /// Snapshot of admit λ (WU/s) per bucket after decaying to `now`.
     pub fn admit_rates_wu_s(&mut self, now: Instant) -> Vec<u64> {
         self.decay_to(now);
-        self.admit_wu_s
-            .iter()
-            .map(|x| x.max(0.0).round() as u64)
-            .collect()
+        self.admit_wu_s.iter().map(|x| x.max(0.0).round() as u64).collect()
     }
 
     pub fn note_admit(&mut self, weight_wu: u64, rate_sat_per_kvb: u64, now: Instant) {

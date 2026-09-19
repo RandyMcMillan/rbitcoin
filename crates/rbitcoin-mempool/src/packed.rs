@@ -100,15 +100,8 @@ pub fn decode_packed_live(buf: &[u8]) -> Result<PackedLive, MempoolError> {
         let (rec, n) = OutputRecord::decode_at(&buf[off..])
             .map_err(|_| MempoolError::Corrupt("packed vout"))?;
         off += n;
-        let value = if rec.value < 0 {
-            Amount::ZERO
-        } else {
-            Amount::from_sat(rec.value as u64)
-        };
-        output.push(TxOut {
-            value,
-            script_pubkey: ScriptBuf::from_bytes(rec.script),
-        });
+        let value = if rec.value < 0 { Amount::ZERO } else { Amount::from_sat(rec.value as u64) };
+        output.push(TxOut { value, script_pubkey: ScriptBuf::from_bytes(rec.script) });
     }
     if off != buf.len() {
         return Err(MempoolError::Corrupt("packed live trailing"));
@@ -119,14 +112,7 @@ pub fn decode_packed_live(buf: &[u8]) -> Result<PackedLive, MempoolError> {
         input,
         output,
     };
-    Ok(PackedLive {
-        fee_sat,
-        weight,
-        txid,
-        wtxid,
-        tx,
-        vins,
-    })
+    Ok(PackedLive { fee_sat, weight, txid, wtxid, tx, vins })
 }
 
 fn encode_vin(out: &mut Vec<u8>, inp: &TxIn, aux: Option<&VinAux>) {
@@ -200,9 +186,7 @@ fn decode_vin(buf: &[u8]) -> Result<(TxIn, VinAux, usize), MempoolError> {
     } else {
         let (len, n) = read_compact_size(&buf[off..])?;
         off += n;
-        let end = off
-            .checked_add(len as usize)
-            .ok_or(MempoolError::Corrupt("packed script"))?;
+        let end = off.checked_add(len as usize).ok_or(MempoolError::Corrupt("packed script"))?;
         if end > buf.len() {
             return Err(MempoolError::Corrupt("packed script"));
         }
@@ -219,9 +203,8 @@ fn decode_vin(buf: &[u8]) -> Result<(TxIn, VinAux, usize), MempoolError> {
         for _ in 0..n_items {
             let (len, n) = read_compact_size(&buf[off..])?;
             off += n;
-            let end = off
-                .checked_add(len as usize)
-                .ok_or(MempoolError::Corrupt("packed witness"))?;
+            let end =
+                off.checked_add(len as usize).ok_or(MempoolError::Corrupt("packed witness"))?;
             if end > buf.len() {
                 return Err(MempoolError::Corrupt("packed witness"));
             }
@@ -235,33 +218,20 @@ fn decode_vin(buf: &[u8]) -> Result<(TxIn, VinAux, usize), MempoolError> {
     } else {
         None
     };
-    let script_hash = if flags & VIN_HAS_SCRIPT_HASH != 0 {
-        Some(take_arr::<32>(buf, &mut off)?)
-    } else {
-        None
-    };
+    let script_hash =
+        if flags & VIN_HAS_SCRIPT_HASH != 0 { Some(take_arr::<32>(buf, &mut off)?) } else { None };
     let txin = TxIn {
-        previous_output: bitcoin::OutPoint {
-            txid: prev_txid,
-            vout,
-        },
+        previous_output: bitcoin::OutPoint { txid: prev_txid, vout },
         script_sig,
         sequence,
         witness,
     };
-    let aux = VinAux {
-        prev_txid,
-        vout,
-        script_hash,
-        create_fk,
-    };
+    let aux = VinAux { prev_txid, vout, script_hash, create_fk };
     Ok((txin, aux, off))
 }
 
 fn take_arr<const N: usize>(buf: &[u8], off: &mut usize) -> Result<[u8; N], MempoolError> {
-    let end = off
-        .checked_add(N)
-        .ok_or(MempoolError::Corrupt("packed short"))?;
+    let end = off.checked_add(N).ok_or(MempoolError::Corrupt("packed short"))?;
     if end > buf.len() {
         return Err(MempoolError::Corrupt("packed short"));
     }

@@ -255,9 +255,7 @@ pub(crate) fn win_set_eof(file: &std::fs::File, new_len: u64) -> std::io::Result
         fn GetLastError() -> u32;
     }
     const FILE_END_OF_FILE_INFO: u32 = 6;
-    let info = FileEndOfFileInfo {
-        end_of_file: new_len as i64,
-    };
+    let info = FileEndOfFileInfo { end_of_file: new_len as i64 };
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle() as *mut core::ffi::c_void,
@@ -267,9 +265,7 @@ pub(crate) fn win_set_eof(file: &std::fs::File, new_len: u64) -> std::io::Result
         )
     };
     if ok == 0 {
-        Err(std::io::Error::from_raw_os_error(
-            unsafe { GetLastError() } as i32
-        ))
+        Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32))
     } else {
         Ok(())
     }

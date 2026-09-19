@@ -139,15 +139,9 @@ mod tests {
             (ConsensusError::BadHeader("bits"), "bad header: bits"),
             (ConsensusError::BadBlock("empty"), "bad block: empty"),
             (ConsensusError::BadTx("fee"), "bad transaction: fee"),
-            (
-                ConsensusError::Script("sig".into()),
-                "script verification failed: sig",
-            ),
+            (ConsensusError::Script("sig".into()), "script verification failed: sig"),
             (ConsensusError::MissingPrevout, "missing prevout"),
-            (
-                ConsensusError::PrevoutSpent,
-                "prevout already spent on best chain",
-            ),
+            (ConsensusError::PrevoutSpent, "prevout already spent on best chain"),
             (ConsensusError::InvalidPow, "pow invalid"),
             (ConsensusError::BadPrev, "unexpected previous header"),
             (ConsensusError::BadVersion(2), "bad-version(0x00000002)"),
@@ -194,10 +188,7 @@ mod tests {
 
     #[test]
     fn block_reject_reason_bip113_and_bip112_needles() {
-        assert_eq!(
-            block_reject_reason(&ConsensusError::BadTx("not final")),
-            "bad-txns-nonfinal"
-        );
+        assert_eq!(block_reject_reason(&ConsensusError::BadTx("not final")), "bad-txns-nonfinal");
         assert_eq!(
             block_reject_reason(&ConsensusError::BadTx("bad-txns-nonfinal")),
             "bad-txns-nonfinal"
@@ -234,10 +225,7 @@ mod tests {
             block_reject_reason(&ConsensusError::BadHeader("incorrect proof of work bits")),
             "bad-diffbits"
         );
-        assert_eq!(
-            block_reject_reason(&ConsensusError::InvalidPow),
-            "high-hash"
-        );
+        assert_eq!(block_reject_reason(&ConsensusError::InvalidPow), "high-hash");
         assert_eq!(
             block_reject_reason(&ConsensusError::Script("SIG_DER".into())),
             "block-script-verify-flag-failed (Non-canonical DER signature)"
@@ -245,10 +233,7 @@ mod tests {
         // feature_cltv.py five BIP65 paren reasons (stack / negative / type /
         // locktime / SEQUENCE_FINAL).
         for (token, paren) in [
-            (
-                "stack empty",
-                "Operation not valid with the current stack size",
-            ),
+            ("stack empty", "Operation not valid with the current stack size"),
             ("CLTV negative", "Negative locktime"),
             ("CLTV type", "Locktime requirement not satisfied"),
             ("CLTV", "Locktime requirement not satisfied"),
@@ -266,10 +251,7 @@ mod tests {
                 format!("Block validation error: block-script-verify-flag-failed ({paren})")
             );
         }
-        assert_eq!(
-            block_reject_reason(&ConsensusError::BadVersion(2)),
-            "bad-version(0x00000002)"
-        );
+        assert_eq!(block_reject_reason(&ConsensusError::BadVersion(2)), "bad-version(0x00000002)");
         assert_eq!(
             block_reject_log_line("abcd", "bad-version(0x00000002)"),
             "abcd, bad-version(0x00000002)"

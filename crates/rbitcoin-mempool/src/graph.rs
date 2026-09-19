@@ -75,11 +75,7 @@ pub fn frontier_feerate_from_chunks(chunks: &[Chunk], target_wu: u64) -> Option<
 
 /// Weight strictly above `rate_sat_per_kvb` from a best-first chunk list.
 pub fn weight_above_from_chunks(chunks: &[Chunk], rate_sat_per_kvb: u64) -> u64 {
-    chunks
-        .iter()
-        .filter(|c| c.fee_rate_sat_per_kvb() > rate_sat_per_kvb)
-        .map(|c| c.weight)
-        .sum()
+    chunks.iter().filter(|c| c.fee_rate_sat_per_kvb() > rate_sat_per_kvb).map(|c| c.weight).sum()
 }
 
 /// Cluster identity: sorted member set fingerprint (min txid as representative).
@@ -329,11 +325,7 @@ impl TxGraph {
             let Some(e) = self.entries.get(&cur) else {
                 continue;
             };
-            let next = if parents {
-                e.parents.iter()
-            } else {
-                e.children.iter()
-            };
+            let next = if parents { e.parents.iter() } else { e.children.iter() };
             for n in next {
                 if set.insert(*n) {
                     q.push_back(*n);
@@ -439,10 +431,7 @@ impl TxGraph {
             }
         }
         for (vout, _) in tx.output.iter().enumerate() {
-            let op = OutPoint {
-                txid,
-                vout: vout as u32,
-            };
+            let op = OutPoint { txid, vout: vout as u32 };
             if let Some(child) = self.conflicts.get(&op).copied() {
                 if let Some(r) = self.cluster_rep(&child) {
                     old_reps.insert(r);
@@ -481,20 +470,14 @@ impl TxGraph {
             }
         }
         for (vout, _) in tx.output.iter().enumerate() {
-            self.created.insert(OutPoint {
-                txid,
-                vout: vout as u32,
-            });
+            self.created.insert(OutPoint { txid, vout: vout as u32 });
         }
         self.total_weight = self.total_weight.saturating_add(weight);
         self.by_wtxid.insert(e.wtxid, txid);
         self.entries.insert(txid, e);
         // Children accepted while we were confirmed (reorg re-accept).
         for (vout, _) in tx.output.iter().enumerate() {
-            let op = OutPoint {
-                txid,
-                vout: vout as u32,
-            };
+            let op = OutPoint { txid, vout: vout as u32 };
             let Some(child_id) = self.conflicts.get(&op).copied() else {
                 continue;
             };
@@ -548,10 +531,7 @@ impl TxGraph {
             }
         }
         for (vout, _) in tx.output.iter().enumerate() {
-            self.created.remove(&OutPoint {
-                txid: *txid,
-                vout: vout as u32,
-            });
+            self.created.remove(&OutPoint { txid: *txid, vout: vout as u32 });
         }
         for n in neighbors {
             if self.entries.contains_key(&n) {
@@ -581,10 +561,8 @@ impl TxGraph {
                 }
             }
         }
-        let total_weight = members
-            .iter()
-            .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
-            .sum();
+        let total_weight =
+            members.iter().map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0)).sum();
         self.cluster_from_members(members, total_weight, |_| 0)
     }
 
@@ -603,12 +581,7 @@ impl TxGraph {
     ) -> Option<Cluster> {
         let linearization = self.linearize_delta(&members, &delta);
         let chunks = self.chunkify_delta(&linearization, &delta);
-        Some(Cluster {
-            members,
-            total_weight,
-            linearization,
-            chunks,
-        })
+        Some(Cluster { members, total_weight, linearization, chunks })
     }
 
     /// Whether adding `extra_weight` and `extra_count` txs that connect to
@@ -626,10 +599,8 @@ impl TxGraph {
                 members.extend(c.members);
             }
         }
-        let base_weight: u64 = members
-            .iter()
-            .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
-            .sum();
+        let base_weight: u64 =
+            members.iter().map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0)).sum();
         let count = members.len() + extra_count;
         let vsize = base_weight.saturating_add(extra_weight).saturating_add(3) / 4;
         count > self.cluster_count_limit || vsize > self.cluster_vsize_limit
@@ -638,11 +609,7 @@ impl TxGraph {
     /// Topo linearization: among ready txs (parents already emitted or outside
     /// cluster), pick highest fee_rate, then higher fee, then txid.
     fn modified_fee(&self, t: &Txid, delta: &impl Fn(Txid) -> i64) -> i64 {
-        self.entries
-            .get(t)
-            .map(|e| e.fee_sat as i64)
-            .unwrap_or(0)
-            .saturating_add(delta(*t))
+        self.entries.get(t).map(|e| e.fee_sat as i64).unwrap_or(0).saturating_add(delta(*t))
     }
 
     fn linearize_delta(&self, members: &BTreeSet<Txid>, delta: &impl Fn(Txid) -> i64) -> Vec<Txid> {
@@ -656,10 +623,7 @@ impl TxGraph {
                     Some(e) => e,
                     None => continue,
                 };
-                let ready = e
-                    .parents
-                    .iter()
-                    .all(|p| !members.contains(p) || done.contains(p));
+                let ready = e.parents.iter().all(|p| !members.contains(p) || done.contains(p));
                 if !ready {
                     continue;
                 }
@@ -831,10 +795,8 @@ impl TxGraph {
             if add.is_empty() {
                 continue;
             }
-            let extra: u64 = add
-                .iter()
-                .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
-                .sum();
+            let extra: u64 =
+                add.iter().map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0)).sum();
             if used.saturating_add(extra) > max_weight_wu {
                 break;
             }
@@ -880,10 +842,7 @@ impl TxGraph {
 
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
     pub fn worst_chunk(&self) -> Option<(Txid, Chunk)> {
-        self.worst_chunks
-            .iter()
-            .next()
-            .map(|((_, rep), ch)| (*rep, ch.clone()))
+        self.worst_chunks.iter().next().map(|((_, rep), ch)| (*rep, ch.clone()))
     }
 
     /// Rebuild helper: clear and re-insert from an ordered list (parents first best-effort).
@@ -944,10 +903,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: prev.0,
-                    vout: prev.1,
-                },
+                previous_output: OutPoint { txid: prev.0, vout: prev.1 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -1056,10 +1012,7 @@ mod tests {
         assert!(g.weight_above_feerate(0) >= wa);
         // Shared-slice helpers match full-graph methods (fee snapshot path).
         let ch = g.mining_chunks_best_first();
-        assert_eq!(
-            frontier_feerate_from_chunks(&ch, 1),
-            g.frontier_feerate_sat_per_kvb(1)
-        );
+        assert_eq!(frontier_feerate_from_chunks(&ch, 1), g.frontier_feerate_sat_per_kvb(1));
         assert!(
             frontier_feerate_from_chunks(&ch, wa + wb + 1).is_none(),
             "under-full target must not use last_chunk as a far-horizon rate"
@@ -1080,9 +1033,7 @@ mod tests {
     #[test]
     fn select_block_txids_empty_parent_before_child_and_weight_cap() {
         let g = TxGraph::new();
-        assert!(g
-            .select_block_txids(TxGraph::template_tx_weight())
-            .is_empty());
+        assert!(g.select_block_txids(TxGraph::template_tx_weight()).is_empty());
         assert!(g.select_block_txids(0).is_empty());
 
         let mut g = TxGraph::new();
@@ -1091,10 +1042,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -1165,10 +1113,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -1189,11 +1134,7 @@ mod tests {
                 0
             }
         });
-        assert_eq!(
-            only_p,
-            vec![pid, cid],
-            "zero-modified child stays selectable with parent"
-        );
+        assert_eq!(only_p, vec![pid, cid], "zero-modified child stays selectable with parent");
         let only_p_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
             if id == cid {
                 -1_001
@@ -1201,11 +1142,7 @@ mod tests {
                 0
             }
         });
-        assert_eq!(
-            only_p_neg,
-            vec![pid],
-            "negative-modified child is not mined with parent"
-        );
+        assert_eq!(only_p_neg, vec![pid], "negative-modified child is not mined with parent");
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {
@@ -1213,10 +1150,7 @@ mod tests {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array(seed),
-                    vout: 0,
-                },
+                previous_output: OutPoint { txid: Txid::from_byte_array(seed), vout: 0 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
@@ -1323,9 +1257,7 @@ mod tests {
         assert_eq!(fee, 2_000 + 31_200 + 31_200);
         assert_eq!(w, cl.chunks[0].weight);
         assert_eq!(txs.len(), 3);
-        let (d_fee, _, d_txs) = g
-            .chunk_of(&did, |id| if id == bid { 9_999 } else { 0 })
-            .unwrap();
+        let (d_fee, _, d_txs) = g.chunk_of(&did, |id| if id == bid { 9_999 } else { 0 }).unwrap();
         assert_eq!(d_txs, vec![did]);
         assert_eq!(d_fee, 1_000, "d's chunk fee ignores sibling deltas");
     }
@@ -1360,10 +1292,7 @@ mod tests {
         g.insert(pe, &parent);
         let mut parents = BTreeSet::new();
         parents.insert(pid);
-        assert!(
-            g.cluster_would_exceed(&parents, 1, 400),
-            "count limit 1 must reject a child"
-        );
+        assert!(g.cluster_would_exceed(&parents, 1, 400), "count limit 1 must reject a child");
         g.set_cluster_limits(Some(2), None);
         assert!(!g.cluster_would_exceed(&parents, 1, 400));
     }
@@ -1451,10 +1380,7 @@ mod tests {
         // Deliberately child-first in input list.
         let items = vec![
             (entry_for(&child, 10, 1), std::sync::Arc::new(child.clone())),
-            (
-                entry_for(&parent, 10, 0),
-                std::sync::Arc::new(parent.clone()),
-            ),
+            (entry_for(&parent, 10, 0), std::sync::Arc::new(parent.clone())),
         ];
         g.rebuild_from(items);
         assert!(g.contains(&parent.compute_txid()));

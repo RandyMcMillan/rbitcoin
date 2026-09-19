@@ -54,11 +54,8 @@ impl PeerRate {
         let delta = bytes_total.saturating_sub(self.last_bytes);
         let inst = delta.saturating_mul(1000) / dt;
         let den = TAU_MS.saturating_add(dt);
-        self.ewma = self
-            .ewma
-            .saturating_mul(TAU_MS)
-            .saturating_add(inst.saturating_mul(dt))
-            / den.max(1);
+        self.ewma =
+            self.ewma.saturating_mul(TAU_MS).saturating_add(inst.saturating_mul(dt)) / den.max(1);
         self.active_ms = self.active_ms.saturating_add(dt);
         if delta >= PROGRESS_STEP {
             self.progress_ms = now_ms;

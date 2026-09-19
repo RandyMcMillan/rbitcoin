@@ -125,18 +125,8 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
 /// Nibble values 10–15 are Corrupt (soft-extend), not extra exponent.
 pub const AMOUNT_EXP_MAX: u8 = 9;
 
-const POW10: [u64; (AMOUNT_EXP_MAX as usize) + 1] = [
-    1,
-    10,
-    100,
-    1_000,
-    10_000,
-    100_000,
-    1_000_000,
-    10_000_000,
-    100_000_000,
-    1_000_000_000,
-];
+const POW10: [u64; (AMOUNT_EXP_MAX as usize) + 1] =
+    [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000, 1_000_000_000];
 
 pub fn amount_exp_mantissa(sats: u64) -> (u8, u64) {
     if sats == 0 {
@@ -172,9 +162,7 @@ pub fn scale_amount_exp(exp: u8, mantissa: u64) -> Result<u64, StoreError> {
     if exp < AMOUNT_EXP_MAX && mantissa.is_multiple_of(10) {
         return Err(StoreError::Corrupt("txout amount exp"));
     }
-    mantissa
-        .checked_mul(POW10[exp as usize])
-        .ok_or(StoreError::Corrupt("output value too large"))
+    mantissa.checked_mul(POW10[exp as usize]).ok_or(StoreError::Corrupt("output value too large"))
 }
 
 /// `(sats, uleb bytes)`. `buf` starts at the mantissa ULEB. Above `i64::MAX` is Corrupt.
@@ -489,25 +477,13 @@ mod tests {
         assert_eq!(amount_exp_mantissa(330), (1, 33));
         assert_eq!(amount_exp_mantissa(1_250_000_000), (7, 125));
         assert_eq!(amount_exp_mantissa(2_500_000_000), (8, 25));
-        for sats in [
-            0u64,
-            330,
-            546,
-            1_000,
-            1_250_000_000,
-            2_500_000_000,
-            5_000_000_000,
-        ] {
+        for sats in [0u64, 330, 546, 1_000, 1_250_000_000, 2_500_000_000, 5_000_000_000] {
             let (e, m) = amount_exp_mantissa(sats);
             assert_eq!(scale_amount_exp(e, m).unwrap(), sats, "{sats}");
         }
         assert_eq!(scale_amount_exp(8, 1).unwrap(), 100_000_000);
         for e in 0..=AMOUNT_EXP_MAX {
-            assert_eq!(
-                scale_amount_exp(e, 1).unwrap(),
-                10u64.pow(u32::from(e)),
-                "{e}"
-            );
+            assert_eq!(scale_amount_exp(e, 1).unwrap(), 10u64.pow(u32::from(e)), "{e}");
         }
         assert!(scale_amount_exp(9, u64::MAX).is_err());
         assert!(scale_amount_exp(10, 1).is_err());
@@ -538,26 +514,14 @@ mod tests {
             assert_eq!(used, uleb128_len(n));
             assert_eq!(&dst[..used], vec.as_slice());
         }
-        assert!(matches!(
-            write_uleb128_into(&mut [0u8; 1], 128),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(write_uleb128_into(&mut [0u8; 1], 128), Err(StoreError::Corrupt(_))));
     }
 
     #[test]
     fn compact_and_uleb_error_paths() {
-        assert!(matches!(
-            read_compact_size(&[]),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            read_compact_size(&[253, 1]),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            read_compact_size(&[254, 1, 2, 3]),
-            Err(StoreError::Corrupt(_))
-        ));
+        assert!(matches!(read_compact_size(&[]), Err(StoreError::Corrupt(_))));
+        assert!(matches!(read_compact_size(&[253, 1]), Err(StoreError::Corrupt(_))));
+        assert!(matches!(read_compact_size(&[254, 1, 2, 3]), Err(StoreError::Corrupt(_))));
         assert!(matches!(
             read_compact_size(&[255, 1, 2, 3, 4, 5, 6, 7]),
             Err(StoreError::Corrupt(_))

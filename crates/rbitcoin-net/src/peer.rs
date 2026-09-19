@@ -105,11 +105,7 @@ async fn accept_received_from_peer(
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<AcceptOutcome, NetError> {
     let relay_ok = hub.mempool().is_none_or(|m| m.relay_enabled());
-    let hb = if relay_ok {
-        session.and_then(|s| s.peer_hub().map(|ph| (ph, s.id)))
-    } else {
-        None
-    };
+    let hb = if relay_ok { session.and_then(|s| s.peer_hub().map(|ph| (ph, s.id))) } else { None };
     crate::tip_accept::run_on_tip_accept_async(move || {
         let r = hub.accept_received_on_lane(block);
         if matches!(&r, Ok(AcceptOutcome::Accepted { .. })) {
@@ -428,11 +424,7 @@ impl V2PlainSession {
     pub async fn outbound_bip324(stream: TcpStream) -> Result<Self, NetError> {
         let magic = Magic::REGTEST;
         let (reader, writer, _wire, tcp_shutdown) = open_v2(stream, magic, false).await?;
-        Ok(Self {
-            reader,
-            writer,
-            tcp_shutdown,
-        })
+        Ok(Self { reader, writer, tcp_shutdown })
     }
 
     /// Dial-side handshake on `stream`; `limit` bounds VERSION/VERACK.
@@ -456,11 +448,7 @@ impl V2PlainSession {
             HandshakePolicy::plain(),
         )
         .await?;
-        Ok(Self {
-            reader,
-            writer,
-            tcp_shutdown,
-        })
+        Ok(Self { reader, writer, tcp_shutdown })
     }
 
     pub async fn write_contents(&mut self, contents: &[u8]) -> Result<(), NetError> {
@@ -494,16 +482,8 @@ pub async fn connect_and_handshake(
     inbound: bool,
     user_agent: &str,
     policy: HandshakePolicy<'_>,
-) -> Result<
-    (
-        VersionMessage,
-        V2Reader,
-        V2Writer,
-        crate::v2::WireBytes,
-        std::net::TcpStream,
-    ),
-    NetError,
-> {
+) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes, std::net::TcpStream), NetError>
+{
     let (mut reader, mut writer, wire, tcp_shutdown) = open_v2(stream, magic, inbound).await?;
     let their_version = application_handshake(
         &mut reader,
@@ -640,16 +620,8 @@ pub(crate) async fn connect_and_handshake_timed(
     inbound: bool,
     user_agent: &str,
     policy: HandshakePolicy<'_>,
-) -> Result<
-    (
-        VersionMessage,
-        V2Reader,
-        V2Writer,
-        crate::v2::WireBytes,
-        std::net::TcpStream,
-    ),
-    NetError,
-> {
+) -> Result<(VersionMessage, V2Reader, V2Writer, crate::v2::WireBytes, std::net::TcpStream), NetError>
+{
     tokio::time::timeout(
         limit,
         connect_and_handshake(
@@ -700,14 +672,7 @@ pub async fn run_feeler_timed(
 ) -> Result<(), NetError> {
     tokio::time::timeout(
         limit,
-        run_feeler_inner(
-            stream,
-            magic,
-            our_addr,
-            their_addr,
-            start_height,
-            user_agent,
-        ),
+        run_feeler_inner(stream, magic, our_addr, their_addr, start_height, user_agent),
     )
     .await
     .map_err(|_| NetError::Timeout)?
@@ -723,10 +688,7 @@ async fn run_feeler_inner(
 ) -> Result<(), NetError> {
     let (mut reader, mut writer, _wire, _tcp_shutdown) = open_v2(stream, magic, false).await?;
     let services = local_service_flags();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let version = VersionMessage {
         version: OUR_PROTOCOL_VERSION.max(PROTOCOL_VERSION),
         services,
@@ -812,10 +774,7 @@ async fn application_handshake(
     policy: HandshakePolicy<'_>,
 ) -> Result<VersionMessage, NetError> {
     let services = local_service_flags();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let our_nonce = rand_nonce();
     let version = VersionMessage {
         version: OUR_PROTOCOL_VERSION.max(PROTOCOL_VERSION),
@@ -843,11 +802,7 @@ async fn application_handshake(
             }
         }
     }
-    let mut nonce_guard = OutboundNonceGuard {
-        peers: None,
-        nonce: our_nonce,
-        clear: false,
-    };
+    let mut nonce_guard = OutboundNonceGuard { peers: None, nonce: our_nonce, clear: false };
     if !inbound {
         if let Some(peers) = policy.peers {
             peers.note_outbound_nonce(our_nonce);
@@ -948,10 +903,7 @@ async fn wait_peer_verack(
         if apply_pre_verack(policy.session, msg.payload(), &cmd) {
             return Ok(());
         }
-        if !matches!(
-            msg.payload(),
-            NetworkMessage::SendAddrV2 | NetworkMessage::WtxidRelay
-        ) {
+        if !matches!(msg.payload(), NetworkMessage::SendAddrV2 | NetworkMessage::WtxidRelay) {
             fail_if_handshake_timed_out(policy)?;
         }
     }
@@ -1003,12 +955,9 @@ fn rand_nonce() -> u64 {
     // version nonces unique (Core self-connect / loop detection uses nonce).
     static N: AtomicU64 = AtomicU64::new(1);
     let seq = N.fetch_add(1, Ordering::Relaxed);
-    let tick = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+    let tick =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
 /// Bidirectional peer session: serve history, tip follow, announce our tip.
@@ -1060,10 +1009,8 @@ async fn run_writer_task(
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let (full, err) = match out {
                 PeerOut::Msg(msg) => {
-                    let full = matches!(
-                        msg,
-                        NetworkMessage::Block(_) | NetworkMessage::CmpctBlock(_)
-                    );
+                    let full =
+                        matches!(msg, NetworkMessage::Block(_) | NetworkMessage::CmpctBlock(_));
                     (full, write_v2_msg_offload(&mut writer, msg).await.is_err())
                 }
                 PeerOut::Encoded(bytes) => {
@@ -1146,19 +1093,13 @@ async fn on_heartbeat(
         crate::peers::PendingSendCmpct::Lb => {
             let _ = queue_out(
                 out_tx,
-                NetworkMessage::SendCmpct(SendCmpct {
-                    send_compact: false,
-                    version: 2,
-                }),
+                NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }),
             );
         }
         crate::peers::PendingSendCmpct::Hb => {
             let _ = queue_out(
                 out_tx,
-                NetworkMessage::SendCmpct(SendCmpct {
-                    send_compact: true,
-                    version: 2,
-                }),
+                NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }),
             );
         }
         crate::peers::PendingSendCmpct::None => {}
@@ -1392,19 +1333,13 @@ pub async fn peer_session_with(
     meta: FollowSessionMeta,
 ) -> Result<(), NetError> {
     let _live_dec = LiveFollowDec(meta.live.clone());
-    let peer_s = meta
-        .peer
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "peer".into());
+    let peer_s = meta.peer.map(|p| p.to_string()).unwrap_or_else(|| "peer".into());
 
     let _ = write_v2_msg(&mut writer, NetworkMessage::SendHeaders).await;
     // BIP152: compact v2 low-bandwidth. HB is selected later (max 3, prefer outbound).
     let _ = write_v2_msg(
         &mut writer,
-        NetworkMessage::SendCmpct(SendCmpct {
-            send_compact: false,
-            version: 2,
-        }),
+        NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }),
     )
     .await;
     // Handshake-writer ping, same nonce as LivePeer: connect_nodes needs pong
@@ -1458,10 +1393,7 @@ pub async fn peer_session_with(
     let mut last_hb = std::time::Instant::now();
     let result = async {
         loop {
-            if session
-                .as_ref()
-                .is_some_and(|s| s.stop.load(Ordering::Relaxed))
-            {
+            if session.as_ref().is_some_and(|s| s.stop.load(Ordering::Relaxed)) {
                 return Ok(());
             }
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
@@ -1735,10 +1667,7 @@ pub(crate) fn should_poll_peer_headers(hub: &ChainHub, best_known: Option<BlockH
         return h.0 >= our_tip;
     }
     let empty = HashMap::new();
-    !matches!(
-        header_branch_vs_tip(hub, &empty, best),
-        Some(std::cmp::Ordering::Less)
-    )
+    !matches!(header_branch_vs_tip(hub, &empty, best), Some(std::cmp::Ordering::Less))
 }
 
 /// Start Core initial headers-sync on this session if we are allowed to.
@@ -1755,9 +1684,8 @@ fn maybe_queue_initial_getheaders(
     }
     let now = session.clock_now();
     let best_t = hub.tip_header().map(|h| u64::from(h.time)).unwrap_or(0);
-    let started = session
-        .peer_hub()
-        .is_some_and(|ph| ph.try_start_headers_sync(session, now, best_t));
+    let started =
+        session.peer_hub().is_some_and(|ph| ph.try_start_headers_sync(session, now, best_t));
     if started {
         let h = hub.tip_height().unwrap_or(0);
         rbitcoin_log::info!("{}", crate::chain::initial_getheaders_log(h, session.id));
@@ -1897,10 +1825,7 @@ fn take_requested_block(hub: &ChainHub, requested: &mut HashSet<BlockHash>, hash
 }
 
 fn net_error_needs_parent(e: &NetError) -> bool {
-    matches!(
-        e,
-        NetError::UnknownParent | NetError::Protocol("gap above tip")
-    )
+    matches!(e, NetError::UnknownParent | NetError::Protocol("gap above tip"))
 }
 
 /// Incomplete compact block waiting for `blocktxn`.
@@ -1916,15 +1841,9 @@ fn mempool_shortid_avail(
     hub: &ChainHub,
     hsi: &HeaderAndShortIds,
     version: u32,
-) -> (
-    HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
-    Option<crate::compact::CmpctFillSets>,
-) {
-    let pref: Vec<bitcoin::Wtxid> = hsi
-        .prefilled_txs
-        .iter()
-        .map(|p| p.tx.compute_wtxid())
-        .collect();
+) -> (HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>, Option<crate::compact::CmpctFillSets>) {
+    let pref: Vec<bitcoin::Wtxid> =
+        hsi.prefilled_txs.iter().map(|p| p.tx.compute_wtxid()).collect();
     match hub
         .mempool()
         .and_then(|mp| mp.try_cmpct_avail(&hsi.header, hsi.nonce, version, &hsi.short_ids, &pref))
@@ -1937,10 +1856,7 @@ fn mempool_shortid_avail(
 #[derive(Debug)]
 enum CmpctReconstruct {
     Block(Block, Option<Box<crate::compact::CmpctFillSets>>),
-    NeedTxn(
-        crate::compact::CmpctPartial,
-        Option<Box<crate::compact::CmpctFillSets>>,
-    ),
+    NeedTxn(crate::compact::CmpctPartial, Option<Box<crate::compact::CmpctFillSets>>),
     GetData,
 }
 
@@ -1983,10 +1899,7 @@ fn log_cmpct_filled(
 }
 
 fn log_cmpct_getdata(hash: BlockHash, missing_n: usize) {
-    rbitcoin_log::info!(
-        "{}",
-        crate::compact::reconstruct_getdata_stats(hash, missing_n)
-    );
+    rbitcoin_log::info!("{}", crate::compact::reconstruct_getdata_stats(hash, missing_n));
 }
 
 /// Flush due / unbroadcast tx INVs onto every live session writer.
@@ -2101,10 +2014,7 @@ fn tx_inv_candidate_ok(
     if session.has_announced_wtx(&w) {
         return false;
     }
-    if mp
-        .accept_gen(&w)
-        .is_some_and(|g| g < session.inv_gen_floor())
-    {
+    if mp.accept_gen(&w).is_some_and(|g| g < session.inv_gen_floor()) {
         return false;
     }
     let peer_min = session.minfeefilter_sat_kvb();
@@ -2186,15 +2096,7 @@ fn queue_due_tx_invs(
         };
         session.note_age_inv_seen(last.0, last.1);
         for (txid, w) in due_wtx {
-            if !tx_inv_candidate_ok(
-                mp,
-                session,
-                from_this_peer,
-                txid,
-                w,
-                false,
-                inbound_age_gate,
-            ) {
+            if !tx_inv_candidate_ok(mp, session, from_this_peer, txid, w, false, inbound_age_gate) {
                 continue;
             }
             session.note_announced_wtx(w);
@@ -2556,11 +2458,8 @@ fn on_getblocks(
             stop_hash: gb.stop_hash,
         },
     )?;
-    let inv: Vec<Inventory> = headers
-        .into_iter()
-        .take(500)
-        .map(|h| Inventory::WitnessBlock(h.block_hash()))
-        .collect();
+    let inv: Vec<Inventory> =
+        headers.into_iter().take(500).map(|h| Inventory::WitnessBlock(h.block_hash())).collect();
     if !inv.is_empty() {
         queue_out(out_tx, NetworkMessage::Inv(inv))?;
     }
@@ -2643,13 +2542,8 @@ fn serve_getdata_compact(
         return Ok(());
     };
     let tip_h = hub.tip_height().unwrap_or(0);
-    let block_h = hub
-        .query
-        .height_of_hash(&h.to_byte_array())
-        .ok()
-        .flatten()
-        .map(|ht| ht.0)
-        .unwrap_or(0);
+    let block_h =
+        hub.query.height_of_hash(&h.to_byte_array()).ok().flatten().map(|ht| ht.0).unwrap_or(0);
     if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
         let _ = try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
         return Ok(());
@@ -2751,10 +2645,7 @@ fn on_getblocktxn(
                 queue_out(
                     out_tx,
                     NetworkMessage::BlockTxn(BlockTxn {
-                        transactions: BlockTransactions {
-                            block_hash: hash,
-                            transactions,
-                        },
+                        transactions: BlockTransactions { block_hash: hash, transactions },
                     }),
                 )?;
             }
@@ -2787,8 +2678,7 @@ fn on_inv(
                 if !hub.is_connected(h) {
                     if !hub.knows_header(h) && !follow.pending_headers.contains_key(h) {
                         if session.is_none_or(|s| {
-                            s.peer_hub()
-                                .is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
+                            s.peer_hub().is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
                         }) {
                             need_headers = true;
                         }
@@ -2885,10 +2775,7 @@ fn on_headers(
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
         if hub.is_block_invalid(&prev)
-            || headers
-                .iter()
-                .take(n)
-                .any(|h| hub.is_block_invalid(&h.block_hash()))
+            || headers.iter().take(n).any(|h| hub.is_block_invalid(&h.block_hash()))
         {
             // Headers on a cached-invalid chain: disconnect
             // (`p2p_unrequested_blocks` step 8 follow-up header).
@@ -3230,10 +3117,7 @@ async fn on_cmpctblock_reconstruct(
         }
         None => {
             log_cmpct_getdata(hash, 0);
-            queue_out(
-                out_tx,
-                NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-            )
+            queue_out(out_tx, NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
         }
     }
 }
@@ -3292,10 +3176,7 @@ fn on_cmpct_need_getdata(
     if let Some(s) = session {
         s.note_failed_cmpct(hash);
     }
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    queue_out(out_tx, NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3316,10 +3197,7 @@ fn on_cmpct_need_txn(
     if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
         follow.ban_score = follow.ban_score.saturating_add(10);
         log_cmpct_getdata(hash, missing_n);
-        return queue_out(
-            out_tx,
-            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-        );
+        return queue_out(out_tx, NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]));
     }
     let may_fill = session.is_none_or(|s| s.try_cmpct_fill(hash));
     if !may_fill {
@@ -3470,10 +3348,7 @@ fn on_blocktxn_apply_fail(
         s.release_cmpct_taken(hash);
     }
     follow.ban_score = follow.ban_score.saturating_add(10);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    queue_out(out_tx, NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
 }
 
 fn on_blocktxn_unconnectable(
@@ -3488,10 +3363,7 @@ fn on_blocktxn_unconnectable(
         s.release_cmpct_taken(hash);
     }
     follow.ban_score = follow.ban_score.saturating_add(10);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    queue_out(out_tx, NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3505,16 +3377,12 @@ enum TxAcceptLog<'a> {
 fn tx_accept_log(e: &rbitcoin_mempool::AcceptError) -> TxAcceptLog<'_> {
     match e {
         rbitcoin_mempool::AcceptError::Duplicate(_) => TxAcceptLog::Silent,
-        rbitcoin_mempool::AcceptError::Orphaned {
-            missing,
-            fresh: true,
-            ..
-        } => TxAcceptLog::Park(missing),
-        rbitcoin_mempool::AcceptError::Orphaned {
-            missing,
-            fresh: false,
-            ..
-        } => TxAcceptLog::ParentFetch(missing),
+        rbitcoin_mempool::AcceptError::Orphaned { missing, fresh: true, .. } => {
+            TxAcceptLog::Park(missing)
+        }
+        rbitcoin_mempool::AcceptError::Orphaned { missing, fresh: false, .. } => {
+            TxAcceptLog::ParentFetch(missing)
+        }
         _ => TxAcceptLog::Reject,
     }
 }
@@ -3531,11 +3399,7 @@ fn queue_orphan_parent_getdata(
     mp.note_getdata_tx(want.len() as u64);
     queue_out(
         out_tx,
-        NetworkMessage::GetData(
-            want.into_iter()
-                .map(Inventory::WitnessTransaction)
-                .collect(),
-        ),
+        NetworkMessage::GetData(want.into_iter().map(Inventory::WitnessTransaction).collect()),
     )
 }
 
@@ -3567,10 +3431,7 @@ async fn on_tx(
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
             }
-            match mp
-                .accept_tx_from_async(tx.clone(), session.map(|s| s.id))
-                .await
-            {
+            match mp.accept_tx_from_async(tx.clone(), session.map(|s| s.id)).await {
                 Ok(r) => {
                     if let Some(s) = session {
                         s.note_last_transaction();
@@ -3745,9 +3606,7 @@ fn cmpct_announce_from_block(
 ) -> Option<NetworkMessage> {
     let nonce = rand_nonce();
     let ver = cmpct_version.clamp(1, 2);
-    let pref = hub
-        .cmpct_prefill_indexes(&block.block_hash())
-        .unwrap_or_else(|| vec![0]);
+    let pref = hub.cmpct_prefill_indexes(&block.block_hash()).unwrap_or_else(|| vec![0]);
     let hsi = HeaderAndShortIds::from_block(block, nonce, ver, &pref)
         .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
         .ok()?;
@@ -3755,9 +3614,7 @@ fn cmpct_announce_from_block(
         "{}",
         crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
     );
-    Some(NetworkMessage::CmpctBlock(CmpctBlock {
-        compact_block: hsi,
-    }))
+    Some(NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }))
 }
 
 /// BIP152 compact tip announcement (coinbase prefilled). `None` if the body
@@ -3985,12 +3842,7 @@ fn header_branch_vs_tip(
     start: BlockHash,
 ) -> Option<std::cmp::Ordering> {
     if hub.is_connected(&start) {
-        let ancestor = hub
-            .query
-            .height_of_hash(&start.to_byte_array())
-            .ok()
-            .flatten()?
-            .0;
+        let ancestor = hub.query.height_of_hash(&start.to_byte_array()).ok().flatten()?.0;
         let tip = hub.tip_height()?;
         return Some(0u32.cmp(&tip.saturating_sub(ancestor)));
     }
@@ -4000,12 +3852,7 @@ fn header_branch_vs_tip(
     }
     for _ in 0..10_000 {
         if hub.is_connected(&h) {
-            let ancestor = hub
-                .query
-                .height_of_hash(&h.to_byte_array())
-                .ok()
-                .flatten()?
-                .0;
+            let ancestor = hub.query.height_of_hash(&h.to_byte_array()).ok().flatten()?.0;
             let tip = hub.tip_height()?;
             return Some(n_new.cmp(&tip.saturating_sub(ancestor)));
         }
@@ -4046,9 +3893,7 @@ fn any_header_path_meets_minwork(
     if header_path_meets_minwork(hub, pending, extra_tip) {
         return true;
     }
-    pending
-        .keys()
-        .any(|h| *h != extra_tip && header_path_meets_minwork(hub, pending, *h))
+    pending.keys().any(|h| *h != extra_tip && header_path_meets_minwork(hub, pending, *h))
 }
 
 fn work_of_header_path(
@@ -4060,17 +3905,10 @@ fn work_of_header_path(
     let mut h = tip;
     for _ in 0..10_000 {
         if hub.is_connected(&h) {
-            let height = hub
-                .query
-                .height_of_hash(&h.to_byte_array())
-                .ok()
-                .flatten()?
-                .0;
+            let height = hub.query.height_of_hash(&h.to_byte_array()).ok().flatten()?.0;
             let base = hub.work_through_height(height).ok()?;
             extra.reverse();
-            return Some(crate::most_work::sum_work(
-                std::iter::once(base).chain(extra),
-            ));
+            return Some(crate::most_work::sum_work(std::iter::once(base).chain(extra)));
         }
         let hdr = pending.get(&h).copied().or_else(|| hub.header_of(&h))?;
         if !hub.header_claimed_pow_ok(&hdr) {
@@ -4107,10 +3945,7 @@ fn connecting_header_path(
             break;
         }
         path.push(h);
-        let prev = pending
-            .get(&h)
-            .map(|hdr| hdr.prev_blockhash)
-            .or_else(|| hub.prev_of(&h));
+        let prev = pending.get(&h).map(|hdr| hdr.prev_blockhash).or_else(|| hub.prev_of(&h));
         let Some(prev) = prev else {
             break;
         };
@@ -4130,10 +3965,7 @@ fn better_connecting_header_path(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> Vec<BlockHash> {
-    if matches!(
-        announced_work_cmp(hub, pending, tip),
-        Some(std::cmp::Ordering::Less)
-    ) {
+    if matches!(announced_work_cmp(hub, pending, tip), Some(std::cmp::Ordering::Less)) {
         return Vec::new();
     }
     connecting_header_path(hub, pending, tip)
@@ -4164,8 +3996,7 @@ fn compact_getdata_near_tip(hub: &ChainHub, hash: &BlockHash) -> bool {
     if hub.tip_hash() == Some(*hash) {
         return true;
     }
-    hub.header_of(hash)
-        .is_some_and(|hdr| hub.tip_hash() == Some(hdr.prev_blockhash))
+    hub.header_of(hash).is_some_and(|hdr| hub.tip_hash() == Some(hdr.prev_blockhash))
 }
 
 /// Core CMPCTBLOCK: reconstruct unsolicited compact only when claimed work
@@ -4196,8 +4027,7 @@ fn compact_claimed_height(hub: &ChainHub, header: &bitcoin::block::Header) -> Op
     if let Some(h) = hub.header_height(&hash) {
         return Some(h);
     }
-    hub.header_height(&header.prev_blockhash)
-        .map(|p| p.saturating_add(1))
+    hub.header_height(&header.prev_blockhash).map(|p| p.saturating_add(1))
 }
 
 /// Compact whose claimed chain work is below the 144-block anti-DoS buffer.
@@ -4226,13 +4056,11 @@ pub(crate) fn outbound_feefilter_sats(
 }
 
 fn queue_out(out: &mpsc::UnboundedSender<PeerOut>, msg: NetworkMessage) -> Result<(), NetError> {
-    out.send(PeerOut::Msg(msg))
-        .map_err(|_| NetError::Protocol("peer write half closed"))
+    out.send(PeerOut::Msg(msg)).map_err(|_| NetError::Protocol("peer write half closed"))
 }
 
 fn queue_encoded(out: &mpsc::UnboundedSender<PeerOut>, bytes: Vec<u8>) -> Result<(), NetError> {
-    out.send(PeerOut::Encoded(bytes))
-        .map_err(|_| NetError::Protocol("peer write half closed"))
+    out.send(PeerOut::Encoded(bytes)).map_err(|_| NetError::Protocol("peer write half closed"))
 }
 
 /// Queue a reconstructed `Block`/`CmpctBlock` if this session is under the serve cap.
@@ -4289,18 +4117,12 @@ fn queue_cmpct_tip_announce(
 }
 
 fn note_served_write(n: &AtomicUsize) {
-    let _ = n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-        Some(v.saturating_sub(1))
-    });
+    let _ = n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1)));
 }
 
 fn pending_header_leaves(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {
     let prevs: HashSet<BlockHash> = pending.values().map(|h| h.prev_blockhash).collect();
-    pending
-        .keys()
-        .copied()
-        .filter(|h| !prevs.contains(h))
-        .collect()
+    pending.keys().copied().filter(|h| !prevs.contains(h)).collect()
 }
 
 fn keep_pending_connecting_paths(
@@ -4322,11 +4144,7 @@ fn release_asks_off_path(hub: &ChainHub, requested: &mut HashSet<BlockHash>, pat
     if path.is_empty() {
         return;
     }
-    let drop: Vec<BlockHash> = requested
-        .iter()
-        .copied()
-        .filter(|h| !path.contains(h))
-        .collect();
+    let drop: Vec<BlockHash> = requested.iter().copied().filter(|h| !path.contains(h)).collect();
     for h in drop {
         take_requested_block(hub, requested, &h);
     }
@@ -4481,10 +4299,7 @@ pub(crate) fn headers_reply_for_getheaders(
                 }
             } else if hub.stale_relay_allowed(&stop) {
                 let have_body = hub.cache.get_block(&stop).is_some()
-                    || hub
-                        .query
-                        .is_block_archived(&stop.to_byte_array())
-                        .unwrap_or(false);
+                    || hub.query.is_block_archived(&stop.to_byte_array()).unwrap_or(false);
                 if have_body {
                     if let Some(h) = hub.header_of(&stop) {
                         return Ok(vec![h]);
@@ -4511,13 +4326,8 @@ fn headers_for_peer(
 
 fn tx_from_tip_block(hub: &ChainHub, wtxid: &bitcoin::Wtxid) -> Option<Transaction> {
     let hash = hub.tip_hash()?;
-    let block = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &hash)
-        .ok()
-        .flatten()?;
-    block
-        .txdata
-        .into_iter()
-        .find(|tx| tx.compute_wtxid() == *wtxid)
+    let block = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &hash).ok().flatten()?;
+    block.txdata.into_iter().find(|tx| tx.compute_wtxid() == *wtxid)
 }
 
 fn block_for_peer(

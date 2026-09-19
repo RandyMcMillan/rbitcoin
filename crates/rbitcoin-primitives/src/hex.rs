@@ -78,14 +78,9 @@ pub fn encode(data: impl AsRef<[u8]>) -> String {
 
 /// Decode a hex string (even length, optional `0x` prefix). Accepts a-f/A-F.
 pub fn decode(s: &str) -> Result<Vec<u8>, HexError> {
-    let s = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
     if !s.len().is_multiple_of(2) {
-        return Err(HexError {
-            message: "odd hex length",
-        });
+        return Err(HexError { message: "odd hex length" });
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
@@ -104,9 +99,7 @@ fn from_digit(b: u8) -> Result<u8, HexError> {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(HexError {
-            message: "invalid hex digit",
-        }),
+        _ => Err(HexError { message: "invalid hex digit" }),
     }
 }
 
@@ -150,18 +143,9 @@ mod tests {
 
     #[test]
     fn parse_display_hash32_rejects_odd_length_and_non_hex() {
-        assert_eq!(
-            parse_display_hash32("c").unwrap_err().to_string(),
-            "odd hex length"
-        );
-        assert_eq!(
-            parse_display_hash32("zz").unwrap_err().to_string(),
-            "invalid hex digit"
-        );
+        assert_eq!(parse_display_hash32("c").unwrap_err().to_string(), "odd hex length");
+        assert_eq!(parse_display_hash32("zz").unwrap_err().to_string(), "invalid hex digit");
         let e = parse_display_hash32("abcd").unwrap_err();
-        assert!(
-            matches!(e, DisplayHashError::WrongLength { got: 2 }),
-            "{e:?}"
-        );
+        assert!(matches!(e, DisplayHashError::WrongLength { got: 2 }), "{e:?}");
     }
 }

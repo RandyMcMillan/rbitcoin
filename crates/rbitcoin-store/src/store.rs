@@ -113,10 +113,7 @@ impl StoreLayout {
     }
 
     pub fn inwit_dir(&self) -> &Path {
-        self.cold_dir
-            .as_deref()
-            .filter(|c| *c != self.dir)
-            .unwrap_or(&self.dir)
+        self.cold_dir.as_deref().filter(|c| *c != self.dir).unwrap_or(&self.dir)
     }
 }
 
@@ -435,10 +432,7 @@ impl Store {
 
     /// BIP113 times for `height` when it is the fence tip and the ring is warm.
     pub fn mtp_times_at(&self, height: Height) -> Option<(u8, [u32; 11])> {
-        self.mtp_ring
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .window_at(height.0)
+        self.mtp_ring.read().unwrap_or_else(|e| e.into_inner()).window_at(height.0)
     }
 
     fn mtp_push(&self, height: u32, time: u32) {
@@ -521,9 +515,7 @@ impl Store {
     /// creates and TipOnly leftover misses (restart rebuild from disk then heals).
     pub fn height_fence_extend(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
         let Some((first, n)) = self.header_txs.get_range(header_fk)? else {
-            return Err(StoreError::Corrupt(
-                "height fence: header_txs range missing",
-            ));
+            return Err(StoreError::Corrupt("height fence: header_txs range missing"));
         };
         if n == 0 || first.is_null() {
             return Err(StoreError::Corrupt("height fence: header_txs range empty"));
@@ -733,8 +725,7 @@ impl Store {
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        self.txs
-            .put_full_batch_from_pins(items, index, spent_overlay)
+        self.txs.put_full_batch_from_pins(items, index, spent_overlay)
     }
 
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
@@ -770,10 +761,7 @@ impl Store {
         let create_fk = if let Some(fk) = self.txs.queued_pending_fk(out_txid) {
             fk
         } else {
-            self.txs
-                .get_by_txid(out_txid)?
-                .map(|(fk, _)| fk)
-                .ok_or(StoreError::NotFound)?
+            self.txs.get_by_txid(out_txid)?.map(|(fk, _)| fk).ok_or(StoreError::NotFound)?
         };
         self.put_spend_create(create_fk, out_index, spending_tx_fk, spending_vin)?;
         Ok(spending_tx_fk)
@@ -857,8 +845,7 @@ impl Store {
         &self,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-        self.txs
-            .put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
+        self.txs.put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
     }
 
     /// Resolve txid → Class A fk without full body decode (head probe + body txid).
@@ -953,19 +940,11 @@ impl Store {
     }
 
     pub fn tx_body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        Ok(self
-            .tx_create_loc_range_batch(fks)?
-            .into_iter()
-            .map(|p| p.map(|x| x.txout))
-            .collect())
+        Ok(self.tx_create_loc_range_batch(fks)?.into_iter().map(|p| p.map(|x| x.txout)).collect())
     }
 
     pub fn tx_spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        Ok(self
-            .tx_create_loc_range_batch(fks)?
-            .into_iter()
-            .map(|p| p.map(|x| x.spent))
-            .collect())
+        Ok(self.tx_create_loc_range_batch(fks)?.into_iter().map(|p| p.map(|x| x.spent)).collect())
     }
 
     /// Completion-driven loc→body io_uring pipeline (confirm load / prep).
@@ -1006,8 +985,7 @@ impl Store {
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
     ) -> Result<Vec<Option<crate::tx_table::SpenderSlot>>, StoreError> {
-        self.txs
-            .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
+        self.txs.get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }
 
     /// Pure-write annotate with structural-known meta (no body pread).
@@ -1020,8 +998,7 @@ impl Store {
         known: &[(Fk, u8, u32)],
         backend: crate::io_backend::WriteIoBackend,
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-        self.txs
-            .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known, backend)
+        self.txs.put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known, backend)
     }
 
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.
@@ -1444,10 +1421,7 @@ impl Store {
         rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
         self.headers.flush()?;
         self.flush_class_c_tip()?;
-        rbitcoin_log::info!(
-            "store: shutdown flush — async Class A… elapsed={:?}",
-            t0.elapsed()
-        );
+        rbitcoin_log::info!("store: shutdown flush — async Class A… elapsed={:?}", t0.elapsed());
         self.txs.flush_async()?;
         self.spenders.flush_async()?;
         self.scripthash.flush_async()?;
@@ -1507,10 +1481,8 @@ fn write_meta(dir: &Path) -> Result<(), StoreError> {
         .create_new(true)
         .open(&path)
         .map_err(|e| StoreError::io(&path, e))?;
-    f.write_all(&STORE_MAGIC)
-        .map_err(|e| StoreError::io(&path, e))?;
-    f.write_all(&SCHEMA_VERSION.to_le_bytes())
-        .map_err(|e| StoreError::io(&path, e))?;
+    f.write_all(&STORE_MAGIC).map_err(|e| StoreError::io(&path, e))?;
+    f.write_all(&SCHEMA_VERSION.to_le_bytes()).map_err(|e| StoreError::io(&path, e))?;
     f.flush().map_err(|e| StoreError::io(&path, e))?;
     Ok(())
 }
@@ -1526,10 +1498,8 @@ fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
             .truncate(true)
             .open(&tmp)
             .map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(&STORE_MAGIC)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.write_all(&SCHEMA_VERSION.to_le_bytes())
-            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.write_all(&STORE_MAGIC).map_err(|e| StoreError::io(&tmp, e))?;
+        f.write_all(&SCHEMA_VERSION.to_le_bytes()).map_err(|e| StoreError::io(&tmp, e))?;
         f.flush().map_err(|e| StoreError::io(&tmp, e))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
@@ -1734,9 +1704,7 @@ mod tests {
 
     fn sh_put_create(s: &Store, rec: crate::scripthash::ScriptHashRecord) {
         let mut heads = std::collections::HashMap::new();
-        s.scripthash
-            .put_create_batch_append(std::slice::from_ref(&rec), &mut heads)
-            .unwrap();
+        s.scripthash.put_create_batch_append(std::slice::from_ref(&rec), &mut heads).unwrap();
     }
 
     #[test]
@@ -1788,10 +1756,8 @@ mod tests {
                 rbitcoin_primitives::TableKind::Header,
             )
             .unwrap();
-            dst.write_at(FILE_HEADER_LEN as u64, &rec.encode_v23())
-                .unwrap();
-            dst.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V23 as u64)
-                .unwrap();
+            dst.write_at(FILE_HEADER_LEN as u64, &rec.encode_v23()).unwrap();
+            dst.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V23 as u64).unwrap();
             dst.flush().unwrap();
             drop(dst);
             std::fs::rename(dir.join("header.body.v23tmp"), dir.join("header.body")).unwrap();
@@ -1837,10 +1803,7 @@ mod tests {
         let dir = tmp();
         {
             let s = Store::create_tiny(&dir).unwrap();
-            sh_put_create(
-                &s,
-                crate::scripthash::ScriptHashRecord::from_fk([0x11u8; 32], Fk(1)),
-            );
+            sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk([0x11u8; 32], Fk(1)));
             s.flush().unwrap();
         }
         let ingest = dir.join("scripthash.ovf").join("ingest");
@@ -1883,10 +1846,7 @@ mod tests {
             assert_ne!(dir.path(), dir2.path(), "each open must be a unique path");
             assert_eq!(store2.headers.head_target_slots(), 64);
         }
-        assert!(
-            !path.exists(),
-            "drop must remove the Tiny store directory {path:?}"
-        );
+        assert!(!path.exists(), "drop must remove the Tiny store directory {path:?}");
     }
 
     #[test]
@@ -1977,9 +1937,7 @@ mod tests {
                 multi_spender: false,
             }],
         );
-        let cb_fks = s
-            .put_tx_full_batch_indexed(&[(cb_tx, cb_in, cb_out)], false)
-            .unwrap();
+        let cb_fks = s.put_tx_full_batch_indexed(&[(cb_tx, cb_in, cb_out)], false).unwrap();
         let non_tx = TxRecord {
             txid: [11u8; 32],
             version: 1,
@@ -2003,9 +1961,7 @@ mod tests {
             spender_field: Fk::NULL,
             multi_spender: false,
         }];
-        let non_fks = s
-            .put_tx_full_batch_indexed(&[(non_tx, non_in, non_out)], false)
-            .unwrap();
+        let non_fks = s.put_tx_full_batch_indexed(&[(non_tx, non_in, non_out)], false).unwrap();
         let fks = [cb_fks[0], non_fks[0]];
         assert_eq!(fks.len(), 2);
         s.header_txs.put_range(hfk, fks[0], 2).unwrap();
@@ -2029,22 +1985,13 @@ mod tests {
         {
             let file = dir.join("not-a-dir");
             std::fs::write(&file, b"x").unwrap();
-            assert!(matches!(
-                Store::create_tiny(&file),
-                Err(StoreError::NotDirectory(_))
-            ));
+            assert!(matches!(Store::create_tiny(&file), Err(StoreError::NotDirectory(_))));
         }
-        assert!(matches!(
-            Store::open_tiny(dir.join("missing")),
-            Err(StoreError::NotDirectory(_))
-        ));
+        assert!(matches!(Store::open_tiny(dir.join("missing")), Err(StoreError::NotDirectory(_))));
         {
             let file = dir.join("open-file-not-dir");
             std::fs::write(&file, b"x").unwrap();
-            assert!(matches!(
-                Store::open_tiny(&file),
-                Err(StoreError::NotDirectory(_))
-            ));
+            assert!(matches!(Store::open_tiny(&file), Err(StoreError::NotDirectory(_))));
         }
 
         let s = Store::create_tiny(&dir).unwrap();
@@ -2071,10 +2018,7 @@ mod tests {
 
         let create = coinbase_item(
             [10u8; 32],
-            vec![
-                OutputRecord::unspent(50, vec![0x51]),
-                OutputRecord::unspent(25, vec![0x51]),
-            ],
+            vec![OutputRecord::unspent(50, vec![0x51]), OutputRecord::unspent(25, vec![0x51])],
         );
         let fks = s.put_tx_full_batch_indexed(&[create], true).unwrap();
         let create_fk = fks[0];
@@ -2095,14 +2039,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let expect: Vec<[u8; 32]> = outs
-            .iter()
-            .map(|o| crate::scripthash::script_hash(&o.script))
-            .collect();
-        assert_eq!(
-            span_hashes, expect,
-            "fk-span script hashes must match per-fk decode"
-        );
+        let expect: Vec<[u8; 32]> =
+            outs.iter().map(|o| crate::scripthash::script_hash(&o.script)).collect();
+        assert_eq!(span_hashes, expect, "fk-span script hashes must match per-fk decode");
         assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
         assert_eq!(s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0, create_fk);
 
@@ -2210,20 +2149,14 @@ mod tests {
         // Contiguous body covering create..spend (sequential put order).
         let body_first = create_fk.0.min(spend_fk.0);
         let body_last = create_fk.0.max(spend_fk.0);
-        s.header_txs
-            .put_range(hfk, Fk(body_first), (body_last - body_first + 1) as u32)
-            .unwrap();
+        s.header_txs.put_range(hfk, Fk(body_first), (body_last - body_first + 1) as u32).unwrap();
         s.strong_tx.set_strong(spend_fk, hfk).unwrap();
         s.rebuild_height_fence().unwrap();
         assert!(s.is_confirmed_strong(spend_fk).unwrap());
         assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
-        assert!(s
-            .has_confirmed_strong_spender_create(create_fk, 0, Some((soff, slen)))
-            .unwrap());
+        assert!(s.has_confirmed_strong_spender_create(create_fk, 0, Some((soff, slen))).unwrap());
         assert!(s.has_confirmed_strong_spender(&[10u8; 32], 0).unwrap());
-        let unspent = s
-            .unspent_create_vouts(create_fk, &[0, 1], Some((soff, slen)))
-            .unwrap();
+        let unspent = s.unspent_create_vouts(create_fk, &[0, 1], Some((soff, slen))).unwrap();
         // vout 0 has confirmed strong spender; vout1 multi without strong may still be unspent
         assert!(!unspent.contains(&0));
         let raw = s.spenders_raw(&[10u8; 32], 0).unwrap();
@@ -2268,10 +2201,7 @@ mod tests {
         drop(s3);
 
         // meta errors
-        assert!(matches!(
-            check_meta(std::path::Path::new("/no/such")),
-            Err(StoreError::Io { .. })
-        ));
+        assert!(matches!(check_meta(std::path::Path::new("/no/such")), Err(StoreError::Io { .. })));
         {
             let bad = tmp();
             std::fs::create_dir_all(&bad).unwrap();
@@ -2321,10 +2251,7 @@ mod tests {
 
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
-        assert!(
-            dir.join("create.loc").is_file(),
-            "schema 22 open must keep create.loc"
-        );
+        assert!(dir.join("create.loc").is_file(), "schema 22 open must keep create.loc");
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         assert_eq!(SCHEMA_VERSION, 24);
         let s = Store::open_tiny(&dir).unwrap();
@@ -2349,8 +2276,7 @@ mod tests {
             };
             let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x51], vec![])];
             let outs = vec![OutputRecord::unspent(1, vec![0x51])];
-            s.put_tx_full_batch_indexed(&[(tx, ins, outs)], false)
-                .unwrap();
+            s.put_tx_full_batch_indexed(&[(tx, ins, outs)], false).unwrap();
             s.flush().unwrap();
         }
         write_store_meta_ver(&dir, 21);
@@ -2472,10 +2398,7 @@ mod tests {
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         assert_eq!(SCHEMA_VERSION, 24);
-        assert!(
-            !dir.join("spent.off").exists(),
-            "empty 21 open must unlink leftover spent.off"
-        );
+        assert!(!dir.join("spent.off").exists(), "empty 21 open must unlink leftover spent.off");
         assert!(!dir.join("txout.idx").exists());
         assert!(!dir.join("spent.idx").exists());
         assert!(!dir.join("inwit.idx").exists());
@@ -2630,10 +2553,7 @@ mod tests {
         match Store::open_tiny(&dir) {
             Ok(_) => panic!("expected refuse for schema 14 with durable SH"),
             Err(StoreError::Corrupt(m)) => {
-                assert!(
-                    m.contains("wipe store/scripthash") || m.contains("schema 14"),
-                    "{m}"
-                );
+                assert!(m.contains("wipe store/scripthash") || m.contains("schema 14"), "{m}");
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2657,10 +2577,7 @@ mod tests {
         match Store::open_tiny(&dir) {
             Ok(_) => panic!("expected refuse for schema 13 with durable SH"),
             Err(StoreError::Corrupt(m)) => {
-                assert!(
-                    m.contains("materialized scripthash") || m.contains("schema 13"),
-                    "{m}"
-                );
+                assert!(m.contains("materialized scripthash") || m.contains("schema 13"), "{m}");
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2768,10 +2685,7 @@ mod tests {
         let dir = tmp();
         {
             let s = Store::create_tiny(&dir).unwrap();
-            sh_put_create(
-                &s,
-                crate::scripthash::ScriptHashRecord::from_fk([0xabu8; 32], Fk(1)),
-            );
+            sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk([0xabu8; 32], Fk(1)));
             s.flush().unwrap();
         }
         write_store_meta_ver(&dir, 17);
@@ -2938,10 +2852,7 @@ mod tests {
         match Store::open_tiny(&dir) {
             Ok(_) => panic!("expected refuse for 16-layout Class A with creates"),
             Err(StoreError::Corrupt(m)) => {
-                assert_eq!(
-                    m,
-                    "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD"
-                );
+                assert_eq!(m, "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD");
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -3001,10 +2912,7 @@ mod tests {
                 output_count: 2,
             },
             vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-            vec![
-                OutputRecord::unspent(2, p2tr.clone()),
-                OutputRecord::unspent(3, p2wsh.clone()),
-            ],
+            vec![OutputRecord::unspent(2, p2tr.clone()), OutputRecord::unspent(3, p2wsh.clone())],
         );
         let v3 = (
             TxRecord {
@@ -3017,10 +2925,7 @@ mod tests {
                 output_count: 2,
             },
             vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-            vec![
-                OutputRecord::unspent(0, opreturn.clone()),
-                OutputRecord::unspent(4, p2a.clone()),
-            ],
+            vec![OutputRecord::unspent(0, opreturn.clone()), OutputRecord::unspent(4, p2a.clone())],
         );
         let hi = (
             TxRecord {
@@ -3035,9 +2940,7 @@ mod tests {
             vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             vec![OutputRecord::unspent(5, vec![0x51])],
         );
-        let fks = s
-            .put_tx_full_batch_indexed(&[v1, v2, v3, hi], true)
-            .unwrap();
+        let fks = s.put_tx_full_batch_indexed(&[v1, v2, v3, hi], true).unwrap();
         assert_eq!(fks.len(), 4);
 
         let (off, len) = s.txs.body_range(fks[0]).unwrap();
@@ -3052,10 +2955,7 @@ mod tests {
         assert_eq!(outs2[0].script, p2tr);
         assert_eq!(outs2[1].script, p2wsh);
         let (off2, len2) = s.txs.body_range(fks[1]).unwrap();
-        let raw2 = s
-            .txs
-            .with_body_span(off2, len2, |b| Ok(b.to_vec()))
-            .unwrap();
+        let raw2 = s.txs.with_body_span(off2, len2, |b| Ok(b.to_vec())).unwrap();
         let (_, meta_n) = TxRecord::decode_body_meta(&raw2).unwrap();
         assert_eq!(raw2[meta_n] & 0x0f, crate::compact::SCRIPT_KIND_V17_P2TR);
 
@@ -3070,10 +2970,7 @@ mod tests {
 
         let (soff, slen) = s.tx_spent_range(fks[1]).unwrap();
         assert_eq!(slen, 2 * OutputRecord::SPENT_SLOT_LEN as u64);
-        assert_eq!(
-            s.txs.get_output_spender_meta_at(soff, slen, 0).unwrap().1,
-            Fk::NULL
-        );
+        assert_eq!(s.txs.get_output_spender_meta_at(soff, slen, 0).unwrap().1, Fk::NULL);
 
         s.flush().unwrap();
         drop(s);
@@ -3183,9 +3080,7 @@ mod tests {
         s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
         s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
         let item = coinbase_item([0x51; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-        let fks = s
-            .put_tx_full_batch_indexed(&[item], /*index=*/ false)
-            .unwrap();
+        let fks = s.put_tx_full_batch_indexed(&[item], /*index=*/ false).unwrap();
         s.txs.head_note_pending(&[([0x51; 32], fks[0])]);
         s.rebuild_height_fence().unwrap();
         assert_eq!(
@@ -3213,11 +3108,7 @@ mod tests {
 
         s.confirmed.set(Height(1), Fk(2)).unwrap();
         s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
-        assert_eq!(
-            s.tip_height(),
-            Some(Height(1)),
-            "set_many/set publishes tip"
-        );
+        assert_eq!(s.tip_height(), Some(Height(1)), "set_many/set publishes tip");
         assert_eq!(
             s.fence_tip_height(),
             Some(0),
@@ -3246,15 +3137,8 @@ mod tests {
             .height_fence_extend(Height(1), Fk(2))
             .expect_err("missing header_txs must not silently skip");
         let msg = err.to_string();
-        assert!(
-            msg.contains("header_txs"),
-            "shipped error must name the missing range: {msg}"
-        );
-        assert_eq!(
-            s.tx_height_get(Fk(2)).unwrap(),
-            None,
-            "must not invent a connected height"
-        );
+        assert!(msg.contains("header_txs"), "shipped error must name the missing range: {msg}");
+        assert_eq!(s.tx_height_get(Fk(2)).unwrap(), None, "must not invent a connected height");
         assert_eq!(s.fence_tip_height(), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3296,16 +3180,10 @@ mod tests {
             )
             .unwrap()[0];
         let hits = s.get_fk_by_txid_batch(&[txid]).unwrap();
-        assert!(
-            hits[0].1.is_none(),
-            "TipOnly must drop unconnected identity"
-        );
+        assert!(hits[0].1.is_none(), "TipOnly must drop unconnected identity");
         let (on, cands) = crate::head_resolve_stats::take_leftover_miss().expect("classified");
         assert_eq!(on, LeftoverMissOn::Fence);
-        assert!(
-            cands >= 1,
-            "open-head probe must have produced the create fk"
-        );
+        assert!(cands >= 1, "open-head probe must have produced the create fk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3365,14 +3243,9 @@ mod tests {
         assert!(diag.hit_empty, "hop must stop at empty");
         assert!(diag.hop_equal_second, "second page load must match first");
         assert!(
-            diag.cands
-                .iter()
-                .any(|c| c.abs_fk == a_fk.0 && !c.body_match),
+            diag.cands.iter().any(|c| c.abs_fk == a_fk.0 && !c.body_match),
             "dump must list A's fk with body≠B, cands={:?}",
-            diag.cands
-                .iter()
-                .map(|c| (c.abs_fk, c.body_match))
-                .collect::<Vec<_>>()
+            diag.cands.iter().map(|c| (c.abs_fk, c.body_match)).collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3482,10 +3355,7 @@ mod tests {
         // Strong may still mark height-1 txs; they are not on the new fence.
         assert!(s.strong_tx.is_strong(Fk(2)).unwrap());
         let cleared = s.repair_class_c_above_tip().unwrap();
-        assert!(
-            cleared >= 1,
-            "strong/height above new tip must be repairable (cleared={cleared})"
-        );
+        assert!(cleared >= 1, "strong/height above new tip must be repairable (cleared={cleared})");
         assert!(s.is_confirmed_strong(Fk(1)).unwrap());
         assert!(!s.is_confirmed_strong(Fk(2)).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3637,9 +3507,7 @@ mod tests {
             assert_eq!(u, vec![0]);
             // empty vouts
             assert!(s.unspent_create_vouts(fk, &[], None).unwrap().is_empty());
-            let batch = s
-                .unspent_create_vouts_batch(&[(fk, vec![0u32]), (fk, vec![])])
-                .unwrap();
+            let batch = s.unspent_create_vouts_batch(&[(fk, vec![0u32]), (fk, vec![])]).unwrap();
             assert_eq!(batch[0], vec![0]);
             assert!(batch[1].is_empty());
             // has_confirmed without range, no spender
@@ -3661,10 +3529,7 @@ mod tests {
         for i in 1u8..=4 {
             let item = coinbase_item(
                 [i; 32],
-                vec![
-                    OutputRecord::unspent(10, vec![0x51]),
-                    OutputRecord::unspent(11, vec![0x51]),
-                ],
+                vec![OutputRecord::unspent(10, vec![0x51]), OutputRecord::unspent(11, vec![0x51])],
             );
             fks.push(s.put_tx_full_batch_indexed(&[item], true).unwrap()[0]);
         }
@@ -3673,11 +3538,7 @@ mod tests {
         let batch = s.unspent_create_vouts_batch(&items).unwrap();
         assert_eq!(batch.len(), 4);
         for (i, fk) in fks.iter().enumerate() {
-            assert_eq!(
-                batch[i],
-                s.unspent_create_vouts(*fk, &[0, 1], None).unwrap(),
-                "fk {fk:?}"
-            );
+            assert_eq!(batch[i], s.unspent_create_vouts(*fk, &[0, 1], None).unwrap(), "fk {fk:?}");
         }
         assert!(s.unspent_create_vouts_batch(&[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3713,21 +3574,11 @@ mod tests {
             output_count: 1,
         };
         let out = vec![OutputRecord::unspent(1, vec![0x51])];
-        let old = s
-            .put_tx_full_batch_indexed(&[(rec(1), vec![], out.clone())], true)
-            .unwrap()[0];
-        let new = s
-            .put_tx_full_batch_indexed(&[(rec(2), vec![], out)], true)
-            .unwrap()[0];
+        let old = s.put_tx_full_batch_indexed(&[(rec(1), vec![], out.clone())], true).unwrap()[0];
+        let new = s.put_tx_full_batch_indexed(&[(rec(2), vec![], out)], true).unwrap()[0];
         assert_ne!(old, new);
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(new)
-        );
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
-            None
-        );
+        assert_eq!(s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(), Some(new));
+        assert_eq!(s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(), None);
         s.header_txs.put_range(Fk(1), old, 1).unwrap();
         s.confirmed.set(Height(0), Fk(1)).unwrap();
         s.rebuild_height_fence().unwrap();
@@ -3736,17 +3587,10 @@ mod tests {
             Some(old),
             "connected older row must win"
         );
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(old)
-        );
-        let batch_tip = s
-            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
-            .unwrap();
+        assert_eq!(s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(), Some(old));
+        let batch_tip = s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly).unwrap();
         assert_eq!(batch_tip[0].1.map(|(f, _)| f), Some(old));
-        let batch_any = s
-            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
-            .unwrap();
+        let batch_any = s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny).unwrap();
         assert_eq!(batch_any[0].1.map(|(f, _)| f), Some(old));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3772,8 +3616,7 @@ mod tests {
                 output_count: 1,
             };
             let out = vec![OutputRecord::unspent(1, vec![0x51])];
-            s.put_tx_full_batch_indexed(&[(rec, vec![], out)], true)
-                .unwrap()[0]
+            s.put_tx_full_batch_indexed(&[(rec, vec![], out)], true).unwrap()[0]
         }
 
         let dir = tmp();
@@ -3820,29 +3663,15 @@ mod tests {
         let first = s.txs.head.first_fks_snapshot();
         let age_old = sealed_age_for_fk(&first, old.0).unwrap();
         let age_new = sealed_age_for_fk(&first, new.0).unwrap();
-        assert!(
-            age_old > HEAD_PROBE_HOT_MAX_AGE,
-            "old fk must sit in cold age={age_old}"
-        );
-        assert!(
-            age_new <= HEAD_PROBE_HOT_MAX_AGE,
-            "new fk must sit in hot age={age_new}"
-        );
+        assert!(age_old > HEAD_PROBE_HOT_MAX_AGE, "old fk must sit in cold age={age_old}");
+        assert!(age_new <= HEAD_PROBE_HOT_MAX_AGE, "new fk must sit in hot age={age_new}");
 
         let mixed = [s.txs.secret.mix_txid(&txid)];
         let open = s.txs.head.probe_candidates_batch_open(&mixed).unwrap();
-        let mid = s
-            .txs
-            .head
-            .probe_candidates_batch_sealed_hot(&mixed, &[true])
-            .unwrap();
+        let mid = s.txs.head.probe_candidates_batch_sealed_hot(&mixed, &[true]).unwrap();
         let mut hot = open;
         hot[0].extend(mid[0].iter().copied());
-        let cold = s
-            .txs
-            .head
-            .probe_candidates_batch_cold(&mixed, &[true])
-            .unwrap();
+        let cold = s.txs.head.probe_candidates_batch_cold(&mixed, &[true]).unwrap();
         assert!(
             hot[0].contains(&new) && !hot[0].contains(&old),
             "open∪sealed_hot={:?} new={new:?} old={old:?}",
@@ -3855,22 +3684,16 @@ mod tests {
         );
 
         // Neither connected yet: newest unconnected (hot) for TipThenAny.
+        assert_eq!(s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(), Some(new));
         assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(new)
-        );
-        assert_eq!(
-            s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
-                .unwrap()[0]
+            s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny).unwrap()[0]
                 .1
                 .map(|(f, _)| f),
             Some(new),
             "batch TipThenAny must keep newer unconnected when cold has no connected"
         );
         assert_eq!(
-            s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
-                .unwrap()[0]
-                .1,
+            s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly).unwrap()[0].1,
             None
         );
 
@@ -3878,25 +3701,15 @@ mod tests {
         s.confirmed.set(Height(0), Fk(1)).unwrap();
         s.rebuild_height_fence().unwrap();
 
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
-            Some(old)
-        );
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(old)
-        );
-        let batch_tip = s
-            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
-            .unwrap();
+        assert_eq!(s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(), Some(old));
+        assert_eq!(s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(), Some(old));
+        let batch_tip = s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly).unwrap();
         assert_eq!(
             batch_tip[0].1.map(|(f, _)| f),
             Some(old),
             "TipOnly must take connected cold sibling, not unconnected hot"
         );
-        let batch_any = s
-            .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
-            .unwrap();
+        let batch_any = s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny).unwrap();
         assert_eq!(
             batch_any[0].1.map(|(f, _)| f),
             Some(old),
@@ -3909,10 +3722,7 @@ mod tests {
     fn schema17_create_does_not_write_archive_epoch() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
-        assert!(
-            !dir.join("archive_epoch").exists(),
-            "unread leftover must not be created"
-        );
+        assert!(!dir.join("archive_epoch").exists(), "unread leftover must not be created");
         assert!(dir.join("spent.ovf").exists());
         assert!(!dir.join("spenders.body").exists());
         assert!(!dir.join("tx.body").exists());
@@ -3937,10 +3747,7 @@ mod tests {
     fn schema16_create_does_not_write_tx_height_and_fence_has_reorg_holes() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
-        assert!(
-            !dir.join("tx_height.body").exists(),
-            "schema 16 must not create tx_height.body"
-        );
+        assert!(!dir.join("tx_height.body").exists(), "schema 16 must not create tx_height.body");
         s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
         s.confirmed.set(Height(0), Fk(1)).unwrap();
         // Discarded block used fks 3..=5 under header 2 (not confirmed).
@@ -4049,10 +3856,7 @@ mod tests {
         let cold = root.join("cold");
         let s = Store::create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
         let item = coinbase_item([9u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-        let fks = s
-            .txs
-            .put_full_batch_indexed(std::slice::from_ref(&item), true)
-            .unwrap();
+        let fks = s.txs.put_full_batch_indexed(std::slice::from_ref(&item), true).unwrap();
         assert_eq!(fks.len(), 1);
         let range = s.tx_inwit_range(fks[0]).unwrap();
         assert!(range.1 > 0);

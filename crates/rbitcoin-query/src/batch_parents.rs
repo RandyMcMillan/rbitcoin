@@ -41,30 +41,18 @@ const CB_TRUE: u8 = 2;
 #[derive(Debug, Clone)]
 enum PinOuts {
     /// Plan / in-flight: share the CreatePin Arc.
-    Full {
-        pin: crate::CreatePin,
-        checked: Vec<u32>,
-    },
+    Full { pin: crate::CreatePin, checked: Vec<u32> },
     /// Range-fill: owned sparse decoded outs.
-    Sparse {
-        outs: Vec<(u32, OutputRecord)>,
-        checked: Vec<u32>,
-    },
+    Sparse { outs: Vec<(u32, OutputRecord)>, checked: Vec<u32> },
 }
 
 impl PinOuts {
     fn new(live: Vec<(u32, OutputRecord)>, checked: Vec<u32>) -> Self {
-        Self::Sparse {
-            outs: ensure_outs_sorted(live),
-            checked: ensure_checked_sorted(checked),
-        }
+        Self::Sparse { outs: ensure_outs_sorted(live), checked: ensure_checked_sorted(checked) }
     }
 
     fn full(pin: crate::CreatePin, checked: Vec<u32>) -> Self {
-        Self::Full {
-            pin,
-            checked: ensure_checked_sorted(checked),
-        }
+        Self::Full { pin, checked: ensure_checked_sorted(checked) }
     }
 
     fn checked(&self) -> &[u32] {
@@ -76,14 +64,8 @@ impl PinOuts {
     fn with_checked(&self, checked: Vec<u32>) -> Self {
         let checked = ensure_checked_sorted(checked);
         match self {
-            Self::Full { pin, .. } => Self::Full {
-                pin: std::sync::Arc::clone(pin),
-                checked,
-            },
-            Self::Sparse { outs, .. } => Self::Sparse {
-                outs: outs.clone(),
-                checked,
-            },
+            Self::Full { pin, .. } => Self::Full { pin: std::sync::Arc::clone(pin), checked },
+            Self::Sparse { outs, .. } => Self::Sparse { outs: outs.clone(), checked },
         }
     }
 
@@ -127,10 +109,9 @@ impl PinOuts {
     fn sparse_live(&self) -> Vec<(u32, OutputRecord)> {
         match self {
             Self::Sparse { outs, .. } => outs.clone(),
-            Self::Full { pin, checked, .. } => checked
-                .iter()
-                .filter_map(|&v| pin.out_record(v).map(|o| (v, o)))
-                .collect(),
+            Self::Full { pin, checked, .. } => {
+                checked.iter().filter_map(|&v| pin.out_record(v).map(|o| (v, o))).collect()
+            }
         }
     }
 
@@ -151,19 +132,13 @@ impl PinOuts {
                     next_ch.extend_from_slice(checked);
                     next_ch.sort_unstable();
                     next_ch.dedup();
-                    Self::Sparse {
-                        outs,
-                        checked: next_ch,
-                    }
+                    Self::Sparse { outs, checked: next_ch }
                 } else {
                     let mut next_ch = ch.clone();
                     next_ch.extend_from_slice(checked);
                     next_ch.sort_unstable();
                     next_ch.dedup();
-                    Self::Full {
-                        pin: std::sync::Arc::clone(pin),
-                        checked: next_ch,
-                    }
+                    Self::Full { pin: std::sync::Arc::clone(pin), checked: next_ch }
                 }
             }
             Self::Sparse { outs, checked: ch } => {
@@ -178,10 +153,7 @@ impl PinOuts {
                 next_ch.extend_from_slice(checked);
                 next_ch.sort_unstable();
                 next_ch.dedup();
-                Self::Sparse {
-                    outs: next_outs,
-                    checked: next_ch,
-                }
+                Self::Sparse { outs: next_outs, checked: next_ch }
             }
         }
     }
@@ -197,11 +169,7 @@ struct ParentLayout {
 
 impl ParentLayout {
     fn new(body_range: Option<(u64, u64)>, spender_rels: Vec<(u32, u32)>) -> Self {
-        Self {
-            body_range,
-            spent_range: None,
-            spender_rels,
-        }
+        Self { body_range, spent_range: None, spender_rels }
     }
 
     fn already_covers(&self, body_range: Option<(u64, u64)>, spender_rels: &[(u32, u32)]) -> bool {
@@ -245,10 +213,7 @@ struct PinHalf<T> {
 
 impl<T> PinHalf<T> {
     fn new(val: T) -> Self {
-        Self {
-            frozen: Arc::new(val),
-            rcu: OnceLock::new(),
-        }
+        Self { frozen: Arc::new(val), rcu: OnceLock::new() }
     }
 
     #[inline]
@@ -397,8 +362,7 @@ impl SharedParentPin {
         if let Some(b) = coinbase {
             let v = if b { CB_TRUE } else { CB_FALSE };
             let _ =
-                self.coinbase
-                    .compare_exchange(CB_UNKNOWN, v, Ordering::Relaxed, Ordering::Relaxed);
+                self.coinbase.compare_exchange(CB_UNKNOWN, v, Ordering::Relaxed, Ordering::Relaxed);
         }
     }
 
@@ -469,19 +433,13 @@ pub struct BatchParents {
 
 impl Clone for BatchParents {
     fn clone(&self) -> Self {
-        Self {
-            pins: self.pins.clone(),
-            sticky_outs: RefCell::new(None),
-        }
+        Self { pins: self.pins.clone(), sticky_outs: RefCell::new(None) }
     }
 }
 
 impl BatchParents {
     pub fn new() -> Self {
-        Self {
-            pins: U64Map::default(),
-            sticky_outs: RefCell::new(None),
-        }
+        Self { pins: U64Map::default(), sticky_outs: RefCell::new(None) }
     }
 
     pub fn with_capacity(n: usize) -> Self {
@@ -638,15 +596,7 @@ impl BatchParents {
         checked: &[u32],
         coinbase: Option<bool>,
     ) {
-        self.insert_owned(
-            fk,
-            tx,
-            live.to_vec(),
-            checked.to_vec(),
-            coinbase,
-            None,
-            Vec::new(),
-        );
+        self.insert_owned(fk, tx, live.to_vec(), checked.to_vec(), coinbase, None, Vec::new());
     }
 
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
@@ -973,11 +923,9 @@ impl BatchParents {
                     if !Arc::ptr_eq(o.get(), &src) {
                         let src_outs = src.load_outs();
                         let src_lay = src.load_layout();
-                        o.get()
-                            .merge_outs(src_outs.sparse_live(), src_outs.checked());
+                        o.get().merge_outs(src_outs.sparse_live(), src_outs.checked());
                         o.get().set_coinbase_if_known(src.coinbase_opt());
-                        o.get()
-                            .maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
+                        o.get().maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
                     }
                 }
             }
@@ -1125,14 +1073,7 @@ mod tests {
         let pin = CreatePinInner::records(tx(9), vec![OutputRecord::unspent(50, script)]);
         let expect = pin.out_parts(0).expect("vout 0").1.as_ptr();
         let mut bp = BatchParents::new();
-        bp.insert_create_pin(
-            Fk(9),
-            Arc::clone(&pin),
-            vec![0],
-            Some(false),
-            None,
-            Vec::new(),
-        );
+        bp.insert_create_pin(Fk(9), Arc::clone(&pin), vec![0], Some(false), None, Vec::new());
         let got = bp
             .get_parent_txout_parts(Fk(9), 0, |v, sc, t| {
                 assert_eq!(v, 50);
@@ -1156,24 +1097,8 @@ mod tests {
             vec![(0, 10)],
         );
         let mut b = BatchParents::new();
-        b.insert_owned(
-            Fk(2),
-            tx(2),
-            vec![(0, out(2))],
-            vec![0],
-            Some(true),
-            None,
-            Vec::new(),
-        );
-        b.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(1, out(3))],
-            vec![1],
-            None,
-            None,
-            vec![(1, 20)],
-        );
+        b.insert_owned(Fk(2), tx(2), vec![(0, out(2))], vec![0], Some(true), None, Vec::new());
+        b.insert_owned(Fk(1), tx(1), vec![(1, out(3))], vec![1], None, None, vec![(1, 20)]);
         a.extend_from(b);
         assert_eq!(a.len(), 2);
         assert!(a.has_parent_out(Fk(1), 0));
@@ -1210,9 +1135,8 @@ mod tests {
         assert!(bp.has_abs_layout(Fk(9)));
         let (_, o) = bp.get_parent_out(Fk(9), 0).unwrap();
         assert_eq!(o.value, 42);
-        let (v, script, parent_txid) = bp
-            .get_parent_txout_parts(Fk(9), 0, |v, s, t| (v, s.to_vec(), t))
-            .unwrap();
+        let (v, script, parent_txid) =
+            bp.get_parent_txout_parts(Fk(9), 0, |v, s, t| (v, s.to_vec(), t)).unwrap();
         assert_eq!(v, 42);
         assert_eq!(script, &[0x51]);
         assert_eq!(parent_txid[0], 9);
@@ -1242,11 +1166,7 @@ mod tests {
                 assert_eq!(value, 42);
                 assert_eq!(spk, &[0x51, 0x52, 0x53]);
                 assert_eq!(txid[0], 9);
-                assert_eq!(
-                    spk.as_ptr(),
-                    pin_ptr,
-                    "must borrow pin script bytes, not clone"
-                );
+                assert_eq!(spk.as_ptr(), pin_ptr, "must borrow pin script bytes, not clone");
                 true
             })
             .expect("hit");
@@ -1256,15 +1176,7 @@ mod tests {
     #[test]
     fn set_body_range_only_completes_layout_when_rels_present() {
         let mut bp = BatchParents::with_capacity(1);
-        bp.insert_owned(
-            Fk(3),
-            tx(3),
-            vec![(0, out(1))],
-            vec![0],
-            None,
-            None,
-            vec![(0, 40)],
-        );
+        bp.insert_owned(Fk(3), tx(3), vec![(0, out(1))], vec![0], None, None, vec![(0, 40)]);
         assert!(!bp.has_abs_layout(Fk(3)));
         bp.set_body_range_only(Fk(3), (500, 80));
         assert!(!bp.has_abs_layout(Fk(3)));
@@ -1279,11 +1191,7 @@ mod tests {
         let sparse = sparse_spender_rels(&dense, &[0, 1, 2]);
         assert_eq!(sparse, vec![(0, 10), (2, 30)]);
         assert!(!layout_covers_need(Some((0, 100)), &sparse, &[0, 1, 2]));
-        assert!(layout_covers_need(
-            Some((0, 100)),
-            &[(0, 10), (2, 30)],
-            &[0, 2]
-        ));
+        assert!(layout_covers_need(Some((0, 100)), &[(0, 10), (2, 30)], &[0, 2]));
         assert!(!layout_covers_need(None, &[(0, 10)], &[0]));
     }
 
@@ -1333,20 +1241,9 @@ mod tests {
     #[test]
     fn vacant_insert_does_not_arcswap_until_compose() {
         let mut bp = BatchParents::new();
-        bp.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(0, out(10))],
-            vec![0],
-            Some(false),
-            None,
-            Vec::new(),
-        );
+        bp.insert_owned(Fk(1), tx(1), vec![(0, out(10))], vec![0], Some(false), None, Vec::new());
         let pin = bp.pins.get(&1).expect("vacant pin");
-        assert!(
-            pin.outs.rcu.get().is_none(),
-            "vacant insert must not allocate ArcSwap on outs"
-        );
+        assert!(pin.outs.rcu.get().is_none(), "vacant insert must not allocate ArcSwap on outs");
         assert!(
             pin.layout.rcu.get().is_none(),
             "vacant insert must not allocate ArcSwap on layout"
@@ -1360,27 +1257,13 @@ mod tests {
     #[test]
     fn merge_outs_empty_checked_keeps_outs_arc() {
         let mut bp = BatchParents::new();
-        bp.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(0, out(10))],
-            vec![0],
-            Some(false),
-            None,
-            Vec::new(),
-        );
+        bp.insert_owned(Fk(1), tx(1), vec![(0, out(10))], vec![0], Some(false), None, Vec::new());
         let pin = Arc::clone(bp.pins.get(&1).unwrap());
         assert!(pin.outs.rcu.get().is_none());
         let before = pin.load_outs();
         pin.merge_outs(vec![], &[]);
-        assert!(
-            Arc::ptr_eq(&before, &pin.load_outs()),
-            "empty checked no-op must keep outs Arc"
-        );
-        assert!(
-            pin.outs.rcu.get().is_none(),
-            "empty checked no-op must stay Frozen"
-        );
+        assert!(Arc::ptr_eq(&before, &pin.load_outs()), "empty checked no-op must keep outs Arc");
+        assert!(pin.outs.rcu.get().is_none(), "empty checked no-op must stay Frozen");
         pin.merge_outs(vec![(0, out(10))], &[]);
         assert!(
             Arc::ptr_eq(&before, &pin.load_outs()),
@@ -1388,15 +1271,7 @@ mod tests {
         );
         assert!(pin.outs.rcu.get().is_none());
 
-        bp.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(1, out(20))],
-            vec![],
-            None,
-            None,
-            Vec::new(),
-        );
+        bp.insert_owned(Fk(1), tx(1), vec![(1, out(20))], vec![], None, None, Vec::new());
         let after = pin.load_outs();
         assert!(
             after.covers_need(&[0]) && after.get_parts(1).is_some(),
@@ -1409,15 +1284,7 @@ mod tests {
     fn merge_outs_large_script_widens_once() {
         let script = vec![0x51u8; 4096];
         let mut bp = BatchParents::new();
-        bp.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(0, out(10))],
-            vec![0],
-            Some(false),
-            None,
-            Vec::new(),
-        );
+        bp.insert_owned(Fk(1), tx(1), vec![(0, out(10))], vec![0], Some(false), None, Vec::new());
         let pin = Arc::clone(bp.pins.get(&1).unwrap());
         let rec = OutputRecord::unspent(20, script.clone());
         pin.merge_outs(vec![(1, rec.clone())], &[1]);
@@ -1431,22 +1298,11 @@ mod tests {
     #[test]
     fn compose_adds_vout_without_mutating_old_snap() {
         let mut bp = BatchParents::new();
-        bp.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(0, out(10))],
-            vec![0],
-            Some(false),
-            None,
-            Vec::new(),
-        );
+        bp.insert_owned(Fk(1), tx(1), vec![(0, out(10))], vec![0], Some(false), None, Vec::new());
         let pin = Arc::clone(bp.pins.get(&1).unwrap());
         let old = pin.load_outs();
         pin.merge_outs(vec![(1, out(20))], &[1]);
-        assert!(
-            pin.outs.rcu.get().is_some(),
-            "real compose promotes Frozen to Rcu"
-        );
+        assert!(pin.outs.rcu.get().is_some(), "real compose promotes Frozen to Rcu");
         let new = pin.load_outs();
         assert_eq!(old.live_len(), 1, "old snap must not gain vouts");
         assert_eq!(old.checked(), &[0]);
@@ -1672,9 +1528,7 @@ mod tests {
             Vec::new(),
         );
         for vout in [0u32, 1] {
-            let s = bp
-                .get_parent_txout_parts(Fk(3), vout, |v, sc, t| (v, sc.to_vec(), t))
-                .unwrap();
+            let s = bp.get_parent_txout_parts(Fk(3), vout, |v, sc, t| (v, sc.to_vec(), t)).unwrap();
             let c = bp
                 .get_parent_txout_parts_no_sticky(Fk(3), vout, |v, sc, t| (v, sc.to_vec(), t))
                 .unwrap();
@@ -1697,12 +1551,10 @@ mod tests {
             None,
             Vec::new(),
         );
-        let (v0, s0, t0) = bp
-            .get_parent_txout_parts(Fk(7), 0, |v, s, t| (v, s.to_vec(), t))
-            .unwrap();
-        let (v1, s1, t1) = bp
-            .get_parent_txout_parts(Fk(7), 1, |v, s, t| (v, s.to_vec(), t))
-            .unwrap();
+        let (v0, s0, t0) =
+            bp.get_parent_txout_parts(Fk(7), 0, |v, s, t| (v, s.to_vec(), t)).unwrap();
+        let (v1, s1, t1) =
+            bp.get_parent_txout_parts(Fk(7), 1, |v, s, t| (v, s.to_vec(), t)).unwrap();
         let pin = std::sync::Arc::clone(bp.pins.get(&7).unwrap());
         let outs = pin.load_outs();
         let before = std::sync::Arc::strong_count(&outs);
@@ -1714,9 +1566,8 @@ mod tests {
             );
         })
         .unwrap();
-        let (v2, s2, t2) = bp
-            .get_parent_txout_parts(Fk(7), 2, |v, s, t| (v, s.to_vec(), t))
-            .unwrap();
+        let (v2, s2, t2) =
+            bp.get_parent_txout_parts(Fk(7), 2, |v, s, t| (v, s.to_vec(), t)).unwrap();
         assert_eq!(v0, 10);
         assert_eq!(v1, 20);
         assert_eq!(v2, 30);
@@ -1729,15 +1580,7 @@ mod tests {
         // Sticky holds parent 7.
         assert_eq!(bp.sticky_outs.borrow().as_ref().map(|(id, _)| *id), Some(7));
         // Switch parent clears sticky to new id.
-        bp.insert_owned(
-            Fk(8),
-            tx(8),
-            vec![(0, out(99))],
-            vec![0],
-            None,
-            None,
-            Vec::new(),
-        );
+        bp.insert_owned(Fk(8), tx(8), vec![(0, out(99))], vec![0], None, None, Vec::new());
         bp.get_parent_txout_parts(Fk(8), 0, |_, _, _| ()).unwrap();
         assert_eq!(bp.sticky_outs.borrow().as_ref().map(|(id, _)| *id), Some(8));
     }
@@ -1788,14 +1631,8 @@ mod tests {
         assert_eq!(after_outs.live_len(), 2);
         assert!(after_outs.covers_need(&[0, 1]));
         assert_eq!(after_lay.spender_rels, vec![(0, 10), (1, 20)]);
-        assert!(
-            !Arc::ptr_eq(&before_outs, &after_outs),
-            "outs compose must publish new Arc"
-        );
-        assert!(
-            !Arc::ptr_eq(&before_lay, &after_lay),
-            "layout compose must publish new Arc"
-        );
+        assert!(!Arc::ptr_eq(&before_outs, &after_outs), "outs compose must publish new Arc");
+        assert!(!Arc::ptr_eq(&before_lay, &after_lay), "layout compose must publish new Arc");
     }
 
     /// Covered share hit must not replace outs Arc (no full clone on no-op).
@@ -1830,10 +1667,7 @@ mod tests {
             Arc::ptr_eq(&outs_before, &outs_after),
             "no-op outs must keep Arc identity (no clone)"
         );
-        assert!(
-            Arc::ptr_eq(&lay_before, &lay_after),
-            "no-op layout must keep Arc identity"
-        );
+        assert!(Arc::ptr_eq(&lay_before, &lay_after), "no-op layout must keep Arc identity");
     }
 
     /// Layout-only write must not replace outs Arc (scripts stay shared).
@@ -1854,10 +1688,7 @@ mod tests {
         bp.set_layout_for_need(Fk(1), (500, 80), &[10, 20], &[]);
         let outs_after = pin.load_outs();
         let lay = pin.load_layout();
-        assert!(
-            Arc::ptr_eq(&outs_before, &outs_after),
-            "layout fill must not clone outs half"
-        );
+        assert!(Arc::ptr_eq(&outs_before, &outs_after), "layout fill must not clone outs half");
         assert_eq!(lay.body_range, Some((500, 80)));
         bp.set_spent_range_only(Fk(1), (800, 24));
         assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(808));
@@ -1918,21 +1749,11 @@ mod tests {
         bp.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0], None, None, vec![]);
         bp.set_spent_range_only(Fk(1), (1000, 24));
         let jobs = bp
-            .spend_abs_jobs([
-                (Fk(1), 0, Fk(9), 0),
-                (Fk::NULL, 0, Fk(9), 0),
-                (Fk(1), 0, Fk(9), 1),
-            ])
+            .spend_abs_jobs([(Fk(1), 0, Fk(9), 0), (Fk::NULL, 0, Fk(9), 0), (Fk(1), 0, Fk(9), 1)])
             .expect("abs");
-        assert_eq!(
-            jobs,
-            vec![(1, 0, rbitcoin_store::spent_abs(1000, 0), Fk(9), 0)]
-        );
+        assert_eq!(jobs, vec![(1, 0, rbitcoin_store::spent_abs(1000, 0), Fk(9), 0)]);
         let err = bp.spend_abs_jobs([(Fk(2), 0, Fk(9), 0)]).unwrap_err();
-        assert!(
-            err.to_string().contains("missing pin denserels/abs"),
-            "got {err}"
-        );
+        assert!(err.to_string().contains("missing pin denserels/abs"), "got {err}");
     }
 
     /// has_abs_layout null and missing pins.

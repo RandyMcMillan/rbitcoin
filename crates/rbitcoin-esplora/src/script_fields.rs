@@ -25,12 +25,7 @@ pub fn esplora_script_fields(script: &[u8], network: Network) -> EsploraScriptFi
     let asm = s.to_asm_string();
     let script_type = classify_script(s);
     let address = Address::from_script(s, network).ok().map(|a| a.to_string());
-    EsploraScriptFields {
-        hex,
-        asm,
-        script_type,
-        address,
-    }
+    EsploraScriptFields { hex, asm, script_type, address }
 }
 
 fn classify_script(s: &Script) -> &'static str {
@@ -115,10 +110,7 @@ mod tests {
     #[test]
     fn p2tr_fields() {
         let xonly = XOnlyPublicKey::from_slice(&G_XONLY).unwrap();
-        let spk = Builder::new()
-            .push_int(1)
-            .push_x_only_key(&xonly)
-            .into_script();
+        let spk = Builder::new().push_int(1).push_x_only_key(&xonly).into_script();
         let f = esplora_script_fields(spk.as_bytes(), Network::Bitcoin);
         assert_eq!(f.script_type, "v1_p2tr");
         assert!(f.address.as_ref().unwrap().starts_with("bc1p"));
@@ -152,10 +144,7 @@ mod tests {
     #[test]
     fn p2pk_type() {
         let pk = PublicKey::from_slice(&G_COMPRESSED).expect("G");
-        let spk = Builder::new()
-            .push_key(&pk)
-            .push_opcode(OP_CHECKSIG)
-            .into_script();
+        let spk = Builder::new().push_key(&pk).push_opcode(OP_CHECKSIG).into_script();
         let f = esplora_script_fields(spk.as_bytes(), Network::Bitcoin);
         assert_eq!(f.script_type, "p2pk");
         assert!(f.asm.contains("OP_CHECKSIG"));
@@ -169,15 +158,9 @@ mod tests {
             v.extend_from_slice(&[0xab; 32]);
             v
         };
-        assert_eq!(
-            esplora_script_fields(&spk_wsh, Network::Bitcoin).script_type,
-            "v0_p2wsh"
-        );
+        assert_eq!(esplora_script_fields(&spk_wsh, Network::Bitcoin).script_type, "v0_p2wsh");
         // OP_RETURN
-        let opreturn = Builder::new()
-            .push_opcode(OP_RETURN)
-            .push_slice(b"hi")
-            .into_script();
+        let opreturn = Builder::new().push_opcode(OP_RETURN).push_slice(b"hi").into_script();
         assert_eq!(
             esplora_script_fields(opreturn.as_bytes(), Network::Bitcoin).script_type,
             "op_return"
@@ -194,9 +177,6 @@ mod tests {
             "multisig"
         );
         // Short script is not bare multisig
-        assert_eq!(
-            esplora_script_fields(&[0x51, 0x51], Network::Regtest).script_type,
-            "unknown"
-        );
+        assert_eq!(esplora_script_fields(&[0x51, 0x51], Network::Regtest).script_type, "unknown");
     }
 }

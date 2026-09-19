@@ -34,10 +34,7 @@ pub enum StoreError {
 
 impl StoreError {
     pub fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
-        StoreError::Io {
-            path: path.into(),
-            source,
-        }
+        StoreError::Io { path: path.into(), source }
     }
 
     /// Ring in-flight cap — not on-disk corruption. Do not WARN as `corrupt record`.
@@ -111,10 +108,7 @@ mod tests {
         let arms: Vec<StoreError> = vec![
             StoreError::BadMagic,
             StoreError::BadSchema(9),
-            StoreError::BadKind {
-                expected: 1,
-                got: 2,
-            },
+            StoreError::BadKind { expected: 1, got: 2 },
             StoreError::NotFound,
             StoreError::InvalidFk,
             StoreError::NotDirectory(PathBuf::from("/not/a/dir")),

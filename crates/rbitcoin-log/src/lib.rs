@@ -11,7 +11,8 @@ pub use api_log::{api_call, close_api_log, init_api_log};
 
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Log severity. Higher numeric values are more verbose.
@@ -78,6 +79,34 @@ pub fn capture_logs(on: bool) {
 /// Drain lines recorded after [`capture_logs`]`(true)`.
 pub fn take_logs() -> Vec<(Level, String)> {
     CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+// ── Global (cross-thread) log capture ────────────────────────────────────────
+
+const GLOBAL_RING_CAP: usize = 4_000;
+
+static GLOBAL_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+static GLOBAL_CAPTURED: Mutex<Vec<(Level, String)>> = Mutex::new(Vec::new());
+
+/// Enable global cross-thread log capture (e.g. for mobile UI console).
+/// Oldest entries are dropped once the ring exceeds [`GLOBAL_RING_CAP`] lines.
+pub fn global_capture_logs(on: bool) {
+    GLOBAL_CAPTURE_ENABLED.store(on, Ordering::Relaxed);
+    if !on {
+        let _ = global_take_logs();
+    }
+}
+
+/// Drain all globally captured log lines.
+pub fn global_take_logs() -> Vec<(Level, String)> {
+    let mut guard = GLOBAL_CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *guard)
+}
+
+/// Return the most recent `limit` globally captured log lines without draining.
+pub fn global_logs_recent(limit: usize) -> Vec<(Level, String)> {
+    let guard = GLOBAL_CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
+    guard.iter().rev().take(limit).cloned().collect::<Vec<_>>().into_iter().rev().collect()
 }
 
 /// Set the maximum log level (inclusive).
@@ -187,6 +216,16 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     if CAPTURE.with(|c| c.get()) {
         CAPTURED.with(|c| c.borrow_mut().push((level, args.to_string())));
     }
+    if GLOBAL_CAPTURE_ENABLED.load(Ordering::Relaxed) {
+        let msg = args.to_string();
+        if let Ok(mut guard) = GLOBAL_CAPTURED.lock() {
+            guard.push((level, msg));
+            if guard.len() > GLOBAL_RING_CAP {
+                let excess = guard.len() - GLOBAL_RING_CAP;
+                guard.drain(0..excess);
+            }
+        }
+    }
     if !enabled(level) {
         return;
     }
@@ -260,6 +299,12 @@ mod tests {
 
     /// Global log level is process-wide; serialize tests that call `init*`.
     fn lock_log_init() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Global capture state is process-wide; serialize tests that touch it.
+    fn lock_global_capture() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -345,6 +390,41 @@ mod tests {
             logs.iter().any(|(l, m)| *l == Level::Debug && m.contains("ibd: perf")),
             "{logs:?}"
         );
+    }
+
+    #[test]
+    fn global_capture_cross_thread() {
+        let _g = lock_global_capture();
+        let _log_g = lock_log_init();
+        init(Level::Info);
+        global_capture_logs(true);
+        info!("global line one");
+        warn!("global line two");
+
+        let recent = global_logs_recent(10);
+        assert!(recent.iter().any(|(l, m)| *l == Level::Info && m.contains("global line one")));
+        assert!(recent.iter().any(|(l, m)| *l == Level::Warn && m.contains("global line two")));
+
+        let taken = global_take_logs();
+        assert!(taken.iter().any(|(l, m)| *l == Level::Info && m.contains("global line one")));
+        assert!(global_logs_recent(10).is_empty());
+
+        global_capture_logs(false);
+    }
+
+    #[test]
+    fn global_capture_ring_evicts_oldest() {
+        let _g = lock_global_capture();
+        global_capture_logs(true);
+        for i in 0..GLOBAL_RING_CAP + 100 {
+            info!("fill {i}");
+        }
+        let recent = global_logs_recent(GLOBAL_RING_CAP + 1);
+        assert_eq!(recent.len(), GLOBAL_RING_CAP);
+        assert!(!recent.iter().any(|(_, m)| m.contains("fill 0")));
+        assert!(recent.iter().any(|(_, m)| m.contains(&format!("fill {}", GLOBAL_RING_CAP + 99))));
+        let _ = global_take_logs();
+        global_capture_logs(false);
     }
 
     #[test]

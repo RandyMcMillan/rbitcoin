@@ -2121,7 +2121,7 @@ mod tests {
         cfg.max_run_secs = Some(0);
 
         let handle = run_node(cfg.clone()).expect("run_node should succeed");
-        let tip_height = Arc::clone(&handle.tip_height);
+        let _tip_height = Arc::clone(&handle.tip_height);
         let ibd = Arc::clone(&handle.initial_block_download);
         let shutdown = Shutdown::new();
         let sd = Arc::clone(&shutdown);
@@ -2139,7 +2139,7 @@ mod tests {
         shutdown.request();
         let result = tokio::time::timeout(Duration::from_secs(15), task).await;
         assert!(result.is_ok(), "run_p2p_with_handle timed out");
-        result.unwrap().expect("run_p2p_with_handle should complete");
+        let _ = result.unwrap().expect("run_p2p_with_handle should complete");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

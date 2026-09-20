@@ -104,9 +104,14 @@ pub fn global_take_logs() -> Vec<(Level, String)> {
 }
 
 /// Return the most recent `limit` globally captured log lines without draining.
+/// A `limit` of `0` means no limit (return all captured lines).
 pub fn global_logs_recent(limit: usize) -> Vec<(Level, String)> {
     let guard = GLOBAL_CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
-    guard.iter().rev().take(limit).cloned().collect::<Vec<_>>().into_iter().rev().collect()
+    if limit == 0 {
+        guard.iter().cloned().collect()
+    } else {
+        guard.iter().rev().take(limit).cloned().collect::<Vec<_>>().into_iter().rev().collect()
+    }
 }
 
 /// Set the maximum log level (inclusive).

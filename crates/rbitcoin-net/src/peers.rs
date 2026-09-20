@@ -1566,6 +1566,12 @@ impl PeerHub {
         g.values().cloned().collect()
     }
 
+    /// Count of peers that have not been stopped.
+    pub fn live_count(&self) -> usize {
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        g.values().filter(|p| !p.stop.load(Ordering::SeqCst)).count()
+    }
+
     /// Re-advertise BIP133 feefilter after IBD/minrelay change (skip block-relay / forcerelay).
     pub fn queue_feefilter_all(&self, sat_kvb: i64) {
         for s in self.live_peers() {

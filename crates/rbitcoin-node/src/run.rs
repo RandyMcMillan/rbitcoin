@@ -301,7 +301,7 @@ pub async fn run_p2p_with_handle(
                 tip_poll_height.store(tip, Ordering::Relaxed);
             }
             tip_poll_ibd.store(tip_poll_hub.in_ibd(), Ordering::SeqCst);
-            tip_poll_connections.store(tip_poll_peers.live_peers().len(), Ordering::Relaxed);
+            tip_poll_connections.store(tip_poll_peers.live_count(), Ordering::Relaxed);
             tick.tick().await;
         }
     });

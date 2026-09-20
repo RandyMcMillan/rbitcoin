@@ -36,6 +36,8 @@ pub struct NodeHandle {
     pub initial_block_download: Arc<AtomicBool>,
     /// Number of live outbound full-relay peers.
     pub connections: Arc<AtomicUsize>,
+    /// Number of live IBD download peers.
+    pub ibd_peers: Arc<AtomicUsize>,
     /// Exclusive datadir flock (released on drop).
     _dir_locks: crate::lock::DirLocks,
 }
@@ -164,6 +166,7 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         tip_height: Arc::new(AtomicU32::new(0)),
         initial_block_download: Arc::new(AtomicBool::new(true)),
         connections: Arc::new(AtomicUsize::new(0)),
+        ibd_peers: Arc::new(AtomicUsize::new(0)),
         _dir_locks: dir_locks,
     })
 }
@@ -289,6 +292,7 @@ pub async fn run_p2p_with_handle(
     let tip_poll_height = Arc::clone(&tip_height);
     let tip_poll_ibd = Arc::clone(&initial_block_download);
     let tip_poll_connections = Arc::clone(&handle.connections);
+    let tip_poll_ibd_peers = Arc::clone(&handle.ibd_peers);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -301,7 +305,9 @@ pub async fn run_p2p_with_handle(
                 tip_poll_height.store(tip, Ordering::Relaxed);
             }
             tip_poll_ibd.store(tip_poll_hub.in_ibd(), Ordering::SeqCst);
-            tip_poll_connections.store(tip_poll_peers.live_count(), Ordering::Relaxed);
+            let follow_n = tip_poll_peers.live_count();
+            let ibd_n = tip_poll_ibd_peers.load(Ordering::Relaxed);
+            tip_poll_connections.store(follow_n + ibd_n, Ordering::Relaxed);
             tick.tick().await;
         }
     });
@@ -442,6 +448,7 @@ pub async fn run_p2p_with_handle(
         &mut addrman,
         &peers_path,
         &shutdown,
+        &handle.ibd_peers,
     )
     .await;
 
@@ -1120,6 +1127,7 @@ async fn run_ibd_or_skip(
     addrman: &mut AddrMan,
     peers_path: &std::path::Path,
     shutdown: &Shutdown,
+    ibd_peers: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> CatchUp {
     if ibd_targets.is_empty() {
         info!("ibd: no outbound peers; serving only (use --connect or seeds)");
@@ -1137,6 +1145,7 @@ async fn run_ibd_or_skip(
         // could deliver mid-chain blocks). Default 30s is enough.
         stall: std::time::Duration::from_secs(30),
         peers: Some(std::sync::Arc::clone(shared_peers)),
+        peer_count_atomic: Some(std::sync::Arc::clone(ibd_peers)),
         ..IbdConfig::default()
     };
     info!(

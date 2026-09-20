@@ -164,6 +164,8 @@ pub struct IbdConfig {
     /// Optional shared peer book (discovered addrs + flags). Seeded at start and
     /// written back on IBD exit so the node can persist across runs.
     pub peers: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
+    /// Optional atomic to publish the current count of live IBD peers.
+    pub peer_count_atomic: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for IbdConfig {
@@ -176,6 +178,7 @@ impl Default for IbdConfig {
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_secs(8),
             peers: None,
+            peer_count_atomic: None,
         }
     }
 }
@@ -191,6 +194,7 @@ impl IbdConfig {
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_millis(400),
             peers: None,
+            peer_count_atomic: None,
         }
     }
 }
@@ -681,6 +685,9 @@ pub async fn ibd_cancellable(
         // When *all* peers are dead (network blip), do not wait for the 15s
         // interval — redial immediately so we never race the exit check.
         let alive_n = st.slots.iter().filter(|s| s.alive).count();
+        if let Some(ref atomic) = cfg.peer_count_atomic {
+            atomic.store(alive_n, std::sync::atomic::Ordering::Relaxed);
+        }
         let target = cfg.target_peers.max(1);
         let redial_interval =
             if alive_n == 0 { Duration::from_secs(0) } else { Duration::from_secs(15) };

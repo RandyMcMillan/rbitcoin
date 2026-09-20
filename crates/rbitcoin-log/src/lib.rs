@@ -83,7 +83,7 @@ pub fn take_logs() -> Vec<(Level, String)> {
 
 // ── Global (cross-thread) log capture ────────────────────────────────────────
 
-const GLOBAL_RING_CAP: usize = 4_000;
+const GLOBAL_RING_CAP: usize = 100_000;
 
 static GLOBAL_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 static GLOBAL_CAPTURED: Mutex<Vec<(Level, String)>> = Mutex::new(Vec::new());

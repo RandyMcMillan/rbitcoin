@@ -432,6 +432,11 @@ assert_ok "v2 getheaders seed" \
 assert_ok "electrum subscribe seed" \
   test -s "$ROOT/crates/rbitcoin-electrum/tests/fixtures/blockchain_scripthash_subscribe.json"
 
+# Run the clean-tree fmt gate before helpers that may touch the checkout.
+if [[ -x "$ROOT/scripts/fmt.test.sh" ]]; then
+  assert_ok "fmt.test.sh" "$ROOT/scripts/fmt.test.sh"
+fi
+
 rm -rf "$WORKDIR"
 
 # Pin/fetch tests land before the operator YAML commit; required CI already
@@ -441,9 +446,6 @@ if [[ -x "$ROOT/scripts/core-functional/release_pin.test.sh" ]]; then
 fi
 if [[ -x "$ROOT/scripts/core-functional/fetch-bitcoind.test.sh" ]]; then
   assert_ok "fetch-bitcoind.test.sh" "$ROOT/scripts/core-functional/fetch-bitcoind.test.sh"
-fi
-if [[ -x "$ROOT/scripts/fmt.test.sh" ]]; then
-  assert_ok "fmt.test.sh" "$ROOT/scripts/fmt.test.sh"
 fi
 
 if [[ "$FAIL" -ne 0 ]]; then

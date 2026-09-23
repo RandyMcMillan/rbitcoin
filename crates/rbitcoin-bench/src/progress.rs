@@ -55,10 +55,8 @@ impl Progress {
 impl Progress {
     fn emit(&mut self, force: bool) {
         let now = Instant::now();
-        let since = self
-            .last_emit
-            .map(|t| now.saturating_duration_since(t))
-            .unwrap_or(Duration::MAX);
+        let since =
+            self.last_emit.map(|t| now.saturating_duration_since(t)).unwrap_or(Duration::MAX);
         if !force && !should_emit(self.done, self.total, self.last_done, since) {
             return;
         }
@@ -103,11 +101,7 @@ pub fn should_emit(done: u64, total: u64, last_done: u64, since_last: Duration) 
     if done == 0 || (total > 0 && done >= total) {
         return true;
     }
-    let bucket = |n: u64| {
-        n.saturating_mul(PCT_STEPS)
-            .checked_div(total)
-            .unwrap_or(PCT_STEPS)
-    };
+    let bucket = |n: u64| n.saturating_mul(PCT_STEPS).checked_div(total).unwrap_or(PCT_STEPS);
     if bucket(done) > bucket(last_done) {
         return true;
     }

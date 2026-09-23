@@ -21,15 +21,8 @@ impl ElectrumClient {
             .map_err(|e| e.to_string())?;
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
         let (r, w) = stream.into_split();
-        let mut c = Self {
-            reader: BufReader::new(r),
-            writer: w,
-            next_id: 1,
-            timeout,
-        };
-        let _ = c
-            .call("server.version", json!(["rbitcoin-bench", "1.4"]))
-            .await?;
+        let mut c = Self { reader: BufReader::new(r), writer: w, next_id: 1, timeout };
+        let _ = c.call("server.version", json!(["rbitcoin-bench", "1.4"])).await?;
         Ok(c)
     }
 
@@ -38,14 +31,8 @@ impl ElectrumClient {
         self.next_id = self.next_id.saturating_add(1);
         let line = jsonrpc::request(id, method, params);
         let t0 = Instant::now();
-        self.writer
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        self.writer
-            .write_all(b"\n")
-            .await
-            .map_err(|e| e.to_string())?;
+        self.writer.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+        self.writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
         self.writer.flush().await.map_err(|e| e.to_string())?;
         let mut resp = String::new();
         tokio::time::timeout(self.timeout, self.reader.read_line(&mut resp))
@@ -74,10 +61,7 @@ impl ElectrumClient {
             buf.push_str(&jsonrpc::request(id, method, params.clone()));
             buf.push('\n');
         }
-        self.writer
-            .write_all(buf.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
+        self.writer.write_all(buf.as_bytes()).await.map_err(|e| e.to_string())?;
         self.writer.flush().await.map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(methods.len());
         for _ in ids {
@@ -109,9 +93,7 @@ mod tests {
             let mut line = String::new();
             let _ = br.read_line(&mut line).await;
             // handshake
-            w.write_all(b"{\"id\":1,\"result\":[\"ok\",\"1.4\"]}\n")
-                .await
-                .unwrap();
+            w.write_all(b"{\"id\":1,\"result\":[\"ok\",\"1.4\"]}\n").await.unwrap();
             let mut line2 = String::new();
             let _ = br.read_line(&mut line2).await;
             w.write_all(reply.as_bytes()).await.unwrap();
@@ -123,16 +105,9 @@ mod tests {
     #[tokio::test]
     async fn call_balance() {
         let addr = serve_one_line(r#"{"id":2,"result":{"confirmed":1,"unconfirmed":0}}"#).await;
-        let mut c = ElectrumClient::connect(&addr, Duration::from_secs(2))
-            .await
-            .unwrap();
-        let (v, ns) = c
-            .call(
-                "blockchain.scripthash.get_balance",
-                json!(["ab".repeat(32)]),
-            )
-            .await
-            .unwrap();
+        let mut c = ElectrumClient::connect(&addr, Duration::from_secs(2)).await.unwrap();
+        let (v, ns) =
+            c.call("blockchain.scripthash.get_balance", json!(["ab".repeat(32)])).await.unwrap();
         assert_eq!(v["confirmed"], 1);
         assert!(ns > 0);
     }

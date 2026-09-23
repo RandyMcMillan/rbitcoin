@@ -61,10 +61,7 @@ pub struct CasaOpts {
 
 impl Default for CasaOpts {
     fn default() -> Self {
-        Self {
-            warmup: 1,
-            passes: 9,
-        }
+        Self { warmup: 1, passes: 9 }
     }
 }
 
@@ -80,20 +77,14 @@ pub async fn electrum_casa(
     let mut keys = Vec::new();
     for sh in targets {
         let params = json!([sh]);
-        let mut row = KeyRow {
-            scripthash: sh.clone(),
-            ..KeyRow::default()
-        };
+        let mut row = KeyRow { scripthash: sh.clone(), ..KeyRow::default() };
         for pass in 0..total {
-            let (bal, bns) = client
-                .call("blockchain.scripthash.get_balance", params.clone())
-                .await?;
-            let (hist, hns) = client
-                .call("blockchain.scripthash.get_history", params.clone())
-                .await?;
-            let (utxo, uns) = client
-                .call("blockchain.scripthash.listunspent", params.clone())
-                .await?;
+            let (bal, bns) =
+                client.call("blockchain.scripthash.get_balance", params.clone()).await?;
+            let (hist, hns) =
+                client.call("blockchain.scripthash.get_history", params.clone()).await?;
+            let (utxo, uns) =
+                client.call("blockchain.scripthash.listunspent", params.clone()).await?;
             let history_n = jsonrpc::history_len(&hist);
             let utxo_n = jsonrpc::utxo_len(&utxo);
             let _ = bal;
@@ -102,35 +93,16 @@ pub async fn electrum_casa(
                 row.get_balance_us.push(us(bns));
                 row.get_history_us.push(us(hns));
                 row.listunspent_us.push(us(uns));
-                samples.push(Sample {
-                    query: "get_balance",
-                    nanos: bns,
-                    history_n,
-                    utxo_n,
-                });
-                samples.push(Sample {
-                    query: "get_history",
-                    nanos: hns,
-                    history_n,
-                    utxo_n,
-                });
-                samples.push(Sample {
-                    query: "listunspent",
-                    nanos: uns,
-                    history_n,
-                    utxo_n,
-                });
+                samples.push(Sample { query: "get_balance", nanos: bns, history_n, utxo_n });
+                samples.push(Sample { query: "get_history", nanos: hns, history_n, utxo_n });
+                samples.push(Sample { query: "listunspent", nanos: uns, history_n, utxo_n });
             }
             progress.tick();
         }
         keys.push(row);
     }
     progress.finish();
-    Ok(RunOutcome {
-        samples,
-        keys,
-        clients: Vec::new(),
-    })
+    Ok(RunOutcome { samples, keys, clients: Vec::new() })
 }
 
 pub async fn esplora_casa(
@@ -144,10 +116,7 @@ pub async fn esplora_casa(
     let mut samples = Vec::new();
     let mut keys = Vec::new();
     for sh in targets {
-        let mut row = KeyRow {
-            scripthash: sh.clone(),
-            ..KeyRow::default()
-        };
+        let mut row = KeyRow { scripthash: sh.clone(), ..KeyRow::default() };
         for pass in 0..total {
             let (info, ins) = client.get_json(&format!("/scripthash/{sh}")).await?;
             let (txs, tns) = client.get_json(&format!("/scripthash/{sh}/txs")).await?;
@@ -162,35 +131,16 @@ pub async fn esplora_casa(
                 row.get_balance_us.push(us(ins));
                 row.get_history_us.push(us(tns));
                 row.listunspent_us.push(us(uns));
-                samples.push(Sample {
-                    query: "get_balance",
-                    nanos: ins,
-                    history_n,
-                    utxo_n,
-                });
-                samples.push(Sample {
-                    query: "get_history",
-                    nanos: tns,
-                    history_n,
-                    utxo_n,
-                });
-                samples.push(Sample {
-                    query: "listunspent",
-                    nanos: uns,
-                    history_n,
-                    utxo_n,
-                });
+                samples.push(Sample { query: "get_balance", nanos: ins, history_n, utxo_n });
+                samples.push(Sample { query: "get_history", nanos: tns, history_n, utxo_n });
+                samples.push(Sample { query: "listunspent", nanos: uns, history_n, utxo_n });
             }
             progress.tick();
         }
         keys.push(row);
     }
     progress.finish();
-    Ok(RunOutcome {
-        samples,
-        keys,
-        clients: Vec::new(),
-    })
+    Ok(RunOutcome { samples, keys, clients: Vec::new() })
 }
 
 pub async fn electrum_sparrow(
@@ -206,10 +156,8 @@ pub async fn electrum_sparrow(
     while i < targets.len() {
         let end = (i + batch).min(targets.len());
         let chunk = &targets[i..end];
-        let reqs: Vec<(&str, Value)> = chunk
-            .iter()
-            .map(|sh| ("blockchain.scripthash.subscribe", json!([sh])))
-            .collect();
+        let reqs: Vec<(&str, Value)> =
+            chunk.iter().map(|sh| ("blockchain.scripthash.subscribe", json!([sh]))).collect();
         let (_vals, ns) = client.call_batch(&reqs).await?;
         samples.push(Sample {
             query: "subscribe_batch",
@@ -226,10 +174,8 @@ pub async fn electrum_sparrow(
     while i < targets.len() {
         let end = (i + batch).min(targets.len());
         let chunk = &targets[i..end];
-        let reqs: Vec<(&str, Value)> = chunk
-            .iter()
-            .map(|sh| ("blockchain.scripthash.get_history", json!([sh])))
-            .collect();
+        let reqs: Vec<(&str, Value)> =
+            chunk.iter().map(|sh| ("blockchain.scripthash.get_history", json!([sh]))).collect();
         let (vals, ns) = client.call_batch(&reqs).await?;
         samples.push(Sample {
             query: "get_history_batch",
@@ -260,10 +206,8 @@ pub async fn electrum_sparrow(
         i = 0;
         while i < txids.len() {
             let end = (i + batch).min(txids.len());
-            let reqs: Vec<(&str, Value)> = txids[i..end]
-                .iter()
-                .map(|h| ("blockchain.transaction.get", json!([h])))
-                .collect();
+            let reqs: Vec<(&str, Value)> =
+                txids[i..end].iter().map(|h| ("blockchain.transaction.get", json!([h]))).collect();
             let (_vals, ns) = client.call_batch(&reqs).await?;
             samples.push(Sample {
                 query: "transaction_get_batch",
@@ -276,11 +220,7 @@ pub async fn electrum_sparrow(
         }
     }
     progress.finish();
-    Ok(RunOutcome {
-        samples,
-        keys: Vec::new(),
-        clients: Vec::new(),
-    })
+    Ok(RunOutcome { samples, keys: Vec::new(), clients: Vec::new() })
 }
 
 pub async fn electrum_hot(
@@ -294,42 +234,21 @@ pub async fn electrum_hot(
     let mut keys = Vec::new();
     for sh in targets {
         let params = json!([sh]);
-        let mut row = KeyRow {
-            scripthash: sh.clone(),
-            ..KeyRow::default()
-        };
-        let (hist, hns) = client
-            .call("blockchain.scripthash.get_history", params.clone())
-            .await?;
+        let mut row = KeyRow { scripthash: sh.clone(), ..KeyRow::default() };
+        let (hist, hns) = client.call("blockchain.scripthash.get_history", params.clone()).await?;
         let history_n = jsonrpc::history_len(&hist);
-        samples.push(Sample {
-            query: "get_history",
-            nanos: hns,
-            history_n,
-            utxo_n: 0,
-        });
-        let (utxo, uns) = client
-            .call("blockchain.scripthash.listunspent", params)
-            .await?;
+        samples.push(Sample { query: "get_history", nanos: hns, history_n, utxo_n: 0 });
+        let (utxo, uns) = client.call("blockchain.scripthash.listunspent", params).await?;
         let utxo_n = jsonrpc::utxo_len(&utxo);
         fill_key_meta(&mut row, &hist, &utxo, history_n, utxo_n);
         row.get_history_us.push(us(hns));
         row.listunspent_us.push(us(uns));
-        samples.push(Sample {
-            query: "listunspent",
-            nanos: uns,
-            history_n,
-            utxo_n,
-        });
+        samples.push(Sample { query: "listunspent", nanos: uns, history_n, utxo_n });
         keys.push(row);
         progress.tick();
     }
     progress.finish();
-    Ok(RunOutcome {
-        samples,
-        keys,
-        clients: Vec::new(),
-    })
+    Ok(RunOutcome { samples, keys, clients: Vec::new() })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -343,13 +262,7 @@ pub struct ClientsOpts {
 
 impl Default for ClientsOpts {
     fn default() -> Self {
-        Self {
-            warmup: 1,
-            passes: 9,
-            batch: 50,
-            max_txs: 1000,
-            max_utxos: 100,
-        }
+        Self { warmup: 1, passes: 9, batch: 50, max_txs: 1000, max_utxos: 100 }
     }
 }
 
@@ -399,20 +312,14 @@ async fn electrum_one_wallet(
         while i < keys.len() {
             let end = (i + batch).min(keys.len());
             let chunk = &keys[i..end];
-            let subs: Vec<(&str, Value)> = chunk
-                .iter()
-                .map(|sh| ("blockchain.scripthash.subscribe", json!([sh])))
-                .collect();
+            let subs: Vec<(&str, Value)> =
+                chunk.iter().map(|sh| ("blockchain.scripthash.subscribe", json!([sh]))).collect();
             let (_svals, sns) = client.call_batch(&subs).await?;
-            let hreqs: Vec<(&str, Value)> = chunk
-                .iter()
-                .map(|sh| ("blockchain.scripthash.get_history", json!([sh])))
-                .collect();
+            let hreqs: Vec<(&str, Value)> =
+                chunk.iter().map(|sh| ("blockchain.scripthash.get_history", json!([sh]))).collect();
             let (hvals, hns) = client.call_batch(&hreqs).await?;
-            let ureqs: Vec<(&str, Value)> = chunk
-                .iter()
-                .map(|sh| ("blockchain.scripthash.listunspent", json!([sh])))
-                .collect();
+            let ureqs: Vec<(&str, Value)> =
+                chunk.iter().map(|sh| ("blockchain.scripthash.listunspent", json!([sh]))).collect();
             let (uvals, uns) = client.call_batch(&ureqs).await?;
             let mut hist_sum = 0u64;
             let mut utxo_sum = 0u64;
@@ -591,11 +498,7 @@ async fn join_client_set(
         return Err(e);
     }
     clients.sort_by_key(|c| c.client);
-    Ok(RunOutcome {
-        samples,
-        keys: Vec::new(),
-        clients,
-    })
+    Ok(RunOutcome { samples, keys: Vec::new(), clients })
 }
 
 pub async fn electrum_clients(
@@ -695,18 +598,13 @@ mod tests {
                 w.write_all(b"\n").await.unwrap();
             }
         });
-        let mut c = ElectrumClient::connect(&addr, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut c = ElectrumClient::connect(&addr, Duration::from_secs(2)).await.unwrap();
         let sh = "ab".repeat(32);
         let mut progress = Progress::start("casa test", 3);
         let out = electrum_casa(
             &mut c,
             std::slice::from_ref(&sh),
-            &CasaOpts {
-                warmup: 1,
-                passes: 2,
-            },
+            &CasaOpts { warmup: 1, passes: 2 },
             &mut progress,
         )
         .await
@@ -749,15 +647,11 @@ mod tests {
                 w.write_all(b"\n").await.unwrap();
             }
         });
-        let mut c = ElectrumClient::connect(&addr, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let mut c = ElectrumClient::connect(&addr, Duration::from_secs(2)).await.unwrap();
         let a = "ab".repeat(32);
         let b = "cd".repeat(32);
         let mut progress = Progress::start("sparrow test", 2);
-        let out = electrum_sparrow(&mut c, &[a, b], 2, false, &mut progress)
-            .await
-            .unwrap();
+        let out = electrum_sparrow(&mut c, &[a, b], 2, false, &mut progress).await.unwrap();
         assert!(out.samples.iter().any(|s| s.query == "subscribe_batch"));
         assert!(out.samples.iter().any(|s| s.query == "get_history_batch"));
         assert!(out.keys.is_empty());
@@ -784,9 +678,8 @@ mod tests {
                 "blockchain.scripthash.subscribe" => json!("s"),
                 "blockchain.scripthash.get_history" => {
                     if sh.starts_with("ff") {
-                        let items: Vec<Value> = (0..1001)
-                            .map(|i| json!({"height": i + 1, "tx_hash": "aa"}))
-                            .collect();
+                        let items: Vec<Value> =
+                            (0..1001).map(|i| json!({"height": i + 1, "tx_hash": "aa"})).collect();
                         json!(items)
                     } else {
                         json!([{"height": 10, "tx_hash": "aa"}])
@@ -840,22 +733,12 @@ mod tests {
             &addr,
             Duration::from_secs(2),
             vec![vec![a, b], vec![c, d]],
-            &ClientsOpts {
-                warmup: 0,
-                passes: 2,
-                batch: 50,
-                max_txs: 1000,
-                max_utxos: 100,
-            },
+            &ClientsOpts { warmup: 0, passes: 2, batch: 50, max_txs: 1000, max_utxos: 100 },
             progress,
         )
         .await
         .unwrap();
-        let loads: Vec<_> = out
-            .samples
-            .iter()
-            .filter(|s| s.query == "wallet_load")
-            .collect();
+        let loads: Vec<_> = out.samples.iter().filter(|s| s.query == "wallet_load").collect();
         assert_eq!(loads.len(), 4);
         assert_eq!(out.clients.len(), 2);
         assert!(out.clients.iter().all(|r| r.n_keys == 2));
@@ -879,13 +762,7 @@ mod tests {
             &addr,
             Duration::from_secs(2),
             vec![vec![small, fat]],
-            &ClientsOpts {
-                warmup: 0,
-                passes: 2,
-                batch: 50,
-                max_txs: 1000,
-                max_utxos: 100,
-            },
+            &ClientsOpts { warmup: 0, passes: 2, batch: 50, max_txs: 1000, max_utxos: 100 },
             progress,
         )
         .await
@@ -893,11 +770,7 @@ mod tests {
         assert_eq!(out.clients.len(), 1);
         assert_eq!(out.clients[0].n_keys, 1);
         assert_eq!(out.clients[0].txs, 1);
-        let loads: Vec<_> = out
-            .samples
-            .iter()
-            .filter(|s| s.query == "wallet_load")
-            .collect();
+        let loads: Vec<_> = out.samples.iter().filter(|s| s.query == "wallet_load").collect();
         assert_eq!(loads.len(), 2);
         assert!(loads.iter().all(|s| s.history_n == 1));
     }
@@ -974,24 +847,12 @@ mod tests {
             &url,
             Duration::from_secs(2),
             vec![vec![a], vec![b]],
-            &ClientsOpts {
-                warmup: 0,
-                passes: 1,
-                batch: 50,
-                max_txs: 1000,
-                max_utxos: 100,
-            },
+            &ClientsOpts { warmup: 0, passes: 1, batch: 50, max_txs: 1000, max_utxos: 100 },
             progress,
         )
         .await
         .unwrap();
-        assert_eq!(
-            out.samples
-                .iter()
-                .filter(|s| s.query == "wallet_load")
-                .count(),
-            2
-        );
+        assert_eq!(out.samples.iter().filter(|s| s.query == "wallet_load").count(), 2);
         assert_eq!(out.clients.len(), 2);
     }
 }

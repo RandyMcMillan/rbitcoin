@@ -5,12 +5,7 @@ pub const MIXED_WALLET_KEYS: &[usize] = &[8, 16, 32];
 pub fn keys_needed(n_wallets: usize, wallet_keys: Option<usize>) -> usize {
     match wallet_keys {
         Some(k) => n_wallets.saturating_mul(k),
-        None => MIXED_WALLET_KEYS
-            .iter()
-            .copied()
-            .cycle()
-            .take(n_wallets)
-            .sum(),
+        None => MIXED_WALLET_KEYS.iter().copied().cycle().take(n_wallets).sum(),
     }
 }
 
@@ -27,10 +22,7 @@ pub fn pack_wallets(
     }
     let need = keys_needed(n_wallets, wallet_keys);
     if keys.len() < need {
-        return Err(format!(
-            "need {need} keys for {n_wallets} clients (have {})",
-            keys.len()
-        ));
+        return Err(format!("need {need} keys for {n_wallets} clients (have {})", keys.len()));
     }
     let mut out = Vec::with_capacity(n_wallets);
     let mut off = 0usize;
@@ -96,15 +88,9 @@ mod tests {
         assert_eq!(w.len(), 4);
         assert!(w.iter().all(|x| x.len() == 10));
         assert_eq!(keys_needed(4, Some(10)), 40);
-        assert!(pack_wallets(&k, 5, Some(10))
-            .unwrap_err()
-            .contains("need 50 keys"));
-        assert!(pack_wallets(&k, 0, None)
-            .unwrap_err()
-            .contains("--clients must be >= 1"));
-        assert!(pack_wallets(&k, 1, Some(0))
-            .unwrap_err()
-            .contains("--wallet-keys must be >= 1"));
+        assert!(pack_wallets(&k, 5, Some(10)).unwrap_err().contains("need 50 keys"));
+        assert!(pack_wallets(&k, 0, None).unwrap_err().contains("--clients must be >= 1"));
+        assert!(pack_wallets(&k, 1, Some(0)).unwrap_err().contains("--wallet-keys must be >= 1"));
     }
 
     #[test]
@@ -117,10 +103,7 @@ mod tests {
             ("ee".repeat(32), 1, 1),
         ];
         let kept = keep_small(&items, 1000, 100);
-        assert_eq!(
-            kept,
-            vec!["aa".repeat(32), "cc".repeat(32), "ee".repeat(32)]
-        );
+        assert_eq!(kept, vec!["aa".repeat(32), "cc".repeat(32), "ee".repeat(32)]);
         assert!(keep_small(&[("ff".repeat(32), 5, 200)], 1000, 100).is_empty());
     }
 

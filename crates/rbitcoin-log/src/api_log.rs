@@ -24,14 +24,14 @@ pub fn init_api_log(path: impl AsRef<Path>) -> std::io::Result<()> {
         }
     }
     let f = OpenOptions::new().create(true).append(true).open(path)?;
-    let mut g = API_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = API_LOG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     *g = Some(f);
     Ok(())
 }
 
 /// Stop writing the API call file (tests).
 pub fn close_api_log() {
-    let mut g = API_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = API_LOG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     *g = None;
 }
 
@@ -65,7 +65,7 @@ pub fn api_call(
         Some(e) => trace!("api: {surface} peer={peer} {method} {params} wall_ms={wall_ms} err={e}"),
     }
 
-    let mut g = API_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = API_LOG.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(file) = g.as_mut() else {
         return;
     };
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn api_log_file_records_json_line() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join(format!(
             "rbitcoin-api-log-{}-{}.jsonl",
             std::process::id(),
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn api_stderr_line_is_trace() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::capture_logs(true);
         api_call("electrum", "127.0.0.1:1", "server.ping", "[]", 3, None);
         let logs = crate::take_logs();

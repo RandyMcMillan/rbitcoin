@@ -99,14 +99,14 @@ pub fn global_capture_logs(on: bool) {
 
 /// Drain all globally captured log lines.
 pub fn global_take_logs() -> Vec<(Level, String)> {
-    let mut guard = GLOBAL_CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = GLOBAL_CAPTURED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::mem::take(&mut *guard)
 }
 
 /// Return the most recent `limit` globally captured log lines without draining.
 /// A `limit` of `0` means no limit (return all captured lines).
 pub fn global_logs_recent(limit: usize) -> Vec<(Level, String)> {
-    let guard = GLOBAL_CAPTURED.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = GLOBAL_CAPTURED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if limit == 0 {
         guard.iter().cloned().collect()
     } else {
@@ -218,7 +218,7 @@ pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
 /// Write one log line with optional style. Bold is applied only when stderr is
 /// an interactive terminal so redirected logs stay clean ASCII.
 pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
-    if CAPTURE.with(|c| c.get()) {
+    if CAPTURE.with(std::cell::Cell::get) {
         CAPTURED.with(|c| c.borrow_mut().push((level, args.to_string())));
     }
     if GLOBAL_CAPTURE_ENABLED.load(Ordering::Relaxed) {

@@ -38,9 +38,7 @@ pub fn parse_target_line(line: &str) -> Result<Option<String>, String> {
     }
     let addr: Address<NetworkUnchecked> = Address::from_str(line).map_err(|e| e.to_string())?;
     let addr = addr.assume_checked();
-    Ok(Some(electrum_scripthash_hex(
-        addr.script_pubkey().as_bytes(),
-    )))
+    Ok(Some(electrum_scripthash_hex(addr.script_pubkey().as_bytes())))
 }
 
 pub fn parse_targets_text(text: &str) -> Result<Vec<String>, String> {
@@ -94,10 +92,7 @@ mod tests {
         let line = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
         let sh = parse_target_line(line).unwrap().unwrap();
         assert_eq!(sh.len(), 64);
-        assert_eq!(
-            parse_target_line(&sh).unwrap().as_deref(),
-            Some(sh.as_str())
-        );
+        assert_eq!(parse_target_line(&sh).unwrap().as_deref(), Some(sh.as_str()));
     }
 
     #[test]
@@ -129,10 +124,7 @@ mod tests {
         let got = load_corpus("hot").unwrap();
         assert!(got.len() >= 16);
         let from_addr = parse_target_line("bc1pfeessrawgf").unwrap().unwrap();
-        assert_eq!(
-            from_addr,
-            "c5d0fb3863474a90cfe5b26801e66cb45fdc046b40e6829788eaf1b8770ffea6"
-        );
+        assert_eq!(from_addr, "c5d0fb3863474a90cfe5b26801e66cb45fdc046b40e6829788eaf1b8770ffea6");
         assert!(got.iter().any(|s| s == &from_addr));
     }
 
@@ -143,11 +135,7 @@ mod tests {
         let mut prefixes: Vec<_> = got.iter().map(|s| &s[..2]).collect();
         prefixes.sort_unstable();
         prefixes.dedup();
-        assert!(
-            prefixes.len() >= 64,
-            "scripthash prefixes too clustered: {}",
-            prefixes.len()
-        );
+        assert!(prefixes.len() >= 64, "scripthash prefixes too clustered: {}", prefixes.len());
     }
 
     #[test]

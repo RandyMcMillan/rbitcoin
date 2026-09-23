@@ -242,49 +242,39 @@ fn parse_args(args: &[OsString]) -> Result<Cfg, String> {
                 }
                 "suite" => cfg.suite = Suite::parse(&take_val(&mut i)?)?,
                 "warmup" => {
-                    cfg.warmup = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --warmup".to_string())?;
+                    cfg.warmup =
+                        take_val(&mut i)?.parse().map_err(|_| "bad --warmup".to_string())?;
                 }
                 "passes" => {
-                    cfg.passes = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --passes".to_string())?;
+                    cfg.passes =
+                        take_val(&mut i)?.parse().map_err(|_| "bad --passes".to_string())?;
                 }
                 "batch" => {
-                    cfg.batch = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --batch".to_string())?;
+                    cfg.batch = take_val(&mut i)?.parse().map_err(|_| "bad --batch".to_string())?;
                 }
                 "timeout-secs" => {
-                    let n: u64 = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --timeout-secs".to_string())?;
+                    let n: u64 =
+                        take_val(&mut i)?.parse().map_err(|_| "bad --timeout-secs".to_string())?;
                     cfg.timeout = Duration::from_secs(n.max(1));
                 }
                 "out" => cfg.out = Some(PathBuf::from(take_val(&mut i)?)),
                 "clients" => {
                     cfg.clients_flag = true;
-                    cfg.clients = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --clients".to_string())?;
+                    cfg.clients =
+                        take_val(&mut i)?.parse().map_err(|_| "bad --clients".to_string())?;
                 }
                 "wallet-keys" => {
                     cfg.wallet_keys = Some(
-                        take_val(&mut i)?
-                            .parse()
-                            .map_err(|_| "bad --wallet-keys".to_string())?,
+                        take_val(&mut i)?.parse().map_err(|_| "bad --wallet-keys".to_string())?,
                     );
                 }
                 "max-txs" => {
-                    cfg.max_txs = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --max-txs".to_string())?;
+                    cfg.max_txs =
+                        take_val(&mut i)?.parse().map_err(|_| "bad --max-txs".to_string())?;
                 }
                 "max-utxos" => {
-                    cfg.max_utxos = take_val(&mut i)?
-                        .parse()
-                        .map_err(|_| "bad --max-utxos".to_string())?;
+                    cfg.max_utxos =
+                        take_val(&mut i)?.parse().map_err(|_| "bad --max-utxos".to_string())?;
                 }
                 unk => return Err(format!("unknown argument `--{unk}`")),
             }
@@ -411,10 +401,7 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
                         electrum_casa(
                             &mut c,
                             &targets,
-                            &CasaOpts {
-                                warmup: cfg.warmup,
-                                passes: cfg.passes,
-                            },
+                            &CasaOpts { warmup: cfg.warmup, passes: cfg.passes },
                             &mut progress,
                         )
                         .await?
@@ -454,13 +441,8 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
                         };
                         let mut progress =
                             Progress::start(label, casa_units(targets.len(), warmup, passes));
-                        esplora_casa(
-                            &mut c,
-                            &targets,
-                            &CasaOpts { warmup, passes },
-                            &mut progress,
-                        )
-                        .await?
+                        esplora_casa(&mut c, &targets, &CasaOpts { warmup, passes }, &mut progress)
+                            .await?
                     }
                     Suite::Sparrow => unreachable!(),
                     Suite::Clients => unreachable!(),
@@ -489,11 +471,7 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
     }
     println!("{}", format_report(name, backend, &outcome.samples));
     if let Some(path) = &cfg.out {
-        let passes = if cfg.suite == Suite::Hot {
-            1
-        } else {
-            cfg.passes.max(1) as usize
-        };
+        let passes = if cfg.suite == Suite::Hot { 1 } else { cfg.passes.max(1) as usize };
         if cfg.suite == Suite::Clients {
             write_clients_csv(path, &outcome.clients, passes)?;
             eprintln!(
@@ -503,11 +481,7 @@ async fn run_async(cfg: Cfg, targets: Vec<String>) -> Result<(), String> {
             );
         } else {
             write_csv(path, &outcome.keys, passes)?;
-            eprintln!(
-                "rbitcoin-bench: wrote {} keys to {}",
-                outcome.keys.len(),
-                path.display()
-            );
+            eprintln!("rbitcoin-bench: wrote {} keys to {}", outcome.keys.len(), path.display());
         }
     }
     Ok(())
@@ -538,10 +512,7 @@ mod tests {
         assert_eq!(c.batch, 25);
         assert_eq!(c.suite, Suite::Sparrow);
         assert_eq!(c.clients, 8);
-        assert_eq!(
-            c.out.as_deref().map(|p| p.to_str().unwrap()),
-            Some("/tmp/casa.csv")
-        );
+        assert_eq!(c.out.as_deref().map(|p| p.to_str().unwrap()), Some("/tmp/casa.csv"));
         let args = vec![
             OsString::from("rbitcoin-bench"),
             OsString::from("--corpus"),
@@ -601,20 +572,14 @@ mod tests {
         assert!(u.contains("-V, --version"), "{u}");
         assert!(u.contains("this message"), "{u}");
         assert!(u.contains("print version"), "{u}");
-        assert!(
-            u.contains("--esplora [URL]") && u.contains("Esplora REST"),
-            "{u}"
-        );
+        assert!(u.contains("--esplora [URL]") && u.contains("Esplora REST"), "{u}");
         assert!(u.contains("--electrum [HOST:PORT]"), "{u}");
     }
 
     #[test]
     fn omitted_electrum_esplora_host_uses_local_defaults() {
-        let e = parse_args(&[
-            OsString::from("rbitcoin-bench"),
-            OsString::from("--electrum"),
-        ])
-        .unwrap();
+        let e =
+            parse_args(&[OsString::from("rbitcoin-bench"), OsString::from("--electrum")]).unwrap();
         assert_eq!(e.electrum.as_deref(), Some("127.0.0.1:50001"));
         let s = parse_args(&[
             OsString::from("rbitcoin-bench"),
@@ -624,11 +589,8 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(s.esplora.as_deref(), Some("http://127.0.0.1:3000"));
-        let eq = parse_args(&[
-            OsString::from("rbitcoin-bench"),
-            OsString::from("--electrum="),
-        ])
-        .unwrap();
+        let eq =
+            parse_args(&[OsString::from("rbitcoin-bench"), OsString::from("--electrum=")]).unwrap();
         assert_eq!(eq.electrum.as_deref(), Some("127.0.0.1:50001"));
     }
 

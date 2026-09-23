@@ -37,22 +37,13 @@ pub fn summarize(samples: &[Sample]) -> Vec<QuerySummary> {
     names.dedup();
     let mut out = Vec::with_capacity(names.len());
     for query in names {
-        let mut ns: Vec<u64> = samples
-            .iter()
-            .filter(|s| s.query == query)
-            .map(|s| s.nanos)
-            .collect();
+        let mut ns: Vec<u64> =
+            samples.iter().filter(|s| s.query == query).map(|s| s.nanos).collect();
         let n = ns.len();
         let max_us = ns.iter().copied().max().unwrap_or(0) / 1000;
         let p50_us = median_us(&mut ns);
         let p95_us = percentile_us(&mut ns, 95.0);
-        out.push(QuerySummary {
-            query,
-            n,
-            p50_us,
-            p95_us,
-            max_us,
-        });
+        out.push(QuerySummary { query, n, p50_us, p95_us, max_us });
     }
     out
 }
@@ -71,22 +62,14 @@ pub fn history_bucket(history_n: u64) -> &'static str {
 
 pub fn format_report(suite: &str, backend: &str, samples: &[Sample]) -> String {
     let mut lines = Vec::new();
-    lines.push(format!(
-        "suite={suite} backend={backend} samples={}",
-        samples.len()
-    ));
+    lines.push(format!("suite={suite} backend={backend} samples={}", samples.len()));
     lines.push("query\tn\tp50_us\tp95_us\tmax_us".to_string());
     for q in summarize(samples) {
-        lines.push(format!(
-            "{}\t{}\t{}\t{}\t{}",
-            q.query, q.n, q.p50_us, q.p95_us, q.max_us
-        ));
+        lines.push(format!("{}\t{}\t{}\t{}\t{}", q.query, q.n, q.p50_us, q.p95_us, q.max_us));
     }
     lines.push("query\tbucket\tn\tp50_us".to_string());
-    let mut keys: Vec<(&'static str, &'static str)> = samples
-        .iter()
-        .map(|s| (s.query, history_bucket(s.history_n)))
-        .collect();
+    let mut keys: Vec<(&'static str, &'static str)> =
+        samples.iter().map(|s| (s.query, history_bucket(s.history_n))).collect();
     keys.sort_unstable();
     keys.dedup();
     for (query, bucket) in keys {
@@ -116,24 +99,9 @@ mod tests {
     #[test]
     fn summarize_groups_queries() {
         let samples = vec![
-            Sample {
-                query: "get_balance",
-                nanos: 2_000,
-                history_n: 12,
-                utxo_n: 1,
-            },
-            Sample {
-                query: "get_balance",
-                nanos: 4_000,
-                history_n: 12,
-                utxo_n: 1,
-            },
-            Sample {
-                query: "listunspent",
-                nanos: 10_000,
-                history_n: 12,
-                utxo_n: 3,
-            },
+            Sample { query: "get_balance", nanos: 2_000, history_n: 12, utxo_n: 1 },
+            Sample { query: "get_balance", nanos: 4_000, history_n: 12, utxo_n: 1 },
+            Sample { query: "listunspent", nanos: 10_000, history_n: 12, utxo_n: 3 },
         ];
         let s = summarize(&samples);
         assert_eq!(s.len(), 2);

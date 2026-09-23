@@ -21,10 +21,9 @@ pub fn utxo_len(result: &Value) -> u64 {
 }
 
 fn item_height(item: &Value) -> Option<i64> {
-    item.get("height").and_then(|v| v.as_i64()).or_else(|| {
-        item.pointer("/status/block_height")
-            .and_then(|v| v.as_i64())
-    })
+    item.get("height")
+        .and_then(|v| v.as_i64())
+        .or_else(|| item.pointer("/status/block_height").and_then(|v| v.as_i64()))
 }
 
 /// Confirmed height span (skips mempool height ≤ 0).
@@ -61,10 +60,7 @@ mod tests {
 
     #[test]
     fn result_ok_and_error() {
-        assert_eq!(
-            result_ok(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap(),
-            Value::Null
-        );
+        assert_eq!(result_ok(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap(), Value::Null);
         assert!(result_ok(r#"{"id":1,"error":{"code":-1,"message":"no"}}"#)
             .unwrap_err()
             .contains("no"));

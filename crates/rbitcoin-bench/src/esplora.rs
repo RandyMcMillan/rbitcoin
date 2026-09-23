@@ -32,12 +32,7 @@ impl EsploraClient {
             .map_err(|_| format!("connect timeout {host}:{port}"))?
             .map_err(|e| e.to_string())?;
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
-        Ok(Self {
-            host,
-            port,
-            stream: BufReader::new(stream),
-            timeout,
-        })
+        Ok(Self { host, port, stream: BufReader::new(stream), timeout })
     }
 
     pub async fn get_json(&mut self, path: &str) -> Result<(Value, u64), String> {
@@ -47,11 +42,7 @@ impl EsploraClient {
             port = self.port
         );
         let t0 = Instant::now();
-        self.stream
-            .get_mut()
-            .write_all(req.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
+        self.stream.get_mut().write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
         let mut headers = Vec::new();
         loop {
             let mut line = String::new();
@@ -64,10 +55,7 @@ impl EsploraClient {
             }
             headers.push(line);
         }
-        if headers
-            .first()
-            .is_none_or(|s| !s.contains(" 200 ") && !s.starts_with("HTTP/1.1 200"))
-        {
+        if headers.first().is_none_or(|s| !s.contains(" 200 ") && !s.starts_with("HTTP/1.1 200")) {
             return Err(format!(
                 "http {}",
                 headers.first().map(|s| s.trim()).unwrap_or("no status")
@@ -77,11 +65,7 @@ impl EsploraClient {
         for h in &headers {
             let l = h.to_ascii_lowercase();
             if let Some(rest) = l.strip_prefix("content-length:") {
-                len = Some(
-                    rest.trim()
-                        .parse()
-                        .map_err(|_| "bad content-length".to_string())?,
-                );
+                len = Some(rest.trim().parse().map_err(|_| "bad content-length".to_string())?);
             }
         }
         let body = if let Some(n) = len {

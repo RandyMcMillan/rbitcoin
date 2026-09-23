@@ -89,12 +89,8 @@ pub struct ClientRow {
 
 pub fn clients_csv_header(passes: usize) -> String {
     let passes = passes.max(1);
-    let mut cols = vec![
-        "client".to_string(),
-        "n_keys".to_string(),
-        "txs".to_string(),
-        "utxos".to_string(),
-    ];
+    let mut cols =
+        vec!["client".to_string(), "n_keys".to_string(), "txs".to_string(), "utxos".to_string()];
     for i in 1..=passes {
         cols.push(format!("wallet_load_us_{i}"));
     }
@@ -179,10 +175,7 @@ mod tests {
 
     #[test]
     fn empty_heights_are_blank() {
-        let row = KeyRow {
-            scripthash: "cd".repeat(32),
-            ..KeyRow::default()
-        };
+        let row = KeyRow { scripthash: "cd".repeat(32), ..KeyRow::default() };
         let line = csv_row(&row, 1);
         assert!(line.contains(",,,,,0,0,"));
     }
@@ -209,18 +202,10 @@ mod tests {
 
     #[test]
     fn clients_csv_has_load_times() {
-        let row = ClientRow {
-            client: 3,
-            n_keys: 8,
-            txs: 12,
-            utxos: 4,
-            wallet_load_us: vec![100, 90],
-        };
+        let row =
+            ClientRow { client: 3, n_keys: 8, txs: 12, utxos: 4, wallet_load_us: vec![100, 90] };
         let h = clients_csv_header(2);
-        assert_eq!(
-            h,
-            "client,n_keys,txs,utxos,wallet_load_us_1,wallet_load_us_2"
-        );
+        assert_eq!(h, "client,n_keys,txs,utxos,wallet_load_us_1,wallet_load_us_2");
         assert_eq!(clients_csv_row(&row, 2), "3,8,12,4,100,90");
         let csv = format_clients_csv(&[row], 2);
         assert_eq!(csv.lines().count(), 2);

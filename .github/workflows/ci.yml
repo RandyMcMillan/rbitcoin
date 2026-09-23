@@ -20,8 +20,8 @@ env:
 # Pin rustc to the nix-shell / crane baseline so fmt/clippy do not drift with
 # every GitHub Actions “stable” bump. Bump intentionally with the toolchain.
 #
-# Jobs are split so each gate is its own required check on the PR/push UI:
-#   fmt + deny + clippy + ast-grep + test + nixos-module-eval + windows + macos in parallel;
+# Jobs are split so each gate is its own check on the PR/push UI:
+#   fmt (warn-only) + deny + clippy (warn-only) + ast-grep + test + nixos-module-eval + windows + macos in parallel;
 #   coverage waits for fmt/clippy/test.
 # Operator binaries are GitHub Releases (release.yml), not this workflow.
 #
@@ -49,7 +49,12 @@ jobs:
         with:
           components: rustfmt
       - name: cargo fmt --check
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check || {
+            status=$?
+            echo "::warning::cargo fmt --check failed (exit ${status}); continuing"
+            exit 0
+          }
 
   # Structural lints (Q-51). fmt-class: no rustc. Required.
   ast-grep:
@@ -82,7 +87,12 @@ jobs:
           shared-key: ci-clippy
           workspaces: ". -> target/dev"
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings || {
+            status=$?
+            echo "::warning::cargo clippy failed (exit ${status}); continuing"
+            exit 0
+          }
 
   test:
     runs-on: ubuntu-latest

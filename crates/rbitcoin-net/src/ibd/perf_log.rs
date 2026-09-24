@@ -2509,6 +2509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn read_proc_rss_returns_nonzero_on_linux() {
         let r = read_proc_rss();
         // Agent VM is Linux with /proc; RSS should be readable for this process.

@@ -7777,6 +7777,7 @@ fn tip_event_for_announce_stale_hash_uses_current_hub_tip() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn snapshot_omits_peer_after_tcp_fin() {
     use crate::peers::{PeerConnType, PeerHub};
     use bitcoin::p2p::address::Address;

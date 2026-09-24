@@ -927,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn unix_socket_needs_no_http_auth() {
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-sock").expect("temp dir");
-        let sock = dir.path().join("rpc.sock");
+        let sock = std::path::PathBuf::from(format!("/tmp/rpc-{}.sock", std::process::id()));
         let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
         let cfg = RpcConfig {
             listen: None,

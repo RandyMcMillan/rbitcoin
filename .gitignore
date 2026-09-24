@@ -1,3 +1,5 @@
+third_party/.init-bitcoin.lock
+
 /target/
 # cargo-fuzz (isolated workspace under fuzz/)
 /fuzz/target/

@@ -38,7 +38,7 @@ pub fn rbitcoin_subversion(
     let s = if comments.is_empty() {
         format!("/rbitcoin:{pkg_version}/")
     } else {
-        let joined = comments.iter().map(|c| c.as_ref()).collect::<Vec<_>>().join("; ");
+        let joined = comments.iter().map(AsRef::as_ref).collect::<Vec<_>>().join("; ");
         format!("/rbitcoin:{pkg_version}({joined})/")
     };
     if s.len() > 256 {

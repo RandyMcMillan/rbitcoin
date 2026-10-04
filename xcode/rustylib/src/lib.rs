@@ -4829,12 +4829,15 @@ impl FfiActiveMempool {
     }
 
     pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .select_block_txs(max_weight_wu)
+        let g = self.inner.lock().unwrap();
+        let budget = rbitcoin_mempool::SelectBudget {
+            max_weight_wu,
+            reserved_sigops: 400,
+            min_sat_kvb: 0,
+        };
+        g.select_block_template(budget, |_| 0)
             .into_iter()
-            .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
+            .map(|(t, _)| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
             .collect()
     }
 
@@ -6471,7 +6474,7 @@ pub fn mempool_relay_fee_btc_per_kb() -> f64 {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCmpctReconstructStats {
     pub hash: String,
-    pub ntx: u64,
+    pub tx_count: u64,
     pub getdata: bool,
     pub missing_n: u64,
     pub prefill_n: u64,
@@ -6492,7 +6495,7 @@ impl From<rbitcoin_net::CmpctReconstructStats> for FfiCmpctReconstructStats {
     fn from(s: rbitcoin_net::CmpctReconstructStats) -> Self {
         Self {
             hash: s.hash.to_string(),
-            ntx: s.ntx as u64,
+            tx_count: s.tx_count as u64,
             getdata: s.getdata,
             missing_n: s.missing_n as u64,
             prefill_n: s.prefill_n as u64,

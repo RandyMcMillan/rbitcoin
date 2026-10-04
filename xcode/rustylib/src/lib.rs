@@ -2193,7 +2193,7 @@ pub fn sum_work_hex(work_hexes: Vec<String>) -> Result<String, RustyError> {
             Ok(bitcoin::Work::from_be_bytes(arr))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let sum = rbitcoin_net::sum_work(works.into_iter());
+    let sum = rbitcoin_net::sum_work(works.into_iter()).map_err(|_| RustyError::InvalidInput)?;
     Ok(rbitcoin_primitives::hex_encode(sum.to_be_bytes()))
 }
 
@@ -3574,6 +3574,7 @@ impl FfiQuery {
         let out_txid = parse_hash32(&out_txid_hex)?;
         let fk = self
             .inner
+            .store()
             .put_spend(
                 &out_txid,
                 out_index,
@@ -4125,7 +4126,7 @@ impl From<rbitcoin_store::HeadResizeSizeSnapshot> for FfiHeadResizeSizeSnapshot 
             sealed_segments: h.sealed_segments,
             fuse8_bytes: h.fuse8_bytes,
             mphf_g_bytes: h.mphf_g_bytes,
-            open_keys_bytes: h.open_keys_bytes,
+            open_keys_bytes: h.mphf_occ_bytes,
             class_c_l2_bytes: h.class_c_l2_bytes,
         }
     }
@@ -4536,11 +4537,12 @@ impl FfiMempool {
         let tx: bitcoin::Transaction =
             deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
         let txid = tx.compute_txid();
+        let wtxid = tx.compute_wtxid();
         let raw = bitcoin::consensus::encode::serialize(&tx);
         self.inner
             .lock()
             .unwrap()
-            .append_live_tx(&raw, &txid, fee_sat, weight)
+            .append_live_tx(&tx, &txid, &wtxid, fee_sat, weight, 0, &[])
             .map_err(|_| RustyError::MempoolError)
     }
 }
@@ -4627,7 +4629,7 @@ impl FfiTxGraph {
         };
         g.select_block_template(budget, |_| 0)
             .into_iter()
-            .map(|(tx, _)| tx.compute_txid().to_string())
+            .map(|s| s.txid.to_string())
             .collect()
     }
 
@@ -5289,6 +5291,7 @@ impl rbitcoin_mempool::UtxoProvider for FfiUtxoProvider {
             create_height,
             create_mtp,
             is_coinbase,
+            create_fk: Some(fk),
         })
     }
 }
@@ -6359,7 +6362,7 @@ impl FfiMempoolHub {
             .into_iter()
             .map(|h| bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput))
             .collect::<Result<_, _>>()?;
-        Ok(self.inner.remove_live_txids(&txids).map_err(|_| RustyError::MempoolError)? as u64)
+        Ok(self.inner.remove_for_block(&txids).map_err(|_| RustyError::MempoolError)? as u64)
     }
 
     pub fn prioritise_tx(&self, txid_hex: String, fee_delta: i64) -> Result<(), RustyError> {
@@ -7191,12 +7194,12 @@ pub fn mempool_seconds_per_block() -> u64 {
 
 #[uniffi::export]
 pub fn mempool_capacity_safety_num() -> u64 {
-    rbitcoin_mempool::CAPACITY_SAFETY_NUM
+    95
 }
 
 #[uniffi::export]
 pub fn mempool_capacity_safety_den() -> u64 {
-    rbitcoin_mempool::CAPACITY_SAFETY_DEN
+    100
 }
 
 #[uniffi::export]
@@ -8185,7 +8188,7 @@ pub fn p2p_start_with_config(
     config.max_sh_creates = max_sh_creates;
 
     if let Some(addr) = p2p_listen {
-        config.listen.p2p = Some(
+        config.listen.p2p = rbitcoin_node::P2pListen::Socket(
             addr.parse::<std::net::SocketAddr>()
                 .map_err(|_| RustyError::InvalidInput)?,
         );
@@ -8197,10 +8200,10 @@ pub fn p2p_start_with_config(
         );
     }
     if let Some(addr) = esplora_listen {
-        config.listen.esplora = Some(
+        config.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(
             addr.parse::<std::net::SocketAddr>()
                 .map_err(|_| RustyError::InvalidInput)?,
-        );
+        ));
     }
     if let Some(addr) = rpc_listen {
         config.rpc.listen = Some(
@@ -8208,11 +8211,15 @@ pub fn p2p_start_with_config(
                 .map_err(|_| RustyError::InvalidInput)?,
         );
     }
-    if let Some(user) = rpc_user {
-        config.rpc.user = Some(user);
-    }
-    if let Some(pass) = rpc_password {
-        config.rpc.password = Some(pass);
+    match (rpc_user, rpc_password) {
+        (Some(user), Some(pass)) => {
+            let cookie_path = std::path::Path::new(&datadir).join("rpc.cookie");
+            std::fs::write(&cookie_path, format!("{user}:{pass}"))
+                .map_err(|_| RustyError::InvalidInput)?;
+            config.rpc.cookie_file = Some(cookie_path);
+        }
+        (None, None) => {}
+        _ => return Err(RustyError::InvalidInput),
     }
 
     let handle = std::thread::spawn(move || {

@@ -6740,8 +6740,8 @@ pub struct FfiRpcAuth {
 impl From<rbitcoin_rpc::RpcAuth> for FfiRpcAuth {
     fn from(a: rbitcoin_rpc::RpcAuth) -> Self {
         Self {
-            user: a.user,
-            password: a.password,
+            user: "__cookie__".to_string(),
+            password: a.token,
         }
     }
 }
@@ -6755,10 +6755,13 @@ pub fn write_cookie_file(path: String) -> Result<FfiRpcAuth, RustyError> {
 
 #[uniffi::export]
 pub fn parse_basic_auth(header: String) -> Result<FfiRpcAuth, RustyError> {
-    let auth = rbitcoin_rpc::parse_basic_auth(&header).ok_or(RustyError::InvalidInput)?;
+    let creds = rbitcoin_rpc::parse_basic_auth(&header).ok_or(RustyError::InvalidInput)?;
+    let (user, password) = creds
+        .split_once(':')
+        .ok_or(RustyError::InvalidInput)?;
     Ok(FfiRpcAuth {
-        user: auth.0,
-        password: auth.1,
+        user: user.to_string(),
+        password: password.to_string(),
     })
 }
 
@@ -6769,15 +6772,19 @@ pub fn resolve_rpc_auth(
     rpc_password: Option<String>,
     cookie_path: Option<String>,
 ) -> Result<FfiRpcAuth, RustyError> {
-    let cp = cookie_path.as_deref().map(std::path::Path::new);
-    let (auth, _) = rbitcoin_rpc::resolve_rpc_auth(
-        std::path::Path::new(&datadir),
-        rpc_user.as_deref(),
-        rpc_password.as_deref(),
-        cp,
-    )
-    .map_err(|_| RustyError::InvalidInput)?;
-    Ok(auth.into())
+    match (rpc_user, rpc_password) {
+        (Some(user), Some(password)) => Ok(FfiRpcAuth { user, password }),
+        (None, None) => {
+            let token_path = cookie_path.as_deref().map(std::path::Path::new);
+            let (auth, _) = rbitcoin_rpc::resolve_rpc_auth(std::path::Path::new(&datadir), token_path)
+                .map_err(|_| RustyError::InvalidInput)?;
+            Ok(FfiRpcAuth {
+                user: "__cookie__".to_string(),
+                password: auth.token,
+            })
+        }
+        _ => Err(RustyError::InvalidInput),
+    }
 }
 
 // --- Work Comparison FFI ---

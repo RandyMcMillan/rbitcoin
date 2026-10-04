@@ -1255,8 +1255,7 @@ pub fn rpc_call_json(
 ) -> Result<String, RustyError> {
     let params: Vec<serde_json::Value> =
         serde_json::from_str(&params_json).map_err(|_| RustyError::InvalidInput)?;
-    let result = rbitcoin_cli::rpc_call(&host, port, &user, &password, &method, &params)
-        .map_err(|_| RustyError::InvalidInput)?;
+    let result = rpc_call(&host, port, &user, &password, &method, &params)?;
     serde_json::to_string(&result).map_err(|_| RustyError::InvalidInput)
 }
 
@@ -2828,7 +2827,7 @@ impl FfiStore {
     pub fn tx_inwit_range(&self, fk: u64) -> Result<FfiTxRange, RustyError> {
         let (offset, len) = self
             .inner
-            .tx_inwit_range(rbitcoin_primitives::Fk(fk))
+            .tx_seqsigwit_range(rbitcoin_primitives::Fk(fk))
             .map_err(|_| RustyError::StoreError)?;
         Ok(FfiTxRange { offset, len })
     }
@@ -3637,7 +3636,7 @@ impl FfiQuery {
     }
 
     pub fn point_edge_count(&self) -> u64 {
-        self.inner.point_edge_count()
+        self.inner.store().spender_list_count()
     }
 
     pub fn backfill_tx_index(&self) -> Result<u64, RustyError> {
@@ -4620,12 +4619,15 @@ impl FfiTxGraph {
     }
 
     pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .select_block_txids(max_weight_wu)
+        let g = self.inner.lock().unwrap();
+        let budget = rbitcoin_mempool::SelectBudget {
+            max_weight_wu,
+            reserved_sigops: 400,
+            min_sat_kvb: 0,
+        };
+        g.select_block_template(budget, |_| 0)
             .into_iter()
-            .map(|t| t.to_string())
+            .map(|(tx, _)| tx.compute_txid().to_string())
             .collect()
     }
 
@@ -4853,14 +4855,12 @@ impl FfiActiveMempool {
                 Ok((txid, d))
             })
             .collect::<Result<_, _>>()?;
-        let txs = self
-            .inner
-            .lock()
-            .unwrap()
-            .select_block_txs_delta(max_weight_wu, |id| map.get(&id).copied().unwrap_or(0));
+        let g = self.inner.lock().unwrap();
+        let budget = g.template_budget(0);
+        let txs = g.select_block_template(budget, |id| map.get(&id).copied().unwrap_or(0));
         Ok(txs
             .into_iter()
-            .map(|t| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
+            .map(|(t, _)| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
             .collect())
     }
 
@@ -5931,7 +5931,7 @@ impl FfiChainHub {
             rbitcoin_primitives::hex_decode(&header_hex).map_err(|_| RustyError::InvalidInput)?;
         let header: bitcoin::block::Header = bitcoin::consensus::encode::deserialize(&bytes)
             .map_err(|_| RustyError::InvalidInput)?;
-        Ok(self.inner.unrequested_weaker_than_tip(&header))
+        Ok(self.inner.header_below_minwork(&header))
     }
 
     pub fn header_below_minwork(&self, header_hex: String) -> Result<bool, RustyError> {
@@ -6347,7 +6347,7 @@ impl FfiMempoolHub {
             .into_iter()
             .map(|h| bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput))
             .collect::<Result<_, _>>()?;
-        Ok(self.inner.evict_live_txids(&txids) as u64)
+        Ok(self.inner.remove_live_txids(&txids).map_err(|_| RustyError::MempoolError)? as u64)
     }
 
     pub fn prioritise_tx(&self, txid_hex: String, fee_delta: i64) -> Result<(), RustyError> {
@@ -6690,7 +6690,7 @@ pub fn txout_serialized_size(out_hex: String) -> Result<i64, RustyError> {
     let bytes = rbitcoin_primitives::hex_decode(&out_hex).map_err(|_| RustyError::InvalidInput)?;
     let out: bitcoin::TxOut =
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
-    Ok(rbitcoin_rpc::txout_serialized_size(&out))
+    Ok(bitcoin::consensus::encode::serialize(&out).len() as i64)
 }
 
 #[uniffi::export]
@@ -6714,7 +6714,7 @@ pub fn percentiles_by_weight(
 
 #[uniffi::export]
 pub fn rpc_per_utxo_overhead() -> i64 {
-    rbitcoin_rpc::PER_UTXO_OVERHEAD
+    41
 }
 
 // --- RPC Auth FFI ---

@@ -40,3 +40,5 @@ mutants.out/
 third_party/.init-bitcoin.lock
 
 xcode/rustylib/Cargo.lock
+
+crates/rbitcoin-consensus/target

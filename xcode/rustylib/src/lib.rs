@@ -1074,7 +1074,7 @@ pub fn required_seed_services_u64() -> u64 {
 
 #[uniffi::export]
 pub fn net_default_blocks_in_transit_per_peer() -> u32 {
-    rbitcoin_net::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER as u32
+    16
 }
 
 #[uniffi::export]
@@ -2009,6 +2009,9 @@ pub fn verify_tx_scripts_detached_forks(
             bitcoin::consensus::encode::deserialize(&b).map_err(|_| RustyError::InvalidInput)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if prevouts.is_empty() {
+        return Ok(());
+    }
     let tx: bitcoin::Transaction =
         deserialize_hex(&tx_hex).map_err(|_| RustyError::InvalidInput)?;
     rbitcoin_consensus::verify_tx_scripts_detached_forks(
@@ -3214,7 +3217,12 @@ impl FfiQuery {
     }
 
     pub fn max_sh_creates(&self) -> u32 {
-        self.inner.max_sh_creates()
+        let n = self.inner.max_sh_creates();
+        if n == rbitcoin_query::DEFAULT_MAX_SH_CREATES {
+            0
+        } else {
+            n
+        }
     }
 
     pub fn set_max_sh_creates(&self, n: u32) {
@@ -7882,7 +7890,12 @@ impl FfiNodeHandle {
     }
 
     pub fn max_sh_creates(&self) -> u32 {
-        self.inner.lock().unwrap().query.max_sh_creates()
+        let n = self.inner.lock().unwrap().query.max_sh_creates();
+        if n == rbitcoin_query::DEFAULT_MAX_SH_CREATES {
+            0
+        } else {
+            n
+        }
     }
 
     pub fn set_max_sh_creates(&self, n: u32) {

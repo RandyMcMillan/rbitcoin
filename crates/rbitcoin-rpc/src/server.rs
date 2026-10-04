@@ -1728,9 +1728,14 @@ mod tests {
                 }
             })
         };
-        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-umask").expect("temp dir");
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "rbtc-rpc-umask-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
         for i in 0..200 {
-            let sock = dir.path().join(format!("s{i}.sock"));
+            let sock = dir.join(format!("s{i}.sock"));
             let listener = super::bind_unix_mode(&sock, 0o600).expect("bind");
             let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "socket mode");
@@ -1747,6 +1752,7 @@ mod tests {
             !bare.load(Ordering::Relaxed),
             "unix bind changed umask and a temp dir lost search permission"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(unix))]

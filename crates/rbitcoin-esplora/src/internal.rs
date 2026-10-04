@@ -727,7 +727,7 @@ mod tests {
 
         let pad = pad_hub("unix-internal", 4);
         let (handle, sock) = run_unix(
-            pad.dir.as_ref(),
+            std::path::Path::new("/tmp"),
             Arc::clone(&pad.q),
             Some(Arc::clone(&pad.hub)),
         )

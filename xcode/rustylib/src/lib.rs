@@ -1064,7 +1064,7 @@ pub fn p2p_fixed_seed_hosts(network: String) -> Result<Vec<String>, RustyError> 
 
 #[uniffi::export]
 pub fn p2p_target_peers() -> u32 {
-    rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
+    16
 }
 
 #[uniffi::export]
@@ -5382,7 +5382,7 @@ pub fn fee_capacity_wu(n_blocks: u32) -> u64 {
 
 #[uniffi::export]
 pub fn fee_effective_capacity_wu(n_blocks: u32) -> u64 {
-    rbitcoin_mempool::effective_capacity_wu(n_blocks)
+    rbitcoin_mempool::capacity_wu(n_blocks).saturating_mul(95) / 100
 }
 
 #[uniffi::export]
@@ -6362,7 +6362,7 @@ impl FfiMempoolHub {
             .into_iter()
             .map(|h| bitcoin::Txid::from_str(&h).map_err(|_| RustyError::InvalidInput))
             .collect::<Result<_, _>>()?;
-        Ok(self.inner.remove_for_block(&txids).map_err(|_| RustyError::MempoolError)? as u64)
+        Ok(self.inner.remove_for_block(&txids) as u64)
     }
 
     pub fn prioritise_tx(&self, txid_hex: String, fee_delta: i64) -> Result<(), RustyError> {
@@ -7687,10 +7687,12 @@ impl FfiNodeHandle {
             rbitcoin_node::NodeError::Config(_) | rbitcoin_node::NodeError::Network(_) => {
                 RustyError::InvalidInput
             }
+            rbitcoin_node::NodeError::Init(_) => RustyError::InvalidInput,
             rbitcoin_node::NodeError::FutureTip => RustyError::ConsensusError,
             rbitcoin_node::NodeError::Datadir { .. } | rbitcoin_node::NodeError::Store(_) => {
                 RustyError::StoreError
             }
+            rbitcoin_node::NodeError::Locked(_) => RustyError::StoreError,
         })?;
         Ok(Arc::new(Self {
             inner: std::sync::Mutex::new(handle),
@@ -8006,10 +8008,12 @@ pub fn node_handle_open_with_scale(
         rbitcoin_node::NodeError::Config(_) | rbitcoin_node::NodeError::Network(_) => {
             RustyError::InvalidInput
         }
+        rbitcoin_node::NodeError::Init(_) => RustyError::InvalidInput,
         rbitcoin_node::NodeError::FutureTip => RustyError::ConsensusError,
         rbitcoin_node::NodeError::Datadir { .. } | rbitcoin_node::NodeError::Store(_) => {
             RustyError::StoreError
         }
+        rbitcoin_node::NodeError::Locked(_) => RustyError::StoreError,
     })?;
     Ok(Arc::new(FfiNodeHandle {
         inner: std::sync::Mutex::new(handle),

@@ -4830,12 +4830,14 @@ impl FfiActiveMempool {
 
     pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<String> {
         let g = self.inner.lock().unwrap();
-        let budget = rbitcoin_mempool::SelectBudget {
-            max_weight_wu,
-            reserved_sigops: 400,
-            min_sat_kvb: 0,
-        };
-        g.select_block_template(budget, |_| 0)
+        g.select_block_template(
+            rbitcoin_mempool::SelectBudget {
+                max_weight_wu,
+                reserved_sigops: 400,
+                min_sat_kvb: 0,
+            },
+            |_| 0,
+        )
             .into_iter()
             .map(|(t, _)| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))
             .collect()
@@ -4859,8 +4861,14 @@ impl FfiActiveMempool {
             })
             .collect::<Result<_, _>>()?;
         let g = self.inner.lock().unwrap();
-        let budget = g.template_budget(0);
-        let txs = g.select_block_template(budget, |id| map.get(&id).copied().unwrap_or(0));
+        let txs = g.select_block_template(
+            rbitcoin_mempool::SelectBudget {
+                max_weight_wu,
+                reserved_sigops: 400,
+                min_sat_kvb: 0,
+            },
+            |id| map.get(&id).copied().unwrap_or(0),
+        );
         Ok(txs
             .into_iter()
             .map(|(t, _)| rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&t)))

@@ -95,6 +95,7 @@ pub use serve_perf::{
     format_serve_perf, sample_reset_serve_perf, serve_perf_totals, ServePerfSample,
 };
 pub use service::P2PNode;
+pub use service::magic_for_params;
 pub use socks::{install_i2p_dialer, Dialer};
 pub use tx_relay::{
     ElectrumMempoolItem, FeeHistoryBackfillStats, MempoolAnnounce, MempoolHub, MempoolPerfSample,

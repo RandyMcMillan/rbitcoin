@@ -6,6 +6,8 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{Address, Network};
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_primitives::Height;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -40,6 +42,79 @@ fn chain_params_for_network(network: &str) -> Result<ChainParams, RustyError> {
 
 fn parse_hash32(hex: &str) -> Result<[u8; 32], RustyError> {
     rbitcoin_primitives::parse_display_hash32(hex).map_err(|_| RustyError::InvalidInput)
+}
+
+fn rpc_call(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    method: &str,
+    params: &[serde_json::Value],
+) -> Result<serde_json::Value, RustyError> {
+    fn base64_encode(input: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+        let mut i = 0;
+        while i < input.len() {
+            let b0 = input[i];
+            let b1 = *input.get(i + 1).unwrap_or(&0);
+            let b2 = *input.get(i + 2).unwrap_or(&0);
+            let n = u32::from(b0) << 16 | u32::from(b1) << 8 | u32::from(b2);
+            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+            if i + 1 < input.len() {
+                out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if i + 2 < input.len() {
+                out.push(TABLE[(n & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            i += 3;
+        }
+        out
+    }
+
+    let body = serde_json::json!({
+        "jsonrpc": "1.0",
+        "id": "rbitcoin",
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let auth = format!("Basic {}", base64_encode(format!("{user}:{password}").as_bytes()));
+    let mut stream = TcpStream::connect((host, port)).map_err(|_| RustyError::InvalidInput)?;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| RustyError::InvalidInput)?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|_| RustyError::InvalidInput)?;
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or(RustyError::InvalidInput)?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| RustyError::InvalidInput)?;
+    if let Some(error) = value.get("error") {
+        if !error.is_null() {
+            return Err(RustyError::InvalidInput);
+        }
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or(RustyError::InvalidInput)
 }
 
 // --- Primitives FFI ---
@@ -1968,6 +2043,7 @@ pub fn accept_and_connect_block(
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let milestone = rbitcoin_consensus::Milestone {
         height: milestone_height,
+        anchor: None,
     };
     let fk = rbitcoin_consensus::accept_and_connect_block(
         &query,
@@ -2049,6 +2125,7 @@ pub fn commit_class_a_block(
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let milestone = rbitcoin_consensus::Milestone {
         height: milestone_height,
+        anchor: None,
     };
     rbitcoin_consensus::commit_class_a_block(
         &query,
@@ -2074,7 +2151,10 @@ pub fn validate_block_structure(
     let block: bitcoin::Block =
         bitcoin::consensus::encode::deserialize(&bytes).map_err(|_| RustyError::InvalidInput)?;
     let params = chain_params_for_network(&network)?;
-    let milestone = rbitcoin_consensus::Milestone { height };
+    let milestone = rbitcoin_consensus::Milestone {
+        height,
+        anchor: None,
+    };
     let ctx = rbitcoin_consensus::ValidationContext {
         params: &params,
         height: rbitcoin_primitives::Height(height),
@@ -2166,7 +2246,7 @@ pub fn format_disconnect_tip_line(
 pub struct FfiServePerfSample {
     pub n: u64,
     pub bytes: u64,
-    pub ntx: u64,
+    pub tx_count: u64,
     pub wall_ns: u64,
     pub max_ns: u64,
 }
@@ -2176,7 +2256,7 @@ impl From<rbitcoin_net::ServePerfSample> for FfiServePerfSample {
         Self {
             n: s.n,
             bytes: s.bytes,
-            ntx: s.ntx,
+            tx_count: s.tx_count,
             wall_ns: s.wall_ns,
             max_ns: s.max_ns,
         }
@@ -2193,7 +2273,7 @@ pub fn format_serve_perf(sample: FfiServePerfSample) -> String {
     let s = rbitcoin_net::ServePerfSample {
         n: sample.n,
         bytes: sample.bytes,
-        ntx: sample.ntx,
+        tx_count: sample.tx_count,
         wall_ns: sample.wall_ns,
         max_ns: sample.max_ns,
     };

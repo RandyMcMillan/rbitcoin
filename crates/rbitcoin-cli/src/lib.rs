@@ -314,11 +314,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn exit_ok(c: ExitCode) -> bool {
         format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)
@@ -329,7 +332,30 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("rbitcoin-cli-{n}"));
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-cli-{}-{}-{}",
+            std::process::id(),
+            n,
+            seq
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn tmp_unix_socket_dir(label: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = PathBuf::from("/tmp").join(format!(
+            "rbtc-cli-{label}-{}-{}-{}",
+            std::process::id(),
+            n,
+            seq
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -493,7 +519,7 @@ mod tests {
     #[test]
     fn unix_socket_needs_no_token() {
         use std::os::unix::net::UnixListener;
-        let dir = tmp_datadir();
+        let dir = tmp_unix_socket_dir("unix");
         let sock = dir.join("rpc.sock");
         let h = serve_one_rpc(UnixListener::bind(&sock).unwrap());
         let code = cli_main([
@@ -515,7 +541,8 @@ mod tests {
     fn rpc_socket_reaches_a_socket_outside_the_datadir() {
         use std::os::unix::net::UnixListener;
         let dir = tmp_datadir();
-        let sock = dir.join("rpc-elsewhere.sock");
+        let sock_dir = tmp_unix_socket_dir("rpc-sock");
+        let sock = sock_dir.join("rpc-elsewhere.sock");
         let h = serve_one_rpc(UnixListener::bind(&sock).unwrap());
         let code = cli_main([
             "rbitcoin-cli",
@@ -526,6 +553,7 @@ mod tests {
             "getblockcount",
         ]);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&sock_dir);
         assert!(
             exit_ok(code),
             "--rpc-socket getblockcount must succeed, got {code:?}"

@@ -6856,7 +6856,7 @@ public func FfiConverterTypeFfiChunk_lower(_ value: FfiChunk) -> RustBuffer {
 
 public struct FfiCmpctReconstructStats {
     public var hash: String
-    public var ntx: UInt64
+    public var txCount: UInt64
     public var getdata: Bool
     public var missingN: UInt64
     public var prefillN: UInt64
@@ -6874,9 +6874,9 @@ public struct FfiCmpctReconstructStats {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hash: String, ntx: UInt64, getdata: Bool, missingN: UInt64, prefillN: UInt64, prefillBytes: UInt64, mempoolN: UInt64, mempoolBytes: UInt64, extraN: UInt64, extraBytes: UInt64, orphanN: UInt64, orphanBytes: UInt64, redundantPrefillN: UInt64, redundantPrefillBytes: UInt64, fetchedN: UInt64, fetchedBytes: UInt64) {
+    public init(hash: String, txCount: UInt64, getdata: Bool, missingN: UInt64, prefillN: UInt64, prefillBytes: UInt64, mempoolN: UInt64, mempoolBytes: UInt64, extraN: UInt64, extraBytes: UInt64, orphanN: UInt64, orphanBytes: UInt64, redundantPrefillN: UInt64, redundantPrefillBytes: UInt64, fetchedN: UInt64, fetchedBytes: UInt64) {
         self.hash = hash
-        self.ntx = ntx
+        self.txCount = txCount
         self.getdata = getdata
         self.missingN = missingN
         self.prefillN = prefillN
@@ -6901,7 +6901,7 @@ extension FfiCmpctReconstructStats: Equatable, Hashable {
         if lhs.hash != rhs.hash {
             return false
         }
-        if lhs.ntx != rhs.ntx {
+        if lhs.txCount != rhs.txCount {
             return false
         }
         if lhs.getdata != rhs.getdata {
@@ -6951,7 +6951,7 @@ extension FfiCmpctReconstructStats: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(hash)
-        hasher.combine(ntx)
+        hasher.combine(txCount)
         hasher.combine(getdata)
         hasher.combine(missingN)
         hasher.combine(prefillN)
@@ -6978,7 +6978,7 @@ public struct FfiConverterTypeFfiCmpctReconstructStats: FfiConverterRustBuffer {
         return
             try FfiCmpctReconstructStats(
                 hash: FfiConverterString.read(from: &buf), 
-                ntx: FfiConverterUInt64.read(from: &buf), 
+                txCount: FfiConverterUInt64.read(from: &buf), 
                 getdata: FfiConverterBool.read(from: &buf), 
                 missingN: FfiConverterUInt64.read(from: &buf), 
                 prefillN: FfiConverterUInt64.read(from: &buf), 
@@ -6998,7 +6998,7 @@ public struct FfiConverterTypeFfiCmpctReconstructStats: FfiConverterRustBuffer {
 
     public static func write(_ value: FfiCmpctReconstructStats, into buf: inout [UInt8]) {
         FfiConverterString.write(value.hash, into: &buf)
-        FfiConverterUInt64.write(value.ntx, into: &buf)
+        FfiConverterUInt64.write(value.txCount, into: &buf)
         FfiConverterBool.write(value.getdata, into: &buf)
         FfiConverterUInt64.write(value.missingN, into: &buf)
         FfiConverterUInt64.write(value.prefillN, into: &buf)
@@ -9973,16 +9973,16 @@ public func FfiConverterTypeFfiRpcAuth_lower(_ value: FfiRpcAuth) -> RustBuffer 
 public struct FfiServePerfSample {
     public var n: UInt64
     public var bytes: UInt64
-    public var ntx: UInt64
+    public var txCount: UInt64
     public var wallNs: UInt64
     public var maxNs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(n: UInt64, bytes: UInt64, ntx: UInt64, wallNs: UInt64, maxNs: UInt64) {
+    public init(n: UInt64, bytes: UInt64, txCount: UInt64, wallNs: UInt64, maxNs: UInt64) {
         self.n = n
         self.bytes = bytes
-        self.ntx = ntx
+        self.txCount = txCount
         self.wallNs = wallNs
         self.maxNs = maxNs
     }
@@ -9998,7 +9998,7 @@ extension FfiServePerfSample: Equatable, Hashable {
         if lhs.bytes != rhs.bytes {
             return false
         }
-        if lhs.ntx != rhs.ntx {
+        if lhs.txCount != rhs.txCount {
             return false
         }
         if lhs.wallNs != rhs.wallNs {
@@ -10013,7 +10013,7 @@ extension FfiServePerfSample: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(n)
         hasher.combine(bytes)
-        hasher.combine(ntx)
+        hasher.combine(txCount)
         hasher.combine(wallNs)
         hasher.combine(maxNs)
     }
@@ -10029,7 +10029,7 @@ public struct FfiConverterTypeFfiServePerfSample: FfiConverterRustBuffer {
             try FfiServePerfSample(
                 n: FfiConverterUInt64.read(from: &buf), 
                 bytes: FfiConverterUInt64.read(from: &buf), 
-                ntx: FfiConverterUInt64.read(from: &buf), 
+                txCount: FfiConverterUInt64.read(from: &buf), 
                 wallNs: FfiConverterUInt64.read(from: &buf), 
                 maxNs: FfiConverterUInt64.read(from: &buf)
         )
@@ -10038,7 +10038,7 @@ public struct FfiConverterTypeFfiServePerfSample: FfiConverterRustBuffer {
     public static func write(_ value: FfiServePerfSample, into buf: inout [UInt8]) {
         FfiConverterUInt64.write(value.n, into: &buf)
         FfiConverterUInt64.write(value.bytes, into: &buf)
-        FfiConverterUInt64.write(value.ntx, into: &buf)
+        FfiConverterUInt64.write(value.txCount, into: &buf)
         FfiConverterUInt64.write(value.wallNs, into: &buf)
         FfiConverterUInt64.write(value.maxNs, into: &buf)
     }

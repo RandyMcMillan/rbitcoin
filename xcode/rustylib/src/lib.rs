@@ -5646,6 +5646,7 @@ impl FfiChainHub {
         let params = chain_params_for_network(&network)?;
         let milestone = rbitcoin_consensus::Milestone {
             height: milestone_height,
+            anchor: None,
         };
         Ok(Arc::new(Self {
             inner: rbitcoin_net::ChainHub::new(query, params, milestone),
@@ -6361,9 +6362,9 @@ impl FfiMempoolHub {
 
     pub fn select_block_txs(&self) -> Vec<String> {
         self.inner
-            .select_block_txs()
+            .select_block_template(self.inner.template_budget(0))
             .into_iter()
-            .map(|tx| bitcoin::consensus::encode::serialize_hex(&tx))
+            .map(|(tx, _)| bitcoin::consensus::encode::serialize_hex(&tx))
             .collect()
     }
 

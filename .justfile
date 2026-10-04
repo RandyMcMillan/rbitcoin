@@ -52,6 +52,19 @@ core-dry-run:
 core-nightly:
 	./scripts/core-functional/nightly.sh
 
+xcode-rust:
+	cd xcode && make rust
+
+xcode-rust-test:
+	cd xcode && make rust
+	cd xcode/rustylib && cargo test --lib
+
+xcode-build:
+	cd xcode && make rust
+	cd xcode/swiftyapp && xcodebuild -project swiftyapp.xcodeproj -scheme swiftyapp -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+
+xcode-check: xcode-rust-test xcode-build
+
 pr-checks:
 	./scripts/pr-checks-watch.sh --pr "${PR:?set PR=<number>}"
 

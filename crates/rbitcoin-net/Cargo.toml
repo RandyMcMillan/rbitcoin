@@ -21,13 +21,7 @@ arc-swap = { workspace = true }
 getrandom = "0.4"
 sha3 = "0.12"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# POLLRDHUP: peer FIN with unread bytes still in the receive buffer.
-libc = "0.2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# proc_pid_rusage: resident size for `ibd: sizes` / `tip: perf`; Darwin
-# has no /proc.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [lints]

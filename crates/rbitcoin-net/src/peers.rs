@@ -345,20 +345,33 @@ pub struct LivePeer {
     version_timestamp: i64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn tcp_has_peer_fin(tcp: &std::net::TcpStream) -> bool {
     use std::os::fd::AsRawFd;
+    let events = libc::POLLIN | libc::POLLHUP | libc::POLLERR;
+    #[cfg(target_os = "linux")]
+    {
+        events |= libc::POLLRDHUP;
+    }
     let mut pfd = libc::pollfd {
         fd: tcp.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLRDHUP,
+        events,
         revents: 0,
     };
     // SAFETY: fd is a live TcpStream as_raw_fd, timeout 0.
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
-    n >= 0 && pfd.revents & (libc::POLLHUP | libc::POLLRDHUP | libc::POLLERR) != 0
+    if n < 0 {
+        return false;
+    }
+    let hup = pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0;
+    #[cfg(target_os = "linux")]
+    {
+        hup |= pfd.revents & libc::POLLRDHUP != 0;
+    }
+    hup
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn tcp_has_peer_fin(_tcp: &std::net::TcpStream) -> bool {
     false
 }

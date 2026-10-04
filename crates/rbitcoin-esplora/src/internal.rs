@@ -542,7 +542,7 @@ mod tests {
         q: Arc<Query>,
         mp: Option<Arc<MempoolHub>>,
     ) -> (crate::server::EsploraHandle, std::path::PathBuf) {
-        let sock = dir.join("esplora.sock");
+        let sock = dir.join(format!("esplora-{}.sock", std::process::id()));
         let cfg = EsploraConfig::with_listen(
             EsploraListen::Unix(sock.clone()),
             bitcoin::Network::Regtest,

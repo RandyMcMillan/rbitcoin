@@ -20,7 +20,7 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
 test:
-	cargo test --workspace
+	RUST_TEST_THREADS=1 cargo test --workspace
 
 check: fmt-check clippy test
 
@@ -61,7 +61,7 @@ xcode-rust-test:
 
 xcode-build:
 	cd xcode && make rust
-	cd xcode/swiftyapp && xcodebuild -project swiftyapp.xcodeproj -scheme swiftyapp -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+	cd xcode && IOS_DESTINATION='generic/platform=iOS' make app
 
 xcode-check: xcode-rust-test xcode-build
 

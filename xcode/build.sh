@@ -11,6 +11,8 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 
 cd $MY_CRATE
 export CARGO_TARGET_DIR="$PWD/target"
+rm -rf out
+mkdir -p out
 
 # step 1 - compile rust library and generate bindings
 HEADERPATH="out/${MY_CRATE}FFI.h"

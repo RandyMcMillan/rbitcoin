@@ -1785,14 +1785,22 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socket_needs_no_http_auth() {
-        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-sock").expect("temp dir");
-        let sock = dir.path().join("rpc.sock");
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "rbitcoin-rpc-sock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("rpc.sock");
         let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
         let cfg = RpcConfig {
             listen: None,
             socket_path: Some(sock.clone()),
             socket_shared: false,
-            datadir: dir.path().to_path_buf(),
+            datadir: dir.clone(),
             network: Network::Regtest,
             token_path: None,
             cookie_path: None,
@@ -1825,6 +1833,7 @@ mod tests {
             "unix unauthenticated getblockcount: {text}"
         );
         handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn http_wait_ctx() -> (

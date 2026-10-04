@@ -137,13 +137,18 @@ fn signals_unknown(version: &i32, bit: i32) -> bool {
 
 /// Warning strings for RPC `warnings` arrays.
 pub fn warning_strings(query: &Query, network: Network) -> Vec<String> {
+    active_unknown_bits(query, network)
+        .into_iter()
+        .map(unknown_rules_warning)
+        .collect()
+}
+
+/// Active unknown versionbits on the best chain.
+pub fn active_unknown_bits(query: &Query, network: Network) -> Vec<i32> {
     static SCAN: Mutex<UnknownBitsScan> = Mutex::new(UnknownBitsScan::new());
     SCAN.lock()
         .unwrap_or_else(|e| e.into_inner())
         .active_bits(query, network)
-        .into_iter()
-        .map(unknown_rules_warning)
-        .collect()
 }
 
 #[cfg(test)]

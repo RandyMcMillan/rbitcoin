@@ -12,10 +12,6 @@ mod script_fields;
 mod server;
 mod tx_json;
 
-pub use server::{
-    perf_totals, run_esplora, sample_reset_perf, BlockTemplateFn, EsploraConfig, EsploraHandle,
-    EsploraListen,
-};
 pub use script_fields::{esplora_script_fields, EsploraScriptFields};
 pub use server::{
     perf_totals, run_esplora, sample_reset_perf, BlockTemplateFn, EsploraConfig, EsploraHandle,

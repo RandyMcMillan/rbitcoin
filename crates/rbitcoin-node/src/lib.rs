@@ -12,9 +12,9 @@ mod tor_control;
 
 pub use cli::cli_main;
 pub use config::{
-    inbound_from_maxconnections, ConfApply, DatadirOpts, ListenOpts, MempoolOpts, NodeConfig,
-    P2pListen, RpcOpts, TorControlOpts, CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
-    parse_minimum_chain_work,
+    inbound_from_maxconnections, parse_minimum_chain_work, ConfApply, DatadirOpts, ListenOpts,
+    MempoolOpts, NodeConfig, P2pListen, RpcOpts, TorControlOpts,
+    CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, DEFAULT_MAX_INBOUND,
 };
 pub use error::{tip_too_far_in_future, NodeError, MAX_FUTURE_BLOCK_TIME};
 pub use run::{run_node, run_p2p, run_p2p_with_shutdown, NodeHandle, Shutdown};

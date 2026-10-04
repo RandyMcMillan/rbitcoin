@@ -34,10 +34,6 @@ mod status;
 
 pub use dial::connect_timeout_for;
 pub use perf_log::{format_tip_perf_sizes, read_platform_rss, ProcessRss, TipPerfSizes};
-pub use perf_log::{
-    format_tip_perf_sizes, read_platform_rss as read_proc_rss, ProcessRss as ProcRss,
-    ProcessRss, TipPerfSizes,
-};
 pub use reorg::is_bad_prev_err;
 
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};

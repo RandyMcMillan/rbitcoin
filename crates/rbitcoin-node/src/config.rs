@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 
 /// Default max concurrent inbound P2P sessions (same as net `DEFAULT_MAX_INBOUND`).
 pub const DEFAULT_MAX_INBOUND: u32 = rbitcoin_net::DEFAULT_MAX_INBOUND as u32;
+/// Core `-maxconnections` outbound reserve (10 outbound + feeler).
+pub const CORE_MAXCONNECTIONS_OUTBOUND_RESERVE: u32 = 11;
+
+pub fn inbound_from_maxconnections(total: u32) -> u32 {
+    total
+        .saturating_sub(CORE_MAXCONNECTIONS_OUTBOUND_RESERVE)
+        .max(1)
+}
 
 /// P2P bind: omitted flag (loopback default), `--listen=0` / `--no-listen`, or an address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

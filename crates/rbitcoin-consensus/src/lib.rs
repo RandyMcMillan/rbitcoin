@@ -59,10 +59,10 @@ pub fn verify_tx_scripts_detached_forks(
 }
 
 pub use block::{
-    bip34_height_script, bip68_active_for_tx, block_has_witness, block_subsidy, check_block_wire,
-    is_final_tx, legacy_sigop_count, sequence_locks_satisfied, tx_gbt_sigops, tx_sigop_cost,
-    validate_block_structure, witness_commitment_script, ValidationContext, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT, apply_witness_commitment,
+    apply_witness_commitment, bip34_height_script, bip68_active_for_tx, block_has_witness,
+    block_subsidy, check_block_wire, is_final_tx, legacy_sigop_count, sequence_locks_satisfied,
+    tx_sigop_cost, validate_block_structure, witness_commitment_script, ValidationContext,
+    MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
 };
 pub(crate) use block::{validate_block_structure_hashed, TxPrecompute};
 pub use clock::{with_now, NodeClock};
@@ -89,9 +89,113 @@ pub use regtest_pad::{
 };
 pub use signet::{default_signet_challenge, signet_magic, validate_signet_block_solution};
 pub use silent_payments::{
-    backfill_sp_tweaks, backfill_sp_tweaks_cancellable, tweak_from_tx, tweaks_for_height,
-    taproot_matches_scan, TaprootOut, TxTweak,
+    taproot_matches_scan, tweak_from_tx, tweaks_at_height, tweaks_for_height, TaprootOut, TxTweak,
 };
+
+/// Count a transaction's legacy sigops in GBT-style cost units.
+pub fn tx_gbt_sigops(tx: &bitcoin::Transaction) -> u64 {
+    legacy_sigop_count(tx).saturating_mul(4)
+}
+
+/// Backfill the thin silent-payments tweak index from confirmed blocks.
+pub fn backfill_sp_tweaks(query: &Query, params: &ChainParams) -> Result<u32, ConsensusError> {
+    backfill_sp_tweaks_cancellable(query, params)
+}
+
+/// Same as [`backfill_sp_tweaks`]; retained for FFI compatibility.
+pub fn backfill_sp_tweaks_cancellable(
+    query: &Query,
+    params: &ChainParams,
+) -> Result<u32, ConsensusError> {
+    let Some(next) = query.tweak_index_next() else {
+        return Ok(0);
+    };
+    let Some(tip) = query.tip_height() else {
+        return Ok(0);
+    };
+    if next > tip.0 {
+        return Ok(0);
+    }
+
+    let mut committed = 0u32;
+    for height in next..=tip.0 {
+        let height = Height(height);
+        let Some((header_fk, _header)) = query.header_at_height(height)? else {
+            break;
+        };
+        let fks = query.block_tx_fks(height)?;
+        let mut rows = Vec::with_capacity(fks.len());
+        for fk in fks {
+            let (txrec, inputs, outs) = query.store().get_tx_full(fk)?;
+            let tx = bitcoin::Transaction {
+                version: bitcoin::transaction::Version(txrec.version),
+                lock_time: bitcoin::absolute::LockTime::from_consensus(txrec.locktime),
+                input: inputs
+                    .iter()
+                    .map(|inp| bitcoin::TxIn {
+                        previous_output: bitcoin::OutPoint {
+                            txid: bitcoin::Txid::from_byte_array(inp.prev_txid),
+                            vout: inp.prev_index,
+                        },
+                        script_sig: bitcoin::ScriptBuf::from_bytes(inp.script_sig.clone()),
+                        sequence: bitcoin::Sequence::from_consensus(inp.sequence),
+                        witness: bitcoin::Witness::from_slice(
+                            &inp.witness.iter().map(|w| w.as_slice()).collect::<Vec<_>>(),
+                        ),
+                    })
+                    .collect(),
+                output: outs
+                    .into_iter()
+                    .map(|o| bitcoin::TxOut {
+                        value: if o.value < 0 {
+                            bitcoin::Amount::ZERO
+                        } else {
+                            bitcoin::Amount::from_sat(o.value as u64)
+                        },
+                        script_pubkey: bitcoin::ScriptBuf::from_bytes(o.script),
+                    })
+                    .collect(),
+            };
+            let prevouts = inputs
+                .iter()
+                .map(|inp| {
+                    if inp.is_coinbase() {
+                        Ok(bitcoin::TxOut {
+                            value: bitcoin::Amount::ZERO,
+                            script_pubkey: bitcoin::ScriptBuf::new(),
+                        })
+                    } else {
+                        let (_meta, parent_outs) =
+                            query.store().get_tx_meta_and_outputs(inp.create_fk)?;
+                        let parent_out = parent_outs.get(inp.prev_index as usize).ok_or(
+                            ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                                "invariant: sp_tweaks parent output missing",
+                            )),
+                        )?;
+                        Ok(bitcoin::TxOut {
+                            value: if parent_out.value < 0 {
+                                bitcoin::Amount::ZERO
+                            } else {
+                                bitcoin::Amount::from_sat(parent_out.value as u64)
+                            },
+                            script_pubkey: bitcoin::ScriptBuf::from_bytes(
+                                parent_out.script.clone(),
+                            ),
+                        })
+                    }
+                })
+                .collect::<Result<Vec<_>, ConsensusError>>()?;
+            let tweak = tweak_from_tx(&tx, &prevouts).map(|tt| tt.tweak);
+            rows.push(tweak);
+        }
+        if query.commit_window_tweaks(&[(height, header_fk, rows)])? == 0 {
+            break;
+        }
+        committed += 1;
+    }
+    let _ = params;
+    Ok(committed)
+}
 
 use bitcoin::hashes::Hash;
 use bitcoin::Block;
@@ -536,5 +640,26 @@ mod coverage_tests {
             confirm_wire_run(&q, &params, ms, &[(Height(1), b1), (Height(2), b2)]).unwrap_err();
         assert!(matches!(err, ConsensusError::BadVersion(1)), "{err:?}");
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn tx_gbt_sigops_uses_legacy_cost_units() {
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
+            }],
+        };
+        assert_eq!(crate::tx_gbt_sigops(&tx), 4);
+    }
+
+    #[test]
+    fn backfill_sp_tweaks_empty_query_is_noop() {
+        let (_path, q) = temp_store();
+        let params = ChainParams::regtest();
+        assert_eq!(crate::backfill_sp_tweaks(&q, &params).unwrap(), 0);
     }
 }

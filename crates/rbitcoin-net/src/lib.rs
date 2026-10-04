@@ -48,11 +48,11 @@ pub use compact::{
 pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{eviction_netgroup, select_inbound_eviction, InboundEvictCandidate};
-pub use i2p_sam::I2Psam;
+pub use i2p_sam::I2pSam;
 pub use ibd::{
-    connect_timeout_for, format_tip_perf_sizes, read_platform_rss, rehydrate_block_queue_residue,
-    IbdConfig, ProcessRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
-    is_bad_prev_err, read_platform_rss as read_proc_rss, ProcessRss as ProcRss,
+    connect_timeout_for, format_tip_perf_sizes, is_bad_prev_err, read_platform_rss,
+    read_platform_rss as read_proc_rss, rehydrate_block_queue_residue, IbdConfig, ProcessRss,
+    ProcessRss as ProcRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
 pub use most_work::{sum_work, work_better, InvalidHashSet, WorkOverflow};
 pub use net_permissions::{

@@ -124,6 +124,11 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
     Ok(auth)
 }
 
+/// Backwards-compatible alias for the token writer used by FFI callers.
+pub fn write_cookie_file(path: &Path) -> Result<RpcAuth, String> {
+    write_token_file(path)
+}
+
 /// Parse `Authorization: Bearer …`.
 pub fn parse_bearer_auth(header: &str) -> Option<&str> {
     let header = header.trim();

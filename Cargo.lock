@@ -1173,7 +1173,7 @@ name = "rustylib"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
- "rand 0.8.8",
+ "rand",
  "rbitcoin-cli",
  "rbitcoin-consensus",
  "rbitcoin-electrum",

@@ -52,12 +52,11 @@ pub use accept::{
 pub use error::MempoolError;
 pub use fee_analog::AnalogHistory;
 pub use fee_est::{
-    block_individual_p10_sat_kvb, default_candidate_rates, depth_rate_sat_kvb,
-    enforce_monotone_desc, fine_candidate_rates, flow_for_depth, hold_defined_then_monotone,
-    min_rate_for_capacity, percentile_sat, BLOCK_WEIGHT_WU, CONFIDENCE_FAR, CONFIDENCE_NEAR,
-    bucket_count, bucket_index, capacity_wu, default_candidate_rates, effective_capacity_wu,
-    horizon_secs, min_rate_for_capacity, projected_inflow_wu_above, BLOCK_WEIGHT_WU,
-    CAPACITY_SAFETY_DEN, CAPACITY_SAFETY_NUM, FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
+    block_individual_p10_sat_kvb, bucket_count, bucket_index, capacity_wu, default_candidate_rates,
+    depth_rate_sat_kvb, effective_capacity_wu, enforce_monotone_desc, fine_candidate_rates,
+    flow_for_depth, hold_defined_then_monotone, horizon_secs, min_rate_for_capacity,
+    percentile_sat, projected_inflow_wu_above, BLOCK_WEIGHT_WU, CONFIDENCE_FAR, CONFIDENCE_NEAR,
+    FEE_BUCKET_EDGES_SAT_PER_KVB, SECONDS_PER_BLOCK,
 };
 pub use fee_flow::{FeeFlowMeter, ADMIT_HALF_LIFE_SECS, WARM_AFTER_ADMITS, WARM_AFTER_SECS};
 pub use graph::{

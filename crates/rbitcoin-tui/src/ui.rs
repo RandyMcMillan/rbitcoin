@@ -215,7 +215,7 @@ impl AppWidget<'_> {
         }
     }
 
-    fn render_dashboard_network(&self, area: Rect, buf: &mut Buffer, chain: Option<&crate::app::BlockchainInfo>) {
+    fn render_dashboard_network(&self, area: Rect, buf: &mut Buffer, chain: Option<&crate::rpc::BlockchainInfo>) {
         let net_block = Block::bordered()
             .title(" Network ")
             .title_style(THEME.description_title)

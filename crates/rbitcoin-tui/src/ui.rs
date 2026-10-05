@@ -129,8 +129,7 @@ impl AppWidget<'_> {
             "not started".into()
         };
         let _ = writeln!(left_text, "node: {node_status}");
-        // Only show startup telemetry while the node is actually starting,
-        // not after it has exited.
+        // Show startup telemetry while the node is starting and RPC isn't up.
         if self.app.node_child.is_some()
             && self.app.node_exit_code.is_none()
             && self.app.snapshot.chain.is_err()
@@ -143,6 +142,15 @@ impl AppWidget<'_> {
             }
             if let Some(h) = self.app.startup_height {
                 let _ = writeln!(left_text, "height: {h}");
+            }
+            if let (Some(i), Some(o)) = (self.app.log_net_in, self.app.log_net_out) {
+                let _ = writeln!(left_text, "peers: {i} in / {o} out");
+            }
+            if let (Some(txs), Some(bytes)) = (self.app.log_mempool_txs, self.app.log_mempool_bytes) {
+                let _ = writeln!(left_text, "mempool: {txs} txs / {}", human_bytes(bytes));
+            }
+            for (k, v) in &self.app.log_store_stats {
+                let _ = writeln!(left_text, "store {k}: {v}");
             }
         }
         Paragraph::new(left_text)
@@ -181,6 +189,14 @@ impl AppWidget<'_> {
         if let Some(err) = &self.app.snapshot.last_error {
             let err_para = Paragraph::new(format!("error: {err}")).style(ERROR);
             err_para.render(inner, buf);
+        }
+        if let Some(ref w) = self.app.log_last_warn {
+            let warn = Paragraph::new(format!("log warn: {w}")).style(WARN);
+            warn.render(inner, buf);
+        }
+        if let Some(ref e) = self.app.log_last_error {
+            let err = Paragraph::new(format!("log error: {e}")).style(ERROR);
+            err.render(inner, buf);
         }
     }
 
@@ -480,7 +496,17 @@ impl AppWidget<'_> {
                     .render(inner, buf);
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
-                Paragraph::new("waiting for network data…")
+                let mut text = String::new();
+                if let Some(i) = self.app.log_net_in {
+                    let _ = writeln!(text, "Inbound:     {i} (from logs)");
+                }
+                if let Some(o) = self.app.log_net_out {
+                    let _ = writeln!(text, "Outbound:    {o} (from logs)");
+                }
+                if text.is_empty() {
+                    text = "waiting for network data…".into();
+                }
+                Paragraph::new(text)
                     .style(MUTED)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
@@ -704,7 +730,17 @@ impl AppWidget<'_> {
                     .render(inner, buf);
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
-                Paragraph::new("waiting for mempool data…")
+                let mut text = String::new();
+                if let Some(txs) = self.app.log_mempool_txs {
+                    let _ = writeln!(text, "Transactions:    {txs} (from logs)");
+                }
+                if let Some(bytes) = self.app.log_mempool_bytes {
+                    let _ = writeln!(text, "Bytes:           {} (from logs)", human_bytes(bytes));
+                }
+                if text.is_empty() {
+                    text = "waiting for mempool data…".into();
+                }
+                Paragraph::new(text)
                     .style(MUTED)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);

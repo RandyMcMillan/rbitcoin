@@ -414,9 +414,6 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
-fn format_unix_time(secs: u64) -> String {
-    secs.to_string()
-}
 
 #[derive(Clone, Debug)]
 struct Snapshot {

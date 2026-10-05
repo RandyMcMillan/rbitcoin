@@ -15,7 +15,6 @@ use std::os::unix::net::UnixStream;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 #[global_allocator]
@@ -698,11 +697,35 @@ fn rpc_http(
     body: &[u8],
 ) -> Result<String, String> {
     let auth_h = match auth {
-        Some(_) => "Authorization: ******\r\n",
+        Some(token) => {
+            return rpc_http_with_auth(stream, host, port, token, body);
+        }
         None => "",
     };
     let req = format!(
         "POST / HTTP/1.1\r\nHost: {host}:{port}\r\n{auth_h}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut wire = req.into_bytes();
+    wire.extend_from_slice(body);
+    stream.write_all(&wire).map_err(|e| format!("write: {e}"))?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read: {e}"))?;
+    let text = String::from_utf8(buf).map_err(|e| format!("utf-8: {e}"))?;
+    parse_http_response(&text)
+}
+
+fn rpc_http_with_auth(
+    mut stream: impl Read + Write,
+    host: &str,
+    port: u16,
+    token: &str,
+    body: &[u8],
+) -> Result<String, String> {
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut wire = req.into_bytes();

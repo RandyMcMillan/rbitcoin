@@ -189,6 +189,8 @@ pub struct App {
     pub spawn_attempted: bool,
     pub spawn_error: Option<String>,
     pub startup_height: Option<u64>,
+    pub startup_progress: Option<(u64, u64)>,
+    pub startup_operation: Option<String>,
     pub command_input: String,
     pub cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
@@ -215,6 +217,8 @@ impl App {
             spawn_attempted: false,
             spawn_error: None,
             startup_height: None,
+            startup_progress: None,
+            startup_operation: None,
             command_input: String::new(),
             cmd_rx: None,
         }
@@ -256,6 +260,12 @@ impl App {
                 self.console_lines.push_back(line.clone());
                 if let Some(h) = extract_height(&line) {
                     self.startup_height = Some(h);
+                }
+                if let Some(p) = extract_progress(&line) {
+                    self.startup_progress = Some(p);
+                }
+                if let Some(op) = extract_operation(&line) {
+                    self.startup_operation = Some(op);
                 }
             }
         }
@@ -519,6 +529,43 @@ fn extract_height(line: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Scrape a progress ratio like `480/1673` from a log line.
+fn extract_progress(line: &str) -> Option<(u64, u64)> {
+    for token in line.split_whitespace() {
+        if let Some((a, b)) = token.split_once('/') {
+            if let (Ok(cur), Ok(tot)) = (a.parse::<u64>(), b.parse::<u64>()) {
+                if tot > 0 {
+                    return Some((cur, tot));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Scrape an operation name from a log line.
+/// Looks for the text between the last colon and the first number/progress token.
+fn extract_operation(line: &str) -> Option<String> {
+    // Find the part after the last colon (e.g., "store: replay spend annotations")
+    let after_colon = line.rsplit_once(':').map(|(_, s)| s.trim())?;
+    // Take words until we hit a number, progress token, or height token
+    let words: Vec<&str> = after_colon
+        .split_whitespace()
+        .take_while(|w| {
+            !w.parse::<u64>().is_ok()
+                && !w.contains('/')
+                && !w.starts_with("height=")
+                && !w.starts_with("blocks=")
+                && !w.starts_with('[')
+        })
+        .collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
 }
 
 #[cfg(test)]

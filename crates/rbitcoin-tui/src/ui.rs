@@ -112,6 +112,16 @@ impl AppWidget<'_> {
             "refresh: every {}s",
             self.app.interval.as_secs()
         );
+        if self.app.config.start_node {
+            let node_status = if let Some(code) = self.app.node_exit_code {
+                format!("exited {code}")
+            } else if self.app.node_child.is_some() {
+                "running".into()
+            } else {
+                "starting…".into()
+            };
+            let _ = writeln!(left_text, "node: {node_status}");
+        }
         Paragraph::new(left_text)
             .style(THEME.content)
             .wrap(Wrap { trim: true })

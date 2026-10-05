@@ -131,6 +131,10 @@ jobs:
           workspaces: ". -> target/dev"
       - name: tmpfs headroom
         run: df -h /dev/shm && free -m
+      - name: rbitcoin-node signet datadir regressions
+        run: |
+          cargo test -p rbitcoin-node custom_signet_datadir_appends_challenge -- --nocapture --test-threads=1
+          cargo test -p rbitcoin-node default_signet_datadir_uses_builtin_challenge -- --nocapture --test-threads=1
       - name: cargo test
         run: cargo test --workspace
 

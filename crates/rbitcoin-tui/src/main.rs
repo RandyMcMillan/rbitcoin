@@ -729,11 +729,12 @@ fn rpc_http(
     parse_http_response(&text)
 }
 
+#[allow(dead_code)]
 fn rpc_http_with_auth(
     mut stream: impl Read + Write,
     host: &str,
     port: u16,
-    token: &str,
+    _token: &str,
     body: &[u8],
 ) -> Result<String, String> {
     let req = format!(

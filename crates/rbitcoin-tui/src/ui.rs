@@ -101,7 +101,8 @@ impl AppWidget<'_> {
         let block = Block::bordered()
             .title(" Summary ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -630,9 +631,11 @@ impl AppWidget<'_> {
     }
 
     fn render_peer_table(&self, area: Rect, buf: &mut Buffer) {
-        let header = Row::new(vec!["ID", "Address", "Type", "Height", "Ping", "Version"])
-            .style(THEME.table.header)
-            .height(1);
+        let header = Row::new(vec![
+            "ID", "Address", "Type", "Height", "Ping", "↓ Bytes", "↑ Bytes", "Ban", "Version", "Sync",
+        ])
+        .style(THEME.table.header)
+        .height(1);
 
         match &self.app.snapshot.peers {
             Ok(peers) => {
@@ -644,10 +647,18 @@ impl AppWidget<'_> {
                             .ping_ms
                             .map(|ms| format!("{ms}ms"))
                             .unwrap_or_else(|| "-".into());
-                        let conn_color = if p.inbound {
-                            BRIGHT_CYAN
+                        let ping_color = match p.ping_ms {
+                            None => MID_GRAY,
+                            Some(ms) if ms < 50 => BRIGHT_GREEN,
+                            Some(ms) if ms < 150 => BRIGHT_YELLOW,
+                            Some(_) => BRIGHT_RED,
+                        };
+                        let arrow = if p.inbound { "↓ " } else { "↑ " };
+                        let conn_color = if p.inbound { BRIGHT_CYAN } else { BRIGHT_GREEN };
+                        let sync = if p.synched_headers < 0 {
+                            "-".into()
                         } else {
-                            BRIGHT_GREEN
+                            format!("{}/{}", p.synched_headers, p.synched_blocks)
                         };
                         let style = if i % 2 == 0 {
                             THEME.table.row
@@ -657,11 +668,17 @@ impl AppWidget<'_> {
                         Row::new(vec![
                             Cell::from(p.id.to_string()),
                             Cell::from(p.addr.clone()),
-                            Cell::from(p.conn_type.clone())
-                                .style(Style::new().fg(conn_color)),
+                            Cell::from(Line::from(vec![
+                                Span::styled(arrow, Style::new().fg(conn_color).add_modifier(Modifier::BOLD)),
+                                Span::styled(p.conn_type.clone(), Style::new().fg(conn_color)),
+                            ])),
                             Cell::from(p.height.to_string()),
-                            Cell::from(ping),
+                            Cell::from(ping).style(Style::new().fg(ping_color)),
+                            Cell::from(human_bytes(p.bytesrecv)),
+                            Cell::from(human_bytes(p.bytessent)),
+                            Cell::from(p.banscore.to_string()),
                             Cell::from(p.subver.clone()),
+                            Cell::from(sync),
                         ])
                         .height(1)
                         .style(style)
@@ -675,27 +692,28 @@ impl AppWidget<'_> {
                 let table = Table::new(
                     rows,
                     [
-                        Constraint::Length(6),
-                        Constraint::Min(20),
-                        Constraint::Length(12),
+                        Constraint::Length(5),
+                        Constraint::Min(18),
                         Constraint::Length(10),
                         Constraint::Length(8),
-                        Constraint::Min(15),
+                        Constraint::Length(8),
+                        Constraint::Length(9),
+                        Constraint::Length(9),
+                        Constraint::Length(5),
+                        Constraint::Min(12),
+                        Constraint::Length(10),
                     ],
                 )
                 .header(header)
                 .block(
                     Block::bordered()
-                        .title(" Peers ")
+                        .title(format!(" Peers ({} connected) ", peers.len()))
                         .title_style(THEME.description_title)
-                        .border_style(THEME.borders),
+                        .border_style(THEME.borders)
+                        .style(Style::new().bg(BLACK)),
                 )
                 .row_highlight_style(THEME.table.selected);
 
-                let mut state = ratatui::widgets::TableState::default();
-                if !peers.is_empty() {
-                    state.select(Some(scroll));
-                }
                 let mut state = ratatui::widgets::TableState::default();
                 if !peers.is_empty() {
                     state.select(Some(scroll));
@@ -733,7 +751,8 @@ impl AppWidget<'_> {
                             Block::bordered()
                                 .title(" Peers ")
                                 .title_style(THEME.description_title)
-                                .border_style(THEME.borders),
+                                .border_style(THEME.borders)
+                                .style(Style::new().bg(BLACK)),
                         )
                         .style(MUTED)
                         .wrap(Wrap { trim: true })
@@ -768,7 +787,8 @@ impl AppWidget<'_> {
                             Block::bordered()
                                 .title(" Peers (from logs) ")
                                 .title_style(THEME.description_title)
-                                .border_style(THEME.borders),
+                                .border_style(THEME.borders)
+                                .style(Style::new().bg(BLACK)),
                         );
                     ratatui::widgets::Widget::render(table, area, buf);
                 }
@@ -779,7 +799,8 @@ impl AppWidget<'_> {
                         Block::bordered()
                             .title(" Peers ")
                             .title_style(THEME.description_title)
-                            .border_style(THEME.borders),
+                            .border_style(THEME.borders)
+                            .style(Style::new().bg(BLACK)),
                     )
                     .style(ERROR)
                     .wrap(Wrap { trim: true })
@@ -794,7 +815,8 @@ impl AppWidget<'_> {
         let block = Block::bordered()
             .title(" Peer Map ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -841,18 +863,21 @@ impl AppWidget<'_> {
     }
 
     fn render_mempool(&self, area: Rect, buf: &mut Buffer) {
-        let layout = Layout::vertical([Constraint::Length(10), Constraint::Min(0)]).margin(1);
+        let layout = Layout::vertical([Constraint::Length(10), Constraint::Length(8), Constraint::Min(0)]).margin(1);
         let chunks = layout.split(area);
         let charts = chunks[0];
-        let details = chunks[1];
+        let usage = chunks[1];
+        let details = chunks[2];
 
         let outer = Block::bordered()
             .border_style(THEME.borders)
             .title(" Mempool ")
-            .title_style(THEME.app_title);
+            .title_style(THEME.app_title)
+            .style(Style::new().bg(BLACK));
         outer.render(area, buf);
 
         self.render_mempool_charts(charts, buf);
+        self.render_mempool_usage(usage, buf);
         self.render_mempool_details(details, buf);
     }
 
@@ -872,7 +897,8 @@ impl AppWidget<'_> {
         let fee_block = Block::bordered()
             .title(" Min Fee History (sat/vB) ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let fee_inner = fee_block.inner(fee_area);
         fee_block.render(fee_area, buf);
         if fee_data.len() >= 2 {
@@ -893,7 +919,8 @@ impl AppWidget<'_> {
         let tx_block = Block::bordered()
             .title(" Tx Count History ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let tx_inner = tx_block.inner(tx_area);
         tx_block.render(tx_area, buf);
         if tx_data.len() >= 2 {
@@ -911,32 +938,100 @@ impl AppWidget<'_> {
         }
     }
 
-    fn render_mempool_details(&self, area: Rect, buf: &mut Buffer) {
+    fn render_mempool_usage(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::bordered()
-            .title(" Details ")
+            .title(" Memory Usage ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(area);
         block.render(area, buf);
 
         match &self.app.snapshot.mempool {
             Ok(mempool) => {
-                let mut text = String::new();
-                let _ = writeln!(text, "Transactions:    {}", mempool.transactions);
-                let _ = writeln!(text, "Bytes:           {}", human_bytes(mempool.bytes));
-                let _ = writeln!(text, "Max mempool:     {}", human_bytes(mempool.maxmempool));
-                let _ = writeln!(text, "Min fee:         {:.2} sat/vB", mempool.min_fee_sat_vb);
-                let _ = writeln!(text, "Unbroadcast:     {}", mempool.unbroadcast);
                 let usage_pct = if mempool.maxmempool > 0 {
-                    (mempool.bytes as f64 / mempool.maxmempool as f64) * 100.0
+                    (mempool.bytes as f64 / mempool.maxmempool as f64)
                 } else {
                     0.0
                 };
-                let _ = write!(text, "Usage:           {:.2}%", usage_pct);
+                let bar_width = inner.width.saturating_sub(4) as usize;
+                let bar = block_bar(usage_pct, bar_width.max(1));
+                let color = if usage_pct >= 0.9 {
+                    BRIGHT_RED
+                } else if usage_pct >= 0.5 {
+                    BRIGHT_YELLOW
+                } else {
+                    BRIGHT_GREEN
+                };
+                let bar_line = Line::from(vec![
+                    Span::styled(bar, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {:.2}%  {}/{}", usage_pct * 100.0, human_bytes(mempool.bytes), human_bytes(mempool.maxmempool)), Style::new().fg(WHITE)),
+                ]);
+                Paragraph::new(bar_line)
+                    .alignment(Alignment::Center)
+                    .render(inner, buf);
+            }
+            Err(ref e) if e == "no RPC endpoint responded" => {
+                let mut text = String::new();
+                if let Some(txs) = self.app.log_mempool_txs {
+                    let _ = writeln!(text, "Transactions: {txs} (from logs)");
+                }
+                if let Some(bytes) = self.app.log_mempool_bytes {
+                    let _ = writeln!(text, "Bytes: {} (from logs)", human_bytes(bytes));
+                }
+                if text.is_empty() {
+                    text = "waiting for mempool data…".into();
+                }
                 Paragraph::new(text)
+                    .style(MUTED)
+                    .alignment(Alignment::Center)
+                    .render(inner, buf);
+            }
+            Err(ref e) => {
+                Paragraph::new(format!("Error: {e}"))
+                    .style(ERROR)
+                    .alignment(Alignment::Center)
+                    .render(inner, buf);
+            }
+        }
+    }
+
+    fn render_mempool_details(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::bordered()
+            .title(" Details ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        match &self.app.snapshot.mempool {
+            Ok(mempool) => {
+                let layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
+                let chunks = layout.split(inner);
+                let left = chunks[0];
+                let right = chunks[1];
+
+                let mut left_text = String::new();
+                let _ = writeln!(left_text, "Transactions:    {}", mempool.transactions);
+                let _ = writeln!(left_text, "Bytes:           {}", human_bytes(mempool.bytes));
+                let _ = writeln!(left_text, "Usage:           {}", human_bytes(mempool.usage));
+                let _ = writeln!(left_text, "Max mempool:     {}", human_bytes(mempool.maxmempool));
+                let _ = writeln!(left_text, "Min fee:         {:.2} sat/vB", mempool.min_fee_sat_vb);
+                Paragraph::new(left_text)
                     .style(THEME.content)
                     .wrap(Wrap { trim: true })
-                    .render(inner, buf);
+                    .render(left, buf);
+
+                let mut right_text = String::new();
+                let _ = writeln!(right_text, "Total fee:       {:.8} BTC", mempool.total_fee);
+                let _ = writeln!(right_text, "Unbroadcast:     {}", mempool.unbroadcast);
+                let _ = writeln!(right_text, "Ancestor limit:  {}", mempool.ancestorlimit);
+                let _ = writeln!(right_text, "Descendant limit:{}", mempool.descendantlimit);
+                Paragraph::new(right_text)
+                    .style(THEME.content)
+                    .wrap(Wrap { trim: true })
+                    .render(right, buf);
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
                 let mut text = String::new();

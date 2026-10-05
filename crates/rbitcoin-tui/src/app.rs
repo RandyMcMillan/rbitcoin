@@ -415,15 +415,11 @@ impl App {
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
-                modifiers,
+                modifiers: KeyModifiers::NONE,
                 ..
-            }) => {
-                if self.tab == Tab::Console && modifiers.is_empty() {
-                    self.command_input.push(c);
-                    false
-                } else {
-                    false
-                }
+            }) if self.tab == Tab::Console => {
+                self.command_input.push(c);
+                false
             }
             _ => false,
         }

@@ -693,6 +693,11 @@ impl AppWidget<'_> {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
+        let layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]);
+        let chunks = layout.split(inner);
+        let log_area = chunks[0];
+        let prompt_area = chunks[1];
+
         if self.app.console_lines.is_empty() {
             let msg = if self.app.config.has_external_rpc() {
                 "no local logs — connected to external node"
@@ -702,35 +707,39 @@ impl AppWidget<'_> {
             let placeholder = Paragraph::new(msg)
                 .style(MUTED)
                 .alignment(Alignment::Center);
-            placeholder.render(inner, buf);
-            return;
+            placeholder.render(log_area, buf);
+        } else {
+            let visible = log_area.height as usize;
+            let max_scroll = self.app.console_lines.len().saturating_sub(visible);
+            let scroll = self.app.console_scroll.min(max_scroll);
+
+            let lines: Vec<Line<'_>> = self
+                .app
+                .console_lines
+                .iter()
+                .skip(scroll)
+                .take(visible)
+                .map(|line| console_line(line))
+                .collect();
+
+            Paragraph::new(lines).render(log_area, buf);
+
+            if self.app.console_lines.len() > visible {
+                let scrollbar = Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight);
+                let mut sb_state = ScrollbarState::new(self.app.console_lines.len()).position(scroll);
+                let sb_area = log_area.inner(Margin {
+                    horizontal: 0,
+                    vertical: 0,
+                });
+                StatefulWidget::render(scrollbar, sb_area, buf, &mut sb_state);
+            }
         }
 
-        let visible = inner.height as usize;
-        let max_scroll = self.app.console_lines.len().saturating_sub(visible);
-        let scroll = self.app.console_scroll.min(max_scroll);
-
-        let lines: Vec<Line<'_>> = self
-            .app
-            .console_lines
-            .iter()
-            .skip(scroll)
-            .take(visible)
-            .map(|line| console_line(line))
-            .collect();
-
-        Paragraph::new(lines).render(inner, buf);
-
-        if self.app.console_lines.len() > visible {
-            let scrollbar = Scrollbar::default()
-                .orientation(ScrollbarOrientation::VerticalRight);
-            let mut sb_state = ScrollbarState::new(self.app.console_lines.len()).position(scroll);
-            let sb_area = inner.inner(Margin {
-                horizontal: 0,
-                vertical: 0,
-            });
-            StatefulWidget::render(scrollbar, sb_area, buf, &mut sb_state);
-        }
+        let prompt = format!("> {}", self.app.command_input);
+        let prompt_para = Paragraph::new(prompt)
+            .style(Style::new().fg(BRIGHT_CYAN).add_modifier(Modifier::BOLD));
+        prompt_para.render(prompt_area, buf);
     }
 }
 
@@ -784,6 +793,11 @@ Navigation
   Shift+Tab / Left  previous tab
   1-5               jump to tab
   Up / Down         scroll peer table / console
+
+Console (type RPC commands)
+  Type              enter command
+  Enter             execute command
+  Backspace         delete character
 
 Actions
   r                 refresh now

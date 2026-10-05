@@ -65,6 +65,11 @@ impl Config {
                     // Legacy no-op. Node startup is now automatic; do not pass
                     // this through to the node binary.
                 }
+                "--signet" | "--regtest" | "--testnet" | "--mainnet" => {
+                    let net = &arg[2..]; // strip leading "--"
+                    node_args.push("--network".into());
+                    node_args.push(net.into());
+                }
                 "--node-binary" => {
                     node_binary = Some(PathBuf::from(take_value(&mut iter, "--node-binary")?));
                 }
@@ -109,8 +114,10 @@ TUI Options:
 
 Node Options:
   Any unknown argument is passed through to rbitcoin-node.
-  Examples: --network regtest, --network signet, --listen ADDR,
-  --connect ADDR, --rpc, --rest, --log-level LEVEL, --prune-seqsigwit, etc.
+  Shorthands: --signet, --regtest, --testnet, --mainnet are translated
+  to --network <net> automatically.
+  Examples: --network signet, --listen ADDR, --connect ADDR,
+  --rpc, --rest, --log-level LEVEL, --prune-seqsigwit, etc.
 ";
 
 fn take_value(
@@ -170,16 +177,43 @@ mod tests {
     fn parse_passes_unknown_args_to_node() {
         let args = vec![
             std::ffi::OsString::from("rbitcoin-tui"),
-            std::ffi::OsString::from("--signet"),
             std::ffi::OsString::from("--listen"),
             std::ffi::OsString::from("0.0.0.0:38333"),
             std::ffi::OsString::from("--rpc"),
         ];
         let cfg = Config::parse(args).expect("parse");
-        assert_eq!(
-            cfg.node_args,
-            vec!["--signet", "--listen", "0.0.0.0:38333", "--rpc"]
-        );
+        assert_eq!(cfg.node_args, vec!["--listen", "0.0.0.0:38333", "--rpc"]);
+    }
+
+    #[test]
+    fn parse_network_shorthands_are_translated() {
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--signet"),
+        ])
+        .expect("parse");
+        assert_eq!(cfg.node_args, vec!["--network", "signet"]);
+
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--regtest"),
+        ])
+        .expect("parse");
+        assert_eq!(cfg.node_args, vec!["--network", "regtest"]);
+
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--testnet"),
+        ])
+        .expect("parse");
+        assert_eq!(cfg.node_args, vec!["--network", "testnet"]);
+
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--mainnet"),
+        ])
+        .expect("parse");
+        assert_eq!(cfg.node_args, vec!["--network", "mainnet"]);
     }
 
     #[test]

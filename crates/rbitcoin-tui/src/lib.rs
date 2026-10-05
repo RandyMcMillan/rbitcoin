@@ -16,9 +16,6 @@ use std::io;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-const STARTUP_POLL: Duration = Duration::from_millis(500);
-const NODE_START_TIMEOUT: Duration = Duration::from_secs(30);
-
 pub fn tui_main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -49,7 +46,7 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
     let mut app = app::App::new(config);
 
     if app.config.start_node {
-        try_start_node(&mut app)?;
+        spawn_node_if_needed(&mut app);
     }
 
     app.refresh();
@@ -71,10 +68,10 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
             redraw = true;
         }
         if Instant::now() >= app.next_refresh {
-            app.refresh();
             if let Some(ref mut child) = app.node_child {
                 app.node_exit_code = node::check_child(child);
             }
+            app.refresh();
             redraw = true;
         }
         if redraw {
@@ -92,29 +89,15 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
     Ok(())
 }
 
-fn try_start_node(app: &mut app::App) -> Result<(), String> {
+fn spawn_node_if_needed(app: &mut app::App) {
     let snapshot = app::Snapshot::fetch(&app.config, Duration::from_secs(2));
     if snapshot.chain.is_ok() || snapshot.network.is_ok() {
-        return Ok(());
+        return;
     }
-
-    let mut child = node::spawn_node(&app.config.datadir, app.config.node_binary.as_deref())?;
-
-    let started = Instant::now();
-    while started.elapsed() < NODE_START_TIMEOUT {
-        std::thread::sleep(STARTUP_POLL);
-        if node::check_child(&mut child).is_some() {
-            return Err("node exited during startup".into());
-        }
-        let probe = app::Snapshot::fetch(&app.config, Duration::from_secs(2));
-        if probe.chain.is_ok() || probe.network.is_ok() {
-            app.node_child = Some(child);
-            return Ok(());
-        }
+    match node::spawn_node(&app.config.datadir, app.config.node_binary.as_deref()) {
+        Ok(child) => app.node_child = Some(child),
+        Err(err) => app.snapshot.last_error = Some(format!("node spawn: {err}")),
     }
-
-    node::kill_child(&mut child);
-    Err("node did not become ready within 30s".into())
 }
 
 struct TerminalGuard;

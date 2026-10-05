@@ -1,5 +1,5 @@
 use crate::error::NodeError;
-use bitcoin::hex::FromHex;
+use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::ScriptBuf;
 use rbitcoin_consensus::{default_milestone_anchor, ChainParams, Milestone};
 use rbitcoin_esplora::EsploraListen;
@@ -476,6 +476,32 @@ impl NodeConfig {
         self
     }
 
+    /// Datadir resolved for the active chain.
+    ///
+    /// Custom signet keeps its own `signet/<challenge>` tree so peers and
+    /// store state do not collide with other signet challenges. Plain signet
+    /// uses the network default challenge.
+    pub fn datadir_path(&self) -> PathBuf {
+        let root = self.datadir.path();
+        if self.network != Network::Signet {
+            return root.to_path_buf();
+        }
+        let challenge = self.signet_challenge.as_ref().map_or_else(
+            || {
+                rbitcoin_consensus::ChainParams::signet()
+                    .signet_challenge
+                    .expect("default signet challenge")
+            },
+            Clone::clone,
+        );
+        let challenge = challenge.as_bytes().to_lower_hex_string();
+        let custom = Path::new("signet").join(&challenge);
+        if root.ends_with(&custom) {
+            return root.to_path_buf();
+        }
+        root.join("signet").join(challenge)
+    }
+
     pub fn with_p2p_listen(mut self, addr: SocketAddr) -> Self {
         self.listen.p2p = P2pListen::Socket(addr);
         self
@@ -488,7 +514,7 @@ impl NodeConfig {
     }
 
     pub fn store_path(&self) -> PathBuf {
-        self.datadir.path().join("store")
+        self.datadir_path().join("store")
     }
 
     /// Cold store directory (`{datadir-cold}/store`) when `--datadir-cold` is set.
@@ -509,7 +535,7 @@ impl NodeConfig {
 
     /// Durable mempool directory (`{datadir}/mempool/`).
     pub fn mempool_path(&self) -> PathBuf {
-        self.datadir.path().join("mempool")
+        self.datadir_path().join("mempool")
     }
 
     pub fn milestone(&self) -> Milestone {
@@ -758,7 +784,7 @@ impl NodeConfig {
         self.rpc
             .token_file
             .clone()
-            .unwrap_or_else(|| rbitcoin_rpc::default_token_path(self.datadir.path()))
+            .unwrap_or_else(|| rbitcoin_rpc::default_token_path(&self.datadir_path()))
     }
 
     /// Configured Core cookie file for TCP HTTP Basic authentication.
@@ -771,7 +797,7 @@ impl NodeConfig {
         self.rpc
             .socket_path
             .clone()
-            .unwrap_or_else(|| rbitcoin_rpc::default_socket_path(self.datadir.path()))
+            .unwrap_or_else(|| rbitcoin_rpc::default_socket_path(&self.datadir_path()))
     }
 
     /// Owner-only mode for a directory this process just created.
@@ -796,14 +822,14 @@ impl NodeConfig {
     /// Create `{datadir}` and standard subdirs (`store`, `mempool`) if missing.
     pub fn ensure_datadir(&self) -> Result<(), NodeError> {
         self.validate()?;
-        let root = self.datadir.path();
+        let root = self.datadir_path();
         let created_root = !root.exists();
-        std::fs::create_dir_all(root).map_err(|source| NodeError::Datadir {
+        std::fs::create_dir_all(&root).map_err(|source| NodeError::Datadir {
             path: self.datadir.path.clone(),
             source,
         })?;
         if created_root {
-            Self::restrict_new_dir(root)?;
+            Self::restrict_new_dir(&root)?;
         }
         if root.exists() && !root.is_dir() {
             return Err(NodeError::Config(format!(
@@ -840,7 +866,7 @@ impl NodeConfig {
             }
         }
         if created_root {
-            rbitcoin_log::info!("node: created datadir {}", self.datadir.path().display());
+            rbitcoin_log::info!("node: created datadir {}", self.datadir_path().display());
         }
         Ok(())
     }

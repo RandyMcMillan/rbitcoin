@@ -23,7 +23,7 @@ pub fn lock_busy_msg(dir: &Path) -> String {
 /// Exclusive-lock the process datadir.
 pub fn lock_node_dirs(config: &NodeConfig) -> Result<DirLocks, NodeError> {
     Ok(DirLocks {
-        _files: vec![lock_dir(config.datadir.path())?],
+        _files: vec![lock_dir(&config.datadir_path())?],
     })
 }
 

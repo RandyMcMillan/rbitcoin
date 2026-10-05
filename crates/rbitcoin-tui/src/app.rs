@@ -189,6 +189,8 @@ pub struct App {
     pub spawn_attempted: bool,
     pub spawn_error: Option<String>,
     pub startup_height: Option<u64>,
+    pub command_input: String,
+    pub cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl App {
@@ -213,6 +215,8 @@ impl App {
             spawn_attempted: false,
             spawn_error: None,
             startup_height: None,
+            command_input: String::new(),
+            cmd_rx: None,
         }
     }
 
@@ -253,6 +257,17 @@ impl App {
                 if let Some(h) = extract_height(&line) {
                     self.startup_height = Some(h);
                 }
+            }
+        }
+        if let Some(ref rx) = self.cmd_rx {
+            if let Ok(result) = rx.try_recv() {
+                for line in result.lines() {
+                    if self.console_lines.len() >= CONSOLE_CAPACITY {
+                        self.console_lines.pop_front();
+                    }
+                    self.console_lines.push_back(line.to_string());
+                }
+                self.cmd_rx = None;
             }
         }
         self.next_refresh = Instant::now() + self.interval;

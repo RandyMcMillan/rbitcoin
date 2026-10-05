@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Gauge, LineGauge, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    Block, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Sparkline, StatefulWidget, Table, Tabs, Widget, Wrap,
 };
 use ratatui::Frame;
@@ -954,7 +954,7 @@ impl AppWidget<'_> {
         match &self.app.snapshot.mempool {
             Ok(mempool) => {
                 let usage_pct = if mempool.maxmempool > 0 {
-                    (mempool.bytes as f64 / mempool.maxmempool as f64)
+                    mempool.bytes as f64 / mempool.maxmempool as f64
                 } else {
                     0.0
                 };

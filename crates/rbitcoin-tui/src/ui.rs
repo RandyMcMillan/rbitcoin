@@ -274,7 +274,8 @@ impl AppWidget<'_> {
         let net_block = Block::bordered()
             .title(" Network ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let net_inner = net_block.inner(area);
         net_block.render(area, buf);
 
@@ -305,6 +306,9 @@ impl AppWidget<'_> {
                 .map(|n| n.timeoffset)
                 .unwrap_or(0)
         );
+        if let Some(net) = self.app.snapshot.network.as_ref().ok() {
+            let _ = writeln!(net_text, "relay fee: {:.5} BTC/kvB", net.relayfee);
+        }
         if let Some(chain) = chain {
             let _ = writeln!(net_text, "chain: {}", chain.chain);
             let _ = writeln!(net_text, "blocks: {}", chain.blocks);
@@ -322,7 +326,8 @@ impl AppWidget<'_> {
         let block = Block::bordered()
             .title(" Mempool ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -370,7 +375,8 @@ impl AppWidget<'_> {
         let block = Block::bordered()
             .title(" Latest Logs ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -388,7 +394,7 @@ impl AppWidget<'_> {
     }
 
     fn render_chain(&self, area: Rect, buf: &mut Buffer) {
-        let layout = Layout::vertical([Constraint::Length(10), Constraint::Min(0)]).margin(1);
+        let layout = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).margin(1);
         let chunks = layout.split(area);
         let gauge_area = chunks[0];
         let info_area = chunks[1];
@@ -396,7 +402,8 @@ impl AppWidget<'_> {
         let outer = Block::bordered()
             .border_style(THEME.borders)
             .title(" Chain ")
-            .title_style(THEME.app_title);
+            .title_style(THEME.app_title)
+            .style(Style::new().bg(BLACK));
         outer.render(area, buf);
 
         match &self.app.snapshot.chain {
@@ -410,45 +417,63 @@ impl AppWidget<'_> {
                     BRIGHT_RED
                 };
                 let label = format!("{:.4}%", ratio * 100.0);
-                let gauge = LineGauge::default()
-                    .block(
-                        Block::bordered()
-                            .title(" Sync Progress ")
-                            .title_style(THEME.description_title)
-                            .border_style(THEME.borders),
-                    )
-                    .filled_style(Style::new().fg(color).add_modifier(Modifier::BOLD))
-                    .unfilled_style(Style::new().fg(MID_GRAY))
-                    .ratio(ratio)
-                    .label(label)
-                    .line_set(symbols::line::THICK);
-                gauge.render(gauge_area, buf);
+                let bar_width = gauge_area.width.saturating_sub(4) as usize;
+                let bar = block_bar(ratio, bar_width.max(1));
 
-                let rows = [
-                    ("Chain", chain.chain.clone()),
-                    ("Blocks", chain.blocks.to_string()),
-                    ("Headers", chain.headers.to_string()),
-                    (
-                        "Verification",
-                        format!("{:.4}%", chain.verification_progress * 100.0),
-                    ),
-                    (
-                        "IBD",
-                        if chain.initial_block_download {
-                            "yes".into()
-                        } else {
-                            "no".into()
-                        },
-                    ),
-                ];
-                let mut text = String::new();
-                for (k, v) in &rows {
-                    let _ = writeln!(text, "{k:<20} {v}");
-                }
-                let para = Paragraph::new(text)
+                let gauge_block = Block::bordered()
+                    .title(" Sync Progress ")
+                    .title_style(THEME.description_title)
+                    .border_style(THEME.borders)
+                    .style(Style::new().bg(BLACK));
+                let gauge_inner = gauge_block.inner(gauge_area);
+                gauge_block.render(gauge_area, buf);
+
+                let bar_line = Line::from(vec![
+                    Span::styled(bar, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {label}"), Style::new().fg(WHITE)),
+                ]);
+                Paragraph::new(bar_line)
+                    .alignment(Alignment::Center)
+                    .render(gauge_inner, buf);
+
+                let info_layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
+                let info_chunks = info_layout.split(info_area);
+                let left = info_chunks[0];
+                let right = info_chunks[1];
+
+                let mut left_text = String::new();
+                let _ = writeln!(left_text, "Chain:        {}", chain.chain);
+                let _ = writeln!(left_text, "Blocks:       {}", chain.blocks);
+                let _ = writeln!(left_text, "Headers:      {}", chain.headers);
+                let _ = writeln!(left_text, "IBD:          {}", if chain.initial_block_download { "yes" } else { "no" });
+                let _ = writeln!(left_text, "Pruned:       {}", if chain.pruned { "yes" } else { "no" });
+                let _ = writeln!(left_text, "Size on disk: {}", human_bytes(chain.size_on_disk));
+                let _ = writeln!(left_text, "Median time:  {}", chain.mediantime);
+                Paragraph::new(left_text)
                     .style(THEME.content)
-                    .wrap(Wrap { trim: true });
-                para.render(info_area, buf);
+                    .wrap(Wrap { trim: true })
+                    .render(left, buf);
+
+                let mut right_text = String::new();
+                let hash_short = if chain.bestblockhash.len() > 16 {
+                    format!("{}…{}", &chain.bestblockhash[..8], &chain.bestblockhash[chain.bestblockhash.len()-8..])
+                } else {
+                    chain.bestblockhash.clone()
+                };
+                let work_short = if chain.chainwork.len() > 16 {
+                    format!("{}…{}", &chain.chainwork[..8], &chain.chainwork[chain.chainwork.len()-8..])
+                } else {
+                    chain.chainwork.clone()
+                };
+                let _ = writeln!(right_text, "Best block:   {}", hash_short);
+                let _ = writeln!(right_text, "Difficulty:   {:.4}", chain.difficulty);
+                let _ = writeln!(right_text, "Chain work:   {}", work_short);
+                let _ = writeln!(right_text, "Progress:     {:.4}%", chain.verification_progress * 100.0);
+                let _ = writeln!(right_text, "Remaining:    {}", chain.headers.saturating_sub(chain.blocks));
+                Paragraph::new(right_text)
+                    .style(THEME.content)
+                    .wrap(Wrap { trim: true })
+                    .render(right, buf);
             }
             Err(ref e) => {
                 let (ratio, label) = if let Some((cur, tot)) = self.app.startup_progress {
@@ -457,19 +482,24 @@ impl AppWidget<'_> {
                 } else {
                     (0.0, "starting…".into())
                 };
-                let gauge = LineGauge::default()
-                    .block(
-                        Block::bordered()
-                            .title(" Sync Progress ")
-                            .title_style(THEME.description_title)
-                            .border_style(THEME.borders),
-                    )
-                    .filled_style(Style::new().fg(BRIGHT_CYAN).add_modifier(Modifier::BOLD))
-                    .unfilled_style(Style::new().fg(DARK_BG))
-                    .ratio(ratio)
-                    .label(label)
-                    .line_set(symbols::line::THICK);
-                gauge.render(gauge_area, buf);
+                let bar_width = gauge_area.width.saturating_sub(4) as usize;
+                let bar = block_bar(ratio, bar_width.max(1));
+
+                let gauge_block = Block::bordered()
+                    .title(" Sync Progress ")
+                    .title_style(THEME.description_title)
+                    .border_style(THEME.borders)
+                    .style(Style::new().bg(BLACK));
+                let gauge_inner = gauge_block.inner(gauge_area);
+                gauge_block.render(gauge_area, buf);
+
+                let bar_line = Line::from(vec![
+                    Span::styled(bar, Style::new().fg(BRIGHT_CYAN).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {label}"), Style::new().fg(WHITE)),
+                ]);
+                Paragraph::new(bar_line)
+                    .alignment(Alignment::Center)
+                    .render(gauge_inner, buf);
 
                 let mut rows = Vec::new();
                 if e != "no RPC endpoint responded" {
@@ -500,8 +530,8 @@ impl AppWidget<'_> {
 
     fn render_network(&self, area: Rect, buf: &mut Buffer) {
         let layout = Layout::vertical([
-            Constraint::Length(7),
-            Constraint::Length(12),
+            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Min(0),
         ])
         .margin(1);
@@ -513,7 +543,8 @@ impl AppWidget<'_> {
         let outer = Block::bordered()
             .border_style(THEME.borders)
             .title(" Network ")
-            .title_style(THEME.app_title);
+            .title_style(THEME.app_title)
+            .style(Style::new().bg(BLACK));
         outer.render(area, buf);
 
         self.render_net_summary(summary, buf);
@@ -525,23 +556,44 @@ impl AppWidget<'_> {
         let block = Block::bordered()
             .title(" Connections ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(area);
         block.render(area, buf);
 
         match &self.app.snapshot.network {
             Ok(net) => {
-                let mut text = String::new();
-                let _ = writeln!(text, "Inbound:     {}", net.connections_in);
-                let _ = writeln!(text, "Outbound:    {}", net.connections_out);
-                let _ = writeln!(text, "Time offset: {}s", net.timeoffset);
-                if let Some(w) = &net.warnings {
-                    let _ = writeln!(text, "Warnings:    {w}");
-                }
-                Paragraph::new(text)
+                let layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
+                let chunks = layout.split(inner);
+                let left = chunks[0];
+                let right = chunks[1];
+
+                let mut left_text = String::new();
+                let _ = writeln!(left_text, "Inbound:      {}", net.connections_in);
+                let _ = writeln!(left_text, "Outbound:     {}", net.connections_out);
+                let _ = writeln!(left_text, "Time offset:  {}s", net.timeoffset);
+                let _ = writeln!(left_text, "Relay fee:    {:.5} BTC/kvB", net.relayfee);
+                let _ = writeln!(left_text, "Network:      {}", if net.networkactive { "active" } else { "inactive" });
+                Paragraph::new(left_text)
                     .style(THEME.content)
                     .wrap(Wrap { trim: true })
-                    .render(inner, buf);
+                    .render(left, buf);
+
+                let mut right_text = String::new();
+                let _ = writeln!(right_text, "Version:      {}", net.version);
+                let _ = writeln!(right_text, "Subversion:   {}", net.subversion);
+                let _ = writeln!(right_text, "Protocol:     {}", net.protocolversion);
+                if !net.localaddresses.is_empty() {
+                    let addrs = net.localaddresses.join(", ");
+                    let _ = writeln!(right_text, "Local addrs:  {}", addrs);
+                }
+                if let Some(w) = &net.warnings {
+                    let _ = writeln!(right_text, "Warnings:     {w}");
+                }
+                Paragraph::new(right_text)
+                    .style(THEME.content)
+                    .wrap(Wrap { trim: true })
+                    .render(right, buf);
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
                 let mut text = String::new();

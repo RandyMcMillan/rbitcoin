@@ -1075,7 +1075,8 @@ impl AppWidget<'_> {
         let outer = Block::bordered()
             .border_style(THEME.borders)
             .title(" Console ")
-            .title_style(THEME.app_title);
+            .title_style(THEME.app_title)
+            .style(Style::new().bg(BLACK));
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -1122,9 +1123,13 @@ impl AppWidget<'_> {
             }
         }
 
-        let prompt = format!("> {}", self.app.command_input);
-        let prompt_para = Paragraph::new(prompt)
-            .style(Style::new().fg(BRIGHT_CYAN).add_modifier(Modifier::BOLD));
+        let prompt_line = Line::from(vec![
+            Span::styled("> ", Style::new().fg(BRIGHT_GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(self.app.command_input.clone(), Style::new().fg(WHITE)),
+            Span::styled("█", Style::new().fg(BRIGHT_CYAN)),
+        ]);
+        let prompt_para = Paragraph::new(prompt_line)
+            .style(Style::new().bg(DARK_BG));
         prompt_para.render(prompt_area, buf);
     }
 }

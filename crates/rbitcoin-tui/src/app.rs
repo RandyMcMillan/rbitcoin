@@ -278,59 +278,65 @@ impl App {
             }
             self.mempool_fee_history.push_back(m.min_fee_sat_vb);
         }
-        if let Some(ref rx) = self.log_rx {
-            while let Ok(line) = rx.try_recv() {
+        self.drain_log_lines();
+        self.drain_cmd_results();
+        self.next_refresh = Instant::now() + self.interval;
+    }
+
+    fn drain_log_lines(&mut self) {
+        let Some(ref rx) = self.log_rx else { return };
+        while let Ok(line) = rx.try_recv() {
+            if self.console_lines.len() >= CONSOLE_CAPACITY {
+                self.console_lines.pop_front();
+            }
+            self.console_lines.push_back(line.clone());
+
+            if let Some(h) = extract_height(&line) {
+                self.startup_height = Some(h);
+            }
+            if let Some(p) = extract_progress(&line) {
+                self.startup_progress = Some(p);
+            }
+            if let Some(op) = extract_operation(&line) {
+                self.startup_operation = Some(op);
+            }
+            if let Some((i, o)) = extract_net_peers(&line) {
+                self.log_net_in = Some(i);
+                self.log_net_out = Some(o);
+            }
+            if let Some((txs, bytes)) = extract_mempool_stats(&line) {
+                self.log_mempool_txs = Some(txs);
+                self.log_mempool_bytes = Some(bytes);
+            }
+            if let Some(pairs) = extract_store_stats(&line) {
+                self.log_store_stats = pairs;
+            }
+            if line.contains(" WARN ") {
+                self.log_last_warn = Some(line.clone());
+            }
+            if line.contains(" ERROR ") {
+                self.log_last_error = Some(line.clone());
+            }
+            if is_peer_event(&line) {
+                if self.log_peer_events.len() >= 100 {
+                    self.log_peer_events.pop_front();
+                }
+                self.log_peer_events.push_back(line);
+            }
+        }
+    }
+
+    fn drain_cmd_results(&mut self) {
+        let Some(ref rx) = self.cmd_rx else { return };
+        if let Ok(result) = rx.try_recv() {
+            for line in result.lines() {
                 if self.console_lines.len() >= CONSOLE_CAPACITY {
                     self.console_lines.pop_front();
                 }
-                self.console_lines.push_back(line.clone());
-
-                if let Some(h) = extract_height(&line) {
-                    self.startup_height = Some(h);
-                }
-                if let Some(p) = extract_progress(&line) {
-                    self.startup_progress = Some(p);
-                }
-                if let Some(op) = extract_operation(&line) {
-                    self.startup_operation = Some(op);
-                }
-                if let Some((i, o)) = extract_net_peers(&line) {
-                    self.log_net_in = Some(i);
-                    self.log_net_out = Some(o);
-                }
-                if let Some((txs, bytes)) = extract_mempool_stats(&line) {
-                    self.log_mempool_txs = Some(txs);
-                    self.log_mempool_bytes = Some(bytes);
-                }
-                if let Some(pairs) = extract_store_stats(&line) {
-                    self.log_store_stats = pairs;
-                }
-                if line.contains(" WARN ") {
-                    self.log_last_warn = Some(line.clone());
-                }
-                if line.contains(" ERROR ") {
-                    self.log_last_error = Some(line.clone());
-                }
-                if is_peer_event(&line) {
-                    if self.log_peer_events.len() >= 100 {
-                        self.log_peer_events.pop_front();
-                    }
-                    self.log_peer_events.push_back(line);
-                }
+                self.console_lines.push_back(line.to_string());
             }
+            self.cmd_rx = None;
         }
-        if let Some(ref rx) = self.cmd_rx {
-            if let Ok(result) = rx.try_recv() {
-                for line in result.lines() {
-                    if self.console_lines.len() >= CONSOLE_CAPACITY {
-                        self.console_lines.pop_front();
-                    }
-                    self.console_lines.push_back(line.to_string());
-                }
-                self.cmd_rx = None;
-            }
-        }
-        self.next_refresh = Instant::now() + self.interval;
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {

@@ -497,6 +497,15 @@ impl AppWidget<'_> {
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
                 let mut text = String::new();
+                if let Some(ref op) = self.app.startup_operation {
+                    let _ = writeln!(text, "node is initializing: {op}");
+                }
+                if let Some((cur, tot)) = self.app.startup_progress {
+                    let _ = writeln!(text, "progress: {cur}/{tot}");
+                }
+                if let Some(h) = self.app.startup_height {
+                    let _ = writeln!(text, "height: {h}");
+                }
                 if let Some(i) = self.app.log_net_in {
                     let _ = writeln!(text, "Inbound:     {i} (from logs)");
                 }
@@ -605,7 +614,20 @@ impl AppWidget<'_> {
                 }
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
-                Paragraph::new("waiting for peer data…")
+                let mut msg = String::new();
+                if let Some(ref op) = self.app.startup_operation {
+                    let _ = writeln!(msg, "node is initializing: {op}");
+                }
+                if let Some((cur, tot)) = self.app.startup_progress {
+                    let _ = writeln!(msg, "progress: {cur}/{tot}");
+                }
+                if let Some(h) = self.app.startup_height {
+                    let _ = writeln!(msg, "height: {h}");
+                }
+                if msg.is_empty() {
+                    msg = "waiting for peer data…".into();
+                }
+                Paragraph::new(msg)
                     .block(
                         Block::bordered()
                             .title(" Peers ")

@@ -71,7 +71,7 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
             // Auto-spawn the node if no external RPC is configured, no child is
             // running, we haven't tried yet, and the default unix socket isn't
             // already present (which signals an existing node).
-            if !app.config.has_external_rpc()
+            let just_spawned = if !app.config.has_external_rpc()
                 && app.node_child.is_none()
                 && app.node_exit_code.is_none()
                 && !app.spawn_attempted
@@ -85,15 +85,26 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
                     Ok((child, rx)) => {
                         app.node_child = Some(child);
                         app.log_rx = Some(rx);
+                        true
                     }
                     Err(err) => {
-                        app.snapshot.last_error = Some(format!("node spawn: {err}"));
+                        app.spawn_error = Some(format!("node spawn: {err}"));
+                        false
                     }
                 }
-                app.spawn_attempted = true;
-            }
+            } else {
+                false
+            };
+            app.spawn_attempted = true;
 
-            app.refresh();
+            // Give the freshly-spawned node one interval before we hit it with
+            // RPC probes, otherwise every tab shows "no RPC endpoint responded"
+            // for the first few seconds.
+            if just_spawned {
+                app.next_refresh = Instant::now() + app.interval;
+            } else {
+                app.refresh();
+            }
             redraw = true;
         }
         if redraw {

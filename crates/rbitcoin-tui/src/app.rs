@@ -185,6 +185,7 @@ pub struct App {
     pub console_lines: VecDeque<String>,
     pub console_scroll: usize,
     pub spawn_attempted: bool,
+    pub spawn_error: Option<String>,
 }
 
 impl App {
@@ -207,11 +208,37 @@ impl App {
             console_lines: VecDeque::with_capacity(CONSOLE_CAPACITY),
             console_scroll: 0,
             spawn_attempted: false,
+            spawn_error: None,
         }
     }
 
     pub fn refresh(&mut self) {
         self.snapshot = Snapshot::fetch(&self.config, DEFAULT_TIMEOUT);
+
+        // When we manage a local child process, replace the generic
+        // "no RPC endpoint responded" spam with a message that actually
+        // tells the user what is happening.
+        if !self.config.has_external_rpc() {
+            let replacement = if let Some(ref e) = self.spawn_error {
+                Some(e.clone())
+            } else if let Some(code) = self.node_exit_code {
+                Some(format!("node exited with code {code} — check Console tab"))
+            } else if self.node_child.is_some() {
+                Some("node is starting…".into())
+            } else {
+                None
+            };
+            if let Some(msg) = replacement {
+                if matches!(self.snapshot.chain, Err(ref e) if e == "no RPC endpoint responded") {
+                    self.snapshot.chain = Err(msg.clone());
+                    self.snapshot.network = Err(msg.clone());
+                    self.snapshot.mempool = Err(msg.clone());
+                    self.snapshot.peers = Err(msg.clone());
+                    self.snapshot.last_error = Some(msg);
+                }
+            }
+        }
+
         if let Ok(ref m) = self.snapshot.mempool {
             if self.mempool_tx_history.len() >= HISTORY_CAPACITY {
                 self.mempool_tx_history.pop_front();

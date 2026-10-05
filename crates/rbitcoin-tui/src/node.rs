@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Receiver;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Try to find the `rbitcoin-node` binary.
 ///
@@ -37,6 +39,11 @@ pub fn spawn_node(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
+    // Put the node in its own process group so Ctrl-C in the TUI
+    // (which sends SIGINT to the foreground group) does not also
+    // kill the child node.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", bin.display()))?;

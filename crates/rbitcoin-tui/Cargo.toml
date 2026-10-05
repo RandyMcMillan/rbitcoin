@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Terminal UI for rbitcoin node status"
+description = "Terminal UI API client for rbitcoin node status"
 
 [[bin]]
 name = "rbitcoin-tui"

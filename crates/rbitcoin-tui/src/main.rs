@@ -150,10 +150,10 @@ impl Config {
 const USAGE: &str = "\
 rbitcoin-tui [--addr ADDR] [--interval SECONDS] [--once] [ADDR]
 
-TUI for rbitcoin node health / ready / progress.
+TUI client for an existing rbitcoin node health / ready / progress surface.
 
 Options:
-  -a, --addr ADDR       Node health listener address (default 127.0.0.1:9332)
+  -a, --addr ADDR       Existing node health listener address (default 127.0.0.1:9332)
   -i, --interval SEC    Refresh interval in seconds (default 1)
       --once            Fetch a single snapshot and print it
   -h, --help            Show this help

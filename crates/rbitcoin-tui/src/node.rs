@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::Receiver;
 
 /// Try to find the `rbitcoin-node` binary.
 ///
@@ -21,16 +22,33 @@ pub fn find_node_binary(explicit: Option<&Path>) -> PathBuf {
     PathBuf::from("rbitcoin-node")
 }
 
-/// Spawn the node as a child process.
-pub fn spawn_node(datadir: &Path, binary: Option<&Path>) -> Result<Child, String> {
+/// Spawn the node as a child process and return a channel that receives stderr lines.
+pub fn spawn_node(datadir: &Path, binary: Option<&Path>) -> Result<(Child, Receiver<String>), String> {
     let bin = find_node_binary(binary);
     let mut cmd = Command::new(&bin);
     cmd.arg("--datadir").arg(datadir);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
-    cmd.spawn()
-        .map_err(|e| format!("spawn {}: {e}", bin.display()))
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in std::io::BufRead::lines(reader) {
+            if let Ok(l) = line {
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok((child, rx))
 }
 
 /// Poll whether the child is still alive. If it exited, return the exit code.

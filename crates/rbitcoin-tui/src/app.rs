@@ -16,10 +16,17 @@ pub enum Tab {
     Chain,
     Network,
     Mempool,
+    Console,
 }
 
 impl Tab {
-    pub const ALL: &[Tab] = &[Tab::Dashboard, Tab::Chain, Tab::Network, Tab::Mempool];
+    pub const ALL: &[Tab] = &[
+        Tab::Dashboard,
+        Tab::Chain,
+        Tab::Network,
+        Tab::Mempool,
+        Tab::Console,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -27,6 +34,7 @@ impl Tab {
             Tab::Chain => "Chain",
             Tab::Network => "Network",
             Tab::Mempool => "Mempool",
+            Tab::Console => "Console",
         }
     }
 
@@ -35,16 +43,18 @@ impl Tab {
             Tab::Dashboard => Tab::Chain,
             Tab::Chain => Tab::Network,
             Tab::Network => Tab::Mempool,
-            Tab::Mempool => Tab::Dashboard,
+            Tab::Mempool => Tab::Console,
+            Tab::Console => Tab::Dashboard,
         }
     }
 
     pub fn prev(self) -> Tab {
         match self {
-            Tab::Dashboard => Tab::Mempool,
+            Tab::Dashboard => Tab::Console,
             Tab::Chain => Tab::Dashboard,
             Tab::Network => Tab::Chain,
             Tab::Mempool => Tab::Network,
+            Tab::Console => Tab::Mempool,
         }
     }
 }
@@ -156,6 +166,8 @@ impl Snapshot {
     }
 }
 
+const CONSOLE_CAPACITY: usize = 1000;
+
 pub struct App {
     pub config: Config,
     pub tab: Tab,
@@ -169,6 +181,9 @@ pub struct App {
     pub peer_table_scroll: usize,
     pub node_child: Option<std::process::Child>,
     pub node_exit_code: Option<i32>,
+    pub log_rx: Option<std::sync::mpsc::Receiver<String>>,
+    pub console_lines: VecDeque<String>,
+    pub console_scroll: usize,
 }
 
 impl App {
@@ -187,6 +202,9 @@ impl App {
             peer_table_scroll: 0,
             node_child: None,
             node_exit_code: None,
+            log_rx: None,
+            console_lines: VecDeque::with_capacity(CONSOLE_CAPACITY),
+            console_scroll: 0,
         }
     }
 
@@ -201,6 +219,14 @@ impl App {
                 self.mempool_fee_history.pop_front();
             }
             self.mempool_fee_history.push_back(m.min_fee_sat_vb);
+        }
+        if let Some(ref rx) = self.log_rx {
+            while let Ok(line) = rx.try_recv() {
+                if self.console_lines.len() >= CONSOLE_CAPACITY {
+                    self.console_lines.pop_front();
+                }
+                self.console_lines.push_back(line);
+            }
         }
         self.next_refresh = Instant::now() + self.interval;
     }
@@ -297,17 +323,32 @@ impl App {
                 false
             }
             Event::Key(KeyEvent {
+                code: KeyCode::Char('5'),
+                ..
+            }) => {
+                self.tab = Tab::Console;
+                false
+            }
+            Event::Key(KeyEvent {
                 code: KeyCode::Down,
                 ..
             }) => {
-                self.peer_table_scroll = self.peer_table_scroll.saturating_add(1);
+                match self.tab {
+                    Tab::Network => self.peer_table_scroll = self.peer_table_scroll.saturating_add(1),
+                    Tab::Console => self.console_scroll = self.console_scroll.saturating_add(1),
+                    _ => {}
+                }
                 false
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Up,
                 ..
             }) => {
-                self.peer_table_scroll = self.peer_table_scroll.saturating_sub(1);
+                match self.tab {
+                    Tab::Network => self.peer_table_scroll = self.peer_table_scroll.saturating_sub(1),
+                    Tab::Console => self.console_scroll = self.console_scroll.saturating_sub(1),
+                    _ => {}
+                }
                 false
             }
             _ => false,
@@ -396,8 +437,12 @@ mod tests {
         t = t.next();
         assert_eq!(t, Tab::Mempool);
         t = t.next();
+        assert_eq!(t, Tab::Console);
+        t = t.next();
         assert_eq!(t, Tab::Dashboard);
 
+        t = t.prev();
+        assert_eq!(t, Tab::Console);
         t = t.prev();
         assert_eq!(t, Tab::Mempool);
         t = t.prev();

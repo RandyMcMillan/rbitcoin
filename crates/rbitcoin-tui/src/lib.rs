@@ -95,7 +95,10 @@ fn spawn_node_if_needed(app: &mut app::App) {
         return;
     }
     match node::spawn_node(&app.config.datadir, app.config.node_binary.as_deref()) {
-        Ok(child) => app.node_child = Some(child),
+        Ok((child, rx)) => {
+            app.node_child = Some(child);
+            app.log_rx = Some(rx);
+        }
         Err(err) => app.snapshot.last_error = Some(format!("node spawn: {err}")),
     }
 }

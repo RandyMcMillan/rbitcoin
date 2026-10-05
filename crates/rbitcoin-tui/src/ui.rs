@@ -71,6 +71,7 @@ impl AppWidget<'_> {
             Tab::Chain => self.render_chain(area, buf),
             Tab::Network => self.render_network(area, buf),
             Tab::Mempool => self.render_mempool(area, buf),
+            Tab::Console => self.render_console(area, buf),
         }
     }
 
@@ -116,9 +117,13 @@ impl AppWidget<'_> {
             let node_status = if let Some(code) = self.app.node_exit_code {
                 format!("exited {code}")
             } else if self.app.node_child.is_some() {
-                "running".into()
+                if self.app.snapshot.chain.is_ok() || self.app.snapshot.network.is_ok() {
+                    "running".into()
+                } else {
+                    "starting…".into()
+                }
             } else {
-                "starting…".into()
+                "not started".into()
             };
             let _ = writeln!(left_text, "node: {node_status}");
         }
@@ -624,13 +629,69 @@ impl AppWidget<'_> {
             }
         }
     }
+
+    fn render_console(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::bordered()
+            .border_style(THEME.borders)
+            .title(" Console ")
+            .title_style(THEME.app_title);
+        let inner = outer.inner(area);
+        outer.render(area, buf);
+
+        if self.app.console_lines.is_empty() {
+            let placeholder = Paragraph::new("no log output — start node with --start-node to see logs")
+                .style(MUTED)
+                .alignment(Alignment::Center);
+            placeholder.render(inner, buf);
+            return;
+        }
+
+        let visible = inner.height as usize;
+        let max_scroll = self.app.console_lines.len().saturating_sub(visible);
+        let scroll = self.app.console_scroll.min(max_scroll);
+
+        let lines: Vec<Line<'_>> = self
+            .app
+            .console_lines
+            .iter()
+            .skip(scroll)
+            .take(visible)
+            .map(|line| console_line(line))
+            .collect();
+
+        Paragraph::new(lines).render(inner, buf);
+
+        if self.app.console_lines.len() > visible {
+            let scrollbar = Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight);
+            let mut sb_state = ScrollbarState::new(self.app.console_lines.len()).position(scroll);
+            let sb_area = inner.inner(Margin {
+                horizontal: 0,
+                vertical: 0,
+            });
+            StatefulWidget::render(scrollbar, sb_area, buf, &mut sb_state);
+        }
+    }
+}
+
+fn console_line(line: &str) -> Line<'_> {
+    let style = if line.contains(" ERROR ") {
+        ERROR
+    } else if line.contains(" WARN ") {
+        WARN
+    } else if line.contains(" DEBUG ") || line.contains(" TRACE ") {
+        MUTED
+    } else {
+        THEME.content
+    };
+    Line::from(Span::styled(line.to_string(), style))
 }
 
 fn render_bottom_bar(area: Rect, buf: &mut Buffer) {
     let keys = [
         ("Tab/→", "Next"),
         ("Shift+Tab/←", "Prev"),
-        ("1-4", "Tab"),
+        ("1-5", "Tab"),
         ("R", "Refresh"),
         ("H/?", "Help"),
         ("Q/Esc", "Quit"),
@@ -661,8 +722,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 Navigation
   Tab / Right       next tab
   Shift+Tab / Left  previous tab
-  1-4               jump to tab
-  Up / Down         scroll peer table
+  1-5               jump to tab
+  Up / Down         scroll peer table / console
 
 Actions
   r                 refresh now

@@ -2739,9 +2739,7 @@ mod tests {
             .to_lower_hex_string();
         assert_eq!(
             cfg.datadir_path(),
-            std::path::Path::new(&format!(
-                "/tmp/rbitcoin-default-signet/signet/{challenge}"
-            ))
+            std::path::Path::new(&format!("/tmp/rbitcoin-default-signet/signet/{challenge}"))
         );
     }
 

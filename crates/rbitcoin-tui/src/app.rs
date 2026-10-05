@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const HISTORY_CAPACITY: usize = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,23 +110,25 @@ impl Snapshot {
                     other => Err(format!("expected array, got {other}")),
                 });
 
-            match (&c, &n, &m) {
-                (Ok(_), Ok(_), Ok(_)) => {
-                    endpoint = Some(candidate);
-                    chain = c;
-                    network = n;
-                    mempool = m;
-                    peers = p;
-                    break;
-                }
-                _ => errors.push(format!(
-                    "{}: {} | {} | {}",
-                    candidate.label(),
-                    c.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
-                    n.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
-                    m.as_ref().err().cloned().unwrap_or_else(|| "ok".into())
-                )),
+            // Accept the endpoint as soon as chain info works; keep whatever
+            // else succeeded. This prevents a slow mempool or peer call from
+            // blanking the whole UI during sync.
+            if c.is_ok() {
+                endpoint = Some(candidate);
+                chain = c;
+                network = n;
+                mempool = m;
+                peers = p;
+                break;
             }
+
+            errors.push(format!(
+                "{}: {} | {} | {}",
+                candidate.label(),
+                c.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
+                n.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
+                m.as_ref().err().cloned().unwrap_or_else(|| "ok".into())
+            ));
         }
         let endpoint =
             endpoint.unwrap_or_else(|| RpcEndpoint::Unix(PathBuf::from("./datadir/rpc.sock")));
@@ -217,28 +219,19 @@ impl App {
     pub fn refresh(&mut self) {
         self.snapshot = Snapshot::fetch(&self.config, DEFAULT_TIMEOUT);
 
-        // When we manage a local child process, replace the generic
-        // "no RPC endpoint responded" spam with a message that actually
-        // tells the user what is happening.
-        if !self.config.has_external_rpc() {
-            let replacement = if let Some(ref e) = self.spawn_error {
-                Some(e.clone())
+        // Replace the dashboard summary error with a node-state-aware message
+        // so the user knows whether we're starting, crashed, or connected.
+        if !self.config.has_external_rpc() && self.snapshot.last_error.is_some() {
+            let msg = if let Some(ref e) = self.spawn_error {
+                e.clone()
             } else if let Some(code) = self.node_exit_code {
-                Some(format!("node exited with code {code} — check Console tab"))
+                format!("node exited with code {code} — check Console tab")
             } else if self.node_child.is_some() {
-                Some("node is starting…".into())
+                "node is starting…".into()
             } else {
-                None
+                return;
             };
-            if let Some(msg) = replacement {
-                if matches!(self.snapshot.chain, Err(ref e) if e == "no RPC endpoint responded") {
-                    self.snapshot.chain = Err(msg.clone());
-                    self.snapshot.network = Err(msg.clone());
-                    self.snapshot.mempool = Err(msg.clone());
-                    self.snapshot.peers = Err(msg.clone());
-                    self.snapshot.last_error = Some(msg);
-                }
-            }
+            self.snapshot.last_error = Some(msg);
         }
 
         if let Ok(ref m) = self.snapshot.mempool {

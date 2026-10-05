@@ -374,7 +374,7 @@ impl AppWidget<'_> {
                     .wrap(Wrap { trim: true });
                 para.render(info_area, buf);
             }
-            Err(_) => {
+            Err(ref e) => {
                 let gauge = LineGauge::default()
                     .block(
                         Block::bordered()
@@ -389,13 +389,18 @@ impl AppWidget<'_> {
                     .line_set(symbols::line::THICK);
                 gauge.render(gauge_area, buf);
 
-                let msg = if let Some(h) = self.app.startup_height {
-                    format!("node is initializing…\nlast height seen in logs: {h}")
+                let msg = if e == "no RPC endpoint responded" {
+                    if let Some(h) = self.app.startup_height {
+                        format!("node is initializing…\nlast height seen in logs: {h}")
+                    } else {
+                        "node is initializing…".into()
+                    }
                 } else {
-                    "node is initializing…".into()
+                    format!("Error: {e}")
                 };
+                let style = if e == "no RPC endpoint responded" { MUTED } else { ERROR };
                 let placeholder = Paragraph::new(msg)
-                    .style(MUTED)
+                    .style(style)
                     .alignment(Alignment::Center);
                 placeholder.render(info_area, buf);
             }
@@ -441,9 +446,15 @@ impl AppWidget<'_> {
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
-            Err(_) => {
+            Err(ref e) if e == "no RPC endpoint responded" => {
                 Paragraph::new("waiting for network data…")
                     .style(MUTED)
+                    .wrap(Wrap { trim: true })
+                    .render(inner, buf);
+            }
+            Err(ref e) => {
+                Paragraph::new(format!("Error: {e}"))
+                    .style(ERROR)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
@@ -534,7 +545,7 @@ impl AppWidget<'_> {
                     scrollbar.render(sb_area, buf, &mut sb_state);
                 }
             }
-            Err(_) => {
+            Err(ref e) if e == "no RPC endpoint responded" => {
                 Paragraph::new("waiting for peer data…")
                     .block(
                         Block::bordered()
@@ -543,6 +554,18 @@ impl AppWidget<'_> {
                             .border_style(THEME.borders),
                     )
                     .style(MUTED)
+                    .wrap(Wrap { trim: true })
+                    .render(area, buf);
+            }
+            Err(ref e) => {
+                Paragraph::new(format!("Error: {e}"))
+                    .block(
+                        Block::bordered()
+                            .title(" Peers ")
+                            .title_style(THEME.description_title)
+                            .border_style(THEME.borders),
+                    )
+                    .style(ERROR)
                     .wrap(Wrap { trim: true })
                     .render(area, buf);
             }
@@ -647,9 +670,15 @@ impl AppWidget<'_> {
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
-            Err(_) => {
+            Err(ref e) if e == "no RPC endpoint responded" => {
                 Paragraph::new("waiting for mempool data…")
                     .style(MUTED)
+                    .wrap(Wrap { trim: true })
+                    .render(inner, buf);
+            }
+            Err(ref e) => {
+                Paragraph::new(format!("Error: {e}"))
+                    .style(ERROR)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }

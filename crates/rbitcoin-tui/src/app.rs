@@ -393,8 +393,83 @@ impl App {
                 }
                 false
             }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                if self.tab == Tab::Console {
+                    self.command_input.pop();
+                }
+                false
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) => {
+                if self.tab == Tab::Console && !self.command_input.is_empty() {
+                    let cmd = self.command_input.clone();
+                    self.command_input.clear();
+                    self.submit_console_command(&cmd);
+                }
+                false
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            }) => {
+                if self.tab == Tab::Console && modifiers.is_empty() {
+                    self.command_input.push(c);
+                    false
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
+    }
+
+    fn submit_console_command(&mut self, cmd: &str) {
+        if self.console_lines.len() >= CONSOLE_CAPACITY {
+            self.console_lines.pop_front();
+        }
+        self.console_lines.push_back(format!("> {cmd}"));
+
+        let endpoint = self.snapshot.endpoint.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.cmd_rx = Some(rx);
+
+        let cmd = cmd.to_string();
+        std::thread::spawn(move || {
+            let result = execute_rpc_command(&endpoint, &cmd);
+            let _ = tx.send(result);
+        });
+    }
+}
+
+fn execute_rpc_command(endpoint: &RpcEndpoint, cmd: &str) -> String {
+    let mut parts = cmd.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    if method.is_empty() {
+        return "error: empty command".into();
+    }
+    let params: Vec<serde_json::Value> = parts
+        .map(|p| serde_json::from_str(p).unwrap_or_else(|_| serde_json::Value::String(p.to_string())))
+        .collect();
+
+    match crate::rpc::rpc_call(endpoint, method, &params, std::time::Duration::from_secs(30)) {
+        Ok(v) => format_rpc_result(&v),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+fn format_rpc_result(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
     }
 }
 

@@ -164,26 +164,37 @@ impl Config {
         })
     }
 
-    fn endpoint(&self) -> RpcEndpoint {
+    fn endpoints(&self) -> Vec<RpcEndpoint> {
         if let Some(url) = &self.rpc_url {
-            let (host, port) = parse_http_url(url).unwrap_or_else(|e| {
-                panic!("{e}")
-            });
-            RpcEndpoint::Tcp {
+            let (host, port) = parse_http_url(url)
+                .unwrap_or_else(|e| panic!("{e}"));
+            return vec![RpcEndpoint::Tcp {
                 host,
                 port,
                 token_file: self
                     .rpc_token_file
                     .clone()
                     .unwrap_or_else(|| self.datadir.join("rpc.token")),
-            }
-        } else {
-            RpcEndpoint::Unix(
-                self.rpc_socket
-                    .clone()
-                    .unwrap_or_else(|| self.datadir.join("rpc.sock")),
-            )
+            }];
         }
+        if let Some(sock) = &self.rpc_socket {
+            return vec![RpcEndpoint::Unix(sock.clone())];
+        }
+        let mut endpoints = Vec::new();
+        let unix = self.datadir.join("rpc.sock");
+        if unix.exists() {
+            endpoints.push(RpcEndpoint::Unix(unix));
+        }
+        endpoints.push(RpcEndpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port: 8332,
+            token_file: self
+                .rpc_token_file
+                .clone()
+                .unwrap_or_else(|| self.datadir.join("rpc.token")),
+        });
+        endpoints.push(RpcEndpoint::Unix(self.datadir.join("rpc.sock")));
+        endpoints
     }
 }
 
@@ -440,14 +451,37 @@ impl Snapshot {
     }
 
     fn fetch(config: &Config, timeout: Duration) -> Self {
-        let endpoint = config.endpoint();
+        let mut endpoint = None;
         let refreshed_at = Some(Instant::now());
-        let chain = rpc_call(&endpoint, "getblockchaininfo", &[], timeout)
-            .and_then(BlockchainInfo::from_value);
-        let network = rpc_call(&endpoint, "getnetworkinfo", &[], timeout)
-            .and_then(NetworkInfo::from_value);
-        let mempool = rpc_call(&endpoint, "getmempoolinfo", &[], timeout)
-            .and_then(MempoolInfo::from_value);
+        let mut chain = Err("no RPC endpoint responded".to_string());
+        let mut network = Err("no RPC endpoint responded".to_string());
+        let mut mempool = Err("no RPC endpoint responded".to_string());
+        let mut errors = Vec::new();
+        for candidate in config.endpoints() {
+            let c = rpc_call(&candidate, "getblockchaininfo", &[], timeout)
+                .and_then(BlockchainInfo::from_value);
+            let n = rpc_call(&candidate, "getnetworkinfo", &[], timeout)
+                .and_then(NetworkInfo::from_value);
+            let m = rpc_call(&candidate, "getmempoolinfo", &[], timeout)
+                .and_then(MempoolInfo::from_value);
+            match (&c, &n, &m) {
+                (Ok(_), Ok(_), Ok(_)) => {
+                    endpoint = Some(candidate);
+                    chain = c;
+                    network = n;
+                    mempool = m;
+                    break;
+                }
+                _ => errors.push(format!(
+                    "{}: {} | {} | {}",
+                    candidate.label(),
+                    c.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
+                    n.as_ref().err().cloned().unwrap_or_else(|| "ok".into()),
+                    m.as_ref().err().cloned().unwrap_or_else(|| "ok".into())
+                )),
+            }
+        }
+        let endpoint = endpoint.unwrap_or_else(|| RpcEndpoint::Unix(PathBuf::from("./datadir/rpc.sock")));
         let warnings = chain
             .as_ref()
             .ok()
@@ -458,7 +492,8 @@ impl Snapshot {
             .err()
             .cloned()
             .or_else(|| network.as_ref().err().cloned())
-            .or_else(|| mempool.as_ref().err().cloned());
+            .or_else(|| mempool.as_ref().err().cloned())
+            .or_else(|| (!errors.is_empty()).then(|| errors.join(" ; ")));
         Self {
             endpoint,
             refreshed_at,

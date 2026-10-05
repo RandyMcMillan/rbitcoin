@@ -231,15 +231,21 @@ impl App {
         // so the user knows whether we're starting, crashed, or connected.
         if !self.config.has_external_rpc() && self.snapshot.last_error.is_some() {
             let msg = if let Some(ref e) = self.spawn_error {
-                e.clone()
+                Some(e.clone())
+            } else if let Some(0) = self.node_exit_code {
+                // Clean exit — not an error, clear the banner.
+                None
             } else if let Some(code) = self.node_exit_code {
-                format!("node exited with code {code} — check Console tab")
+                Some(format!("node exited with code {code} — check Console tab"))
             } else if self.node_child.is_some() {
-                "node is starting…".into()
+                Some("node is starting…".into())
             } else {
-                return;
+                None
             };
-            self.snapshot.last_error = Some(msg);
+            match msg {
+                Some(m) => self.snapshot.last_error = Some(m),
+                None => self.snapshot.last_error = None,
+            }
         }
 
         if let Ok(ref m) = self.snapshot.mempool {

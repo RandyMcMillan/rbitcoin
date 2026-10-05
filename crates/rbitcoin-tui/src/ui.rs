@@ -115,6 +115,8 @@ impl AppWidget<'_> {
         );
         let node_status = if self.app.config.has_external_rpc() {
             "external".into()
+        } else if let Some(0) = self.app.node_exit_code {
+            "stopped".into()
         } else if let Some(code) = self.app.node_exit_code {
             format!("exited {code}")
         } else if self.app.node_child.is_some() {
@@ -127,7 +129,12 @@ impl AppWidget<'_> {
             "not started".into()
         };
         let _ = writeln!(left_text, "node: {node_status}");
-        if self.app.snapshot.chain.is_err() {
+        // Only show startup telemetry while the node is actually starting,
+        // not after it has exited.
+        if self.app.node_child.is_some()
+            && self.app.node_exit_code.is_none()
+            && self.app.snapshot.chain.is_err()
+        {
             if let Some(ref op) = self.app.startup_operation {
                 let _ = writeln!(left_text, "op: {op}");
             }

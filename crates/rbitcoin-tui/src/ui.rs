@@ -1,5 +1,5 @@
 use crate::app::{App, Tab};
-use crate::theme::{BLACK, BRIGHT_CYAN, BRIGHT_GREEN, BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_YELLOW, ERROR, MID_GRAY, MUTED, OK, THEME, WARN, WHITE};
+use crate::theme::{BLACK, BRIGHT_CYAN, BRIGHT_GREEN, BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_YELLOW, DARK_BG, ERROR, MID_GRAY, MUTED, OK, THEME, WARN, WHITE};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
@@ -393,6 +393,12 @@ impl AppWidget<'_> {
                 para.render(info_area, buf);
             }
             Err(ref e) => {
+                let (ratio, label) = if let Some((cur, tot)) = self.app.startup_progress {
+                    let r = (cur as f64 / tot as f64).clamp(0.0, 1.0);
+                    (r, format!("{:.1}%  {cur}/{tot}", r * 100.0))
+                } else {
+                    (0.0, "starting…".into())
+                };
                 let gauge = LineGauge::default()
                     .block(
                         Block::bordered()
@@ -400,10 +406,10 @@ impl AppWidget<'_> {
                             .title_style(THEME.description_title)
                             .border_style(THEME.borders),
                     )
-                    .filled_style(Style::new().fg(MID_GRAY))
-                    .unfilled_style(Style::new().fg(MID_GRAY))
-                    .ratio(0.0)
-                    .label("starting…")
+                    .filled_style(Style::new().fg(BRIGHT_CYAN).add_modifier(Modifier::BOLD))
+                    .unfilled_style(Style::new().fg(DARK_BG))
+                    .ratio(ratio)
+                    .label(label)
                     .line_set(symbols::line::THICK);
                 gauge.render(gauge_area, buf);
 

@@ -39,11 +39,10 @@ pub fn spawn_node(datadir: &Path, binary: Option<&Path>) -> Result<(Child, Recei
 
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stderr);
-        for line in std::io::BufRead::lines(reader) {
-            if let Ok(l) = line {
-                if tx.send(l).is_err() {
-                    break;
-                }
+        let mut lines = std::io::BufRead::lines(reader);
+        while let Some(Ok(l)) = lines.next() {
+            if tx.send(l).is_err() {
+                break;
             }
         }
     });

@@ -311,7 +311,7 @@ impl AppWidget<'_> {
                 .map(|n| n.timeoffset)
                 .unwrap_or(0)
         );
-        if let Some(net) = self.app.snapshot.network.as_ref().ok() {
+        if let Ok(net) = &self.app.snapshot.network {
             let _ = writeln!(net_text, "relay fee: {:.5} BTC/kvB", net.relayfee);
         }
         if let Some(chain) = chain {
@@ -1271,21 +1271,6 @@ fn block_bar(ratio: f64, width: usize) -> String {
     let filled = (ratio * width as f64).clamp(0.0, width as f64) as usize;
     let empty = width.saturating_sub(filled);
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
-}
-
-fn text_bar(value: u64, max: u64, width: usize, color: ratatui::style::Color) -> Line<'static> {
-    let ratio = if max > 0 {
-        value as f64 / max as f64
-    } else {
-        0.0
-    };
-    let filled = (ratio * width as f64).clamp(0.0, width as f64) as usize;
-    let empty = width.saturating_sub(filled);
-    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
-    Line::from(vec![
-        Span::styled(bar, Style::new().fg(color)),
-        Span::styled(format!(" {:.1}%", ratio * 100.0), Style::new().fg(LIGHT_GRAY)),
-    ])
 }
 
 fn human_bytes(bytes: u64) -> String {

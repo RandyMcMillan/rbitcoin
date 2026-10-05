@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+type LogHook = Box<dyn Fn(Level, String) + Send>;
+
 /// Global log hook for cross-thread capture (e.g., TUI embedding the node).
-static LOG_HOOK: OnceLock<Mutex<Box<dyn Fn(Level, String) + Send>>> = OnceLock::new();
+static LOG_HOOK: OnceLock<Mutex<LogHook>> = OnceLock::new();
 
 /// Install a global hook that receives every log line from all threads.
 ///

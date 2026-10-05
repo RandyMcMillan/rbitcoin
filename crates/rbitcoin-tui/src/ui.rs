@@ -113,20 +113,20 @@ impl AppWidget<'_> {
             "refresh: every {}s",
             self.app.interval.as_secs()
         );
-        if self.app.config.start_node {
-            let node_status = if let Some(code) = self.app.node_exit_code {
-                format!("exited {code}")
-            } else if self.app.node_child.is_some() {
-                if self.app.snapshot.chain.is_ok() || self.app.snapshot.network.is_ok() {
-                    "running".into()
-                } else {
-                    "starting…".into()
-                }
+        let node_status = if self.app.config.has_external_rpc() {
+            "external".into()
+        } else if let Some(code) = self.app.node_exit_code {
+            format!("exited {code}")
+        } else if self.app.node_child.is_some() {
+            if self.app.snapshot.chain.is_ok() || self.app.snapshot.network.is_ok() {
+                "running".into()
             } else {
-                "not started".into()
-            };
-            let _ = writeln!(left_text, "node: {node_status}");
-        }
+                "starting…".into()
+            }
+        } else {
+            "not started".into()
+        };
+        let _ = writeln!(left_text, "node: {node_status}");
         Paragraph::new(left_text)
             .style(THEME.content)
             .wrap(Wrap { trim: true })
@@ -639,7 +639,12 @@ impl AppWidget<'_> {
         outer.render(area, buf);
 
         if self.app.console_lines.is_empty() {
-            let placeholder = Paragraph::new("no log output — start node with --start-node to see logs")
+            let msg = if self.app.config.has_external_rpc() {
+                "no local logs — connected to external node"
+            } else {
+                "no log output yet — node is starting up…"
+            };
+            let placeholder = Paragraph::new(msg)
                 .style(MUTED)
                 .alignment(Alignment::Center);
             placeholder.render(inner, buf);

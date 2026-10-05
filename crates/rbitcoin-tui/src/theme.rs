@@ -31,7 +31,7 @@ pub struct Sparkline {
 }
 
 pub const THEME: Theme = Theme {
-    root: Style::new(),
+    root: Style::new().bg(BLACK),
     content: Style::new().fg(LIGHT_GRAY),
     app_title: Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
     tabs: Style::new().fg(MID_GRAY),
@@ -62,7 +62,7 @@ pub const THEME: Theme = Theme {
     },
 };
 
-pub const ERROR: Style = Style::new().fg(BRIGHT_RED);
+pub const ERROR: Style = Style::new().fg(BRIGHT_RED).add_modifier(Modifier::BOLD);
 pub const WARN: Style = Style::new().fg(BRIGHT_YELLOW);
 pub const OK: Style = Style::new().fg(BRIGHT_GREEN);
 pub const INFO: Style = Style::new().fg(BRIGHT_CYAN);

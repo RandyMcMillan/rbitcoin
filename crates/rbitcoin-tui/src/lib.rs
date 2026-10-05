@@ -45,11 +45,7 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
 
     let mut app = app::App::new(config);
 
-    if app.config.start_node {
-        spawn_node_if_needed(&mut app);
-    }
-
-    app.refresh();
+    // Draw immediately so the TUI is visible before any blocking I/O.
     terminal
         .draw(|frame| ui::render(frame, &app))
         .map_err(|e| format!("draw: {e}"))?;
@@ -71,6 +67,32 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
             if let Some(ref mut child) = app.node_child {
                 app.node_exit_code = node::check_child(child);
             }
+
+            // Auto-spawn the node if no external RPC is configured, no child is
+            // running, we haven't tried yet, and the default unix socket isn't
+            // already present (which signals an existing node).
+            if !app.config.has_external_rpc()
+                && app.node_child.is_none()
+                && app.node_exit_code.is_none()
+                && !app.spawn_attempted
+                && !app.config.datadir.join("rpc.sock").exists()
+            {
+                match node::spawn_node(
+                    &app.config.datadir,
+                    app.config.node_binary.as_deref(),
+                    &app.config.node_args,
+                ) {
+                    Ok((child, rx)) => {
+                        app.node_child = Some(child);
+                        app.log_rx = Some(rx);
+                    }
+                    Err(err) => {
+                        app.snapshot.last_error = Some(format!("node spawn: {err}"));
+                    }
+                }
+                app.spawn_attempted = true;
+            }
+
             app.refresh();
             redraw = true;
         }
@@ -87,24 +109,6 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
 
     drop(guard);
     Ok(())
-}
-
-fn spawn_node_if_needed(app: &mut app::App) {
-    let snapshot = app::Snapshot::fetch(&app.config, Duration::from_secs(2));
-    if snapshot.chain.is_ok() || snapshot.network.is_ok() {
-        return;
-    }
-    match node::spawn_node(
-        &app.config.datadir,
-        app.config.node_binary.as_deref(),
-        &app.config.node_args,
-    ) {
-        Ok((child, rx)) => {
-            app.node_child = Some(child);
-            app.log_rx = Some(rx);
-        }
-        Err(err) => app.snapshot.last_error = Some(format!("node spawn: {err}")),
-    }
 }
 
 struct TerminalGuard;

@@ -184,6 +184,7 @@ pub struct App {
     pub log_rx: Option<std::sync::mpsc::Receiver<String>>,
     pub console_lines: VecDeque<String>,
     pub console_scroll: usize,
+    pub spawn_attempted: bool,
 }
 
 impl App {
@@ -205,6 +206,7 @@ impl App {
             log_rx: None,
             console_lines: VecDeque::with_capacity(CONSOLE_CAPACITY),
             console_scroll: 0,
+            spawn_attempted: false,
         }
     }
 

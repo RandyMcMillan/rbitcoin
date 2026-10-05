@@ -191,6 +191,13 @@ pub struct App {
     pub startup_height: Option<u64>,
     pub startup_progress: Option<(u64, u64)>,
     pub startup_operation: Option<String>,
+    pub log_net_in: Option<u64>,
+    pub log_net_out: Option<u64>,
+    pub log_mempool_txs: Option<u64>,
+    pub log_mempool_bytes: Option<u64>,
+    pub log_store_stats: Vec<(String, String)>,
+    pub log_last_warn: Option<String>,
+    pub log_last_error: Option<String>,
     pub command_input: String,
     pub cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
@@ -219,6 +226,13 @@ impl App {
             startup_height: None,
             startup_progress: None,
             startup_operation: None,
+            log_net_in: None,
+            log_net_out: None,
+            log_mempool_txs: None,
+            log_mempool_bytes: None,
+            log_store_stats: Vec::new(),
+            log_last_warn: None,
+            log_last_error: None,
             command_input: String::new(),
             cmd_rx: None,
         }
@@ -264,6 +278,7 @@ impl App {
                     self.console_lines.pop_front();
                 }
                 self.console_lines.push_back(line.clone());
+
                 if let Some(h) = extract_height(&line) {
                     self.startup_height = Some(h);
                 }
@@ -272,6 +287,23 @@ impl App {
                 }
                 if let Some(op) = extract_operation(&line) {
                     self.startup_operation = Some(op);
+                }
+                if let Some((i, o)) = extract_net_peers(&line) {
+                    self.log_net_in = Some(i);
+                    self.log_net_out = Some(o);
+                }
+                if let Some((txs, bytes)) = extract_mempool_stats(&line) {
+                    self.log_mempool_txs = Some(txs);
+                    self.log_mempool_bytes = Some(bytes);
+                }
+                if let Some(pairs) = extract_store_stats(&line) {
+                    self.log_store_stats = pairs;
+                }
+                if line.contains(" WARN ") {
+                    self.log_last_warn = Some(line.clone());
+                }
+                if line.contains(" ERROR ") {
+                    self.log_last_error = Some(line.clone());
                 }
             }
         }
@@ -571,6 +603,75 @@ fn extract_operation(line: &str) -> Option<String> {
         None
     } else {
         Some(words.join(" "))
+    }
+}
+
+/// Scrape peer counts from a log line.
+/// Looks for `in=N` / `out=N` or `connections_in=N` / `connections_out=N`.
+fn extract_net_peers(line: &str) -> Option<(u64, u64)> {
+    let mut inbound = None;
+    let mut outbound = None;
+    for token in line.split_whitespace() {
+        if let Some(v) = token.strip_prefix("in=") {
+            inbound = v.parse::<u64>().ok();
+        }
+        if let Some(v) = token.strip_prefix("out=") {
+            outbound = v.parse::<u64>().ok();
+        }
+        if let Some(v) = token.strip_prefix("connections_in=") {
+            inbound = v.parse::<u64>().ok();
+        }
+        if let Some(v) = token.strip_prefix("connections_out=") {
+            outbound = v.parse::<u64>().ok();
+        }
+    }
+    match (inbound, outbound) {
+        (Some(i), Some(o)) => Some((i, o)),
+        _ => None,
+    }
+}
+
+/// Scrape mempool size from a log line.
+/// Looks for `size=N` or `txs=N` and `bytes=N`.
+fn extract_mempool_stats(line: &str) -> Option<(u64, u64)> {
+    let mut txs = None;
+    let mut bytes = None;
+    for token in line.split_whitespace() {
+        if let Some(v) = token.strip_prefix("size=") {
+            txs = v.parse::<u64>().ok();
+        }
+        if let Some(v) = token.strip_prefix("txs=") {
+            txs = v.parse::<u64>().ok();
+        }
+        if let Some(v) = token.strip_prefix("bytes=") {
+            bytes = v.parse::<u64>().ok();
+        }
+    }
+    match (txs, bytes) {
+        (Some(t), Some(b)) => Some((t, b)),
+        _ => None,
+    }
+}
+
+/// Scrape store statistics from a log line.
+/// Looks for key=value pairs after "store:".
+fn extract_store_stats(line: &str) -> Option<Vec<(String, String)>> {
+    if !line.contains("store:") {
+        return None;
+    }
+    let after = line.rsplit_once(':').map(|(_, s)| s.trim())?;
+    let mut pairs = Vec::new();
+    for token in after.split_whitespace() {
+        if let Some((k, v)) = token.split_once('=') {
+            if !k.is_empty() && !v.is_empty() {
+                pairs.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs)
     }
 }
 

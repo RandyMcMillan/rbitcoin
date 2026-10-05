@@ -118,7 +118,8 @@ impl Snapshot {
                 )),
             }
         }
-        let endpoint = endpoint.unwrap_or_else(|| RpcEndpoint::Unix(PathBuf::from("./datadir/rpc.sock")));
+        let endpoint =
+            endpoint.unwrap_or_else(|| RpcEndpoint::Unix(PathBuf::from("./datadir/rpc.sock")));
         let warnings = chain
             .as_ref()
             .ok()

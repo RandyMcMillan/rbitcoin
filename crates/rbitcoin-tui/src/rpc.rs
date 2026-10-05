@@ -177,6 +177,21 @@ impl PeerInfo {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct NetTotals {
+    pub total_bytes_recv: u64,
+    pub total_bytes_sent: u64,
+}
+
+impl NetTotals {
+    pub fn from_value(v: Value) -> Result<Self, String> {
+        Ok(Self {
+            total_bytes_recv: u64_field(&v, "totalbytesrecv").unwrap_or(0),
+            total_bytes_sent: u64_field(&v, "totalbytessent").unwrap_or(0),
+        })
+    }
+}
+
 pub fn parse_http_url(url: &str) -> Result<(String, u16), String> {
     let rest = url
         .strip_prefix("http://")

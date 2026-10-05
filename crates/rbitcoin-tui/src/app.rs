@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::rpc::{
-    parse_http_url, BlockchainInfo, MempoolInfo, NetworkInfo, PeerInfo, RpcEndpoint,
+    parse_http_url, BlockchainInfo, MempoolInfo, NetTotals, NetworkInfo, PeerInfo, RpcEndpoint,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use std::collections::VecDeque;

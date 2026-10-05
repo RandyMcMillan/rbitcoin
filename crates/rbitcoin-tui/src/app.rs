@@ -198,6 +198,7 @@ pub struct App {
     pub log_store_stats: Vec<(String, String)>,
     pub log_last_warn: Option<String>,
     pub log_last_error: Option<String>,
+    pub log_peer_events: VecDeque<String>,
     pub node_spawned_at: Option<Instant>,
     pub node_pid: Option<u32>,
     pub command_input: String,
@@ -235,6 +236,7 @@ impl App {
             log_store_stats: Vec::new(),
             log_last_warn: None,
             log_last_error: None,
+            log_peer_events: VecDeque::with_capacity(100),
             node_spawned_at: None,
             node_pid: None,
             command_input: String::new(),
@@ -308,6 +310,12 @@ impl App {
                 }
                 if line.contains(" ERROR ") {
                     self.log_last_error = Some(line.clone());
+                }
+                if is_peer_event(&line) {
+                    if self.log_peer_events.len() >= 100 {
+                        self.log_peer_events.pop_front();
+                    }
+                    self.log_peer_events.push_back(line);
                 }
             }
         }
@@ -677,6 +685,19 @@ fn extract_store_stats(line: &str) -> Option<Vec<(String, String)>> {
     } else {
         Some(pairs)
     }
+}
+
+/// Heuristic: does a log line describe a peer connect/disconnect event?
+fn is_peer_event(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("peer")
+        && (lower.contains("connect")
+            || lower.contains("disconnect")
+            || lower.contains("drop")
+            || lower.contains("ban")
+            || lower.contains("handshake")
+            || lower.contains("version")
+            || lower.contains("verack"))
 }
 
 #[cfg(test)]

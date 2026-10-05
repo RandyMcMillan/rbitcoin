@@ -1,5 +1,5 @@
 use crate::app::{App, Tab};
-use crate::theme::{BLACK, BRIGHT_CYAN, BRIGHT_GREEN, BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_YELLOW, DARK_BG, ERROR, MID_GRAY, MUTED, OK, THEME, WARN, WHITE};
+use crate::theme::{BLACK, BRIGHT_CYAN, BRIGHT_GREEN, BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_YELLOW, DARK_BG, ERROR, LIGHT_GRAY, MID_GRAY, MUTED, OK, THEME, WARN, WHITE};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
@@ -654,29 +654,64 @@ impl AppWidget<'_> {
                 }
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
-                let mut msg = String::new();
-                if let Some(ref op) = self.app.startup_operation {
-                    let _ = writeln!(msg, "node is initializing: {op}");
+                if self.app.log_peer_events.is_empty() {
+                    let mut msg = String::new();
+                    if let Some(ref op) = self.app.startup_operation {
+                        let _ = writeln!(msg, "node is initializing: {op}");
+                    }
+                    if let Some((cur, tot)) = self.app.startup_progress {
+                        let _ = writeln!(msg, "progress: {cur}/{tot}");
+                    }
+                    if let Some(h) = self.app.startup_height {
+                        let _ = writeln!(msg, "height: {h}");
+                    }
+                    if msg.is_empty() {
+                        msg = "waiting for peer data…".into();
+                    }
+                    Paragraph::new(msg)
+                        .block(
+                            Block::bordered()
+                                .title(" Peers ")
+                                .title_style(THEME.description_title)
+                                .border_style(THEME.borders),
+                        )
+                        .style(MUTED)
+                        .wrap(Wrap { trim: true })
+                        .render(area, buf);
+                } else {
+                    let header = Row::new(vec!["Event"])
+                        .style(THEME.table.header)
+                        .height(1);
+                    let visible = area.height.saturating_sub(3) as usize;
+                    let rows: Vec<Row<'_>> = self
+                        .app
+                        .log_peer_events
+                        .iter()
+                        .rev()
+                        .take(visible)
+                        .rev()
+                        .map(|line| {
+                            let color = if line.contains("disconnect") || line.contains("drop") || line.contains("ban") {
+                                BRIGHT_RED
+                            } else if line.contains("connect") || line.contains("handshake") {
+                                BRIGHT_GREEN
+                            } else {
+                                THEME.content.fg.unwrap_or(LIGHT_GRAY)
+                            };
+                            Row::new(vec![Cell::from(line.as_str()).style(Style::new().fg(color))])
+                                .height(1)
+                        })
+                        .collect();
+                    let table = Table::new(rows, [Constraint::Min(0)])
+                        .header(header)
+                        .block(
+                            Block::bordered()
+                                .title(" Peers (from logs) ")
+                                .title_style(THEME.description_title)
+                                .border_style(THEME.borders),
+                        );
+                    ratatui::widgets::Widget::render(table, area, buf);
                 }
-                if let Some((cur, tot)) = self.app.startup_progress {
-                    let _ = writeln!(msg, "progress: {cur}/{tot}");
-                }
-                if let Some(h) = self.app.startup_height {
-                    let _ = writeln!(msg, "height: {h}");
-                }
-                if msg.is_empty() {
-                    msg = "waiting for peer data…".into();
-                }
-                Paragraph::new(msg)
-                    .block(
-                        Block::bordered()
-                            .title(" Peers ")
-                            .title_style(THEME.description_title)
-                            .border_style(THEME.borders),
-                    )
-                    .style(MUTED)
-                    .wrap(Wrap { trim: true })
-                    .render(area, buf);
             }
             Err(ref e) => {
                 Paragraph::new(format!("Error: {e}"))

@@ -83,6 +83,8 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
                     &app.config.node_args,
                 ) {
                     Ok((child, rx)) => {
+                        app.node_pid = Some(child.id());
+                        app.node_spawned_at = Some(std::time::Instant::now());
                         app.node_child = Some(child);
                         app.log_rx = Some(rx);
                         true

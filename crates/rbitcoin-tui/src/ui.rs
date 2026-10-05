@@ -85,11 +85,16 @@ impl AppWidget<'_> {
         let chunks = layout.split(area);
         let summary = chunks[0];
         let gauges = chunks[1];
-        let mempool = chunks[2];
+        let bottom = chunks[2];
 
         self.render_summary_card(summary, buf);
         self.render_gauges_row(gauges, buf);
-        self.render_mempool_sparkline(mempool, buf);
+
+        let bottom_layout =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]);
+        let bottom_chunks = bottom_layout.split(bottom);
+        self.render_mempool_sparkline(bottom_chunks[0], buf);
+        self.render_mini_log(bottom_chunks[1], buf);
     }
 
     fn render_summary_card(&self, area: Rect, buf: &mut Buffer) {
@@ -129,6 +134,20 @@ impl AppWidget<'_> {
             "not started".into()
         };
         let _ = writeln!(left_text, "node: {node_status}");
+        if let Some(pid) = self.app.node_pid {
+            let _ = writeln!(left_text, "pid: {pid}");
+        }
+        if let Some(started) = self.app.node_spawned_at {
+            let uptime = format_elapsed(started.elapsed());
+            let _ = writeln!(left_text, "uptime: {uptime}");
+        }
+        if let Ok(meta) = std::fs::metadata(&self.app.config.datadir) {
+            if meta.is_dir() {
+                if let Ok(size) = dir_size(&self.app.config.datadir) {
+                    let _ = writeln!(left_text, "datadir: {}", human_bytes(size));
+                }
+            }
+        }
         // Show startup telemetry while the node is starting and RPC isn't up.
         if self.app.node_child.is_some()
             && self.app.node_exit_code.is_none()
@@ -343,6 +362,27 @@ impl AppWidget<'_> {
             .alignment(Alignment::Right)
             .wrap(Wrap { trim: true })
             .render(stats_area, buf);
+    }
+
+    fn render_mini_log(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::bordered()
+            .title(" Latest Logs ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let visible = inner.height as usize;
+        let lines: Vec<Line<'_>> = self
+            .app
+            .console_lines
+            .iter()
+            .rev()
+            .take(visible)
+            .rev()
+            .map(|line| console_line(line))
+            .collect();
+        Paragraph::new(lines).render(inner, buf);
     }
 
     fn render_chain(&self, area: Rect, buf: &mut Buffer) {
@@ -844,6 +884,7 @@ impl AppWidget<'_> {
 }
 
 fn console_line(line: &str) -> Line<'_> {
+    // Level-based colors take priority for errors/warnings.
     let style = if line.contains(" ERROR ") {
         ERROR
     } else if line.contains(" WARN ") {
@@ -851,9 +892,37 @@ fn console_line(line: &str) -> Line<'_> {
     } else if line.contains(" DEBUG ") || line.contains(" TRACE ") {
         MUTED
     } else {
-        THEME.content
+        // Module-based tint for INFO lines.
+        if line.contains(" store:") || line.contains(" store::") {
+            Style::new().fg(BRIGHT_GREEN)
+        } else if line.contains(" net:") || line.contains(" net::") {
+            Style::new().fg(BRIGHT_CYAN)
+        } else if line.contains(" mempool:") || line.contains(" mempool::") {
+            Style::new().fg(BRIGHT_MAGENTA)
+        } else if line.contains(" chain:") || line.contains(" chain::") {
+            Style::new().fg(BRIGHT_YELLOW)
+        } else if line.contains(" node:") || line.contains(" node::") {
+            Style::new().fg(WHITE)
+        } else {
+            THEME.content
+        }
     };
     Line::from(Span::styled(line.to_string(), style))
+}
+
+/// Recursively calculate directory size.
+fn dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
 }
 
 fn render_bottom_bar(area: Rect, buf: &mut Buffer) {

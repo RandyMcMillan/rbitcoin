@@ -198,6 +198,8 @@ pub struct App {
     pub log_store_stats: Vec<(String, String)>,
     pub log_last_warn: Option<String>,
     pub log_last_error: Option<String>,
+    pub node_spawned_at: Option<Instant>,
+    pub node_pid: Option<u32>,
     pub command_input: String,
     pub cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
@@ -233,6 +235,8 @@ impl App {
             log_store_stats: Vec::new(),
             log_last_warn: None,
             log_last_error: None,
+            node_spawned_at: None,
+            node_pid: None,
             command_input: String::new(),
             cmd_rx: None,
         }

@@ -11,6 +11,8 @@ pub struct Config {
     pub rpc_token_file: Option<PathBuf>,
     pub interval: Duration,
     pub once: bool,
+    pub start_node: bool,
+    pub node_binary: Option<PathBuf>,
 }
 
 impl Config {
@@ -21,6 +23,8 @@ impl Config {
         let mut rpc_token_file = None;
         let mut interval = DEFAULT_INTERVAL;
         let mut once = false;
+        let mut start_node = false;
+        let mut node_binary = None;
 
         let mut iter = args.into_iter();
         let _ = iter.next();
@@ -57,6 +61,10 @@ impl Config {
                     }
                 }
                 "--once" => once = true,
+                "--start-node" => start_node = true,
+                "--node-binary" => {
+                    node_binary = Some(PathBuf::from(take_value(&mut iter, "--node-binary")?));
+                }
                 other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
                 other => return Err(format!("unexpected argument `{other}`")),
             }
@@ -69,6 +77,8 @@ impl Config {
             rpc_token_file,
             interval,
             once,
+            start_node,
+            node_binary,
         })
     }
 }
@@ -85,6 +95,8 @@ Options:
   --rpc-token-file PATH RPC bearer token file for TCP (default PATH/rpc.token)
   --interval SECONDS    refresh interval (default 1)
   --once                print one snapshot and exit
+  --start-node          start rbitcoin-node if no RPC endpoint responds
+  --node-binary PATH    path to rbitcoin-node binary (default: rbitcoin-node in PATH)
   -h, --help            show this help
   -V, --version         print version
 ";
@@ -126,5 +138,29 @@ mod tests {
         ];
         let cfg = Config::parse(args).expect("parse");
         assert!(cfg.once);
+    }
+
+    #[test]
+    fn parse_start_node_flag() {
+        let args = vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--start-node"),
+        ];
+        let cfg = Config::parse(args).expect("parse");
+        assert!(cfg.start_node);
+    }
+
+    #[test]
+    fn parse_node_binary() {
+        let args = vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--node-binary"),
+            std::ffi::OsString::from("/usr/local/bin/rbitcoin-node"),
+        ];
+        let cfg = Config::parse(args).expect("parse");
+        assert_eq!(
+            cfg.node_binary,
+            Some(PathBuf::from("/usr/local/bin/rbitcoin-node"))
+        );
     }
 }

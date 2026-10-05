@@ -256,7 +256,7 @@ where
                     "rbitcoin-node {} on {} datadir={}",
                     env!("CARGO_PKG_VERSION"),
                     handle.network_name(),
-                    handle.config.datadir.path().display()
+                    handle.config.datadir_path().display()
                 );
                 if std::env::var_os("RBITCOIN_TEST_DROP_STORE").is_some() {
                     let _ = std::fs::remove_dir_all(handle.config.store_path());

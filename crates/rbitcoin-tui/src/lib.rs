@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod rpc;
+pub mod theme;
 pub mod ui;
 
 use crossterm::event::{self};

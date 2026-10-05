@@ -11,7 +11,6 @@ pub struct Config {
     pub rpc_token_file: Option<PathBuf>,
     pub interval: Duration,
     pub once: bool,
-    pub start_node: bool,
     pub node_binary: Option<PathBuf>,
     pub node_args: Vec<String>,
 }
@@ -24,7 +23,6 @@ impl Config {
         let mut rpc_token_file = None;
         let mut interval = DEFAULT_INTERVAL;
         let mut once = false;
-        let mut start_node = false;
         let mut node_binary = None;
         let mut node_args = Vec::new();
 
@@ -63,7 +61,6 @@ impl Config {
                     }
                 }
                 "--once" => once = true,
-                "--start-node" => start_node = true,
                 "--node-binary" => {
                     node_binary = Some(PathBuf::from(take_value(&mut iter, "--node-binary")?));
                 }
@@ -78,26 +75,30 @@ impl Config {
             rpc_token_file,
             interval,
             once,
-            start_node,
             node_binary,
             node_args,
         })
+    }
+
+    /// Whether the user explicitly configured an external RPC endpoint.
+    pub fn has_external_rpc(&self) -> bool {
+        self.rpc_url.is_some() || self.rpc_socket.is_some()
     }
 }
 
 const USAGE: &str = "\
 rbitcoin-tui [OPTIONS] [NODE_OPTIONS...]
 
-TUI client for a running rbitcoin node JSON-RPC endpoint.
+Full-node TUI for rbitcoin. The node is started automatically;
+unknown arguments are passed through to the node binary.
 
 TUI Options:
-  --datadir PATH        node datadir (default ./datadir); local socket is PATH/rpc.sock
-  --rpc-socket PATH     unix socket the node binds with --rpc-socket
-  --rpc-url URL         HTTP RPC endpoint (for example http://127.0.0.1:8332)
+  --datadir PATH        node datadir (default ./datadir)
+  --rpc-socket PATH     connect to an existing node unix socket
+  --rpc-url URL         connect to an existing node HTTP endpoint
   --rpc-token-file PATH RPC bearer token file for TCP (default PATH/rpc.token)
   --interval SECONDS    refresh interval (default 1)
   --once                print one snapshot and exit
-  --start-node          start rbitcoin-node if no RPC endpoint responds
   --node-binary PATH    path to rbitcoin-node binary (default: rbitcoin-node in PATH)
   -h, --help            show this help
   -V, --version         print version
@@ -148,16 +149,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_start_node_flag() {
-        let args = vec![
-            std::ffi::OsString::from("rbitcoin-tui"),
-            std::ffi::OsString::from("--start-node"),
-        ];
-        let cfg = Config::parse(args).expect("parse");
-        assert!(cfg.start_node);
-    }
-
-    #[test]
     fn parse_node_binary() {
         let args = vec![
             std::ffi::OsString::from("rbitcoin-tui"),
@@ -175,17 +166,37 @@ mod tests {
     fn parse_passes_unknown_args_to_node() {
         let args = vec![
             std::ffi::OsString::from("rbitcoin-tui"),
-            std::ffi::OsString::from("--start-node"),
             std::ffi::OsString::from("--signet"),
             std::ffi::OsString::from("--listen"),
             std::ffi::OsString::from("0.0.0.0:38333"),
             std::ffi::OsString::from("--rpc"),
         ];
         let cfg = Config::parse(args).expect("parse");
-        assert!(cfg.start_node);
         assert_eq!(
             cfg.node_args,
             vec!["--signet", "--listen", "0.0.0.0:38333", "--rpc"]
         );
+    }
+
+    #[test]
+    fn has_external_rpc_detects_explicit_endpoint() {
+        let with_url = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--rpc-url"),
+            std::ffi::OsString::from("http://127.0.0.1:8332"),
+        ])
+        .expect("parse");
+        assert!(with_url.has_external_rpc());
+
+        let with_socket = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--rpc-socket"),
+            std::ffi::OsString::from("/tmp/rpc.sock"),
+        ])
+        .expect("parse");
+        assert!(with_socket.has_external_rpc());
+
+        let plain = Config::parse(vec![std::ffi::OsString::from("rbitcoin-tui")]).expect("parse");
+        assert!(!plain.has_external_rpc());
     }
 }

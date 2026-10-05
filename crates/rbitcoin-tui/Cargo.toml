@@ -16,6 +16,8 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }
 mimalloc = { workspace = true }
+rbitcoin-node = { workspace = true }
+rbitcoin-log = { workspace = true }
 
 [lints]
 workspace = true

@@ -61,6 +61,10 @@ impl Config {
                     }
                 }
                 "--once" => once = true,
+                "--start-node" => {
+                    // Legacy no-op. Node startup is now automatic; do not pass
+                    // this through to the node binary.
+                }
                 "--node-binary" => {
                     node_binary = Some(PathBuf::from(take_value(&mut iter, "--node-binary")?));
                 }

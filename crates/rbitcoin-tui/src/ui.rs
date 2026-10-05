@@ -389,7 +389,12 @@ impl AppWidget<'_> {
                     .line_set(symbols::line::THICK);
                 gauge.render(gauge_area, buf);
 
-                let placeholder = Paragraph::new("waiting for chain data…")
+                let msg = if let Some(h) = self.app.startup_height {
+                    format!("node is initializing…\nlast height seen in logs: {h}")
+                } else {
+                    "node is initializing…".into()
+                };
+                let placeholder = Paragraph::new(msg)
                     .style(MUTED)
                     .alignment(Alignment::Center);
                 placeholder.render(info_area, buf);

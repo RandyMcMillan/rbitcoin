@@ -186,6 +186,7 @@ pub struct App {
     pub console_scroll: usize,
     pub spawn_attempted: bool,
     pub spawn_error: Option<String>,
+    pub startup_height: Option<u64>,
 }
 
 impl App {
@@ -209,6 +210,7 @@ impl App {
             console_scroll: 0,
             spawn_attempted: false,
             spawn_error: None,
+            startup_height: None,
         }
     }
 
@@ -254,7 +256,10 @@ impl App {
                 if self.console_lines.len() >= CONSOLE_CAPACITY {
                     self.console_lines.pop_front();
                 }
-                self.console_lines.push_back(line);
+                self.console_lines.push_back(line.clone());
+                if let Some(h) = extract_height(&line) {
+                    self.startup_height = Some(h);
+                }
             }
         }
         self.next_refresh = Instant::now() + self.interval;
@@ -417,6 +422,24 @@ impl Config {
         endpoints.push(RpcEndpoint::Unix(self.datadir.join("rpc.sock")));
         endpoints
     }
+}
+
+/// Scrape a block height from a node stderr line.
+/// Looks for `height=NNNN` or `blocks=NNNN` tokens.
+fn extract_height(line: &str) -> Option<u64> {
+    for token in line.split_whitespace() {
+        if let Some(val) = token.strip_prefix("height=") {
+            if let Ok(h) = val.parse::<u64>() {
+                return Some(h);
+            }
+        }
+        if let Some(val) = token.strip_prefix("blocks=") {
+            if let Ok(h) = val.parse::<u64>() {
+                return Some(h);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

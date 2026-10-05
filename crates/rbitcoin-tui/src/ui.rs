@@ -374,11 +374,25 @@ impl AppWidget<'_> {
                     .wrap(Wrap { trim: true });
                 para.render(info_area, buf);
             }
-            Err(err) => {
-                let para = Paragraph::new(format!("Error: {err}"))
-                    .style(ERROR)
-                    .wrap(Wrap { trim: true });
-                para.render(gauge_area, buf);
+            Err(_) => {
+                let gauge = LineGauge::default()
+                    .block(
+                        Block::bordered()
+                            .title(" Sync Progress ")
+                            .title_style(THEME.description_title)
+                            .border_style(THEME.borders),
+                    )
+                    .filled_style(Style::new().fg(MID_GRAY))
+                    .unfilled_style(Style::new().fg(MID_GRAY))
+                    .ratio(0.0)
+                    .label("starting…")
+                    .line_set(symbols::line::THICK);
+                gauge.render(gauge_area, buf);
+
+                let placeholder = Paragraph::new("waiting for chain data…")
+                    .style(MUTED)
+                    .alignment(Alignment::Center);
+                placeholder.render(info_area, buf);
             }
         }
     }
@@ -422,9 +436,9 @@ impl AppWidget<'_> {
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
-            Err(err) => {
-                Paragraph::new(format!("Error: {err}"))
-                    .style(ERROR)
+            Err(_) => {
+                Paragraph::new("waiting for network data…")
+                    .style(MUTED)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
@@ -515,15 +529,15 @@ impl AppWidget<'_> {
                     scrollbar.render(sb_area, buf, &mut sb_state);
                 }
             }
-            Err(err) => {
-                Paragraph::new(format!("Error: {err}"))
+            Err(_) => {
+                Paragraph::new("waiting for peer data…")
                     .block(
                         Block::bordered()
                             .title(" Peers ")
                             .title_style(THEME.description_title)
                             .border_style(THEME.borders),
                     )
-                    .style(ERROR)
+                    .style(MUTED)
                     .wrap(Wrap { trim: true })
                     .render(area, buf);
             }
@@ -628,9 +642,9 @@ impl AppWidget<'_> {
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
-            Err(err) => {
-                Paragraph::new(format!("Error: {err}"))
-                    .style(ERROR)
+            Err(_) => {
+                Paragraph::new("waiting for mempool data…")
+                    .style(MUTED)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }

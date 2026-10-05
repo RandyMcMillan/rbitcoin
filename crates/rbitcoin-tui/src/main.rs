@@ -698,7 +698,19 @@ fn rpc_http(
 ) -> Result<String, String> {
     let auth_h = match auth {
         Some(token) => {
-            return rpc_http_with_auth(stream, host, port, token, body);
+            let req = format!(
+                "POST / HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut wire = req.into_bytes();
+            wire.extend_from_slice(body);
+            stream.write_all(&wire).map_err(|e| format!("write: {e}"))?;
+            let mut buf = Vec::new();
+            stream
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("read: {e}"))?;
+            let text = String::from_utf8(buf).map_err(|e| format!("utf-8: {e}"))?;
+            return parse_http_response(&text);
         }
         None => "",
     };

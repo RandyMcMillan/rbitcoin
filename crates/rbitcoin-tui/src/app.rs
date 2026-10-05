@@ -554,7 +554,7 @@ fn extract_operation(line: &str) -> Option<String> {
     let words: Vec<&str> = after_colon
         .split_whitespace()
         .take_while(|w| {
-            !w.parse::<u64>().is_ok()
+            w.parse::<u64>().is_err()
                 && !w.contains('/')
                 && !w.starts_with("height=")
                 && !w.starts_with("blocks=")

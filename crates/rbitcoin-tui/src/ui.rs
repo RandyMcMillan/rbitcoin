@@ -127,6 +127,17 @@ impl AppWidget<'_> {
             "not started".into()
         };
         let _ = writeln!(left_text, "node: {node_status}");
+        if self.app.snapshot.chain.is_err() {
+            if let Some(ref op) = self.app.startup_operation {
+                let _ = writeln!(left_text, "op: {op}");
+            }
+            if let Some((cur, tot)) = self.app.startup_progress {
+                let _ = writeln!(left_text, "progress: {cur}/{tot}");
+            }
+            if let Some(h) = self.app.startup_height {
+                let _ = writeln!(left_text, "height: {h}");
+            }
+        }
         Paragraph::new(left_text)
             .style(THEME.content)
             .wrap(Wrap { trim: true })

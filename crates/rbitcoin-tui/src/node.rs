@@ -23,10 +23,17 @@ pub fn find_node_binary(explicit: Option<&Path>) -> PathBuf {
 }
 
 /// Spawn the node as a child process and return a channel that receives stderr lines.
-pub fn spawn_node(datadir: &Path, binary: Option<&Path>) -> Result<(Child, Receiver<String>), String> {
+pub fn spawn_node(
+    datadir: &Path,
+    binary: Option<&Path>,
+    node_args: &[String],
+) -> Result<(Child, Receiver<String>), String> {
     let bin = find_node_binary(binary);
     let mut cmd = Command::new(&bin);
     cmd.arg("--datadir").arg(datadir);
+    for arg in node_args {
+        cmd.arg(arg);
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());

@@ -94,7 +94,11 @@ fn spawn_node_if_needed(app: &mut app::App) {
     if snapshot.chain.is_ok() || snapshot.network.is_ok() {
         return;
     }
-    match node::spawn_node(&app.config.datadir, app.config.node_binary.as_deref()) {
+    match node::spawn_node(
+        &app.config.datadir,
+        app.config.node_binary.as_deref(),
+        &app.config.node_args,
+    ) {
         Ok((child, rx)) => {
             app.node_child = Some(child);
             app.log_rx = Some(rx);

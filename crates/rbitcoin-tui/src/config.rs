@@ -13,6 +13,7 @@ pub struct Config {
     pub once: bool,
     pub start_node: bool,
     pub node_binary: Option<PathBuf>,
+    pub node_args: Vec<String>,
 }
 
 impl Config {
@@ -25,6 +26,7 @@ impl Config {
         let mut once = false;
         let mut start_node = false;
         let mut node_binary = None;
+        let mut node_args = Vec::new();
 
         let mut iter = args.into_iter();
         let _ = iter.next();
@@ -65,8 +67,7 @@ impl Config {
                 "--node-binary" => {
                     node_binary = Some(PathBuf::from(take_value(&mut iter, "--node-binary")?));
                 }
-                other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
-                other => return Err(format!("unexpected argument `{other}`")),
+                other => node_args.push(other.to_string()),
             }
         }
 
@@ -79,16 +80,17 @@ impl Config {
             once,
             start_node,
             node_binary,
+            node_args,
         })
     }
 }
 
 const USAGE: &str = "\
-rbitcoin-tui [OPTIONS]
+rbitcoin-tui [OPTIONS] [NODE_OPTIONS...]
 
 TUI client for a running rbitcoin node JSON-RPC endpoint.
 
-Options:
+TUI Options:
   --datadir PATH        node datadir (default ./datadir); local socket is PATH/rpc.sock
   --rpc-socket PATH     unix socket the node binds with --rpc-socket
   --rpc-url URL         HTTP RPC endpoint (for example http://127.0.0.1:8332)
@@ -99,6 +101,11 @@ Options:
   --node-binary PATH    path to rbitcoin-node binary (default: rbitcoin-node in PATH)
   -h, --help            show this help
   -V, --version         print version
+
+Node Options:
+  Any unknown argument is passed through to rbitcoin-node.
+  Examples: --signet, --regtest, --listen ADDR, --connect ADDR,
+  --rpc, --rest, --log-level LEVEL, --prune-seqsigwit, etc.
 ";
 
 fn take_value(
@@ -161,6 +168,24 @@ mod tests {
         assert_eq!(
             cfg.node_binary,
             Some(PathBuf::from("/usr/local/bin/rbitcoin-node"))
+        );
+    }
+
+    #[test]
+    fn parse_passes_unknown_args_to_node() {
+        let args = vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--start-node"),
+            std::ffi::OsString::from("--signet"),
+            std::ffi::OsString::from("--listen"),
+            std::ffi::OsString::from("0.0.0.0:38333"),
+            std::ffi::OsString::from("--rpc"),
+        ];
+        let cfg = Config::parse(args).expect("parse");
+        assert!(cfg.start_node);
+        assert_eq!(
+            cfg.node_args,
+            vec!["--signet", "--listen", "0.0.0.0:38333", "--rpc"]
         );
     }
 }

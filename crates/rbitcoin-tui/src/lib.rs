@@ -65,7 +65,9 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
         }
         if Instant::now() >= app.next_refresh {
             if let Some(ref mut child) = app.node_child {
-                app.node_exit_code = node::check_child(child);
+                if app.node_exit_code.is_none() {
+                    app.node_exit_code = node::check_child(child);
+                }
             }
 
             // Auto-spawn the node if no external RPC is configured, no child is

@@ -228,7 +228,8 @@ impl AppWidget<'_> {
         let block = Block::bordered()
             .title(" Verification Progress ")
             .title_style(THEME.description_title)
-            .border_style(THEME.borders);
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
         let inner = block.inner(left);
         block.render(left, buf);
 
@@ -243,25 +244,26 @@ impl AppWidget<'_> {
                     BRIGHT_RED
                 };
                 let label = format!("{:.2}%", ratio * 100.0);
-                let gauge = Gauge::default()
-                    .gauge_style(
-                        Style::new()
-                            .fg(color)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .ratio(ratio)
-                    .label(label)
-                    .use_unicode(true);
-                gauge.render(inner, buf);
+                let bar_width = inner.width.saturating_sub(2) as usize;
+                let bar = block_bar(ratio, bar_width.max(1));
+                let bar_line = Line::from(vec![
+                    Span::styled(bar, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {label}"), Style::new().fg(WHITE)),
+                ]);
+                let bar_para = Paragraph::new(bar_line).alignment(Alignment::Center);
+                bar_para.render(inner, buf);
 
                 self.render_dashboard_network(right, buf, Some(chain));
             }
             Err(_) => {
-                let gauge = Gauge::default()
-                    .gauge_style(Style::new().fg(MID_GRAY))
-                    .ratio(0.0)
-                    .label("starting…");
-                gauge.render(inner, buf);
+                let bar_width = inner.width.saturating_sub(2) as usize;
+                let bar = block_bar(0.0, bar_width.max(1));
+                let bar_line = Line::from(vec![
+                    Span::styled(bar, Style::new().fg(MID_GRAY)),
+                    Span::styled("  starting…", Style::new().fg(WHITE)),
+                ]);
+                let bar_para = Paragraph::new(bar_line).alignment(Alignment::Center);
+                bar_para.render(inner, buf);
 
                 self.render_dashboard_network(right, buf, None);
             }
@@ -497,11 +499,16 @@ impl AppWidget<'_> {
     }
 
     fn render_network(&self, area: Rect, buf: &mut Buffer) {
-        let layout =
-            Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).margin(1);
+        let layout = Layout::vertical([
+            Constraint::Length(7),
+            Constraint::Length(12),
+            Constraint::Min(0),
+        ])
+        .margin(1);
         let chunks = layout.split(area);
         let summary = chunks[0];
-        let peers = chunks[1];
+        let map_area = chunks[1];
+        let peers = chunks[2];
 
         let outer = Block::bordered()
             .border_style(THEME.borders)
@@ -510,6 +517,7 @@ impl AppWidget<'_> {
         outer.render(area, buf);
 
         self.render_net_summary(summary, buf);
+        self.render_peer_map(map_area, buf);
         self.render_peer_table(peers, buf);
     }
 
@@ -726,6 +734,58 @@ impl AppWidget<'_> {
                     .render(area, buf);
             }
         }
+    }
+
+    fn render_peer_map(&self, area: Rect, buf: &mut Buffer) {
+        use ratatui::widgets::canvas::Canvas;
+
+        let block = Block::bordered()
+            .title(" Peer Map ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.width < 10 || inner.height < 4 {
+            return;
+        }
+
+        let peers = match &self.app.snapshot.peers {
+            Ok(p) if !p.is_empty() => p.clone(),
+            _ => {
+                let placeholder = Paragraph::new("no peers yet…")
+                    .style(MUTED)
+                    .alignment(Alignment::Center);
+                placeholder.render(inner, buf);
+                return;
+            }
+        };
+
+        let w = inner.width as f64;
+        let h = inner.height as f64;
+        let cx = w / 2.0;
+        let cy = h / 2.0;
+        let radius = (w.min(h) / 2.0) * 0.75;
+
+        Canvas::default()
+            .x_bounds([0.0, w])
+            .y_bounds([0.0, h])
+            .paint(|ctx| {
+                // Draw our node in the center
+                ctx.print(cx, cy, Span::styled("◉", Style::default().fg(BRIGHT_YELLOW)));
+
+                // Draw peers in a circle
+                let n = peers.len().max(1) as f64;
+                for (i, peer) in peers.iter().enumerate() {
+                    let angle = (i as f64 / n) * 2.0 * std::f64::consts::PI;
+                    let px = cx + radius * angle.cos();
+                    let py = cy + radius * angle.sin() * 0.6; // flatten for terminal aspect ratio
+                    let symbol = if peer.inbound { "◆" } else { "●" };
+                    let color = if peer.inbound { BRIGHT_CYAN } else { BRIGHT_GREEN };
+                    ctx.print(px, py, Span::styled(symbol, Style::default().fg(color)));
+                }
+            })
+            .render(inner, buf);
     }
 
     fn render_mempool(&self, area: Rect, buf: &mut Buffer) {
@@ -1049,6 +1109,27 @@ fn format_elapsed(duration: Duration) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+fn block_bar(ratio: f64, width: usize) -> String {
+    let filled = (ratio * width as f64).clamp(0.0, width as f64) as usize;
+    let empty = width.saturating_sub(filled);
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn text_bar(value: u64, max: u64, width: usize, color: ratatui::style::Color) -> Line<'static> {
+    let ratio = if max > 0 {
+        value as f64 / max as f64
+    } else {
+        0.0
+    };
+    let filled = (ratio * width as f64).clamp(0.0, width as f64) as usize;
+    let empty = width.saturating_sub(filled);
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+    Line::from(vec![
+        Span::styled(bar, Style::new().fg(color)),
+        Span::styled(format!(" {:.1}%", ratio * 100.0), Style::new().fg(LIGHT_GRAY)),
+    ])
 }
 
 fn human_bytes(bytes: u64) -> String {

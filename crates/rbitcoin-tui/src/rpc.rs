@@ -32,6 +32,12 @@ pub struct BlockchainInfo {
     pub headers: u64,
     pub verification_progress: f64,
     pub initial_block_download: bool,
+    pub bestblockhash: String,
+    pub difficulty: f64,
+    pub mediantime: u64,
+    pub chainwork: String,
+    pub pruned: bool,
+    pub size_on_disk: u64,
     pub warnings: Option<String>,
 }
 
@@ -43,6 +49,12 @@ impl BlockchainInfo {
             headers: u64_field(&v, "headers")?,
             verification_progress: f64_field(&v, "verificationprogress")?,
             initial_block_download: bool_field(&v, "initialblockdownload")?,
+            bestblockhash: string_field(&v, "bestblockhash").unwrap_or_default(),
+            difficulty: f64_field(&v, "difficulty").unwrap_or(0.0),
+            mediantime: u64_field(&v, "mediantime").unwrap_or(0),
+            chainwork: string_field(&v, "chainwork").unwrap_or_default(),
+            pruned: bool_field(&v, "pruned").unwrap_or(false),
+            size_on_disk: u64_field(&v, "size_on_disk").unwrap_or(0),
             warnings: optional_string_field(&v, "warnings")?,
         })
     }
@@ -50,18 +62,43 @@ impl BlockchainInfo {
 
 #[derive(Clone, Debug)]
 pub struct NetworkInfo {
+    pub version: u64,
+    pub subversion: String,
+    pub protocolversion: u64,
     pub connections_in: u64,
     pub connections_out: u64,
     pub timeoffset: i64,
+    pub relayfee: f64,
+    pub networkactive: bool,
+    pub localaddresses: Vec<String>,
     pub warnings: Option<String>,
 }
 
 impl NetworkInfo {
     pub fn from_value(v: Value) -> Result<Self, String> {
+        let localaddresses = v
+            .get("localaddresses")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        a.get("address")
+                            .and_then(Value::as_str)
+                            .map(|s| s.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
+            version: u64_field(&v, "version").unwrap_or(0),
+            subversion: string_field(&v, "subversion").unwrap_or_default(),
+            protocolversion: u64_field(&v, "protocolversion").unwrap_or(0),
             connections_in: u64_field(&v, "connections_in")?,
             connections_out: u64_field(&v, "connections_out")?,
             timeoffset: i64_field(&v, "timeoffset")?,
+            relayfee: f64_field(&v, "relayfee").unwrap_or(0.0),
+            networkactive: bool_field(&v, "networkactive").unwrap_or(true),
+            localaddresses,
             warnings: optional_string_field(&v, "warnings")?,
         })
     }
@@ -71,9 +108,13 @@ impl NetworkInfo {
 pub struct MempoolInfo {
     pub transactions: u64,
     pub bytes: u64,
+    pub usage: u64,
     pub maxmempool: u64,
     pub min_fee_sat_vb: f64,
+    pub total_fee: f64,
     pub unbroadcast: u64,
+    pub ancestorlimit: u64,
+    pub descendantlimit: u64,
 }
 
 impl MempoolInfo {
@@ -82,9 +123,13 @@ impl MempoolInfo {
         Ok(Self {
             transactions: u64_field(&v, "size")?,
             bytes: u64_field(&v, "bytes")?,
+            usage: u64_field(&v, "usage").unwrap_or(0),
             maxmempool: u64_field(&v, "maxmempool")?,
             min_fee_sat_vb: min_fee_btc_kvb * 100_000_000.0 / 1000.0,
+            total_fee: f64_field(&v, "totalfee").unwrap_or(0.0),
             unbroadcast: u64_field(&v, "unbroadcastcount")?,
+            ancestorlimit: u64_field(&v, "ancestorlimit").unwrap_or(0),
+            descendantlimit: u64_field(&v, "descendantlimit").unwrap_or(0),
         })
     }
 }
@@ -97,15 +142,21 @@ pub struct PeerInfo {
     pub inbound: bool,
     pub height: u64,
     pub ping_ms: Option<u64>,
+    pub minping_ms: Option<u64>,
     pub version: u64,
     pub subver: String,
     pub synched_headers: i64,
     pub synched_blocks: i64,
+    pub bytesrecv: u64,
+    pub bytessent: u64,
+    pub banscore: i64,
+    pub addnode: bool,
 }
 
 impl PeerInfo {
     pub fn from_value(v: Value) -> Result<Self, String> {
         let ping = f64_field(&v, "pingtime").ok().map(|f| (f * 1000.0) as u64);
+        let minping = f64_field(&v, "minping").ok().map(|f| (f * 1000.0) as u64);
         Ok(Self {
             id: u64_field(&v, "id")?,
             addr: string_field(&v, "addr")?,
@@ -113,10 +164,15 @@ impl PeerInfo {
             inbound: bool_field(&v, "inbound")?,
             height: u64_field(&v, "startingheight").unwrap_or(0),
             ping_ms: ping,
+            minping_ms: minping,
             version: u64_field(&v, "version").unwrap_or(0),
             subver: string_field(&v, "subver").unwrap_or_default(),
             synched_headers: i64_field(&v, "synced_headers").unwrap_or(-1),
             synched_blocks: i64_field(&v, "synced_blocks").unwrap_or(-1),
+            bytesrecv: u64_field(&v, "bytesrecv").unwrap_or(0),
+            bytessent: u64_field(&v, "bytessent").unwrap_or(0),
+            banscore: i64_field(&v, "banscore").unwrap_or(0),
+            addnode: bool_field(&v, "addnode").unwrap_or(false),
         })
     }
 }

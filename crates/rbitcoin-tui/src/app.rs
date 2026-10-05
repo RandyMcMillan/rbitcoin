@@ -252,11 +252,13 @@ impl App {
         if !self.config.has_external_rpc() && self.snapshot.last_error.is_some() {
             let msg = if let Some(ref e) = self.spawn_error {
                 Some(e.clone())
-            } else if let Some(0) = self.node_exit_code {
-                // Clean exit — not an error, clear the banner.
-                None
             } else if let Some(code) = self.node_exit_code {
-                Some(format!("node exited with code {code} — check Console tab"))
+                if code == 0 {
+                    // Clean exit — not an error, clear the banner.
+                    None
+                } else {
+                    Some(format!("node exited with code {code} — check Console tab"))
+                }
             } else if self.node_child.is_some() {
                 Some("node is starting…".into())
             } else {
@@ -721,20 +723,36 @@ mod tests {
                 headers: 10,
                 verification_progress: 1.0,
                 initial_block_download: false,
+                bestblockhash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                difficulty: 1.0,
+                mediantime: 0,
+                chainwork: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                pruned: false,
+                size_on_disk: 0,
                 warnings: None,
             }),
             network: Ok(NetworkInfo {
+                version: 0,
+                subversion: "/rbitcoin:0.0.0/".into(),
+                protocolversion: 0,
                 connections_in: 8,
                 connections_out: 4,
                 timeoffset: 0,
+                relayfee: 0.00001,
+                networkactive: true,
+                localaddresses: vec![],
                 warnings: None,
             }),
             mempool: Ok(MempoolInfo {
                 transactions: 1,
                 bytes: 2,
+                usage: 2,
                 maxmempool: 3,
                 min_fee_sat_vb: 1.0,
+                total_fee: 0.0,
                 unbroadcast: 0,
+                ancestorlimit: 0,
+                descendantlimit: 0,
             }),
             peers: Ok(vec![]),
             warnings: None,

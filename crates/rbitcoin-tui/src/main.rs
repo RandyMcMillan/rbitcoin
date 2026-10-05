@@ -347,9 +347,7 @@ fn chain_panel(app: &App) -> Paragraph<'static> {
                 "initial block download: {}",
                 if chain.initial_block_download { "yes" } else { "no" }
             );
-            let _ = writeln!(text, "tip time: {}",
-                chain.time.map(format_unix_time).unwrap_or_else(|| "unknown".into())
-            );
+            let _ = writeln!(text, "tip time: unknown");
         }
         Err(err) => {
             let _ = writeln!(text, "chain error: {err}");
@@ -729,12 +727,11 @@ fn rpc_http(
     parse_http_response(&text)
 }
 
-#[allow(dead_code)]
 fn rpc_http_with_auth(
     mut stream: impl Read + Write,
     host: &str,
     port: u16,
-    _token: &str,
+    token: &str,
     body: &[u8],
 ) -> Result<String, String> {
     let req = format!(

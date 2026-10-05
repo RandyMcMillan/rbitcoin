@@ -2,7 +2,7 @@ use crate::app::{App, Tab};
 use crate::theme::{BLACK, BRIGHT_CYAN, BRIGHT_GREEN, BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_YELLOW, ERROR, MID_GRAY, MUTED, OK, THEME, WARN, WHITE};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -179,7 +179,6 @@ impl AppWidget<'_> {
                     .gauge_style(
                         Style::new()
                             .fg(color)
-                            .bg(DARK_BG)
                             .add_modifier(Modifier::BOLD),
                     )
                     .ratio(ratio)
@@ -231,7 +230,7 @@ impl AppWidget<'_> {
             }
             Err(err) => {
                 let gauge = Gauge::default()
-                    .gauge_style(Style::new().fg(BRIGHT_RED).bg(DARK_BG))
+                    .gauge_style(Style::new().fg(BRIGHT_RED))
                     .ratio(0.0)
                     .label(err.clone());
                 gauge.render(inner, buf);
@@ -715,4 +714,4 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-const DARK_BG: Color = Color::Rgb(30, 30, 40);
+

@@ -167,6 +167,8 @@ pub struct App {
     pub mempool_tx_history: VecDeque<u64>,
     pub mempool_fee_history: VecDeque<f64>,
     pub peer_table_scroll: usize,
+    pub node_child: Option<std::process::Child>,
+    pub node_exit_code: Option<i32>,
 }
 
 impl App {
@@ -183,6 +185,8 @@ impl App {
             mempool_tx_history: VecDeque::with_capacity(HISTORY_CAPACITY),
             mempool_fee_history: VecDeque::with_capacity(HISTORY_CAPACITY),
             peer_table_scroll: 0,
+            node_child: None,
+            node_exit_code: None,
         }
     }
 

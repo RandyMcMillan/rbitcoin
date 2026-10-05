@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod node;
 pub mod rpc;
 pub mod theme;
 pub mod ui;
@@ -13,7 +14,10 @@ use ratatui::Terminal;
 use std::fmt::Write as _;
 use std::io;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const STARTUP_POLL: Duration = Duration::from_millis(500);
+const NODE_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn tui_main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
     match run(args) {
@@ -28,7 +32,7 @@ pub fn tui_main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode 
 fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String> {
     let config = config::Config::parse(args)?;
     if config.once {
-        let snapshot = app::Snapshot::fetch(&config, std::time::Duration::from_secs(2));
+        let snapshot = app::Snapshot::fetch(&config, Duration::from_secs(2));
         println!("{}", snapshot_summary(&snapshot));
         return Ok(());
     }
@@ -43,6 +47,11 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
     let guard = TerminalGuard;
 
     let mut app = app::App::new(config);
+
+    if app.config.start_node {
+        try_start_node(&mut app)?;
+    }
+
     app.refresh();
     terminal
         .draw(|frame| ui::render(frame, &app))
@@ -63,6 +72,9 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
         }
         if Instant::now() >= app.next_refresh {
             app.refresh();
+            if let Some(ref mut child) = app.node_child {
+                app.node_exit_code = node::check_child(child);
+            }
             redraw = true;
         }
         if redraw {
@@ -72,8 +84,37 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
         }
     }
 
+    if let Some(ref mut child) = app.node_child {
+        node::kill_child(child);
+    }
+
     drop(guard);
     Ok(())
+}
+
+fn try_start_node(app: &mut app::App) -> Result<(), String> {
+    let snapshot = app::Snapshot::fetch(&app.config, Duration::from_secs(2));
+    if snapshot.chain.is_ok() || snapshot.network.is_ok() {
+        return Ok(());
+    }
+
+    let mut child = node::spawn_node(&app.config.datadir, app.config.node_binary.as_deref())?;
+
+    let started = Instant::now();
+    while started.elapsed() < NODE_START_TIMEOUT {
+        std::thread::sleep(STARTUP_POLL);
+        if node::check_child(&mut child).is_some() {
+            return Err("node exited during startup".into());
+        }
+        let probe = app::Snapshot::fetch(&app.config, Duration::from_secs(2));
+        if probe.chain.is_ok() || probe.network.is_ok() {
+            app.node_child = Some(child);
+            return Ok(());
+        }
+    }
+
+    node::kill_child(&mut child);
+    Err("node did not become ready within 30s".into())
 }
 
 struct TerminalGuard;

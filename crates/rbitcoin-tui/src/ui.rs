@@ -201,59 +201,66 @@ impl AppWidget<'_> {
                     .use_unicode(true);
                 gauge.render(inner, buf);
 
-                let net_block = Block::bordered()
-                    .title(" Network ")
-                    .title_style(THEME.description_title)
-                    .border_style(THEME.borders);
-                let net_inner = net_block.inner(right);
-                net_block.render(right, buf);
-
-                let mut net_text = String::new();
-                let _ = writeln!(
-                    net_text,
-                    "in: {}  out: {}",
-                    self.app
-                        .snapshot
-                        .network
-                        .as_ref()
-                        .map(|n| n.connections_in)
-                        .unwrap_or(0),
-                    self.app
-                        .snapshot
-                        .network
-                        .as_ref()
-                        .map(|n| n.connections_out)
-                        .unwrap_or(0)
-                );
-                let _ = writeln!(
-                    net_text,
-                    "time offset: {}s",
-                    self.app
-                        .snapshot
-                        .network
-                        .as_ref()
-                        .map(|n| n.timeoffset)
-                        .unwrap_or(0)
-                );
-                let _ = writeln!(net_text, "chain: {}", chain.chain);
-                let _ = writeln!(net_text, "blocks: {}", chain.blocks);
-                let _ = write!(net_text, "headers: {}", chain.headers);
-                Paragraph::new(net_text)
-                    .style(THEME.content)
-                    .wrap(Wrap { trim: true })
-                    .render(net_inner, buf);
+                self.render_dashboard_network(right, buf, Some(chain));
             }
-            Err(err) => {
+            Err(_) => {
                 let gauge = Gauge::default()
-                    .gauge_style(Style::new().fg(BRIGHT_RED))
+                    .gauge_style(Style::new().fg(MID_GRAY))
                     .ratio(0.0)
-                    .label(err.clone());
+                    .label("starting…");
                 gauge.render(inner, buf);
 
-                let empty = Block::bordered().border_style(THEME.borders);
-                empty.render(right, buf);
+                self.render_dashboard_network(right, buf, None);
             }
         }
+    }
+
+    fn render_dashboard_network(&self, area: Rect, buf: &mut Buffer, chain: Option<&crate::app::BlockchainInfo>) {
+        let net_block = Block::bordered()
+            .title(" Network ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders);
+        let net_inner = net_block.inner(area);
+        net_block.render(area, buf);
+
+        let mut net_text = String::new();
+        let _ = writeln!(
+            net_text,
+            "in: {}  out: {}",
+            self.app
+                .snapshot
+                .network
+                .as_ref()
+                .map(|n| n.connections_in)
+                .unwrap_or(0),
+            self.app
+                .snapshot
+                .network
+                .as_ref()
+                .map(|n| n.connections_out)
+                .unwrap_or(0)
+        );
+        let _ = writeln!(
+            net_text,
+            "time offset: {}s",
+            self.app
+                .snapshot
+                .network
+                .as_ref()
+                .map(|n| n.timeoffset)
+                .unwrap_or(0)
+        );
+        if let Some(chain) = chain {
+            let _ = writeln!(net_text, "chain: {}", chain.chain);
+            let _ = writeln!(net_text, "blocks: {}", chain.blocks);
+            let _ = write!(net_text, "headers: {}", chain.headers);
+        } else {
+            let _ = write!(net_text, "waiting for chain data…");
+        }
+        Paragraph::new(net_text)
+            .style(THEME.content)
+            .wrap(Wrap { trim: true })
+            .render(net_inner, buf);
     }
 
     fn render_mempool_sparkline(&self, area: Rect, buf: &mut Buffer) {

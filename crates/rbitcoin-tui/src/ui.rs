@@ -753,6 +753,15 @@ impl AppWidget<'_> {
             }
             Err(ref e) if e == "no RPC endpoint responded" => {
                 let mut text = String::new();
+                if let Some(ref op) = self.app.startup_operation {
+                    let _ = writeln!(text, "node is initializing: {op}");
+                }
+                if let Some((cur, tot)) = self.app.startup_progress {
+                    let _ = writeln!(text, "progress: {cur}/{tot}");
+                }
+                if let Some(h) = self.app.startup_height {
+                    let _ = writeln!(text, "height: {h}");
+                }
                 if let Some(txs) = self.app.log_mempool_txs {
                     let _ = writeln!(text, "Transactions:    {txs} (from logs)");
                 }

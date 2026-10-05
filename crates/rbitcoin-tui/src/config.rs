@@ -104,8 +104,8 @@ TUI Options:
 
 Node Options:
   Any unknown argument is passed through to rbitcoin-node.
-  Examples: --signet, --regtest, --listen ADDR, --connect ADDR,
-  --rpc, --rest, --log-level LEVEL, --prune-seqsigwit, etc.
+  Examples: --network regtest, --network signet, --listen ADDR,
+  --connect ADDR, --rpc, --rest, --log-level LEVEL, --prune-seqsigwit, etc.
 ";
 
 fn take_value(

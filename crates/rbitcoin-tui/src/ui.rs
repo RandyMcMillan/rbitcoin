@@ -1,5 +1,5 @@
 use crate::app::{App, Tab};
-use crate::theme::THEME;
+use crate::theme::{BLACK, BRIGHT_CYAN, BRIGHT_GREEN, BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_YELLOW, ERROR, MID_GRAY, MUTED, OK, THEME, WARN, WHITE};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -128,12 +128,9 @@ impl AppWidget<'_> {
                 .unwrap_or_else(|| "not yet refreshed".into())
         );
         let ready = if self.app.snapshot.is_ready() {
-            Span::styled(
-                "READY",
-                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )
+            Span::styled("READY", OK.add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("SYNCING", Style::new().fg(Color::Yellow))
+            Span::styled("SYNCING", WARN)
         };
         let _ = write!(right_text, "status: ");
         Paragraph::new(right_text)
@@ -145,13 +142,11 @@ impl AppWidget<'_> {
         ready_para.render(right, buf);
 
         if let Some(w) = &self.app.snapshot.warnings {
-            let warn = Paragraph::new(format!("warning: {w}"))
-                .style(Style::new().fg(Color::Yellow));
+            let warn = Paragraph::new(format!("warning: {w}")).style(WARN);
             warn.render(inner, buf);
         }
         if let Some(err) = &self.app.snapshot.last_error {
-            let err_para = Paragraph::new(format!("error: {err}"))
-                .style(Style::new().fg(Color::Red));
+            let err_para = Paragraph::new(format!("error: {err}")).style(ERROR);
             err_para.render(inner, buf);
         }
     }
@@ -173,18 +168,18 @@ impl AppWidget<'_> {
             Ok(chain) => {
                 let ratio = chain.verification_progress.clamp(0.0, 1.0);
                 let color = if ratio >= 0.99 {
-                    Color::Green
+                    BRIGHT_GREEN
                 } else if ratio >= 0.5 {
-                    Color::Yellow
+                    BRIGHT_YELLOW
                 } else {
-                    Color::Red
+                    BRIGHT_RED
                 };
                 let label = format!("{:.2}%", ratio * 100.0);
                 let gauge = Gauge::default()
                     .gauge_style(
                         Style::new()
                             .fg(color)
-                            .bg(DARK_BLUE)
+                            .bg(DARK_BG)
                             .add_modifier(Modifier::BOLD),
                     )
                     .ratio(ratio)
@@ -236,7 +231,7 @@ impl AppWidget<'_> {
             }
             Err(err) => {
                 let gauge = Gauge::default()
-                    .gauge_style(Style::new().fg(Color::Red).bg(DARK_BLUE))
+                    .gauge_style(Style::new().fg(BRIGHT_RED).bg(DARK_BG))
                     .ratio(0.0)
                     .label(err.clone());
                 gauge.render(inner, buf);
@@ -270,7 +265,7 @@ impl AppWidget<'_> {
             sparkline.render(chart_area, buf);
         } else {
             let placeholder = Paragraph::new("collecting data…")
-                .style(Style::new().fg(Color::DarkGray))
+                .style(MUTED)
                 .alignment(Alignment::Center);
             placeholder.render(chart_area, buf);
         }
@@ -311,11 +306,11 @@ impl AppWidget<'_> {
             Ok(chain) => {
                 let ratio = chain.verification_progress.clamp(0.0, 1.0);
                 let color = if ratio >= 0.99 {
-                    Color::Green
+                    BRIGHT_GREEN
                 } else if ratio >= 0.5 {
-                    Color::Yellow
+                    BRIGHT_YELLOW
                 } else {
-                    Color::Red
+                    BRIGHT_RED
                 };
                 let label = format!("{:.4}%", ratio * 100.0);
                 let gauge = LineGauge::default()
@@ -326,7 +321,7 @@ impl AppWidget<'_> {
                             .border_style(THEME.borders),
                     )
                     .filled_style(Style::new().fg(color).add_modifier(Modifier::BOLD))
-                    .unfilled_style(Style::new().fg(Color::DarkGray))
+                    .unfilled_style(Style::new().fg(MID_GRAY))
                     .ratio(ratio)
                     .label(label)
                     .line_set(symbols::line::THICK);
@@ -360,7 +355,7 @@ impl AppWidget<'_> {
             }
             Err(err) => {
                 let para = Paragraph::new(format!("Error: {err}"))
-                    .style(Style::new().fg(Color::Red))
+                    .style(ERROR)
                     .wrap(Wrap { trim: true });
                 para.render(gauge_area, buf);
             }
@@ -408,7 +403,7 @@ impl AppWidget<'_> {
             }
             Err(err) => {
                 Paragraph::new(format!("Error: {err}"))
-                    .style(Style::new().fg(Color::Red))
+                    .style(ERROR)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
@@ -431,9 +426,9 @@ impl AppWidget<'_> {
                             .map(|ms| format!("{ms}ms"))
                             .unwrap_or_else(|| "-".into());
                         let conn_color = if p.inbound {
-                            Color::Cyan
+                            BRIGHT_CYAN
                         } else {
-                            Color::Green
+                            BRIGHT_GREEN
                         };
                         let style = if i % 2 == 0 {
                             THEME.table.row
@@ -507,7 +502,7 @@ impl AppWidget<'_> {
                             .title_style(THEME.description_title)
                             .border_style(THEME.borders),
                     )
-                    .style(Style::new().fg(Color::Red))
+                    .style(ERROR)
                     .wrap(Wrap { trim: true })
                     .render(area, buf);
             }
@@ -552,13 +547,13 @@ impl AppWidget<'_> {
         if fee_data.len() >= 2 {
             let sparkline = Sparkline::default()
                 .data(&fee_data)
-                .style(Style::new().fg(Color::Magenta))
+                .style(Style::new().fg(BRIGHT_MAGENTA))
                 .max(*fee_data.iter().max().unwrap_or(&1).max(&1))
                 .bar_set(symbols::bar::NINE_LEVELS);
             sparkline.render(fee_inner, buf);
         } else {
             Paragraph::new("collecting data…")
-                .style(Style::new().fg(Color::DarkGray))
+                .style(MUTED)
                 .alignment(Alignment::Center)
                 .render(fee_inner, buf);
         }
@@ -579,7 +574,7 @@ impl AppWidget<'_> {
             sparkline.render(tx_inner, buf);
         } else {
             Paragraph::new("collecting data…")
-                .style(Style::new().fg(Color::DarkGray))
+                .style(MUTED)
                 .alignment(Alignment::Center)
                 .render(tx_inner, buf);
         }
@@ -614,7 +609,7 @@ impl AppWidget<'_> {
             }
             Err(err) => {
                 Paragraph::new(format!("Error: {err}"))
-                    .style(Style::new().fg(Color::Red))
+                    .style(ERROR)
                     .wrap(Wrap { trim: true })
                     .render(inner, buf);
             }
@@ -642,16 +637,16 @@ fn render_bottom_bar(area: Rect, buf: &mut Buffer) {
         .collect();
     Line::from(spans)
         .centered()
-        .style(Style::new().fg(Color::Indexed(236)).bg(Color::Indexed(232)))
+        .style(Style::new().fg(MID_GRAY).bg(BLACK))
         .render(area, buf);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     let popup_area = centered_rect(50, 60, area);
     let block = Block::bordered()
-        .border_style(Style::new().fg(Color::Cyan))
+        .border_style(Style::new().fg(BRIGHT_CYAN))
         .title(" Help ")
-        .title_style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD));
+        .title_style(Style::new().fg(WHITE).add_modifier(Modifier::BOLD));
 
     let text = "\
 Navigation
@@ -667,7 +662,7 @@ Actions
 ";
     let paragraph = Paragraph::new(text)
         .block(block)
-        .style(Style::new().fg(Color::White))
+        .style(Style::new().fg(WHITE))
         .wrap(Wrap { trim: true })
         .alignment(Alignment::Left);
     frame.render_widget(ratatui::widgets::Clear, popup_area);
@@ -720,4 +715,4 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-const DARK_BLUE: Color = Color::Rgb(16, 24, 48);
+const DARK_BG: Color = Color::Rgb(30, 30, 40);

@@ -10,28 +10,13 @@ pub struct Theme {
     pub description: Style,
     pub description_title: Style,
     pub key_binding: KeyBinding,
-    pub gauge: Gauge,
-    pub chart: Chart,
     pub table: Table,
     pub sparkline: Sparkline,
-    pub barchart: BarChart,
 }
 
 pub struct KeyBinding {
     pub key: Style,
     pub description: Style,
-}
-
-pub struct Gauge {
-    pub filled: Style,
-    pub unfilled: Style,
-    pub label: Style,
-}
-
-pub struct Chart {
-    pub axis: Style,
-    pub dataset: Style,
-    pub grid: Style,
 }
 
 pub struct Table {
@@ -45,50 +30,28 @@ pub struct Sparkline {
     pub data: Style,
 }
 
-pub struct BarChart {
-    pub bar: Style,
-    pub value: Style,
-    pub label: Style,
-}
-
 pub const THEME: Theme = Theme {
-    root: Style::new().bg(DARK_BLUE),
-    content: Style::new().bg(DARK_BLUE).fg(LIGHT_GRAY),
-    app_title: Style::new()
-        .fg(WHITE)
-        .bg(DARK_BLUE)
-        .add_modifier(Modifier::BOLD),
-    tabs: Style::new().fg(MID_GRAY).bg(DARK_BLUE),
+    root: Style::new(),
+    content: Style::new().fg(LIGHT_GRAY),
+    app_title: Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
+    tabs: Style::new().fg(MID_GRAY),
     tabs_selected: Style::new()
-        .fg(WHITE)
-        .bg(DARK_BLUE)
-        .add_modifier(Modifier::BOLD)
-        .add_modifier(Modifier::REVERSED),
-    borders: Style::new().fg(LIGHT_GRAY),
-    description: Style::new().fg(LIGHT_GRAY).bg(DARK_BLUE),
+        .fg(BLACK)
+        .bg(CYAN)
+        .add_modifier(Modifier::BOLD),
+    borders: Style::new().fg(MID_GRAY),
+    description: Style::new().fg(LIGHT_GRAY),
     description_title: Style::new()
-        .fg(LIGHT_GRAY)
+        .fg(WHITE)
         .add_modifier(Modifier::BOLD),
     key_binding: KeyBinding {
-        key: Style::new().fg(BLACK).bg(DARK_GRAY),
-        description: Style::new().fg(DARK_GRAY).bg(BLACK),
-    },
-    gauge: Gauge {
-        filled: Style::new().fg(LIGHT_BLUE).bg(DARK_BLUE),
-        unfilled: Style::new().fg(DARK_GRAY).bg(DARK_BLUE),
-        label: Style::new().fg(WHITE).add_modifier(Modifier::BOLD),
-    },
-    chart: Chart {
-        axis: Style::new().fg(MID_GRAY),
-        dataset: Style::new().fg(LIGHT_GREEN),
-        grid: Style::new().fg(DARK_GRAY),
+        key: Style::new().fg(BLACK).bg(LIGHT_GRAY),
+        description: Style::new().fg(LIGHT_GRAY).bg(BLACK),
     },
     table: Table {
-        header: Style::new()
-            .fg(YELLOW)
-            .add_modifier(Modifier::BOLD),
+        header: Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
         row: Style::new().fg(LIGHT_GRAY),
-        row_alt: Style::new().fg(LIGHT_GRAY).bg(DARKER_BLUE),
+        row_alt: Style::new().fg(LIGHT_GRAY).bg(DARK_BG),
         selected: Style::new()
             .fg(BLACK)
             .bg(LIGHT_YELLOW)
@@ -97,22 +60,24 @@ pub const THEME: Theme = Theme {
     sparkline: Sparkline {
         data: Style::new().fg(CYAN),
     },
-    barchart: BarChart {
-        bar: Style::new().fg(LIGHT_BLUE),
-        value: Style::new().fg(BLACK).bg(LIGHT_BLUE),
-        label: Style::new().fg(LIGHT_GRAY),
-    },
 };
 
-const DARK_BLUE: Color = Color::Rgb(16, 24, 48);
-const DARKER_BLUE: Color = Color::Rgb(12, 18, 36);
-const LIGHT_BLUE: Color = Color::Rgb(64, 128, 224);
-const CYAN: Color = Color::Rgb(64, 192, 224);
-const YELLOW: Color = Color::Rgb(224, 192, 64);
-const LIGHT_YELLOW: Color = Color::Rgb(255, 224, 128);
-const LIGHT_GREEN: Color = Color::Rgb(64, 224, 128);
-const BLACK: Color = Color::Rgb(8, 8, 8);
-const DARK_GRAY: Color = Color::Rgb(68, 68, 68);
-const MID_GRAY: Color = Color::Rgb(128, 128, 128);
-const LIGHT_GRAY: Color = Color::Rgb(188, 188, 188);
-const WHITE: Color = Color::Rgb(238, 238, 238);
+pub const ERROR: Style = Style::new().fg(BRIGHT_RED);
+pub const WARN: Style = Style::new().fg(BRIGHT_YELLOW);
+pub const OK: Style = Style::new().fg(BRIGHT_GREEN);
+pub const INFO: Style = Style::new().fg(BRIGHT_CYAN);
+pub const MUTED: Style = Style::new().fg(MID_GRAY);
+
+pub const DARK_BG: Color = Color::Rgb(30, 30, 40);
+pub const CYAN: Color = Color::Rgb(64, 224, 224);
+pub const YELLOW: Color = Color::Rgb(224, 192, 64);
+pub const LIGHT_YELLOW: Color = Color::Rgb(255, 224, 128);
+pub const BRIGHT_RED: Color = Color::Rgb(255, 80, 80);
+pub const BRIGHT_YELLOW: Color = Color::Rgb(255, 220, 80);
+pub const BRIGHT_GREEN: Color = Color::Rgb(80, 255, 120);
+pub const BRIGHT_CYAN: Color = Color::Rgb(64, 240, 240);
+pub const BRIGHT_MAGENTA: Color = Color::Rgb(255, 80, 255);
+pub const BLACK: Color = Color::Rgb(0, 0, 0);
+pub const MID_GRAY: Color = Color::Rgb(128, 128, 128);
+pub const LIGHT_GRAY: Color = Color::Rgb(200, 200, 200);
+pub const WHITE: Color = Color::Rgb(240, 240, 240);

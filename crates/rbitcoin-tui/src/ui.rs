@@ -389,17 +389,26 @@ impl AppWidget<'_> {
                     .line_set(symbols::line::THICK);
                 gauge.render(gauge_area, buf);
 
-                let msg = if e == "no RPC endpoint responded" {
-                    if let Some(h) = self.app.startup_height {
-                        format!("node is initializing…\nlast height seen in logs: {h}")
-                    } else {
-                        "node is initializing…".into()
-                    }
+                let mut rows = Vec::new();
+                if e != "no RPC endpoint responded" {
+                    rows.push(format!("Error: {e}"));
                 } else {
-                    format!("Error: {e}")
-                };
+                    if let Some(ref op) = self.app.startup_operation {
+                        rows.push(format!("operation: {op}"));
+                    }
+                    if let Some((cur, tot)) = self.app.startup_progress {
+                        let pct = (cur as f64 / tot as f64) * 100.0;
+                        rows.push(format!("progress: {cur}/{tot} ({pct:.1}%)"));
+                    }
+                    if let Some(h) = self.app.startup_height {
+                        rows.push(format!("height: {h}"));
+                    }
+                    if rows.is_empty() {
+                        rows.push("node is initializing…".into());
+                    }
+                }
                 let style = if e == "no RPC endpoint responded" { MUTED } else { ERROR };
-                let placeholder = Paragraph::new(msg)
+                let placeholder = Paragraph::new(rows.join("\n"))
                     .style(style)
                     .alignment(Alignment::Center);
                 placeholder.render(info_area, buf);

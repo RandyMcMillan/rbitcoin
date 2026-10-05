@@ -1,0 +1,22 @@
+[package]
+name = "rbitcoin-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Terminal UI for rbitcoin node status"
+
+[[bin]]
+name = "rbitcoin-tui"
+path = "src/main.rs"
+
+[dependencies]
+rbitcoin-primitives = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde_json = { workspace = true }
+mimalloc = { workspace = true }
+
+[lints]
+workspace = true

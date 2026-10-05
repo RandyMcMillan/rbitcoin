@@ -88,7 +88,7 @@ started).
 
 ```bash
 git clone https://github.com/reardencode/rbitcoin.git && cd rbitcoin
-cargo build -p rbitcoin-node -p rbitcoin-cli
+cargo build -p rbitcoin-node -p rbitcoin-cli -p rbitcoin-tui
 ```
 
 Linux-only optional pin (`nix develop` / `nix-shell`, same `flake.lock` as

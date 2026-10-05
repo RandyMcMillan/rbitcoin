@@ -19,6 +19,7 @@ shared libraries through storage and runtime crates to composition and tools;
 | `rbitcoin-sv2` | Stratum v2 Template Distribution Protocol server (Noise over TCP) |
 | `rbitcoin-node` | Product binary and process composition |
 | `rbitcoin-cli` | RPC client binary |
+| `rbitcoin-tui` | Terminal status viewer for node health and progress |
 | `rbitcoin-test` | High-level scenario and integration-test harness |
 | `rbitcoin-bench` | Optional Electrum/Esplora client benchmark |
 

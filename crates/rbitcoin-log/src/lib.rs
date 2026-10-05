@@ -15,7 +15,19 @@ pub use api_log::{api_call, close_api_log, init_api_log};
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Global log hook for cross-thread capture (e.g., TUI embedding the node).
+static LOG_HOOK: OnceLock<Mutex<Box<dyn Fn(Level, String) + Send>>> = OnceLock::new();
+
+/// Install a global hook that receives every log line from all threads.
+///
+/// The hook is called after level filtering but before stderr output.
+/// Only one hook can be installed; subsequent calls replace it.
+pub fn set_log_hook(hook: impl Fn(Level, String) + Send + 'static) {
+    let _ = LOG_HOOK.set(Mutex::new(Box::new(hook)));
+}
 
 /// Log severity. Higher numeric values are more verbose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -189,8 +201,14 @@ pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
 /// Write one log line with optional style. Bold is applied only when stderr is
 /// an interactive terminal so redirected logs stay clean ASCII.
 pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
+    let msg = args.to_string();
     if CAPTURE.with(|c| c.get()) {
-        CAPTURED.with(|c| c.borrow_mut().push((level, args.to_string())));
+        CAPTURED.with(|c| c.borrow_mut().push((level, msg.clone())));
+    }
+    if let Some(hook) = LOG_HOOK.get() {
+        if let Ok(h) = hook.lock() {
+            h(level, msg.clone());
+        }
     }
     if !enabled(level) {
         return;
@@ -199,9 +217,9 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     let mut stderr = io::stderr().lock();
     let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
     if bold {
-        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{args}\x1b[0m");
+        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{msg}\x1b[0m");
     } else {
-        let _ = writeln!(stderr, "{ts} {level:<5} {args}");
+        let _ = writeln!(stderr, "{ts} {level:<5} {msg}");
     }
     let _ = stderr.flush();
 }

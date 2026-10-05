@@ -1433,6 +1433,8 @@ dependencies = [
  "crossterm 0.29.0",
  "mimalloc",
  "ratatui",
+ "rbitcoin-log",
+ "rbitcoin-node",
  "serde_json",
 ]
 

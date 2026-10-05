@@ -188,6 +188,10 @@ impl AppWidget<'_> {
                 .map(|t| format_elapsed(t.elapsed()))
                 .unwrap_or_else(|| "not yet refreshed".into())
         );
+        if let Ok(chain) = &self.app.snapshot.chain {
+            let _ = writeln!(right_text, "blocks: {}", chain.blocks);
+            let _ = writeln!(right_text, "headers: {}", chain.headers);
+        }
         let ready = if self.app.snapshot.is_ready() {
             Span::styled("READY", OK.add_modifier(Modifier::BOLD))
         } else {

@@ -254,7 +254,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         "rbitcoin-node starting version={} network={} datadir={}{} tip={start_tip} io={}",
         env!("CARGO_PKG_VERSION"),
         config.network.as_str(),
-        config.datadir.path().display(),
+        config.datadir_path().display(),
         config
             .datadir
             .cold
@@ -462,7 +462,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .expect("validate requires --tor-control with --listen-onion");
         let virt = config.network.default_p2p_port();
         let hs = ctl
-            .add_p2p_onion(config.datadir.path(), node.local_addr, virt)
+            .add_p2p_onion(&config.datadir_path(), node.local_addr, virt)
             .await?;
         info!("p2p onion {}.onion:{}", hs.service_id, virt);
         node.peers
@@ -473,7 +473,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let mut i2p_sam = if let Some(addr) = config.listen.i2p_sam {
         let s = if config.listen.i2p_accept_incoming {
-            let dest = config.datadir.path().join("i2p").join("p2p.priv");
+            let dest = config.datadir_path().join("i2p").join("p2p.priv");
             rbitcoin_net::I2pSam::connect_persistent(addr, &dest).await
         } else {
             rbitcoin_net::I2pSam::connect(addr).await
@@ -516,7 +516,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     } else {
         None
     };
-    let peers_path = config.datadir.path().join("peers");
+    let peers_path = config.datadir_path().join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
             if !am.is_empty() {
@@ -536,7 +536,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             AddrMan::new()
         }
     };
-    let asmap = load_asmap(config.datadir.path(), config.asmap.as_deref());
+    let asmap = load_asmap(&config.datadir_path(), config.asmap.as_deref());
     addrman.set_asmap(asmap.clone());
     addrman.set_only_net(config.listen.only_net.clone());
     addrman.set_cjdns_reachable(config.listen.cjdns_reachable);
@@ -574,7 +574,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         && !config.listen.has_pinned_connect()
         && addrman.is_empty()
     {
-        warn!("custom signet has no peers; use --connect ADDR or reuse a datadir with known peers");
+        info!("custom signet has no peers yet; keep listening or add --connect ADDR");
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
@@ -808,7 +808,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .await;
     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
         let hs = ctl
-            .add_electrum_onion(config.datadir.path(), h.local_addr)
+            .add_electrum_onion(&config.datadir_path(), h.local_addr)
             .await?;
         info!(
             "electrum onion {}.onion:{}",
@@ -832,7 +832,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if config.esplora_onion {
         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
             let hs = ctl
-                .add_esplora_onion(config.datadir.path(), h.local_addr)
+                .add_esplora_onion(&config.datadir_path(), h.local_addr)
                 .await?;
             info!(
                 "esplora onion http://{}.onion:{} (/ws same port)",
@@ -851,7 +851,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 i2p_wallet.push(
                     start_i2p_named_forward(
                         addr,
-                        config.datadir.path(),
+                        &config.datadir_path(),
                         "electrum",
                         h.local_addr.port(),
                     )
@@ -862,7 +862,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 i2p_wallet.push(
                     start_i2p_named_forward(
                         addr,
-                        config.datadir.path(),
+                        &config.datadir_path(),
                         "esplora",
                         h.local_addr.port(),
                     )
@@ -938,7 +938,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    if tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
+    if (tip_follow_ready || config.network == Network::Signet)
+        && config.max_run_secs != Some(0)
+        && !shutdown.requested()
+    {
         let unbound = [
             (
                 "rpc",
@@ -1017,7 +1020,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     .await;
                     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
                         let hs = ctl
-                            .add_electrum_onion(config.datadir.path(), h.local_addr)
+                            .add_electrum_onion(&config.datadir_path(), h.local_addr)
                             .await?;
                         info!(
                             "electrum onion {}.onion:{}",
@@ -1037,7 +1040,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 i2p_wallet.push(
                                     start_i2p_named_forward(
                                         addr,
-                                        config.datadir.path(),
+                                        &config.datadir_path(),
                                         "electrum",
                                         h.local_addr.port(),
                                     )
@@ -1063,7 +1066,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     if config.esplora_onion {
                         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
                             let hs = ctl
-                                .add_esplora_onion(config.datadir.path(), h.local_addr)
+                                .add_esplora_onion(&config.datadir_path(), h.local_addr)
                                 .await?;
                             info!(
                                 "esplora onion http://{}.onion:{} (/ws same port)",
@@ -1082,7 +1085,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 i2p_wallet.push(
                                     start_i2p_named_forward(
                                         addr,
-                                        config.datadir.path(),
+                                        &config.datadir_path(),
                                         "esplora",
                                         h.local_addr.port(),
                                     )
@@ -2253,6 +2256,7 @@ fn resolve_seednode(raw: &str, network: Network) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hex::DisplayHex;
     use std::time::{SystemTime, UNIX_EPOCH};
     fn tiny_regtest(dir: impl AsRef<std::path::Path>) -> NodeConfig {
         NodeConfig::default()
@@ -2699,6 +2703,46 @@ mod tests {
         let _ = format!("{:?}", handle);
         handle.shutdown().expect("shutdown flush");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_signet_datadir_appends_challenge() {
+        let mut cfg = NodeConfig::default()
+            .with_datadir("/tmp/rbitcoin-custom-signet")
+            .with_network(rbitcoin_primitives::Network::Signet);
+        cfg.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        assert_eq!(
+            cfg.datadir_path(),
+            std::path::Path::new("/tmp/rbitcoin-custom-signet/signet/51")
+        );
+
+        let already = NodeConfig::default()
+            .with_datadir("/tmp/rbitcoin-custom-signet/signet/51")
+            .with_network(rbitcoin_primitives::Network::Signet);
+        let mut already = already;
+        already.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        assert_eq!(
+            already.datadir_path(),
+            std::path::Path::new("/tmp/rbitcoin-custom-signet/signet/51")
+        );
+    }
+
+    #[test]
+    fn default_signet_datadir_uses_builtin_challenge() {
+        let cfg = NodeConfig::default()
+            .with_datadir("/tmp/rbitcoin-default-signet")
+            .with_network(rbitcoin_primitives::Network::Signet);
+        let challenge = rbitcoin_consensus::ChainParams::signet()
+            .signet_challenge
+            .unwrap()
+            .as_bytes()
+            .to_lower_hex_string();
+        assert_eq!(
+            cfg.datadir_path(),
+            std::path::Path::new(&format!(
+                "/tmp/rbitcoin-default-signet/signet/{challenge}"
+            ))
+        );
     }
 
     #[tokio::test]

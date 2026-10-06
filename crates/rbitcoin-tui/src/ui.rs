@@ -127,8 +127,32 @@ impl AppWidget<'_> {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        // Collect warning/error lines so we can reserve space for them.
+        let mut banners: Vec<Line<'_>> = Vec::new();
+        if let Some(w) = &self.app.snapshot.warnings {
+            banners.push(Line::from(Span::styled(format!("warning: {w}"), WARN)));
+        }
+        if let Some(err) = &self.app.snapshot.last_error {
+            banners.push(Line::from(Span::styled(format!("error: {err}"), ERROR)));
+        }
+        if let Some(ref w) = self.app.log_last_warn {
+            banners.push(Line::from(Span::styled(format!("log warn: {w}"), WARN)));
+        }
+        if let Some(ref e) = self.app.log_last_error {
+            banners.push(Line::from(Span::styled(format!("log error: {e}"), ERROR)));
+        }
+
+        let banner_height = banners.len() as u16;
+        let vlayout = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(banner_height),
+        ]);
+        let vchunks = vlayout.split(inner);
+        let content_area = vchunks[0];
+        let banner_area = vchunks[1];
+
         let layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
-        let chunks = layout.split(inner);
+        let chunks = layout.split(content_area);
         let left = chunks[0];
         let right = chunks[1];
 

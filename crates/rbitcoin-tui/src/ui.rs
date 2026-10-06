@@ -71,8 +71,8 @@ impl AppWidget<'_> {
             .style(THEME.tabs)
             .highlight_style(THEME.tabs_selected)
             .select(self.app.tab as usize)
-            .divider("")
-            .padding("", "")
+            .divider("│")
+            .padding(" ", " ")
             .render(tabs_area, buf);
     }
 

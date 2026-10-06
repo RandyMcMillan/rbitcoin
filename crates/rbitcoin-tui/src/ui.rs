@@ -118,17 +118,8 @@ impl AppWidget<'_> {
         self.render_event_ticker(ticker, buf);
     }
 
-    fn render_summary_card(&self, area: Rect, buf: &mut Buffer) {
-        let block = Block::bordered()
-            .title(" Summary ")
-            .title_style(THEME.description_title)
-            .border_style(THEME.borders)
-            .style(Style::new().bg(BLACK));
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        // Collect warning/error lines so we can reserve space for them.
-        let mut banners: Vec<Line<'_>> = Vec::new();
+    fn summary_banners(&self) -> Vec<Line<'_>> {
+        let mut banners = Vec::new();
         if let Some(w) = &self.app.snapshot.warnings {
             banners.push(Line::from(Span::styled(format!("warning: {w}"), WARN)));
         }
@@ -141,7 +132,19 @@ impl AppWidget<'_> {
         if let Some(ref e) = self.app.log_last_error {
             banners.push(Line::from(Span::styled(format!("log error: {e}"), ERROR)));
         }
+        banners
+    }
 
+    fn render_summary_card(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::bordered()
+            .title(" Summary ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let banners = self.summary_banners();
         let banner_height = banners.len() as u16;
         let vlayout = Layout::vertical([
             Constraint::Min(0),
@@ -256,35 +259,22 @@ impl AppWidget<'_> {
         let ready_para = Paragraph::new(ready_line).alignment(Alignment::Right);
         ready_para.render(right, buf);
 
-        if let Some(w) = &self.app.snapshot.warnings {
-            let warn = Paragraph::new(format!("warning: {w}")).style(WARN);
-            warn.render(inner, buf);
-        }
-        if let Some(err) = &self.app.snapshot.last_error {
-            let err_para = Paragraph::new(format!("error: {err}")).style(ERROR);
-            err_para.render(inner, buf);
-        }
-        if let Some(ref w) = self.app.log_last_warn {
-            let warn = Paragraph::new(format!("log warn: {w}")).style(WARN);
-            warn.render(inner, buf);
-        }
-        if let Some(ref e) = self.app.log_last_error {
-            let err = Paragraph::new(format!("log error: {e}")).style(ERROR);
-            err.render(inner, buf);
+        if !banners.is_empty() {
+            Paragraph::new(banners).render(banner_area, buf);
         }
     }
 
     fn render_gauges_row(&self, area: Rect, buf: &mut Buffer) {
-        let layout = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]);
-        let chunks = layout.split(area);
-        let left = chunks[0];
-        let right = chunks[1];
-
         let block = Block::bordered()
             .title(" Verification Progress ")
             .title_style(THEME.description_title)
             .border_style(THEME.borders)
             .style(Style::new().bg(BLACK));
+        let layout = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]);
+        let chunks = layout.split(area);
+        let left = chunks[0];
+        let right = chunks[1];
+
         let inner = block.inner(left);
         block.render(left, buf);
 

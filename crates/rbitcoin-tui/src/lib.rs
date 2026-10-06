@@ -70,15 +70,40 @@ fn run(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<(), String>
                 }
             }
 
+            // If the node crashed (non-zero exit), schedule an auto-restart.
+            if !app.config.has_external_rpc()
+                && app.node_child.is_none()
+                && app.node_restart_after.is_none()
+            {
+                if let Some(code) = app.node_exit_code {
+                    if code != 0 {
+                        app.node_restart_after = Some(Instant::now() + Duration::from_secs(5));
+                    }
+                }
+            }
+
             // Auto-spawn the node if no external RPC is configured, no child is
             // running, we haven't tried yet, and the default unix socket isn't
             // already present (which signals an existing node).
-            let just_spawned = if !app.config.has_external_rpc()
+            let should_spawn = !app.config.has_external_rpc()
                 && app.node_child.is_none()
-                && app.node_exit_code.is_none()
-                && !app.spawn_attempted
                 && !app.config.datadir.join("rpc.sock").exists()
-            {
+                && (app.node_exit_code.is_none() || app.node_exit_code == Some(0))
+                && !app.spawn_attempted;
+
+            let should_restart = !app.config.has_external_rpc()
+                && app.node_child.is_none()
+                && app.node_exit_code.is_some()
+                && app.node_exit_code != Some(0)
+                && app.node_restart_after.is_some_and(|t| Instant::now() >= t);
+
+            let just_spawned = if should_spawn || should_restart {
+                if should_restart {
+                    app.node_exit_code = None;
+                    app.node_restart_after = None;
+                    app.spawn_error = None;
+                    app.spawn_attempted = false;
+                }
                 match node::spawn_node(
                     &app.config.datadir,
                     app.config.node_binary.as_deref(),

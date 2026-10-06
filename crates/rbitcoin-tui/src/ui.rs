@@ -39,18 +39,29 @@ impl Widget for AppWidget<'_> {
 
         self.render_title_bar(title_bar, buf);
         self.render_content(content, buf);
-        render_bottom_bar(bottom_bar, buf);
+        render_status_bar(bottom_bar, buf, self.app);
     }
 }
 
 impl AppWidget<'_> {
+    fn tab_accent(&self) -> ratatui::style::Color {
+        match self.app.tab {
+            Tab::Dashboard => BRIGHT_CYAN,
+            Tab::Chain => BRIGHT_YELLOW,
+            Tab::Network => BRIGHT_GREEN,
+            Tab::Mempool => BRIGHT_MAGENTA,
+            Tab::Console => WHITE,
+        }
+    }
+
     fn render_title_bar(&self, area: Rect, buf: &mut Buffer) {
         let layout = Layout::horizontal([Constraint::Min(0), Constraint::Length(40)]);
         let chunks = layout.split(area);
         let title = chunks[0];
         let tabs_area = chunks[1];
 
-        Span::styled(" rbitcoin-tui ", THEME.app_title).render(title, buf);
+        let accent = self.tab_accent();
+        Span::styled(" rbitcoin-tui ", Style::new().fg(accent).add_modifier(Modifier::BOLD)).render(title, buf);
 
         let titles: Vec<Line<'_>> = Tab::ALL
             .iter()
@@ -76,16 +87,25 @@ impl AppWidget<'_> {
     }
 
     fn render_dashboard(&self, area: Rect, buf: &mut Buffer) {
+        let outer = Block::bordered()
+            .border_style(Style::new().fg(self.tab_accent()))
+            .title(" Dashboard ")
+            .title_style(Style::new().fg(self.tab_accent()).add_modifier(Modifier::BOLD))
+            .style(Style::new().bg(BLACK));
+        outer.render(area, buf);
+
         let layout = Layout::vertical([
             Constraint::Length(7),
             Constraint::Length(9),
             Constraint::Min(0),
+            Constraint::Length(3),
         ])
         .margin(1);
         let chunks = layout.split(area);
         let summary = chunks[0];
         let gauges = chunks[1];
         let bottom = chunks[2];
+        let ticker = chunks[3];
 
         self.render_summary_card(summary, buf);
         self.render_gauges_row(gauges, buf);
@@ -95,6 +115,7 @@ impl AppWidget<'_> {
         let bottom_chunks = bottom_layout.split(bottom);
         self.render_mempool_sparkline(bottom_chunks[0], buf);
         self.render_mini_log(bottom_chunks[1], buf);
+        self.render_event_ticker(ticker, buf);
     }
 
     fn render_summary_card(&self, area: Rect, buf: &mut Buffer) {
@@ -149,6 +170,10 @@ impl AppWidget<'_> {
                 }
             }
         }
+        if !self.app.config.node_args.is_empty() {
+            let args = self.app.config.node_args.join(" ");
+            let _ = writeln!(left_text, "args: {args}");
+        }
         // Show startup telemetry while the node is starting and RPC isn't up.
         if self.app.node_child.is_some()
             && self.app.node_exit_code.is_none()
@@ -191,6 +216,7 @@ impl AppWidget<'_> {
         if let Ok(chain) = &self.app.snapshot.chain {
             let _ = writeln!(right_text, "blocks: {}", chain.blocks);
             let _ = writeln!(right_text, "headers: {}", chain.headers);
+            let _ = writeln!(right_text, "tip age: {}", tip_age(chain.mediantime));
         }
         let ready = if self.app.snapshot.is_ready() {
             Span::styled("READY", OK.add_modifier(Modifier::BOLD))
@@ -398,6 +424,48 @@ impl AppWidget<'_> {
         Paragraph::new(lines).render(inner, buf);
     }
 
+    fn render_event_ticker(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::bordered()
+            .title(" Live Feed ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let mut events: Vec<Span<'_>> = Vec::new();
+
+        // Add latest peer events
+        for evt in self.app.log_peer_events.iter().rev().take(3) {
+            let color = if evt.contains("disconnect") || evt.contains("drop") || evt.contains("ban") {
+                BRIGHT_RED
+            } else if evt.contains("connect") || evt.contains("handshake") {
+                BRIGHT_GREEN
+            } else {
+                LIGHT_GRAY
+            };
+            let short = if evt.len() > 60 { &evt[..60] } else { evt };
+            events.push(Span::styled(format!(" ● {short} "), Style::new().fg(color)));
+        }
+
+        // Add latest warn/error if any
+        if let Some(ref err) = self.app.log_last_error {
+            let short = if err.len() > 60 { &err[..60] } else { err };
+            events.push(Span::styled(format!(" ● {short} "), ERROR));
+        } else if let Some(ref warn) = self.app.log_last_warn {
+            let short = if warn.len() > 60 { &warn[..60] } else { warn };
+            events.push(Span::styled(format!(" ● {short} "), WARN));
+        }
+
+        if events.is_empty() {
+            events.push(Span::styled(" waiting for events… ", MUTED));
+        }
+
+        Line::from(events)
+            .style(Style::new().bg(BLACK))
+            .render(inner, buf);
+    }
+
     fn render_chain(&self, area: Rect, buf: &mut Buffer) {
         let layout = Layout::vertical([Constraint::Length(8), Constraint::Min(0)]).margin(1);
         let chunks = layout.split(area);
@@ -405,9 +473,9 @@ impl AppWidget<'_> {
         let info_area = chunks[1];
 
         let outer = Block::bordered()
-            .border_style(THEME.borders)
+            .border_style(Style::new().fg(self.tab_accent()))
             .title(" Chain ")
-            .title_style(THEME.app_title)
+            .title_style(Style::new().fg(self.tab_accent()).add_modifier(Modifier::BOLD))
             .style(Style::new().bg(BLACK));
         outer.render(area, buf);
 
@@ -470,11 +538,15 @@ impl AppWidget<'_> {
                 } else {
                     chain.chainwork.clone()
                 };
+                let remaining = chain.headers.saturating_sub(chain.blocks);
+                let eta = sync_eta(&self.app.blocks_history, remaining, self.app.interval.as_secs());
                 let _ = writeln!(right_text, "Best block:   {}", hash_short);
                 let _ = writeln!(right_text, "Difficulty:   {:.4}", chain.difficulty);
                 let _ = writeln!(right_text, "Chain work:   {}", work_short);
                 let _ = writeln!(right_text, "Progress:     {:.4}%", chain.verification_progress * 100.0);
-                let _ = writeln!(right_text, "Remaining:    {}", chain.headers.saturating_sub(chain.blocks));
+                let _ = writeln!(right_text, "Remaining:    {}", remaining);
+                let _ = writeln!(right_text, "ETA:          {}", eta);
+                let _ = writeln!(right_text, "Tip age:      {}", tip_age(chain.mediantime));
                 Paragraph::new(right_text)
                     .style(THEME.content)
                     .wrap(Wrap { trim: true })
@@ -506,12 +578,16 @@ impl AppWidget<'_> {
                     .alignment(Alignment::Center)
                     .render(gauge_inner, buf);
 
+                let spinner = ["◐", "◓", "◑", "◒"];
+                let spin = spinner[self.app.tick_counter as usize % spinner.len()];
                 let mut rows = Vec::new();
                 if e != "no RPC endpoint responded" {
                     rows.push(format!("Error: {e}"));
                 } else {
                     if let Some(ref op) = self.app.startup_operation {
-                        rows.push(format!("operation: {op}"));
+                        rows.push(format!("{spin}  {op}"));
+                    } else {
+                        rows.push(format!("{spin}  node is initializing…"));
                     }
                     if let Some((cur, tot)) = self.app.startup_progress {
                         let pct = (cur as f64 / tot as f64) * 100.0;
@@ -520,11 +596,12 @@ impl AppWidget<'_> {
                     if let Some(h) = self.app.startup_height {
                         rows.push(format!("height: {h}"));
                     }
-                    if rows.is_empty() {
-                        rows.push("node is initializing…".into());
-                    }
                 }
-                let style = if e == "no RPC endpoint responded" { MUTED } else { ERROR };
+                let style = if e == "no RPC endpoint responded" {
+                    Style::new().fg(WHITE).add_modifier(Modifier::BOLD)
+                } else {
+                    ERROR
+                };
                 let placeholder = Paragraph::new(rows.join("\n"))
                     .style(style)
                     .alignment(Alignment::Center);
@@ -537,23 +614,26 @@ impl AppWidget<'_> {
         let layout = Layout::vertical([
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Length(8),
             Constraint::Min(0),
         ])
         .margin(1);
         let chunks = layout.split(area);
         let summary = chunks[0];
         let map_area = chunks[1];
-        let peers = chunks[2];
+        let traffic = chunks[2];
+        let peers = chunks[3];
 
         let outer = Block::bordered()
-            .border_style(THEME.borders)
+            .border_style(Style::new().fg(self.tab_accent()))
             .title(" Network ")
-            .title_style(THEME.app_title)
+            .title_style(Style::new().fg(self.tab_accent()).add_modifier(Modifier::BOLD))
             .style(Style::new().bg(BLACK));
         outer.render(area, buf);
 
         self.render_net_summary(summary, buf);
         self.render_peer_map(map_area, buf);
+        self.render_net_traffic(traffic, buf);
         self.render_peer_table(peers, buf);
     }
 
@@ -866,6 +946,69 @@ impl AppWidget<'_> {
             .render(inner, buf);
     }
 
+    fn render_net_traffic(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::bordered()
+            .title(" Network Traffic ")
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let layout = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]);
+        let chunks = layout.split(inner);
+        let recv_area = chunks[0];
+        let sent_area = chunks[1];
+
+        let recv_rate = self.app.net_recv_rate_history.back().copied().unwrap_or(0);
+        let recv_data: Vec<u64> = self.app.net_recv_rate_history.iter().copied().collect();
+        let recv_title = format!(" ↓ {} ", human_bytes(recv_rate));
+        let recv_block = Block::bordered()
+            .title(recv_title)
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
+        let recv_inner = recv_block.inner(recv_area);
+        recv_block.render(recv_area, buf);
+        if recv_data.len() >= 2 {
+            let sparkline = Sparkline::default()
+                .data(&recv_data)
+                .style(Style::new().fg(BRIGHT_GREEN))
+                .max(*recv_data.iter().max().unwrap_or(&1).max(&1))
+                .bar_set(symbols::bar::NINE_LEVELS);
+            sparkline.render(recv_inner, buf);
+        } else {
+            Paragraph::new("collecting data…")
+                .style(MUTED)
+                .alignment(Alignment::Center)
+                .render(recv_inner, buf);
+        }
+
+        let sent_rate = self.app.net_sent_rate_history.back().copied().unwrap_or(0);
+        let sent_data: Vec<u64> = self.app.net_sent_rate_history.iter().copied().collect();
+        let sent_title = format!(" ↑ {} ", human_bytes(sent_rate));
+        let sent_block = Block::bordered()
+            .title(sent_title)
+            .title_style(THEME.description_title)
+            .border_style(THEME.borders)
+            .style(Style::new().bg(BLACK));
+        let sent_inner = sent_block.inner(sent_area);
+        sent_block.render(sent_area, buf);
+        if sent_data.len() >= 2 {
+            let sparkline = Sparkline::default()
+                .data(&sent_data)
+                .style(Style::new().fg(BRIGHT_CYAN))
+                .max(*sent_data.iter().max().unwrap_or(&1).max(&1))
+                .bar_set(symbols::bar::NINE_LEVELS);
+            sparkline.render(sent_inner, buf);
+        } else {
+            Paragraph::new("collecting data…")
+                .style(MUTED)
+                .alignment(Alignment::Center)
+                .render(sent_inner, buf);
+        }
+    }
+
     fn render_mempool(&self, area: Rect, buf: &mut Buffer) {
         let layout = Layout::vertical([Constraint::Length(10), Constraint::Length(8), Constraint::Min(0)]).margin(1);
         let chunks = layout.split(area);
@@ -874,9 +1017,9 @@ impl AppWidget<'_> {
         let details = chunks[2];
 
         let outer = Block::bordered()
-            .border_style(THEME.borders)
+            .border_style(Style::new().fg(self.tab_accent()))
             .title(" Mempool ")
-            .title_style(THEME.app_title)
+            .title_style(Style::new().fg(self.tab_accent()).add_modifier(Modifier::BOLD))
             .style(Style::new().bg(BLACK));
         outer.render(area, buf);
 
@@ -1072,9 +1215,13 @@ impl AppWidget<'_> {
     }
 
     fn render_console(&self, area: Rect, buf: &mut Buffer) {
+        let follow_label = if self.app.console_follow { " [FOLLOW]" } else { " [PAUSED]" };
         let outer = Block::bordered()
-            .border_style(THEME.borders)
-            .title(" Console ")
+            .border_style(Style::new().fg(self.tab_accent()))
+            .title(Line::from(vec![
+                Span::styled(" Console ", Style::new().fg(self.tab_accent()).add_modifier(Modifier::BOLD)),
+                Span::styled(follow_label, Style::new().fg(if self.app.console_follow { BRIGHT_GREEN } else { BRIGHT_YELLOW })),
+            ]))
             .title_style(THEME.app_title)
             .style(Style::new().bg(BLACK));
         let inner = outer.inner(area);
@@ -1176,28 +1323,106 @@ fn dir_size(path: &std::path::Path) -> Result<u64, std::io::Error> {
     Ok(total)
 }
 
-fn render_bottom_bar(area: Rect, buf: &mut Buffer) {
-    let keys = [
-        ("Tab/→", "Next"),
-        ("Shift+Tab/←", "Prev"),
-        ("1-5", "Tab"),
-        ("R", "Refresh"),
-        ("H/?", "Help"),
-        ("Q/Esc", "Quit"),
-    ];
-    let spans: Vec<Span<'_>> = keys
-        .iter()
-        .flat_map(|(key, desc)| {
-            [
-                Span::styled(format!(" {key} "), THEME.key_binding.key),
-                Span::styled(format!(" {desc} "), THEME.key_binding.description),
-            ]
+fn render_status_bar(area: Rect, buf: &mut Buffer, app: &App) {
+    let spinner = ["◐", "◓", "◑", "◒"];
+    let spin = spinner[app.tick_counter as usize % spinner.len()];
+
+    let height = app
+        .snapshot
+        .chain
+        .as_ref()
+        .map(|c| format!("{}/{}", c.blocks, c.headers))
+        .unwrap_or_else(|_| {
+            app.startup_height
+                .map(|h| format!("{h} (logs)"))
+                .unwrap_or_else(|| "—".into())
+        });
+
+    let sync_pct = app
+        .snapshot
+        .chain
+        .as_ref()
+        .map(|c| format!("{:.2}%", c.verification_progress * 100.0))
+        .unwrap_or_else(|_| {
+            app.startup_progress
+                .map(|(cur, tot)| format!("{:.1}%", (cur as f64 / tot as f64) * 100.0))
+                .unwrap_or_else(|| "—".into())
+        });
+
+    let peers = app
+        .snapshot
+        .network
+        .as_ref()
+        .map(|n| format!("{}↓ {}↑", n.connections_in, n.connections_out))
+        .unwrap_or_else(|_| {
+            match (app.log_net_in, app.log_net_out) {
+                (Some(i), Some(o)) => format!("{i}↓ {o}↑ (logs)"),
+                _ => "—".into(),
+            }
+        });
+
+    let mempool = app
+        .snapshot
+        .mempool
+        .as_ref()
+        .map(|m| format!("{} txs", m.transactions))
+        .unwrap_or_else(|_| {
+            app.log_mempool_txs
+                .map(|t| format!("{t} txs (logs)"))
+                .unwrap_or_else(|| "—".into())
+        });
+
+    let net_traffic = app
+        .snapshot
+        .net_totals
+        .as_ref()
+        .map(|t| format!("↓{} ↑{}", human_bytes(t.total_bytes_recv), human_bytes(t.total_bytes_sent)))
+        .unwrap_or_else(|_| "—".into());
+
+    let uptime = app
+        .node_spawned_at
+        .map(|s| format_elapsed(s.elapsed()))
+        .unwrap_or_else(|| "—".into());
+
+    let node_state = if app.config.has_external_rpc() {
+        Span::styled(" external ", Style::new().fg(BLACK).bg(BRIGHT_CYAN).add_modifier(Modifier::BOLD))
+    } else if let Some(0) = app.node_exit_code {
+        Span::styled(" stopped ", Style::new().fg(BLACK).bg(MID_GRAY).add_modifier(Modifier::BOLD))
+    } else if let Some(code) = app.node_exit_code {
+        if let Some(restart) = app.node_restart_after {
+            let secs = restart.saturating_duration_since(std::time::Instant::now()).as_secs();
+            Span::styled(format!(" restart in {secs}s "), Style::new().fg(BLACK).bg(BRIGHT_YELLOW).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(format!(" exited {code} "), Style::new().fg(BLACK).bg(BRIGHT_RED).add_modifier(Modifier::BOLD))
+        }
+    } else if app.node_child.is_some() {
+        if app.snapshot.chain.is_ok() {
+            Span::styled(" running ", Style::new().fg(BLACK).bg(BRIGHT_GREEN).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(format!(" {spin} starting "), Style::new().fg(BLACK).bg(BRIGHT_YELLOW).add_modifier(Modifier::BOLD))
+        }
+    } else {
+        Span::styled(" not started ", Style::new().fg(BLACK).bg(MID_GRAY).add_modifier(Modifier::BOLD))
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            let secs = d.as_secs();
+            let h = (secs / 3600) % 24;
+            let m = (secs / 60) % 60;
+            let s = secs % 60;
+            format!("{h:02}:{m:02}:{s:02} UTC")
         })
-        .collect();
-    Line::from(spans)
-        .centered()
-        .style(Style::new().fg(MID_GRAY).bg(BLACK))
-        .render(area, buf);
+        .unwrap_or_default();
+
+    let left = Line::from(vec![
+        Span::styled(" h:? ", THEME.key_binding.key),
+        node_state,
+        Span::styled(format!("  height:{height}  sync:{sync_pct}  peers:{peers}  mempool:{mempool}  net:{net_traffic}  uptime:{uptime} "), Style::new().fg(LIGHT_GRAY).bg(BLACK)),
+        Span::styled(format!(" {now} "), Style::new().fg(MID_GRAY).bg(BLACK)),
+    ]);
+    left.render(area, buf);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
@@ -1212,12 +1437,15 @@ Navigation
   Tab / Right       next tab
   Shift+Tab / Left  previous tab
   1-5               jump to tab
-  Up / Down         scroll peer table / console
+  Up / Down         scroll peer table / browse command history
+  PageUp / PageDown fast scroll (console +10, peers +5)
 
 Console (type RPC commands)
   Type              enter command
   Enter             execute command
   Backspace         delete character
+  Up / Down         browse command history
+  f                 toggle follow mode (auto-scroll)
 
 Actions
   r                 refresh now
@@ -1271,6 +1499,44 @@ fn block_bar(ratio: f64, width: usize) -> String {
     let filled = (ratio * width as f64).clamp(0.0, width as f64) as usize;
     let empty = width.saturating_sub(filled);
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn tip_age(mediantime: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age = now.saturating_sub(mediantime);
+    if age < 60 {
+        format!("{age}s")
+    } else if age < 3600 {
+        format!("{}m", age / 60)
+    } else {
+        format!("{}h{}m", age / 3600, (age % 3600) / 60)
+    }
+}
+
+fn sync_eta(blocks_history: &std::collections::VecDeque<u64>, remaining: u64, interval_secs: u64) -> String {
+    if blocks_history.len() < 2 || interval_secs == 0 {
+        return "—".into();
+    }
+    let first = *blocks_history.front().unwrap();
+    let last = *blocks_history.back().unwrap();
+    let samples = blocks_history.len() as u64;
+    let delta = last.saturating_sub(first);
+    let duration = (samples - 1) * interval_secs;
+    if delta == 0 || duration == 0 {
+        return "—".into();
+    }
+    let rate = delta as f64 / duration as f64;
+    let eta_secs = (remaining as f64 / rate) as u64;
+    if eta_secs < 60 {
+        format!("{eta_secs}s")
+    } else if eta_secs < 3600 {
+        format!("{}m", eta_secs / 60)
+    } else {
+        format!("{}h{}m", eta_secs / 3600, (eta_secs % 3600) / 60)
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {

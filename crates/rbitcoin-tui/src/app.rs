@@ -67,6 +67,7 @@ pub struct Snapshot {
     pub network: Result<NetworkInfo, String>,
     pub mempool: Result<MempoolInfo, String>,
     pub peers: Result<Vec<PeerInfo>, String>,
+    pub net_totals: Result<NetTotals, String>,
     pub warnings: Option<String>,
     pub last_error: Option<String>,
 }
@@ -80,6 +81,7 @@ impl Snapshot {
             network: Err("waiting".into()),
             mempool: Err("waiting".into()),
             peers: Err("waiting".into()),
+            net_totals: Err("waiting".into()),
             warnings: None,
             last_error: None,
         }
@@ -92,6 +94,7 @@ impl Snapshot {
         let mut network = Err("no RPC endpoint responded".to_string());
         let mut mempool = Err("no RPC endpoint responded".to_string());
         let mut peers = Err("no RPC endpoint responded".to_string());
+        let mut net_totals = Err("no RPC endpoint responded".to_string());
         let mut errors = Vec::new();
 
         for candidate in config.endpoints() {
@@ -109,6 +112,8 @@ impl Snapshot {
                         .collect::<Result<Vec<_>, _>>(),
                     other => Err(format!("expected array, got {other}")),
                 });
+            let t = crate::rpc::rpc_call(&candidate, "getnettotals", &[], timeout)
+                .and_then(NetTotals::from_value);
 
             // Accept the endpoint as soon as chain info works; keep whatever
             // else succeeded. This prevents a slow mempool or peer call from
@@ -119,6 +124,7 @@ impl Snapshot {
                 network = n;
                 mempool = m;
                 peers = p;
+                net_totals = t;
                 break;
             }
 
@@ -144,6 +150,7 @@ impl Snapshot {
             .or_else(|| network.as_ref().err().cloned())
             .or_else(|| mempool.as_ref().err().cloned())
             .or_else(|| peers.as_ref().err().cloned())
+            .or_else(|| net_totals.as_ref().err().cloned())
             .or_else(|| (!errors.is_empty()).then(|| errors.join(" ; ")));
         Self {
             endpoint,
@@ -152,6 +159,7 @@ impl Snapshot {
             network,
             mempool,
             peers,
+            net_totals,
             warnings,
             last_error,
         }
@@ -169,6 +177,7 @@ impl Snapshot {
 }
 
 const CONSOLE_CAPACITY: usize = 1000;
+const CMD_HISTORY_CAPACITY: usize = 100;
 
 pub struct App {
     pub config: Config,
@@ -180,12 +189,21 @@ pub struct App {
     pub snapshot: Snapshot,
     pub mempool_tx_history: VecDeque<u64>,
     pub mempool_fee_history: VecDeque<f64>,
+    pub net_recv_history: VecDeque<u64>,
+    pub net_sent_history: VecDeque<u64>,
+    pub net_recv_rate_history: VecDeque<u64>,
+    pub net_sent_rate_history: VecDeque<u64>,
+    pub blocks_history: VecDeque<u64>,
     pub peer_table_scroll: usize,
     pub node_child: Option<std::process::Child>,
     pub node_exit_code: Option<i32>,
+    pub node_restart_after: Option<Instant>,
     pub log_rx: Option<std::sync::mpsc::Receiver<String>>,
     pub console_lines: VecDeque<String>,
     pub console_scroll: usize,
+    pub console_follow: bool,
+    pub console_history: VecDeque<String>,
+    pub history_index: Option<usize>,
     pub spawn_attempted: bool,
     pub spawn_error: Option<String>,
     pub startup_height: Option<u64>,
@@ -203,6 +221,7 @@ pub struct App {
     pub node_pid: Option<u32>,
     pub command_input: String,
     pub cmd_rx: Option<std::sync::mpsc::Receiver<String>>,
+    pub tick_counter: u64,
 }
 
 impl App {
@@ -218,12 +237,21 @@ impl App {
             snapshot: Snapshot::empty(),
             mempool_tx_history: VecDeque::with_capacity(HISTORY_CAPACITY),
             mempool_fee_history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            net_recv_history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            net_sent_history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            net_recv_rate_history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            net_sent_rate_history: VecDeque::with_capacity(HISTORY_CAPACITY),
+            blocks_history: VecDeque::with_capacity(HISTORY_CAPACITY),
             peer_table_scroll: 0,
             node_child: None,
             node_exit_code: None,
+            node_restart_after: None,
             log_rx: None,
             console_lines: VecDeque::with_capacity(CONSOLE_CAPACITY),
             console_scroll: 0,
+            console_follow: true,
+            console_history: VecDeque::with_capacity(CMD_HISTORY_CAPACITY),
+            history_index: None,
             spawn_attempted: false,
             spawn_error: None,
             startup_height: None,
@@ -241,6 +269,7 @@ impl App {
             node_pid: None,
             command_input: String::new(),
             cmd_rx: None,
+            tick_counter: 0,
         }
     }
 
@@ -270,6 +299,12 @@ impl App {
             }
         }
 
+        if let Ok(ref c) = self.snapshot.chain {
+            if self.blocks_history.len() >= HISTORY_CAPACITY {
+                self.blocks_history.pop_front();
+            }
+            self.blocks_history.push_back(c.blocks);
+        }
         if let Ok(ref m) = self.snapshot.mempool {
             if self.mempool_tx_history.len() >= HISTORY_CAPACITY {
                 self.mempool_tx_history.pop_front();
@@ -280,14 +315,42 @@ impl App {
             }
             self.mempool_fee_history.push_back(m.min_fee_sat_vb);
         }
+        if let Ok(ref t) = self.snapshot.net_totals {
+            let prev_recv = self.net_recv_history.back().copied();
+            let prev_sent = self.net_sent_history.back().copied();
+            if self.net_recv_history.len() >= HISTORY_CAPACITY {
+                self.net_recv_history.pop_front();
+            }
+            self.net_recv_history.push_back(t.total_bytes_recv);
+            if self.net_sent_history.len() >= HISTORY_CAPACITY {
+                self.net_sent_history.pop_front();
+            }
+            self.net_sent_history.push_back(t.total_bytes_sent);
+            // Compute rates (bytes per interval)
+            if let (Some(pr), Some(ps)) = (prev_recv, prev_sent) {
+                let recv_rate = t.total_bytes_recv.saturating_sub(pr);
+                let sent_rate = t.total_bytes_sent.saturating_sub(ps);
+                if self.net_recv_rate_history.len() >= HISTORY_CAPACITY {
+                    self.net_recv_rate_history.pop_front();
+                }
+                self.net_recv_rate_history.push_back(recv_rate);
+                if self.net_sent_rate_history.len() >= HISTORY_CAPACITY {
+                    self.net_sent_rate_history.pop_front();
+                }
+                self.net_sent_rate_history.push_back(sent_rate);
+            }
+        }
         self.drain_log_lines();
         self.drain_cmd_results();
+        self.tick_counter = self.tick_counter.wrapping_add(1);
         self.next_refresh = Instant::now() + self.interval;
     }
 
     fn drain_log_lines(&mut self) {
         let Some(ref rx) = self.log_rx else { return };
+        let mut new_lines = false;
         while let Ok(line) = rx.try_recv() {
+            new_lines = true;
             if self.console_lines.len() >= CONSOLE_CAPACITY {
                 self.console_lines.pop_front();
             }
@@ -325,6 +388,11 @@ impl App {
                 }
                 self.log_peer_events.push_back(line);
             }
+        }
+        if new_lines && self.console_follow {
+            let visible = 1; // will be set by renderer; just clamp to end
+            let max_scroll = self.console_lines.len().saturating_sub(visible);
+            self.console_scroll = max_scroll;
         }
     }
 
@@ -445,7 +513,13 @@ impl App {
             }) => {
                 match self.tab {
                     Tab::Network => self.peer_table_scroll = self.peer_table_scroll.saturating_add(1),
-                    Tab::Console => self.console_scroll = self.console_scroll.saturating_add(1),
+                    Tab::Console => {
+                        if self.history_index.is_some() || !self.command_input.is_empty() {
+                            self.history_next();
+                        } else {
+                            self.console_scroll = self.console_scroll.saturating_add(1);
+                        }
+                    }
                     _ => {}
                 }
                 false
@@ -456,7 +530,35 @@ impl App {
             }) => {
                 match self.tab {
                     Tab::Network => self.peer_table_scroll = self.peer_table_scroll.saturating_sub(1),
-                    Tab::Console => self.console_scroll = self.console_scroll.saturating_sub(1),
+                    Tab::Console => {
+                        if !self.console_history.is_empty() {
+                            self.history_prev();
+                        } else {
+                            self.console_scroll = self.console_scroll.saturating_sub(1);
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            }) => {
+                match self.tab {
+                    Tab::Network => self.peer_table_scroll = self.peer_table_scroll.saturating_add(5),
+                    Tab::Console => self.console_scroll = self.console_scroll.saturating_add(10),
+                    _ => {}
+                }
+                false
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            }) => {
+                match self.tab {
+                    Tab::Network => self.peer_table_scroll = self.peer_table_scroll.saturating_sub(5),
+                    Tab::Console => self.console_scroll = self.console_scroll.saturating_sub(10),
                     _ => {}
                 }
                 false
@@ -467,6 +569,7 @@ impl App {
             }) => {
                 if self.tab == Tab::Console {
                     self.command_input.pop();
+                    self.history_index = None;
                 }
                 false
             }
@@ -477,7 +580,18 @@ impl App {
                 if self.tab == Tab::Console && !self.command_input.is_empty() {
                     let cmd = self.command_input.clone();
                     self.command_input.clear();
+                    self.history_index = None;
+                    self.push_history(cmd.clone());
                     self.submit_console_command(&cmd);
+                }
+                false
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('f'),
+                ..
+            }) => {
+                if self.tab == Tab::Console {
+                    self.console_follow = !self.console_follow;
                 }
                 false
             }
@@ -487,9 +601,53 @@ impl App {
                 ..
             }) if self.tab == Tab::Console => {
                 self.command_input.push(c);
+                self.history_index = None;
                 false
             }
             _ => false,
+        }
+    }
+
+    fn push_history(&mut self, cmd: String) {
+        if self.console_history.len() >= CMD_HISTORY_CAPACITY {
+            self.console_history.pop_front();
+        }
+        self.console_history.push_back(cmd);
+    }
+
+    fn history_prev(&mut self) {
+        let len = self.console_history.len();
+        if len == 0 {
+            return;
+        }
+        let idx = match self.history_index {
+            Some(i) if i > 0 => i - 1,
+            Some(_) => 0,
+            None => len - 1,
+        };
+        self.history_index = Some(idx);
+        if let Some(cmd) = self.console_history.get(idx) {
+            self.command_input = cmd.clone();
+        }
+    }
+
+    fn history_next(&mut self) {
+        let len = self.console_history.len();
+        if len == 0 {
+            return;
+        }
+        let idx = match self.history_index {
+            Some(i) if i + 1 < len => i + 1,
+            Some(_) => {
+                self.history_index = None;
+                self.command_input.clear();
+                return;
+            }
+            None => return,
+        };
+        self.history_index = Some(idx);
+        if let Some(cmd) = self.console_history.get(idx) {
+            self.command_input = cmd.clone();
         }
     }
 
@@ -498,6 +656,14 @@ impl App {
             self.console_lines.pop_front();
         }
         self.console_lines.push_back(format!("> {cmd}"));
+
+        // Intercept TUI-local commands before sending to RPC.
+        let trimmed = cmd.trim();
+        if trimmed.eq_ignore_ascii_case("clear") {
+            self.console_lines.clear();
+            self.console_scroll = 0;
+            return;
+        }
 
         let endpoint = self.snapshot.endpoint.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -755,6 +921,7 @@ mod tests {
                 descendantlimit: 0,
             }),
             peers: Ok(vec![]),
+            net_totals: Ok(NetTotals { total_bytes_recv: 0, total_bytes_sent: 0 }),
             warnings: None,
             last_error: None,
         };

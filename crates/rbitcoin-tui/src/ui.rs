@@ -289,24 +289,14 @@ impl AppWidget<'_> {
                     BRIGHT_RED
                 };
                 let label = format!("{:.2}%", ratio * 100.0);
-                let bar_width = inner.width.saturating_sub(2) as usize;
-                let bar = block_bar(ratio, bar_width.max(1));
-                let bar_line = Line::from(vec![
-                    Span::styled(bar, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {label}"), Style::new().fg(WHITE)),
-                ]);
+                let bar_line = progress_line(ratio, inner.width, &label, color);
                 let bar_para = Paragraph::new(bar_line).alignment(Alignment::Center);
                 bar_para.render(inner, buf);
 
                 self.render_dashboard_network(right, buf, Some(chain));
             }
             Err(_) => {
-                let bar_width = inner.width.saturating_sub(2) as usize;
-                let bar = block_bar(0.0, bar_width.max(1));
-                let bar_line = Line::from(vec![
-                    Span::styled(bar, Style::new().fg(MID_GRAY)),
-                    Span::styled("  starting…", Style::new().fg(WHITE)),
-                ]);
+                let bar_line = progress_line(0.0, inner.width, "starting…", MID_GRAY);
                 let bar_para = Paragraph::new(bar_line).alignment(Alignment::Center);
                 bar_para.render(inner, buf);
 
@@ -504,8 +494,7 @@ impl AppWidget<'_> {
                     BRIGHT_RED
                 };
                 let label = format!("{:.4}%", ratio * 100.0);
-                let bar_width = gauge_area.width.saturating_sub(4) as usize;
-                let bar = block_bar(ratio, bar_width.max(1));
+                let bar_line = progress_line(ratio, gauge_area.width, &label, color);
 
                 let gauge_block = Block::bordered()
                     .title(" Sync Progress ")
@@ -515,10 +504,6 @@ impl AppWidget<'_> {
                 let gauge_inner = gauge_block.inner(gauge_area);
                 gauge_block.render(gauge_area, buf);
 
-                let bar_line = Line::from(vec![
-                    Span::styled(bar, Style::new().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {label}"), Style::new().fg(WHITE)),
-                ]);
                 Paragraph::new(bar_line)
                     .alignment(Alignment::Center)
                     .render(gauge_inner, buf);
@@ -567,27 +552,23 @@ impl AppWidget<'_> {
                     .render(right, buf);
             }
             Err(ref e) => {
-                let (ratio, label) = if let Some((cur, tot)) = self.app.startup_progress {
+                let (ratio, label, title) = if let Some((cur, tot)) = self.app.startup_progress {
                     let r = (cur as f64 / tot as f64).clamp(0.0, 1.0);
-                    (r, format!("{:.1}%  {cur}/{tot}", r * 100.0))
+                    let op = self.app.startup_operation.as_deref().unwrap_or("startup");
+                    (r, format!("{:.1}%  {cur}/{tot}", r * 100.0), format!(" {op} "))
                 } else {
-                    (0.0, "starting…".into())
+                    (0.0, "starting…".into(), " Startup ".into())
                 };
-                let bar_width = gauge_area.width.saturating_sub(4) as usize;
-                let bar = block_bar(ratio, bar_width.max(1));
+                let bar_line = progress_line(ratio, gauge_area.width, &label, BRIGHT_CYAN);
 
                 let gauge_block = Block::bordered()
-                    .title(" Sync Progress ")
+                    .title(title)
                     .title_style(THEME.description_title)
                     .border_style(THEME.borders)
                     .style(Style::new().bg(BLACK));
                 let gauge_inner = gauge_block.inner(gauge_area);
                 gauge_block.render(gauge_area, buf);
 
-                let bar_line = Line::from(vec![
-                    Span::styled(bar, Style::new().fg(BRIGHT_CYAN).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  {label}"), Style::new().fg(WHITE)),
-                ]);
                 Paragraph::new(bar_line)
                     .alignment(Alignment::Center)
                     .render(gauge_inner, buf);
@@ -1507,6 +1488,17 @@ fn format_elapsed(duration: Duration) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+fn progress_line(ratio: f64, available_width: u16, label: &str, color: ratatui::style::Color) -> Line<'static> {
+    let label_part = format!("  {label}");
+    let label_len = label_part.chars().count() as u16;
+    let bar_width = available_width.saturating_sub(label_len) as usize;
+    let bar = block_bar(ratio, bar_width.max(1));
+    Line::from(vec![
+        Span::styled(bar, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(label_part, Style::new().fg(WHITE)),
+    ])
 }
 
 fn block_bar(ratio: f64, width: usize) -> String {

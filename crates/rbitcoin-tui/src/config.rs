@@ -25,6 +25,7 @@ impl Config {
         let mut once = false;
         let mut node_binary = None;
         let mut node_args = Vec::new();
+        let mut network_set = false;
 
         let mut iter = args.into_iter();
         let _ = iter.next();
@@ -69,6 +70,33 @@ impl Config {
                     let net = &arg[2..]; // strip leading "--"
                     node_args.push("--network".into());
                     node_args.push(net.into());
+                    network_set = true;
+                }
+                "-signet" | "-regtest" | "-testnet" => {
+                    let net = &arg[1..]; // strip leading "-"
+                    node_args.push("--network".into());
+                    node_args.push(net.into());
+                    network_set = true;
+                }
+                "--signet-challenge" => {
+                    let val = take_value(&mut iter, "--signet-challenge")?;
+                    node_args.push("--signet-challenge".into());
+                    node_args.push(val);
+                    if !network_set {
+                        node_args.push("--network".into());
+                        node_args.push("signet".into());
+                        network_set = true;
+                    }
+                }
+                "--signet-seed" => {
+                    let val = take_value(&mut iter, "--signet-seed")?;
+                    node_args.push("--signet-seed".into());
+                    node_args.push(val);
+                    if !network_set {
+                        node_args.push("--network".into());
+                        node_args.push("signet".into());
+                        network_set = true;
+                    }
                 }
                 "--node-binary" => {
                     node_binary = Some(PathBuf::from(take_value(&mut iter, "--node-binary")?));
@@ -116,6 +144,8 @@ Node Options:
   Any unknown argument is passed through to rbitcoin-node.
   Shorthands: --signet, --regtest, --testnet, --mainnet are translated
   to --network <net> automatically.
+  --signet-challenge HEX and --signet-seed HOST also auto-select
+  --network signet if no network is already set.
   Examples: --network signet, --listen ADDR, --connect ADDR,
   --rpc, --rest, --log-level LEVEL, --prune-seqsigwit, etc.
 ";
@@ -236,5 +266,44 @@ mod tests {
 
         let plain = Config::parse(vec![std::ffi::OsString::from("rbitcoin-tui")]).expect("parse");
         assert!(!plain.has_external_rpc());
+    }
+
+    #[test]
+    fn parse_signet_challenge_injects_network() {
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--signet-challenge"),
+            std::ffi::OsString::from("51"),
+        ])
+        .expect("parse");
+        assert_eq!(
+            cfg.node_args,
+            vec!["--signet-challenge", "51", "--network", "signet"]
+        );
+    }
+
+    #[test]
+    fn parse_signet_challenge_does_not_duplicate_network() {
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("--signet"),
+            std::ffi::OsString::from("--signet-challenge"),
+            std::ffi::OsString::from("51"),
+        ])
+        .expect("parse");
+        assert_eq!(
+            cfg.node_args,
+            vec!["--network", "signet", "--signet-challenge", "51"]
+        );
+    }
+
+    #[test]
+    fn parse_single_dash_network_shorthands() {
+        let cfg = Config::parse(vec![
+            std::ffi::OsString::from("rbitcoin-tui"),
+            std::ffi::OsString::from("-signet"),
+        ])
+        .expect("parse");
+        assert_eq!(cfg.node_args, vec!["--network", "signet"]);
     }
 }

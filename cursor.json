@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
   "new_skip": 0,
-  "old_index": 8195,
+  "old_index": 8840,
   "new_cap_used": false,
   "run_id": "41750075844",
-  "old_name": "crates/rbitcoin-mempool/src/fee_est.rs:277:44: replace * with + in blend_sat_kvb",
+  "old_name": "crates/rbitcoin-mempool/src/store.rs:414:32: replace + with - in Mempool::mark_slot_dead",
   "new_len": 0,
   "old_len": 32614,
   "new_remaining": 0,
-  "old_remaining": 31894,
+  "old_remaining": 31969,
   "completed_new": 0,
-  "completed_old": 720
+  "completed_old": 645
 }

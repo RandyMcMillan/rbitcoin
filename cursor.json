@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
   "new_skip": 236,
-  "old_index": 9092,
+  "old_index": 9372,
   "new_cap_used": true,
   "run_id": "41944530636",
-  "old_name": "crates/rbitcoin-mempool/src/store.rs:1202:16: replace < with > in open_or_init_body",
+  "old_name": "crates/rbitcoin-net/src/chain.rs:205:19: replace > with == in HeldBodies::insert",
   "new_len": 1295,
   "old_len": 32309,
   "new_remaining": 1059,
-  "old_remaining": 31933,
-  "completed_new": 236,
-  "completed_old": 376
+  "old_remaining": 32029,
+  "completed_new": 0,
+  "completed_old": 280
 }

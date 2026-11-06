@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
-  "new_skip": 236,
-  "old_index": 9372,
+  "new_skip": 366,
+  "old_index": 9574,
   "new_cap_used": true,
-  "run_id": "41944530636",
-  "old_name": "crates/rbitcoin-net/src/chain.rs:205:19: replace > with == in HeldBodies::insert",
+  "run_id": "42140011159",
+  "old_name": "crates/rbitcoin-net/src/chain.rs:1193:9: replace ChainHub::min_chain_work_floor -> Option<[u8; 32]> with Some([1; 32])",
   "new_len": 1295,
   "old_len": 32309,
-  "new_remaining": 1059,
-  "old_remaining": 32029,
-  "completed_new": 0,
-  "completed_old": 280
+  "new_remaining": 929,
+  "old_remaining": 32107,
+  "completed_new": 130,
+  "completed_old": 202
 }

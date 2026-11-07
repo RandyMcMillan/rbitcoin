@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
   "new_skip": 534,
-  "old_index": 9958,
+  "old_index": 10292,
   "new_cap_used": true,
   "run_id": "42320803951",
-  "old_name": "crates/rbitcoin-net/src/chain.rs:4108:42: replace > with < in ChainHub::hold_body",
+  "old_name": "crates/rbitcoin-net/src/codec.rs:558:9: delete match arm \"reject\" in decode_cmd_payload",
   "new_len": 1295,
   "old_len": 32309,
   "new_remaining": 761,
-  "old_remaining": 32238,
-  "completed_new": 168,
-  "completed_old": 71
+  "old_remaining": 31975,
+  "completed_new": 0,
+  "completed_old": 334
 }

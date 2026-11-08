@@ -1,0 +1,59 @@
+# 42431917420 1 0c500814592097d74fc68bc6d754f397a7a8c32d
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:111:57: replace & with | in TxSet::intersection in 109s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:119:9: replace TxSet::is_empty -> bool with false in 7s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:139:25: replace * with / in TxSet::iter in 7s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:228:21: delete match arm Ordering::Greater in DepGraph::linearize in 7s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:262:40: replace + with * in DepGraph::output_order in 7s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:281:25: delete match arm Ordering::Greater in DepGraph::output_order in 7s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:297:21: delete match arm Ordering::Greater in DepGraph::output_order in 7s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/linearize.rs:314:28: replace == with != in DepGraph::post_linearize in 7s build + 90s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2233:62: replace || with && in ChainHub::min_diff_walk_bits in 102s build + 51s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2664:20: replace > with == in ChainHub::generate_paying_async in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2664:20: replace > with >= in ChainHub::generate_paying_async in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2683:34: replace == with != in ChainHub::generate_paying_async in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2753:9: replace ChainHub::drain_generate_indexes with () in 14s build + 50s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3011:28: replace && with || in ChainHub::invalidate_block_inner in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3763:12: delete ! in ChainHub::finish_branch_reorg in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/chain.rs:4608:9: replace ChainHub::reset_side_branch_walks with () in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/chain.rs:4613:9: replace ChainHub::side_branch_walks -> u64 with 1 in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/chain.rs:4628:9: replace ChainHub::take_min_diff_walk_steps -> u64 with 0 in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/chain.rs:4628:9: replace ChainHub::take_min_diff_walk_steps -> u64 with 1 in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/ephemeral.rs:217:20: delete ! in spawn_isolated_broadcast_loop in 102s build + 51s test
+MISSED   crates/rbitcoin-net/src/listen.rs:30:5: replace set_exclusive_addr_use -> io::Result<()> with Ok(()) in 102s build + 50s test
+MISSED   crates/rbitcoin-net/src/listen.rs:47:11: replace == with != in set_exclusive_addr_use in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/msg_decode.rs:59:5: replace ctrl_decode_permits -> usize with 1 in 102s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:274:9: replace || with && in keep_staged_body_after_accept_err in 103s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:273:9: replace || with && in keep_staged_body_after_accept_err in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:277:36: replace && with || in keep_staged_body_after_accept_err in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:340:28: replace * with + in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:340:23: replace + with - in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:340:23: replace + with * in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:354:9: replace || with && in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:353:9: replace || with && in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:352:25: replace > with == in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:352:25: replace > with >= in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:353:24: replace > with == in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:353:24: replace > with >= in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:354:25: replace > with == in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:354:25: replace > with >= in decode_queue_over_cap in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:365:10: replace == with != in add_decode_q_heavy in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:372:10: replace == with != in sub_decode_q_heavy in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:426:9: replace DecodeQueue::front_len -> usize with 0 in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:426:9: replace DecodeQueue::front_len -> usize with 1 in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:430:9: replace DecodeQueue::front_heavy -> bool with true in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:430:9: replace DecodeQueue::front_heavy -> bool with false in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:500:9: replace <impl Drop for DecodeQueue>::drop with () in 9s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:1822:16: delete ! in on_heartbeat in 8s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:1887:41: replace == with != in announce_unsent_tip in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:2093:47: replace && with || in tx_announce_should_queue in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:2093:50: delete ! in tx_announce_should_queue in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:2342:16: delete ! in peer_session_with in 7s build + 50s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3618:16: replace == with != in note_block_request_window in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3620:31: replace || with && in note_block_request_window in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3620:23: replace < with == in note_block_request_window in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3620:23: replace < with > in note_block_request_window in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3620:23: replace < with <= in note_block_request_window in 6s build + 52s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3620:40: replace == with != in note_block_request_window in 6s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3787:63: replace && with || in apply_queued_decodes in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:3903:9: delete match arm NetworkMessage::Pong(n) in handle_peer_control_msg in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/peer.rs:6229:44: replace && with || in on_tx in 7s build + 51s test

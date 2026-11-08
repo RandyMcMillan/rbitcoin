@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
-  "new_skip": 534,
+  "new_skip": 915,
   "old_index": 10292,
   "new_cap_used": true,
-  "run_id": "42320803951",
-  "old_name": "crates/rbitcoin-net/src/codec.rs:558:9: delete match arm \"reject\" in decode_cmd_payload",
-  "new_len": 1295,
-  "old_len": 32309,
-  "new_remaining": 761,
-  "old_remaining": 31975,
-  "completed_new": 0,
-  "completed_old": 334
+  "run_id": "42431917420",
+  "old_name": "crates/rbitcoin-net/src/compact.rs:305:9: replace || with && in finish_reconstructed",
+  "new_len": 2186,
+  "old_len": 32079,
+  "new_remaining": 1271,
+  "old_remaining": 32079,
+  "completed_new": 381,
+  "completed_old": 0
 }

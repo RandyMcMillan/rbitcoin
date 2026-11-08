@@ -57,3 +57,18 @@ MISSED   crates/rbitcoin-net/src/peer.rs:3620:40: replace == with != in note_blo
 MISSED   crates/rbitcoin-net/src/peer.rs:3787:63: replace && with || in apply_queued_decodes in 7s build + 51s test
 MISSED   crates/rbitcoin-net/src/peer.rs:3903:9: delete match arm NetworkMessage::Pong(n) in handle_peer_control_msg in 7s build + 51s test
 MISSED   crates/rbitcoin-net/src/peer.rs:6229:44: replace && with || in on_tx in 7s build + 51s test
+# 42431917420 2 0c500814592097d74fc68bc6d754f397a7a8c32d
+MISSED   crates/rbitcoin-net/src/ephemeral.rs:213:23: replace < with == in spawn_isolated_broadcast_loop in 115s build + 52s test
+MISSED   crates/rbitcoin-net/src/ephemeral.rs:213:23: replace < with > in spawn_isolated_broadcast_loop in 7s build + 52s test
+MISSED   crates/rbitcoin-net/src/ephemeral.rs:213:23: replace < with <= in spawn_isolated_broadcast_loop in 7s build + 51s test
+MISSED   crates/rbitcoin-net/src/error.rs:109:13: delete match arm NetError::ConnectFailed{rules:Some(e), ..} in NetError::consensus_rules in 104s build + 50s test
+MISSED   crates/rbitcoin-net/src/error.rs:129:13: delete match arm NetError::ConnectFailed{rules:Some(e), msg, ..} in NetError::is_mutated in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/error.rs:137:13: delete match arm NetError::ConnectFailed{msg, ..} | NetError::Consensus(msg) in NetError::is_mutated in 6s build + 50s test
+MISSED   crates/rbitcoin-net/src/error.rs:135:21: replace || with && in NetError::is_mutated in 6s build + 52s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:167:5: replace clear_installed with () in 3s build + 41s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:225:27: replace match guard sam_retry(&e) with true in I2pSam::connect_session_dest in 5s build + 41s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:225:27: replace match guard sam_retry(&e) with false in I2pSam::connect_session_dest in 4s build + 41s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:314:27: replace match guard stream_retry(&e) with true in I2pSam::stream_forward in 4s build + 40s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:352:27: replace match guard stream_retry(&e) with true in I2pDialer::stream_connect in 4s build + 41s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:430:33: replace + with - in i2p_public_destination in 4s build + 40s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:491:40: replace | with ^ in i2p_b64_encode in 3s build + 40s test

@@ -72,3 +72,36 @@ MISSED   crates/rbitcoin-net/src/i2p_sam.rs:314:27: replace match guard stream_r
 MISSED   crates/rbitcoin-net/src/i2p_sam.rs:352:27: replace match guard stream_retry(&e) with true in I2pDialer::stream_connect in 4s build + 41s test
 MISSED   crates/rbitcoin-net/src/i2p_sam.rs:430:33: replace + with - in i2p_public_destination in 4s build + 40s test
 MISSED   crates/rbitcoin-net/src/i2p_sam.rs:491:40: replace | with ^ in i2p_b64_encode in 3s build + 40s test
+# 42542805525 1 0c500814592097d74fc68bc6d754f397a7a8c32d
+MISSED   crates/rbitcoin-net/src/peers.rs:1195:9: replace LivePeer::note_last_block with () in 103s build + 42s test
+MISSED   crates/rbitcoin-net/src/peers.rs:1406:27: replace && with || in LivePeer::block_download_owns in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/peers.rs:2563:46: replace || with && in PeerHub::try_start_headers_sync in 7s build + 43s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:55:5: replace on_off_pool_thread -> bool with false in 102s build + 44s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:68:9: replace <impl Drop for LeaveOffPool>::drop with () in 7s build + 43s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:168:9: replace <impl Drop for StorePermitGuard>::drop with () in 10s build + 42s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:221:9: replace off_pool_lane::off_pool_threads -> usize with 0 in 7s build + 44s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:221:9: replace off_pool_lane::off_pool_threads -> usize with 1 in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:227:28: replace == with != in off_pool_lane::off_pool_threads in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:228:19: replace += with -= in off_pool_lane::off_pool_threads in 5s build + 44s test
+MISSED   crates/rbitcoin-net/src/reactor.rs:228:19: replace += with *= in off_pool_lane::off_pool_threads in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:217:5: replace lane_test_gate_enabled -> bool with true in 105s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:256:54: replace == with != in take_lane_exemption in 9s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:262:5: replace take_lane_exemption -> bool with false in 9s build + 44s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:270:18: delete ! in lane_send_guard in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:284:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::new()) in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:284:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::from_iter([()])) in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:284:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::new(())) in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:284:5: replace lane_send_guard -> Option<std::sync::MutexGuard<'static, ()>> with Some(MutexGuard::from(())) in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:316:5: replace lane_exclusive_notify -> &'static tokio::sync::Notify with Box::leak(Box::new(Default::default())) in 8s build + 43s test
+MISSED   crates/rbitcoin-net/src/tip_accept.rs:417:11: delete ! in hold_lane_mutex_for_tests in 8s build + 44s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:492:18: replace < with <= in i2p_b64_encode in 103s build + 43s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:492:14: replace + with * in i2p_b64_encode in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:493:45: replace | with ^ in i2p_b64_encode in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:72:21: replace | with ^ in <impl std::ops::BitOr for NetPermissionFlags>::bitor in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:108:22: replace >= with < in ipv4_mask in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:35: replace - with + in ipv4_mask in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:35: replace - with / in ipv4_mask in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:17: replace << with >> in ipv4_mask in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:24: replace - with + in ipv4_mask in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:24: replace - with / in ipv4_mask in 4s build + 34s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:122:26: replace - with / in ipv6_mask in 4s build + 34s test

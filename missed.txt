@@ -105,3 +105,36 @@ MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:17: replace << with >> i
 MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:24: replace - with + in ipv4_mask in 4s build + 34s test
 MISSED   crates/rbitcoin-net/src/net_permissions.rs:111:24: replace - with / in ipv4_mask in 4s build + 34s test
 MISSED   crates/rbitcoin-net/src/net_permissions.rs:122:26: replace - with / in ipv6_mask in 4s build + 34s test
+# 42542805525 2 0c500814592097d74fc68bc6d754f397a7a8c32d
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:356:35: replace || with && in NetPermTable::flags_for in 81s build + 43s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:356:51: replace == with != in NetPermTable::flags_for in 9s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:73:53: replace && with || in ipv6_special_unroutable in 81s build + 43s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:77:21: replace && with || in ipv6_special_unroutable in 7s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:125:53: replace && with || in ipv6_embedded_bogon in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:125:37: replace && with || in ipv6_embedded_bogon in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:131:55: replace && with || in ipv6_embedded_bogon in 7s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:131:39: replace && with || in ipv6_embedded_bogon in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:174:9: replace || with && in ipv4_unroutable in 6s build + 45s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:173:9: replace || with && in ipv4_unroutable in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:197:17: replace || with && in clearnet_unroutable in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:196:17: replace || with && in clearnet_unroutable in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:195:17: replace || with && in clearnet_unroutable in 6s build + 45s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:194:17: replace || with && in clearnet_unroutable in 6s build + 43s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:394:26: replace | with ^ in encode_i2p_name in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:419:13: delete match arm b'A'..= b'Z' in decode_i2p_name in 85s build + 43s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:419:30: replace - with + in decode_i2p_name in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:419:30: replace - with / in decode_i2p_name in 7s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:423:26: replace | with ^ in decode_i2p_name in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:443:16: replace < with == in strip_onion_suffix in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:443:16: replace < with <= in strip_onion_suffix in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:495:26: replace | with ^ in b32_encode in 7s build + 45s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:514:13: delete match arm b'A'..= b'Z' in b32_decode in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:514:30: replace - with + in b32_decode in 6s build + 45s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:514:30: replace - with / in b32_decode in 7s build + 44s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:518:26: replace | with ^ in b32_decode in 7s build + 45s test
+MISSED   crates/rbitcoin-net/src/netaddr.rs:529:16: replace || with && in b32_decode in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netgroup.rs:25:17: replace || with && in select_diverse in 82s build + 45s test
+MISSED   crates/rbitcoin-net/src/netgroup.rs:41:21: replace < with <= in select_diverse in 6s build + 44s test
+MISSED   crates/rbitcoin-net/src/netgroup.rs:60:36: replace | with ^ in prefix_group in 6s build + 45s test
+MISSED   crates/rbitcoin-net/src/peer.rs:637:81: replace + with - in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/peer.rs:637:81: replace + with * in 3s build + 36s test

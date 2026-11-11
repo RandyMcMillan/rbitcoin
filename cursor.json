@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
-  "new_skip": 1296,
-  "old_index": 11785,
+  "new_skip": 1537,
+  "old_index": 11985,
   "new_cap_used": true,
-  "run_id": "42731611171",
-  "old_name": "crates/rbitcoin-net/src/peer.rs:5048:8: delete ! in on_inv_txid",
+  "run_id": "42934795332",
+  "old_name": "crates/rbitcoin-net/src/peer.rs:6835:5: replace pending_walk -> (BlockHash, u32) with (Default::default(), 1)",
   "new_len": 2186,
   "old_len": 32079,
-  "new_remaining": 890,
-  "old_remaining": 31707,
-  "completed_new": 0,
-  "completed_old": 372
+  "new_remaining": 649,
+  "old_remaining": 31879,
+  "completed_new": 241,
+  "completed_old": 200
 }

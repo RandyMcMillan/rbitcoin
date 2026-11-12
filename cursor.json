@@ -1,14 +1,14 @@
 {
   "new_base": "118dafdbb373580eef29a5dcd6fe2a09d159465a",
   "new_skip": 2055,
-  "old_index": 12602,
+  "old_index": 12995,
   "new_cap_used": true,
   "run_id": "43130740742",
-  "old_name": "crates/rbitcoin-net/src/peers.rs:1887:17: replace >> with << in mix64",
+  "old_name": "crates/rbitcoin-net/src/perf_meter.rs:22:9: replace PerfCounter::add with ()",
   "new_len": 2186,
   "old_len": 32079,
   "new_remaining": 131,
-  "old_remaining": 31837,
-  "completed_new": 518,
-  "completed_old": 242
+  "old_remaining": 31686,
+  "completed_new": 0,
+  "completed_old": 393
 }

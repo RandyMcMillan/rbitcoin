@@ -717,3 +717,86 @@ MISSED   crates/rbitcoin-net/src/tx_relay.rs:6608:9: replace MempoolHub::isolate
 MISSED   crates/rbitcoin-net/src/tx_relay.rs:6660:20: replace > with >= in MempoolHub::requeue_unreturned in 3s build + 27s test
 MISSED   crates/rbitcoin-net/src/tx_relay.rs:6663:19: replace += with *= in MempoolHub::requeue_unreturned in 3s build + 26s test
 MISSED   crates/rbitcoin-net/src/tx_relay.rs:6669:21: replace > with == in MempoolHub::requeue_unreturned in 3s build + 27s test
+# 43660593247 2 0c500814592097d74fc68bc6d754f397a7a8c32d
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:6744:16: replace == with != in MempoolHub::restamp_relay_age in 64s build + 36s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:6977:25: replace && with || in MempoolHub::scripthash_unconfirmed_delta in 6s build + 35s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:7096:25: replace > with == in MempoolHub::push_confirm_memory in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/v1.rs:27:34: replace * with + in 68s build + 36s test
+MISSED   crates/rbitcoin-net/src/v1.rs:27:34: replace * with / in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v1.rs:139:16: replace > with >= in V1Reader<R>::check_head in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v1.rs:164:39: replace < with == in V1Writer<W>::write_contents in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v1.rs:164:39: replace < with > in V1Writer<W>::write_contents in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v1.rs:164:39: replace < with <= in V1Writer<W>::write_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:380:37: replace > with >= in V2SessionReader<R>::read_packet in 66s build + 37s test
+MISSED   crates/rbitcoin-net/src/v2.rs:560:44: replace == with != in command_from_12 in 6s build + 36s test
+MISSED   crates/rbitcoin-net/src/v2.rs:577:43: replace match guard gh.locator_hashes.len() > MAX_LOCATOR_SZ with false in encode_v2_contents in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v2.rs:580:42: replace match guard gb.locator_hashes.len() > MAX_LOCATOR_SZ with false in encode_v2_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:570:24: replace > with == in encode_v2_contents in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v2.rs:570:24: replace > with >= in encode_v2_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:577:67: replace > with == in encode_v2_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:577:67: replace > with >= in encode_v2_contents in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v2.rs:580:66: replace > with == in encode_v2_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:580:66: replace > with >= in encode_v2_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:587:9: delete match arm NetworkMessage::Unknown{command, ..} in encode_v2_contents in 7s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:591:19: replace > with == in encode_v2_contents in 7s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:591:19: replace > with >= in encode_v2_contents in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:649:27: replace + with * in v2_command in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:667:22: replace > with == in framed_payload in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:667:22: replace > with >= in framed_payload in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/v2.rs:853:24: replace && with || in bip324_halves in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/v2.rs:942:33: replace - with + in read_v2_frame_with_progress in 63s build + 36s test
+MISSED   crates/rbitcoin-net/src/v2.rs:942:33: replace - with / in read_v2_frame_with_progress in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/versionbits_warn.rs:89:42: replace || with && in UnknownBitsScan::advance in 65s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:89:9: replace ChainHub::ibd_header_epoch -> IbdHeaderEpoch with Default::default() in 5s build + 37s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:102:13: replace || with && in ChainHub::publish_ibd_header_tip in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:101:41: replace != with == in ChainHub::publish_ibd_header_tip in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:111:17: replace && with || in ChainHub::publish_ibd_header_tip in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:110:17: replace && with || in ChainHub::publish_ibd_header_tip in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:109:21: replace == with != in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:110:20: delete ! in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:111:53: replace || with && in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:114:13: replace || with && in ChainHub::publish_ibd_header_tip in 4s build + 36s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:113:43: replace && with || in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:113:27: replace == with != in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:117:25: replace || with && in ChainHub::publish_ibd_header_tip in 4s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:117:80: replace && with || in ChainHub::publish_ibd_header_tip in 5s build + 36s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:117:47: replace == with != in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:117:85: replace <= with > in ChainHub::publish_ibd_header_tip in 5s build + 35s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:140:23: delete ! in ChainHub::publish_ibd_header_tip in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:146:22: replace |= with &= in ChainHub::publish_ibd_header_tip in 3s build + 28s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:146:25: delete ! in ChainHub::publish_ibd_header_tip in 3s build + 28s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:147:12: delete ! in ChainHub::publish_ibd_header_tip in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:188:37: replace < with <= in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:200:42: replace || with && in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:209:13: delete match arm (Some(a), Some(b)) in ChainHub::refresh_header_report in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:210:13: delete match arm (None, None) in ChainHub::refresh_header_report in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:209:58: replace && with || in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:209:45: replace == with != in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:209:69: replace == with != in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:217:61: replace && with || in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:217:44: replace == with != in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:217:72: replace == with != in ChainHub::refresh_header_report in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:229:22: replace &= with |= in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:229:25: delete ! in ChainHub::refresh_header_report in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:274:37: replace || with && in ChainHub::note_header_tip in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:276:42: replace && with || in ChainHub::note_header_tip in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:287:12: delete ! in ChainHub::note_header_tip in 4s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:292:27: replace != with == in ChainHub::note_header_tip in 3s build + 97s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:319:24: replace == with != in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:320:25: replace == with != in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:322:25: replace < with == in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:322:25: replace < with > in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:322:25: replace < with <= in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:330:42: replace && with || in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:330:25: replace == with != in ChainHub::refresh_stored_header_tip in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:343:37: replace == with != in ChainHub::proved_stored_header_height in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:359:42: replace || with && in ChainHub::stored_header_prefix in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:376:30: replace == with != in ChainHub::stored_header_prefix in 3s build + 27s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:390:38: replace || with && in ChainHub::stored_hash_at in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:390:55: replace >= with < in ChainHub::stored_hash_at in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:421:25: replace == with != in ChainHub::check_ibd_header_proof in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:428:25: replace != with == in ChainHub::check_ibd_header_proof in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:443:76: replace == with != in ChainHub::check_ibd_header_proof in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:453:31: replace <= with > in ChainHub::check_ibd_header_proof in 2s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:457:44: replace != with == in ChainHub::check_ibd_header_proof in 3s build + 26s test
+MISSED   crates/rbitcoin-net/src/header_report.rs:464:13: delete field safe_until from struct IbdValidation expression in ChainHub::check_ibd_header_proof in 3s build + 26s test

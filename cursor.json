@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
-  "new_skip": 650,
-  "old_index": 17404,
+  "new_skip": 931,
+  "old_index": 17621,
   "new_cap_used": true,
-  "run_id": "43991505088",
-  "old_name": "crates/rbitcoin-query/src/batch_parents.rs:1196:5: replace union_vouts -> Vec<u32> with vec![0]",
+  "run_id": "44211791358",
+  "old_name": "crates/rbitcoin-query/src/chain_view.rs:15:5: replace reset_index_io_under_lock with ()",
   "new_len": 4772,
   "old_len": 32449,
-  "new_remaining": 4122,
-  "old_remaining": 31711,
-  "completed_new": 0,
-  "completed_old": 738
+  "new_remaining": 3841,
+  "old_remaining": 32232,
+  "completed_new": 281,
+  "completed_old": 217
 }

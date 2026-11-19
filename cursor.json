@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
-  "new_skip": 931,
-  "old_index": 18114,
+  "new_skip": 1226,
+  "old_index": 18483,
   "new_cap_used": true,
-  "run_id": "44211791358",
-  "old_name": "crates/rbitcoin-query/src/reconstruct.rs:177:25: replace + with - in Query::tx_fk_at_height",
+  "run_id": "44432768827",
+  "old_name": "crates/rbitcoin-query/src/scripthash.rs:1761:18: replace < with <= in Query::height_window_history",
   "new_len": 4772,
   "old_len": 32449,
-  "new_remaining": 3841,
-  "old_remaining": 31956,
-  "completed_new": 0,
-  "completed_old": 493
+  "new_remaining": 3546,
+  "old_remaining": 32080,
+  "completed_new": 295,
+  "completed_old": 369
 }

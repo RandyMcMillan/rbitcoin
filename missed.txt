@@ -1108,3 +1108,104 @@ MISSED   crates/rbitcoin-query/src/reconstruct.rs:86:39: replace || with && in Q
 MISSED   crates/rbitcoin-query/src/reconstruct.rs:123:42: replace match guard self.prune_seqsigwit() with true in Query::load_body_from_store in 2s build + 7s test
 MISSED   crates/rbitcoin-query/src/reconstruct.rs:123:42: replace match guard self.prune_seqsigwit() with false in Query::load_body_from_store in 2s build + 7s test
 MISSED   crates/rbitcoin-query/src/reconstruct.rs:174:18: replace >= with < in Query::tx_fk_at_height in 2s build + 7s test
+# 44432768827 1 28f3c89bf0e4cbc5c6f211856c14d5c6d7a6fbe4
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1209:9: delete field work from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1210:9: delete field header from struct WalkTip expression in cut_back_to in 2s build + 15s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1211:9: delete field times from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1212:9: delete field diff from struct WalkTip expression in cut_back_to in 2s build + 15s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1214:9: delete field milestone_prev from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1215:9: delete field milestone_header from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:3794:56: replace > with >= in settle_lead_after_confirmed_rewind in 97s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:3800:82: replace > with == in settle_lead_after_confirmed_rewind in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:3800:82: replace > with < in settle_lead_after_confirmed_rewind in 4s build + 65s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:3800:82: replace > with >= in settle_lead_after_confirmed_rewind in 4s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4064:15: delete ! in restore_adopt in 4s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4292:56: replace || with && in note_unproven_class_a in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4292:31: replace || with && in note_unproven_class_a in 4s build + 65s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4299:15: replace > with >= in note_unproven_class_a in 4s build + 65s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4326:9: replace || with && in note_header_witness in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4325:26: replace < with > in note_header_witness in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4360:50: replace > with < in note_header_witness in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:4381:19: delete ! in leaving_unproved_lead in 4s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1209:9: delete field work from struct WalkTip expression in cut_back_to in 2s build + 15s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1210:9: delete field header from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1211:9: delete field times from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1212:9: delete field diff from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1214:9: delete field milestone_prev from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/header_walk.rs:1215:9: delete field milestone_header from struct WalkTip expression in cut_back_to in 2s build + 16s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:131:15: replace > with == in QueuedHashSpan::load in 98s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:131:15: replace > with < in QueuedHashSpan::load in 4s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:131:15: replace > with >= in QueuedHashSpan::load in 4s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:152:19: replace < with == in QueuedHashSpan::hash_at in 4s build + 63s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:152:19: replace < with > in QueuedHashSpan::hash_at in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:152:19: replace < with <= in QueuedHashSpan::hash_at in 4s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/progress.rs:152:39: replace > with >= in QueuedHashSpan::hash_at in 5s build + 64s test
+MISSED   crates/rbitcoin-ibd/src/ibd/reorg.rs:596:36: replace > with >= in prepare_header_rewind in 97s build + 65s test
+MISSED   crates/rbitcoin-ibd/src/ibd/state.rs:119:9: replace InflightReq::retired_ids -> impl Iterator<Item = usize>+'_ with ::std::iter::once(0) in 91s build + 62s test
+MISSED   crates/rbitcoin-ibd/src/ibd/state.rs:124:9: replace InflightReq::holder_ids -> impl Iterator<Item = usize>+'_ with ::std::iter::once(0) in 8s build + 62s test
+MISSED   crates/rbitcoin-query/src/reconstruct.rs:232:18: replace == with != in Query::contiguous_fk_run in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/reconstruct.rs:236:25: replace != with == in Query::contiguous_fk_run in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/reconstruct.rs:236:39: replace + with - in Query::contiguous_fk_run in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/reconstruct.rs:236:39: replace + with * in Query::contiguous_fk_run in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/reconstruct.rs:342:47: replace == with != in Query::fill_input_prev_txids_cached in 8s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:94:9: replace ScriptHashOutpoint::coin_value -> i64 with 0 in 92s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:178:9: replace HistoryFilter::open -> Self with Default::default() in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:265:41: replace < with <= in apply_history_filter in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:265:69: replace && with || in apply_history_filter in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:265:79: replace < with <= in apply_history_filter in 9s build + 79s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:276:22: replace > with >= in apply_history_filter in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:303:23: replace < with == in history_items_from_joined in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:303:23: replace < with > in history_items_from_joined in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:303:23: replace < with <= in history_items_from_joined in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:311:41: replace >= with < in history_items_from_joined in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:319:27: replace < with == in history_items_from_joined in 9s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:319:27: replace < with > in history_items_from_joined in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:319:27: replace < with <= in history_items_from_joined in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:624:17: delete field limit from struct HistoryFilter expression in Query::history_page_full in 18s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:625:17: delete field after_txid from struct HistoryFilter expression in Query::history_page_full in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:629:16: delete ! in Query::history_page_full in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:629:49: replace == with != in Query::history_page_full in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:647:28: replace || with && in Query::history_tail_keep in 9s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:647:44: replace != with == in Query::history_tail_keep in 12s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:660:55: replace <= with > in Query::history_tail_keep in 12s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:745:21: replace >= with < in Query::sh_join_limited in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:779:16: replace == with != in Query::unpaged_join_admit in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:832:20: replace && with || in Query::page_without_full_slot in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:832:16: replace > with == in Query::page_without_full_slot in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:832:65: replace > with == in Query::page_without_full_slot in 8s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:832:65: replace > with < in Query::page_without_full_slot in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:832:65: replace > with >= in Query::page_without_full_slot in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:895:43: replace || with && in Query::fill_spender_identity in 9s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:909:37: replace || with && in Query::fill_spender_identity in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:924:43: replace || with && in Query::fill_spender_identity in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1037:44: replace >= with < in Query::join_page_waves in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1048:49: replace || with && in Query::join_page_waves in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1048:52: delete ! in Query::join_page_waves in 8s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1049:29: replace && with || in Query::join_page_waves in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1049:32: delete ! in Query::join_page_waves in 9s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1060:48: replace >= with < in Query::join_page_waves in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1082:31: replace || with && in Query::spend_abs_offs in 9s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1169:34: replace && with || in Query::join_known_offs in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1172:49: replace || with && in Query::join_known_offs in 8s build + 77s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1231:22: replace & with | in Query::join_spends_wave_fks in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1280:19: replace <= with > in Query::newest_page_scan in 9s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1295:30: replace || with && in Query::newest_page_scan in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1299:29: replace >= with < in Query::newest_page_scan in 8s build + 78s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:624:17: delete field limit from struct HistoryFilter expression in Query::history_page_full in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:625:17: delete field after_txid from struct HistoryFilter expression in Query::history_page_full in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1378:27: replace && with || in Query::newest_create_window in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1388:55: replace < with == in Query::newest_create_window in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1388:55: replace < with > in Query::newest_create_window in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1388:55: replace < with <= in Query::newest_create_window in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1422:31: replace || with && in Query::spends_of_retained_creates in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1437:35: replace > with == in Query::spends_of_retained_creates in 2s build + 6s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1437:35: replace > with >= in Query::spends_of_retained_creates in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1458:62: replace || with && in Query::spends_of_members in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1458:40: replace || with && in Query::spends_of_members in 2s build + 6s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1584:22: replace < with <= in Query::spends_for_newest_page in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1604:19: replace <= with > in Query::newest_limited_summaries in 2s build + 6s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1679:45: replace && with || in Query::newest_limited_summaries in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1748:17: replace > with >= in Query::height_window_history in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1761:25: replace || with && in Query::height_window_history in 2s build + 5s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1761:18: replace < with == in Query::height_window_history in 2s build + 6s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1761:18: replace < with > in Query::height_window_history in 2s build + 5s test

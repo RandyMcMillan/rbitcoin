@@ -1209,3 +1209,60 @@ MISSED   crates/rbitcoin-query/src/scripthash.rs:1748:17: replace > with >= in Q
 MISSED   crates/rbitcoin-query/src/scripthash.rs:1761:25: replace || with && in Query::height_window_history in 2s build + 5s test
 MISSED   crates/rbitcoin-query/src/scripthash.rs:1761:18: replace < with == in Query::height_window_history in 2s build + 6s test
 MISSED   crates/rbitcoin-query/src/scripthash.rs:1761:18: replace < with > in Query::height_window_history in 2s build + 5s test
+# 44432768827 2 28f3c89bf0e4cbc5c6f211856c14d5c6d7a6fbe4
+MISSED   crates/rbitcoin-query/src/scripthash.rs:624:17: delete field limit from struct HistoryFilter expression in Query::history_page_full in 2s build + 7s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:625:17: delete field after_txid from struct HistoryFilter expression in Query::history_page_full in 2s build + 8s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1772:34: replace || with && in Query::height_window_history in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1772:27: replace < with > in Query::height_window_history in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:1772:48: replace > with < in Query::height_window_history in 9s build + 89s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:2056:12: delete ! in Query::scripthash_has_postings in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:2359:64: replace && with || in ShJoinProbe::enter in 2s build + 7s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:2359:60: replace < with <= in ShJoinProbe::enter in 11s build + 88s test
+MISSED   crates/rbitcoin-query/src/scripthash.rs:2359:93: replace < with <= in ShJoinProbe::enter in 11s build + 87s test
+MISSED   crates/rbitcoin-query/src/sh_builder.rs:170:48: replace || with && in ShRunBuilder::finalize_and_unsorted_materialize_cancellable in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/sh_builder.rs:170:36: delete ! in ShRunBuilder::finalize_and_unsorted_materialize_cancellable in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/sh_builder.rs:170:62: replace > with == in ShRunBuilder::finalize_and_unsorted_materialize_cancellable in 9s build + 88s test
+MISSED   crates/rbitcoin-query/src/sh_builder.rs:181:23: replace && with || in ShRunBuilder::finalize_and_unsorted_materialize_cancellable in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/sh_builder.rs:214:23: replace > with == in ShRunBuilder::finalize_and_unsorted_materialize_cancellable in 9s build + 88s test
+MISSED   crates/rbitcoin-query/src/soft_densify.rs:27:35: replace && with || in soft_confirm_window_n in 121s build + 88s test
+MISSED   crates/rbitcoin-query/src/soft_densify.rs:27:41: replace > with >= in soft_confirm_window_n in 9s build + 88s test
+MISSED   crates/rbitcoin-query/src/soft_densify.rs:65:19: replace < with == in soft_densify_band_hi in 9s build + 89s test
+MISSED   crates/rbitcoin-query/src/soft_densify.rs:65:19: replace < with <= in soft_densify_band_hi in 9s build + 89s test
+MISSED   crates/rbitcoin-query/src/soft_densify.rs:76:24: replace match guard h >= path_lo with true in soft_densify_band_hi in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/sp_tweaks.rs:54:35: replace < with <= in wave_join_is_dense in 121s build + 88s test
+MISSED   crates/rbitcoin-query/src/sp_tweaks.rs:86:33: replace || with && in thin_join_txids_and_loc in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/sp_tweaks.rs:156:47: replace > with >= in thin_tweak_height_plans in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/sp_tweaks.rs:482:18: replace != with == in Query::repair_sp_tweaks in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/sp_tweaks.rs:869:68: delete ! in Query::block_sp_outpoints in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/spend_sync.rs:78:25: replace == with != in run in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/spend_sync.rs:101:19: delete ! in run in 9s build + 89s test
+MISSED   crates/rbitcoin-query/src/spend_sync.rs:111:16: delete ! in run in 10s build + 86s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:172:9: delete field resolved from struct ExternalParentStamp expression in external_parent_stamp in 124s build + 87s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:173:9: delete field idents from struct ExternalParentStamp expression in external_parent_stamp in 10s build + 90s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:172:64: replace / with % in external_parent_stamp in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:172:64: replace / with * in external_parent_stamp in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:258:32: replace == with != in stamp_external_parents in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:261:32: replace <= with > in stamp_external_parents in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:317:58: replace || with && in fill_missing_parent_ranges in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/stamp.rs:317:33: replace || with && in fill_missing_parent_ranges in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/testutil.rs:154:25: replace / with * in sh_join_slot_over_16mib in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/testutil.rs:154:18: replace - with + in sh_join_slot_over_16mib in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/write_create_loc.rs:180:29: replace > with >= in WriteCreateLocRam::drop_from_height in 126s build + 88s test
+MISSED   crates/rbitcoin-query/src/write_create_loc.rs:208:5: replace clear with () in 10s build + 91s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:34:42: replace + with * in test_phase::tl_note_cold_why_txid_mismatch in 121s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:42:42: replace + with - in test_phase::tl_note_cold_why_vout_miss in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:42:42: replace + with * in test_phase::tl_note_cold_why_vout_miss in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:54:9: replace test_phase::sample_tl_batch_cold_n_and_reset -> (u64, u64) with (1, 0) in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:345:18: replace > with >= in assemble_non_cb_tx in 121s build + 87s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:557:14: replace - with / in add_spent_value in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:918:22: replace > with < in contiguous_create_spans in 9s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:1450:9: replace && with || in reject_bip30_unspent_overwrite in 9s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:1582:40: replace || with && in bip34_ancestry_skips_bip30 in 11s build + 89s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:1611:19: replace < with <= in EarlierIndex::earlier_than in 9s build + 88s test
+MISSED   crates/rbitcoin-query/src/block_pipeline.rs:1666:43: delete ! in resolve_prevout in 10s build + 89s test
+MISSED   crates/rbitcoin-query/src/confirm_error.rs:25:9: replace <impl std::error::Error for ConfirmError>::source -> Option<&(dyn std::error::Error +'static)> with None in 121s build + 86s test
+MISSED   crates/rbitcoin-query/src/confirm_error.rs:57:9: replace ConfirmError::rules -> Option<&ConsensusError> with None in 10s build + 90s test
+MISSED   crates/rbitcoin-query/src/confirm_run/mod.rs:462:31: replace == with != in log_trust_ids in 125s build + 88s test
+MISSED   crates/rbitcoin-query/src/confirm_run/mod.rs:543:30: replace / with % in trust_log_fresh in 10s build + 88s test
+MISSED   crates/rbitcoin-query/src/confirm_run/mod.rs:543:30: replace / with * in trust_log_fresh in 10s build + 87s test
+MISSED   crates/rbitcoin-query/src/confirm_run/mod.rs:606:35: replace != with == in ScriptOkBatch::wire_headers in 2s build + 8s test

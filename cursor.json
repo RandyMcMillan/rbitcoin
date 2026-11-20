@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
   "new_skip": 1458,
-  "old_index": 19697,
+  "old_index": 20782,
   "new_cap_used": true,
   "run_id": "44649457779",
-  "old_name": "crates/rbitcoin-query/src/confirm_run/bq_resolve.rs:40:5: replace stop_for_key_cap -> bool with true",
+  "old_name": "crates/rbitcoin-rpc/src/server.rs:1059:9: delete match arm Some(\"waitforblock\" | \"waitforblockheight\" | \"waitfornewblock\") in http_call_is_longpoll",
   "new_len": 4772,
   "old_len": 32449,
   "new_remaining": 3314,
-  "old_remaining": 32164,
-  "completed_new": 232,
-  "completed_old": 285
+  "old_remaining": 31364,
+  "completed_new": 0,
+  "completed_old": 1085
 }

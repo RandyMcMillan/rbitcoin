@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
-  "new_skip": 1226,
-  "old_index": 19412,
+  "new_skip": 1458,
+  "old_index": 19697,
   "new_cap_used": true,
-  "run_id": "44432768827",
-  "old_name": "crates/rbitcoin-query/src/connect_facade.rs:53:5: replace accept_and_connect_block -> Result<rbitcoin_primitives::Fk, ConfirmError> with Ok(Default::default())",
+  "run_id": "44649457779",
+  "old_name": "crates/rbitcoin-query/src/confirm_run/bq_resolve.rs:40:5: replace stop_for_key_cap -> bool with true",
   "new_len": 4772,
   "old_len": 32449,
-  "new_remaining": 3546,
-  "old_remaining": 31520,
-  "completed_new": 0,
-  "completed_old": 929
+  "new_remaining": 3314,
+  "old_remaining": 32164,
+  "completed_new": 232,
+  "completed_old": 285
 }

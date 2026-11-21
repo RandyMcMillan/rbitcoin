@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
-  "new_skip": 1458,
-  "old_index": 20782,
+  "new_skip": 1817,
+  "old_index": 21397,
   "new_cap_used": true,
-  "run_id": "44649457779",
-  "old_name": "crates/rbitcoin-rpc/src/server.rs:1059:9: delete match arm Some(\"waitforblock\" | \"waitforblockheight\" | \"waitfornewblock\") in http_call_is_longpoll",
+  "run_id": "44846786453",
+  "old_name": "crates/rbitcoin-rpc/src/methods/mempool.rs:1026:9: delete match arm Some(Value::Bool(true)) in sendrawtransaction",
   "new_len": 4772,
   "old_len": 32449,
-  "new_remaining": 3314,
-  "old_remaining": 31364,
-  "completed_new": 0,
-  "completed_old": 1085
+  "new_remaining": 2955,
+  "old_remaining": 31834,
+  "completed_new": 359,
+  "completed_old": 615
 }

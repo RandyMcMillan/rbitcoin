@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
   "new_skip": 1817,
-  "old_index": 21397,
+  "old_index": 22311,
   "new_cap_used": true,
   "run_id": "44846786453",
-  "old_name": "crates/rbitcoin-rpc/src/methods/mempool.rs:1026:9: delete match arm Some(Value::Bool(true)) in sendrawtransaction",
+  "old_name": "crates/rbitcoin-store/src/array_table.rs:590:15: replace & with ^ in seq_read",
   "new_len": 4772,
   "old_len": 32449,
   "new_remaining": 2955,
-  "old_remaining": 31834,
-  "completed_new": 359,
-  "completed_old": 615
+  "old_remaining": 31535,
+  "completed_new": 0,
+  "completed_old": 914
 }

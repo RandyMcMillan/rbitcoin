@@ -2126,3 +2126,66 @@ MISSED   crates/rbitcoin-store/src/hashhead.rs:386:46: replace + with - in HashH
 MISSED   crates/rbitcoin-store/src/hashhead.rs:386:53: replace * with / in HashHead::open in 3s build + 20s test
 MISSED   crates/rbitcoin-store/src/hashhead.rs:456:9: replace HashHead::multi_count -> u64 with 0 in 3s build + 20s test
 MISSED   crates/rbitcoin-store/src/hashhead.rs:469:9: replace HashHead::at_load_cap -> bool with true in 3s build + 20s test
+# 45521976710 2 e0373b4eded353f1e348ff6a5cbf52fdacda026b
+MISSED   crates/rbitcoin-store/src/hashhead.rs:557:27: replace += with *= in HashHead::insert_many_file in 100s build + 81s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:679:33: replace - with + in HashHead::rewrite_to_slots in 11s build + 83s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:680:46: replace + with - in HashHead::rewrite_to_slots in 10s build + 81s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:680:53: replace * with / in HashHead::rewrite_to_slots in 9s build + 84s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:732:9: replace HashHead::flush -> Result<(), StoreError> with Ok(()) in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:737:9: replace HashHead::flush_async -> Result<(), StoreError> with Ok(()) in 10s build + 84s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:820:19: replace == with != in SlotPageCache<'a>::try_place_raw in 13s build + 81s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:827:31: replace & with | in SlotPageCache<'a>::try_place_raw in 10s build + 83s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:827:31: replace & with ^ in SlotPageCache<'a>::try_place_raw in 11s build + 83s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:827:26: replace + with - in SlotPageCache<'a>::try_place_raw in 10s build + 84s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:827:26: replace + with * in SlotPageCache<'a>::try_place_raw in 10s build + 83s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:827:45: replace - with + in SlotPageCache<'a>::try_place_raw in 11s build + 83s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:827:45: replace - with / in SlotPageCache<'a>::try_place_raw in 10s build + 83s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:856:34: replace >= with < in SlotPageCache<'a>::ensure_chunk in 10s build + 81s test
+MISSED   crates/rbitcoin-store/src/hashhead.rs:860:34: replace - with + in SlotPageCache<'a>::ensure_chunk in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:152:12: delete ! in diagnose_txid_probe in 88s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:157:24: replace <= with > in diagnose_txid_probe in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:158:24: replace - with + in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:158:24: replace - with / in diagnose_txid_probe in 7s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:158:15: replace << with >> in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:160:20: replace - with + in diagnose_txid_probe in 7s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:160:20: replace - with / in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:166:68: replace & with | in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:166:68: replace & with ^ in diagnose_txid_probe in 7s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:174:25: replace >= with < in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:174:53: replace + with * in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:174:42: replace - with + in diagnose_txid_probe in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:174:42: replace - with / in diagnose_txid_probe in 7s build + 79s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:261:40: replace match guard path.as_os_str() == "io_uring" with true in is_uring_unavailable in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:261:40: replace match guard path.as_os_str() == "io_uring" with false in is_uring_unavailable in 7s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:261:57: replace == with != in is_uring_unavailable in 12s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:520:23: delete ! in id_idx_wave in 12s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_denserels.rs:581:12: delete ! in id_idx_wave in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:74:9: delete match arm 2 in miss_on_from_code in 90s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:149:5: replace leftover_probe_diag_ready -> bool with true in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:149:5: replace leftover_probe_diag_ready -> bool with false in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:149:49: replace != with == in leftover_probe_diag_ready in 9s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:253:45: replace - with + in Sample::age_cdf in 7s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:253:45: replace - with / in Sample::age_cdf in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:313:11: replace > with == in add_idx in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:320:11: replace > with == in add_body in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:327:10: replace > with == in add_keys in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:334:10: replace > with == in add_cands in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:341:10: replace > with == in add_body_lookups in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/head_resolve_stats.rs:399:10: replace > with == in add_miss_peeks in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/header_table.rs:225:9: replace HeaderHead::flush -> Result<(), StoreError> with Ok(()) in 92s build + 81s test
+MISSED   crates/rbitcoin-store/src/header_table.rs:234:9: replace HeaderHead::flush_async -> Result<(), StoreError> with Ok(()) in 9s build + 81s test
+MISSED   crates/rbitcoin-store/src/header_table.rs:339:43: replace * with + in HeaderTable::rewrite_v24_body_to_88 in 9s build + 81s test
+MISSED   crates/rbitcoin-store/src/header_table.rs:339:43: replace * with / in HeaderTable::rewrite_v24_body_to_88 in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/header_table.rs:534:9: replace HeaderTable::flush -> Result<(), StoreError> with Ok(()) in 9s build + 81s test
+MISSED   crates/rbitcoin-store/src/header_table.rs:540:9: replace HeaderTable::flush_async -> Result<(), StoreError> with Ok(()) in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:44:9: replace HeightFence::empty -> Self with Default::default() in 87s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:51:37: replace && with || in HeightFence::from_runs in 18s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:99:9: replace HeightFence::is_empty -> bool with true in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:118:37: replace < with == in HeightFence::extend in 7s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:118:37: replace < with > in HeightFence::extend in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:118:37: replace < with <= in HeightFence::extend in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:118:46: replace - with / in HeightFence::extend in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:173:24: replace > with >= in HeightFence::unconnected_ranges in 8s build + 80s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:188:31: replace || with && in HeightFence::covers_fk_span in 8s build + 81s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:188:20: replace || with && in HeightFence::covers_fk_span in 9s build + 81s test
+MISSED   crates/rbitcoin-store/src/height_fence.rs:260:9: replace MtpRing::empty -> Self with Default::default() in 7s build + 80s test

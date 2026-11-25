@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
   "new_skip": 2989,
-  "old_index": 24390,
+  "old_index": 24946,
   "new_cap_used": true,
   "run_id": "45521976710",
-  "old_name": "crates/rbitcoin-store/src/hashhead.rs:545:59: replace && with || in HashHead::insert_many_file",
+  "old_name": "crates/rbitcoin-store/src/idx_body_pipeline.rs:107:29: replace - with + in outs_first_wave_len",
   "new_len": 7492,
   "old_len": 31273,
   "new_remaining": 4503,
-  "old_remaining": 31064,
-  "completed_new": 246,
-  "completed_old": 209
+  "old_remaining": 30717,
+  "completed_new": 0,
+  "completed_old": 556
 }

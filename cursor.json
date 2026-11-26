@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
   "new_skip": 3386,
-  "old_index": 25201,
+  "old_index": 25626,
   "new_cap_used": true,
   "run_id": "45732225677",
-  "old_name": "crates/rbitcoin-store/src/input.rs:23:29: replace << with >>",
+  "old_name": "crates/rbitcoin-store/src/io_handle.rs:20:9: replace IoHandle::from_raw_fd -> Self with Default::default()",
   "new_len": 7492,
   "old_len": 31273,
   "new_remaining": 4106,
-  "old_remaining": 31018,
-  "completed_new": 397,
-  "completed_old": 255
+  "old_remaining": 30848,
+  "completed_new": 0,
+  "completed_old": 425
 }

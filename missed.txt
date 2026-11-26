@@ -2310,3 +2310,74 @@ MISSED   crates/rbitcoin-store/src/index_build_uring.rs:532:30: replace + with -
 MISSED   crates/rbitcoin-store/src/index_build_uring.rs:532:30: replace + with * in decode_block in 2s build + 14s test
 MISSED   crates/rbitcoin-store/src/index_build_uring.rs:555:31: replace && with || in outside_parents in 2s build + 14s test
 MISSED   crates/rbitcoin-store/src/index_build_uring.rs:619:40: replace + with - in read_witnesses_and_parent_locs in 2s build + 14s test
+# 45732225677 2 e0373b4eded353f1e348ff6a5cbf52fdacda026b
+MISSED   crates/rbitcoin-store/src/input.rs:66:61: replace | with ^ in InputEdge::unpack in 108s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:66:36: replace | with ^ in InputEdge::unpack in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:66:80: replace << with >> in InputEdge::unpack in 11s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:95:60: replace || with && in Input::pending_sync in 11s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:95:33: replace || with && in Input::pending_sync in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:127:13: replace || with && in Input::open in 11s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:127:27: replace - with + in Input::open in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:154:55: replace * with + in Input::open in 11s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:154:55: replace * with / in Input::open in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:155:41: replace > with == in Input::open in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:155:41: replace > with < in Input::open in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:155:41: replace > with >= in Input::open in 9s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:269:28: replace > with >= in Input::append in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:302:49: replace + with - in Input::append in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:302:65: replace * with / in Input::append in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:319:22: replace > with == in Input::truncate_to_count in 11s build + 93s test
+MISSED   crates/rbitcoin-store/src/input.rs:319:22: replace > with >= in Input::truncate_to_count in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:329:31: replace / with % in Input::truncate_to_count in 11s build + 90s test
+MISSED   crates/rbitcoin-store/src/input.rs:331:53: replace + with - in Input::truncate_to_count in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:331:61: replace * with + in Input::truncate_to_count in 9s build + 90s test
+MISSED   crates/rbitcoin-store/src/input.rs:331:61: replace * with / in Input::truncate_to_count in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/input.rs:382:21: replace < with <= in Input::shrink_body_to in 9s build + 90s test
+MISSED   crates/rbitcoin-store/src/input.rs:450:27: replace * with / in Input::body_abs in 111s build + 92s test
+MISSED   crates/rbitcoin-store/src/input.rs:453:57: replace * with / in Input::body_abs in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:45:35: replace - with + in TipRevalidateLog::start in 111s build + 93s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:58:21: replace += with *= in TipRevalidateLog::step in 9s build + 92s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:59:49: replace >= with < in TipRevalidateLog::step in 10s build + 94s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:182:9: replace TipRevalidateReport::is_clean -> bool with true in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:182:61: replace && with || in TipRevalidateReport::is_clean in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:182:41: replace && with || in TipRevalidateReport::is_clean in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:255:18: replace > with < in Store::clamp_to_tip_seal in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:258:18: replace < with > in Store::clamp_to_tip_seal in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:330:77: replace - with + in Store::revalidate_tip_window_n in 9s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:330:77: replace - with / in Store::revalidate_tip_window_n in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:353:34: replace > with == in Store::revalidate_tip_window_n in 10s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:481:23: replace || with && in Store::block_txid_fault in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:557:61: replace + with - in Store::block_input_edge_reason in 9s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:563:78: replace && with || in Store::block_input_edge_reason in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:563:49: replace && with || in Store::block_input_edge_reason in 10s build + 93s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:642:33: replace > with >= in Store::shrink_tip_to in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:712:20: replace <= with > in Store::class_a_confirmed_cut in 9s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:726:16: replace > with < in Store::class_a_confirmed_cut in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:729:17: replace < with <= in Store::class_a_confirmed_cut in 10s build + 94s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:742:19: replace || with && in Store::header_tx_end in 10s build + 94s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:754:26: replace + with - in Store::first_height_past_creates in 11s build + 95s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:754:26: replace + with * in Store::first_height_past_creates in 10s build + 94s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:754:38: replace / with % in Store::first_height_past_creates in 9s build + 93s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:754:32: replace - with + in Store::first_height_past_creates in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:757:40: replace > with == in Store::first_height_past_creates in 10s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:757:40: replace > with < in Store::first_height_past_creates in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:757:40: replace > with >= in Store::first_height_past_creates in 10s build + 92s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:763:26: replace - with + in Store::first_height_past_creates in 10s build + 93s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:763:26: replace - with / in Store::first_height_past_creates in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:764:27: replace == with != in Store::first_height_past_creates in 10s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:767:26: replace + with - in Store::first_height_past_creates in 10s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:767:26: replace + with * in Store::first_height_past_creates in 10s build + 90s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:781:38: replace / with % in Store::highest_height_with_tx_range in 9s build + 91s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:784:24: replace == with != in Store::highest_height_with_tx_range in 10s build + 93s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:793:19: replace > with == in Store::highest_height_with_tx_range in 10s build + 94s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:793:19: replace > with >= in Store::highest_height_with_tx_range in 10s build + 95s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:802:9: replace Store::persist_class_c_repair -> Result<(), StoreError> with Ok(()) in 9s build + 93s test
+MISSED   crates/rbitcoin-store/src/integrity.rs:803:14: replace > with == in Store::persist_class_c_repair in 9s build + 93s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:64:5: replace global_read_from_env -> Option<ReadIoBackend> with None in 110s build + 93s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:74:5: replace global_write_from_env -> Option<WriteIoBackend> with None in 16s build + 93s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:87:33: replace match guard !bulk_io::io_uring_enabled() with true in effective_read in 16s build + 94s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:87:33: replace match guard !bulk_io::io_uring_enabled() with false in effective_read in 2s build + 15s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:87:33: delete ! in effective_read in 2s build + 15s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:95:34: replace match guard !bulk_io::io_uring_enabled() with true in effective_write in 2s build + 16s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:95:34: replace match guard !bulk_io::io_uring_enabled() with false in effective_write in 3s build + 16s test
+MISSED   crates/rbitcoin-store/src/io_backend.rs:95:34: delete ! in effective_write in 3s build + 16s test

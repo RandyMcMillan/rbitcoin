@@ -583,3 +583,142 @@ fn a_new_segment_pair_syncs_its_directories() {
         "body dir not synced: {synced:?}"
     );
 }
+
+/// A first create that fails after its directories exist leaves no `meta`,
+/// so the next `open_or_create` starts the table again instead of refusing a
+/// table with no pairs.
+#[test]
+fn a_failed_first_create_is_retried_by_open_or_create() {
+    let dir = tmp_dir();
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    // A directory where body 000000 goes: pair 000000 cannot be made.
+    fs::create_dir_all(dirs.body_path(0)).unwrap();
+    assert!(BlockFilterTable::create(&dir).is_err());
+    assert!(
+        !BlockFilterTable::meta_path(&dir).exists(),
+        "a failed create left meta"
+    );
+    let t = BlockFilterTable::open_or_create(&dir).expect("the retried create");
+    put_range(&t, 0, 1);
+    drop(t);
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(2));
+}
+
+/// A put that extends pair 0 and rolls pair 1 publishes pair 0's body length
+/// before its idx length. A crash between them leaves pair 0's body past its
+/// last row and pair 1 empty. Open fits pair 0 too, so a cut back to pair 0
+/// and the next put land at the end of its last row. Small files stand in
+/// for a 4 GiB pair 0: the fit does not depend on the roll offset.
+#[test]
+fn open_fits_the_last_populated_pair_before_an_empty_one() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    let end = HDR + (3 + 4 + 5);
+    set_file_hwm(&dirs.body_path(0), end + 9);
+    drop(dirs.create(1, 3).unwrap());
+
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(3));
+    put_range(&t, 3, 3);
+    t.truncate_through(Some(Height(2))).unwrap();
+    put_range(&t, 3, 4);
+    drop(t);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(5));
+    assert_eq!(
+        t.filters(Height(2), Height(4)).unwrap().unwrap(),
+        vec![
+            (vec![2u8; 5], slot(2)),
+            (vec![3u8; 6], slot(3)),
+            (vec![4u8; 7], slot(4)),
+        ]
+    );
+}
+
+/// Overwrite the header of `path` with zeros: a name the directory
+/// kept whose header never reached the disk.
+fn zero_header(path: &Path) {
+    let mut f = fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all(&[0u8; FILE_HEADER_LEN]).unwrap();
+}
+
+/// A crash inside a pair create can keep both names of the newest pair while
+/// a header did not persist. That pair holds no row: open drops it.
+#[test]
+fn open_drops_a_newest_pair_whose_header_never_landed() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    drop(dirs.create(1, 3).unwrap());
+    zero_header(&dirs.body_path(1));
+    let t = BlockFilterTable::open(&dir).expect("a newest pair with no header");
+    assert_eq!(t.next_height(), Height(3));
+    assert!(!dirs.idx_path(1).exists(), "the headerless pair stayed");
+    drop(
+        dirs.create(1, 3)
+            .expect("the next roll makes the pair again"),
+    );
+
+    // A file shorter than a header is the same crash.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dirs.idx_path(1))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    drop(t);
+    let t = BlockFilterTable::open(&dir).expect("a newest idx with no header");
+    assert_eq!(t.next_height(), Height(3));
+    assert!(!dirs.body_path(1).exists(), "the headerless pair stayed");
+}
+
+/// A bad header is still corruption when the pair has rows or a later pair
+/// exists. Open refuses and deletes nothing.
+#[test]
+fn open_refuses_a_bad_header_in_a_pair_with_rows_or_a_successor() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    zero_header(&dirs.body_path(0));
+    assert!(BlockFilterTable::open(&dir).is_err());
+    assert!(dirs.idx_path(0).exists() && dirs.body_path(0).exists());
+
+    let dir = tmp_dir();
+    drop(BlockFilterTable::open_or_create(&dir).unwrap());
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    drop(dirs.create(1, 0).unwrap());
+    zero_header(&dirs.body_path(0));
+    assert!(BlockFilterTable::open(&dir).is_err());
+    assert!(dirs.idx_path(0).exists() && dirs.body_path(0).exists());
+}
+
+/// A presence check that fails is not a missing file: open returns the error
+/// and keeps the pair. A regular file where the body directory goes makes
+/// every body path fail to stat with `ENOTDIR`.
+#[cfg(unix)]
+#[test]
+fn open_keeps_a_pair_whose_files_it_cannot_stat() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let body_dir = BlockFilterTable::body_dir(&dir);
+    let aside = dir.join("body.aside");
+    fs::rename(&body_dir, &aside).unwrap();
+    fs::write(&body_dir, b"not a dir").unwrap();
+    assert!(BlockFilterTable::open(&dir).is_err());
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    assert!(dirs.idx_path(0).exists(), "open unlinked a committed idx");
+    fs::remove_file(&body_dir).unwrap();
+    fs::rename(&aside, &body_dir).unwrap();
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(3));
+}

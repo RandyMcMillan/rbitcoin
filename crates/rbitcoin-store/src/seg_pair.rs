@@ -5,8 +5,9 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::TableKind;
-use std::path::PathBuf;
+use rbitcoin_primitives::{le_u64, TableKind, STORE_MAGIC};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 pub struct SegPair {
     pub file_id: u32,
@@ -96,22 +97,31 @@ impl SegDirs {
     /// the whole slots in each idx; callers check any remainder.
     ///
     /// A crash inside [`Self::create`] can keep one name of the newest pair
-    /// and lose the other. No length is published before both names are
-    /// synced, so that pair holds no row: open removes it. One missing file
-    /// in any earlier pair is still corruption.
+    /// and lose the other, or keep both names while a header never reached
+    /// the disk: a filesystem may commit a new name before its data. No
+    /// length is published before both headers are synced, so that pair
+    /// holds no row: open removes it. In any earlier pair, or in a newest
+    /// pair that shows a published length, either is still corruption. A
+    /// presence check that fails is an error, never a missing file.
     pub fn open(&self, slot: u64) -> Result<Vec<SegPair>, StoreError> {
         let mut segs = Vec::new();
         let mut first_slot = 0u64;
         for file_id in 0u32.. {
             let (ip, bp) = (self.idx_path(file_id), self.body_path(file_id));
-            if !ip.exists() && !bp.exists() {
+            let (has_idx, has_body) = (present(&ip)?, present(&bp)?);
+            if !has_idx && !has_body {
                 break;
             }
-            if !ip.exists() || !bp.exists() {
-                let next = file_id.saturating_add(1);
-                if self.idx_path(next).exists() || self.body_path(next).exists() {
+            let next = file_id.saturating_add(1);
+            let newest = !present(&self.idx_path(next))? && !present(&self.body_path(next))?;
+            if !has_idx || !has_body {
+                if !newest {
                     return Err(StoreError::Corrupt("segment pair incomplete"));
                 }
+                self.discard(file_id);
+                break;
+            }
+            if newest && never_written(&ip, &bp)? {
                 self.discard(file_id);
                 break;
             }
@@ -154,6 +164,35 @@ impl SegDirs {
             let _ = std::fs::remove_file(self.body_path(id));
         }
     }
+}
+
+/// `Ok(false)` only when `path` is absent. Any other stat error is returned.
+fn present(path: &Path) -> Result<bool, StoreError> {
+    path.try_exists().map_err(|e| StoreError::io(path, e))
+}
+
+/// The logical length in `path`'s header, or `None` when the file is shorter
+/// than a header or does not start with the store magic: a header that never
+/// reached the disk.
+fn header_len(path: &Path) -> Result<Option<u64>, StoreError> {
+    let mut header = [0u8; FILE_HEADER_LEN];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut header));
+    match read {
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(StoreError::io(path, e)),
+        Ok(()) if header[0..4] != STORE_MAGIC => Ok(None),
+        Ok(()) => Ok(Some(le_u64!(header, 8))),
+    }
+}
+
+/// A pair whose header did not persist, where neither file shows a length
+/// past its header. Its create never returned, so no row was published.
+fn never_written(idx: &Path, body: &Path) -> Result<bool, StoreError> {
+    let hdr = FILE_HEADER_LEN as u64;
+    Ok(match (header_len(idx)?, header_len(body)?) {
+        (Some(_), Some(_)) => false,
+        (i, b) => i.unwrap_or(hdr) <= hdr && b.unwrap_or(hdr) <= hdr,
+    })
 }
 
 /// Pair index and local slot of global slot `g`, if written.

@@ -93,6 +93,16 @@ pub fn write_file_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), Sto
     })
 }
 
+/// Write a small [`TableKind::ArrayLink`] table holding `payload` after its
+/// header, through a synced tmp and a rename. The name appears only with
+/// its bytes durable, so a crash leaves the whole file or none.
+pub fn write_meta_file(path: &Path, payload: &[u8]) -> Result<(), StoreError> {
+    let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
+    let mut bytes = encode_leading_header(TableKind::ArrayLink, logical).to_vec();
+    bytes.extend_from_slice(payload);
+    write_synced_tmp_rename(path, &bytes)
+}
+
 /// Stream `write` into a sibling tmp, `sync_all`, then rename over `path`.
 ///
 /// The durable name is not created or truncated until rename.

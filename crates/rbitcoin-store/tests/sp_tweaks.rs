@@ -685,3 +685,24 @@ fn a_tweak_put_arms_no_mark() {
         Some(vec![None, Some(tweak)])
     );
 }
+
+/// A first create that fails after its directories exist leaves no `meta`,
+/// so the next `open_or_create` starts the table again instead of refusing a
+/// table with no pairs.
+#[test]
+fn a_failed_first_create_is_retried_by_open_or_create() {
+    let dir = tmp_dir();
+    let dirs = SpTweaksTable::seg_dirs(&dir);
+    // A directory where body 000000 goes: pair 000000 cannot be made.
+    fs::create_dir_all(dirs.body_path(0)).unwrap();
+    assert!(SpTweaksTable::create(&dir, Height(5)).is_err());
+    assert!(
+        !SpTweaksTable::files_present(&dir),
+        "a failed create left meta"
+    );
+    let t = SpTweaksTable::open_or_create(&dir, Height(5)).expect("the retried create");
+    t.put_block(Height(5), &[None]).unwrap();
+    drop(t);
+    let t = SpTweaksTable::open_or_create(&dir, Height(5)).unwrap();
+    assert_eq!(t.next_height(), Height(6));
+}

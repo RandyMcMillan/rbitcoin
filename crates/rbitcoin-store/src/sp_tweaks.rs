@@ -113,9 +113,12 @@ impl SpTweaksTable {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(Self::idx_dir(&dir)).map_err(|e| StoreError::io(&dir, e))?;
         std::fs::create_dir_all(Self::body_dir(&dir)).map_err(|e| StoreError::io(&dir, e))?;
-        Self::write_meta(&dir, origin.0)?;
         let dirs = Self::seg_dirs(&dir);
         let seg = dirs.create(0, 0)?;
+        // `meta` names a built table, so it appears last and whole: a create
+        // that fails or crashes before it leaves the "incomplete dirs" case
+        // of `open_or_create`.
+        Self::write_meta(&dir, origin.0)?;
         // The first forward commit syncs only the segment files and their own
         // directories. `meta`, the segment names, and the two table
         // directories have to be durable before a put can return.
@@ -131,12 +134,10 @@ impl SpTweaksTable {
 
     #[doc(hidden)]
     pub fn write_meta(dir: &Path, origin: u32) -> Result<(), StoreError> {
-        let meta = TableFile::create(Self::meta_path(dir), TableKind::ArrayLink)?;
         let mut prefix = [0u8; 8];
         prefix[..4].copy_from_slice(&origin.to_le_bytes());
         prefix[4..8].copy_from_slice(&IDX_FMT_SEG_TIP.to_le_bytes());
-        meta.write_at_pwrite(FILE_HEADER_LEN as u64, &prefix)?;
-        meta.flush()
+        crate::file::write_meta_file(&Self::meta_path(dir), &prefix)
     }
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {

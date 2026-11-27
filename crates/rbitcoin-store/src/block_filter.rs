@@ -227,10 +227,11 @@ impl BlockFilterTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(Self::idx_dir(dir)).map_err(|e| StoreError::io(dir, e))?;
         std::fs::create_dir_all(Self::body_dir(dir)).map_err(|e| StoreError::io(dir, e))?;
-        let meta = TableFile::create(Self::meta_path(dir), TableKind::ArrayLink)?;
-        meta.write_at_pwrite(HDR, &IDX_FMT.to_le_bytes())?;
-        meta.flush()?;
         let seg = Self::seg_dirs(dir).create(0, 0)?;
+        // `meta` names a built table, so it appears last and whole: a create
+        // that fails or crashes before it leaves dirs that `open_or_create`
+        // starts again.
+        crate::file::write_meta_file(&Self::meta_path(dir), &IDX_FMT.to_le_bytes())?;
         // The first forward commit syncs only the segment files. `meta`, the
         // segment names, and the two table directories have to be durable
         // before a put can return.
@@ -252,11 +253,19 @@ impl BlockFilterTable {
             return Err(StoreError::Corrupt("blockfilter idx format"));
         }
         let mut segs = Self::seg_dirs(dir).open(SLOT)?;
-        // Commits only append to the last pair, so only it can be torn.
-        let tail = segs
-            .last_mut()
-            .ok_or(StoreError::Corrupt("segment pairs missing"))?;
-        let tail_end = Self::clamp_torn_tail(tail)?;
+        // Commits only append, so only the last pair with rows and the empty
+        // pairs after it can be torn: a put that fills one pair and rolls the
+        // next publishes the first pair's lengths before the next pair's.
+        let from = segs.iter().rposition(|s| s.n_slots > 0).unwrap_or(0);
+        let mut tail_end = HDR;
+        for seg in &mut segs[from..] {
+            tail_end = Self::clamp_torn_tail(seg)?;
+        }
+        let mut first_slot = 0;
+        for seg in &mut segs {
+            seg.first_slot = first_slot;
+            first_slot += seg.n_slots;
+        }
         Ok(Self::with_segs(dir, segs, tail_end))
     }
 

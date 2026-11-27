@@ -17,6 +17,7 @@ use crate::tx_table::{pack_spent_field, unpack_spent_field};
 use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub const SPENDER_RECORD_LEN: usize = 16;
 /// Multi-spender overflow next to `spent.body` (schema 17).
@@ -31,6 +32,11 @@ pub struct SpenderTable {
     /// the dirty pages, so every later flush is refused until restart and
     /// no length is published over them.
     sync_failed: AtomicBool,
+    /// Held through a whole flush: the latch check, the node sync, the
+    /// length write, and the latch. Two flushes that overlapped could both
+    /// pass the check, and the second could publish a length over nodes
+    /// whose failed sync only the first saw. Appends do not take it.
+    flush_lock: Mutex<()>,
 }
 
 #[doc(hidden)]
@@ -60,6 +66,7 @@ impl SpenderTable {
             body,
             count: AtomicU64::new(0),
             sync_failed: AtomicBool::new(false),
+            flush_lock: Mutex::new(()),
         })
     }
 
@@ -78,6 +85,7 @@ impl SpenderTable {
             body,
             count: AtomicU64::new(count),
             sync_failed: AtomicBool::new(false),
+            flush_lock: Mutex::new(()),
         })
     }
 
@@ -124,6 +132,7 @@ impl SpenderTable {
 
     /// Sync the nodes, then write and sync the length that names them.
     pub fn flush(&self) -> Result<(), StoreError> {
+        let _one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.refuse_if_sync_failed()?;
         self.finish_sync(self.publish_synced())
     }

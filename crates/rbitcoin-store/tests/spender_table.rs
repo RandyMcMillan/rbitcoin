@@ -209,6 +209,7 @@ fn an_append_arms_no_mark_and_waits_for_flush_to_publish() {
 
 /// A flush whose node sync fails publishes no length, and the latch keeps
 /// a retry from publishing one.
+#[cfg(debug_assertions)]
 #[test]
 fn a_failed_node_sync_publishes_no_length() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-sync-first").unwrap();
@@ -262,4 +263,46 @@ fn a_failed_length_sync_latches_the_flush() {
     rbitcoin_store::io_handle::arm_fail_sync_after(s.spenders.body.io_handle(), 1, 1);
     assert!(s.spenders.flush().is_err());
     assert!(s.spenders.flush().is_err(), "the latch holds");
+}
+
+/// Flushes do not overlap. A second flush started while the first sits
+/// between its node sync and its length write waits for the first to end,
+/// so it cannot pass the latch check before the first latches a failed sync
+/// and then publish a length over nodes the kernel dropped.
+#[cfg(debug_assertions)]
+#[test]
+fn a_flush_waits_for_a_flush_in_progress() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("spent-ovf-serial").unwrap();
+    let path = dir.path().to_path_buf();
+    let s = Store::create_tiny(&path).unwrap();
+    s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
+    let (go_tx, go_rx) = channel::<()>();
+    let (done_tx, done_rx) = channel::<()>();
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&overlapped);
+    rbitcoin_store::spender_table::set_after_node_sync(Some(Box::new(move |_t: &SpenderTable| {
+        go_tx.send(()).unwrap();
+        if done_rx.recv_timeout(Duration::from_millis(300)).is_ok() {
+            seen.store(true, Ordering::SeqCst);
+        }
+    })));
+    std::thread::scope(|scope| {
+        let spenders = &s.spenders;
+        let second = scope.spawn(move || {
+            go_rx.recv().unwrap();
+            let flushed = spenders.flush();
+            let _ = done_tx.send(());
+            flushed
+        });
+        s.spenders.flush().unwrap();
+        second.join().unwrap().unwrap();
+    });
+    assert!(
+        !overlapped.load(Ordering::SeqCst),
+        "a second flush ran inside the first"
+    );
 }

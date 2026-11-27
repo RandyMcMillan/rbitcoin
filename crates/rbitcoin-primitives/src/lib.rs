@@ -109,8 +109,9 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **31:** `meta` only. The first page-guard mark publishes 31, then
-///         the mark. A plain open of 30 does not. No table rewrite.
+/// **31:** `meta` only. A new store is created at 31; an upgraded one
+///         reaches 31 at its first page-guard mark, before the mark is
+///         published. A plain open of 30 does not. No table rewrite.
 ///         An older binary refuses 31 `meta`.
 /// **30:** Every spend slot is a note in `spent.delta/`: page records in
 ///         16 MiB segments, a directory base plus log, and `commit`. Class A

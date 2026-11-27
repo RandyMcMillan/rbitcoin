@@ -2792,9 +2792,9 @@ pub fn open_layout_rewrite_before_spend_delta(
 }
 
 /// Spend-delta `meta`. A plain open rewrites an older meta here and leaves
-/// 30 alone. Schema 31 is the first Class A arm, not this rewrite: promoting
-/// 30 on open would make a mark-free datadir unreadable by the binary that
-/// wrote it.
+/// 30 alone. An upgraded store reaches 31 at its first page-guard mark, not
+/// at this rewrite: promoting 30 on open would make a mark-free datadir
+/// unreadable by the binary that wrote it. A new store is created at 31.
 const SCHEMA_SPEND_DELTA: u16 = 30;
 
 /// `meta` to [`SCHEMA_SPEND_DELTA`] when it is older. Runs after the tx table

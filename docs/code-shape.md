@@ -141,11 +141,13 @@ the baseline.
 whole new file or a temp, or replay a synced ahead image at open. `write_at`,
 `write_at_pwrite`, `write_uncommitted`, `pwrite_all`, `persist_hwm`,
 `persist_logical_len`, `write_trailer`, and `zero_range` are the
-`TableFile` write door and are not counted. `handle_pwrite_all` does not
-match inside `pwrite_all`.
+`TableFile` write door: they go through the armed-page check and are not
+counted. `handle_pwrite_all` does not match inside `pwrite_all`.
 The scan is `crates/rbitcoin-store/src` and `crates/rbitcoin-mempool/src`,
-with the same `#[cfg(test)]` skip as the unwrap ratchet. The calls that
-bypass the door are the baseline. A baseline edit belongs in the commit
+with the same `#[cfg(test)]` skip as the unwrap ratchet. A new write of
+a live page that already holds committed bytes goes through `page_guard`.
+The calls that still bypass the door are the baseline. `page_guard`
+(`append_past_end` and image restore) is the protocol bypass on that list. A baseline edit belongs in the commit
 that adds or removes the call.
 
 **Goal:** no `[workspace.lints.clippy]` `= "allow"`. A lint that is wrong

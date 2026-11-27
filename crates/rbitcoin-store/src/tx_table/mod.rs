@@ -1391,8 +1391,9 @@ fn open_spend_delta(
         .map_err(|e| StoreError::io(path, e))?
         .len();
     let populated = body_end > crate::file::FILE_HEADER_LEN as u64;
-    let schema_30 = opened_schema.is_some_and(|v| v >= rbitcoin_primitives::SCHEMA_VERSION);
-    let filled_by_class_a = physical >= body_end && !schema_30;
+    // 30 and 31 both keep a sparse `spent.body`. Only an older meta filled it.
+    let spend_delta_meta = opened_schema.is_some_and(|v| v >= 30);
+    let filled_by_class_a = physical >= body_end && !spend_delta_meta;
     if populated && !filled_by_class_a && !dir.join(crate::spend_delta::SPEND_DELTA_DIR).exists() {
         return Err(StoreError::Corrupt(
             "spent.delta is missing beside a populated spent.body; wipe datadir and redo IBD",

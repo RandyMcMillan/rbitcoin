@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **31** | `meta` only. The first Class A arm writes 31, syncs it, then renames `tear_guard/armed`. A plain open leaves 30 in place. No table rewrite. A 30 binary refuses 31 `meta`. | **Current** |
+| **31** | `meta` only. A new store is created at 31. An upgraded store stays at 30 on a plain open; the first page-guard mark writes 31 and syncs it before the mark is published. No table rewrite. A 30 binary refuses 31 `meta`. | **Current** |
 | **30** | `spent.delta/` records every spend: segments of page records, a directory base plus a log, and a commit. `spent.body` is sparse; only a fold writes it. Open adopts a 29 `spent.body` and page log as the first delta generation. A 29 binary refuses 30 `meta`. | superseded by 31 |
 | **29** | Each `spend.pages` record names the generation file that holds that image. An unchanged page stays in the older file. A 28 binary would read every offset as the newest file, so it refuses 29 `meta`. Open rewrites 22–28 `meta` to 29. | superseded by 30 |
 | **28** | `meta` only. A 27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. A 28 binary rewrote 22–27 `meta` to 28. | Prior |
@@ -47,7 +47,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ## v31 (`meta` only)
 
-No table changes shape. `store/meta` becomes 31 when the first Class A arm syncs it, and only then is `tear_guard/armed` renamed into place. A plain open of schema 30 does not write 31. While `armed` is present, open restores the slot generation it names and ignores a newer slot. With no `armed` file, a zero Class A page still restores from `tear_guard` and a nonzero page is left alone. A 30 binary refuses 31 `meta`.
+No table changes shape. 31 means a page-guard mark may exist under `store/guard/`. A new store is created at 31. An upgraded store stays at 30 on a plain open, and `store/meta` becomes 31 when the first mark syncs it, before that mark is renamed into place. A 30 binary refuses 31 `meta`, so it never opens a store with a mark it would ignore.
 
 ## v30 (spend delta overlay)
 

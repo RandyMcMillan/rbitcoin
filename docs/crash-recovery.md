@@ -233,9 +233,9 @@ file must exist. A strong bit a fence run names is set again by
 `restore_strong_from_fence`.
 
 **Not yet in effect.** The marks above are where this change series ends.
-`store/guard/class_c` is wired at this revision; the others are not.
-`header.head` and the scripthash ingest head still write the synced
-`*.ahead` image open restores (What open trusts, above).
+`store/guard/class_c` and the header marks are wired at this revision. The
+scripthash ingest head still writes the synced `*.ahead` image open
+restores (What open trusts, above).
 A scripthash slab or head word written in place has no page guard: the
 `scripthash.dirty` refusal below and the rebuild cover an unclean stop. A
 same-class scripthash slab rewritten in place can still tear
@@ -243,9 +243,8 @@ same-class scripthash slab rewritten in place can still tear
 restore of one head word can tear the neighbor slots on that page
 ([#2132](https://github.com/rbitcoin-org/rbitcoin/issues/2132)). Until those
 are closed, the whole-store guarantee is the guarded state above, not every
-row. The rest take over in the change that wires them: the
-header marks in #2185, `guard/sh-*` in #2186, and `mempool/guard/flush` in
-#2188.
+row. The rest take over in the change that wires them:
+`guard/sh-*` in #2186 and `mempool/guard/flush` in #2188.
 
 The scripthash index is still gated: an append, an unlink, or a deferred
 empty-head commit writes `scripthash.dirty` before it writes. A full synced

@@ -22,7 +22,6 @@ pub mod bulk_io;
 #[doc(hidden)]
 pub mod chain;
 #[doc(hidden)]
-pub mod class_a_pages;
 #[doc(hidden)]
 pub mod compact;
 #[doc(hidden)]

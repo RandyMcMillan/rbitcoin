@@ -720,6 +720,9 @@ pub struct TxTable {
     /// returns 0 because another took the writeback error cannot commit
     /// after that failure.
     class_a_sync: std::sync::Mutex<()>,
+    /// Appends inside a pwrite. A sync on another thread waits for zero
+    /// before it seals, so it sees a failure such an append latched.
+    pub(crate) class_a_writes: std::sync::atomic::AtomicUsize,
     /// Set once a Class A sync or append write failed. The kernel may have
     /// dropped those dirty pages, and RAM may name rows the device does not
     /// hold, so a retry that succeeds proves nothing: every later sync and
@@ -728,7 +731,7 @@ pub struct TxTable {
     /// Told once when [`Self::class_a_failed`] latches.
     class_a_on_fail: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Hot store directory, where [`CLASS_A_SYNCED_NAME`] lives.
-    hot_dir: PathBuf,
+    pub(crate) hot_dir: PathBuf,
     /// The value in [`CLASS_A_SYNCED_NAME`]. Written under the latch.
     synced_named: std::sync::atomic::AtomicU64,
     /// Creates whose every Class A row is written. [`Self::count`] moves
@@ -1232,6 +1235,32 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A one-shot test hook run inside a Class A seal.
+#[doc(hidden)]
+pub type SealHook = Box<dyn FnOnce(&TxTable)>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    pub(crate) static BEFORE_SEAL: std::cell::RefCell<Option<SealHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the one-shot hook a test set with
+/// [`crate::testutil::set_before_class_a_seal`]. It runs on the sync thread
+/// after the latch check at entry and before the writer count is read.
+fn run_before_seal_hook(txs: &TxTable) {
+    #[cfg(debug_assertions)]
+    if let Some(hook) = BEFORE_SEAL.with(|c| c.borrow_mut().take()) {
+        hook(txs);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = txs;
+}
+
+thread_local! {
+    pub(crate) static WRITERS_AT_LATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One-shot hook run inside the next Class A append on this thread, after
 /// its bodies and locators publish and before `txid.body`, `txstat`, and
 /// `input`. Tests run a spend commit or scripthash mark in that window.
@@ -1246,6 +1275,94 @@ fn run_after_bodies_hook() {
     if let Some(hook) = AFTER_BODIES.with(|c| c.borrow_mut().take()) {
         hook();
     }
+}
+
+// Which table this thread is inside `class_a_append` for, and how deep.
+// A sync on that thread must not wait out its own pwrite.
+thread_local! {
+    static CLASS_A_WRITER: std::cell::Cell<(*const (), usize)> =
+        const { std::cell::Cell::new((std::ptr::null(), 0)) };
+}
+
+fn class_a_writer_depth(table: *const ()) -> usize {
+    CLASS_A_WRITER.with(|slot| {
+        let (ptr, depth) = slot.get();
+        if ptr == table {
+            depth
+        } else {
+            0
+        }
+    })
+}
+
+/// One counted Class A append. Drop latches a failure unless the append
+/// finished, then releases the count, on `Ok`, `Err`, and unwind alike.
+/// The latch comes first: a sync that samples the count inside the failure
+/// hook must not see zero and seal over a write that failed.
+struct ClassAInFlight<'a> {
+    table: &'a TxTable,
+    done: bool,
+}
+
+impl Drop for ClassAInFlight<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.table.latch_class_a_failure();
+        }
+        self.table
+            .class_a_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+struct ClassAWriterDepth {
+    prev: (*const (), usize),
+}
+
+impl Drop for ClassAWriterDepth {
+    fn drop(&mut self) {
+        CLASS_A_WRITER.with(|slot| slot.set(self.prev));
+    }
+}
+
+fn enter_class_a_writer_depth(table: *const ()) -> ClassAWriterDepth {
+    CLASS_A_WRITER.with(|slot| {
+        let prev = slot.get();
+        let depth = if prev.0 == table { prev.1 } else { 0 };
+        slot.set((table, depth + 1));
+        ClassAWriterDepth { prev }
+    })
+}
+
+/// `tear_guard/` and `{stem}.kept` came from a build that imaged Class A
+/// pages. The sector rule leaves nothing for them to restore, and nothing
+/// reads them, so open removes them.
+fn drop_class_a_images(hot: &Path, seq: &Path) -> Result<(), StoreError> {
+    let guard = hot.join("tear_guard");
+    match std::fs::remove_dir_all(&guard) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    }
+    for dir in [hot, seq] {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(StoreError::io(dir, e)),
+        };
+        for ent in entries {
+            let ent = ent.map_err(|e| StoreError::io(dir, e))?;
+            if ent.file_name().to_string_lossy().ends_with(".kept") {
+                let path = ent.path();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(StoreError::io(&path, e)),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn publish_prepared_body(
@@ -1479,6 +1596,7 @@ impl TxTable {
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_delta::SpendPageLog::create(dir)?,
             class_a_sync: std::sync::Mutex::new(()),
+            class_a_writes: std::sync::atomic::AtomicUsize::new(0),
             class_a_failed: std::sync::atomic::AtomicBool::new(false),
             class_a_on_fail: std::sync::OnceLock::new(),
             hot_dir: dir.to_path_buf(),
@@ -1557,7 +1675,7 @@ impl TxTable {
         opts: HeadOpenOpts,
         store: Option<OpenedFromStore>,
     ) -> Result<Self, StoreError> {
-        crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir)?;
+        drop_class_a_images(dir, seqsigwit_dir)?;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
@@ -1767,6 +1885,7 @@ impl TxTable {
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages,
             class_a_sync: std::sync::Mutex::new(()),
+            class_a_writes: std::sync::atomic::AtomicUsize::new(0),
             class_a_failed: std::sync::atomic::AtomicBool::new(false),
             class_a_on_fail: std::sync::OnceLock::new(),
             hot_dir: dir.to_path_buf(),
@@ -4014,9 +4133,7 @@ impl TxTable {
     /// A failure latches: every later call refuses until restart. Calls run
     /// one at a time (the tip barrier and the spend checkpoint can overlap).
     pub fn sync_class_a_data(&self) -> Result<(), StoreError> {
-        self.class_a_latched(|| {
-            self.sync_class_a_stems(self.synced_named.load(std::sync::atomic::Ordering::Acquire))
-        })
+        self.sync_class_a_quiescent(None)
     }
 
     /// Call `on_fail` once, when a Class A sync or append write first fails.
@@ -4032,20 +4149,47 @@ impl TxTable {
     /// `named` is at most [`Self::settled_count`]: every row of those
     /// creates was written, and a failed write latched before this sync.
     pub fn sync_class_a_named(&self, named: u64) -> Result<(), StoreError> {
+        self.sync_class_a_quiescent(Some(named))
+    }
+
+    /// Seal once no other append is in a pwrite.
+    ///
+    /// The append thread is already inside the pwrite, so it waits out every
+    /// other append and then seals. Waiting for its own count would never
+    /// finish. Any other thread waits until the count is zero, so a failure
+    /// an append latched is seen before the seal.
+    fn sync_class_a_quiescent(&self, named: Option<u64>) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        self.class_a_latched(|| {
-            self.sync_class_a_stems(named)?;
-            // Synced first, then named: the mark never passes a create the
-            // device may not hold. One writer at a time under the latch.
-            if named > self.synced_named.load(Ordering::Acquire) {
-                crate::file::write_synced_tmp_rename(
-                    &self.hot_dir.join(CLASS_A_SYNCED_NAME),
-                    &named.to_le_bytes(),
-                )?;
-                self.synced_named.store(named, Ordering::Release);
+        loop {
+            self.refuse_if_class_a_failed()?;
+            let mine = class_a_writer_depth(self as *const Self as *const ());
+            if self.class_a_writes.load(Ordering::Acquire) != mine {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
             }
-            Ok(())
-        })
+            let mut sealed = false;
+            self.class_a_latched(|| {
+                run_before_seal_hook(self);
+                let mine = class_a_writer_depth(self as *const Self as *const ());
+                if self.class_a_writes.load(Ordering::Acquire) != mine {
+                    return Ok(());
+                }
+                // A failed append latches before it drops its count. It may
+                // have done both since the check at entry, so check again
+                // after the count, before the seal.
+                self.refuse_if_class_a_failed()?;
+                // Seal at least the synced value. A slot with a lower
+                // `settled` would lower the sidecar when open restores it.
+                let synced = self.synced_named.load(Ordering::Acquire);
+                let named = named.map_or(synced, |n| n.max(synced));
+                self.sync_class_a_stems(named)?;
+                sealed = true;
+                Ok(())
+            })?;
+            if sealed {
+                return Ok(());
+            }
+        }
     }
 
     /// Run `sync` on Class A fds under the latch: refuse once one failed,
@@ -4098,7 +4242,11 @@ impl TxTable {
         Ok(())
     }
 
-    fn latch_class_a_failure(&self) {
+    pub(crate) fn latch_class_a_failure(&self) {
+        let writers = self
+            .class_a_writes
+            .load(std::sync::atomic::Ordering::Acquire);
+        WRITERS_AT_LATCH.with(|slot| slot.set(writers));
         let first = !self
             .class_a_failed
             .swap(true, std::sync::atomic::Ordering::AcqRel);
@@ -4116,14 +4264,31 @@ impl TxTable {
         &self,
         write: impl FnOnce() -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.enter_class_a_write()?;
+        let depth = enter_class_a_writer_depth(self as *const Self as *const ());
+        let mut in_flight = ClassAInFlight {
+            table: self,
+            done: false,
+        };
         let written = write();
-        if written.is_err() {
-            self.latch_class_a_failure();
-        }
+        in_flight.done = written.is_ok();
+        drop(in_flight);
+        drop(depth);
         written
     }
 
+    /// Count the write before releasing the sync latch, so a sync on
+    /// another thread waits for it.
+    fn enter_class_a_write(&self) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        let _one = self.class_a_sync.lock().unwrap_or_else(|e| e.into_inner());
+        self.refuse_if_class_a_failed()?;
+        self.class_a_writes.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     fn sync_class_a_stems(&self, named: u64) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         let files: [&crate::file::TableFile; 16] = [
             &self.body.body,
             &self.seqsigwit.body,
@@ -4142,7 +4307,20 @@ impl TxTable {
             &self.input.off,
             &self.input.body,
         ];
-        crate::class_a_pages::write_barrier(&self.hot_dir, &files, named)
+        // An append writes past the committed end, so the sectors it shares
+        // with committed rows land unchanged. The sync is the whole barrier.
+        crate::file::TableFile::sync_data_all_with(&files, &[])?;
+        // The sidecar moves even with an append in flight: a spend commit
+        // or scripthash mark on this thread names `named`, and open keeps
+        // those creates.
+        if named > self.synced_named.load(Ordering::Acquire) {
+            crate::file::write_synced_tmp_rename(
+                &self.hot_dir.join(CLASS_A_SYNCED_NAME),
+                &named.to_le_bytes(),
+            )?;
+            self.synced_named.store(named, Ordering::Release);
+        }
+        Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {

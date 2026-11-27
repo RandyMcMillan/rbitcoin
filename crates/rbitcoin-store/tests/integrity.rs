@@ -860,8 +860,14 @@ fn failed_header_write_stops_class_a(
     s.checkpoint_spend_through(0).unwrap();
     s.set_prune_seqsigwit_mode(prune);
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers_at_fail = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = std::sync::Arc::clone(&fired);
+    let counted = std::sync::Arc::clone(&writers_at_fail);
     s.txs.on_class_a_failure(move || {
+        counted.store(
+            rbitcoin_store::testutil::class_a_writers_at_last_failure(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         seen.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 
@@ -874,6 +880,10 @@ fn failed_header_write_stops_class_a(
     );
     drop(disarm);
     assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        writers_at_fail.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the failure hook ran after the writer count dropped, so a sync can clear the mark"
+    );
     assert!(
         s.flush_class_c_tip().is_err(),
         "the barrier ran after a failed write"

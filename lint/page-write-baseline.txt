@@ -7,10 +7,6 @@ crates/rbitcoin-store/src/bdz.rs	write_all	5
 crates/rbitcoin-store/src/bulk_io.rs	pwrite	1
 crates/rbitcoin-store/src/bulk_io.rs	pwrite_batch	1
 crates/rbitcoin-store/src/chain.rs	truncate	2
-crates/rbitcoin-store/src/class_a_pages.rs	WriteOp	1
-crates/rbitcoin-store/src/class_a_pages.rs	pwrite_batch	1
-crates/rbitcoin-store/src/class_a_pages.rs	pwrite_exact	10
-crates/rbitcoin-store/src/class_a_pages.rs	set_len	5
 crates/rbitcoin-store/src/create_loc.rs	truncate	1
 crates/rbitcoin-store/src/delta_loc.rs	truncate	1
 crates/rbitcoin-store/src/file.rs	handle_pwrite_all	3

@@ -101,7 +101,8 @@ impl SegDirs {
     /// the disk: a filesystem may commit a new name before its data. No
     /// length is published before both headers are synced, so that pair
     /// holds no row: open removes it. In any earlier pair, or in a newest
-    /// pair that shows a published length, either is still corruption. A
+    /// pair where either surviving file shows a published length, either is
+    /// still corruption and nothing is unlinked. A
     /// presence check that fails is an error, never a missing file.
     pub fn open(&self, slot: u64) -> Result<Vec<SegPair>, StoreError> {
         let mut segs = Vec::new();
@@ -117,6 +118,12 @@ impl SegDirs {
             if !has_idx || !has_body {
                 if !newest {
                     return Err(StoreError::Corrupt("segment pair incomplete"));
+                }
+                let survivor = if has_idx { &ip } else { &bp };
+                if header_len(survivor)?.is_some_and(|len| len > FILE_HEADER_LEN as u64) {
+                    return Err(StoreError::Corrupt(
+                        "newest segment pair has published rows",
+                    ));
                 }
                 self.discard(file_id);
                 break;

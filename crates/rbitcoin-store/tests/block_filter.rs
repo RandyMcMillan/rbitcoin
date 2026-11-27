@@ -700,6 +700,31 @@ fn open_refuses_a_bad_header_in_a_pair_with_rows_or_a_successor() {
     assert!(dirs.idx_path(0).exists() && dirs.body_path(0).exists());
 }
 
+/// A newest pair that lost one file is dropped only while the survivor shows
+/// no length past its header (`open_drops_a_half_created_newest_pair`). A
+/// survivor with rows means a file was lost after rows were published: open
+/// refuses and deletes nothing, whichever file survived.
+#[test]
+fn open_refuses_a_newest_pair_missing_a_file_beside_published_rows() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    fs::remove_file(dirs.body_path(0)).unwrap();
+    assert!(BlockFilterTable::open(&dir).is_err());
+    assert!(dirs.idx_path(0).exists(), "open unlinked an idx with rows");
+
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    fs::remove_file(dirs.idx_path(0)).unwrap();
+    assert!(BlockFilterTable::open(&dir).is_err());
+    assert!(dirs.body_path(0).exists(), "open unlinked a body with rows");
+}
+
 /// A presence check that fails is not a missing file: open returns the error
 /// and keeps the pair. A regular file where the body directory goes makes
 /// every body path fail to stat with `ENOTDIR`.

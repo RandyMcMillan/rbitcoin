@@ -419,6 +419,8 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
     for (data, data_path) in files {
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::synced(data_path);
     }
     let mut synced = HashSet::with_capacity(files.len());
     for (_, data_path) in files {
@@ -662,6 +664,8 @@ pub fn clear_page_guard_rel(
     for (data, data_path) in files {
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::synced(data_path);
     }
     let mut synced = HashSet::with_capacity(files.len());
     for (_, data_path) in files {
@@ -1165,4 +1169,21 @@ fn run_commit_hook() -> Result<(), StoreError> {
         Some(hook) => hook(),
         None => Ok(()),
     }
+}
+
+/// Write probe: `path` has an arm whose pages cover the whole write.
+#[cfg(feature = "write-probe")]
+pub(crate) fn probe_armed_covers(path: &Path, offset: u64, len: u64) -> bool {
+    let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pages) = map.get(path) else {
+        return false;
+    };
+    let mut page = offset & !(PAGE - 1);
+    while page < offset + len {
+        if !pages.contains(&page) {
+            return false;
+        }
+        page += PAGE;
+    }
+    true
 }

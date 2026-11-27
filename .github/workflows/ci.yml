@@ -25,7 +25,7 @@ env:
 # fmt/clippy do not drift with GitHub Actions “stable”. The runner image's
 # rustup auto-installs that toolchain and its components on first cargo.
 #
-# `qc` is one Ubuntu runner: fmt, ast-grep, unwrap-ratchet, hex-ratchet, src-test-modules, doc-attach, unused-pub, deny, scripts, clippy.
+# `qc` is one Ubuntu runner: fmt, ast-grep, unwrap-ratchet, hex-ratchet, write-probe classifier, src-test-modules, doc-attach, unused-pub, deny, scripts, clippy.
 # test, windows, macos, and macos-test each have their own runner.
 # coverage, pread, rust-forward, and nixos-module-eval wait for qc and test.
 # The module eval runs beside pread and rust-forward. It does not gate coverage.
@@ -85,6 +85,8 @@ jobs:
         run: ./scripts/src-test-modules.test.sh
       - name: src test modules
         run: ./scripts/src-test-modules.sh
+      - name: write probe classifier self-test
+        run: ./scripts/write-probe-classify.test.sh
       - name: doc attach self-test
         run: ./scripts/doc-attach.test.sh
       - name: doc attach
@@ -187,8 +189,14 @@ jobs:
           workspaces: ". -> target/dev"
       - name: tmpfs headroom
         run: df -h /dev/shm && free -m
+      # The write probe logs every in-place write and length publish the
+      # suite makes. The classifier fails on one with no reviewed reason.
       - name: cargo test
-        run: cargo test --workspace --exclude rbitcoin-bench
+        env:
+          WRITE_PROBE_OUT: ${{ runner.temp }}/write-probe.log
+        run: cargo test --workspace --exclude rbitcoin-bench --features rbitcoin-store/write-probe
+      - name: write probe
+        run: python3 scripts/write-probe-classify.py "${{ runner.temp }}/write-probe.log"
       # The workspace exclude stays (coverage.test.sh). This one lib test is
       # the address-corpus pin: sha256::Hash Display is internal order.
       - name: bench scripthash pin

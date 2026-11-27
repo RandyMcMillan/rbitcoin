@@ -250,6 +250,17 @@ hardware fault: the scripthash path marks the index degraded and rebuilds,
 while a Class A read error stops open. A design that needs one auditable
 "closed cleanly" predicate, or a whole-store restore, needs a snapshot instead.
 
+**The write probe.** CI runs the test suite with the `write-probe` feature
+on `rbitcoin-store`. Every TableFile write below a file's durable end, and
+every length publish, is logged by class: a fresh file, pages a mark
+images, one sector, or a length published before or after its bytes were
+synced. `scripts/write-probe-classify.py` passes the classes that are safe
+by structure and fails CI on any other entry without a reviewed reason in
+its rule list: a Class A length past the synced floor, the `spent.body`
+fold that open replays, a hash-checked filter repair, and the few writes a
+dirty flag or a fresh file covers. A new writer that needs a new rule gets
+one in the same change, with its reason.
+
 ## Tip as commit point
 
 Best-chain views ignore uncommitted Class C state:

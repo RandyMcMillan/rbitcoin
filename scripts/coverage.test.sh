@@ -85,7 +85,9 @@ assert_ok "ci coverage step skips the HTML report" \
 assert_ok "ci coverage job has a wall timeout" \
   bash -c 'awk "/^  coverage:/{p=1} p&&/timeout-minutes:/{print; exit}" "$1" | grep -q timeout-minutes' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "required test job excludes rbitcoin-bench" \
-  bash -c 'awk "/^  test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -Eq -- "^ +run: cargo test --workspace --exclude rbitcoin-bench$"' _ "$ROOT/.github/workflows/ci.yml"
+  bash -c 'awk "/^  test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -Eq -- "^ +run: cargo test --workspace --exclude rbitcoin-bench( --features rbitcoin-store/write-probe)?$"' _ "$ROOT/.github/workflows/ci.yml"
+assert_ok "required test job classifies the write probe" \
+  bash -c 'awk "/^  test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -q -- "scripts/write-probe-classify.py"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "required test job still pins the bench scripthash" \
   grep -q 'cargo test -p rbitcoin-bench --lib hot_corpus_includes_p2a' "$ROOT/.github/workflows/ci.yml"
 assert_ok "pread job runs the skip-flushes switch test" \

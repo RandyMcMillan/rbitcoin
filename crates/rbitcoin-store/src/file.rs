@@ -977,7 +977,14 @@ impl TableFile {
     /// [`Self::pwrite_all`] against a `committed` end the caller sampled.
     fn pwrite_checked(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         self.refuse_if_poisoned()?;
-        self.pwrite_length(committed, offset, bytes)
+        #[cfg(feature = "write-probe")]
+        self.probe(
+            committed,
+            offset,
+            bytes,
+            crate::write_probe::WriteKind::Payload,
+        );
+        self.pwrite_door(committed, offset, bytes)
     }
 
     /// [`Self::pwrite_checked`] for the length a flush republishes. A
@@ -987,6 +994,35 @@ impl TableFile {
     /// poisoned file before it changes RAM.
     fn pwrite_length(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         #[cfg(feature = "write-probe")]
+        self.probe(
+            committed,
+            offset,
+            bytes,
+            crate::write_probe::WriteKind::Length,
+        );
+        self.pwrite_door(committed, offset, bytes)
+    }
+
+    /// Classify a payload write that bypasses the door (bulk io_uring) as the
+    /// door would.
+    #[cfg(feature = "write-probe")]
+    pub(crate) fn probe_bulk_write(&self, offset: u64, bytes: &[u8]) {
+        self.probe(
+            self.header_len_to_persist(),
+            offset,
+            bytes,
+            crate::write_probe::WriteKind::Payload,
+        );
+    }
+
+    #[cfg(feature = "write-probe")]
+    fn probe(
+        &self,
+        committed: u64,
+        offset: u64,
+        bytes: &[u8],
+        kind: crate::write_probe::WriteKind,
+    ) {
         crate::write_probe::write(
             &self.path,
             committed,
@@ -998,7 +1034,11 @@ impl TableFile {
             } else {
                 FILE_HEADER_LEN as u64
             },
+            kind,
         );
+    }
+
+    fn pwrite_door(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if !bytes.is_empty() {
             // Committed end is the durable header, not a RAM high-water.
             // A shared page has to be one this file's current arm names.
@@ -1578,7 +1618,7 @@ impl TableFile {
             return Ok(());
         }
         #[cfg(feature = "write-probe")]
-        let probe_n: Vec<usize> = files
+        let probe_n: Vec<_> = files
             .iter()
             .map(|f| crate::write_probe::sync_begin(&f.path))
             .collect();

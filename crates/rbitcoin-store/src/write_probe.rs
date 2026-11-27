@@ -1,5 +1,6 @@
 //! Write probe (`write-probe` feature, CI only). Classify every TableFile
-//! write that lands below the durable end, and every length publish, by the
+//! write that lands below the durable end, including a bulk body write that
+//! bypasses the door, and every length publish, by the
 //! sector rule and the sync order. One line per distinct (class, file,
 //! caller) goes to `$WRITE_PROBE_OUT`. `scripts/write-probe-classify.py`
 //! fails CI on a class with no reviewed reason.
@@ -12,42 +13,67 @@ use std::sync::{Mutex, OnceLock};
 
 const SECTOR: u64 = 512;
 
-fn dirty() -> &'static Mutex<HashMap<PathBuf, Vec<(u64, u64)>>> {
-    static D: OnceLock<Mutex<HashMap<PathBuf, Vec<(u64, u64)>>>> = OnceLock::new();
+/// What a door write carries. The caller names it: a payload can have any
+/// length and offset, so the probe does not infer a publish from its shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteKind {
+    Payload,
+    /// A header length field or a trailing footer.
+    Length,
+}
+
+/// Unsynced byte ranges per file, each with the per-file sequence number of
+/// the write that made it.
+#[derive(Default)]
+struct Dirty {
+    next: u64,
+    ranges: Vec<(u64, u64, u64)>,
+}
+
+fn dirty() -> &'static Mutex<HashMap<PathBuf, Dirty>> {
+    static D: OnceLock<Mutex<HashMap<PathBuf, Dirty>>> = OnceLock::new();
     D.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The dirty ranges of `path` a sync starting now covers. A write that
-/// lands while the sync waits is not among them.
-pub(crate) fn sync_begin(path: &Path) -> usize {
-    dirty()
+/// What a sync starting now covers: the writes made before it, and the last
+/// trailer written before it.
+pub(crate) struct SyncPoint {
+    seq: u64,
+    trailer: Option<u64>,
+}
+
+/// A write that lands while the sync waits is not covered by it.
+pub(crate) fn sync_begin(path: &Path) -> SyncPoint {
+    let seq = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
-        .map_or(0, Vec::len)
+        .map_or(0, |d| d.next);
+    let trailer = trailers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .get(path)
+        .copied();
+    SyncPoint { seq, trailer }
 }
 
-/// A sync made the first `n` dirty ranges of `path` durable, and the last
-/// trailer written before it.
-pub(crate) fn synced(path: &Path, n: usize) {
-    if let Some(v) = dirty()
+/// A sync that began at `at` finished: the writes and trailer it covered are
+/// durable.
+pub(crate) fn synced(path: &Path, at: SyncPoint) {
+    if let Some(d) = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(path)
     {
-        v.drain(..n.min(v.len()));
+        d.ranges.retain(|&(seq, _, _)| seq >= at.seq);
     }
-    let mut trailers = trailers().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(end) = trailers.0.get(path).copied() {
-        trailers.1.insert(path.to_path_buf(), end);
-    }
-}
-
-/// Bytes a write bypassing the `TableFile` door (bulk io_uring writes)
-/// put past a file's end. They count as unsynced until a sync.
-pub(crate) fn note_append(path: &Path, offset: u64, len: u64) {
-    if len > 0 {
-        note_dirty(path, offset, offset + len);
+    if let Some(end) = at.trailer {
+        trailers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .insert(path.to_path_buf(), end);
     }
 }
 
@@ -82,19 +108,18 @@ fn unsynced_in(path: &Path, from: u64, to: u64) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
-        .is_some_and(|v| v.iter().any(|&(s, e)| s < to && e > from))
+        .is_some_and(|d| d.ranges.iter().any(|&(_, s, e)| s < to && e > from))
 }
 
 fn note_dirty(path: &Path, from: u64, to: u64) {
-    dirty()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(path.to_path_buf())
-        .or_default()
-        .push((from, to));
+    let mut map = dirty().lock().unwrap_or_else(|e| e.into_inner());
+    let d = map.entry(path.to_path_buf()).or_default();
+    d.ranges.push((d.next, from, to));
+    d.next += 1;
 }
 
-/// Called with the durable `committed` end before every TableFile pwrite.
+/// Called with the durable `committed` end before every TableFile pwrite,
+/// and before a bulk write that bypasses the door.
 pub(crate) fn write(
     path: &Path,
     committed: u64,
@@ -102,6 +127,7 @@ pub(crate) fn write(
     bytes: &[u8],
     trailing: bool,
     header_len: u64,
+    kind: WriteKind,
 ) {
     let len = bytes.len() as u64;
     if len == 0 {
@@ -117,37 +143,39 @@ pub(crate) fn write(
         header_on_file(path).unwrap_or(committed)
     };
     let end = offset + len;
-    let len_field = if trailing {
-        len == 32 && end >= committed.saturating_sub(32)
-    } else {
-        offset == 8 && len == 8
-    };
+    let len_field = kind == WriteKind::Length;
     let class = if len_field {
-        let new = if trailing {
-            end
-        } else {
-            u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
+        // An 8-byte length field holds the new length. A trailing footer
+        // ends at it.
+        let new = match <[u8; 8]>::try_from(bytes) {
+            Ok(field) => u64::from_le_bytes(field),
+            Err(_) => end,
         };
         if trailing {
             trailers()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .0
-                .insert(path.to_path_buf(), end);
+                .insert(path.to_path_buf(), new);
         }
+        // A trailing length counts its footer, so the payload it names ends
+        // one footer earlier, and starts where the old footer sat.
+        let footer = if trailing {
+            crate::file::TRAILING_FOOTER_LEN as u64
+        } else {
+            0
+        };
+        let (lo, hi) = (committed.saturating_sub(footer), new.saturating_sub(footer));
         // The bytes the new length names must be synced, or imaged by a live
         // mark, before the length is safe.
-        let named_safe = !unsynced_in(path, committed, new)
-            || crate::page_guard::probe_armed_covers(
-                path,
-                committed,
-                new.saturating_sub(committed),
-            );
+        let named_unsynced = unsynced_in(path, lo, hi);
+        let named_safe = !named_unsynced
+            || crate::page_guard::probe_armed_covers(path, lo, hi.saturating_sub(lo));
         if new <= committed {
             None
         } else if named_safe
             && crate::page_guard::probe_armed_covers(path, offset, len)
-            && unsynced_in(path, committed, new)
+            && named_unsynced
         {
             Some("LEN_ARMED")
         } else if !named_safe && !trailing && new <= SECTOR {
@@ -283,7 +311,9 @@ const SAFE_CLASSES: &[&str] = &[
     "FIXTURE",
 ];
 
-/// Append one entry the first time its key is seen.
+/// Append one entry the first time its key is seen. A log that cannot be
+/// written fails the run: a dropped entry would let the classifier pass
+/// writes it never saw.
 fn write_entry(
     out: &std::ffi::OsStr,
     key: String,
@@ -294,12 +324,11 @@ fn write_entry(
 ) {
     use std::io::Write as _;
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    if !SEEN
+    let mut seen = SEEN
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key.clone())
-    {
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&key) {
         return;
     }
     let mut line = format!("PROBE {key} end={committed} off={offset} len={len}\n");
@@ -308,11 +337,16 @@ fn write_entry(
         line.push_str(f);
         line.push('\n');
     }
-    if let Ok(mut fh) = std::fs::OpenOptions::new()
+    let wrote = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(out)
-    {
-        let _ = fh.write_all(line.as_bytes());
+        .and_then(|mut fh| fh.write_all(line.as_bytes()));
+    if let Err(e) = wrote {
+        panic!(
+            "write probe: cannot append to {}: {e}",
+            Path::new(out).display()
+        );
     }
+    seen.insert(key);
 }

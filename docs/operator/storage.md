@@ -253,8 +253,11 @@ removes the mark once those bytes are synced (about every second while the
 index catches up, and at a clean shutdown). If the process dies in between (a
 kill -9, an out-of-memory kill or a power cut), the next start with
 `--sh-index` exits with a "torn write" error, because the index can read as
-valid and be wrong. Start once with `RBITCOIN_SH_FORCE_REBUILD=1` to rebuild
-it from Class A. That takes hours on mainnet, but the chain is not touched.
+valid and be wrong. A mark left by an index write that failed (a full disk,
+say) is the exception to the sync: no sync removes it, so a clean shutdown
+keeps it and the next start refuses the same way. Start once with
+`RBITCOIN_SH_FORCE_REBUILD=1` to rebuild it from Class A. That takes hours on
+mainnet, but the chain is not touched.
 Under systemd, `Restart=always` repeats any failed start, so check the log
 for the "torn write" error before forcing a rebuild. Give a
 clean stop room to finish (`TimeoutStopSec`): the shutdown flush syncs the
@@ -345,7 +348,7 @@ to start over unless you intend a full Class A collect
 | All `.packed`, neither mark, Class A has creates | Delete the head and materialize from Class A. A block-by-block replay from height 0 is not the rebuild. |
 | Complete head, no marks, no extract | Soft-migrate: write `.packed`. Missing `include_hwm` is set from the create count. |
 | Kill-9 mid pack | Unfinished shard is redone. Open follows [`docs/crash-recovery.md`](../crash-recovery.md). |
-| Write-behind IO error (disk full) | The process exits non-zero after the shutdown flush. Restart the same datadir; write-behind continues. |
+| Write-behind IO error (disk full) | The process exits non-zero after the shutdown flush. Free space and restart the same datadir; write-behind continues. If that start exits with the "torn write" error, the failed write left `store/scripthash.dirty`, which the clean shutdown does not remove: start once with `RBITCOIN_SH_FORCE_REBUILD=1`. |
 | Corrupt SH (mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. Leftover live OA is removed on open. |
 
 Electrum waits until SH is tip-ready. Do **not** `rm -rf store/` for an SH

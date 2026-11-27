@@ -774,6 +774,31 @@ fn collect_marks_past_the_archive_do_not_publish() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A rebuild mark found at open drops the old index files there. The
+/// finalize after it recollects Class A and drops the mark.
+#[test]
+fn rebuild_mark_at_open_recollects_then_clears() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-open");
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    let before = q.store.scripthash.entry_count();
+    assert!(before > 0);
+    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).unwrap();
+    assert!(q.sh_force_rebuild());
+    let _ = q.finalize_sh_runs().unwrap();
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_marked(
+        q.store.path()
+    ));
+    assert!(q.sh_is_tip_ready());
+    assert_eq!(
+        q.store.scripthash.entry_count(),
+        before,
+        "the rebuild after open recollected Class A"
+    );
+}
+
 /// A rebuild mark wipes and recollects the index on the next finalize, then
 /// is dropped so the start after that keeps the head.
 #[test]

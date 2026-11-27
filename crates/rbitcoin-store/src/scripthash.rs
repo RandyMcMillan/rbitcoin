@@ -9,6 +9,7 @@ use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
 use crate::hashhead::{sh_main_shard_count, HeadScale};
 use crate::io_backend::ReadIoBackend;
+use crate::page_guard::{self, PAGE};
 use crate::scripthash_head::{prefix_shard_of, ScriptHashHead};
 use crate::scripthash_layout::{
     head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShHeadValue,
@@ -30,10 +31,20 @@ use crate::scripthash_slabs::{
 use crate::scripthash_sorted_head::SortedHead;
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{le_u64, uleb128_len, Fk, TableKind};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
+
+#[cfg(debug_assertions)]
+use std::cell::Cell;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static FAIL_CLEAR_SH_GUARD: Cell<bool> = const { Cell::new(false) };
+    static FAIL_INGEST_REL_DROP: Cell<bool> = const { Cell::new(false) };
+}
 
 #[path = "scripthash_unlink.rs"]
 #[doc(hidden)]
@@ -95,6 +106,20 @@ pub fn mark_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
 
 pub fn sh_rebuild_marked(store_dir: &Path) -> bool {
     store_dir.join(SH_REBUILD_NAME).is_file()
+}
+
+/// A requested rebuild drops the index files before open decodes them, so a
+/// torn file cannot stop the open that would rebuild it. Open then creates
+/// an empty index.
+pub(crate) fn discard_index_for_rebuild(store_dir: &Path) -> Result<(), StoreError> {
+    if !sh_rebuild_marked(store_dir) {
+        return Ok(());
+    }
+    page_guard::clear_sh_marks(store_dir)?;
+    for name in ["scripthash.body", "scripthash.ovf", "scripthash.head"] {
+        remove_store_path(&store_dir.join(name))?;
+    }
+    crate::file::fsync_parent_dir(store_dir).map_err(|e| StoreError::io(store_dir, e))
 }
 
 /// A finished rebuild drops the mark. A crash before this rebuilds again.
@@ -298,6 +323,119 @@ pub struct AppendTiming {
     pub head_ns: u64,
 }
 
+/// Slab and page writes, and slab frees, an ingest batch holds back from one body.
+///
+/// An ingest batch packs every key first. The payloads land only after the
+/// allocator header that stops naming a popped offset is durable, and a
+/// replaced slab joins the free list only after the head that named it is
+/// durable. The trade is RAM for that order: the batch keeps every new slab
+/// and page image until its body barrier, one contiguous buffer per body.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct StagedSlabs {
+    bytes: Vec<u8>,
+    writes: Vec<(u64, usize)>,
+    frees: Vec<(u8, u64)>,
+    /// Alignment-gap chunks the allocator carved. Their free-list links
+    /// share a block with the slab below the old bump, so they are imaged
+    /// and pushed with the frees, inside the armed commit.
+    pub(crate) gaps: Vec<(u8, u64)>,
+}
+
+impl StagedSlabs {
+    #[doc(hidden)]
+    pub fn write(&mut self, off: u64, bytes: &[u8]) {
+        self.writes.push((off, bytes.len()));
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    #[doc(hidden)]
+    pub fn free(&mut self, class: u8, off: u64) {
+        self.frees.push((class, off));
+    }
+
+    #[doc(hidden)]
+    pub fn write_to(&self, body: &TableFile) -> Result<(), StoreError> {
+        let mut at = 0usize;
+        for &(off, len) in &self.writes {
+            body.write_at(off, &self.bytes[at..at + len])?;
+            at += len;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(super) struct ArmedSh {
+    files: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn body_sh_mark(dir: &Path, body: &TableFile) -> Result<String, StoreError> {
+    let rel = page_guard::guard_rel_name(dir, body.path())?;
+    if let Some(rest) = rel.strip_prefix("scripthash.body/") {
+        Ok(page_guard::sh_mark(rest))
+    } else {
+        Ok(page_guard::sh_mark("ovf"))
+    }
+}
+
+fn image_range(
+    pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+    mark: &str,
+    rel: &str,
+    path: &Path,
+    file: &File,
+    off: u64,
+    len: u64,
+) -> Result<(), StoreError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let first = (off / PAGE) * PAGE;
+    let last = ((off + len - 1) / PAGE) * PAGE;
+    let mut block = first;
+    while block <= last {
+        let key = (mark.to_string(), rel.to_string(), block);
+        if let std::collections::btree_map::Entry::Vacant(e) = pages.entry(key) {
+            e.insert(page_guard::read_live_page(path, file, block)?);
+        }
+        block = block.saturating_add(PAGE);
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_sh_guard_clear() -> bool {
+    FAIL_CLEAR_SH_GUARD.with(|c| c.replace(false))
+}
+
+/// One body's share of an ingest batch.
+struct BodyStage<'a> {
+    body: &'a TableFile,
+    alloc: &'a Mutex<AllocState>,
+    slabs: StagedSlabs,
+    /// Packing took an offset off this body's free list.
+    popped: bool,
+}
+
+/// One ingest batch between packing and its barriers.
+#[derive(Default)]
+struct IngestBatch<'a> {
+    head_final: Vec<([u8; 32], ShHeadValue, KeyHome)>,
+    stages: BTreeMap<usize, BodyStage<'a>>,
+    moved_heads: Vec<MovedHead>,
+    written: usize,
+}
+
+/// A head file whose bare in-place update must be synced before a slab its
+/// key replaced is freed. An ingest head needs none: `insert_many` syncs it,
+/// and a seal writes a synced sorted file.
+#[derive(PartialEq)]
+enum MovedHead {
+    MainShard(usize),
+    SealedOvf,
+}
+
 /// Body slab allocator state (persisted in alloc header).
 #[derive(Clone, Copy)]
 #[doc(hidden)]
@@ -364,15 +502,32 @@ pub fn carve_gap_into_freelist(
     from: u64,
     to: u64,
 ) -> Result<(), StoreError> {
+    for (c, off) in gap_chunks(from, to) {
+        push_free_head(body, free_head, c, off)?;
+    }
+    Ok(())
+}
+
+/// Free slabs that cover `[from, to)`, largest class first.
+#[doc(hidden)]
+pub fn gap_chunks(from: u64, to: u64) -> Vec<(u8, u64)> {
+    let mut out = Vec::new();
     let mut off = from;
     while off < to {
-        let rem = to - off;
-        let Some(c) = largest_reloc_class_le(rem) else {
+        let Some(c) = largest_reloc_class_le(to - off) else {
             break;
         };
-        let sz = slab_bytes(c);
-        push_free_head(body, free_head, c, off)?;
-        off = off.saturating_add(sz);
+        out.push((c, off));
+        off = off.saturating_add(slab_bytes(c));
+    }
+    out
+}
+
+/// Publish the allocator bump as the body length. An armed commit calls
+/// this before its writes, so page 0 is imaged first.
+pub(crate) fn publish_bump(body: &TableFile, alloc: &AllocState) -> Result<(), StoreError> {
+    if alloc.bump > body.logical_len() {
+        body.set_logical_len(alloc.bump)?;
     }
     Ok(())
 }
@@ -724,6 +879,7 @@ pub fn discard_incomplete_scripthash_head(dir: &Path, n_shards: usize) -> Result
     if sorted_main_present(dir, n_shards) {
         return Ok(());
     }
+    page_guard::clear_sh_marks(dir)?;
     remove_store_path(&dir.join("scripthash.head"))
 }
 
@@ -1037,6 +1193,34 @@ impl From<LocatedHome> for KeyHome {
     }
 }
 
+/// `seal_ingest` moved every ingest row into a sealed file. Keys still
+/// tagged `Ingest` in the batch snapshot would also land in the new table.
+fn retarget_ingest_after_seal(heads: &mut HashMap<[u8; 32], (ShHeadValue, KeyHome)>) {
+    for (_, home) in heads.values_mut() {
+        if *home == KeyHome::Ingest {
+            *home = KeyHome::SealedOvf;
+        }
+    }
+}
+
+/// Remember the head file `apply_head_upserts` updates in place for `key`,
+/// once per main shard or for the sealed overflow files.
+fn note_moved_head(
+    table: &ScriptHashTable,
+    heads: &mut Vec<MovedHead>,
+    key: &[u8; 32],
+    kh: KeyHome,
+) {
+    let head = match kh {
+        KeyHome::Main => MovedHead::MainShard(table.shard_index(key)),
+        KeyHome::SealedOvf => MovedHead::SealedOvf,
+        KeyHome::Ingest | KeyHome::Absent => return,
+    };
+    if !heads.contains(&head) {
+        heads.push(head);
+    }
+}
+
 impl ScriptHashTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
         Self::create_with_scale(dir, HeadScale::Mainnet)
@@ -1097,6 +1281,7 @@ impl ScriptHashTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
+        page_guard::restore_sh_marks(dir)?;
         let expected = sh_main_shard_count(scale);
         discard_incomplete_scripthash_head(dir, expected)?;
         discard_leftover_oa_overflow(dir)?;
@@ -1113,6 +1298,7 @@ impl ScriptHashTable {
         n_shards: usize,
         scale: HeadScale,
     ) -> Result<Self, StoreError> {
+        page_guard::restore_sh_marks(dir)?;
         let n_shards = n_shards.max(1);
         let mut bodies = Vec::with_capacity(n_shards);
         let mut allocs = Vec::with_capacity(n_shards);
@@ -1237,6 +1423,7 @@ impl ScriptHashTable {
             bump: payload0,
             free_head: [0; SH_MAX_CLASS as usize + 1],
         };
+        page_guard::clear_sh_marks(&self.store_dir)?;
         // The unlink undo record shares the prefix block with the header. An
         // armed one names pages of the old body, so it goes with them.
         for (i, body) in self.bodies.iter().enumerate() {
@@ -1822,100 +2009,672 @@ impl ScriptHashTable {
         order.sort_by(|&a, &b| recs[a].scripthash.cmp(&recs[b].scripthash));
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
-        let mut heads: HashMap<[u8; 32], ShHeadValue> = HashMap::new();
-        let mut home: HashMap<[u8; 32], KeyHome> = HashMap::new();
-
         let t_seed = std::time::Instant::now();
-        // Cold body (no prior creates): skip N head gets — empty table probes.
-        if self.entry_count() > 0 || !self.head_is_empty() {
-            let mut keys: Vec<[u8; 32]> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for &i in &order {
-                let rec = &recs[i];
-                if rec.create_tx_fk.is_null() {
-                    continue;
-                }
-                if seen.insert(rec.scripthash) {
-                    keys.push(rec.scripthash);
-                }
-            }
-            keys.sort_unstable();
-            for key in keys {
-                if let Some((v, kh)) = self.locate_head(&key)? {
-                    heads.insert(key, v);
-                    home.insert(key, KeyHome::from(kh));
-                } else {
-                    home.insert(key, KeyHome::Absent);
-                }
-            }
-        }
+        let mut heads = self.seed_batch_heads(recs, &order)?;
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
-        let t_body = std::time::Instant::now();
-        let mut head_final: Vec<([u8; 32], ShHeadValue, KeyHome)> = Vec::new();
         let mut written = 0usize;
-
         let mut i = 0usize;
         while i < order.len() {
-            let rec0 = &recs[order[i]];
-            if rec0.create_tx_fk.is_null() {
-                i += 1;
-                continue;
-            }
-            let key = rec0.scripthash;
-            let mut fk_vals: Vec<u64> = Vec::new();
-            while i < order.len() {
-                let rec = &recs[order[i]];
-                if rec.scripthash != key {
-                    break;
+            if self.ingest_room() == 0 {
+                let before = self.ovf_seal_stamp();
+                self.seal_ingest()?;
+                if self.ovf_seal_stamp() != before {
+                    retarget_ingest_after_seal(&mut heads);
                 }
-                if !rec.create_tx_fk.is_null() {
-                    fk_vals.push(rec.create_tx_fk.0);
+                continue;
+            }
+            let room = self.ingest_room();
+            let t_body = std::time::Instant::now();
+            let mut batch = IngestBatch::default();
+            let mut staged = 0u64;
+            while i < order.len() && staged < room {
+                let key = recs[order[i]].scripthash;
+                let mut fk_vals: Vec<u64> = Vec::new();
+                while i < order.len() && recs[order[i]].scripthash == key {
+                    let fk = recs[order[i]].create_tx_fk;
+                    if !fk.is_null() {
+                        fk_vals.push(fk.0);
+                    }
+                    i += 1;
                 }
-                i += 1;
+                if fk_vals.is_empty() {
+                    continue;
+                }
+                let (cur, kh) = heads
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or((ShHeadValue::Empty, KeyHome::Absent));
+                self.stage_key_creates(&mut batch, key, fk_vals, &cur, kh)?;
+                staged = staged.saturating_add(1);
             }
-            if fk_vals.is_empty() {
+            timing.body_ns = timing
+                .body_ns
+                .saturating_add(t_body.elapsed().as_nanos() as u64);
+            if batch.head_final.is_empty() {
                 continue;
             }
-            fk_vals.sort_unstable();
-            fk_vals.dedup();
-
-            let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
-            let kh_early = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let max = self.last_create_fk_on(self.body_for(&key, kh_early), &cur)?;
-            let max_u = max.map(|f| f.0).unwrap_or(0);
-            let add: Vec<Fk> = fk_vals
-                .into_iter()
-                .filter(|&fk| max.is_none() || fk > max_u)
-                .map(Fk)
-                .collect();
-            if add.is_empty() {
-                continue;
-            }
-            written += add.len();
-            let kh = home.get(&key).copied().unwrap_or(KeyHome::Absent);
-            let body = self.body_for(&key, kh);
-            let alloc_mu = self.alloc_for(&key, kh);
-            let mut alloc = alloc_mu.lock().unwrap();
-            let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
-            drop(alloc);
-            head_final.push((key, new_val, kh));
-        }
-
-        timing.body_ns = t_body.elapsed().as_nanos() as u64;
-
-        if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
-            // Slabs and free-list links durable, then alloc headers, then the
-            // ingest head that names those slabs.
-            self.sync_bodies_for(&head_final)?;
-            self.write_alloc_headers_for(&head_final)?;
-            self.sync_bodies_for(&head_final)?;
-            self.apply_head_upserts(&head_final, flush_each)?;
-            timing.head_ns = t_head.elapsed().as_nanos() as u64;
+            let before = self.ovf_seal_stamp();
+            self.commit_staged_batch(&batch, flush_each)?;
+            if self.ovf_seal_stamp() != before {
+                retarget_ingest_after_seal(&mut heads);
+            }
+            timing.head_ns = timing
+                .head_ns
+                .saturating_add(t_head.elapsed().as_nanos() as u64);
+            written = written.saturating_add(batch.written);
         }
         Ok((written, timing))
+    }
+
+    /// Locate the durable head and home of every key the batch names. A key
+    /// not in the map is absent; a cold body (no prior creates) skips the gets.
+    fn seed_batch_heads(
+        &self,
+        recs: &[ScriptHashRecord],
+        order: &[usize],
+    ) -> Result<HashMap<[u8; 32], (ShHeadValue, KeyHome)>, StoreError> {
+        let mut heads = HashMap::new();
+        if self.entry_count() == 0 && self.head_is_empty() {
+            return Ok(heads);
+        }
+        let mut keys: Vec<[u8; 32]> = order
+            .iter()
+            .map(|&i| &recs[i])
+            .filter(|rec| !rec.create_tx_fk.is_null())
+            .map(|rec| rec.scripthash)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            if let Some((v, kh)) = self.locate_head(&key)? {
+                heads.insert(key, (v, KeyHome::from(kh)));
+            }
+        }
+        Ok(heads)
+    }
+
+    /// Pack one key's creates past its durable max into its body's stage.
+    /// Nothing is written to the body here.
+    fn stage_key_creates<'a>(
+        &'a self,
+        batch: &mut IngestBatch<'a>,
+        key: [u8; 32],
+        mut fk_vals: Vec<u64>,
+        cur: &ShHeadValue,
+        kh: KeyHome,
+    ) -> Result<(), StoreError> {
+        fk_vals.sort_unstable();
+        fk_vals.dedup();
+        let body = self.body_for(&key, kh);
+        let max = self.last_create_fk_on(body, cur)?;
+        let max_u = max.map(|f| f.0).unwrap_or(0);
+        let add: Vec<Fk> = fk_vals
+            .into_iter()
+            .filter(|&fk| max.is_none() || fk > max_u)
+            .map(Fk)
+            .collect();
+        if add.is_empty() {
+            return Ok(());
+        }
+        batch.written += add.len();
+        let alloc_mu = self.alloc_for(&key, kh);
+        let stage = batch
+            .stages
+            .entry(std::ptr::from_ref(body) as usize)
+            .or_insert_with(|| BodyStage {
+                body,
+                alloc: alloc_mu,
+                slabs: StagedSlabs::default(),
+                popped: false,
+            });
+        let frees_before = stage.slabs.frees.len();
+        let mut alloc = alloc_mu.lock().unwrap();
+        let free_before = alloc.free_head;
+        let new_val = self.append_sorted_creates(body, &mut alloc, cur, &add, &mut stage.slabs)?;
+        stage.popped |= alloc.free_head != free_before;
+        drop(alloc);
+        if stage.slabs.frees.len() > frees_before {
+            note_moved_head(self, &mut batch.moved_heads, &key, kh);
+        }
+        batch.head_final.push((key, new_val, kh));
+        Ok(())
+    }
+
+    /// Land a packed batch: payloads, alloc headers, heads, then the frees.
+    ///
+    /// A payload on a popped offset waits for a durable header that no longer
+    /// names it. A body that popped nothing writes its payloads before the
+    /// first barrier.
+    fn commit_staged_batch(
+        &self,
+        batch: &IngestBatch<'_>,
+        flush_each: bool,
+    ) -> Result<(), StoreError> {
+        let _hold = page_guard::hold_marks();
+        let armed = self.arm_staged_batch(batch)?;
+        self.land_staged_batch(batch, flush_each)?;
+        self.clear_armed_sh(&armed)?;
+        // Seal only after the mark is gone. A sealed file built while the
+        // mark is armed would name body bytes the restore rolls back.
+        self.maybe_seal_ingest()
+    }
+
+    fn land_staged_batch(
+        &self,
+        batch: &IngestBatch<'_>,
+        flush_each: bool,
+    ) -> Result<(), StoreError> {
+        for stage in batch.stages.values() {
+            publish_bump(stage.body, &stage.alloc.lock().unwrap())?;
+        }
+        for stage in batch.stages.values().filter(|s| !s.popped) {
+            stage.slabs.write_to(stage.body)?;
+        }
+        self.sync_bodies_for(&batch.head_final)?;
+        self.write_alloc_headers_for(&batch.head_final)?;
+        self.sync_bodies_for(&batch.head_final)?;
+        for stage in batch.stages.values().filter(|s| s.popped) {
+            stage.slabs.write_to(stage.body)?;
+            stage.body.sync_data_only()?;
+        }
+        self.apply_head_upserts(&batch.head_final, flush_each)?;
+        self.free_replaced_slabs(&batch.stages, &batch.moved_heads)
+    }
+
+    fn arm_staged_batch(&self, batch: &IngestBatch<'_>) -> Result<ArmedSh, StoreError> {
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        if batch
+            .head_final
+            .iter()
+            .any(|(_, _, kh)| matches!(kh, KeyHome::Ingest | KeyHome::Absent))
+        {
+            self.ensure_ingest()?;
+        }
+        for stage in batch.stages.values() {
+            self.image_body_stage(&mut pages, stage)?;
+        }
+        let heads: Vec<(&[u8; 32], KeyHome)> = batch
+            .head_final
+            .iter()
+            .map(|(key, _, kh)| (key, *kh))
+            .collect();
+        self.image_head_keys(&mut pages, &heads)?;
+        self.publish_sh_pages(&pages)
+    }
+
+    fn image_body_stage(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        stage: &BodyStage<'_>,
+    ) -> Result<(), StoreError> {
+        let mark = body_sh_mark(&self.store_dir, stage.body)?;
+        let rel = page_guard::guard_rel_name(&self.store_dir, stage.body.path())?;
+        image_range(
+            pages,
+            &mark,
+            &rel,
+            stage.body.path(),
+            &stage.body.read_file,
+            0,
+            1,
+        )?;
+        let mut at = 0usize;
+        for &(off, len) in &stage.slabs.writes {
+            image_range(
+                pages,
+                &mark,
+                &rel,
+                stage.body.path(),
+                &stage.body.read_file,
+                off,
+                len as u64,
+            )?;
+            at = at.saturating_add(len);
+        }
+        let _ = at;
+        for &(_, off) in stage.slabs.frees.iter().chain(&stage.slabs.gaps) {
+            image_range(
+                pages,
+                &mark,
+                &rel,
+                stage.body.path(),
+                &stage.body.read_file,
+                off,
+                8,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Image every head this batch will write. Ingest keys, and main or sealed
+    /// keys that fall through to ingest, are one probe pass: a second key that
+    /// loses the first empty slot lands on a later page.
+    fn image_head_keys(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[(&[u8; 32], KeyHome)],
+    ) -> Result<(), StoreError> {
+        let mut ingest = Vec::with_capacity(keys.len());
+        for &(key, kh) in keys {
+            let resident = match kh {
+                KeyHome::Main => self.image_main_resident(pages, key)?,
+                KeyHome::SealedOvf => self.image_sealed_resident(pages, key)?,
+                KeyHome::Ingest | KeyHome::Absent => false,
+            };
+            if !resident {
+                ingest.push(*key);
+            }
+        }
+        self.image_ingest_keys(pages, &ingest)
+    }
+
+    fn image_main_resident(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        key: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(key);
+        let si = self.shard_index(key);
+        let Some(slot) = self.sorted_main.get(si) else {
+            return Ok(false);
+        };
+        let g = slot.read().unwrap();
+        let Some(h) = g.as_ref() else {
+            return Ok(false);
+        };
+        let Some(off) = h.value_word_offset(&hk)? else {
+            return Ok(false);
+        };
+        let vp = crate::scripthash_mphf::val_path(&h.base);
+        let rel = page_guard::guard_rel_name(&self.store_dir, &vp)?;
+        let mark = page_guard::sh_mark(&format!("{si:02x}"));
+        image_range(pages, &mark, &rel, &vp, &h.val_file, off, 8)?;
+        Ok(true)
+    }
+
+    fn image_sealed_resident(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        key: &[u8; 32],
+    ) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(key);
+        let mark = page_guard::sh_mark("ovf");
+        {
+            let g = self.sealed_ovf.lock().unwrap();
+            for h in g.iter().rev() {
+                if let Some(off) = h.value_word_offset(&hk)? {
+                    let rel = page_guard::guard_rel_name(&self.store_dir, h.path())?;
+                    image_range(pages, &mark, &rel, h.path(), &h.file, off, 8)?;
+                    return Ok(true);
+                }
+            }
+        }
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            if let Some(off) = l1.head.value_word_offset(&hk)? {
+                let vp = crate::scripthash_mphf::val_path(&l1.head.base);
+                let rel = page_guard::guard_rel_name(&self.store_dir, &vp)?;
+                image_range(pages, &mark, &rel, &vp, &l1.head.val_file, off, 8)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn rearm_ingest_pages(&self, keys: &[[u8; 32]]) -> Result<(), StoreError> {
+        let mark = self.store_dir.join(page_guard::sh_mark("ovf"));
+        if !mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
+            return Ok(());
+        }
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        self.image_ingest_keys(&mut pages, keys)?;
+        self.publish_sh_pages(&pages).map(|_| ())
+    }
+
+    /// One image for the whole ingest batch. Empty tables bulk-fill slots.
+    /// A live table flushes each dirty chunk, including a key displaced past
+    /// its first empty slot.
+    fn image_ingest_keys(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[[u8; 32]],
+    ) -> Result<(), StoreError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.ensure_ingest()?;
+        let empty = self
+            .ingest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| h.is_known_empty());
+        if empty {
+            self.image_empty_ingest(pages, keys)
+        } else {
+            self.image_live_ingest(pages, keys)
+        }
+    }
+
+    /// An empty ingest table places later keys past the first probe. Image
+    /// every slot this batch will write, not only each key's first empty slot.
+    fn image_empty_ingest(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[[u8; 32]],
+    ) -> Result<(), StoreError> {
+        let g = self.ingest.lock().unwrap();
+        let Some(h) = g.as_ref() else {
+            return Ok(());
+        };
+        let slots = h.state.lock().unwrap().slots;
+        let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
+        let path = h.file.path().to_path_buf();
+        let keyed: Vec<_> = keys.iter().map(ScriptHashHead::to_key).collect();
+        let assigned = ScriptHashHead::assign_empty_slots(slots, &keyed)?;
+        let mark = page_guard::sh_mark("ovf");
+        let mut seen = BTreeSet::new();
+        for slot in assigned {
+            if !seen.insert(slot) {
+                continue;
+            }
+            image_range(
+                pages,
+                &mark,
+                &rel,
+                &path,
+                &h.file.read_file,
+                ScriptHashHead::slot_file_off(slot),
+                crate::scripthash_layout::SH_HEAD_SLOT_SIZE as u64,
+            )?;
+        }
+        self.image_occ_sidecar(pages, &mark, &path)
+    }
+
+    /// A non-empty ingest probe-inserts the batch in hash-slot order. Image
+    /// every chunk that insert will write, including a key displaced past
+    /// its first empty slot.
+    fn image_live_ingest(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        keys: &[[u8; 32]],
+    ) -> Result<(), StoreError> {
+        let (rel, path, spans) = {
+            let g = self.ingest.lock().unwrap();
+            let Some(h) = g.as_ref() else {
+                return Ok(());
+            };
+            let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
+            let path = h.file.path().to_path_buf();
+            let spans = h.upsert_write_spans(keys)?;
+            (rel, path, spans)
+        };
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|e| StoreError::io(&path, e))?;
+        let mark = page_guard::sh_mark("ovf");
+        for (off, len) in spans {
+            image_range(pages, &mark, &rel, &path, &file, off, len)?;
+        }
+        self.image_occ_sidecar(pages, &mark, &path)
+    }
+
+    /// Page 0 of `{head}.occ`. Restore writes only the bytes the sidecar has.
+    fn image_occ_sidecar(
+        &self,
+        pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+        mark: &str,
+        head_path: &Path,
+    ) -> Result<(), StoreError> {
+        let occ = crate::scripthash_head::occ_sidecar_path(head_path);
+        let rel = page_guard::guard_rel_name(&self.store_dir, &occ)?;
+        let key = (mark.to_string(), rel, 0);
+        if pages.contains_key(&key) {
+            return Ok(());
+        }
+        let image = match std::fs::File::open(&occ) {
+            Ok(file) => page_guard::read_live_page(&occ, &file, 0)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => [0u8; PAGE as usize],
+            Err(e) => return Err(StoreError::io(&occ, e)),
+        };
+        pages.insert(key, image);
+        Ok(())
+    }
+
+    /// `prev` is an earlier arm this write still lands under. A page its mark
+    /// still holds keeps that pre-image. A page a later clear dropped is
+    /// imaged again, and the result names both arms' files.
+    pub(super) fn arm_suffix_pages(
+        &self,
+        body: &TableFile,
+        scripthash: &[u8; 32],
+        home: LocatedHome,
+        offs: &[u64],
+        image_head: bool,
+        prev: Option<&ArmedSh>,
+    ) -> Result<ArmedSh, StoreError> {
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        let mark = body_sh_mark(&self.store_dir, body)?;
+        let rel = page_guard::guard_rel_name(&self.store_dir, body.path())?;
+        for &off in offs {
+            image_range(
+                &mut pages,
+                &mark,
+                &rel,
+                body.path(),
+                &body.read_file,
+                off,
+                1,
+            )?;
+        }
+        if image_head {
+            self.image_head_keys(&mut pages, &[(scripthash, KeyHome::from(home))])?;
+        }
+        let Some(prev) = prev else {
+            return self.publish_sh_pages(&pages);
+        };
+        let mut held: BTreeMap<String, HashSet<(String, u64)>> = BTreeMap::new();
+        for (mark, _, _) in pages.keys() {
+            if !held.contains_key(mark) {
+                let pages_held = page_guard::armed_group_pages(&self.store_dir.join(mark))?;
+                held.insert(mark.clone(), pages_held);
+            }
+        }
+        pages.retain(|(mark, rel, off), _| {
+            !held
+                .get(mark)
+                .is_some_and(|h| h.contains(&(rel.clone(), *off)))
+        });
+        let mut armed = self.publish_sh_pages(&pages)?;
+        for (mark, rels) in &prev.files {
+            armed
+                .files
+                .entry(mark.clone())
+                .or_default()
+                .extend(rels.iter().cloned());
+        }
+        Ok(armed)
+    }
+
+    pub(super) fn arm_unlink_rewrites(
+        &self,
+        batch: &unlink::UnlinkBatch,
+    ) -> Result<ArmedSh, StoreError> {
+        let mut pages: BTreeMap<(String, String, u64), [u8; PAGE as usize]> = BTreeMap::new();
+        if batch
+            .rewrites
+            .iter()
+            .any(|j| matches!(j.home, LocatedHome::Ingest | LocatedHome::Main))
+        {
+            self.ensure_ingest()?;
+        }
+        let mut heads = Vec::with_capacity(batch.rewrites.len());
+        for job in &batch.rewrites {
+            let kh = KeyHome::from(job.home);
+            let body = self.body_for(&job.scripthash, kh);
+            let mark = body_sh_mark(&self.store_dir, body)?;
+            let rel = page_guard::guard_rel_name(&self.store_dir, body.path())?;
+            image_range(&mut pages, &mark, &rel, body.path(), &body.read_file, 0, 1)?;
+            let mut at = 0usize;
+            for &(off, len) in &job.staged.writes {
+                image_range(
+                    &mut pages,
+                    &mark,
+                    &rel,
+                    body.path(),
+                    &body.read_file,
+                    off,
+                    len as u64,
+                )?;
+                at = at.saturating_add(len);
+            }
+            let _ = at;
+            for &(_, off) in &job.staged.gaps {
+                image_range(
+                    &mut pages,
+                    &mark,
+                    &rel,
+                    body.path(),
+                    &body.read_file,
+                    off,
+                    8,
+                )?;
+            }
+            if unlink::frees_old_pages(&job.old) {
+                match &job.old {
+                    ShHeadValue::Slab { off, .. } => {
+                        image_range(
+                            &mut pages,
+                            &mark,
+                            &rel,
+                            body.path(),
+                            &body.read_file,
+                            *off,
+                            8,
+                        )?;
+                    }
+                    ShHeadValue::Extent { last_page } => {
+                        let first = paged_first_from_last(body, *last_page)?;
+                        follow_page_chain(body, first, SH_PAGE_CHAIN_MAX, |body, off| {
+                            image_range(
+                                &mut pages,
+                                &mark,
+                                &rel,
+                                body.path(),
+                                &body.read_file,
+                                off,
+                                SH_PAGE_SIZE as u64,
+                            )
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+            heads.push((&job.scripthash, kh));
+        }
+        self.image_head_keys(&mut pages, &heads)?;
+        self.publish_sh_pages(&pages)
+    }
+
+    fn publish_sh_pages(
+        &self,
+        pages: &BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
+    ) -> Result<ArmedSh, StoreError> {
+        let mut by_mark: BTreeMap<String, Vec<(String, u64, [u8; PAGE as usize])>> =
+            BTreeMap::new();
+        let mut armed = ArmedSh::default();
+        for ((mark, rel, off), image) in pages {
+            by_mark
+                .entry(mark.clone())
+                .or_default()
+                .push((rel.clone(), *off, *image));
+            armed
+                .files
+                .entry(mark.clone())
+                .or_default()
+                .insert(rel.clone());
+        }
+        for (mark, recs) in &by_mark {
+            let refs: Vec<(&str, u64, &[u8])> = recs
+                .iter()
+                .map(|(rel, off, image)| (rel.as_str(), *off, image.as_slice()))
+                .collect();
+            page_guard::arm_store_group(&self.store_dir, mark, &refs)?;
+        }
+        Ok(armed)
+    }
+
+    pub(super) fn clear_armed_sh(&self, armed: &ArmedSh) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if take_fail_sh_guard_clear() {
+            return Err(StoreError::Corrupt("scripthash page guard clear failed"));
+        }
+        use std::fs::OpenOptions;
+        for (mark, rels) in &armed.files {
+            let mark_path = self.store_dir.join(mark);
+            let mut opened: Vec<(File, PathBuf)> = Vec::new();
+            for rel in rels {
+                let path = self.store_dir.join(rel);
+                match OpenOptions::new().read(true).write(true).open(&path) {
+                    Ok(f) => opened.push((f, path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(StoreError::io(&path, e)),
+                }
+            }
+            let refs: Vec<(&File, &Path)> = opened.iter().map(|(f, p)| (f, p.as_path())).collect();
+            page_guard::clear_page_guard_rel(&mark_path, &self.store_dir, &refs)?;
+        }
+        Ok(())
+    }
+
+    /// Leave the next scripthash page-guard clear behind.
+    #[cfg(debug_assertions)]
+    pub fn fail_next_sh_guard_clear(&self) {
+        FAIL_CLEAR_SH_GUARD.with(|c| c.set(true));
+    }
+
+    /// Link the slabs a class change replaced once the heads that named them
+    /// are durable: the links, a body barrier, then the header that names them.
+    fn free_replaced_slabs(
+        &self,
+        stages: &BTreeMap<usize, BodyStage<'_>>,
+        moved_heads: &[MovedHead],
+    ) -> Result<(), StoreError> {
+        for head in moved_heads {
+            match head {
+                MovedHead::MainShard(si) => {
+                    if let Some(h) = self.sorted_main[*si].read().unwrap().as_ref() {
+                        h.flush()?;
+                    }
+                }
+                MovedHead::SealedOvf => {
+                    for h in self.sealed_ovf.lock().unwrap().iter() {
+                        h.flush()?;
+                    }
+                    if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                        l1.head.flush()?;
+                    }
+                }
+            }
+        }
+        for stage in stages
+            .values()
+            .filter(|s| !s.slabs.frees.is_empty() || !s.slabs.gaps.is_empty())
+        {
+            let mut alloc = stage.alloc.lock().unwrap();
+            for &(class, off) in stage.slabs.frees.iter().chain(&stage.slabs.gaps) {
+                self.free_slab(stage.body, &mut alloc, class, off)?;
+            }
+            stage.body.sync_data_only()?;
+            write_alloc_header(stage.body, &alloc)?;
+        }
+        Ok(())
     }
 
     /// Route head upserts without get-then-insert:
@@ -2045,6 +2804,13 @@ impl ScriptHashTable {
         Ok(false)
     }
 
+    fn ovf_seal_stamp(&self) -> (usize, bool) {
+        (
+            self.sealed_ovf.lock().unwrap().len(),
+            self.ovf_l1.lock().unwrap().is_some(),
+        )
+    }
+
     fn ingest_room(&self) -> u64 {
         let g = self.ingest.lock().unwrap();
         match g.as_ref() {
@@ -2068,6 +2834,19 @@ impl ScriptHashTable {
 
     #[doc(hidden)]
     pub fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+        if ups.is_empty() {
+            return Ok(());
+        }
+        if self.sh_mark_present()? {
+            self.ensure_ingest()?;
+            let keys: Vec<[u8; 32]> = ups.iter().map(|(k, _)| *k).collect();
+            self.rearm_ingest_pages(&keys)?;
+            let g = self.ingest.lock().unwrap();
+            let Some(h) = g.as_ref() else {
+                return Err(StoreError::Corrupt("scripthash: ingest missing"));
+            };
+            return h.insert_many(ups);
+        }
         let mut i = 0usize;
         while i < ups.len() {
             let room = self.ingest_room();
@@ -2076,6 +2855,8 @@ impl ScriptHashTable {
                 continue;
             }
             self.ensure_ingest()?;
+            let rest: Vec<[u8; 32]> = ups[i..].iter().map(|(k, _)| *k).collect();
+            self.rearm_ingest_pages(&rest)?;
             let n = (room as usize).min(ups.len() - i);
             {
                 let g = self.ingest.lock().unwrap();
@@ -2088,6 +2869,26 @@ impl ScriptHashTable {
             self.maybe_seal_ingest()?;
         }
         Ok(())
+    }
+
+    fn sh_mark_present(&self) -> Result<bool, StoreError> {
+        let guard = self.store_dir.join("guard");
+        let rd = match std::fs::read_dir(&guard) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(StoreError::io(&guard, e)),
+        };
+        for ent in rd {
+            let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+            let name = ent.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if page_guard::published_sh_mark(name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[doc(hidden)]
@@ -2104,6 +2905,14 @@ impl ScriptHashTable {
 
     #[doc(hidden)]
     pub fn seal_ingest(&self) -> Result<(), StoreError> {
+        // A commit that failed before its clear left body and ingest images
+        // armed. A seal would drop only the ingest image, and open could then
+        // roll back a slab the sealed head names. Open restores first.
+        if self.sh_mark_present()? {
+            return Err(StoreError::Rejected(
+                "scripthash: a commit guard is still armed; restart to restore it before a seal",
+            ));
+        }
         let mut recs = {
             let g = self.ingest.lock().unwrap();
             let Some(g) = g.as_ref() else {
@@ -2117,6 +2926,12 @@ impl ScriptHashTable {
             recs
         };
         if recs.is_empty() {
+            // Nothing to move. An empty table can still report no room when
+            // its occupancy is unknown, so retire it instead of returning
+            // with that table in place. The next insert creates a new one.
+            let p = ingest_path(&self.store_dir);
+            *self.ingest.lock().unwrap() = None;
+            crate::scripthash_head::remove_ingest_files(&p)?;
             return Ok(());
         }
         recs.sort_unstable_by_key(|a| a.0);
@@ -2128,6 +2943,12 @@ impl ScriptHashTable {
             ));
         }
         let sealed = SortedHead::write(&path, &recs)?;
+        // Until the drop returns, ingest stays the only copy of these keys.
+        if let Err(e) = self.drop_ingest_rel() {
+            drop(sealed);
+            crate::scripthash_sorted_head::remove_sorted_head_files(&path)?;
+            return Err(e);
+        }
         self.sealed_ovf.lock().unwrap().push(sealed);
         let p = ingest_path(&self.store_dir);
         // Drop the fd before unlink so the name can go away on Windows.
@@ -2135,6 +2956,20 @@ impl ScriptHashTable {
         crate::scripthash_head::remove_ingest_files(&p)?;
         self.maybe_compact_sealed_ovf()?;
         Ok(())
+    }
+
+    fn drop_ingest_rel(&self) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if FAIL_INGEST_REL_DROP.with(|c| c.replace(false)) {
+            return Err(StoreError::Corrupt("scripthash ingest name drop failed"));
+        }
+        page_guard::drop_sh_rel(&self.store_dir, "scripthash.ovf/ingest")
+    }
+
+    /// Fail the next seal's drop of the ingest name from the sh marks.
+    #[cfg(debug_assertions)]
+    pub fn fail_next_ingest_rel_drop(&self) {
+        FAIL_INGEST_REL_DROP.with(|c| c.set(true));
     }
 
     #[doc(hidden)]
@@ -2271,9 +3106,9 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         live: &[Fk],
-    ) -> Result<ShHeadValue, StoreError> {
+    ) -> Result<(ShHeadValue, StagedSlabs, bool), StoreError> {
         if live.is_empty() {
-            return Ok(ShHeadValue::Empty);
+            return Ok((ShHeadValue::Empty, StagedSlabs::default(), false));
         }
         for w in live.windows(2) {
             if w[1].0 <= w[0].0 {
@@ -2282,7 +3117,11 @@ impl ScriptHashTable {
                 ));
             }
         }
-        self.pack_entries(body, alloc, live, false)
+        let mut staged = StagedSlabs::default();
+        let free_before = alloc.free_head;
+        let val = self.pack_entries(body, alloc, live, false, &mut staged)?;
+        let popped = alloc.free_head != free_before;
+        Ok((val, staged, popped))
     }
 
     /// Append strictly increasing `new_ents` (all already `> durable max`) without
@@ -2294,6 +3133,7 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         old: &ShHeadValue,
         new_ents: &[Fk],
+        staged: &mut StagedSlabs,
     ) -> Result<ShHeadValue, StoreError> {
         if new_ents.is_empty() {
             return Ok(old.clone());
@@ -2308,11 +3148,11 @@ impl ScriptHashTable {
         alloc.live_count = alloc.live_count.saturating_add(new_ents.len() as u64);
 
         match old {
-            ShHeadValue::Empty => self.pack_entries(body, alloc, new_ents, true),
+            ShHeadValue::Empty => self.pack_entries(body, alloc, new_ents, true, staged),
             ShHeadValue::Inline { .. } => {
                 let mut live = old.inline_entries().to_vec();
                 live.extend_from_slice(new_ents);
-                self.pack_entries(body, alloc, &live, true)
+                self.pack_entries(body, alloc, &live, true, staged)
             }
             ShHeadValue::Slab { class, off, .. } => {
                 let mut live = self.read_slab(body, *class, *off)?;
@@ -2324,8 +3164,14 @@ impl ScriptHashTable {
                     }
                 }
                 live.extend_from_slice(new_ents);
-                let new_val =
-                    self.pack_entries_reuse(body, alloc, &live, true, Some((*class, *off)))?;
+                let new_val = self.pack_entries_reuse(
+                    body,
+                    alloc,
+                    &live,
+                    true,
+                    Some((*class, *off)),
+                    staged,
+                )?;
                 if !matches!(
                     &new_val,
                     ShHeadValue::Slab {
@@ -2334,12 +3180,12 @@ impl ScriptHashTable {
                         ..
                     } if *nc == *class && *no == *off
                 ) {
-                    self.free_slab(body, alloc, *class, *off)?;
+                    staged.free(*class, *off);
                 }
                 Ok(new_val)
             }
             ShHeadValue::Extent { last_page } => {
-                let last = self.append_fks_to_pages(body, alloc, *last_page, new_ents)?;
+                let last = self.append_fks_to_pages(body, alloc, *last_page, new_ents, staged)?;
                 Ok(ShHeadValue::extent(last))
             }
         }
@@ -2354,8 +3200,9 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         live: &[Fk],
         slack: bool,
+        staged: &mut StagedSlabs,
     ) -> Result<ShHeadValue, StoreError> {
-        self.pack_entries_reuse(body, alloc, live, slack, None)
+        self.pack_entries_reuse(body, alloc, live, slack, None, staged)
     }
 
     #[doc(hidden)]
@@ -2366,6 +3213,7 @@ impl ScriptHashTable {
         live: &[Fk],
         slack: bool,
         reuse: Option<(u8, u64)>,
+        staged: &mut StagedSlabs,
     ) -> Result<ShHeadValue, StoreError> {
         let n = live.len() as u32;
         if n == 0 {
@@ -2375,7 +3223,7 @@ impl ScriptHashTable {
             return Ok(ShHeadValue::inline_one(live[0]));
         }
         if n >= SH_MEGAKEY_MIN_FKS {
-            let last = self.write_new_page_chain(body, alloc, live)?;
+            let last = self.write_new_page_chain(body, alloc, live, staged)?;
             return Ok(ShHeadValue::extent(last));
         }
         let mut raw = [0u64; SH_MEGAKEY_MIN_FKS as usize - 1];
@@ -2387,7 +3235,7 @@ impl ScriptHashTable {
         let class = match Self::slab_class_fitting(n, packed_len, slack) {
             Some(c) => c,
             None => {
-                let last = self.write_new_page_chain(body, alloc, live)?;
+                let last = self.write_new_page_chain(body, alloc, live, staged)?;
                 return Ok(ShHeadValue::extent(last));
             }
         };
@@ -2401,14 +3249,14 @@ impl ScriptHashTable {
             if rc == class {
                 ro
             } else {
-                self.alloc_slab(body, alloc, class)?
+                self.alloc_slab(body, alloc, class, &mut staged.gaps)?
             }
         } else {
-            self.alloc_slab(body, alloc, class)?
+            self.alloc_slab(body, alloc, class, &mut staged.gaps)?
         };
         let mut buf = [0u8; 2048];
         buf[..packed_len].copy_from_slice(&payload[..packed_len]);
-        body.write_at(off, &buf[..cap])?;
+        staged.write(off, &buf[..cap]);
         Ok(ShHeadValue::slab(class, n as u16, off))
     }
 
@@ -2444,13 +3292,14 @@ impl ScriptHashTable {
         body: &TableFile,
         alloc: &mut AllocState,
         live: &[Fk],
+        staged: &mut StagedSlabs,
     ) -> Result<u64, StoreError> {
         if live.is_empty() {
             return Err(StoreError::Corrupt("scripthash empty page chain"));
         }
         let chunks = sh_page_chunk_ranges(live)?;
         let n_pages = chunks.len();
-        let base = self.alloc_extent(body, alloc, n_pages)?;
+        let base = self.alloc_extent(body, alloc, n_pages, &mut staged.gaps)?;
         let mut page = [0u8; SH_PAGE_SIZE];
         for (pi, &(start, end)) in chunks.iter().enumerate() {
             let off = base.saturating_add((pi as u64).saturating_mul(SH_PAGE_SIZE as u64));
@@ -2462,7 +3311,7 @@ impl ScriptHashTable {
                 let next = off.saturating_add(SH_PAGE_SIZE as u64);
                 sh_page_pack_fks(&mut page, &raw, next)?;
             }
-            body.write_at(off, &page)?;
+            staged.write(off, &page);
         }
         Ok(base.saturating_add(((n_pages - 1) as u64).saturating_mul(SH_PAGE_SIZE as u64)))
     }
@@ -2479,6 +3328,7 @@ impl ScriptHashTable {
         alloc: &mut AllocState,
         last_page: u64,
         tail: &[Fk],
+        staged: &mut StagedSlabs,
     ) -> Result<u64, StoreError> {
         if tail.is_empty() {
             return Ok(last_page);
@@ -2503,9 +3353,9 @@ impl ScriptHashTable {
         }
         for fk in tail {
             if !sh_page_try_append(&mut page, *fk)? {
-                let new_off = self.alloc_page(body, alloc)?;
+                let new_off = self.alloc_page(body, alloc, &mut staged.gaps)?;
                 sh_page_set_next(&mut page, new_off)?;
-                body.write_at(last, &page)?;
+                staged.write(last, &page);
                 let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
                 n = if glued { n.saturating_add(1) } else { n };
                 sh_page_pack_extent_last_fks(&mut page, &[fk.0], base, n, 0)?;
@@ -2521,21 +3371,30 @@ impl ScriptHashTable {
         if creates > 0 {
             crate::scripthash_pages::sh_page_set_extent_creates(&mut page, creates);
         }
-        body.write_at(last, &page)?;
+        staged.write(last, &page);
         Ok(last)
     }
 
     #[doc(hidden)]
-    pub fn alloc_page(&self, body: &TableFile, alloc: &mut AllocState) -> Result<u64, StoreError> {
-        self.alloc_slab(body, alloc, SH_PAGE_SLAB_CLASS)
+    pub fn alloc_page(
+        &self,
+        body: &TableFile,
+        alloc: &mut AllocState,
+        gaps: &mut Vec<(u8, u64)>,
+    ) -> Result<u64, StoreError> {
+        self.alloc_slab(body, alloc, SH_PAGE_SLAB_CLASS, gaps)
     }
 
     #[doc(hidden)]
+    ///
+    /// An alignment gap goes to `gaps`, not the file. The caller pushes those
+    /// links and publishes the bump inside its armed commit.
     pub fn alloc_extent(
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
         n_pages: usize,
+        gaps: &mut Vec<(u8, u64)>,
     ) -> Result<u64, StoreError> {
         if n_pages == 0 {
             return Err(StoreError::Corrupt("scripthash empty extent"));
@@ -2543,25 +3402,26 @@ impl ScriptHashTable {
         let mut off = alloc.bump;
         let aligned = (off + 4095) & !4095;
         if aligned != off {
-            carve_gap_into_freelist(body, &mut alloc.free_head, off, aligned)?;
+            gaps.extend(gap_chunks(off, aligned));
             alloc.bump = aligned;
             off = aligned;
         }
         let need = (n_pages as u64).saturating_mul(SH_PAGE_SIZE as u64);
         alloc.bump = alloc.bump.saturating_add(need);
         body.ensure_capacity(alloc.bump)?;
-        if alloc.bump > body.logical_len() {
-            body.set_logical_len(alloc.bump)?;
-        }
         Ok(off)
     }
 
     #[doc(hidden)]
+    ///
+    /// An alignment gap goes to `gaps`, not the file, as in
+    /// [`Self::alloc_extent`].
     pub fn alloc_slab(
         &self,
         body: &TableFile,
         alloc: &mut AllocState,
         class: u8,
+        gaps: &mut Vec<(u8, u64)>,
     ) -> Result<u64, StoreError> {
         if class > SH_MAX_CLASS {
             return Err(StoreError::Corrupt("scripthash page class overflow"));
@@ -2574,16 +3434,13 @@ impl ScriptHashTable {
         if class >= SH_PAGE_SLAB_CLASS {
             let aligned = (off + 4095) & !4095;
             if aligned != off {
-                carve_gap_into_freelist(body, &mut alloc.free_head, off, aligned)?;
+                gaps.extend(gap_chunks(off, aligned));
                 alloc.bump = aligned;
                 off = aligned;
             }
         }
         alloc.bump = alloc.bump.saturating_add(need);
         body.ensure_capacity(alloc.bump)?;
-        if alloc.bump > body.logical_len() {
-            body.set_logical_len(alloc.bump)?;
-        }
         Ok(off)
     }
 

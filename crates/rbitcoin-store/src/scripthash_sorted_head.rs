@@ -56,6 +56,13 @@ impl SortedHead {
 
     /// Durability barrier (shutdown / SH flush). Data already pwrite'd.
     pub fn flush(&self) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        if crate::io_handle::take_fail_sync(crate::io_handle::IoHandle::from_file(&self.file)) {
+            return Err(StoreError::io(
+                &self.path,
+                std::io::Error::from_raw_os_error(5),
+            ));
+        }
         self.file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))
@@ -273,6 +280,18 @@ pub fn fuse_key16(key: &ShHeadKey) -> u64 {
     let mut pad = [0u8; 32];
     pad[..SH_HEAD_KEY_LEN].copy_from_slice(key);
     fuse_key_from_mixed(&pad)
+}
+
+/// Remove a segment [`SortedHead::write`] left unpublished: data, index, fuse.
+pub(crate) fn remove_sorted_head_files(data: &Path) -> Result<(), StoreError> {
+    for path in [data.to_path_buf(), idx_path(data), fuse_path(data)] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+    }
+    Ok(())
 }
 
 #[doc(hidden)]

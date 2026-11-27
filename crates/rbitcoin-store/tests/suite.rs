@@ -38,6 +38,9 @@ mod scripthash_head;
 mod scripthash_layout;
 mod scripthash_materialize;
 mod scripthash_mphf;
+// Every test here fails a guard clear through a debug-only hook.
+#[cfg(debug_assertions)]
+mod scripthash_page_guard;
 mod scripthash_pages;
 mod scripthash_slabs;
 mod scripthash_sorted_head;

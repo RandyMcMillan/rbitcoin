@@ -1,7 +1,8 @@
 //! A mark of whole 4 KiB images, and an append that stays off those pages.
 use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
 use rbitcoin_store::page_guard::{
-    append_past_end, arm_page_guard_group, clear_page_guard, restore_page_guard_group,
+    append_past_end, arm_page_guard_group, clear_page_guard, clear_page_guard_rel, clear_sh_marks,
+    guard_rel_name, restore_page_guard_group, restore_page_guard_group_fit,
 };
 use rbitcoin_store::testutil::TempDir;
 use rbitcoin_store::StoreError;
@@ -564,6 +565,154 @@ fn first_arm_syncs_the_store_directory() {
     assert!(mark.is_file());
 }
 
+#[test]
+fn group_restore_accepts_a_two_component_name() {
+    let dir = TempDir::labeled("page-guard-rel").unwrap();
+    let live = dir.path().join("scripthash.body").join("00");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    let mark = dir.path().join("guard/sh-00");
+    write_bytes(&live, 0, &fill(0x11));
+    let next = fill(0xA1);
+    arm_page_guard_group(&mark, &[("scripthash.body/00", 0, next.as_slice())]).unwrap();
+    write_bytes(&live, 0, &fill(0x00));
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&live, 0, PAGE), next);
+}
+
+#[test]
+fn fit_restore_does_not_extend_a_short_file() {
+    let dir = TempDir::labeled("page-guard-fit").unwrap();
+    let live = dir.path().join("scripthash.head.val");
+    let mark = dir.path().join("guard/sh-00");
+    let mut image = fill(0x22);
+    image[8] = 0x33;
+    write_bytes(&live, 0, &image[..16]);
+    arm_page_guard_group(&mark, &[("scripthash.head.val", 0, image.as_slice())]).unwrap();
+    write_bytes(&live, 0, &[0xffu8; 16]);
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), 16);
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), 16);
+    assert_eq!(read_bytes(&live, 0, 16), image[..16]);
+}
+
+#[test]
+fn guard_rel_name_uses_forward_slashes() {
+    let dir = TempDir::labeled("page-guard-slash").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::File::create(&live).unwrap();
+    assert_eq!(
+        guard_rel_name(dir.path(), &live).unwrap(),
+        "scripthash.ovf/ingest"
+    );
+}
+
+#[test]
+fn fit_restore_drops_the_ahead_sidecar() {
+    let dir = TempDir::labeled("page-guard-ahead").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    let ahead = live.parent().unwrap().join("ingest.ahead");
+    let mark = dir.path().join("guard/sh-ovf");
+    let image = fill(0x44);
+    write_bytes(&live, 0, &image);
+    write_bytes(&ahead, 0, b"SHA1ahead");
+    arm_page_guard_group(&mark, &[("scripthash.ovf/ingest", 0, image.as_slice())]).unwrap();
+    write_bytes(&live, 0, &fill(0x00));
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert!(
+        !ahead.exists(),
+        "ahead replay would overwrite the restored page"
+    );
+    assert_eq!(read_bytes(&live, 0, PAGE), image);
+}
+
+/// A crash can leave a truncated `guard/sh-*.tmp`. Dropping a name skips it,
+/// as restore does, and leaves it for reset to remove.
+#[test]
+fn drop_sh_rel_skips_an_unpublished_temp() {
+    let dir = TempDir::labeled("page-guard-drop-tmp").unwrap();
+    std::fs::create_dir_all(dir.path().join("guard")).unwrap();
+    let tmp = dir.path().join("guard/sh-ovf.tmp");
+    std::fs::write(&tmp, b"half a mark").unwrap();
+    rbitcoin_store::page_guard::drop_sh_rel(dir.path(), "scripthash.ovf/ingest").unwrap();
+    assert!(tmp.is_file());
+}
+
+/// A restore whose `.ahead` sidecar is already gone still syncs the
+/// directory that held it. An earlier unlink may have landed without that
+/// sync, and the mark goes away next.
+#[test]
+fn fit_restore_syncs_the_sidecar_directory_when_it_is_gone() {
+    let dir = TempDir::labeled("page-guard-ahead-gone").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    let mark = dir.path().join("guard/sh-ovf");
+    let image = fill(0x45);
+    write_bytes(&live, 0, &image);
+    arm_page_guard_group(&mark, &[("scripthash.ovf/ingest", 0, image.as_slice())]).unwrap();
+    #[cfg(all(unix, debug_assertions))]
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    #[cfg(all(unix, debug_assertions))]
+    {
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        let side_dir = live.parent().unwrap();
+        assert!(
+            dirs.iter().any(|d| d == side_dir),
+            "the sidecar directory was not synced, got {dirs:?}"
+        );
+    }
+}
+
+/// A restore that creates a file one directory down syncs that directory
+/// before the mark goes away, so a second crash cannot lose the name.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn group_restore_syncs_a_nested_file_parent_before_the_mark_is_gone() {
+    let dir = TempDir::labeled("page-guard-restore-nested").unwrap();
+    let sub = dir.path().join("scripthash.body");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mark = dir.path().join("guard").join("sh-00");
+    let image = fill(0x5B);
+    arm_page_guard_group(&mark, &[("scripthash.body/00", 0, image.as_slice())]).unwrap();
+    let live = sub.join("00");
+    assert!(!live.exists());
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let sub_at = synced.iter().position(|p| p == &sub);
+    let guard_at = synced.iter().position(|p| p == mark.parent().unwrap());
+    assert!(
+        sub_at.is_some() && guard_at.is_some() && sub_at < guard_at,
+        "the nested live dir must be durable before the mark is unlinked, got {synced:?}"
+    );
+    assert_eq!(read_bytes(&live, 0, PAGE), image);
+}
+
+/// An empty live file takes every image in full, whatever the record order.
+#[test]
+fn fit_restore_fills_an_empty_file_with_every_page() {
+    let dir = TempDir::labeled("page-guard-fit-empty").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::File::create(&live).unwrap();
+    let mark = dir.path().join("guard/sh-ovf");
+    let (low, high) = (fill(0x61), fill(0x62));
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("scripthash.ovf/ingest", 0, low.as_slice()),
+            ("scripthash.ovf/ingest", PAGE as u64, high.as_slice()),
+        ],
+    )
+    .unwrap();
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), 2 * PAGE as u64);
+    assert_eq!(read_bytes(&live, 0, PAGE), low);
+    assert_eq!(read_bytes(&live, PAGE as u64, PAGE), high);
+}
+
 /// The release check uses the committed end, not the RAM high-water, and the
 /// pages this arm names. A later page inside that high-water is still an
 /// append when it shares no committed byte. A committed page the arm does
@@ -625,6 +774,45 @@ fn page1_is_rejected(file: &rbitcoin_store::file::TableFile) {
         StoreError::Rejected(msg) => assert_eq!(msg, "write is outside the armed pages"),
         other => panic!("expected reject, got {other:?}"),
     }
+}
+
+/// `clear_page_guard_rel` drops the mark. The release check must drop the
+/// in-memory pages with it, or the next committed write is rejected.
+#[test]
+fn clear_rel_forgets_the_armed_pages() {
+    let dir = TempDir::labeled("page-guard-clear-rel").unwrap();
+    let (file, path) = committed_body(&dir);
+    let mark = dir.path().join("guard/mark");
+    arm_page0(&dir, "guard/mark");
+    page1_is_rejected(&file);
+    clear_page_guard_rel(&mark, dir.path(), &[(&file.read_file, path.as_path())]).unwrap();
+    assert!(!mark.exists(), "clear removes the mark");
+    file.write_at(PAGE as u64, &[0x55; 16]).unwrap();
+}
+
+/// A fit restore deletes the mark outright. The armed-page record goes with it.
+#[test]
+fn fit_restore_forgets_the_armed_pages() {
+    let dir = TempDir::labeled("page-guard-fit-forget").unwrap();
+    let (file, _path) = committed_body(&dir);
+    let mark = dir.path().join("guard/mark");
+    arm_page0(&dir, "guard/mark");
+    page1_is_rejected(&file);
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    assert!(!mark.exists(), "restore removes the mark");
+    file.write_at(PAGE as u64, &[0x66; 16]).unwrap();
+}
+
+/// `clear_sh_marks` deletes `guard/sh-*` without a retain rewrite.
+#[test]
+fn clear_sh_marks_forgets_the_armed_pages() {
+    let dir = TempDir::labeled("page-guard-sh-forget").unwrap();
+    let (file, _path) = committed_body(&dir);
+    arm_page0(&dir, "guard/sh-ovf");
+    page1_is_rejected(&file);
+    clear_sh_marks(dir.path()).unwrap();
+    assert!(!dir.path().join("guard/sh-ovf").exists());
+    file.write_at(PAGE as u64, &[0x77; 16]).unwrap();
 }
 
 /// A clear that unlinks the mark and then fails its directory sync blocks
@@ -738,6 +926,48 @@ fn an_arm_registers_its_pages_before_the_dir_sync() {
             .is_err(),
         "page 1 is committed and not in the mark"
     );
+}
+
+/// A clear that rewrites the mark without one file and then fails its
+/// directory sync blocks that file: the rename is not durable, and a crash
+/// could bring the old mark back over a later write. An arm that syncs
+/// releases it.
+#[cfg(debug_assertions)]
+#[test]
+fn a_rewritten_mark_blocks_dropped_pages_when_the_dir_sync_fails() {
+    let dir = TempDir::labeled("page-guard-retain-forget").unwrap();
+    let live = dir.path().join("live");
+    write_bytes(&live, 0, &fill(0x11));
+    write_bytes(&live, PAGE as u64, &fill(0x12));
+    let mark = dir.path().join("guard/live");
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("live", 0, fill(0x11).as_slice()),
+            ("other", 0, fill(0x21).as_slice()),
+        ],
+    )
+    .unwrap();
+    let committed = 2 * PAGE as u64;
+    let check = |off: u64| rbitcoin_store::page_guard::check_armed_write(&live, committed, off, 8);
+    check(0).expect("page 0 is armed");
+    assert!(
+        check(PAGE as u64).is_err(),
+        "page 1 is committed and not armed"
+    );
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
+    let names = std::collections::HashSet::from(["live".to_string()]);
+    assert!(rbitcoin_store::page_guard::drop_page_guard_names(&mark, &names).is_err());
+    assert!(mark.exists(), "the mark still names `other`");
+    match check(0) {
+        Err(StoreError::Rejected(msg)) => {
+            assert_eq!(msg, "a guard mark change for this file is not durable")
+        }
+        other => panic!("`live` is open before the rewrite is durable: {other:?}"),
+    }
+    assert!(check(PAGE as u64).is_err());
+    arm_page_guard_group(&mark, &[("live", PAGE as u64, fill(0x12).as_slice())]).unwrap();
+    check(PAGE as u64).expect("a synced arm releases `live`");
 }
 
 /// Without hole punching, `zero_range` writes zeros in 1 MiB chunks. Each

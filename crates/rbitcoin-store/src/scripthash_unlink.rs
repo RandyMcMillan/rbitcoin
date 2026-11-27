@@ -8,8 +8,9 @@
 use super::{
     sh_page_as_array, sh_page_chunk_ranges, sh_page_extent, sh_page_next,
     sh_page_pack_extent_last_fks, sh_page_pack_fks, write_alloc_header, AllocState, LocatedHome,
-    ScriptHashTable, StoreError, TableFile, SH_PAGE_SIZE, SH_PAGE_SLAB_CLASS,
+    ScriptHashTable, StagedSlabs, StoreError, TableFile, SH_PAGE_SIZE, SH_PAGE_SLAB_CLASS,
 };
+use crate::page_guard;
 use crate::scripthash_layout::ShHeadValue;
 use crate::scripthash_pages::{
     sh_page_entries_into, sh_page_extent_creates, sh_page_set_extent_creates,
@@ -17,13 +18,12 @@ use crate::scripthash_pages::{
 use rbitcoin_primitives::{le_u16, le_u64, Fk};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(debug_assertions)]
 thread_local! {
     static WATCH_READABLE: Cell<bool> = const { Cell::new(false) };
     static READABLE_BROKE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_CLEAR_UNDO: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_DEFERRED_FREE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -75,6 +75,8 @@ pub struct DeferredRewrite {
     pub new_val: ShHeadValue,
     pub old: ShHeadValue,
     pub removed: u64,
+    pub staged: StagedSlabs,
+    pub popped: bool,
 }
 
 /// A full-list unlink. The empty head and the page free wait until the
@@ -91,6 +93,9 @@ pub(super) struct PendingEmpty {
     pages_left: Option<Vec<(u8, u64)>>,
     /// `live_count` already dropped `removed`. A header retry must not do it again.
     live_applied: bool,
+    /// The earlier attempt's arm. A retry keeps the pre-images its mark still
+    /// holds, re-images only pages a later clear dropped, and clears both sets.
+    armed: Option<super::ArmedSh>,
 }
 
 pub enum SuffixPlan {
@@ -141,14 +146,22 @@ impl ScriptHashTable {
 
     /// Unlink every group, then sync the new chains and heads once before any
     /// replaced page is freed. A full-list drop stays in memory until
-    /// [`Self::commit_deferred_empty_heads`].
+    /// [`Self::commit_deferred_empty_heads`]. Groups that name one scripthash
+    /// are merged, so each head is rewritten once with every removal.
     pub fn unlink_creates_batch(&self, groups: &[([u8; 32], Vec<Fk>)]) -> Result<(), StoreError> {
         if groups.is_empty() {
             return Ok(());
         }
+        let mut merged: BTreeMap<[u8; 32], Vec<Fk>> = BTreeMap::new();
+        for (scripthash, fks) in groups {
+            merged
+                .entry(*scripthash)
+                .or_default()
+                .extend_from_slice(fks);
+        }
         self.dirty_write(|| {
             let mut batch = UnlinkBatch::default();
-            for (scripthash, fks) in groups {
+            for (scripthash, fks) in &merged {
                 self.unlink_one(scripthash, fks, &mut batch)?;
             }
             self.finish_unlink_batch(batch)
@@ -248,11 +261,6 @@ impl ScriptHashTable {
         READABLE_BROKE.with(|c| c.get())
     }
 
-    #[cfg(debug_assertions)]
-    pub fn fail_next_undo_clear(&self) {
-        FAIL_CLEAR_UNDO.with(|c| c.set(true));
-    }
-
     #[doc(hidden)]
     pub fn unlink_by_rewrite(
         &self,
@@ -276,37 +284,25 @@ impl ScriptHashTable {
         let alloc_mu = self.alloc_for(scripthash, super::KeyHome::from(home));
         let mut alloc = alloc_mu.lock().unwrap();
         let saved = *alloc;
-        let new_val = match self.rewrite_entries_for_key(body, &mut alloc, &live) {
+        let (new_val, staged, popped) = match self.rewrite_entries_for_key(body, &mut alloc, &live)
+        {
             Ok(v) => v,
             Err(e) => {
                 *alloc = saved;
                 return Err(e);
             }
         };
-        if let Err(e) = write_alloc_header(body, &alloc) {
-            *alloc = saved;
-            return Err(e);
-        }
         let removed = (before - live.len()) as u64;
-        if frees_old_pages(old) {
-            // Head stays on the old chain until the batch syncs these bytes.
-            note_batch_body(self, batch, scripthash, home);
-            batch.rewrites.push(DeferredRewrite {
-                scripthash: *scripthash,
-                home,
-                new_val,
-                old: old.clone(),
-                removed,
-            });
-            return Ok(true);
-        }
-        if let Err(e) = self.unlink_write_home(scripthash, home, &new_val) {
-            *alloc = saved;
-            let _ = write_alloc_header(body, &alloc);
-            return Err(e);
-        }
-        alloc.live_count = alloc.live_count.saturating_sub(removed);
-        write_alloc_header(body, &alloc)?;
+        note_batch_body(self, batch, scripthash, home);
+        batch.rewrites.push(DeferredRewrite {
+            scripthash: *scripthash,
+            home,
+            new_val,
+            old: old.clone(),
+            removed,
+            staged,
+            popped,
+        });
         Ok(true)
     }
 
@@ -315,14 +311,82 @@ impl ScriptHashTable {
         if batch.rewrites.is_empty() {
             return Ok(());
         }
-        for si in &batch.main_shards {
-            self.bodies[*si].sync_data_only()?;
+        let _hold = page_guard::hold_marks();
+        let armed = self.arm_unlink_rewrites(&batch)?;
+        self.land_unlink_rewrites(&batch)?;
+        self.clear_armed_sh(&armed)
+    }
+
+    fn land_unlink_rewrites(&self, batch: &UnlinkBatch) -> Result<(), StoreError> {
+        let groups = self.rewrite_body_groups(batch);
+        self.write_rewrite_groups(batch, &groups)?;
+        self.stage_unlink_heads(batch)?;
+        let ingest_synced = batch
+            .rewrites
+            .iter()
+            .any(|job| matches!(job.home, LocatedHome::Main | LocatedHome::Ingest));
+        self.sync_batch_homes(batch)?;
+        if ingest_synced {
+            if let Some(head) = self.ingest.lock().unwrap().as_ref() {
+                head.drop_ahead()?;
+            }
         }
-        if batch.ovf {
-            if let Some(body) = &self.ovf_body {
+        self.free_rewrite_groups(batch, &groups)
+    }
+
+    fn rewrite_body_groups(&self, batch: &UnlinkBatch) -> Vec<(usize, Vec<usize>)> {
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, job) in batch.rewrites.iter().enumerate() {
+            let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
+            let key = std::ptr::from_ref(body) as usize;
+            if let Some(group) = groups.iter_mut().find(|(id, _)| *id == key) {
+                group.1.push(i);
+            } else {
+                groups.push((key, vec![i]));
+            }
+        }
+        groups
+    }
+
+    fn write_rewrite_groups(
+        &self,
+        batch: &UnlinkBatch,
+        groups: &[(usize, Vec<usize>)],
+    ) -> Result<(), StoreError> {
+        for (_, jobs) in groups {
+            let first = &batch.rewrites[jobs[0]];
+            let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
+            let popped = jobs.iter().any(|&i| batch.rewrites[i].popped);
+            {
+                let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
+                super::publish_bump(body, &alloc_mu.lock().unwrap())?;
+            }
+            if popped {
+                let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
+                let alloc = alloc_mu.lock().unwrap();
+                write_alloc_header(body, &alloc)?;
+                drop(alloc);
+                body.sync_data_only()?;
+                for &i in jobs {
+                    batch.rewrites[i].staged.write_to(body)?;
+                }
+                body.sync_data_only()?;
+            } else {
+                for &i in jobs {
+                    batch.rewrites[i].staged.write_to(body)?;
+                }
+                body.sync_data_only()?;
+                let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
+                let alloc = alloc_mu.lock().unwrap();
+                write_alloc_header(body, &alloc)?;
+                drop(alloc);
                 body.sync_data_only()?;
             }
         }
+        Ok(())
+    }
+
+    fn stage_unlink_heads(&self, batch: &UnlinkBatch) -> Result<(), StoreError> {
         let mut ingest_rows = Vec::new();
         for job in &batch.rewrites {
             match job.home {
@@ -339,54 +403,39 @@ impl ScriptHashTable {
                 }
             }
         }
-        if !ingest_rows.is_empty() {
-            let g = self.ingest.lock().unwrap();
-            let Some(head) = g.as_ref() else {
-                return Err(StoreError::Corrupt("scripthash: ingest missing"));
-            };
-            head.stage_rewrites(&ingest_rows)?;
+        if ingest_rows.is_empty() {
+            return Ok(());
         }
-        let ingest_synced = batch
-            .rewrites
-            .iter()
-            .any(|job| matches!(job.home, LocatedHome::Main | LocatedHome::Ingest));
-        self.sync_batch_homes(&batch)?;
-        if ingest_synced {
-            if let Some(head) = self.ingest.lock().unwrap().as_ref() {
-                head.drop_ahead()?;
-            }
-        }
-        // One barrier per body, after every free-list write for that file.
-        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-        for (i, job) in batch.rewrites.iter().enumerate() {
-            let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
-            let key = std::ptr::from_ref(body) as usize;
-            if let Some(group) = groups.iter_mut().find(|(id, _)| *id == key) {
-                group.1.push(i);
-            } else {
-                groups.push((key, vec![i]));
-            }
-        }
+        let g = self.ingest.lock().unwrap();
+        let Some(head) = g.as_ref() else {
+            return Err(StoreError::Corrupt("scripthash: ingest missing"));
+        };
+        head.stage_rewrites(&ingest_rows)
+    }
+
+    fn free_rewrite_groups(
+        &self,
+        batch: &UnlinkBatch,
+        groups: &[(usize, Vec<usize>)],
+    ) -> Result<(), StoreError> {
         for (_, jobs) in groups {
             let first = &batch.rewrites[jobs[0]];
             let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
             let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
             let mut alloc = alloc_mu.lock().unwrap();
-            for &i in &jobs {
+            for &i in jobs {
                 let job = &batch.rewrites[i];
                 alloc.live_count = alloc.live_count.saturating_sub(job.removed);
+                for &(class, off) in &job.staged.gaps {
+                    self.free_slab(body, &mut alloc, class, off)?;
+                }
                 if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
-                    // Links already written in this group must be durable
-                    // before the header that names them.
                     if body.sync_data_only().is_ok() {
                         let _ = write_alloc_header(body, &alloc);
                     }
                     return Err(e);
                 }
             }
-            // Free-list links are durable before the header that names them.
-            // A crash between the two leaves the old header and a leak, never
-            // a header pointing at a link the device did not take.
             body.sync_data_only()?;
             write_alloc_header(body, &alloc)?;
         }
@@ -445,6 +494,7 @@ impl ScriptHashTable {
             job.old = old;
             job.removed = removed;
             job.pages_left = None;
+            job.armed = None;
             return;
         }
         q.push(PendingEmpty {
@@ -455,6 +505,7 @@ impl ScriptHashTable {
             head_synced: false,
             pages_left: None,
             live_applied: false,
+            armed: None,
         });
     }
 
@@ -553,17 +604,42 @@ impl ScriptHashTable {
         }
     }
 
+    /// One backward mark covers the head word (until it is synced), page 0,
+    /// and each freed page's link. A crash before the clear restores the
+    /// head and the chain together.
     fn commit_one_empty(&self, job: &mut PendingEmpty) -> Result<(), StoreError> {
+        let _hold = page_guard::hold_marks();
+        if job.pages_left.is_none() {
+            job.pages_left = Some(self.deferred_page_list(job)?);
+        }
+        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
+        let mut offs = vec![0u64];
+        offs.extend(job.pages_left.iter().flatten().map(|&(_, off)| off));
+        let armed = self.arm_suffix_pages(
+            body,
+            &job.scripthash,
+            job.home,
+            &offs,
+            !job.head_synced,
+            job.armed.as_ref(),
+        )?;
+        job.armed = None;
+        let landed = self.land_one_empty(job);
+        let cleared = landed.and_then(|()| self.clear_armed_sh(&armed));
+        if cleared.is_err() {
+            job.armed = Some(armed);
+        }
+        cleared
+    }
+
+    fn land_one_empty(&self, job: &mut PendingEmpty) -> Result<(), StoreError> {
+        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
         if !job.head_synced {
             self.unlink_write_home(&job.scripthash, job.home, &ShHeadValue::Empty)?;
             self.sync_home(job.home, &job.scripthash)?;
             job.head_synced = true;
         }
-        if job.pages_left.is_none() {
-            job.pages_left = Some(self.deferred_page_list(job)?);
-        }
         let mut pages = job.pages_left.take().unwrap_or_default();
-        let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
         let alloc_mu = self.alloc_for(&job.scripthash, super::KeyHome::from(job.home));
         let mut alloc = alloc_mu.lock().unwrap();
         let mut next = 0;
@@ -575,19 +651,13 @@ impl ScriptHashTable {
             }
             next = next.saturating_add(1);
         }
+        job.pages_left = Some(Vec::new());
         if !job.live_applied {
             alloc.live_count = alloc.live_count.saturating_sub(job.removed);
             job.live_applied = true;
         }
-        if let Err(e) = body.sync_data_only() {
-            job.pages_left = Some(Vec::new());
-            return Err(e);
-        }
-        if let Err(e) = write_alloc_header(body, &alloc) {
-            job.pages_left = Some(Vec::new());
-            return Err(e);
-        }
-        Ok(())
+        body.sync_data_only()?;
+        write_alloc_header(body, &alloc)
     }
 
     /// Page offsets, read before any freelist write. A later free error
@@ -636,12 +706,8 @@ impl ScriptHashTable {
         old: &ShHeadValue,
         plan: SuffixPlan,
     ) -> Result<bool, StoreError> {
-        let body = self.body_for(scripthash, super::KeyHome::from(home));
-        let alloc_mu = self.alloc_for(scripthash, super::KeyHome::from(home));
-        let mut alloc = alloc_mu.lock().unwrap();
         match plan {
             SuffixPlan::DropAll { removed } => {
-                drop(alloc);
                 self.defer_full_unlink(scripthash, home, old.clone(), removed);
                 Ok(removed > 0)
             }
@@ -654,47 +720,54 @@ impl ScriptHashTable {
                 creates,
                 removed,
             } => {
+                let _hold = page_guard::hold_marks();
+                let body = self.body_for(scripthash, super::KeyHome::from(home));
+                let alloc_mu = self.alloc_for(scripthash, super::KeyHome::from(home));
+                let mut alloc = alloc_mu.lock().unwrap();
                 let old_last = match old {
                     ShHeadValue::Extent { last_page } => *last_page,
                     _ => boundary,
                 };
                 let extent_n = new_extent_n(base, old_n, boundary);
                 let creates = new_creates(creates, removed);
-                if boundary != old_last {
-                    // The head still names `old_last`. Shrink that page's
-                    // extent first so `boundary` is not an interior page
-                    // when it is rewritten.
-                    self.retire_head_page(
-                        body,
-                        &mut alloc,
-                        scripthash,
-                        home,
-                        old_last,
-                        &BoundaryPack {
-                            base,
-                            extent_n,
-                            boundary,
-                            creates,
-                        },
-                    )?;
-                }
-                let prepared = prepare_boundary(
-                    self,
-                    body,
-                    &mut alloc,
-                    &BoundaryPack {
-                        base,
-                        extent_n,
-                        boundary,
-                        creates,
-                    },
-                    &keep,
-                )?;
+                let pack = BoundaryPack {
+                    base,
+                    extent_n,
+                    boundary,
+                    creates,
+                };
+                let mut gaps = Vec::new();
+                let prepared = prepare_boundary(self, body, &mut alloc, &pack, &keep, &mut gaps)?;
                 let new_head = if prepared.new_last == old_last && drop_pages.is_empty() {
                     None
                 } else {
                     Some(ShHeadValue::extent(prepared.new_last))
                 };
+                let mut dirty = vec![0u64, prepared.at];
+                if boundary != old_last {
+                    dirty.push(old_last);
+                }
+                if let Some((off, _)) = prepared.extra {
+                    dirty.push(off);
+                }
+                dirty.extend_from_slice(&drop_pages);
+                dirty.extend(gaps.iter().map(|&(_, off)| off));
+                let armed = self.arm_suffix_pages(
+                    body,
+                    scripthash,
+                    home,
+                    &dirty,
+                    new_head.is_some(),
+                    None,
+                )?;
+                super::publish_bump(body, &alloc)?;
+                if boundary != old_last {
+                    self.retire_head_page(body, &mut alloc, scripthash, home, old_last, &pack)?;
+                }
+                if let Some((off, bytes)) = prepared.extra {
+                    body.write_at(off, &bytes)?;
+                    body.sync_data_only()?;
+                }
                 self.commit_tail_page(
                     body,
                     &mut alloc,
@@ -711,8 +784,13 @@ impl ScriptHashTable {
                 for off in drop_pages {
                     self.free_slab(body, &mut alloc, SH_PAGE_SLAB_CLASS, off)?;
                 }
+                for (class, off) in gaps {
+                    self.free_slab(body, &mut alloc, class, off)?;
+                }
                 body.sync_data_only()?;
                 write_alloc_header(body, &alloc)?;
+                drop(alloc);
+                self.clear_armed_sh(&armed)?;
                 Ok(true)
             }
             SuffixPlan::Absent | SuffixPlan::NotSuffix => Ok(false),
@@ -728,38 +806,17 @@ impl ScriptHashTable {
         home: LocatedHome,
         write: TailWrite<'_>,
     ) -> Result<(), StoreError> {
-        let word = if write.new_head.is_some() {
-            self.capture_head_word(scripthash, home)?
-        } else {
-            None
-        };
-        let rec = arm_undo(self, body, alloc, write.target, word)?;
-        if let Err(e) = body.write_at(write.target, write.bytes) {
-            self.rollback_undo(body, alloc, &rec)?;
-            return Err(e);
-        }
+        body.write_at(write.target, write.bytes)?;
         body.sync_data_only()?;
         note_readable(body, write.head_page);
         if let Some(val) = write.new_head {
-            if let Err(e) = self.unlink_write_home(scripthash, home, &val) {
-                self.rollback_undo(body, alloc, &rec)?;
-                return Err(e);
-            }
-            if let Err(e) = self.sync_home(home, scripthash) {
-                self.rollback_undo(body, alloc, &rec)?;
-                return Err(e);
-            }
+            self.unlink_write_home(scripthash, home, &val)?;
+            self.sync_home(home, scripthash)?;
             if let ShHeadValue::Extent { last_page } = val {
                 note_readable(body, last_page);
             }
         }
         alloc.live_count = alloc.live_count.saturating_sub(write.removed);
-        if let Err(e) = clear_undo_keep_image(body, alloc) {
-            alloc.live_count = alloc.live_count.saturating_add(write.removed);
-            self.rollback_undo(body, alloc, &rec)?;
-            return Err(e);
-        }
-        self.free_slab(body, alloc, SH_PAGE_SLAB_CLASS, rec.image)?;
         Ok(())
     }
 
@@ -991,6 +1048,7 @@ pub struct PreparedTail {
     pub at: u64,
     pub bytes: [u8; SH_PAGE_SIZE],
     pub new_last: u64,
+    pub extra: Option<(u64, [u8; SH_PAGE_SIZE])>,
 }
 
 #[doc(hidden)]
@@ -1018,6 +1076,7 @@ pub fn prepare_boundary(
     alloc: &mut AllocState,
     pack: &BoundaryPack,
     keep: &[u64],
+    gaps: &mut Vec<(u8, u64)>,
 ) -> Result<PreparedTail, StoreError> {
     if keep.is_empty() {
         return Err(StoreError::Corrupt("scripthash suffix keep is empty"));
@@ -1037,21 +1096,22 @@ pub fn prepare_boundary(
             at: pack.boundary,
             bytes: page,
             new_last: pack.boundary,
+            extra: None,
         });
     }
     let (s0, e0) = chunks[0];
     let (s1, e1) = chunks[1];
-    let tail_off = table.alloc_page(body, alloc)?;
+    let tail_off = table.alloc_page(body, alloc, gaps)?;
     let mut tail = [0u8; SH_PAGE_SIZE];
     sh_page_pack_extent_last_fks(&mut tail, &keep[s1..e1], pack.base, pack.extent_n, 0)?;
     sh_page_set_extent_creates(&mut tail, pack.creates);
-    body.write_at(tail_off, &tail)?;
     let mut mid = [0u8; SH_PAGE_SIZE];
     sh_page_pack_fks(&mut mid, &keep[s0..e0], tail_off)?;
     Ok(PreparedTail {
         at: pack.boundary,
         bytes: mid,
         new_last: tail_off,
+        extra: Some((tail_off, tail)),
     })
 }
 
@@ -1270,7 +1330,12 @@ pub fn arm_undo(
     word: Option<HeadWord>,
 ) -> Result<UndoRec, StoreError> {
     let old_page = read_page(body, target)?;
-    let image = table.alloc_page(body, alloc)?;
+    let mut gaps = Vec::new();
+    let image = table.alloc_page(body, alloc, &mut gaps)?;
+    super::publish_bump(body, alloc)?;
+    for (class, off) in gaps {
+        table.free_slab(body, alloc, class, off)?;
+    }
     body.write_at(image, &old_page)?;
     // The image and the header are different blocks. Publish SHUN only after
     // the image is durable, or recovery copies an unwritten page onto the tail.
@@ -1295,10 +1360,6 @@ pub fn restore_page(body: &TableFile, rec: &UndoRec) -> Result<(), StoreError> {
 
 #[doc(hidden)]
 pub fn clear_undo_keep_image(body: &TableFile, alloc: &AllocState) -> Result<(), StoreError> {
-    #[cfg(debug_assertions)]
-    if FAIL_CLEAR_UNDO.with(|c| c.replace(false)) {
-        return Err(StoreError::Corrupt("scripthash undo clear failed"));
-    }
     persist_undo(body, alloc, None)?;
     body.sync_data_only()?;
     Ok(())

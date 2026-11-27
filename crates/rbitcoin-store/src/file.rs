@@ -79,9 +79,29 @@ pub fn write_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_tmp_synced(path, TmpSync::FileAndDir, |f| {
-        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
-    })
+    write_synced_tmp_rename_then(path, bytes, || Ok(()))
+}
+
+/// Sync the temp file, run `after_sync`, then rename over `path`.
+///
+/// `after_sync` drops a page guard that still names `path`. The new bytes
+/// are durable before that drop, and the live name changes only after it.
+pub fn write_synced_tmp_rename_then<F>(
+    path: &Path,
+    bytes: &[u8],
+    after_sync: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce() -> Result<(), StoreError>,
+{
+    write_named_tmp(
+        &tmp_sidecar_path(path),
+        path,
+        TmpSync::FileAndDir,
+        false,
+        |f| f.write_all(bytes).map_err(|e| StoreError::io(path, e)),
+        after_sync,
+    )
 }
 
 /// Write `bytes` to a sibling tmp and `sync_all` the file before rename.
@@ -136,27 +156,36 @@ where
 /// its own `tmp` name, so one writer cannot truncate another's staging file.
 /// `tmp` must be on the same filesystem as `path` for the rename to be atomic.
 pub fn write_synced_tmp_rename_at(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_named_tmp(tmp, path, TmpSync::FileAndDir, false, |f| {
-        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
-    })
+    write_named_tmp(
+        tmp,
+        path,
+        TmpSync::FileAndDir,
+        false,
+        |f| f.write_all(bytes).map_err(|e| StoreError::io(path, e)),
+        || Ok(()),
+    )
 }
 
 fn write_tmp_with<F>(path: &Path, sync: TmpSync, private: bool, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
-    write_named_tmp(&tmp_sidecar_path(path), path, sync, private, write)
+    write_named_tmp(&tmp_sidecar_path(path), path, sync, private, write, || {
+        Ok(())
+    })
 }
 
-fn write_named_tmp<F>(
+fn write_named_tmp<F, A>(
     tmp: &Path,
     path: &Path,
     sync: TmpSync,
     private: bool,
     write: F,
+    after_sync: A,
 ) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
+    A: FnOnce() -> Result<(), StoreError>,
 {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -170,6 +199,7 @@ where
             f.durable_sync_all().map_err(|e| StoreError::io(tmp, e))?;
         }
     }
+    after_sync()?;
     std::fs::rename(tmp, path).map_err(|e| StoreError::io(path, e))?;
     if sync == TmpSync::FileAndDir {
         if let Some(parent) = path.parent() {

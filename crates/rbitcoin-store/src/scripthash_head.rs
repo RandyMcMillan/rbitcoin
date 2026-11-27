@@ -634,6 +634,29 @@ impl ScriptHashHead {
         Ok(())
     }
 
+    /// Byte spans [`Self::stage_rewrites`] will write for `keys`, in the same
+    /// hash-slot order. The cache is not flushed. A later key displaced by
+    /// an earlier one in this batch is included.
+    pub(crate) fn upsert_write_spans(
+        &self,
+        keys: &[[u8; 32]],
+    ) -> Result<Vec<(u64, u64)>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots_now = self.state.lock().unwrap().slots;
+        let val = ShHeadValue::inline_one(rbitcoin_primitives::Fk(1));
+        let enc = pack8_bytes(&val)?;
+        let mut order: Vec<&[u8; 32]> = keys.iter().collect();
+        order.sort_unstable_by_key(|full| Self::hash_slot(&Self::to_key(full), slots_now));
+        let mut cache = SlotPageCache::new(self, slots_now).preview();
+        for full in order {
+            let key = Self::to_key(full);
+            let _ = cache.try_insert(&key, &enc, true)?;
+        }
+        Ok(cache.dirty_spans())
+    }
+
     /// Sync the head, then drop its `*.ahead` image. No image means nothing to sync.
     #[doc(hidden)]
     pub fn sync_and_drop_ahead(&self) -> Result<(), StoreError> {
@@ -690,31 +713,28 @@ impl ScriptHashHead {
         cap.saturating_sub(occupied)
     }
 
+    /// Slot each key takes on an empty table, including a later key displaced
+    /// by an earlier one in the same batch.
     #[doc(hidden)]
-    pub fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
-        debug_assert!(self.is_known_empty());
-        let slots = self.state.lock().unwrap().slots;
-        let nbytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
-        let mut table = vec![0u8; nbytes];
-        let mut occupied = 0u64;
-        for (key, val) in entries {
-            let enc = pack8_bytes(val)?;
+    pub fn assign_empty_slots(slots: u64, keys: &[ShHeadKey]) -> Result<Vec<u64>, StoreError> {
+        if slots == 0 || !slots.is_power_of_two() {
+            return Err(StoreError::Corrupt("scripthash head bulk_fill full"));
+        }
+        let mut owner: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut out = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
             let mut slot = Self::hash_slot(key, slots);
             let mut placed = false;
             for _ in 0..slots {
-                let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
-                let rec = sh_slot_at(&table, off);
-                let slot_key = bytes!(rec, 0, 16);
-                let slot_v = bytes!(rec, 16, 8);
-                if is_empty_slot(&slot_key, &slot_v) {
-                    table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(key);
-                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
-                    occupied = occupied.saturating_add(1);
-                    placed = true;
-                    break;
-                }
-                if &slot_key == key {
-                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
+                if let Some(prev) = owner.get(&slot).copied() {
+                    if &keys[prev] == key {
+                        out.push(slot);
+                        placed = true;
+                        break;
+                    }
+                } else {
+                    owner.insert(slot, i);
+                    out.push(slot);
                     placed = true;
                     break;
                 }
@@ -724,8 +744,27 @@ impl ScriptHashHead {
                 return Err(StoreError::Corrupt("scripthash head bulk_fill full"));
             }
         }
-        self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
-        self.set_occupied_known(occupied)?;
+        Ok(out)
+    }
+
+    #[doc(hidden)]
+    pub fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
+        debug_assert!(self.is_known_empty());
+        let slots = self.state.lock().unwrap().slots;
+        let keys: Vec<ShHeadKey> = entries.iter().map(|(key, _)| *key).collect();
+        let assigned = Self::assign_empty_slots(slots, &keys)?;
+        let mut final_slot: BTreeMap<u64, [u8; SH_HEAD_SLOT_SIZE]> = BTreeMap::new();
+        for (i, (key, val)) in entries.iter().enumerate() {
+            let enc = pack8_bytes(val)?;
+            let mut rec = [0u8; SH_HEAD_SLOT_SIZE];
+            rec[..SH_HEAD_KEY_LEN].copy_from_slice(key);
+            rec[SH_HEAD_KEY_LEN..].copy_from_slice(&enc);
+            final_slot.insert(assigned[i], rec);
+        }
+        for (slot, rec) in &final_slot {
+            self.file.write_at(Self::slot_file_off(*slot), rec)?;
+        }
+        self.set_occupied_known(final_slot.len() as u64)?;
         Ok(())
     }
 
@@ -808,6 +847,14 @@ pub enum InsertResult {
     NeedSlot,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkSpill {
+    /// A full cache writes the wave, then drops it.
+    Durable,
+    /// A full cache keeps dirty chunks in RAM and never writes the head.
+    Preview,
+}
+
 #[doc(hidden)]
 pub struct SlotPageCache<'a> {
     pub head: &'a ScriptHashHead,
@@ -815,6 +862,8 @@ pub struct SlotPageCache<'a> {
     pub chunks: BTreeMap<u64, CachedChunk>,
     /// Number of `read_at` chunk faults (for microbenches / diagnostics).
     pub chunk_loads: u64,
+    spill: ChunkSpill,
+    spilled: BTreeMap<u64, CachedChunk>,
 }
 
 #[doc(hidden)]
@@ -832,7 +881,74 @@ impl<'a> SlotPageCache<'a> {
             slots,
             chunks: BTreeMap::new(),
             chunk_loads: 0,
+            spill: ChunkSpill::Durable,
+            spilled: BTreeMap::new(),
         }
+    }
+
+    /// Plan a guard image. Dirty chunks stay in RAM, including past one wave.
+    pub fn preview(mut self) -> Self {
+        self.spill = ChunkSpill::Preview;
+        self
+    }
+
+    fn dirty_spans(&self) -> Vec<(u64, u64)> {
+        let mut spans = Vec::new();
+        for chunk in self
+            .chunks
+            .values()
+            .chain(self.spilled.values())
+            .filter(|chunk| chunk.dirty)
+        {
+            spans.push((
+                ScriptHashHead::slot_file_off(chunk.base_slot),
+                chunk.data.len() as u64,
+            ));
+        }
+        spans
+    }
+
+    fn make_preview_room(&mut self) {
+        if self.chunks.len() < CHUNK_CACHE_MAX {
+            return;
+        }
+        let taken = std::mem::take(&mut self.chunks);
+        for (idx, chunk) in taken {
+            if chunk.dirty {
+                self.spilled.insert(idx, chunk);
+            }
+        }
+    }
+
+    fn load_chunk(&mut self, chunk_idx: u64) -> Result<(), StoreError> {
+        if self.spill == ChunkSpill::Preview {
+            if let Some(chunk) = self.spilled.remove(&chunk_idx) {
+                self.make_preview_room();
+                self.chunks.insert(chunk_idx, chunk);
+                return Ok(());
+            }
+            self.make_preview_room();
+        } else if self.chunks.len() >= CHUNK_CACHE_MAX {
+            // This wave is durable before the next one starts, so a later
+            // flush does not rewrite pages the sidecar already retired.
+            self.flush_durable()?;
+        }
+        let base_slot = chunk_idx * SLOTS_PER_CHUNK;
+        let n = ((self.slots - base_slot) as usize).min(SLOTS_PER_CHUNK as usize);
+        let off = ScriptHashHead::slot_file_off(base_slot);
+        let len = n * SH_HEAD_SLOT_SIZE;
+        let mut data = vec![0u8; len];
+        self.head.file.read_at(off, &mut data)?;
+        self.chunk_loads = self.chunk_loads.saturating_add(1);
+        self.chunks.insert(
+            chunk_idx,
+            CachedChunk {
+                base_slot,
+                data,
+                dirty: false,
+            },
+        );
+        Ok(())
     }
 
     /// Probe-insert. When `allow_new` is false, only in-place updates of an
@@ -895,26 +1011,7 @@ impl<'a> SlotPageCache<'a> {
     pub fn ensure_chunk(&mut self, slot: u64) -> Result<&mut CachedChunk, StoreError> {
         let chunk_idx = slot / SLOTS_PER_CHUNK;
         if !self.chunks.contains_key(&chunk_idx) {
-            if self.chunks.len() >= CHUNK_CACHE_MAX {
-                // This wave is durable before the next one starts, so a later
-                // flush does not rewrite pages the sidecar already retired.
-                self.flush_durable()?;
-            }
-            let base_slot = chunk_idx * SLOTS_PER_CHUNK;
-            let n = ((self.slots - base_slot) as usize).min(SLOTS_PER_CHUNK as usize);
-            let off = ScriptHashHead::slot_file_off(base_slot);
-            let len = n * SH_HEAD_SLOT_SIZE;
-            let mut data = vec![0u8; len];
-            self.head.file.read_at(off, &mut data)?;
-            self.chunk_loads = self.chunk_loads.saturating_add(1);
-            self.chunks.insert(
-                chunk_idx,
-                CachedChunk {
-                    base_slot,
-                    data,
-                    dirty: false,
-                },
-            );
+            self.load_chunk(chunk_idx)?;
         }
         Ok(self.chunks.get_mut(&chunk_idx).unwrap())
     }

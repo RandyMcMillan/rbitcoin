@@ -17,7 +17,9 @@ use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 
 use crate::durability::Durable;
 use crate::error::StoreError;
-use crate::file::{fsync_parent_dir, handle_pwrite_all, write_file_synced_tmp_rename, TableFile};
+use crate::file::{
+    fsync_parent_dir, handle_pread_all, handle_pwrite_all, write_file_synced_tmp_rename, TableFile,
+};
 
 pub const PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
 const HEAD: usize = 12;
@@ -33,6 +35,8 @@ pub const CLASS_C_MARK: &str = "guard/class_c";
 pub const HEADER_BODY_MARK: &str = "guard/header.body";
 /// Forward images for one `header.head` generation.
 pub const HEADER_HEAD_MARK: &str = "guard/header.head";
+/// Prefix of one scripthash-commit mark (`guard/sh-00`, `guard/sh-ovf`).
+pub const SH_MARK_PREFIX: &str = "guard/sh-";
 
 fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     static ARMED: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
@@ -266,6 +270,63 @@ fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<Option<Vec<PathBuf
     Ok(Some(opened.into_iter().map(|(_, _, path)| path).collect()))
 }
 
+/// Copies named images onto existing files. A missing live file is skipped.
+///
+/// A short file keeps its length: the sidecar pads to 4 KiB, and restore
+/// writes only the bytes that were on disk. An empty live file is filled
+/// with the full page.
+#[doc(hidden)]
+pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
+    mark_parent(mark)?;
+    let raw = match std::fs::read(mark) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(StoreError::io(mark, e)),
+    };
+    let pages = mark_group_pages(&raw)?;
+    // A forward `*.ahead` image is the post-commit page. The backward mark
+    // wins: drop the sidecar before any head open can replay it.
+    let mut dropped_ahead: Vec<String> = Vec::new();
+    for (name, _, _) in &pages {
+        if dropped_ahead.iter().any(|have| have == name) {
+            continue;
+        }
+        drop_ahead_sidecar(dir, name)?;
+        dropped_ahead.push(name.clone());
+    }
+    let mut opened: Vec<(String, File, PathBuf, u64)> = Vec::new();
+    for (name, offset, at) in &pages {
+        let data_path = dir.join(name);
+        if !opened.iter().any(|(have, _, _, _)| have == name) {
+            let file = match OpenOptions::new().read(true).write(true).open(&data_path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(StoreError::io(&data_path, e)),
+            };
+            let len = file
+                .metadata()
+                .map_err(|e| StoreError::io(&data_path, e))?
+                .len();
+            opened.push((name.clone(), file, data_path.clone(), len));
+        }
+        let Some((_, data, live, len)) = opened.iter().find(|(have, _, _, _)| have == name) else {
+            continue;
+        };
+        let image = &raw[*at..*at + PAGE as usize];
+        write_restored_page(data, live, *offset, image, Some(*len))?;
+    }
+    for (_, data, data_path, _) in &opened {
+        data.durable_sync_data()
+            .map_err(|e| StoreError::io(data_path, e))?;
+    }
+    let mut names = HashSet::new();
+    for (name, _, _) in &pages {
+        names.insert(name.clone());
+    }
+    remove_mark(mark, &live_paths(mark, &names))?;
+    Ok(true)
+}
+
 /// Syncs `data`, then removes `path` and syncs its directory.
 ///
 /// A path that is already gone is `Ok` after the sync. A mark with no
@@ -417,6 +478,219 @@ pub fn take_armed_store_marks() -> Vec<String> {
     ARM_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
 }
 
+/// `guard/sh-<shard>` for one scripthash body (`00` or `ovf`).
+#[doc(hidden)]
+pub fn sh_mark(shard: &str) -> String {
+    format!("{SH_MARK_PREFIX}{shard}")
+}
+
+/// Copy every `guard/sh-*` mark onto its live files, then drop the marks.
+#[doc(hidden)]
+pub fn restore_sh_marks(dir: &Path) -> Result<(), StoreError> {
+    let guard = dir.join("guard");
+    let rd = match std::fs::read_dir(&guard) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    };
+    let mut names: Vec<String> = Vec::new();
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !published_sh_mark(name) {
+            continue;
+        }
+        let file = match ent.file_type() {
+            Ok(t) if t.is_file() => true,
+            Ok(_) => false,
+            Err(e) => return Err(StoreError::io(ent.path(), e)),
+        };
+        if file {
+            names.push(name.to_string());
+        }
+    }
+    names.sort_unstable();
+    for name in names {
+        restore_page_guard_group_fit(&guard.join(name), dir)?;
+    }
+    Ok(())
+}
+
+/// Drop every `guard/sh-*` mark. Missing is `Ok`.
+#[doc(hidden)]
+pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
+    let guard = dir.join("guard");
+    let rd = match std::fs::read_dir(&guard) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    };
+    let mut any = false;
+    let mut released = Vec::new();
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("sh-") {
+            continue;
+        }
+        let path = ent.path();
+        let mut named = HashSet::new();
+        if !name.ends_with(".tmp") {
+            if let Ok(raw) = std::fs::read(&path) {
+                if let Ok(pages) = mark_group_pages(&raw) {
+                    for (file, _, _) in pages {
+                        named.insert(file);
+                    }
+                }
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                any = true;
+                released.extend(live_paths(&path, &named));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+    }
+    if any {
+        sync_mark_dir_then_release(&guard, &released)?;
+    }
+    Ok(())
+}
+
+/// Sync every live file, then drop those files' relative names from `mark`.
+#[doc(hidden)]
+pub fn clear_page_guard_rel(
+    mark: &Path,
+    dir: &Path,
+    files: &[(&File, &Path)],
+) -> Result<(), StoreError> {
+    mark_parent(mark)?;
+    for (data, data_path) in files {
+        data.durable_sync_data()
+            .map_err(|e| StoreError::io(*data_path, e))?;
+    }
+    let mut synced = HashSet::with_capacity(files.len());
+    for (_, data_path) in files {
+        synced.insert(guard_rel_name(dir, data_path)?);
+    }
+    retain_unsynced(mark, &synced)
+}
+
+/// Drop `names` from `mark` without syncing live files. Used before a rename
+/// replaces a file the mark still images.
+#[doc(hidden)]
+pub fn drop_page_guard_names(mark: &Path, names: &HashSet<String>) -> Result<(), StoreError> {
+    mark_parent(mark)?;
+    retain_unsynced(mark, names)
+}
+
+/// Drop `rel` from every `guard/sh-*` mark, then sync `dir`.
+#[doc(hidden)]
+/// A renamed `guard/sh-*` mark. `sh-<shard>.tmp` is a rename leftover that
+/// may be partial; restore and drop skip it, and reset removes it.
+pub(crate) fn published_sh_mark(name: &str) -> bool {
+    name.starts_with("sh-") && !name.ends_with(".tmp")
+}
+
+pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
+    let guard = dir.join("guard");
+    let rd = match std::fs::read_dir(&guard) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    };
+    let mut names = HashSet::new();
+    names.insert(rel.to_string());
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if published_sh_mark(name) {
+            drop_page_guard_names(&ent.path(), &names)?;
+        }
+    }
+    if let Some(parent) = Path::new(rel).parent() {
+        if !parent.as_os_str().is_empty() {
+            let live_parent = dir.join(parent);
+            if live_parent.is_dir() {
+                fsync_parent_dir(&live_parent).map_err(|e| StoreError::io(&live_parent, e))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Store-relative 1–2 component name of `path`.
+#[doc(hidden)]
+pub fn guard_rel_name(dir: &Path, path: &Path) -> Result<String, StoreError> {
+    let rel = path
+        .strip_prefix(dir)
+        .map_err(|_| StoreError::Corrupt("page guard file name"))?;
+    let name = rel
+        .to_str()
+        .ok_or(StoreError::Corrupt("page guard file name"))?
+        .replace('\\', "/");
+    if !valid_guard_name(&name) {
+        return Err(StoreError::Corrupt("page guard file name"));
+    }
+    Ok(name)
+}
+
+/// Remove `{file}.ahead` next to a file the mark is about to restore.
+fn drop_ahead_sidecar(dir: &Path, name: &str) -> Result<(), StoreError> {
+    let live = dir.join(name);
+    let Some(file_name) = live.file_name() else {
+        return Ok(());
+    };
+    let mut ahead = file_name.to_os_string();
+    ahead.push(".ahead");
+    let side = match live.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(ahead),
+        _ => PathBuf::from(ahead),
+    };
+    match std::fs::remove_file(&side) {
+        Ok(()) => {}
+        // An earlier unlink may have landed and its directory sync failed.
+        // Sync again so the sidecar cannot come back after the mark is gone.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StoreError::io(&side, e)),
+    }
+    if let Some(parent) = side.parent().filter(|p| p.is_dir()) {
+        fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
+    Ok(())
+}
+
+/// Read one 4 KiB block. Bytes past EOF are zeros. A missing file is zeros.
+#[doc(hidden)]
+pub fn read_live_page(
+    path: &Path,
+    file: &File,
+    block: u64,
+) -> Result<[u8; PAGE as usize], StoreError> {
+    let mut image = [0u8; PAGE as usize];
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(image),
+        Err(e) => return Err(StoreError::io(path, e)),
+    };
+    if block < len {
+        let n = ((len - block) as usize).min(PAGE as usize);
+        handle_pread_all(file, path, block, &mut image[..n])?;
+    }
+    Ok(image)
+}
+
 /// File name of `path` as a single component, or `Corrupt`.
 #[doc(hidden)]
 pub fn guard_file_name(path: &Path) -> Result<&str, StoreError> {
@@ -459,6 +733,19 @@ fn load_group_leftover(
         leftover.push((name, offset, raw[at..at + PAGE as usize].to_vec()));
     }
     Ok(leftover)
+}
+
+/// The (file, page offset) records `mark` holds. A missing mark holds none.
+pub(crate) fn armed_group_pages(mark: &Path) -> Result<HashSet<(String, u64)>, StoreError> {
+    let raw = match std::fs::read(mark) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(StoreError::io(mark, e)),
+    };
+    Ok(mark_group_pages(&raw)?
+        .into_iter()
+        .map(|(name, offset, _)| (name, offset))
+        .collect())
 }
 
 /// One or two `/`-separated parts, each a plain name. A name has one

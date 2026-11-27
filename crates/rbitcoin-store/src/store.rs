@@ -2765,7 +2765,7 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
 
 /// Copy armed page images back before trim or the tip walk. Every mark lives
 /// in the hot store directory: the cold directory holds only appends, which
-/// need none.
+/// need none. The header marks are replayed by the header table open.
 #[doc(hidden)]
 pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
     restore_hot_marks(&layout.dir)
@@ -2773,7 +2773,36 @@ pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
 
 fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
     crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
+    restore_sh_marks_or_rebuild(path)?;
     Ok(())
+}
+
+/// Open the scripthash table, or create it. A rebuild a restore asked for
+/// discards the index first.
+fn open_scripthash(path: &Path, scale: HeadScale) -> Result<ScriptHashTable, StoreError> {
+    crate::scripthash::discard_index_for_rebuild(path)?;
+    if path.join("scripthash.body").exists() {
+        ScriptHashTable::open_with_scale(path, scale)
+    } else {
+        ScriptHashTable::create_with_scale(path, scale)
+    }
+}
+
+/// A `guard/sh-*` mark that does not parse is scripthash damage, which
+/// rebuilds from Class A. Request that rebuild and drop the scripthash marks
+/// instead of stopping open. An OS error still stops open.
+fn restore_sh_marks_or_rebuild(path: &Path) -> Result<(), StoreError> {
+    match crate::page_guard::restore_sh_marks(path) {
+        Err(StoreError::Corrupt(why)) => {
+            rbitcoin_log::warn!(
+                "store: scripthash guard mark unreadable ({}); rebuilding the scripthash index",
+                why
+            );
+            crate::scripthash::mark_sh_rebuild(path)?;
+            crate::page_guard::clear_sh_marks(path)
+        }
+        other => other,
+    }
 }
 
 #[doc(hidden)]
@@ -2816,11 +2845,7 @@ fn open_or_create_scripthash_header_txs(
     path: &Path,
     head_scale: HeadScale,
 ) -> Result<(ScriptHashTable, HeaderTxsTable), StoreError> {
-    let scripthash = if path.join("scripthash.body").exists() {
-        ScriptHashTable::open_with_scale(path, head_scale)?
-    } else {
-        ScriptHashTable::create_with_scale(path, head_scale)?
-    };
+    let scripthash = open_scripthash(path, head_scale)?;
     let header_txs = if path.join("header_txs_first.body").exists() {
         HeaderTxsTable::open(path)?
     } else {

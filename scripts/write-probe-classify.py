@@ -11,8 +11,11 @@ import re
 import sys
 
 # Safe by structure: a fresh file, pages a mark images, one sector (a
-# length and the bytes it names inside sector 0), or a length published after the bytes it names were synced. FIXTURE is a file
-# outside any store (a table built bare in a test).
+# length and the bytes it names inside sector 0), or a length published
+# after the bytes it names were synced. FIXTURE is a file outside any store
+# (a table built bare in a test). LEN_ON_MARK is never safe by structure: a
+# length that names bytes on pages a live mark images, with the length
+# itself outside that mark, survives a restore that rewrites those bytes.
 SAFE = {"CREATE", "ARMED", "ONE_SECTOR", "LEN_ONE_SECTOR", "LEN_ARMED",
         "LEN_AFTER_SYNC", "FIXTURE"}
 

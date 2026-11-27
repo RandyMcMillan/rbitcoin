@@ -982,7 +982,7 @@ impl TableFile {
     fn pwrite_checked(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         self.refuse_if_poisoned()?;
         #[cfg(feature = "write-probe")]
-        self.probe(
+        let _landing = self.probe(
             committed,
             offset,
             bytes,
@@ -998,7 +998,7 @@ impl TableFile {
     /// poisoned file before it changes RAM.
     fn pwrite_length(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         #[cfg(feature = "write-probe")]
-        self.probe(
+        let _landing = self.probe(
             committed,
             offset,
             bytes,
@@ -1008,15 +1008,19 @@ impl TableFile {
     }
 
     /// Classify a payload write that bypasses the door (bulk io_uring) as the
-    /// door would.
+    /// door would. Hold the landing until that write returns.
     #[cfg(feature = "write-probe")]
-    pub(crate) fn probe_bulk_write(&self, offset: u64, bytes: &[u8]) {
+    pub(crate) fn probe_bulk_write(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+    ) -> crate::write_probe::Landing {
         self.probe(
             self.header_len_to_persist(),
             offset,
             bytes,
             crate::write_probe::WriteKind::Payload,
-        );
+        )
     }
 
     #[cfg(feature = "write-probe")]
@@ -1026,7 +1030,7 @@ impl TableFile {
         offset: u64,
         bytes: &[u8],
         kind: crate::write_probe::WriteKind,
-    ) {
+    ) -> crate::write_probe::Landing {
         crate::write_probe::write(
             &self.path,
             committed,
@@ -1039,7 +1043,7 @@ impl TableFile {
                 FILE_HEADER_LEN as u64
             },
             kind,
-        );
+        )
     }
 
     fn pwrite_door(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {

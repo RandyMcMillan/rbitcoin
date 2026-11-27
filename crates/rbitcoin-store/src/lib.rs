@@ -134,7 +134,8 @@ pub mod uring_session;
 #[doc(hidden)]
 pub mod var_table;
 #[cfg(feature = "write-probe")]
-mod write_probe;
+#[doc(hidden)]
+pub mod write_probe;
 
 pub use crate::array_table::ClassCWrite;
 #[cfg(debug_assertions)]

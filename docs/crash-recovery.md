@@ -256,8 +256,14 @@ on `rbitcoin-store`. Every TableFile write below a file's durable end
 footer writers name as one, is logged by class: a fresh file, pages a mark
 images, one sector (or a length that shares sector 0 with every byte it
 names), or a length published before or after its bytes were synced. A
-length that does not grow rewrites durable bytes, so it is classed like an
-in-place write: a mark's pages, one sector, or several. A trailing table
+payload range counts as unsynced until a sync that began after it landed
+returns. A length that does not grow rewrites durable bytes, so it is
+classed like an in-place write: a mark's pages, one sector, or several. A
+length that names bytes on pages the file's live mark images, when that
+mark does not image the length too, is `LEN_ON_MARK`: a restore rewrites
+those pages from the mark's images and keeps the length, so whether the
+named bytes survive depends on what the mark holds. It is never safe by
+structure. A trailing table
 opened from disk starts from its footer as its durable end. `scripts/write-probe-classify.py` passes the classes that are safe
 by structure and fails CI on any other entry without a reviewed reason in
 its rule list: a Class A length past the synced floor, the `spent.body`

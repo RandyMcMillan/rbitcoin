@@ -324,7 +324,7 @@ impl VarTable {
         let end = start.saturating_add(body_blob.len() as u64);
         self.body.ensure_capacity(end)?;
         #[cfg(feature = "write-probe")]
-        self.body.probe_bulk_write(start, body_blob);
+        let _landing = self.body.probe_bulk_write(start, body_blob);
         let wrote = {
             use crate::bulk_io::{self, WriteOp};
             let mut ops = [WriteOp {
@@ -372,6 +372,9 @@ pub fn write_prepared_bodies_one_wave(
     if jobs.is_empty() {
         return Ok(());
     }
+    // Held until the waves, and any fallback, return.
+    #[cfg(feature = "write-probe")]
+    let mut _landings = Vec::with_capacity(jobs.len());
     for (table, prep) in jobs {
         if prep.body_blob.is_empty() {
             continue;
@@ -379,7 +382,7 @@ pub fn write_prepared_bodies_one_wave(
         let end = prep.start.saturating_add(prep.body_blob.len() as u64);
         table.ensure_body_end(end)?;
         #[cfg(feature = "write-probe")]
-        table.body.probe_bulk_write(prep.start, &prep.body_blob);
+        _landings.push(table.body.probe_bulk_write(prep.start, &prep.body_blob));
     }
     use crate::bulk_io::{self, WriteOp};
     let mut ops: Vec<WriteOp<'_>> = Vec::with_capacity(jobs.len());

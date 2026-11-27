@@ -61,3 +61,5 @@ mod txid_body;
 mod txstat;
 mod uring_session;
 mod var_table;
+#[cfg(feature = "write-probe")]
+mod write_probe;

@@ -1191,3 +1191,33 @@ pub(crate) fn probe_armed_covers(path: &Path, offset: u64, len: u64) -> bool {
     }
     true
 }
+
+/// Write probe: `path` has an arm that images at least one page of the range.
+#[cfg(feature = "write-probe")]
+pub(crate) fn probe_armed_touches(path: &Path, offset: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pages) = map.get(path) else {
+        return false;
+    };
+    let mut page = offset & !(PAGE - 1);
+    while page < offset + len {
+        if pages.contains(&page) {
+            return true;
+        }
+        page += PAGE;
+    }
+    false
+}
+
+/// Write probe tests: arm `pages` of `path` as a live mark would.
+#[cfg(feature = "write-probe")]
+#[doc(hidden)]
+pub fn probe_arm_for_test(path: &Path, pages: &[u64]) {
+    armed_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), pages.iter().copied().collect());
+}

@@ -16,18 +16,22 @@ const SECTOR: u64 = 512;
 /// What a door write carries. The caller names it: a payload can have any
 /// length and offset, so the probe does not infer a publish from its shape.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteKind {
+#[doc(hidden)]
+pub enum WriteKind {
     Payload,
     /// A header length field or a trailing footer.
     Length,
 }
 
-/// Unsynced byte ranges per file, each with the per-file sequence number of
-/// the write that made it.
+/// Unsynced byte ranges per file. A landed range carries the per-file
+/// sequence number it took when it landed. A pending range is still in
+/// flight: no sync clears it.
 #[derive(Default)]
 struct Dirty {
     next: u64,
     ranges: Vec<(u64, u64, u64)>,
+    next_pending: u64,
+    pending: Vec<(u64, u64, u64)>,
 }
 
 fn dirty() -> &'static Mutex<HashMap<PathBuf, Dirty>> {
@@ -37,13 +41,16 @@ fn dirty() -> &'static Mutex<HashMap<PathBuf, Dirty>> {
 
 /// What a sync starting now covers: the writes made before it, and the last
 /// trailer written before it.
-pub(crate) struct SyncPoint {
+#[doc(hidden)]
+pub struct SyncPoint {
     seq: u64,
     trailer: Option<u64>,
 }
 
-/// A write that lands while the sync waits is not covered by it.
-pub(crate) fn sync_begin(path: &Path) -> SyncPoint {
+/// A sync covers only the writes that landed before it began. A write that
+/// lands while it waits, or is still in flight, is not covered by it.
+#[doc(hidden)]
+pub fn sync_begin(path: &Path) -> SyncPoint {
     let seq = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -60,7 +67,8 @@ pub(crate) fn sync_begin(path: &Path) -> SyncPoint {
 
 /// A sync that began at `at` finished: the writes and trailer it covered are
 /// durable.
-pub(crate) fn synced(path: &Path, at: SyncPoint) {
+#[doc(hidden)]
+pub fn synced(path: &Path, at: SyncPoint) {
     if let Some(d) = dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -80,7 +88,8 @@ pub(crate) fn synced(path: &Path, at: SyncPoint) {
 /// A trailing table opened from disk: its footer end is durable. Only a
 /// path the probe has no record of takes it, so a table this process
 /// created and has not synced keeps no durable end.
-pub(crate) fn opened_trailing(path: &Path, end: u64) {
+#[doc(hidden)]
+pub fn opened_trailing(path: &Path, end: u64) {
     let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
     if t.0.contains_key(path) || t.1.contains_key(path) {
         return;
@@ -128,18 +137,61 @@ fn unsynced_in(path: &Path, from: u64, to: u64) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(path)
-        .is_some_and(|d| d.ranges.iter().any(|&(_, s, e)| s < to && e > from))
+        .is_some_and(|d| {
+            d.ranges
+                .iter()
+                .chain(d.pending.iter())
+                .any(|&(_, s, e)| s < to && e > from)
+        })
 }
 
-fn note_dirty(path: &Path, from: u64, to: u64) {
+/// A write [`write`] classified and its caller has not yet finished. Drop it
+/// once the write returns, `Ok` or `Err`: a failed write may have landed
+/// some bytes. A payload range takes its sequence number then, so a sync
+/// that began while it was in flight does not clear it. A trailer becomes
+/// the last one written then.
+#[must_use = "hold it until the write returns"]
+#[doc(hidden)]
+pub struct Landing {
+    path: PathBuf,
+    payload: Option<u64>,
+    trailer: Option<u64>,
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        if let Some(id) = self.payload {
+            let mut map = dirty().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(d) = map.get_mut(&self.path) {
+                if let Some(i) = d.pending.iter().position(|&(p, _, _)| p == id) {
+                    let (_, from, to) = d.pending.swap_remove(i);
+                    d.ranges.push((d.next, from, to));
+                    d.next += 1;
+                }
+            }
+        }
+        if let Some(end) = self.trailer {
+            trailers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .insert(self.path.clone(), end);
+        }
+    }
+}
+
+fn note_pending(path: &Path, from: u64, to: u64) -> u64 {
     let mut map = dirty().lock().unwrap_or_else(|e| e.into_inner());
     let d = map.entry(path.to_path_buf()).or_default();
-    d.ranges.push((d.next, from, to));
-    d.next += 1;
+    let id = d.next_pending;
+    d.pending.push((id, from, to));
+    d.next_pending += 1;
+    id
 }
 
 /// Called with the durable `committed` end before every TableFile pwrite,
-/// and before a bulk write that bypasses the door.
+/// and before a bulk write that bypasses the door. Hold the [`Landing`]
+/// until the write returns.
 pub(crate) fn write(
     path: &Path,
     committed: u64,
@@ -148,10 +200,44 @@ pub(crate) fn write(
     trailing: bool,
     header_len: u64,
     kind: WriteKind,
-) {
+) -> Landing {
+    let (class, committed, landing) =
+        classify(path, committed, offset, bytes, trailing, header_len, kind);
+    if let Some(class) = class {
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| CLASS_A_STEMS.contains(&n));
+        let class = if stem || in_store(path) {
+            class
+        } else {
+            "FIXTURE"
+        };
+        log(class, path, committed, offset, bytes.len() as u64);
+    }
+    landing
+}
+
+/// The class of one write, the durable end it was judged against, and the
+/// landing that records it.
+#[doc(hidden)]
+pub fn classify(
+    path: &Path,
+    committed: u64,
+    offset: u64,
+    bytes: &[u8],
+    trailing: bool,
+    header_len: u64,
+    kind: WriteKind,
+) -> (Option<&'static str>, u64, Landing) {
+    let mut landing = Landing {
+        path: path.to_path_buf(),
+        payload: None,
+        trailer: None,
+    };
     let len = bytes.len() as u64;
     if len == 0 {
-        return;
+        return (None, committed, landing);
     }
     // The header in the file, not the RAM length: a publish moves RAM first.
     // A trailer moves with the length, so its durable end is the last one a
@@ -172,11 +258,7 @@ pub(crate) fn write(
             Err(_) => end,
         };
         if trailing {
-            trailers()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .0
-                .insert(path.to_path_buf(), new);
+            landing.trailer = Some(new);
         }
         // A trailing length counts its footer, so the payload it names ends
         // one footer earlier, and starts where the old footer sat.
@@ -195,6 +277,15 @@ pub(crate) fn write(
             // A length that does not grow names only durable bytes. The
             // rewrite itself can still tear across sectors.
             Some(in_place_class(path, offset, len))
+        } else if crate::page_guard::probe_armed_touches(path, lo, hi.saturating_sub(lo))
+            && !crate::page_guard::probe_armed_covers(path, offset, len)
+        {
+            // A restore after a crash rewrites the marked pages under the
+            // bytes this length names from the mark's images, and leaves the
+            // length. Synced or not, those bytes are the mark's, not the
+            // length's. The arm map is per file, so "the mark" is the file's
+            // live arm.
+            Some("LEN_ON_MARK")
         } else if named_safe
             && crate::page_guard::probe_armed_covers(path, offset, len)
             && named_unsynced
@@ -217,20 +308,9 @@ pub(crate) fn write(
         Some(in_place_class(path, offset, len))
     };
     if !len_field {
-        note_dirty(path, offset, end);
+        landing.payload = Some(note_pending(path, offset, end));
     }
-    if let Some(class) = class {
-        let stem = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| CLASS_A_STEMS.contains(&n));
-        let class = if stem || in_store(path) {
-            class
-        } else {
-            "FIXTURE"
-        };
-        log(class, path, committed, offset, len);
-    }
+    (class, committed, landing)
 }
 
 /// A write over durable bytes: safe when a live mark images its pages or it

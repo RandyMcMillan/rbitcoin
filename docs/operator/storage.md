@@ -3,7 +3,8 @@
 ## Drives
 
 Run the datadir on an SSD that keeps flushed writes on power loss. NVMe
-drives write one logical block atomically by specification. Whether a
+drives write one logical block atomically by specification; prefer a 4 KiB
+logical block format where the drive offers one (`nvme id-ns`). Whether a
 consumer drive honors a flush varies by model: in a 2022 power-cut test the
 Samsung 970 EVO Plus and WD Red SN700 kept flushed data, while the SK hynix
 Gold P31 and Sabrent Rocket lost it. Drives with power-loss protection are

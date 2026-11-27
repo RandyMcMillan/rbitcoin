@@ -117,13 +117,21 @@ journals whole sectors instead
 
 **The device the rules need.** Both rules describe an SSD that does two
 things: it keeps every write a completed flush acknowledged, and it writes
-one logical block whole or not at all when power fails. NVMe puts the
-second in the specification. Identify Controller reports the power-fail
-atomic write unit as `AWUPF`, counted in logical blocks from zero, so every
-controller guarantees at least one block, 512 bytes or 4 KiB by namespace
-format ([NVMe atomic writes](https://blogs.oracle.com/linux/nvme-atomic-write-with-qemu),
+each logical block whole or not at all when power fails. NVMe states the
+second per command. Identify Controller reports the power-fail atomic write
+unit as `AWUPF`, counted in logical blocks from zero, and a write of at most
+that many blocks lands whole; every controller covers at least one block,
+512 bytes or 4 KiB by namespace format
+([NVMe atomic writes](https://blogs.oracle.com/linux/nvme-atomic-write-with-qemu),
 [FAST '25](https://www.usenix.org/conference/fast25/presentation/jeon)).
-`nvme id-ctrl` shows `awupf` and `nvme id-ns` the block format.
+The kernel writes dirty pages back in commands of one page or more, so a
+command, including an append that shares its tail block with committed rows,
+can be larger than that unit. The specification promises nothing for such a
+command, and the sector rule then rests on the drive keeping each block it
+carries old or new. A 4 KiB format makes each block a whole page, so a block
+is never part old and part new across sectors; prefer it where the drive
+offers one. `nvme id-ctrl` shows `awupf`; `nvme id-ns` lists the formats, and
+`nvme format --lbaf` changes it and erases the namespace.
 
 The flush is where consumer drives differ. In a 2022 test that wrote,
 flushed, and then cut power, the Samsung 970 EVO Plus 2TB and the WD Red

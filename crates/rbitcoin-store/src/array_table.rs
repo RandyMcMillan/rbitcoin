@@ -704,6 +704,10 @@ pub struct ArrayTable {
     pub disk_len: AtomicU64,
     /// One flusher at a time.
     pub flush_lock: Mutex<()>,
+    /// An fd write failed after it armed `store/guard/class_c`. Its mark may
+    /// still be on the device even when the file is gone, so writes,
+    /// truncates, flushes, and pair reads refuse until reopen restores it.
+    class_c_failed: AtomicBool,
     /// Largest chunk the last flush passed to `write_at`. Debug builds only.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -767,6 +771,7 @@ impl ArrayTable {
             flushing: AtomicBool::new(false),
             disk_len: AtomicU64::new(n),
             flush_lock: Mutex::new(()),
+            class_c_failed: AtomicBool::new(false),
             #[cfg(debug_assertions)]
             flush_chunk_max: AtomicUsize::new(0),
         }
@@ -984,12 +989,18 @@ impl ArrayTable {
         let _hold = page_guard::hold_marks();
         self.refuse_armed_class_c()?;
         let pages = self.fd_guard_pages(pairs, max_idx, zero_gap)?;
-        let mark = self.arm_class_c(&pages)?;
-        self.write_fd_live(pairs, max_idx, zero_gap)?;
-        if let Some(mark) = mark {
-            page_guard::clear_page_guard(&mark, &self.file.read_file, self.file.path())?;
+        let armed = (|| {
+            let mark = self.arm_class_c(&pages)?;
+            self.write_fd_live(pairs, max_idx, zero_gap)?;
+            if let Some(mark) = mark {
+                page_guard::clear_page_guard(&mark, &self.file.read_file, self.file.path())?;
+            }
+            Ok(())
+        })();
+        if armed.is_err() {
+            self.class_c_failed.store(true, Ordering::Release);
         }
-        Ok(())
+        armed
     }
 
     /// Both columns of an fd-only pair under one `store/guard/class_c` mark.
@@ -1016,6 +1027,7 @@ impl ArrayTable {
         let _b_odd = b.begin_store()?;
         let _hold = page_guard::hold_marks();
         a.refuse_armed_class_c()?;
+        b.refuse_failed_class_c()?;
         let a_pages = a.fd_guard_pages(a_pairs, a_max, zero_gap)?;
         let b_pages = b.fd_guard_pages(b_pairs, b_max, zero_gap)?;
         let dir = a.store_dir()?;
@@ -1029,21 +1041,28 @@ impl ArrayTable {
                     .map(|(off, image)| (b_name, *off, image.as_slice())),
             )
             .collect();
-        if !refs.is_empty() {
-            page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
+        let armed = (|| {
+            if !refs.is_empty() {
+                page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
+            }
+            a.write_fd_live(a_pairs, a_max, zero_gap)?;
+            b.write_fd_live(b_pairs, b_max, zero_gap)?;
+            if !refs.is_empty() {
+                page_guard::clear_page_guard_files(
+                    &dir.join(page_guard::CLASS_C_MARK),
+                    &[
+                        (&a.file.read_file, a.file.path()),
+                        (&b.file.read_file, b.file.path()),
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        if armed.is_err() {
+            a.class_c_failed.store(true, Ordering::Release);
+            b.class_c_failed.store(true, Ordering::Release);
         }
-        a.write_fd_live(a_pairs, a_max, zero_gap)?;
-        b.write_fd_live(b_pairs, b_max, zero_gap)?;
-        if !refs.is_empty() {
-            page_guard::clear_page_guard_files(
-                &dir.join(page_guard::CLASS_C_MARK),
-                &[
-                    (&a.file.read_file, a.file.path()),
-                    (&b.file.read_file, b.file.path()),
-                ],
-            )?;
-        }
-        Ok(())
+        armed
     }
 
     pub(crate) fn is_fd_only(&self) -> bool {
@@ -1054,10 +1073,23 @@ impl ArrayTable {
     /// pages and then clear the file, dropping images it never rewrote.
     /// Refuse until reopen restores that mark.
     fn refuse_armed_class_c(&self) -> Result<(), StoreError> {
+        self.refuse_failed_class_c()?;
         let mark = self.store_dir()?.join(page_guard::CLASS_C_MARK);
         if mark.try_exists().map_err(|e| StoreError::io(&mark, e))? {
             return Err(StoreError::Rejected(
                 "an earlier Class C write is still armed; reopen restores it",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse after this table's own fd write failed under a mark. A failed
+    /// `guard/` sync can unlink the mark in RAM and lose the unlink in a
+    /// crash, so the missing file does not prove the mark is gone.
+    pub(crate) fn refuse_failed_class_c(&self) -> Result<(), StoreError> {
+        if self.class_c_failed.load(Ordering::Acquire) {
+            return Err(StoreError::Rejected(
+                "an earlier Class C write failed under its mark; reopen restores it",
             ));
         }
         Ok(())

@@ -811,6 +811,13 @@ impl HeaderTxsTable {
         Ok(())
     }
 
+    /// A failed fd pair write can leave `first` new and `count` old until
+    /// reopen restores its mark, so reads refuse until then.
+    fn refuse_failed_pair(&self) -> Result<(), StoreError> {
+        self.first.refuse_failed_class_c()?;
+        self.count.refuse_failed_class_c()
+    }
+
     /// Both columns are fd-only, so a pair write needs one mark for both.
     fn fd_pair(&self) -> bool {
         self.first.is_fd_only() && self.count.is_fd_only()
@@ -818,6 +825,7 @@ impl HeaderTxsTable {
 
     pub fn get_range(&self, header_fk: Fk) -> Result<Option<(Fk, u32)>, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+        self.refuse_failed_pair()?;
         let mut failed = None;
         let pair = seq_read(&self.seq, || {
             failed = None;
@@ -909,6 +917,7 @@ impl HeaderTxsTable {
     /// Headers with a Class A body (`count > 0`). Full scan for status and startup
     /// (`archived_block_count`) only. Not a plan hot path: Class A never leads tip.
     pub fn count_bodies(&self) -> Result<u64, StoreError> {
+        self.refuse_failed_pair()?;
         (0..self.count.len()).try_fold(0u64, |total, i| {
             Ok(total + u64::from(self.count.get(i)? > 0))
         })
@@ -1040,6 +1049,11 @@ pub fn release_class_c_group_pause() {
 /// images written as the live pages, then the clear. Unstored stays set until
 /// the mark is gone so a retry re-images every column.
 pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreError> {
+    // A barrier over a table whose fd write failed would report bytes that
+    // only reopen makes whole.
+    for t in tables {
+        t.refuse_failed_class_c()?;
+    }
     let _hold = page_guard::hold_marks();
     let mut dirty: Vec<(&ArrayTable, &str, crate::array_table::GuardSpan<'_>)> = Vec::new();
     #[cfg(debug_assertions)]

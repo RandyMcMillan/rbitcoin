@@ -810,6 +810,60 @@ fn fd_truncate_refuses_an_armed_mark() {
     assert_eq!(t.tip_height(), Some(Height(4999)));
 }
 
+/// A clear whose `guard/` sync fails has unlinked the mark, but the unlink
+/// may not be durable: a crash can bring the mark back. An fd-only truncate
+/// stays refused until reopen even though no mark file is left to see.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_truncate_refuses_after_a_failed_mark_dir_sync() {
+    use rbitcoin_primitives::Height;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-dirsync").unwrap();
+    let t = fd_only_confirmed(&dir.path, 5000);
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path.join("guard"));
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    assert!(t.set(&write, Height(10), Fk(7)).is_err());
+    assert!(!class_c_mark(&dir.path).exists());
+    match t.disconnect_tip(&write, Height(4999)) {
+        Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+        other => panic!("truncate after a failed guard/ sync: {other:?}"),
+    }
+    assert_eq!(t.tip_height(), Some(Height(4999)));
+    assert!(t.set(&write, Height(11), Fk(8)).is_err());
+    assert!(t.flush().is_err(), "flush passed over a failed fd write");
+}
+
+/// An fd-only pair write that fails after `first` is written leaves `first`
+/// new and `count` old. Reads of the pair and a flush refuse until reopen,
+/// which restores the armed mark.
+#[cfg(debug_assertions)]
+#[test]
+fn failed_fd_header_txs_pair_refuses_reads_until_reopen() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair-read").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+    }
+    {
+        let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+            HeaderTxsTable::open(&dir.path).unwrap()
+        });
+        rbitcoin_store::chain::fail_next_fd_write_before_live(
+            &dir.path.join("header_txs_count.body"),
+        );
+        assert!(t.put_range(&write, Fk(1), Fk(5), 3).is_err());
+        match t.get_range(Fk(1)) {
+            Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+            other => panic!("read of a torn pair: {other:?}"),
+        }
+        assert!(t.flush().is_err(), "flush passed over a torn pair");
+    }
+    let t = HeaderTxsTable::open(&dir.path).unwrap();
+    assert_eq!(t.get_range(Fk(1)).unwrap(), Some((Fk(5), 3)));
+}
+
 /// Each `header_txs` column picks RAM or fd from its own length. A pair whose
 /// lengths straddle the RAM cap would open as one fd column and one RAM
 /// column, and no single mark covers a write to that pair. Open refuses it.

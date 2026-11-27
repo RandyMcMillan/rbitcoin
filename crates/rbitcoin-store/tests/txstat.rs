@@ -177,6 +177,48 @@ fn open_refuses_a_legacy_txstat_ahead_journal() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A journal entry open cannot stat is not proof it is absent. A dangling
+/// symlink at the journal name is refused like a journal.
+#[cfg(unix)]
+#[test]
+fn open_refuses_a_dangling_txstat_ahead_entry() {
+    let dir = TempDir::labeled("txstat-legacy-ahead-link").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    t.append_batch(0, &[tiny(1, 2, 3)]).unwrap();
+    drop(t);
+    std::os::unix::fs::symlink(dir.join("gone"), dir.join("txstat.body.ahead")).unwrap();
+    match TxStat::open(&dir) {
+        Ok(_) => panic!("open accepted a dangling ahead journal link"),
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("txstat.body.ahead"), "{msg}"),
+        Err(other) => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// The IBD archive syncs `txstat.ovf` once for the batch before any slot,
+/// and leaves the slots to the Class A barrier. It does not sync per header.
+#[cfg(debug_assertions)]
+#[test]
+fn ibd_overflows_sync_the_overflow_once_per_batch() {
+    let dir = TempDir::labeled("txstat-ovf-batch").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    t.flush().unwrap();
+    let ranges = [(Fk(1), Fk(1), 1), (Fk(2), Fk(2), 1), (Fk(3), Fk(3), 1)];
+    let tails: Vec<(u64, Vec<u8>)> = (1..=3u64).map(|fk| (fk, vec![fk as u8; 4])).collect();
+    let (ovf, blk) = (t.ovf.io_handle(), t.blk.io_handle());
+    rbitcoin_store::io_handle::arm_fail_sync_after(ovf, 1, 1);
+    rbitcoin_store::io_handle::arm_fail_sync(blk, 1);
+    let put = t.put_overflows_for_headers(&ranges, &tails);
+    rbitcoin_store::io_handle::disarm_pwrite(ovf);
+    rbitcoin_store::io_handle::disarm_pwrite(blk);
+    put.expect("one overflow sync and no slot sync for the batch");
+    for fk in 1..=3u64 {
+        let want = encode_ovf_blob(&[(0, vec![fk as u8; 4])]).unwrap();
+        assert_eq!(t.header_blob(Fk(fk)).unwrap(), want);
+    }
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
 #[test]
 fn append_batch_relies_on_the_class_a_tail_guard() {
     let dir = TempDir::labeled("txstat-append-no-ahead").unwrap();

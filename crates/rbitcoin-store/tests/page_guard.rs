@@ -784,6 +784,7 @@ fn a_failed_append_poisons_its_group_until_reopen() {
             f.write_at_pwrite(FILE_HEADER_LEN as u64, &[1]),
             f.write_uncommitted(end, &[1]),
             f.set_logical_len(FILE_HEADER_LEN as u64),
+            f.zero_range(FILE_HEADER_LEN as u64, 8),
             group(&a, &b),
         ] {
             match refused {

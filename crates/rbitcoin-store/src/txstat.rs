@@ -203,9 +203,9 @@ pub fn decode_ovf_blob(raw: &[u8]) -> Result<Vec<(u16, Vec<u8>)>, StoreError> {
 /// A stamped cell completed by its overflow tail, or `None` when the tail is
 /// missing or does not complete it.
 ///
-/// A stamp writes the cells, then the blob, then its `txstat.blk` slot, and
-/// none is synced until the next barrier. After a power cut a cell can name
-/// a tail that never landed. Stats are rebuilt from the block, so such a row
+/// The archive writes the cells, then the blobs, then their `txstat.blk`
+/// slots, and syncs only `txstat.ovf` before the next barrier. After a power
+/// cut a cell can name a tail that never landed. Stats are rebuilt from the block, so such a row
 /// is unstamped: readers fall back and `getblockstats` stamps it again.
 fn merge_tail(cell: [u8; 8], tails: &[(u16, Vec<u8>)], idx: u16) -> Option<TxStatRow> {
     let rest = tail_for_index(tails, idx).ok()?;
@@ -288,9 +288,12 @@ impl TxStat {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         // The page-guard mark replaced `*.ahead`. A journal left by the
         // previous binary is not replayed, so opening would serve a torn page.
+        // Any entry at that name is refused, and so is one open cannot stat.
         let ahead = dir.join("txstat.body.ahead");
-        if ahead.is_file() {
-            return Err(StoreError::Corrupt("txstat.body.ahead"));
+        match std::fs::symlink_metadata(&ahead) {
+            Ok(_) => return Err(StoreError::Corrupt("txstat.body.ahead")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&ahead, e)),
         }
         let leftover = dir.join("txfixed.body");
         if leftover.exists() {
@@ -570,6 +573,7 @@ impl TxStat {
             }
             return Ok(());
         }
+        let mut slots = Vec::new();
         for &(hfk, first, n) in ranges {
             let Some(first_id) = first.get() else {
                 continue;
@@ -588,39 +592,52 @@ impl TxStat {
                 continue;
             }
             let raw = encode_ovf_blob(&chunk)?;
-            self.put_header_blob(hfk, &raw)?;
+            let hfk = hfk.get().ok_or(StoreError::InvalidFk)?;
+            slots.push((hfk, self.append_ovf_blob(&raw)?));
+        }
+        if slots.is_empty() {
+            return Ok(());
+        }
+        // One overflow sync for the batch, before any slot names a blob. The
+        // Class A barrier syncs the slots before Class C names the block.
+        self.ovf.sync_data_only()?;
+        for (hfk, slot) in slots {
+            self.blk.write_at_pwrite(Self::slot_offset(hfk), &slot)?;
         }
         Ok(())
     }
 
     pub fn put_header_blob(&self, header_fk: Fk, blob: &[u8]) -> Result<(), StoreError> {
         let hfk = header_fk.get().ok_or(StoreError::InvalidFk)?;
-        let (off, len, n) = if blob.is_empty() {
-            (0u64, 0u32, 0u32)
+        let slot = if blob.is_empty() {
+            [0u8; 16]
         } else {
-            let _append = self.ovf_append.lock().unwrap_or_else(|e| e.into_inner());
-            let at = FILE_HEADER_LEN as u64 + self.ovf.data_len();
-            self.ovf.write_at_pwrite(at, blob)?;
-            let nlen = blob.len() as u64;
-            let n_ovf = decode_ovf_blob(blob)?.len() as u32;
-            (
-                at,
-                u32::try_from(nlen).map_err(|_| StoreError::Corrupt("txstat ovf len"))?,
-                n_ovf,
-            )
-        };
-        if !blob.is_empty() {
+            let slot = self.append_ovf_blob(blob)?;
             // The slot below is synced. The blob and the txstat.ovf length it
             // names go first, as in `flush`.
             self.ovf.sync_data_only()?;
-        }
-        let slot_off = BLK_HEADER + (hfk - 1) * BLK_SLOT;
+            slot
+        };
+        stamp(&self.blk, Self::slot_offset(hfk), &slot)?;
+        Ok(())
+    }
+
+    fn slot_offset(hfk: u64) -> u64 {
+        BLK_HEADER + (hfk - 1) * BLK_SLOT
+    }
+
+    /// Append `blob` to `txstat.ovf`, unsynced, and return the slot naming it.
+    fn append_ovf_blob(&self, blob: &[u8]) -> Result<[u8; 16], StoreError> {
+        let _append = self.ovf_append.lock().unwrap_or_else(|e| e.into_inner());
+        let at = FILE_HEADER_LEN as u64 + self.ovf.data_len();
+        self.ovf.write_at_pwrite(at, blob)?;
+        let len = u32::try_from(blob.len()).map_err(|_| StoreError::Corrupt("txstat ovf len"))?;
+        let n = decode_ovf_blob(blob)?.len() as u32;
         let mut slot = [0u8; 16];
-        slot[0..8].copy_from_slice(&off.to_le_bytes());
+        slot[0..8].copy_from_slice(&at.to_le_bytes());
         slot[8..12].copy_from_slice(&len.to_le_bytes());
         slot[12..16].copy_from_slice(&n.to_le_bytes());
-        stamp(&self.blk, slot_off, &slot)?;
-        Ok(())
+        Ok(slot)
     }
 
     /// [`Self::header_blob`] for a reader: a slot past the end of

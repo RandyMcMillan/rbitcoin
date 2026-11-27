@@ -1358,6 +1358,8 @@ impl TableFile {
         if len == 0 {
             return Ok(());
         }
+        // The punch below skips `pwrite_checked`, so refuse here.
+        self.refuse_if_poisoned()?;
         // One committed end for the whole call. A fallback chunk publishes
         // its end, and those zeros are not a committed page the next chunk
         // shares.

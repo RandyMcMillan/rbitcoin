@@ -113,6 +113,37 @@ journals whole sectors instead
 ([psow](https://sqlite.org/psow.html),
 [atomic commit](https://www.sqlite.org/atomiccommit.html)).
 
+**The device the rules need.** Both rules describe an SSD that does two
+things: it keeps every write a completed flush acknowledged, and it writes
+one logical block whole or not at all when power fails. NVMe puts the
+second in the specification. Identify Controller reports the power-fail
+atomic write unit as `AWUPF`, counted in logical blocks from zero, so every
+controller guarantees at least one block, 512 bytes or 4 KiB by namespace
+format ([NVMe atomic writes](https://blogs.oracle.com/linux/nvme-atomic-write-with-qemu),
+[FAST '25](https://www.usenix.org/conference/fast25/presentation/jeon)).
+`nvme id-ctrl` shows `awupf` and `nvme id-ns` the block format.
+
+The flush is where consumer drives differ. In a 2022 test that wrote,
+flushed, and then cut power, the Samsung 970 EVO Plus 2TB and the WD Red
+SN700 1TB kept every flushed write. The SK hynix Gold P31 2TB and the
+Sabrent Rocket 512GB lost flushed data
+([Tom's Hardware](https://www.tomshardware.com/news/sk-hynix-sabrent-rocket-ssds-data-loss),
+[GIGAZINE](https://gigazine.net/gsc_news/en/20220224-ssd-cache-risk-data-loss/)).
+A drive that loses flushed data breaks every rule in this file, not only
+the sector rule, as it would for any database. Older SATA consumer drives
+were also seen to tear a single block on power loss
+([Zheng et al., FAST '13](https://www.usenix.org/conference/fast13/understanding-robustness-ssds-under-power-fault)).
+Drives with power-loss protection, which most enterprise and data-center
+models have, meet both requirements by design.
+
+The spend delta asks less of the device than these rules do. It never
+writes a 4 KiB block that holds bytes its commit names, so a block torn to
+zeroes loses nothing ([107](./external_findings/107-torn-spend-page.md)).
+That margin stays for the delta's I/O shape. The rest of the store does not
+rely on it: on a device that can tear a block it did not finish writing, a
+torn page 0 leaves a file that open refuses, and a torn tail block cuts
+rows an append shares it with.
+
 Any other write that changes committed bytes in more than one sector goes
 through `page_guard`. The writer stores an image of every page that
 write will touch, syncs that mark, writes the live bytes, syncs them, then

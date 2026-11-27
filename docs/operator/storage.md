@@ -1,5 +1,16 @@
 # Storage and indexes
 
+## Drives
+
+Run the datadir on an SSD that keeps flushed writes on power loss. NVMe
+drives write one logical block atomically by specification. Whether a
+consumer drive honors a flush varies by model: in a 2022 power-cut test the
+Samsung 970 EVO Plus and WD Red SN700 kept flushed data, while the SK hynix
+Gold P31 and Sabrent Rocket lost it. Drives with power-loss protection are
+safe by design. A drive that loses flushed writes can leave a store that
+refuses to open after a power cut, and recovery is a reindex. See
+[`../crash-recovery.md`](../crash-recovery.md) (the sector rule).
+
 ## Bulk store IO backends
 
 **Bulk batch** uses a **single** switch: `RBITCOIN_IO=uring|pool|iocp|pread` (default uring

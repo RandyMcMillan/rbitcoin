@@ -1283,6 +1283,75 @@ fn class_a_sync_failure_stops_the_class_c_commit() {
     }
 }
 
+/// A failed step of the shutdown flush does not skip the steps after it. A
+/// dirty scripthash index costs a full rebuild at the next start, so it syncs
+/// and clears its mark first, even when the tip seal then fails. The seal is
+/// skipped over a failed header sync: a retried fsync can return 0 over
+/// dropped pages (#2138).
+#[test]
+fn a_failed_shutdown_step_still_syncs_a_dirty_scripthash_index() {
+    use rbitcoin_store::io_handle::{arm_fail_flush, arm_fail_sync, IoHandle};
+    type Arm = fn(IoHandle, u32);
+    let header_body: ClassAPick = |s| s.headers.body.io_handle();
+    for (name, pick, arm, seal) in [
+        ("headers.body", header_body, arm_fail_flush as Arm, true),
+        (
+            CLASS_A_FILES[0].0,
+            CLASS_A_FILES[0].1,
+            arm_fail_sync as Arm,
+            true,
+        ),
+        ("no seal", header_body, arm_fail_flush as Arm, false),
+    ] {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+        s.flush_class_c_tip().unwrap();
+        let sealed = on_disk_hwm(&dir.join("confirmed.body"));
+        connect_coinbase(&s, &write, 1, genesis, parent);
+        drop(s.scripthash.begin_dirty_write().unwrap());
+        let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
+        assert!(marker.exists(), "{name}");
+        if seal {
+            if name == "headers.body" {
+                // A put leaves the body synced. Republish its length so the
+                // shutdown flush has a sync to fail, as after a failed put.
+                let body = &s.headers.body;
+                body.set_logical_len(body.logical_len()).unwrap();
+            }
+            arm(pick(&s), 1);
+        }
+        rbitcoin_log::capture_logs(true);
+        let flushed = s.flush_for_shutdown(seal);
+        let lines = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(flushed.is_err(), seal, "{name}: only a failed step errs");
+        assert!(!marker.exists(), "{name}: the scripthash sync was skipped");
+        assert_eq!(
+            on_disk_hwm(&dir.join("confirmed.body")),
+            sealed,
+            "{name}: the tip was sealed past a failed prerequisite"
+        );
+        let step = |what: &str| {
+            lines
+                .iter()
+                .position(|(_, l)| l.contains("shutdown flush") && l.contains(what))
+                .unwrap_or_else(|| panic!("{name}: no `{what}` step in {lines:?}"))
+        };
+        assert!(step("scripthash") < step("tip seal"), "{name}: {lines:?}");
+        assert!(step("tip seal") < step("Class A writeback"), "{name}");
+        assert!(
+            step("Class A writeback") < step("tx.head snapshot"),
+            "{name}"
+        );
+        drop(s);
+        let s = Store::open_tiny(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A barrier in flight when another caller's Class A sync fails must not
 /// commit after it. The failed fsync took the writeback error for the shared
 /// file description, so the in-flight one can return 0 over dropped pages.

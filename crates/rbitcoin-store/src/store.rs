@@ -2535,29 +2535,59 @@ impl Store {
 
     /// Process-exit flush (IBD / SIGTERM). Target: seconds, not minutes.
     ///
-    /// 1. The connect barrier: Class A `sync_data`, then the Class C tables.
-    /// 2. MS_ASYNC Class A bodies and the derived heads.
-    /// 3. Snapshot the open `tx.head`. That error is logged. It does not
-    ///    skip the writebacks, and a writeback error does not skip it.
-    pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
+    /// The step that is costliest to lose runs first. A failed step does not
+    /// skip the steps after it. Each failure is logged, and the first is
+    /// returned.
+    ///
+    /// 1. A dirty scripthash index gets a synced flush, which clears
+    ///    `scripthash.dirty`. Left behind, the mark refuses the next start
+    ///    until a full rebuild from Class A. Its postings name only sealed
+    ///    creates, so this step does not wait for the seal below.
+    /// 2. Headers, then the connect barrier (Class A `sync_data`, then the
+    ///    Class C tables). The barrier runs only when `seal_tip` is set and
+    ///    the header sync succeeded: a retried fsync can return 0 over pages
+    ///    the kernel dropped. Without it the next start resumes from the last
+    ///    seal.
+    /// 3. MS_ASYNC writeback of the Class A bodies and `spent.ovf`.
+    /// 4. One dense snapshot of the open `tx.head` tail. Not [`Self::flush`],
+    ///    which fsyncs every Class A body. Without it open rebuilds that tail
+    ///    from `txid.body`, so its error is logged and not returned.
+    pub fn flush_for_shutdown(&self, seal_tip: bool) -> Result<(), StoreError> {
         let t0 = std::time::Instant::now();
-        rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
-        self.headers.flush()?;
-        self.flush_class_c_tip()?;
-        rbitcoin_log::info!(
-            "store: shutdown flush — async Class A… elapsed={:?}",
-            t0.elapsed()
-        );
-        let txs = self.txs.flush_async();
-        let spenders = self.spenders.flush_async();
-        let scripthash = self.scripthash.flush_for_close();
-        // One dense image of the open tx.head tail. Not Store::flush: that
-        // fsyncs every Class A body.
-        if let Err(e) = self.txs.flush_head() {
-            rbitcoin_log::warn!("store: shutdown tx.head snapshot failed: {e}");
+        let mut first = None;
+        let mut step = |what: &str, done: Result<(), StoreError>| match done {
+            Ok(()) => rbitcoin_log::info!(
+                "store: shutdown flush — {what} done elapsed={:?}",
+                t0.elapsed()
+            ),
+            Err(e) => {
+                rbitcoin_log::warn!("store: shutdown flush — {what} failed: {e}");
+                first.get_or_insert(e);
+            }
+        };
+        step("scripthash", self.scripthash.flush_for_close());
+        let headers = self.headers.flush();
+        let headers_synced = headers.is_ok();
+        step("headers", headers);
+        if seal_tip && headers_synced {
+            step("tip seal", self.flush_class_c_tip().map(|_| ()));
+        } else {
+            rbitcoin_log::warn!(
+                "store: shutdown flush — tip seal skipped; the next start resumes \
+                 from the last seal"
+            );
         }
-        rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
-        txs.and(spenders).and(scripthash)
+        let spenders = self.spenders.flush_async();
+        step("Class A writeback", self.txs.flush_async().and(spenders));
+        // Open rebuilds the tail from `txid.body`, so a failure is only logged.
+        match self.txs.flush_head() {
+            Ok(()) => rbitcoin_log::info!(
+                "store: shutdown flush — tx.head snapshot done elapsed={:?}",
+                t0.elapsed()
+            ),
+            Err(e) => rbitcoin_log::warn!("store: shutdown flush — tx.head snapshot failed: {e}"),
+        }
+        first.map_or(Ok(()), Err)
     }
 }
 

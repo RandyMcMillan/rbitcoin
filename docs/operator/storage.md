@@ -247,6 +247,18 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 | **off (default)** | No SH run enqueue during IBD; no tip bulk materialize. Tip follow + mempool relay + JSON-RPC work without SH. |
 | **on** (`--sh-index` / `sh_index=1`) | Direct IBD defers SH. Tip entry runs two Class A scans, then pack and seal; write-behind follows. Address/scripthash Electrum/Esplora methods work after that seal. |
 
+**A crash during an index write refuses the next start.** Some index writes
+land in place, so the node marks `store/scripthash.dirty` before it writes and
+removes the mark once those bytes are synced (about every second while the
+index catches up, and at a clean shutdown). If the process dies in between (a
+kill -9, an out-of-memory kill or a power cut), the next start with
+`--sh-index` exits with a "torn write" error, because the index can read as
+valid and be wrong. Start once with `RBITCOIN_SH_FORCE_REBUILD=1` to rebuild
+it from Class A. That takes hours on mainnet, but the chain is not touched.
+Under systemd, an exit loop with `Restart=always` is this refusal. Give a
+clean stop room to finish (`TimeoutStopSec`): the shutdown flush syncs the
+index first.
+
 Electrum/Esplora **start without** `--sh-index`. Address/scripthash methods then fail closed (`scripthash index disabled`). Txid/outpoint/block/fees still work. Matrix: [`docs/lightning.md`](../../docs/lightning.md).
 
 `--esplora-block-template` (conf `esplora_block_template=1`) enables

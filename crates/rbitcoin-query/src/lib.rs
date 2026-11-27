@@ -2417,12 +2417,21 @@ impl Query {
 
     /// Host-friendly process-exit flush (durability for open tables).
     ///
-    /// See [`rbitcoin_store::Store::flush_for_shutdown`].
+    /// See [`rbitcoin_store::Store::flush_for_shutdown`]. A failed IBD tip
+    /// flush, or a tip whose keep-window file is missing, must not become the
+    /// disk tip. Either one skips only the seal: the other steps still run,
+    /// and the first error is returned.
     pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
-        let _commit = self.lock_tip_commit()?;
-        // A tip whose keep-window file is missing must not become the disk tip.
-        self.require_pruned_keep_spills()?;
-        self.store.flush_for_shutdown()
+        let _commit = self.tip_commit.lock().unwrap_or_else(|e| e.into_inner());
+        let sealable = self
+            .join_tip_flush()
+            .and_then(|()| self.require_pruned_keep_spills());
+        if let Err(e) = &sealable {
+            rbitcoin_log::warn!("store: shutdown flush — the tip is not sealable: {e}");
+        }
+        let flushed = self.store.flush_for_shutdown(sealable.is_ok());
+        sealable?;
+        flushed
     }
 }
 

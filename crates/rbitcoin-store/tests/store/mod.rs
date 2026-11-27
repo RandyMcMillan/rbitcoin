@@ -22,7 +22,7 @@ fn shutdown_head_snapshot_error_still_returns_ok() {
     let s = Store::open_or_create_tiny(&dir).unwrap();
     let block = dir.join("tx.head").join("meta.tmp");
     std::fs::create_dir(&block).unwrap();
-    s.flush_for_shutdown()
+    s.flush_for_shutdown(true)
         .expect("a head snapshot error is logged, not returned");
     let _ = std::fs::remove_dir(&block);
 }
@@ -642,7 +642,7 @@ fn store_create_open_archive_spend_and_meta_errors() {
 
     assert_eq!(s.archived_block_count().unwrap(), 1);
     s.flush_header_archive().unwrap();
-    s.flush_for_shutdown().unwrap();
+    s.flush_for_shutdown(true).unwrap();
 
     // repair: strong not on the fence
     s.strong_tx

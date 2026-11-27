@@ -43,12 +43,12 @@ transaction.
   disk. The one exception is the tail: the build kept two tail slots, so
   when one fails its checksum and the other decodes, open restores from the
   good slot and removes both with the guard, as that build's open did.
-- Class C `confirmed[]` and `header_txs_*` write a synced `*.ahead` sidecar
-  of the intended pages before an in-place write, and open restores it before
-  reading the table. An array flush always images page 0, because it rewrites
-  the length there even when a shrink writes no slot or empties the table.
-  `strong_tx` has no sidecar: open sets every strong bit a fence run names
-  again (`restore_strong_from_fence`).
+- Class C `confirmed[]`, `header_txs_*`, and `strong_tx` share one synced
+  `store/guard/class_c` mark of the intended 4 KiB pages before an in-place
+  write, and open copies its images back before reading those tables. An
+  array flush always images page 0, because it rewrites the length there even
+  when a shrink writes no slot or empties the table. Open refuses a legacy
+  `confirmed.body.ahead` or `header_txs_*.body.ahead` instead of restoring it.
 - `header.body` only appends, and its rows are synced before the
   `header.head` insert names them. `header.head` writes a synced `*.ahead`
   image before an in-place write, and open restores it before reading.

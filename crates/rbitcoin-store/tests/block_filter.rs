@@ -418,30 +418,40 @@ fn open_cuts_a_body_length_published_before_its_idx() {
     assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
 }
 
-/// A reader of a committed height does not wait for a put's syncs and mark.
+/// A reader of a committed height does not wait for a put's syncs: the put
+/// is paused inside its commit, after the syncs and before any length moves,
+/// while the read runs.
+#[cfg(debug_assertions)]
 #[test]
 fn a_committed_filter_reads_during_a_put() {
     let dir = tmp_dir();
     let t = BlockFilterTable::open_or_create(&dir).unwrap();
     put_range(&t, 0, 0);
-    let held = rbitcoin_store::page_guard::hold_marks();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
-        let putting = scope.spawn(|| {
+        let t = &t;
+        let putting = scope.spawn(move || {
+            rbitcoin_store::page_guard::set_commit_hook(Some(Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+                Ok(())
+            })));
             t.put(&[BlockFilterRecord {
                 height: Height(1),
                 slot: slot(1),
                 filter: &[1, 1, 1, 1],
             }])
         });
-        // Let the put reach the mark hold inside its commit.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the put never reached its commit");
         let (tx, rx) = std::sync::mpsc::channel();
-        let t = &t;
         scope.spawn(move || {
             let _ = tx.send(t.slot(Height(0)).map(|s| s.is_some()));
         });
         let got = rx.recv_timeout(std::time::Duration::from_secs(2));
-        drop(held);
+        let _ = release_tx.send(());
         assert!(
             matches!(got, Ok(Ok(true))),
             "a committed read waited for the put's commit: {got:?}"
@@ -449,6 +459,41 @@ fn a_committed_filter_reads_during_a_put() {
         putting.join().unwrap().unwrap();
     });
     assert_eq!(t.next_height(), Height(2));
+}
+
+/// A put whose writes all go to a pair it rolls, and whose commit fails,
+/// still makes the next put wait for reopen.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_put_into_a_rolled_pair_refuses_the_next_put() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    drop(t);
+    // Record 0 now ends one past u32::MAX, so the next put rolls a pair.
+    let big = u32::MAX - FILE_HEADER_LEN as u32 + 1;
+    let idx = BlockFilterTable::seg_dirs(&dir).idx_path(0);
+    let mut raw = fs::read(&idx).unwrap();
+    raw[FILE_HEADER_LEN + 4..FILE_HEADER_LEN + 8].copy_from_slice(&big.to_le_bytes());
+    fs::write(&idx, &raw).unwrap();
+    set_file_hwm(
+        &BlockFilterTable::seg_dirs(&dir).body_path(0),
+        u64::from(u32::MAX) + 1,
+    );
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    rbitcoin_store::page_guard::set_commit_hook(Some(Box::new(|| {
+        Err(StoreError::Corrupt("injected commit failure"))
+    })));
+    let rec = |h: u32| BlockFilterRecord {
+        height: Height(h),
+        slot: slot(h),
+        filter: &[1, 1, 1, 1],
+    };
+    assert!(t.put(&[rec(1)]).is_err());
+    match t.put(&[rec(1)]) {
+        Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+        other => panic!("a put after a failed rolled put: {other:?}"),
+    }
 }
 
 /// A repair of a committed filter waits for reopen after a failed put, like

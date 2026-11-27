@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 
@@ -141,17 +141,6 @@ pub fn check_armed_write(
         page = page.saturating_add(PAGE);
     }
     Ok(())
-}
-
-/// One process-wide hold for every mark. Arm and clear of the same path must
-/// sit inside one hold, or a second flusher can rename the file between them.
-#[doc(hidden)]
-pub fn hold_marks() -> MutexGuard<'static, ()> {
-    static MARKS: OnceLock<Mutex<()>> = OnceLock::new();
-    MARKS
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// One group mark for several files. A retry replaces the image at the same
@@ -643,6 +632,8 @@ fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
     for (file, _) in &files {
         file.sync_data_only()?;
     }
+    #[cfg(debug_assertions)]
+    run_commit_hook()?;
     for (file, end) in &files {
         file.set_logical_len(*end)?;
         file.flush()?;
@@ -704,4 +695,30 @@ fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError>
         return Err(StoreError::Corrupt("page guard mark length"));
     }
     Ok(pages)
+}
+
+#[cfg(debug_assertions)]
+type CommitHook = Box<dyn FnOnce() -> Result<(), StoreError>>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static COMMIT_HOOK: std::cell::RefCell<Option<CommitHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` once on this thread inside the next [`commit_appends`], after
+/// its bytes are synced and before any length moves. An error fails that
+/// commit there.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_commit_hook(hook: Option<CommitHook>) {
+    COMMIT_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(debug_assertions)]
+fn run_commit_hook() -> Result<(), StoreError> {
+    match COMMIT_HOOK.with(|slot| slot.borrow_mut().take()) {
+        Some(hook) => hook(),
+        None => Ok(()),
+    }
 }

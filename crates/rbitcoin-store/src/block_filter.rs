@@ -584,8 +584,16 @@ impl BlockFilterTable {
             drop(writes);
             // A length may be durable already, including a rolled pair's.
             // The failed group is poisoned: leave the files for reopen and
-            // publish nothing.
-            committed?;
+            // publish nothing. A put whose writes all went to pairs it
+            // rolled drops those pairs here, so the last published pair is
+            // poisoned too and the next put still waits for reopen.
+            if let Err(e) = committed {
+                if let Some(seg) = inner.segs.last() {
+                    seg.idx.poison();
+                    seg.body.poison();
+                }
+                return Err(e);
+            }
             let tail_end = plans.last().map(|p| p.body_end);
             (counts, rolled, tail_end)
         };

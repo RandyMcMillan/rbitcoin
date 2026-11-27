@@ -153,7 +153,7 @@ pub struct Mempool {
     /// Durable DEAD rows waiting for the next flush mark.
     pub deaths_unsynced: bool,
     /// Slots whose status byte the next flush mark must publish.
-    death_slots: Vec<u32>,
+    death_slots: Vec<QueuedDeath>,
     /// The live slot table is `slots.tmp`: a compact renamed the body but not
     /// the slots. Writes stay there until a persist or the next open links it.
     slots_pending: bool,
@@ -396,8 +396,8 @@ impl Mempool {
     fn death_ranges(&self) -> Vec<(usize, usize)> {
         self.death_slots
             .iter()
-            .map(|slot| {
-                let off = SLOTS_HEADER + (*slot as usize) * SLOT_REC;
+            .map(|death| {
+                let off = death.offset();
                 (off, off + 1)
             })
             .collect()
@@ -491,7 +491,7 @@ impl Mempool {
         // a mark open or a retry restored, can have published it. An armed
         // flush mark may name it LIVE too: open would replay it.
         if body_off.saturating_add(body_len) <= self.body_synced_len || self.flush_mark_armed {
-            self.death_slots.push(slot);
+            self.death_slots.push(QueuedDeath::of(slot, &rec));
             self.deaths_unsynced = true;
         }
         Ok(())
@@ -1024,13 +1024,37 @@ impl Mempool {
     /// persist. `deaths_unsynced` stays set until the mark is cleared, so a
     /// failed call retries. Does not rewrite the slot table and does not
     /// rename `tx.body`.
+    ///
+    /// A leftover mark is applied first. It may install a replacement in a
+    /// queued slot, and a death stamps only a row that still holds the
+    /// record its removal killed.
     pub fn sync_deaths(&mut self) -> Result<(), MempoolError> {
         if !self.deaths_unsynced {
             return Ok(());
         }
-        let ranges = self.death_ranges();
-        let dead_at: Vec<usize> = ranges.iter().map(|(off, _)| *off).collect();
+        let body_path = self.dir.join("tx.body");
+        self.settle_flush_mark(&body_path)?;
+        let dead_at = self.deaths_still_on_disk()?;
+        let ranges: Vec<(usize, usize)> = dead_at.iter().map(|off| (*off, off + 1)).collect();
         self.commit_guarded(false, &ranges, None, true, &dead_at, true)
+    }
+
+    /// Offsets of the queued deaths whose disk row is still the killed record.
+    fn deaths_still_on_disk(&mut self) -> Result<Vec<usize>, MempoolError> {
+        let slots_path = self.slots_path();
+        let mut dead_at = Vec::with_capacity(self.death_slots.len());
+        for death in &self.death_slots {
+            let off = death.offset();
+            let mut rec = [0u8; SLOT_REC];
+            self.slots_file
+                .seek(SeekFrom::Start(off as u64))
+                .and_then(|_| self.slots_file.read_exact(&mut rec))
+                .map_err(|e| MempoolError::io(&slots_path, e))?;
+            if death.names(&rec) {
+                dead_at.push(off);
+            }
+        }
+        Ok(dead_at)
     }
 
     /// One forward mark for the pages this flush dirties.
@@ -1158,33 +1182,34 @@ impl Mempool {
         images: &mut Vec<(String, u64, [u8; 4096])>,
     ) -> Result<(), MempoolError> {
         let page = rbitcoin_store::page_guard::PAGE;
-        if let Some(ram) = full_slots {
-            let need = ram.len() as u64;
+        let cap_len = (SLOTS_HEADER + (self.slot_cap as usize) * SLOT_REC) as u64;
+        let need = full_slots.map_or(0, |ram| ram.len() as u64).max(cap_len);
+        if need > self.slots_len_synced {
             let have = self
                 .slots_file
                 .metadata()
                 .map_err(|e| MempoolError::io(slots_path, e))?
                 .len();
-            if need > self.slots_len_synced {
-                if need > have {
-                    self.slots_file
-                        .set_len(need)
-                        .map_err(|e| MempoolError::io(slots_path, e))?;
-                }
-                // The growth mark publishes `slot_cap` in page 0 and does not
-                // image the zero tail. The longer file has to be durable first.
-                #[cfg(debug_assertions)]
-                if grow_sync_fails(&self.dir) {
-                    return Err(MempoolError::io(
-                        slots_path,
-                        std::io::Error::other("injected slot growth sync failure"),
-                    ));
-                }
+            if need > have {
                 self.slots_file
-                    .durable_sync_all()
+                    .set_len(need)
                     .map_err(|e| MempoolError::io(slots_path, e))?;
-                self.slots_len_synced = need;
             }
+            // Every mark publishes `slot_cap` in meta and does not image the
+            // zero tail. The longer file has to be durable first.
+            #[cfg(debug_assertions)]
+            if grow_sync_fails(&self.dir) {
+                return Err(MempoolError::io(
+                    slots_path,
+                    std::io::Error::other("injected slot growth sync failure"),
+                ));
+            }
+            self.slots_file
+                .durable_sync_all()
+                .map_err(|e| MempoolError::io(slots_path, e))?;
+            self.slots_len_synced = need;
+        }
+        if let Some(ram) = full_slots {
             let mut page_off = 0u64;
             while (page_off as usize) < ram.len() {
                 let mut image = read_page(&mut self.slots_file, slots_path, page_off)?;
@@ -1360,8 +1385,11 @@ impl Mempool {
         live_body_bytes: u64,
     ) -> Result<(), MempoolError> {
         // An interrupted flush mark still names the pre-compact pages. Apply
-        // it and drop it before the packed names replace those files.
+        // it and drop it before the packed names replace those files. A mark
+        // a failed clear unlinked may still be named on disk, so the removal
+        // is made durable here too.
         restore_mempool_mark(&self.dir)?;
+        sync_guard_dir(&self.dir)?;
         let body_path = self.dir.join("tx.body");
         let slots_path = self.dir.join("slots");
         let body_tmp = self.dir.join("tx.body.tmp");
@@ -1412,6 +1440,42 @@ impl Mempool {
         self.death_slots.clear();
         self.deaths_unsynced = false;
     }
+}
+
+/// A durable row a removal queued for DEAD, and the record it named.
+///
+/// The slot may be reused, and a replayed mark may install the replacement
+/// on disk before the death publishes, so the death carries its record.
+#[derive(Clone, Copy)]
+struct QueuedDeath {
+    slot: u32,
+    /// Body offset, body length, and txid of the killed record.
+    record: [u8; SLOT_REC - 4],
+}
+
+impl QueuedDeath {
+    fn of(slot: u32, rec: &[u8; SLOT_REC]) -> Self {
+        let mut record = [0u8; SLOT_REC - 4];
+        record.copy_from_slice(&rec[4..]);
+        Self { slot, record }
+    }
+
+    fn offset(&self) -> usize {
+        SLOTS_HEADER + (self.slot as usize) * SLOT_REC
+    }
+
+    fn names(&self, rec: &[u8; SLOT_REC]) -> bool {
+        rec[4..] == self.record
+    }
+}
+
+/// Sync `guard/` when it exists, so an unlinked mark stays gone after a crash.
+fn sync_guard_dir(dir: &Path) -> Result<(), MempoolError> {
+    let guard = dir.join("guard");
+    if !guard.is_dir() {
+        return Ok(());
+    }
+    rbitcoin_store::file::fsync_parent_dir(&guard).map_err(|e| MempoolError::io(&guard, e))
 }
 
 /// Force status bytes to [`SLOT_DEAD`] on slot images this flush already built.

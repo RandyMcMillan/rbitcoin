@@ -1783,9 +1783,13 @@ fn remove_txid_reports_a_failed_death_publication() {
         mp.remove_txid(&txid, BLOCK).is_err(),
         "the death mark failed but the removal returned Ok"
     );
+    let mark = dir.join("guard/flush");
+    assert!(mark.is_file(), "the failed death left no armed mark");
     // A death-only retry: a full flush would publish the slot DEAD from RAM
     // whether or not the death stayed queued.
     mp.store.sync_deaths().unwrap();
+    // Open would replay the armed mark's DEAD image without any retry.
+    assert!(!mark.exists(), "the retry did not settle the armed mark");
     // The process dies here: nothing flushes on the way out.
     std::mem::forget(mp);
     let mp = ActiveMempool::open_or_create(&dir).unwrap();

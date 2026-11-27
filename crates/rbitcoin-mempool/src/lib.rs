@@ -17,8 +17,10 @@
 //! tick. A removal (`remove_block_txids`, RBF, expiry, `remove_txid`)
 //! publishes its DEAD bytes on that same mark immediately, without waiting for
 //! the tick (not a one-byte pwrite, not a full slot dump, not one sync per tx).
-//! [`ActiveMempool::flush`] bumps `G` and publishes the body, the slot table,
-//! and `meta` in that mark. `tx.body` is not renamed. Crash may lose ≤5 s of
+//! [`ActiveMempool::flush`] bumps `G`, appends and syncs the body tail and
+//! its length, then publishes the slot table and `meta` in that mark. The
+//! mark images only slot and `meta` pages, so replay cannot restore
+//! `tx.body` bytes; they are durable before it arms. `tx.body` is not renamed. Crash may lose ≤5 s of
 //! admits; never LIVE slots past durable `tx.body`. Leftover schema 1–3
 //! converts on open. Schema 1 has empty vin aux (SH reindex batch-fills),
 //! schema ≤ 2 has unknown sigops until the hub recomputes them, and every

@@ -2004,3 +2004,99 @@ fn a_retried_persist_after_a_failed_mark_keeps_every_admit() {
     assert!(ids.iter().all(|id| live.contains(id)));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A persist commits B in A's reused slot, arms its mark, and fails before
+/// its writes. A death sync then replays that mark, so the row on disk is B.
+/// A's queued death must not stamp B DEAD.
+#[cfg(debug_assertions)]
+#[test]
+fn a_death_sync_skips_a_replacement_its_mark_replayed() {
+    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
+    let dir = tmp_dir();
+    let old = Txid::from_byte_array([0xC8; 32]);
+    let new = Txid::from_byte_array([0xC9; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    mp.set_now_ms(0);
+    let slot = put_live(&mut mp, &old, 1, 400);
+    mp.flush().unwrap();
+    mp.mark_slot_dead(slot).unwrap();
+    let reused = put_live(&mut mp, &new, 2, 400);
+    assert_eq!(reused, slot);
+    mp.set_now_ms(PERSIST_INTERVAL_MS);
+    fail_next_mempool_guard_before_write(&dir);
+    assert!(mp.persist_due().is_err());
+    mp.sync_deaths().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = Mempool::open_or_create(&dir).unwrap();
+    let ids: Vec<_> = mp
+        .load_live_txs()
+        .unwrap()
+        .iter()
+        .map(|tx| tx.packed.txid)
+        .collect();
+    assert!(ids.contains(&new), "a queued death stamped the replacement");
+    assert!(!ids.contains(&old));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A grow whose slot-file sync failed leaves the longer file undurable. A
+/// death sync must not publish the larger `slot_cap` before that sync
+/// succeeds: a crash can drop the extension, and open would refuse a meta
+/// whose cap the file does not reach.
+#[cfg(debug_assertions)]
+#[test]
+fn a_death_sync_does_not_publish_an_unsynced_slot_growth() {
+    use rbitcoin_mempool::store::set_mempool_grow_sync_fails;
+    let dir = tmp_dir();
+    let id = Txid::from_byte_array([0xCA; 32]);
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let slot = put_live(&mut mp, &id, 1, 400);
+    mp.flush().unwrap();
+    let synced_len = fs::metadata(dir.join("slots")).unwrap().len();
+    set_mempool_grow_sync_fails(&dir, true);
+    assert!(mp.grow_slots().is_err());
+    mp.mark_slot_dead(slot).unwrap();
+    let _ = mp.sync_deaths();
+    set_mempool_grow_sync_fails(&dir, false);
+    std::mem::forget(mp);
+    // Power loss drops the unsynced extension.
+    let slots = OpenOptions::new()
+        .write(true)
+        .open(dir.join("slots"))
+        .unwrap();
+    slots.set_len(synced_len).unwrap();
+    drop(slots);
+    Mempool::open_or_create(&dir).expect("meta named a slot cap the durable file lacks");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A death sync unlinks its mark and then fails the `guard/` sync, so the
+/// unlink may not be durable. A compact must make it durable before the
+/// packed files take their names, or a crash replays the old pages onto
+/// the packed table.
+#[cfg(debug_assertions)]
+#[test]
+fn compact_syncs_a_cleared_mark_away_before_installing() {
+    use rbitcoin_store::page_guard::fail_next_mark_dir_sync;
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let gone = put_live(&mut mp, &Txid::from_byte_array([0xCB; 32]), 1, 400);
+    put_live(&mut mp, &Txid::from_byte_array([0xCC; 32]), 1, 400);
+    mp.flush().unwrap();
+    mp.mark_slot_dead(gone).unwrap();
+    let guard = dir.join("guard");
+    fail_next_mark_dir_sync(&guard);
+    assert!(mp.sync_deaths().is_err());
+    assert!(!guard.join("flush").exists());
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    mp.compact().unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let guard_at = synced.iter().position(|d| d == &guard);
+    let dir_at = synced.iter().position(|d| d == dir.path());
+    assert!(
+        matches!((guard_at, dir_at), (Some(g), Some(m)) if g < m),
+        "compact installed before guard/ was synced: {synced:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -796,9 +796,7 @@ impl Query {
 
         let write = rbitcoin_store::ClassCWrite::new();
         if !header_ranges.is_empty() {
-            self.store
-                .header_txs
-                .put_ranges_batch(&write, header_ranges)?;
+            self.store.put_header_ranges(&write, header_ranges)?;
         }
 
         let t_strong = std::time::Instant::now();

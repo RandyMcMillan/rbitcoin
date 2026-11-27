@@ -548,7 +548,9 @@ impl StrongTxTable {
 /// `count.body[header_fk-1]` is the tx count (0 = no body).
 ///
 /// `put_range`, `put_lists_batch`, `put_ranges_batch`, and `clear_body` store
-/// the first column, then the count, under one pair counter. If the count
+/// the first column, then the count, under one pair counter. An fd-only pair
+/// is durable when the put returns, so a range that names new creates goes
+/// through [`crate::store::Store::put_header_ranges`], which syncs Class A first. If the count
 /// store returns an error, `get_range` can accept the new first with the
 /// previous count once the call returns.
 pub struct HeaderTxsTable {
@@ -818,17 +820,23 @@ impl HeaderTxsTable {
         self.count.refuse_failed_class_c()
     }
 
-    /// Both columns are fd-only, so a pair write needs one mark for both.
-    fn fd_pair(&self) -> bool {
+    /// Both columns are fd-only, so a pair write needs one mark for both,
+    /// and the pair is durable when the write returns.
+    pub(crate) fn fd_pair(&self) -> bool {
         self.first.is_fd_only() && self.count.is_fd_only()
     }
 
     pub fn get_range(&self, header_fk: Fk) -> Result<Option<(Fk, u32)>, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.refuse_failed_pair()?;
         let mut failed = None;
         let pair = seq_read(&self.seq, || {
             failed = None;
+            // In the sample: a read waiting out a pair write that then
+            // failed must not accept the torn pair it left.
+            if let Err(e) = self.refuse_failed_pair() {
+                failed = Some(e);
+                return Some(None);
+            }
             if id > self.first.len() {
                 return Some(None);
             }
@@ -944,7 +952,7 @@ impl HeaderTxsTable {
     }
 }
 
-/// Test pause after the first table's page images and before the next table's.
+/// Test pause inside a Class C group flush, at one armed [`class_c_pause::Point`].
 ///
 /// Armed for one store directory. A flush of another directory does not wait.
 #[cfg(debug_assertions)]
@@ -953,8 +961,16 @@ mod class_c_pause {
     use std::sync::{Condvar, Mutex, OnceLock};
     use std::time::Duration;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Point {
+        /// Before the mark lock and the failed-write check under it.
+        BeforeHold,
+        /// After the first table's page images, before the next table's.
+        Between,
+    }
+
     struct Inner {
-        dir: Option<PathBuf>,
+        armed: Option<(PathBuf, Point)>,
         entered: bool,
     }
 
@@ -967,36 +983,41 @@ mod class_c_pause {
         static PAUSE: OnceLock<Pause> = OnceLock::new();
         PAUSE.get_or_init(|| Pause {
             inner: Mutex::new(Inner {
-                dir: None,
+                armed: None,
                 entered: false,
             }),
             cv: Condvar::new(),
         })
     }
 
-    pub(super) fn between(dir: &Path) {
+    fn is_armed(inner: &Inner, dir: &Path, at: Point) -> bool {
+        inner
+            .armed
+            .as_ref()
+            .is_some_and(|(d, p)| d.as_path() == dir && *p == at)
+    }
+
+    pub(super) fn at(dir: &Path, point: Point) {
         let pause = pause();
         let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.dir.as_deref() != Some(dir) {
+        if !is_armed(&inner, dir, point) {
             return;
         }
         inner.entered = true;
         pause.cv.notify_all();
-        while inner.dir.as_deref() == Some(dir) {
+        while is_armed(&inner, dir, point) {
             inner = pause.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    #[doc(hidden)]
-    pub fn arm(dir: &Path) {
+    pub(super) fn arm(dir: &Path, point: Point) {
         let pause = pause();
         let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.dir = Some(dir.to_path_buf());
+        inner.armed = Some((dir.to_path_buf(), point));
         inner.entered = false;
     }
 
-    #[doc(hidden)]
-    pub fn wait_until_entered(limit: Duration) -> bool {
+    pub(super) fn wait_until_entered(limit: Duration) -> bool {
         let pause = pause();
         let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + limit;
@@ -1017,11 +1038,10 @@ mod class_c_pause {
         true
     }
 
-    #[doc(hidden)]
-    pub fn release() {
+    pub(super) fn release() {
         let pause = pause();
         let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.dir = None;
+        inner.armed = None;
         inner.entered = false;
         pause.cv.notify_all();
     }
@@ -1030,7 +1050,14 @@ mod class_c_pause {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn arm_class_c_group_pause(dir: &Path) {
-    class_c_pause::arm(dir);
+    class_c_pause::arm(dir, class_c_pause::Point::Between);
+}
+
+/// Pause the next group flush of `dir` before it takes the mark lock.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_class_c_hold_pause(dir: &Path) {
+    class_c_pause::arm(dir, class_c_pause::Point::BeforeHold);
 }
 
 #[cfg(debug_assertions)]
@@ -1049,12 +1076,17 @@ pub fn release_class_c_group_pause() {
 /// images written as the live pages, then the clear. Unstored stays set until
 /// the mark is gone so a retry re-images every column.
 pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreError> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = tables.first().and_then(|t| t.file.path().parent()) {
+        class_c_pause::at(dir, class_c_pause::Point::BeforeHold);
+    }
+    let _hold = page_guard::hold_marks();
     // A barrier over a table whose fd write failed would report bytes that
-    // only reopen makes whole.
+    // only reopen makes whole. An fd write latches under this lock, so the
+    // check sees every write that finished before the barrier.
     for t in tables {
         t.refuse_failed_class_c()?;
     }
-    let _hold = page_guard::hold_marks();
     let mut dirty: Vec<(&ArrayTable, &str, crate::array_table::GuardSpan<'_>)> = Vec::new();
     #[cfg(debug_assertions)]
     let mut imaged = false;
@@ -1073,7 +1105,7 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
         if !imaged {
             imaged = true;
             if let Some(dir) = t.file.path().parent() {
-                class_c_pause::between(dir);
+                class_c_pause::at(dir, class_c_pause::Point::Between);
             }
         }
     }

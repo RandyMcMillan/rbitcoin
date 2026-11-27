@@ -462,8 +462,10 @@ fn arm_on_meta_31_syncs_the_directory_that_holds_meta() {
         )
         .unwrap();
         let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        let store_at = dirs.iter().position(|d| d == dir.path());
+        let guard_at = dirs.iter().position(|d| *d == dir.path().join("guard"));
         assert!(
-            dirs.iter().any(|d| d == dir.path()),
+            matches!((store_at, guard_at), (Some(s), Some(g)) if s < g),
             "meta 31 must be durable before the mark, got {dirs:?}"
         );
     }

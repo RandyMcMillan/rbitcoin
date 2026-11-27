@@ -1845,7 +1845,7 @@ impl Query {
             let _commit = self.lock_tip_commit()?;
             let t = std::time::Instant::now();
             let write = rbitcoin_store::ClassCWrite::new();
-            self.store.header_txs.put_ranges_batch(&write, &ranges)?;
+            self.store.put_header_ranges(&write, &ranges)?;
             self.confirm_stats()
                 .note_write_commit(0, 0, 0, 0, 0, t.elapsed().as_nanos() as u64, 0);
         }

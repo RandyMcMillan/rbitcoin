@@ -507,6 +507,7 @@ fn one_header_txs_failpoint_does_not_clear_another_path() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn one_page_flush_restores_a_mixed_committed_slot() {
     use rbitcoin_primitives::Height;
@@ -533,6 +534,7 @@ fn one_page_flush_restores_a_mixed_committed_slot() {
     assert_eq!(t.tip_height(), Some(Height(79)));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn flush_from_first_slot_restores_a_mixed_committed_slot() {
     use rbitcoin_primitives::Height;
@@ -889,4 +891,103 @@ fn header_txs_pair_on_two_tiers_refuses_open() {
         Err(other) => panic!("wrong refusal: {other}"),
         Ok(_) => panic!("open accepted a header_txs pair split across tiers"),
     }
+}
+
+/// Class A first on the fd tier: an fd-only `header_txs` pair is durable
+/// when its put returns, so the creates it names are synced before it. A
+/// failed Class A sync leaves no range naming them.
+#[cfg(debug_assertions)]
+#[test]
+fn fd_header_ranges_sync_class_a_before_the_pair() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-class-a").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let s = Store::create_tiny(&dir.path).unwrap();
+        s.put_tx_full_batch_indexed(&[coinbase(1)], false).unwrap();
+        s.put_header_ranges(&write, &[(Fk(1), Fk(1), 1)]).unwrap();
+        s.flush_header_archive().unwrap();
+    }
+    let s = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+        Store::open_tiny(&dir.path).unwrap()
+    });
+    assert_eq!(s.header_txs.first.l2_resident_bytes(), 0, "not fd-only");
+    s.put_tx_full_batch_indexed(&[coinbase(2)], false).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(s.txs.txids.file.io_handle(), 1);
+    assert!(
+        s.put_header_ranges(&write, &[(Fk(2), Fk(2), 1)]).is_err(),
+        "an fd pair was stored over an unsynced Class A"
+    );
+    assert_eq!(s.header_txs.get_range(Fk(2)).unwrap(), None);
+}
+
+/// A group flush checks the failed-write latch under the mark lock. An fd
+/// write that fails while the flush waits for that lock leaves the flush
+/// refused, not reporting the partial write as flushed.
+#[cfg(debug_assertions)]
+#[test]
+fn flush_sees_an_fd_write_that_failed_while_it_waited() {
+    use rbitcoin_primitives::Height;
+    use std::time::Duration;
+    let _slot = pause_slot();
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-hold").unwrap();
+    let t = fd_only_confirmed(&dir.path, 5000);
+    rbitcoin_store::chain::arm_class_c_hold_pause(&dir.path);
+    let _release = ReleasePause;
+    std::thread::scope(|scope| {
+        let flush = scope.spawn(|| t.flush());
+        assert!(
+            rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
+            "flush did not reach the mark lock"
+        );
+        rbitcoin_store::chain::fail_next_fd_write_before_live(&dir.path.join("confirmed.body"));
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        assert!(t.set(&write, Height(10), Fk(7)).is_err());
+        rbitcoin_store::chain::release_class_c_group_pause();
+        match flush.join().unwrap() {
+            Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+            other => panic!("flush over a failed fd write: {other:?}"),
+        }
+    });
+}
+
+/// A pair read already waiting when an fd pair write fails between its
+/// columns checks the failed-write latch in the sample it returns, so it
+/// never returns the new `first` beside the old `count`.
+#[cfg(debug_assertions)]
+#[test]
+fn a_waiting_pair_read_sees_a_failed_fd_pair_write() {
+    use rbitcoin_store::chain::HeaderTxsTable;
+    use std::time::Duration;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair-wait").unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    {
+        let t = HeaderTxsTable::create(&dir.path).unwrap();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+    }
+    let t = rbitcoin_store::array_table::with_class_c_inram_max_bytes(0, || {
+        HeaderTxsTable::open(&dir.path).unwrap()
+    });
+    rbitcoin_store::chain::fail_next_fd_write_before_live(&dir.path.join("header_txs_count.body"));
+    std::thread::scope(|scope| {
+        // The writer stops on the mark lock with its pair counter odd.
+        let marks = rbitcoin_store::page_guard::hold_marks();
+        let writer = scope.spawn(|| {
+            let write = rbitcoin_store::ClassCWrite::for_test();
+            t.put_range(&write, Fk(1), Fk(5), 3)
+        });
+        while !t.write_lock_held() {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let reader = scope.spawn(|| t.get_range(Fk(1)));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(marks);
+        assert!(writer.join().unwrap().is_err());
+        match reader.join().unwrap() {
+            Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
+            Ok(Some((Fk(1), 1))) => {}
+            other => panic!("read of a torn pair: {other:?}"),
+        }
+    });
 }

@@ -916,6 +916,22 @@ impl Store {
         Ok(())
     }
 
+    /// Store header ranges that name appended creates.
+    ///
+    /// Class A first: an fd-only pair is durable when its put returns, so
+    /// the creates it names are synced before it. A RAM-tier pair reaches
+    /// disk only at a barrier, which syncs Class A first itself.
+    pub fn put_header_ranges(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        items: &[(Fk, Fk, u32)],
+    ) -> Result<(), StoreError> {
+        if !items.is_empty() && self.header_txs.fd_pair() {
+            self.txs.sync_class_a_data()?;
+        }
+        self.header_txs.put_ranges_batch(write, items)
+    }
+
     /// Meta by fk: the same packed decode as [`Self::get_tx_meta_and_outputs`]
     /// with the outs dropped, so a reader that needs both takes the latter once.
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, StoreError> {

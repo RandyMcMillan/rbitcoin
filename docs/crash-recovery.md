@@ -49,9 +49,13 @@ transaction.
   array flush always images page 0, because it rewrites the length there even
   when a shrink writes no slot or empties the table. Open refuses a legacy
   `confirmed.body.ahead` or `header_txs_*.body.ahead` instead of restoring it.
-- `header.body` only appends, and its rows are synced before the
-  `header.head` insert names them. `header.head` writes a synced `*.ahead`
-  image before an in-place write, and open restores it before reading.
+- `header.body` only appends: rows, then length, each synced before the
+  head insert. Only the first append arms `store/guard/header.body`, an empty
+  flag, because open refuses an empty head beside body rows. One
+  `header.head` generation uses `store/guard/header.head`. Its `.mlt` only
+  appends, and the rows and length are synced before that mark arms. Open
+  copies every named image before reading those files, and refuses a legacy
+  `header.head*.ahead`.
 - The scripthash ingest head writes its own synced `*.ahead` image, and open
   restores it the same way.
 - A `txstat` stamp writes no image (the sector rule, below). Open refuses any

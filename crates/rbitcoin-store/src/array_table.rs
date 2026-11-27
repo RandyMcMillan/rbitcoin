@@ -630,11 +630,16 @@ pub(crate) fn seq_arm(seq: &AtomicU64, flushing: &AtomicBool) {
 pub(crate) type PageImages = Vec<(u64, [u8; PAGE as usize])>;
 
 /// What one grouped flush imaged: the first element it writes, the length it
-/// writes, and the dirty generation sampled with the images.
-pub(crate) struct GuardSpan {
+/// writes, the dirty generation sampled with the images, and the images.
+///
+/// Holds the table's flush lock, so no other flush runs between the images
+/// and their write.
+pub(crate) struct GuardSpan<'a> {
     start: u64,
     n: u64,
     gen: u64,
+    pub(crate) pages: PageImages,
+    _one: std::sync::MutexGuard<'a, ()>,
 }
 
 /// On success, disk length and the clean mark publish before `flushing` clears.
@@ -1187,6 +1192,10 @@ impl ArrayTable {
         }
         let _odd = self.begin_store()?;
         if !self.in_ram {
+            // The length is one in-sector write and needs no image. A mark a
+            // failed write left would restore its longer length over it.
+            let _hold = page_guard::hold_marks();
+            self.refuse_armed_class_c()?;
             self.len.store(new_len, Ordering::Release);
             let logical = FILE_HEADER_LEN as u64 + new_len * ELEM;
             self.file.set_logical_len(logical)?;
@@ -1229,22 +1238,26 @@ impl ArrayTable {
     }
 
     /// Every 4 KiB block this flush rewrites, plus page 0, and the span
-    /// [`Self::persist_dirty`] may write.
+    /// [`Self::persist_dirty`] writes.
     ///
-    /// The span and the images are read while stores are excluded, as the
-    /// write does. A slot noted after this returns stays dirty: the write
-    /// stays inside the span, and the sampled generation keeps
-    /// [`Self::publish_clean`] from marking it clean.
-    pub(crate) fn guard_pages(&self) -> Result<Option<(GuardSpan, PageImages)>, StoreError> {
+    /// The span and the images are read once, while stores are excluded.
+    /// [`Self::persist_dirty`] writes these images, not the live slots, so
+    /// disk gets one state RAM held. A slot noted after this returns stays
+    /// dirty: the sampled generation keeps [`Self::publish_clean`] from
+    /// marking it clean, and the next flush writes it.
+    pub(crate) fn guard_pages(&self) -> Result<Option<GuardSpan<'_>>, StoreError> {
         if !self.in_ram {
             return Ok(None);
         }
-        let _one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.unstored_from.load(Ordering::Acquire) == CLEAN {
             return Ok(None);
         }
         seq_arm(&self.seq, &self.flushing);
         let _end = FlushGuard(&self.flushing, &self.disk_len, &self.unstored_from, None);
+        // After stores are excluded. A test hold pauses the tip flush here.
+        #[cfg(debug_assertions)]
+        flush_hold::wait();
         let from = self.unstored_from.load(Ordering::Acquire);
         if from == CLEAN {
             return Ok(None);
@@ -1276,7 +1289,13 @@ impl ArrayTable {
         for page in pages {
             images.push((page, self.ram_page(page, logical)?));
         }
-        Ok(Some((GuardSpan { start, n, gen }, images)))
+        Ok(Some(GuardSpan {
+            start,
+            n,
+            gen,
+            pages: images,
+            _one: one,
+        }))
     }
 
     fn ram_page(&self, page: u64, logical: u64) -> Result<[u8; PAGE as usize], StoreError> {
@@ -1314,21 +1333,14 @@ impl ArrayTable {
         if new_logical != old_logical {
             pages.insert(0u64);
         }
-        let mut lo = u64::MAX;
-        let mut hi = 0u64;
+        // A slot is 8-aligned from offset 16, so it sits on one page. Sparse
+        // pairs image their own pages, not the span between them.
         for &(index, _) in pairs {
-            let off = Self::offset(index);
-            lo = lo.min(off);
-            hi = hi.max(off + ELEM);
+            pages.insert((Self::offset(index) / PAGE) * PAGE);
         }
         if zero_gap && max_idx >= len {
-            lo = lo.min(Self::offset(len));
-            hi = hi.max(Self::offset(new_len));
-        }
-        if lo < hi {
-            let first = (lo / PAGE) * PAGE;
-            let last = ((hi - 1) / PAGE) * PAGE;
-            let mut page = first;
+            let mut page = (Self::offset(len) / PAGE) * PAGE;
+            let last = ((Self::offset(new_len) - 1) / PAGE) * PAGE;
             while page <= last {
                 pages.insert(page);
                 page += PAGE;
@@ -1388,15 +1400,29 @@ impl ArrayTable {
         Ok(Some(dir.join(page_guard::CLASS_C_MARK)))
     }
 
-    /// Write the slots of `span` without clearing `unstored_from`.
+    /// Write the images of `span` from its start to its length, then that
+    /// length, without clearing `unstored_from`.
     ///
-    /// The write stays inside the pages [`Self::guard_pages`] imaged: it
-    /// starts at the imaged start and stops at the imaged length, or below it
-    /// when the table shrank since. `Some((len, gen))` is the length written
-    /// and the generation sampled with the images. [`Self::publish_clean`]
+    /// Reads no live slot: a store after [`Self::guard_pages`] may have
+    /// moved one, and writing it beside a slot the span skips would put a
+    /// state on disk RAM never held. `(len, gen)` is the length written and
+    /// the generation sampled with the images. [`Self::publish_clean`]
     /// consumes it after the mark is cleared.
-    pub(crate) fn persist_dirty(&self, span: &GuardSpan) -> Result<Option<(u64, u64)>, StoreError> {
-        self.flush_dirty_inner(|_, _| {}, false, Some(span))
+    pub(crate) fn persist_dirty(&self, span: &GuardSpan<'_>) -> Result<(u64, u64), StoreError> {
+        let stride = if self.byte_body { 1 } else { ELEM };
+        let lo = FILE_HEADER_LEN as u64 + span.start * stride;
+        let logical = FILE_HEADER_LEN as u64 + span.n * stride;
+        for (page, image) in &span.pages {
+            let from = (*page).max(lo);
+            let to = (*page + PAGE).min(logical);
+            if from < to {
+                let at = (from - *page) as usize;
+                self.file
+                    .write_at(from, &image[at..at + (to - from) as usize])?;
+            }
+        }
+        self.file.set_logical_len(logical)?;
+        Ok((span.n, span.gen))
     }
 
     /// Publish `disk_len = n` and a clean mark when `gen` is still current.
@@ -1436,50 +1462,30 @@ impl ArrayTable {
     #[doc(hidden)]
     pub fn flush_dirty_between(
         &self,
-        between: impl FnMut(&Self, FlushStep),
-    ) -> Result<(), StoreError> {
-        self.flush_dirty_inner(between, true, None).map(|_| ())
-    }
-
-    fn flush_dirty_inner(
-        &self,
         mut between: impl FnMut(&Self, FlushStep),
-        publish: bool,
-        imaged: Option<&GuardSpan>,
-    ) -> Result<Option<(u64, u64)>, StoreError> {
+    ) -> Result<(), StoreError> {
         // One flusher, including the strong-bit image.
         let _one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         if !self.in_ram {
-            return Ok(None);
+            return Ok(());
         }
         let from = self.unstored_from.load(Ordering::Acquire);
         if from == CLEAN {
-            return Ok(None);
+            return Ok(());
         }
         between(self, FlushStep::Admit);
         seq_arm(&self.seq, &self.flushing);
-        // After stores are excluded. A test hold pauses the tip flush here.
-        #[cfg(debug_assertions)]
-        flush_hold::wait();
         let from = self.unstored_from.load(Ordering::Acquire);
         let n = self.len.load(Ordering::Acquire);
         let disk = self.disk_len.load(Ordering::Acquire);
         let mut end = FlushGuard(&self.flushing, &self.disk_len, &self.unstored_from, None);
-        if imaged.is_some() && from == CLEAN {
-            // Another flush wrote and published this span after the images.
-            return Ok(None);
-        }
-        let n = imaged.map_or(n, |span| span.n.min(n));
         between(self, FlushStep::Write);
         // A byte body counts `len` in bytes and the mark in bits. Slot tables
         // count elements. Write the dirty prefix the new length still names,
         // including when that length is below the last flush. The file length
         // then drops bytes at and above `n`. The file is not padded to a word.
         let stride = if self.byte_body { 1 } else { ELEM };
-        let start = imaged.map_or_else(
-            || if self.byte_body { from / 8 } else { from }.min(disk),
-            |span| span.start,
-        );
+        let start = if self.byte_body { from / 8 } else { from }.min(disk);
         if start < n {
             let mut scratch = [0u8; FLUSH_SCRATCH];
             let mut off = 0u64;
@@ -1506,14 +1512,8 @@ impl ArrayTable {
         let logical = FILE_HEADER_LEN as u64 + n * stride;
         self.file.set_logical_len(logical)?;
         between(self, FlushStep::Clean);
-        let gen = imaged.map_or_else(
-            || self.unstored_gen.load(Ordering::Acquire),
-            |span| span.gen,
-        );
-        if publish {
-            end.3 = Some(n);
-        }
-        Ok(Some((n, gen)))
+        end.3 = Some(n);
+        Ok(())
     }
 
     pub(crate) fn has_unstored(&self) -> bool {

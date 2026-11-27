@@ -326,7 +326,10 @@ returns an error, the counter is even again and `get_range` can accept the
 new first with the old count. Confirm joins the tip flush before those
 stores, so a flush does not reject the count column on that path. The
 error still leaves the pair torn. A flush excludes new stores, then reads the dirty range and
-the live slots. A shrink writes that prefix when it still sits below the
+the live slots. The grouped Class C flush reads them once, into the page
+images of its mark, and writes those images after stores resume. A store
+after the images stays dirty for the next flush, and is not written beside
+a slot the images skipped. A shrink writes that prefix when it still sits below the
 new length, then shortens the file. A truncate that did not store into the
 kept prefix only shortens. The odd bit and the flushing flag are `SeqCst` in both
 directions. A `SeqCst` fence sits between the odd store and the flag load,

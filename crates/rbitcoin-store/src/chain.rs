@@ -7,7 +7,7 @@ use crate::array_table::{
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadScale;
-use crate::page_guard::{self, PAGE};
+use crate::page_guard;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::fs::File;
@@ -517,8 +517,8 @@ impl StrongTxTable {
         Ok(ones == u64::from(count))
     }
 
-    /// Persist dirty L2 bit image by reading live bytes. The unstored mark
-    /// clears only after the group mark is gone.
+    /// Persist the dirty L2 bit image the grouped flush read while stores
+    /// were excluded. The unstored mark clears only after the group mark is gone.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
         flush_class_c_tables(&[&self.table])
     }
@@ -919,6 +919,16 @@ impl HeaderTxsTable {
         self.write.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// True while another holder has the write lock. A test probe.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn write_lock_held(&self) -> bool {
+        matches!(
+            self.write.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         let _write = self.write_guard();
         flush_class_c_tables(&[&self.first, &self.count])
@@ -1026,13 +1036,12 @@ pub fn release_class_c_group_pause() {
     class_c_pause::release();
 }
 
-/// One `store/guard/class_c` mark for every table in the group, then the live
-/// writes, then the clear. Unstored stays set until the mark is gone so a
-/// retry re-images every column.
+/// One `store/guard/class_c` mark for every table in the group, then those
+/// images written as the live pages, then the clear. Unstored stays set until
+/// the mark is gone so a retry re-images every column.
 pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreError> {
     let _hold = page_guard::hold_marks();
-    let mut owned: Vec<(String, u64, [u8; PAGE as usize])> = Vec::new();
-    let mut dirty: Vec<(&ArrayTable, crate::array_table::GuardSpan)> = Vec::new();
+    let mut dirty: Vec<(&ArrayTable, &str, crate::array_table::GuardSpan<'_>)> = Vec::new();
     #[cfg(debug_assertions)]
     let mut imaged = false;
     for t in tables {
@@ -1040,15 +1049,12 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
             t.file.flush()?;
             continue;
         }
-        let name = t.guard_name()?.to_string();
-        let Some((span, pages)) = t.guard_pages()? else {
+        let name = t.guard_name()?;
+        let Some(span) = t.guard_pages()? else {
             t.file.flush()?;
             continue;
         };
-        for (off, image) in pages {
-            owned.push((name.clone(), off, image));
-        }
-        dirty.push((*t, span));
+        dirty.push((*t, name, span));
         #[cfg(debug_assertions)]
         if !imaged {
             imaged = true;
@@ -1057,13 +1063,17 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
             }
         }
     }
-    if owned.is_empty() {
+    if dirty.is_empty() {
         return Ok(());
     }
     let dir = dirty[0].0.store_dir()?;
-    let refs: Vec<(&str, u64, &[u8])> = owned
+    let refs: Vec<(&str, u64, &[u8])> = dirty
         .iter()
-        .map(|(n, o, i)| (n.as_str(), *o, i.as_slice()))
+        .flat_map(|(_, name, span)| {
+            span.pages
+                .iter()
+                .map(move |(o, i)| (*name, *o, i.as_slice()))
+        })
         .collect();
     page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
     #[cfg(debug_assertions)]
@@ -1078,10 +1088,8 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
         }
     }
     let mut spans = Vec::with_capacity(dirty.len());
-    for (t, imaged) in &dirty {
-        if let Some(span) = t.persist_dirty(imaged)? {
-            spans.push((*t, span));
-        }
+    for (t, _, imaged) in &dirty {
+        spans.push((*t, t.persist_dirty(imaged)?));
         #[cfg(debug_assertions)]
         if take_fail_after_first(t.file.path()) {
             return Err(StoreError::io(
@@ -1100,7 +1108,7 @@ pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreEr
     }
     let files: Vec<(&File, &Path)> = dirty
         .iter()
-        .map(|(t, _)| (&t.file.read_file, t.file.path() as &Path))
+        .map(|(t, _, _)| (&t.file.read_file, t.file.path() as &Path))
         .collect();
     page_guard::clear_page_guard_files(&dir.join(page_guard::CLASS_C_MARK), &files)?;
     for (t, (n, gen)) in spans {

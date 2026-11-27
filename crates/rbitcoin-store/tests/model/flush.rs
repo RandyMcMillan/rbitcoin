@@ -71,7 +71,8 @@ fn a_note_during_the_grouped_publish_stays_dirty() {
     }
     super::engine::check_at_most(3, || {
         big(|| {
-            let dir = std::env::temp_dir().join("rbtc-group-publish-model");
+            let dir = std::env::temp_dir()
+                .join(format!("rbtc-group-publish-model-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let table = Arc::new(ConfirmedTable::create(&dir).unwrap());

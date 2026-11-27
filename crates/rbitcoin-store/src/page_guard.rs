@@ -417,10 +417,12 @@ pub fn clear_page_guard(path: &Path, data: &File, data_path: &Path) -> Result<()
 pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(), StoreError> {
     mark_parent(path)?;
     for (data, data_path) in files {
+        #[cfg(feature = "write-probe")]
+        let probe_n = crate::write_probe::sync_begin(data_path);
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
         #[cfg(feature = "write-probe")]
-        crate::write_probe::synced(data_path);
+        crate::write_probe::synced(data_path, probe_n);
     }
     let mut synced = HashSet::with_capacity(files.len());
     for (_, data_path) in files {
@@ -662,10 +664,12 @@ pub fn clear_page_guard_rel(
 ) -> Result<(), StoreError> {
     mark_parent(mark)?;
     for (data, data_path) in files {
+        #[cfg(feature = "write-probe")]
+        let probe_n = crate::write_probe::sync_begin(data_path);
         data.durable_sync_data()
             .map_err(|e| StoreError::io(*data_path, e))?;
         #[cfg(feature = "write-probe")]
-        crate::write_probe::synced(data_path);
+        crate::write_probe::synced(data_path, probe_n);
     }
     let mut synced = HashSet::with_capacity(files.len());
     for (_, data_path) in files {

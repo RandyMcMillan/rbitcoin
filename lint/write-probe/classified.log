@@ -1,3 +1,4 @@
 PROBE ONE_SECTOR store/txstat.body rbitcoin_store::txstat::stamp end=24 off=16 len=8
 PROBE LEN_BEFORE_SYNC store/txid.body rbitcoin_store::txid_body::TxidBody::append_batch end=48 off=8 len=8
     rbitcoin_store::tx_table::TxTable::put
+PROBE LEN_ONE_SECTOR sp_tweaks.idx/meta rbitcoin_store::sp_tweaks::SpTweaksTable::write_meta end=16 off=8 len=8

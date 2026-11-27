@@ -17,13 +17,65 @@ fn dirty() -> &'static Mutex<HashMap<PathBuf, Vec<(u64, u64)>>> {
     D.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A sync made every written byte of `path` durable.
-pub(crate) fn synced(path: &Path) {
+/// The dirty ranges of `path` a sync starting now covers. A write that
+/// lands while the sync waits is not among them.
+pub(crate) fn sync_begin(path: &Path) -> usize {
     dirty()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(path);
+        .get(path)
+        .map_or(0, Vec::len)
 }
+
+/// A sync made the first `n` dirty ranges of `path` durable, and the last
+/// trailer written before it.
+pub(crate) fn synced(path: &Path, n: usize) {
+    if let Some(v) = dirty()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(path)
+    {
+        v.drain(..n.min(v.len()));
+    }
+    let mut trailers = trailers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(end) = trailers.0.get(path).copied() {
+        trailers.1.insert(path.to_path_buf(), end);
+    }
+}
+
+/// Bytes a write bypassing the `TableFile` door (bulk io_uring writes)
+/// put past a file's end. They count as unsynced until a sync.
+pub(crate) fn note_append(path: &Path, offset: u64, len: u64) {
+    if len > 0 {
+        note_dirty(path, offset, offset + len);
+    }
+}
+
+/// (last trailer end written, last trailer end a sync covered) per file.
+fn trailers() -> &'static Mutex<(HashMap<PathBuf, u64>, HashMap<PathBuf, u64>)> {
+    static T: OnceLock<Mutex<(HashMap<PathBuf, u64>, HashMap<PathBuf, u64>)>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new((HashMap::new(), HashMap::new())))
+}
+
+/// Class A stems can live in a cold directory with no `meta` beside them.
+const CLASS_A_STEMS: [&str; 16] = [
+    "txout.body",
+    "seqsigwit.body",
+    "spent.body",
+    "create.loc",
+    "create.loc.ovf",
+    "create.off",
+    "seqsigwit.loc",
+    "seqsigwit.loc.ovf",
+    "seqsigwit.off",
+    "txid.body",
+    "txstat.body",
+    "txstat.ovf",
+    "txstat.blk",
+    "input.loc",
+    "input.off",
+    "input.body",
+];
 
 fn unsynced_in(path: &Path, from: u64, to: u64) -> bool {
     dirty()
@@ -56,8 +108,11 @@ pub(crate) fn write(
         return;
     }
     // The header in the file, not the RAM length: a publish moves RAM first.
+    // A trailer moves with the length, so its durable end is the last one a
+    // sync covered.
     let committed = if trailing {
-        committed
+        let t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+        t.1.get(path).copied().unwrap_or(header_len)
     } else {
         header_on_file(path).unwrap_or(committed)
     };
@@ -73,13 +128,33 @@ pub(crate) fn write(
         } else {
             u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
         };
+        if trailing {
+            trailers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .insert(path.to_path_buf(), end);
+        }
+        // The bytes the new length names must be synced, or imaged by a live
+        // mark, before the length is safe.
+        let named_safe = !unsynced_in(path, committed, new)
+            || crate::page_guard::probe_armed_covers(
+                path,
+                committed,
+                new.saturating_sub(committed),
+            );
         if new <= committed {
             None
-        } else if committed <= header_len {
-            Some("LEN_CREATE")
-        } else if crate::page_guard::probe_armed_covers(path, offset, len) {
+        } else if named_safe
+            && crate::page_guard::probe_armed_covers(path, offset, len)
+            && unsynced_in(path, committed, new)
+        {
             Some("LEN_ARMED")
-        } else if unsynced_in(path, committed, new) {
+        } else if !named_safe && !trailing && new <= SECTOR {
+            // The length field and every byte it names share sector 0, which
+            // lands whole.
+            Some("LEN_ONE_SECTOR")
+        } else if !named_safe {
             Some("LEN_BEFORE_SYNC")
         } else {
             Some("LEN_AFTER_SYNC")
@@ -99,7 +174,15 @@ pub(crate) fn write(
         note_dirty(path, offset, end);
     }
     if let Some(class) = class {
-        let class = if in_store(path) { class } else { "FIXTURE" };
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| CLASS_A_STEMS.contains(&n));
+        let class = if stem || in_store(path) {
+            class
+        } else {
+            "FIXTURE"
+        };
         log(class, path, committed, offset, len);
     }
 }
@@ -163,7 +246,15 @@ fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
         .cloned()
         .or_else(|| test_frame.map(|t| format!("test-body:{t}")))
         .unwrap_or_else(|| format!("?thread={}", std::thread::current().name().unwrap_or("?")));
-    let key = format!("{class} {parent}/{name} {caller}");
+    // Every distinct stack is its own entry: a test hook reaching a
+    // production write first must not hide the production stack after it.
+    let stack = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        frames.hash(&mut h);
+        h.finish()
+    };
+    let key = format!("{class} {parent}/{name} {caller}#{stack:016x}");
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     if !SEEN
         .get_or_init(|| Mutex::new(HashSet::new()))

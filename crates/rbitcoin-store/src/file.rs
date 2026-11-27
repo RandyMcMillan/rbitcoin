@@ -1528,13 +1528,15 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
+        #[cfg(feature = "write-probe")]
+        let probe_n = crate::write_probe::sync_begin(&self.path);
         self.read_file
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
         #[cfg(all(unix, debug_assertions))]
         note_fsynced_dir(&self.path);
         #[cfg(feature = "write-probe")]
-        crate::write_probe::synced(&self.path);
+        crate::write_probe::synced(&self.path, probe_n);
         Ok(())
     }
 
@@ -1575,6 +1577,11 @@ impl TableFile {
         if crate::durability::flushes_skipped() {
             return Ok(());
         }
+        #[cfg(feature = "write-probe")]
+        let probe_n: Vec<usize> = files
+            .iter()
+            .map(|f| crate::write_probe::sync_begin(&f.path))
+            .collect();
         let mut handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
         handles.extend(
             extra
@@ -1609,8 +1616,8 @@ impl TableFile {
             }
         }
         #[cfg(feature = "write-probe")]
-        for f in files {
-            crate::write_probe::synced(&f.path);
+        for (f, n) in files.iter().zip(probe_n) {
+            crate::write_probe::synced(&f.path, n);
         }
         Ok(())
     }
@@ -1650,13 +1657,15 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
+        #[cfg(feature = "write-probe")]
+        let probe_n = crate::write_probe::sync_begin(&self.path);
         self.file
             .lock()
             .unwrap()
             .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
         #[cfg(feature = "write-probe")]
-        crate::write_probe::synced(&self.path);
+        crate::write_probe::synced(&self.path, probe_n);
         Ok(())
     }
 

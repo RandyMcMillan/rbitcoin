@@ -10,10 +10,10 @@ it means the probe did not run. See docs/crash-recovery.md (write probe).
 import re
 import sys
 
-# Safe by structure: a fresh file, pages a mark images, one sector, or a
-# length published after the bytes it names were synced. FIXTURE is a file
+# Safe by structure: a fresh file, pages a mark images, one sector (a
+# length and the bytes it names inside sector 0), or a length published after the bytes it names were synced. FIXTURE is a file
 # outside any store (a table built bare in a test).
-SAFE = {"CREATE", "ARMED", "ONE_SECTOR", "LEN_CREATE", "LEN_ARMED",
+SAFE = {"CREATE", "ARMED", "ONE_SECTOR", "LEN_ONE_SECTOR", "LEN_ARMED",
         "LEN_AFTER_SYNC", "FIXTURE"}
 
 CLASS_A = (r"(txout|seqsigwit|spent|txid|txstat|input)\.body|"
@@ -25,8 +25,8 @@ RULES = [
      "Class A length: open keeps only the creates class_a.synced or a header_txs range names"),
     (r"MULTI_SECTOR", r"/spent\.body$", r"SpentFold|spend_delta::",
      "spent.body fold: open replays it from spent.delta"),
-    (r"MULTI_SECTOR", r"tx\.head/", r"AddressHead::write_snapshot",
-     "fresh shutdown snapshot: data synced before the footer generation (one sector)"),
+    (r"MULTI_SECTOR|LEN_BEFORE_SYNC", r"tx\.head/", r"AddressHead::write_snapshot",
+     "fresh shutdown snapshot: footer generation stays 0, which open does not trust, until the image is synced"),
     (r".*", r"scripthash", r"scripthash_materialize::|pack_shard_session|ScriptHashBulkSession",
      "cold scripthash build behind scripthash.dirty: a crash rebuilds"),
     (r"MULTI_SECTOR", r"scripthash\.ovf/ingest|shhead", r"ScriptHashHead|SlotPageCache|unlink_write_home|scripthash_head::",

@@ -455,6 +455,16 @@ impl HashHead {
         file.ensure_capacity(need)?;
         file.set_logical_len(need)?;
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
+        // Each header is two pwrites, unordered without a sync. The first
+        // insert keeps the length, so its mark need not image page 0, and
+        // `.mlt` gets no sync until a row lands. Sync both, then their names,
+        // before any mark (`header.head` or the first `header.body` append)
+        // can arm over them: a restore recreates a lost name with only the
+        // imaged pages.
+        file.sync_data_only()?;
+        multi.file.sync_data_only()?;
+        let dir = head_dir(&path)?;
+        file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
         if slots > DEFAULT_SLOTS {
             rbitcoin_log::trace!(
                 Store,

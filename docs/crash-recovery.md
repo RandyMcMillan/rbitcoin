@@ -209,7 +209,10 @@ it.
 synced before the head insert. Open indexes the rows the head does not name.
 The first append alone arms the empty `store/guard/header.body` flag.
 `header.head` uses `store/guard/header.head`. `header.head.mlt` is an append:
-rows, then length, each synced before the head mark arms.
+rows, then length, each synced before the head mark arms. A new head
+generation, its `.mlt`, and their directory are synced at create, before any
+mark can arm over them: the first insert keeps the length, so its mark does
+not image page 0, and a restore recreates a lost name from the images alone.
 `spent.ovf` appends past its durable length and publishes the length only at
 a spend checkpoint or flush, after the nodes are synced. A scripthash commit, including an
 in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp

@@ -8,6 +8,29 @@ fn tmp_path() -> std::path::PathBuf {
     dir.join("header.head")
 }
 
+/// A new head, its `.mlt`, and their directory are synced before create
+/// returns. Each header is two pwrites, unordered without a sync, and the
+/// first insert's mark images only the pages it fills: page 0 of an empty
+/// head is not one of them. A restore recreates a lost name from the images.
+#[cfg(debug_assertions)]
+#[test]
+fn create_syncs_the_head_and_multi_list_before_any_mark() {
+    let path = tmp_path();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let mlt = MultiList::path_for(&path);
+    let dir = path.parent().unwrap().to_path_buf();
+    for want in [&path, &mlt, &dir] {
+        assert!(
+            synced.iter().any(|p| p == want),
+            "{} was not synced at create: {synced:?}",
+            want.display()
+        );
+    }
+    drop(h);
+}
+
 #[test]
 fn dense_load_inserts_until_full_without_rehash() {
     let path = tmp_path();

@@ -121,16 +121,16 @@ fn header_flush_holds_put_lock_until_its_flushes_finish() {
         hold.wait_until_entered(Duration::from_secs(5)),
         "flush never reached the hold"
     );
-    let insert_t = Arc::clone(&t);
-    let insert = std::thread::spawn(move || insert_t.ensure(&sample([2u8; 32])).unwrap());
-    std::thread::sleep(Duration::from_millis(150));
     assert!(
-        !insert.is_finished(),
-        "an insert landed in the dirty pages before the mark was cleared"
+        matches!(
+            t.put_lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ),
+        "an insert could land in the dirty pages before the mark was cleared"
     );
     hold.store(false, Ordering::Release);
     handle.join().unwrap();
-    insert.join().unwrap();
+    t.ensure(&sample([2u8; 32])).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

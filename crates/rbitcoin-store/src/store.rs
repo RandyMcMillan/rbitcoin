@@ -637,7 +637,9 @@ impl Store {
         match Self::open_layout(layout.clone()) {
             Ok(store) => Ok(store),
             Err(err)
-                if !creation_has_chain(&layout) && replaces_incomplete_first_creation(&err) =>
+                if !creation_has_chain(&layout)
+                    && !has_guard_mark(&layout.dir)
+                    && replaces_incomplete_first_creation(&err) =>
             {
                 rbitcoin_log::warn!(
                     "store: replacing incomplete first creation at {} ({err})",
@@ -2657,6 +2659,18 @@ fn dir_has_chain_payload(dir: &Path) -> bool {
     )
 }
 
+/// A published `guard/` mark names pages a write was changing, so the
+/// store is not an untouched first creation. An unreadable mark must reach
+/// the caller, not be wiped with the store.
+fn has_guard_mark(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("guard")).is_ok_and(|rd| {
+        rd.filter_map(Result::ok).any(|ent| {
+            !ent.file_name().to_string_lossy().ends_with(".tmp")
+                && ent.file_type().is_ok_and(|t| t.is_file())
+        })
+    })
+}
+
 fn creation_has_chain(layout: &StoreLayout) -> bool {
     dir_has_chain_payload(&layout.dir)
         || (layout.is_split() && dir_has_chain_payload(layout.seqsigwit_dir()))
@@ -2694,7 +2708,7 @@ pub fn write_meta(dir: &Path) -> Result<(), StoreError> {
 }
 
 /// [`write_meta`] at `version`.
-fn write_meta_at(dir: &Path, version: u16) -> Result<(), StoreError> {
+pub(crate) fn write_meta_at(dir: &Path, version: u16) -> Result<(), StoreError> {
     let mut bytes = Vec::with_capacity(STORE_MAGIC.len() + 2);
     bytes.extend_from_slice(&STORE_MAGIC);
     bytes.extend_from_slice(&version.to_le_bytes());
@@ -2777,12 +2791,19 @@ pub fn open_layout_rewrite_before_spend_delta(
     Ok(())
 }
 
-/// `meta` to [`SCHEMA_VERSION`] when it is older. Runs after the tx table
+/// Spend-delta `meta`. A plain open rewrites an older meta here and leaves
+/// 30 alone. Schema 31 is the first Class A arm, not this rewrite: promoting
+/// 30 on open would make a mark-free datadir unreadable by the binary that
+/// wrote it.
+const SCHEMA_SPEND_DELTA: u16 = 30;
+
+/// `meta` to [`SCHEMA_SPEND_DELTA`] when it is older. Runs after the tx table
 /// opened, so the spend delta's adoption of a pre-30 body is published.
+/// A 30 meta is not promoted.
 #[doc(hidden)]
 pub fn open_layout_rewrite_current(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
-    if meta_ver < SCHEMA_VERSION {
-        write_meta(path)?;
+    if meta_ver < SCHEMA_SPEND_DELTA {
+        write_meta_at(path, SCHEMA_SPEND_DELTA)?;
     }
     Ok(())
 }

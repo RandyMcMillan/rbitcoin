@@ -70,29 +70,64 @@ in-process tip; that is lost progress, not a wrong chain. Open does not invent
 a height, a tx range, or a spend from a partially written block: it re-reads
 the window, rebuilds a derived index from Class A, or cuts the tail.
 
-**The residual in-place state.** `confirmed.body`, `header_txs_*`,
-`header.head`, `txstat.body`, and the scripthash ingest head journal a synced
-`*.ahead` image, and open restores it. A strong bit a fence run names is set
-again by `restore_strong_from_fence`. `strong_tx` has no sidecar. The
-scripthash index is gated instead
-of repaired: an append, an unlink or a deferred empty-head commit writes
-`scripthash.dirty` before it writes. A full synced `ScriptHashTable::flush`
-(file data, then the `scripthash.body`, `scripthash.head` and
-`scripthash.ovf` directories) removes the mark only when no write started
-since its sync began, and never a mark that was present at open or that a
-failed write left: syncing torn bytes does not repair them, so only a wipe
-removes those. A clean shutdown of a dirty index runs that flush. The cold
-build and pack paths do not mark: an unsealed shard is untrusted until its
-pack mark, and its keys stay in ingest or overflow until then. A start with
-`--sh-index` that finds the file refuses and names the fix:
+## Two doors
+
+**The sector rule.** The store assumes the device writes a 512-byte sector
+whole or not at all, and that nothing below the filesystem re-encodes data in
+larger units (for example dm-crypt with a 4 KiB sector on a 512-byte disk, or
+a RAID 5/6 stripe without a write journal). The kernel writes a whole page
+back, but a sector whose bytes did not change lands unchanged. A crash can
+therefore leave any subset of the changed sectors new. A write needs no mark
+when every such subset is a state open accepts. Two shapes always pass:
+
+- An append: every byte is at or past the committed end, including bytes that
+  share the committed tail block. It is synced before the length that names
+  it is published, so a torn append is bytes open does not read.
+- A write inside one sector, such as the 8-byte length at offset 8 or a
+  `txstat` cell. It lands old or new. On a file whose commit a mark is
+  protecting, it still has to be inside that mark's pages: it may belong to
+  that commit, and open would roll the mark back around it.
+
+Any other write that changes committed bytes in more than one sector goes
+through `page_guard`. The writer stores the pre-image of every page that
+write will touch, syncs that mark, writes the live bytes, syncs them, then
+removes the mark. Open copies the images back while the mark is there, and
+accepts the live pages only after the mark is gone. The committed end is the
+durable header length, not a RAM high-water.
+
+**The marks.** `confirmed.body`, `header_txs_*`, and `strong_tx` use
+`store/guard/class_c`. `header.body` is an append: rows, then length, each
+synced before the head insert. Open indexes the rows the head does not name.
+The first append alone arms the empty `store/guard/header.body` flag.
+`header.head` uses `store/guard/header.head`. `header.head.mlt` is an append:
+rows, then length, each synced before the head mark arms.
+`spent.ovf` appends past its durable length and publishes the length only at
+a spend checkpoint or flush, after the nodes are synced. A scripthash commit, including an
+in-place slab and a head word, uses `store/guard/sh-*`. A `txstat` stamp
+needs no mark: each cell and block slot sits inside one sector, and the stamp
+is synced. Block-filter and silent-payment tweak puts are appends: bytes,
+then lengths, body before idx, each synced, with no mark. A new segment
+pair's names are synced before any length; Windows cannot sync a directory,
+so there NTFS metadata journaling carries them. Open drops a newest pair
+missing one file, and the index re-derives those heights. The mempool flush
+appends its body the same way, then uses `mempool/guard/flush` for slots and
+`meta`.
+`tx.head` `*.mlt` is renamed into place, and the segment meta bit says the
+file must exist. A strong bit a fence run names is set again by
+`restore_strong_from_fence`.
+
+The scripthash index is still gated: an append, an unlink, or a deferred
+empty-head commit writes `scripthash.dirty` before it writes. A full synced
+`ScriptHashTable::flush` (file data, then the `scripthash.body`,
+`scripthash.head`, and `scripthash.ovf` directories) removes the mark only
+when no write started since its sync began, and never a mark that was present
+at open or that a failed write left. A clean shutdown of a dirty index runs
+that flush. The cold build and pack paths do not mark: an unsealed shard is
+untrusted until its pack mark, and its keys stay in ingest or overflow until
+then. A start with `--sh-index` that finds the file refuses and names the fix:
 `RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
 markers) wipes the index at open and removes the file, or start without
-`--sh-index`. A same-class scripthash slab rewritten in place can still tear
-([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)). An undo
-restore of one head word can tear the neighbor slots on that page
-([#2132](https://github.com/rbitcoin-org/rbitcoin/issues/2132)). Until
-those are closed, the whole-store guarantee is the guarded state above, not
-every row. There is also no clean-close gate and no whole-store snapshot, so a
+`--sh-index`. There is no clean-close gate and no whole-store snapshot, so a
 Class B/C decode error after a crash can be crash damage rather than a
 hardware fault: the scripthash path marks the index degraded and rebuilds,
 while a Class A read error stops open. A design that needs one auditable

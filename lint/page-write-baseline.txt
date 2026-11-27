@@ -28,6 +28,8 @@ crates/rbitcoin-store/src/io_handle.rs	WriteFile	1
 crates/rbitcoin-store/src/io_handle.rs	pwrite	2
 crates/rbitcoin-store/src/io_session_iocp.rs	WriteFile	1
 crates/rbitcoin-store/src/io_session_pool.rs	pwrite	1
+crates/rbitcoin-store/src/page_guard.rs	handle_pwrite_all	3
+crates/rbitcoin-store/src/page_guard.rs	truncate	1
 crates/rbitcoin-store/src/scripthash_head.rs	write_all	1
 crates/rbitcoin-store/src/scripthash_mphf.rs	handle_pwrite_all	1
 crates/rbitcoin-store/src/scripthash_mphf.rs	write_all	1

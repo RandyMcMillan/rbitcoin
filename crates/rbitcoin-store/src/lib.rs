@@ -73,6 +73,8 @@ pub mod loc_table;
 #[doc(hidden)]
 pub mod open_address;
 #[doc(hidden)]
+pub mod page_guard;
+#[doc(hidden)]
 pub mod point_table;
 #[doc(hidden)]
 pub mod readonly_map;

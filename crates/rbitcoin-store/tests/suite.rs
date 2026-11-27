@@ -30,6 +30,7 @@ mod integrity;
 mod io_backend;
 mod io_session_iocp;
 mod open_address;
+mod page_guard;
 mod point_table;
 mod readonly_map;
 mod scripthash;

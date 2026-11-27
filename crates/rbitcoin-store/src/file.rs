@@ -888,6 +888,21 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.pwrite_checked(self.header_len_to_persist(), offset, bytes)
+    }
+
+    /// [`Self::pwrite_all`] against a `committed` end the caller sampled.
+    fn pwrite_checked(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if !bytes.is_empty() {
+            // Committed end is the durable header, not a RAM high-water.
+            // A shared page has to be one this file's current arm names.
+            crate::page_guard::check_armed_write(
+                &self.path,
+                committed,
+                offset,
+                bytes.len() as u64,
+            )?;
+        }
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
@@ -944,12 +959,17 @@ impl TableFile {
     /// error with the RAM length already moved, as [`Self::publish_end`]
     /// does.
     pub fn write_at_pwrite(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_published(self.header_len_to_persist(), offset, bytes)
+    }
+
+    /// [`Self::write_at_pwrite`] against a `committed` end the caller sampled.
+    fn write_published(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
         }
         let end = offset.saturating_add(bytes.len() as u64);
         self.ensure_capacity(end)?;
-        self.pwrite_all(offset, bytes)?;
+        self.pwrite_checked(committed, offset, bytes)?;
         let landed = self.publish_end(end, true);
         self.needs_sync.store(true, Ordering::Release);
         if !landed {
@@ -1289,9 +1309,18 @@ impl TableFile {
         if len == 0 {
             return Ok(());
         }
+        // One committed end for the whole call. A fallback chunk publishes
+        // its end, and those zeros are not a committed page the next chunk
+        // shares.
+        let committed = self.header_len_to_persist();
+        crate::page_guard::check_armed_write(&self.path, committed, offset, len)?;
         self.ensure_capacity(offset.saturating_add(len))?;
         let file = self.file.lock().unwrap();
-        if try_punch_hole(&file, offset, len).is_ok() {
+        #[cfg(debug_assertions)]
+        let punched = !take_no_punch_hole(&self.path) && try_punch_hole(&file, offset, len).is_ok();
+        #[cfg(not(debug_assertions))]
+        let punched = try_punch_hole(&file, offset, len).is_ok();
+        if punched {
             return Ok(());
         }
         drop(file);
@@ -1299,7 +1328,7 @@ impl TableFile {
         let mut written = 0u64;
         while written < len {
             let chunk = ((len - written) as usize).min(zero.len());
-            self.write_at(offset + written, &zero[..chunk])?;
+            self.write_published(committed, offset + written, &zero[..chunk])?;
             written += chunk as u64;
         }
         Ok(())
@@ -1659,6 +1688,30 @@ pub fn try_fallocate(file: &File, len: u64) -> std::io::Result<()> {
             "fallocate unavailable",
         ))
     }
+}
+
+#[cfg(debug_assertions)]
+static NO_PUNCH_HOLE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The next [`TableFile::zero_range`] on `path` takes the zero-write
+/// fallback, as on a filesystem without hole punching.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn skip_next_punch_hole(path: &Path) {
+    NO_PUNCH_HOLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_no_punch_hole(path: &Path) -> bool {
+    let mut armed = NO_PUNCH_HOLE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == path) else {
+        return false;
+    };
+    armed.remove(i);
+    true
 }
 
 #[doc(hidden)]

@@ -173,7 +173,8 @@ fn occupied_schema23_header_body_opens_as_24() {
     assert_eq!(got.weight, 0);
     drop(s);
     let meta = std::fs::read(dir.join("meta")).unwrap();
-    assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), SCHEMA_VERSION);
+    // Open rewrites 22–29 to schema 30. The first Class A arm publishes 31.
+    assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), 30);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -701,7 +702,7 @@ fn open_schema24_occupied_creates_zero_txstat() {
     assert_eq!(s.txs.txstat.count(), 1);
     assert_eq!(s.txs.txstat.get_cell(Fk(1)).unwrap(), [0u8; 8]);
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    assert_eq!(read_store_meta_ver(&dir), 30);
     assert!(dir.join("txstat.body").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -726,7 +727,7 @@ fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     let s = Store::open_tiny(&dir).unwrap();
     drop(s);
     assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(SCHEMA_VERSION, 31);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -759,7 +760,7 @@ fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
     drop(s);
     assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(SCHEMA_VERSION, 31);
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(
         synced.iter().any(|p| p == dir.path()),
@@ -910,7 +911,8 @@ fn open_schema22_occupied_rewrites_create_ovf_12_to_16() {
     assert_eq!(tx.output_count, n_out);
     assert_eq!(outs.len(), n_out as usize);
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    // Open rewrites 22–29 to schema 30. The first Class A arm publishes 31.
+    assert_eq!(read_store_meta_ver(&dir), 30);
     assert_eq!(ovf_data_len(&dir), 16);
     let _ = std::fs::remove_dir_all(&dir);
 }

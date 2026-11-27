@@ -101,7 +101,7 @@ fn schema_file_openable_is_22_through_current() {
 #[test]
 fn constants_stable() {
     assert_eq!(STORE_MAGIC, *b"RBT1");
-    assert_eq!(SCHEMA_VERSION, 30);
+    assert_eq!(SCHEMA_VERSION, 31);
     assert!(!VERSION.is_empty());
     assert!(schema_file_openable(26));
     assert!(schema_file_openable(25));
@@ -117,7 +117,8 @@ fn constants_stable() {
     assert!(schema_file_openable(28));
     assert!(schema_file_openable(29));
     assert!(schema_file_openable(30));
-    assert!(!schema_file_openable(31));
+    assert!(schema_file_openable(31));
+    assert!(!schema_file_openable(32));
     assert!(!schema_file_openable(0));
 }
 

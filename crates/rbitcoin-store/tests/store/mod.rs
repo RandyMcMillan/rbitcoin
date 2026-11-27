@@ -731,6 +731,82 @@ fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every `RBT1` stamp under `dir`, as (file, offset, version).
+fn store_stamps(dir: &Path) -> Vec<(std::path::PathBuf, usize, u16)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for ent in std::fs::read_dir(&d).unwrap() {
+            let p = ent.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+                continue;
+            }
+            let raw = std::fs::read(&p).unwrap();
+            for at in 0..raw.len().saturating_sub(5) {
+                if raw[at..at + 4] == STORE_MAGIC {
+                    out.push((
+                        p.clone(),
+                        at,
+                        u16::from_le_bytes([raw[at + 4], raw[at + 5]]),
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite every stamp under `dir` to `ver`, as a store that binary wrote.
+fn restamp_store(dir: &Path, ver: u16) {
+    let mut by_file: std::collections::HashMap<std::path::PathBuf, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (p, at, _) in store_stamps(dir) {
+        by_file.entry(p).or_default().push(at);
+    }
+    for (p, ats) in by_file {
+        let mut raw = std::fs::read(&p).unwrap();
+        for at in ats {
+            raw[at + 4..at + 6].copy_from_slice(&ver.to_le_bytes());
+        }
+        std::fs::write(&p, raw).unwrap();
+    }
+}
+
+/// A plain open leaves meta 30 alone so a schema-30 binary still opens the
+/// store. Every file this binary writes there other than `meta` and a
+/// `guard/` mark, including a `header_txs_first` pair the open creates, must
+/// carry a stamp that binary accepts. Schema 31 is `meta` only.
+#[test]
+fn plain_open_of_meta_30_stamps_no_file_past_30() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item([0x30u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
+        s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
+        s.flush().unwrap();
+    }
+    restamp_store(&dir, 30);
+    std::fs::remove_file(dir.join("header_txs_first.body")).unwrap();
+    std::fs::remove_file(dir.join("header_txs_count.body")).unwrap();
+    {
+        let s = Store::open_tiny(&dir).unwrap();
+        let item = coinbase_item([0x31u8; 32], vec![OutputRecord::unspent(50, vec![0x52])]);
+        s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
+        s.flush().unwrap();
+    }
+    assert!(dir.join("header_txs_first.body").is_file());
+    let meta = dir.join("meta");
+    let guard = dir.join("guard");
+    let past: Vec<_> = store_stamps(&dir)
+        .into_iter()
+        .filter(|(p, _, v)| *v > 30 && *p != meta && !p.starts_with(&guard))
+        .collect();
+    assert!(past.is_empty(), "a schema-30 binary refuses {past:?}");
+}
+
 /// A 26 datadir whose witness locator is already the finished cut must open,
 /// keep the creates, and rewrite meta to 30. A 26 binary wipes that layout.
 #[test]

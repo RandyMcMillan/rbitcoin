@@ -302,7 +302,7 @@ and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not prun
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **30** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–30** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — new files are stamped **30** (`FILE_SCHEMA_VERSION`): schema 31 changed `meta` only. Occupied files keep the version they were written; **22–31** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 

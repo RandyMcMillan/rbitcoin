@@ -111,7 +111,8 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///
 /// **31:** `meta` only. A new store is created at 31; an upgraded one
 ///         reaches 31 at its first page-guard mark, before the mark is
-///         published. A plain open of 30 does not. No table rewrite.
+///         published. A plain open of 30 does not. No table rewrite:
+///         every other file keeps stamp 30 ([`FILE_SCHEMA_VERSION`]).
 ///         An older binary refuses 31 `meta`.
 /// **30:** Every spend slot is a note in `spent.delta/`: page records in
 ///         16 MiB segments, a directory base plus log, and `commit`. Class A
@@ -153,6 +154,13 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// **21 and older:** not opened. Meta below 22 is one wipe-and-IBD refuse.
 ///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
 pub const SCHEMA_VERSION: u16 = 31;
+
+/// Stamp in every store file other than `meta` and a page-guard mark.
+///
+/// The newest schema that changed such a file. Schema 31 changed `meta`
+/// only, so a plain open of a 30 store, which leaves `meta` at 30, writes
+/// tables, heads, and sidecars a schema-30 binary still opens.
+pub const FILE_SCHEMA_VERSION: u16 = 30;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///

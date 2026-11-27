@@ -36,7 +36,9 @@
 use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
-use rbitcoin_primitives::{le_u64, schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{
+    le_u64, schema_file_openable, TableKind, FILE_SCHEMA_VERSION, STORE_MAGIC,
+};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -360,7 +362,7 @@ pub fn leading_header_bytes(kind: TableKind, logical: u64) -> [u8; FILE_HEADER_L
 pub fn encode_leading_header(kind: TableKind, logical: u64) -> [u8; FILE_HEADER_LEN] {
     let mut header = [0u8; FILE_HEADER_LEN];
     header[0..4].copy_from_slice(&STORE_MAGIC);
-    header[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    header[4..6].copy_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
     header[6..8].copy_from_slice(&kind.as_u16().to_le_bytes());
     header[8..16].copy_from_slice(&logical.to_le_bytes());
     header
@@ -641,7 +643,7 @@ impl TableFile {
         let base = logical - TRAILING_FOOTER_LEN as u64;
         let mut footer = [0u8; TRAILING_FOOTER_LEN];
         footer[0..4].copy_from_slice(&STORE_MAGIC);
-        footer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        footer[4..6].copy_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
         footer[6..8].copy_from_slice(&self.kind.as_u16().to_le_bytes());
         footer[8..16].copy_from_slice(&logical.to_le_bytes());
         footer[16..32].copy_from_slice(&self.trailing_ext);

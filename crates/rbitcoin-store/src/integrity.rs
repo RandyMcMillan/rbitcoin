@@ -16,7 +16,7 @@ use crate::header_table::block_header_hash;
 use crate::store::Store;
 use rbitcoin_primitives::{
     bytes, le_u16, le_u32, le_u64, merkle_root_from_txids, schema_file_openable, Fk, Height,
-    SCHEMA_VERSION, STORE_MAGIC,
+    FILE_SCHEMA_VERSION, STORE_MAGIC,
 };
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -134,7 +134,7 @@ impl TipSeal {
         let p = Self::path(dir);
         let mut buf = [0u8; Self::BYTES];
         buf[0..4].copy_from_slice(&STORE_MAGIC);
-        buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        buf[4..6].copy_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
         // 6..8 reserved
         buf[8..12].copy_from_slice(&self.tip_height.to_le_bytes());
         buf[12..20].copy_from_slice(&self.confirmed_len.to_le_bytes());

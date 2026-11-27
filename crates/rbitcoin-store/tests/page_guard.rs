@@ -149,31 +149,69 @@ fn arm_refuses_a_bare_name() {
     assert!(matches!(err, StoreError::Rejected(_)));
 }
 
+const NO_STORE_CHILD: &str = "RBITCOIN_PAGE_GUARD_NO_STORE_CHILD";
+
 /// A mark with no store directory above `guard/` has nowhere to register
 /// its pages or sync `guard/`. Arm refuses it before it creates anything.
+/// The relative mark resolves against the working directory, so a child
+/// process runs it inside a fresh temp directory.
 #[test]
 fn arm_refuses_a_mark_with_no_store_directory() {
-    let rel = Path::new("page-guard-no-store-dir");
-    let _ = std::fs::remove_dir_all(rel);
-    let page = fill(0x01);
-    let res = arm_page_guard_group(&rel.join("live"), &[("live", 0, &page)]);
-    let created = rel.exists();
-    let _ = std::fs::remove_dir_all(rel);
-    assert!(matches!(res, Err(StoreError::Rejected(_))), "{res:?}");
+    if std::env::var_os(NO_STORE_CHILD).is_some() {
+        let page = fill(0x01);
+        let res = arm_page_guard_group(Path::new("guard/live"), &[("live", 0, &page)]);
+        assert!(matches!(res, Err(StoreError::Rejected(_))), "{res:?}");
+        return;
+    }
+    let dir = TempDir::labeled("page-guard-no-store-dir").unwrap();
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args([
+            "--exact",
+            "page_guard::arm_refuses_a_mark_with_no_store_directory",
+        ])
+        .current_dir(dir.path())
+        .env(NO_STORE_CHILD, "1")
+        .output()
+        .expect("child test");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !created,
+        out.status.success() && stdout.contains("1 passed"),
+        "child: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.path().join("guard").exists(),
         "arm created its guard directory before it refused"
     );
 }
 
+/// Open looks for marks only in `guard/` and skips `.tmp` staging names, so
+/// arm refuses any other mark path before it creates anything.
+#[test]
+fn arm_refuses_a_mark_open_would_not_see() {
+    let dir = TempDir::labeled("page-guard-namespace").unwrap();
+    let page = fill(0x01);
+    for mark in ["journal/class_c", "guard/class_c.tmp"] {
+        let path = dir.path().join(mark);
+        let res = arm_page_guard_group(&path, &[("live", 0, &page)]);
+        assert!(
+            matches!(res, Err(StoreError::Rejected(_))),
+            "{mark}: {res:?}"
+        );
+        assert!(!path.exists(), "{mark}");
+    }
+    assert!(!dir.path().join("journal").exists());
+}
+
 /// One file has one spelling. `sub//live`, `sub/./live`, and `sub/live/`
-/// name the file `sub/live` names, so arm and restore refuse them.
+/// name the file `sub/live` names, so arm and restore refuse them. A `:`
+/// is refused too: on Windows `C:live` joins as a drive prefix.
 #[test]
 fn a_noncanonical_file_name_is_refused() {
     let dir = TempDir::labeled("page-guard-canon").unwrap();
     let mark = dir.path().join("guard/live");
     let page = fill(0x01);
-    for name in ["sub//live", "sub/./live", "sub/live/"] {
+    for name in ["sub//live", "sub/./live", "sub/live/", "C:live", "c:/live"] {
         let err = arm_page_guard_group(&mark, &[(name, 0, &page)]).unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)), "{name}: {err:?}");
         assert!(!mark.exists(), "{name}");
@@ -541,12 +579,12 @@ fn arm_page0(dir: &TempDir, mark: &str) {
     arm_page_guard_group(&dir.path().join(mark), &[("body", 0, image.as_slice())]).unwrap();
 }
 
-/// A clear that unlinks the mark and then fails its directory sync still
-/// drops that mark's pages from the release check. The mark is gone, and a
-/// retry takes the missing-mark path.
+/// A clear that unlinks the mark and then fails its directory sync blocks
+/// the file: the unlink is not durable, and a crash could bring the mark
+/// back over a later write. A retry that syncs releases it.
 #[cfg(debug_assertions)]
 #[test]
-fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
+fn a_removed_mark_blocks_its_file_until_the_dir_sync_succeeds() {
     let dir = TempDir::labeled("page-guard-forget").unwrap();
     let live = dir.path().join("live");
     write_bytes(&live, 0, &fill(0x11));
@@ -554,17 +592,104 @@ fn a_removed_mark_forgets_its_pages_when_the_dir_sync_fails() {
     let mark = dir.path().join("guard/live");
     arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]).unwrap();
     let committed = 2 * PAGE as u64;
+    let check =
+        |off: u64| rbitcoin_store::page_guard::check_armed_write(&live, committed, off, 512);
+    check(256).expect("page 0 is armed");
     assert!(
-        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512)
-            .is_err(),
+        check(PAGE as u64 + 256).is_err(),
         "page 1 is committed and not armed"
     );
     rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
     let file = open_rw(&live);
     assert!(clear_page_guard(&mark, &file, &live).is_err());
     assert!(!mark.exists());
-    rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512)
-        .expect("the removed mark still armed page 0");
+    assert!(
+        check(256).is_err(),
+        "page 0 is open before the unlink is durable"
+    );
+    assert!(check(PAGE as u64 + 256).is_err());
+    check(committed).expect("an append stays allowed");
+    clear_page_guard(&mark, &file, &live).unwrap();
+    check(256).expect("a synced retry releases the file");
+    check(PAGE as u64 + 256).expect("a synced retry releases the file");
+}
+
+/// A clear that rewrites a two-file mark without one file, then fails the
+/// directory sync, blocks the dropped file. The kept file stays armed.
+#[cfg(debug_assertions)]
+#[test]
+fn a_dropped_file_stays_blocked_when_the_rewrite_sync_fails() {
+    let dir = TempDir::labeled("page-guard-drop-block").unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    for live in [&a, &b] {
+        write_bytes(live, 0, &fill(0x11));
+        write_bytes(live, PAGE as u64, &fill(0x12));
+    }
+    let mark = dir.path().join("guard/pair");
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("a", 0, fill(0x11).as_slice()),
+            ("b", 0, fill(0x11).as_slice()),
+        ],
+    )
+    .unwrap();
+    let committed = 2 * PAGE as u64;
+    let check =
+        |live: &Path| rbitcoin_store::page_guard::check_armed_write(live, committed, 256, 512);
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
+    let file = open_rw(&a);
+    assert!(clear_page_guard(&mark, &file, &a).is_err());
+    assert!(mark.exists(), "b keeps the mark");
+    assert!(
+        check(&a).is_err(),
+        "a is open before the rewrite is durable"
+    );
+    check(&b).expect("b is still armed");
+    clear_page_guard(&mark, &file, &a).unwrap();
+    check(&a).expect("a synced retry releases a");
+}
+
+/// A restore whose mark unlink fails its directory sync blocks the files it
+/// wrote: the mark can come back and copy its images again.
+#[cfg(debug_assertions)]
+#[test]
+fn a_restore_blocks_its_files_when_the_unlink_sync_fails() {
+    let dir = TempDir::labeled("page-guard-restore-block").unwrap();
+    let live = dir.path().join("live");
+    write_bytes(&live, 0, &fill(0x11));
+    let mark = dir.path().join("guard/live");
+    arm_page_guard_group(&mark, &[("live", 0, fill(0x22).as_slice())]).unwrap();
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&dir.path().join("guard"));
+    assert!(restore_page_guard_group(&mark, dir.path()).is_err());
+    assert!(
+        rbitcoin_store::page_guard::check_armed_write(&live, PAGE as u64, 256, 512).is_err(),
+        "the restored file is open before the unlink is durable"
+    );
+}
+
+/// The arm rename makes the mark visible before its directory sync. A
+/// failed sync must still leave the write check matching that mark.
+#[cfg(debug_assertions)]
+#[test]
+fn an_arm_registers_its_pages_before_the_dir_sync() {
+    let dir = TempDir::labeled("page-guard-arm-sync").unwrap();
+    let live = dir.path().join("live");
+    write_bytes(&live, 0, &fill(0x11));
+    write_bytes(&live, PAGE as u64, &fill(0x12));
+    let mark = dir.path().join("guard/live");
+    rbitcoin_store::page_guard::fail_next_arm_dir_sync(&dir.path().join("guard"));
+    assert!(arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]).is_err());
+    assert!(mark.is_file(), "the rename published the mark");
+    let committed = 2 * PAGE as u64;
+    rbitcoin_store::page_guard::check_armed_write(&live, committed, 256, 512)
+        .expect("page 0 is in the visible mark");
+    assert!(
+        rbitcoin_store::page_guard::check_armed_write(&live, committed, PAGE as u64 + 256, 512)
+            .is_err(),
+        "page 1 is committed and not in the mark"
+    );
 }
 
 /// Without hole punching, `zero_range` writes zeros in 1 MiB chunks. Each

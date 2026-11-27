@@ -2665,7 +2665,7 @@ fn dir_has_chain_payload(dir: &Path) -> bool {
 /// the caller, not be wiped with the store. Only a missing `guard/` is
 /// `Ok(false)`: a directory or entry that cannot be read may hold a mark.
 fn has_guard_mark(dir: &Path) -> Result<bool, StoreError> {
-    let guard = dir.join("guard");
+    let guard = dir.join(crate::page_guard::GUARD_DIR);
     let rd = match std::fs::read_dir(&guard) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),

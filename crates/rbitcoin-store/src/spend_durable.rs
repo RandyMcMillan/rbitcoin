@@ -5,7 +5,7 @@
 
 use crate::error::StoreError;
 use crate::file::write_synced_tmp_rename;
-use rbitcoin_primitives::{le_u16, le_u32, schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{le_u16, le_u32, schema_file_openable, FILE_SCHEMA_VERSION, STORE_MAGIC};
 use std::path::Path;
 
 /// `store/spend_durable`. Annotated-through and durable-through heights.
@@ -61,7 +61,7 @@ impl SpendDurable {
     pub fn store(&self, dir: &Path) -> Result<(), StoreError> {
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&STORE_MAGIC);
-        buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        buf[4..6].copy_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
         buf[8..12].copy_from_slice(&self.annotated_through.to_le_bytes());
         buf[12..16].copy_from_slice(&self.durable_through.to_le_bytes());
         write_synced_tmp_rename(&dir.join(SPEND_DURABLE_NAME), &buf)

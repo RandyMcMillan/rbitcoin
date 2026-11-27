@@ -17,14 +17,15 @@ use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 
 use crate::durability::Durable;
 use crate::error::StoreError;
-use crate::file::{
-    fsync_parent_dir, handle_pwrite_all, write_file_synced_tmp_rename, write_synced_tmp_rename,
-};
+use crate::file::{fsync_parent_dir, handle_pwrite_all, write_file_synced_tmp_rename};
 
 pub const PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
 const HEAD: usize = 12;
 const RECORD: usize = 8 + PAGE as usize;
 const GROUP_KIND: u16 = 1;
+
+/// The one directory under a store that holds marks. Open looks only here.
+pub(crate) const GUARD_DIR: &str = "guard";
 
 fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     static ARMED: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
@@ -62,14 +63,38 @@ fn forget_armed(path: &Path) {
         .remove(path);
 }
 
-/// A file dropped from a mark is not armed. The release check reads this map.
-fn forget_armed_names(mark: &Path, names: &HashSet<String>) {
+/// An arm with no pages: [`check_armed_write`] refuses every write below
+/// the committed end. A file stays here until a clear or an arm of it
+/// succeeds.
+fn block_armed(path: &Path) {
+    armed_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), HashSet::new());
+}
+
+/// Live paths of `names` under the store that holds `mark`.
+fn live_paths(mark: &Path, names: &HashSet<String>) -> Vec<PathBuf> {
     let Some(dir) = guard_live_dir(mark) else {
-        return;
+        return Vec::new();
     };
-    for name in names {
-        forget_armed(&dir.join(name));
+    names.iter().map(|name| dir.join(name)).collect()
+}
+
+/// Sync the guard directory after a mark change that drops `released`.
+/// A file is released only once that change is durable. Until then a crash
+/// can bring the old mark back, and open would copy its images over a later
+/// write, so a failed sync blocks the file instead.
+fn sync_mark_dir_then_release(parent: &Path, released: &[PathBuf]) -> Result<(), StoreError> {
+    let synced = sync_mark_dir(parent);
+    for path in released {
+        if synced.is_ok() {
+            forget_armed(path);
+        } else {
+            block_armed(path);
+        }
     }
+    synced
 }
 
 /// Reject a range that shares a committed page when `path` has a live arm
@@ -79,8 +104,9 @@ fn forget_armed_names(mark: &Path, names: &HashSet<String>) {
 /// write to a file with a live arm must be inside the pages that arm names:
 /// even a one-sector write that lands whole may belong to the commit the
 /// mark protects, and open would roll the mark back around it. A path with
-/// no live arm is not checked. `committed_end` is the durable header length,
-/// not a RAM high-water.
+/// no live arm is not checked. A file whose mark change failed its directory
+/// sync refuses every such write. `committed_end` is the durable header
+/// length, not a RAM high-water.
 #[doc(hidden)]
 pub fn check_armed_write(
     path: &Path,
@@ -95,6 +121,11 @@ pub fn check_armed_write(
     let Some(pages) = map.get(path) else {
         return Ok(());
     };
+    if pages.is_empty() {
+        return Err(StoreError::Rejected(
+            "a guard mark change for this file is not durable",
+        ));
+    }
     let Some(end) = offset.checked_add(len) else {
         return Err(StoreError::Rejected("write is outside the armed pages"));
     };
@@ -151,9 +182,11 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
     for &(file, offset, image) in pages {
         encode_group_record(&mut buf, file, offset, image)?;
     }
-    write_synced_tmp_rename(path, &buf)?;
+    // The rename makes the mark visible, so register its pages before the
+    // directory sync. A failed sync then leaves the check matching the mark.
+    write_file_synced_tmp_rename(path, &buf)?;
     remember_group(path, pages, &leftover);
-    Ok(())
+    sync_arm_dir(mark_parent(path)?)
 }
 
 /// Copies every named image onto its file under `dir`. Does not read live bytes.
@@ -162,20 +195,20 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
 /// the live files are left alone.
 #[doc(hidden)]
 pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
-    if !replay_page_guard_group(mark, dir)? {
+    let Some(restored) = replay_page_guard_group(mark, dir)? else {
         return Ok(false);
-    }
-    remove_mark(mark, || {})?;
+    };
+    remove_mark(mark, &restored)?;
     Ok(true)
 }
 
 /// Copies the images and leaves the mark. They are on the device when this
-/// returns.
-fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
+/// returns. `Some` names the live files it wrote; `None` is a missing mark.
+fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<Option<Vec<PathBuf>>, StoreError> {
     mark_parent(mark)?;
     let raw = match std::fs::read(mark) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(StoreError::io(mark, e)),
     };
     let pages = mark_group_pages(&raw)?;
@@ -210,10 +243,7 @@ fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> 
             parents.push(parent);
         }
     }
-    for (_, _, data_path) in &opened {
-        forget_armed(data_path);
-    }
-    Ok(true)
+    Ok(Some(opened.into_iter().map(|(_, _, path)| path).collect()))
 }
 
 /// Syncs `data`, then removes `path` and syncs its directory.
@@ -270,8 +300,9 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
         }
         keep.push((name, offset, raw[at..at + PAGE as usize].to_vec()));
     }
+    let released = live_paths(path, &dropped);
     if keep.is_empty() {
-        return remove_mark(path, || forget_armed_names(path, &dropped));
+        return remove_mark(path, &released);
     }
     let count = u32::try_from(keep.len())
         .map_err(|_| StoreError::Corrupt("page guard arm is too large"))?;
@@ -283,11 +314,8 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     for (file, offset, image) in &keep {
         encode_group_record(&mut buf, file, *offset, image)?;
     }
-    // The rename drops the names from the mark, so forget them before the
-    // directory sync. A failed sync must not leave them armed.
     write_file_synced_tmp_rename(path, &buf)?;
-    forget_armed_names(path, &dropped);
-    sync_mark_dir(mark_parent(path)?)
+    sync_mark_dir_then_release(mark_parent(path)?, &released)
 }
 
 /// File name of `path` as a single component, or `Corrupt`.
@@ -336,9 +364,14 @@ fn load_group_leftover(
 
 /// One or two `/`-separated parts, each a plain name. A name has one
 /// spelling: `Path` would read `sub//live` and `sub/live/` as `sub/live`,
-/// and a retry and the parser compare the raw text.
+/// and a retry and the parser compare the raw text. No `:`: on Windows
+/// `C:live` is a drive prefix, and `Path::join` would leave the store.
 fn valid_guard_name(name: &str) -> bool {
-    if name.len() > u16::MAX as usize || name.contains('\\') || name.contains('\0') {
+    if name.len() > u16::MAX as usize
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.contains(':')
+    {
         return false;
     }
     let mut n = 0usize;
@@ -385,9 +418,22 @@ fn mark_parent(path: &Path) -> Result<&Path, StoreError> {
 /// `guard/` that already exists is synced again, because an earlier arm may
 /// have created it and then failed that sync. A mark with no store
 /// directory above `guard/` is refused before anything is created: the
-/// write check keys its pages by that directory.
+/// write check keys its pages by that directory. So is a mark outside
+/// `guard/` or one that ends in `.tmp`: open looks for marks only in
+/// `guard/` and skips the staging names there, and could replace a store
+/// whose mark it never saw.
 fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
+    if parent.file_name().and_then(|n| n.to_str()) != Some(GUARD_DIR) {
+        return Err(StoreError::Rejected("page guard mark is not in guard/"));
+    }
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_none_or(|n| n.ends_with(".tmp"))
+    {
+        return Err(StoreError::Rejected("page guard mark name"));
+    }
     let Some(store) = guard_live_dir(path) else {
         return Err(StoreError::Rejected(
             "page guard mark has no store directory",
@@ -399,34 +445,61 @@ fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
     fsync_parent_dir(store).map_err(|e| StoreError::io(store, e))
 }
 
-/// Unlink `path`, run `forget` once the mark is gone, then sync its
-/// directory. A failed directory sync must not leave the release check
-/// holding pages of a mark that no longer exists.
-fn remove_mark(path: &Path, forget: impl FnOnce()) -> Result<(), StoreError> {
+/// Unlink `path` and sync its directory, then release `released`. A failed
+/// sync blocks them: the unlink is not durable, and neither the old pages
+/// nor an unchecked file may take writes the old mark would roll back.
+fn remove_mark(path: &Path, released: &[PathBuf]) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(StoreError::io(path, e)),
     }
-    forget();
-    sync_mark_dir(parent)
+    sync_mark_dir_then_release(parent, released)
 }
 
 /// Sync the guard directory after a mark was unlinked or renamed over.
 fn sync_mark_dir(parent: &Path) -> Result<(), StoreError> {
     #[cfg(debug_assertions)]
-    if take_fail_mark_dir_sync(parent) {
-        return Err(StoreError::io(
-            parent,
-            std::io::Error::other("injected guard directory sync failure"),
-        ));
+    if take_fail_dir_sync(&FAIL_MARK_DIR_SYNC, parent) {
+        return Err(injected_dir_sync_failure(parent));
+    }
+    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
+}
+
+/// Sync the guard directory after an arm renamed its mark into place.
+fn sync_arm_dir(parent: &Path) -> Result<(), StoreError> {
+    #[cfg(debug_assertions)]
+    if take_fail_dir_sync(&FAIL_ARM_DIR_SYNC, parent) {
+        return Err(injected_dir_sync_failure(parent));
     }
     fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
 }
 
 #[cfg(debug_assertions)]
+fn injected_dir_sync_failure(parent: &Path) -> StoreError {
+    StoreError::io(
+        parent,
+        std::io::Error::other("injected guard directory sync failure"),
+    )
+}
+
+#[cfg(debug_assertions)]
 static FAIL_MARK_DIR_SYNC: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(debug_assertions)]
+static FAIL_ARM_DIR_SYNC: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The next arm in guard directory `dir` renames its mark into place and
+/// then fails its directory sync.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_arm_dir_sync(dir: &Path) {
+    FAIL_ARM_DIR_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
 
 /// The next mark removal or rewrite in guard directory `dir` unlinks or
 /// renames the mark and then fails its directory sync.
@@ -440,8 +513,8 @@ pub fn fail_next_mark_dir_sync(dir: &Path) {
 }
 
 #[cfg(debug_assertions)]
-fn take_fail_mark_dir_sync(dir: &Path) -> bool {
-    let mut armed = FAIL_MARK_DIR_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+fn take_fail_dir_sync(list: &Mutex<Vec<PathBuf>>, dir: &Path) -> bool {
+    let mut armed = list.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = armed.iter().position(|p| p == dir) else {
         return false;
     };

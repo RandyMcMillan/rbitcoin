@@ -27,7 +27,7 @@ use crate::address_head::{AddressHead, HeadLayout, SnapshotImage, HEAD_LOAD_STAR
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
 use crate::tx_head_mphf::TxHeadMphf;
-use rbitcoin_primitives::{le_u32, le_u64, Fk, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{le_u32, le_u64, Fk, FILE_SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -1528,7 +1528,7 @@ fn write_meta_versioned(
     }
     let mut buf = Vec::with_capacity(META_HEADER_LEN + segs.len() * SEG_DESC_LEN);
     buf.extend_from_slice(&STORE_MAGIC);
-    buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    buf.extend_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
     buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&(segs.len() as u32).to_le_bytes());

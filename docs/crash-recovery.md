@@ -211,7 +211,10 @@ are closed, the whole-store guarantee is the guarded state above, not every
 row. Each mark takes over in the change that wires it:
 `store/guard/class_c` in #2184, the header marks in #2185, `guard/sh-*` in
 #2186, and `mempool/guard/flush` in #2188. `txstat` drops its image in
-#2180.
+#2180. Block-filter and tweak segment pairs take the shape above in #2181.
+Until then a new pair's names are not synced before its lengths, and open
+refuses a pair missing one file (`segment pair incomplete`) instead of
+dropping it.
 
 The scripthash index is still gated: an append, an unlink, or a deferred
 empty-head commit writes `scripthash.dirty` before it writes. A full synced

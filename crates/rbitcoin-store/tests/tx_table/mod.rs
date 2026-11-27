@@ -1071,10 +1071,10 @@ fn reopen_backfills_legacy_seqsigwit_as_spans() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn reopen_resumes_partial_legacy_input_backfill() {
-    let dir = tempfile_dir("input-backfill-resume");
-    let t = create_tiny(&dir);
+/// A legacy store: two creates whose prevouts sit inline in seqsigwit, and
+/// an input table that holds only the first. Open backfills the second.
+fn legacy_backfill_fixture(dir: &std::path::Path) {
+    let t = create_tiny(dir);
     let coinbase = (
         TxRecord {
             txid: [1u8; 32],
@@ -1136,11 +1136,17 @@ fn reopen_resumes_partial_legacy_input_backfill() {
     for name in ["input.loc", "input.off", "input.body"] {
         std::fs::remove_file(dir.join(name)).unwrap();
     }
-    let partial = rbitcoin_store::input::Input::create(&dir).unwrap();
+    let partial = rbitcoin_store::input::Input::create(dir).unwrap();
     partial
         .append(&[vec![rbitcoin_store::input::InputEdge::coinbase()]])
         .unwrap();
     drop(partial);
+}
+
+#[test]
+fn reopen_resumes_partial_legacy_input_backfill() {
+    let dir = tempfile_dir("input-backfill-resume");
+    legacy_backfill_fixture(&dir);
     rbitcoin_log::progress::capture_finished(true);
     let t2 = TxTable::open_tiny(&dir).unwrap();
     let fin = finished_stages();
@@ -1161,6 +1167,26 @@ fn reopen_resumes_partial_legacy_input_backfill() {
         !t2.input.pending_sync(),
         "backfill must sync before open returns"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The backfill syncs its rows before it publishes a length. A failed sync
+/// leaves the durable input count where it was.
+#[test]
+fn a_failed_backfill_sync_leaves_the_durable_input_count() {
+    let dir = tempfile_dir("input-backfill-sync");
+    legacy_backfill_fixture(&dir);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.input.count(), 2);
+    t.input.truncate_to_count(1).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(t.input.loc.io_handle(), 1);
+    assert!(t.backfill_inputs_from_seqsigwit(2).is_err());
+    assert_eq!(
+        rbitcoin_store::input::Input::open(&dir).unwrap().count(),
+        1,
+        "a backfilled length moved before its rows synced"
+    );
+    drop(t);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

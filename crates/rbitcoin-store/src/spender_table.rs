@@ -4,13 +4,19 @@
 //! when an outpoint has multiple annotated spenders do we allocate nodes here.
 //!
 //! Fixed 16 B records (1-based fk): packed `(fk:u40, vin:u16)` | `next:u64`.
+//!
+//! An append writes past the durable end and moves only the RAM length.
+//! [`SpenderTable::flush`] syncs the nodes, then writes and syncs the length
+//! that names them, so the durable length is always that of some flush. A
+//! crash keeps the nodes below it and ignores the bytes past it, with no
+//! mark (the sector rule, crash-recovery.md).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::tx_table::{pack_spent_field, unpack_spent_field};
 use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const SPENDER_RECORD_LEN: usize = 16;
 /// Multi-spender overflow next to `spent.body` (schema 17).
@@ -18,9 +24,30 @@ pub const SPENT_OVF_NAME: &str = "spent.ovf";
 #[doc(hidden)]
 pub const LEGACY_SPENDERS_BODY: &str = "spenders.body";
 
+/// The annotate freeze. [`Self::new`] borrows [`crate::store::UtxoViewGuard`]
+/// for the node sync, then the length write and its sync. An annotate
+/// append does not wait for it: [`SpenderTable::flush`] publishes only the
+/// end it sampled before the sync.
+pub struct SpenderFreeze<'a> {
+    _view: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> SpenderFreeze<'a> {
+    pub fn new(guard: &'a crate::store::UtxoViewGuard<'_>) -> Self {
+        let _ = guard.view;
+        Self {
+            _view: std::marker::PhantomData,
+        }
+    }
+}
+
 pub struct SpenderTable {
     pub body: TableFile,
     pub count: AtomicU64,
+    /// A body sync failed. A retry can return 0 after the kernel dropped
+    /// the dirty pages, so every later flush is refused until restart and
+    /// no length is published over them.
+    sync_failed: AtomicBool,
 }
 
 #[doc(hidden)]
@@ -49,6 +76,7 @@ impl SpenderTable {
         Ok(Self {
             body,
             count: AtomicU64::new(0),
+            sync_failed: AtomicBool::new(false),
         })
     }
 
@@ -66,6 +94,7 @@ impl SpenderTable {
         Ok(Self {
             body,
             count: AtomicU64::new(count),
+            sync_failed: AtomicBool::new(false),
         })
     }
 
@@ -89,7 +118,10 @@ impl SpenderTable {
         let mut buf = [0u8; SPENDER_RECORD_LEN];
         buf[0..8].copy_from_slice(&packed.to_le_bytes());
         buf[8..16].copy_from_slice(&next.0.to_le_bytes());
-        self.body.write_at(Self::offset(id), &buf)?;
+        let at = Self::offset(id);
+        self.body.write_uncommitted(at, &buf)?;
+        // RAM only: the header keeps the last flushed length.
+        let _ = self.body.publish_end(at + SPENDER_RECORD_LEN as u64, false);
         self.count.store(id, Ordering::Release);
         Ok(Fk(id))
     }
@@ -107,15 +139,68 @@ impl SpenderTable {
         Ok((spend_tx, vin, Fk(le_u64!(buf, 8))))
     }
 
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.body.flush()
+    /// Sync the nodes, then write and sync the length that names them.
+    pub fn flush(&self, _freeze: &SpenderFreeze<'_>) -> Result<(), StoreError> {
+        self.refuse_if_sync_failed()?;
+        self.finish_sync(self.publish_synced())
     }
 
-    pub fn sync_data_only(&self) -> Result<(), StoreError> {
-        self.body.sync_data_only()
+    /// The annotate path does not take the freeze, so an append can land
+    /// during a flush. The end is sampled before the sync: every append that
+    /// published it had already written its node. One that lands after the
+    /// sample stays past the header until the next flush.
+    fn publish_synced(&self) -> Result<(), StoreError> {
+        let end = self.body.logical_len();
+        self.body.sync_data_only()?;
+        #[cfg(debug_assertions)]
+        run_after_node_sync(self);
+        self.body.publish_synced_len(end)
+    }
+
+    fn refuse_if_sync_failed(&self) -> Result<(), StoreError> {
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(StoreError::io(
+                self.body.path(),
+                std::io::Error::other("an earlier spent.ovf sync failed; restart the node"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Latch the first sync error. A retried fsync can return 0 after the
+    /// kernel dropped the dirty pages, so no later flush publishes a length.
+    fn finish_sync(&self, synced: Result<(), StoreError>) -> Result<(), StoreError> {
+        if synced.is_err() {
+            self.sync_failed.store(true, Ordering::Release);
+        }
+        synced
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()
+    }
+}
+
+#[cfg(debug_assertions)]
+type AfterNodeSync = Box<dyn FnOnce(&SpenderTable)>;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static AFTER_NODE_SYNC: std::cell::RefCell<Option<AfterNodeSync>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` once on this thread, after a flush's node sync and before its
+/// length write.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_after_node_sync(hook: Option<AfterNodeSync>) {
+    AFTER_NODE_SYNC.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(debug_assertions)]
+fn run_after_node_sync(table: &SpenderTable) {
+    if let Some(hook) = AFTER_NODE_SYNC.with(|slot| slot.borrow_mut().take()) {
+        hook(table);
     }
 }

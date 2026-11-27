@@ -105,15 +105,14 @@ fn for_each_spender_create_cycle_is_corrupt() {
     let older_id = older.get().unwrap();
     let off = rbitcoin_store::file::FILE_HEADER_LEN as u64
         + (older_id - 1) * rbitcoin_store::spender_table::SPENDER_RECORD_LEN as u64;
-    let ovf = rbitcoin_store::file::TableFile::open(
-        dir.join(rbitcoin_store::spender_table::SPENT_OVF_NAME),
-        rbitcoin_primitives::TableKind::Spender,
-    )
-    .unwrap();
-    let mut rec = [0u8; rbitcoin_store::spender_table::SPENDER_RECORD_LEN];
-    ovf.read_at(off, &mut rec).unwrap();
-    rec[8..16].copy_from_slice(&head.0.to_le_bytes());
-    ovf.write_at(off, &rec).unwrap();
+    // Point the older node's `next` back at the head. The nodes sit past
+    // the durable length until a flush, so patch the file directly.
+    let mut ovf = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(rbitcoin_store::spender_table::SPENT_OVF_NAME))
+        .unwrap();
+    std::io::Seek::seek(&mut ovf, std::io::SeekFrom::Start(off + 8)).unwrap();
+    std::io::Write::write_all(&mut ovf, &head.0.to_le_bytes()).unwrap();
     match for_each_spender_create(&txs, &spenders, create, 0, |_, _| Ok(true)) {
         Err(StoreError::Corrupt(m)) => {
             assert!(m.contains("cycle"), "{m}");

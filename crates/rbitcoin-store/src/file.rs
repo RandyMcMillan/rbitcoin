@@ -1114,6 +1114,23 @@ impl TableFile {
         true
     }
 
+    /// Write `end` as the header length and sync it. `end` names bytes the
+    /// caller already synced. A RAM-only append past `end` stays past the
+    /// header, so a later flush still cannot publish it unsynced.
+    pub fn publish_synced_len(&self, end: u64) -> Result<(), StoreError> {
+        {
+            let _hold = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let cap = self.header_cap.load(Ordering::Acquire);
+            if cap != 0 && end > cap {
+                self.persist_hwm(end)?;
+                let ram = self.published_len.load(Ordering::Acquire);
+                self.header_cap
+                    .store(if ram > end { end } else { 0 }, Ordering::Release);
+            }
+        }
+        self.sync_data_only()
+    }
+
     /// Loc, overflow, and checkpoint headers for one locator family.
     #[must_use]
     pub(crate) fn catch_up_locator_headers(loc: &Self, ovf: &Self, off: &Self) -> bool {

@@ -17,8 +17,9 @@ write. `handle_pwrite_all(` does not match inside `pwrite_all`.
 `write_at`, `write_at_pwrite`, `write_uncommitted`, `pwrite_all`,
 `persist_hwm`, `persist_logical_len`, `write_trailer`, and `zero_range`
 go through `TableFile::pwrite_all` or the same armed-page check. They
-are the door, not a raw site. A path-qualified `FileExt::write_at(` is
-the raw positional write and is counted.
+are the door, not a raw site. The raw positional write is
+`std::os::unix::fs::FileExt`, which shares the door's `write_at` name, so
+each mention of `FileExt` (its import or a path-qualified call) is counted.
 """
 
 import argparse
@@ -31,7 +32,7 @@ CRATES = ("rbitcoin-mempool", "rbitcoin-store")
 
 # (token, pattern, crates that count it). None counts both crates.
 TOKENS = (
-    ("FileExt_write_at", r"FileExt::write_at\s*\(", None),
+    ("FileExt", r"(?<![A-Za-z0-9_])FileExt(?![A-Za-z0-9_])", None),
     ("WriteOp", r"(?<![A-Za-z0-9_])WriteOp\s*\{", None),
     ("opcode_Write", r"opcode::Write::new\s*\(", None),
     ("fs_write", r"(?<![A-Za-z0-9_])fs::write\s*\(", None),
@@ -60,8 +61,12 @@ def scan(root: str) -> dict[str, int]:
     for token, pattern, only in TOKENS:
         # The name may end one line and its `(` or `{` open the next code
         # line. Blank and comment-only lines between them do not count.
-        name, opener = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern).groups()
-        split = (re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener))
+        # A bare name (`FileExt`) has no opener to split from.
+        call = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern)
+        split = None
+        if call:
+            name, opener = call.groups()
+            split = (re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener))
         compiled.append((token, re.compile(pattern), only, split))
     counts: dict[str, int] = {}
     for crate in CRATES:
@@ -79,13 +84,15 @@ def scan(root: str) -> dict[str, int]:
                     continue
                 rel = f"{rel_dir}/{name}"
                 full = os.path.join(dirpath, name)
-                for token, rx, only, (tail, head) in compiled:
+                for token, rx, only, split in compiled:
                     if only is not None and crate not in only:
                         continue
 
-                    def line_fn(code, prev, rx=rx, tail=tail, head=head):
-                        split = 1 if tail.search(prev) and head.search(code) else 0
-                        return len(rx.findall(code)) + split
+                    def line_fn(code, prev, rx=rx, split=split):
+                        n = len(rx.findall(code))
+                        if split and split[0].search(prev) and split[1].search(code):
+                            n += 1
+                        return n
 
                     got = ratchet.file_count(full, line_fn)
                     if got:

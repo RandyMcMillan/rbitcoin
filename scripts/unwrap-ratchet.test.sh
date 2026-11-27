@@ -58,6 +58,8 @@ assert_fail "rb raw string does not hide a later unwrap" \
   python3 "$PY" --root "$FIX/raw-rb"
 assert_fail "rc and rb# raw strings do not hide a later unwrap" \
   python3 "$PY" --root "$FIX/raw-rc"
+assert_fail "a cooked string across lines does not hide a later unwrap" \
+  python3 "$PY" --root "$FIX/multiline-string"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "unwrap-ratchet.test.sh: $PASS passed, $FAIL failed"

@@ -42,6 +42,12 @@ assert_fail "a call split by comment-only and blank lines fails an empty baselin
   python3 "$PY" --root "$FIX/split-comment"
 assert_fail "a path-qualified FileExt::write_at fails an empty baseline" \
   python3 "$PY" --root "$FIX/fileext-write-at"
+assert_fail "a FileExt import with a method-form write_at fails an empty baseline" \
+  python3 "$PY" --root "$FIX/fileext-method"
+assert_fail "FileExt::write_at split after the path fails an empty baseline" \
+  python3 "$PY" --root "$FIX/fileext-split-path"
+assert_fail "a cooked string across lines does not hide a later write" \
+  python3 "$PY" --root "$FIX/multiline-string"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "page-write-ratchet.test.sh: $PASS passed, $FAIL failed"

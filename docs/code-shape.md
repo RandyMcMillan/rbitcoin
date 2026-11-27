@@ -130,7 +130,8 @@ Raw store and mempool page writes are frozen per file and per token in
 gains one, and when a cleanup leaves the old count in place. The tokens
 are `pwrite`, `pwrite_batch`, `pwrite_exact`, `handle_pwrite_all`,
 `set_len`, `set_file_len`, `truncate`, `fs::write`, `WriteOp`, an io_uring
-`opcode::Write`, and a path-qualified `FileExt::write_at`.
+`opcode::Write`, and any mention of `FileExt` (its import or a
+path-qualified call), since its method `write_at` shares the door's name.
 `write_all` counts only under `rbitcoin-mempool`. `write_at`,
 `write_at_pwrite`, `write_uncommitted`, `pwrite_all`, `persist_hwm`,
 `persist_logical_len`, `write_trailer`, and `zero_range` are the

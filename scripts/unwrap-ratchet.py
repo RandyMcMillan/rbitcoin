@@ -81,10 +81,9 @@ def _string_end(src: str, i: int) -> int | None:
         if src[k] == "\\":
             k += 2
             continue
+        # A cooked string may span lines. Its `/*` or `//` is text.
         if src[k] == '"':
             return k + 1
-        if src[k] == "\n":
-            return None
         k += 1
     return n
 

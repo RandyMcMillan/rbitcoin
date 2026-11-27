@@ -540,10 +540,6 @@ impl StrongTxTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         flush_class_c_tables(&[&self.table])
     }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.table.flush_async()
-    }
 }
 
 /// Per-header contiguous tx_fk range (Class A). Schema v2 stores `(first, count)`

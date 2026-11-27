@@ -1,30 +1,20 @@
 Fixed
 - **Class C and derived writes survive a torn in-place page.** A
   `header_txs` append rewrote the block holding the previous tip's committed
-  range. The two sidecars share one directory sync and one pair stamp,
-  and the two unlinks share one directory sync. Open restores the pair
-  only when both stamps match. A retry after one column has landed reuses
-  that stamp instead of advancing the dirty column. `header.head` rewrote a 3 KiB chunk beside committed slots, and
+  range; both columns now arm one mark, so open restores the pair whole.
+  `header.head` rewrote a 3 KiB chunk beside committed slots, and
   `txstat.body` stamped cells in place. A power cut could tear those pages, and
   open accepted a missing `header_txs` range as `Ok` or served a
-  well-formed wrong stats or filter value. Those writes now put a synced
-  `*.ahead` image of the intended pages first; open restores it. A torn
+  well-formed wrong stats or filter value. Those writes now arm a synced
+  page-guard mark of the intended pages first and open restores it
+  (`class-c-guard.md`); a txstat stamp is a one-sector write synced in
+  place. A torn
   strong flush is repaired from the confirmed fence instead. `txstat.blk`
   and `txstat.ovf` are unchanged ([#2071],
   [#2072], [#2073], [#2075]).
-- **A later write keeps outstanding `*.ahead` page images.** Replacing the
-  sidecar merges every image the new write does not cover; new images win on
-  overlap. `HashHead`, `ScriptHashHead`, in-place `txstat` stamps, and
-  `header_txs` share that merge ([#2108]).
-- **txstat appends leave the Class A tail guard in charge of new cells.** An
-  append-only batch does not copy the new tail into `txstat.body.ahead`. It
-  drops leftover images that overlap the append and keeps pages it does not
-  touch. When every leftover page stays, the sidecar file is left in place.
-  Restore will not shrink a durable length past the sidecar or replay
-  bytes the append already published. A replay of an older page 0 skips that
-  image's 16-byte header, so a crash before the header rewrite does not plant
-  the old length over a newer tail. The in-place `getblockstats` stamp
-  still journals its page set.
+- **A later write keeps outstanding page images.** Replacing a mark merges
+  every image the new write does not cover; new images win on overlap
+  ([#2108]).
 - **Header and scripthash ingest heads become durable after their bodies.**
   `HeaderTable::ensure_batch` syncs `header.body` before `insert_many`.
   Scripthash ingest syncs slabs and the alloc header before

@@ -233,7 +233,9 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     class_a.synced                   # optional: u64 LE create count a spend commit or scripthash mark named after a Class A sync (missing = 0). Open keeps exactly max(this, the highest `header_txs` create). No SCHEMA_VERSION bump
-    *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover txstat.body.ahead instead of restoring it. No SCHEMA_VERSION bump
+    guard/class_c                    # schema 31 sidecar: forward 4 KiB images for confirmed[], header_txs first+count, and strong_tx. One mark per flush group. Open copies every named image before any Class C read. Published after meta 31. No SCHEMA_VERSION bump
+
+    *.ahead                          # transient write-ahead page image for header.head and the scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, or txstat.body.ahead instead of restoring it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked

@@ -685,7 +685,14 @@ fn fd_only_header_txs_pair_is_one_mark() {
         rbitcoin_store::chain::fail_next_fd_write_before_live(
             &dir.path.join("header_txs_count.body"),
         );
+        rbitcoin_store::page_guard::arm_store_mark_trace();
         assert!(t.put_range(&write, Fk(1), Fk(5), 3).is_err());
+        let armed = rbitcoin_store::page_guard::take_armed_store_marks();
+        assert_eq!(
+            armed,
+            vec![rbitcoin_store::page_guard::CLASS_C_MARK.to_string()],
+            "the pair armed more than one mark"
+        );
     }
     assert!(rbitcoin_store::page_guard::restore_store_group(
         &dir.path,

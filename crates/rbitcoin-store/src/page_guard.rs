@@ -115,6 +115,10 @@ pub fn check_armed_write(
 /// One group mark for several files. A retry replaces the image at the same
 /// file and offset. Other offsets stay, including other pages of a file this
 /// set names.
+///
+/// Restore copies each image verbatim and does not check its kind. Pre-images
+/// make a backward mark (a crash rolls back); finished pages make a forward
+/// mark (a crash completes the write). The caller picks and documents it.
 #[doc(hidden)]
 pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result<(), StoreError> {
     ensure_mark_parent(path)?;

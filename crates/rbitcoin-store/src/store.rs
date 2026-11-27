@@ -622,7 +622,7 @@ impl Store {
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         let dir = layout.dir.clone();
         if !dir.join("meta").exists() {
-            if creation_has_chain(&layout) {
+            if creation_has_chain(&layout) || has_guard_mark(&layout.dir) {
                 return Err(StoreError::Corrupt("store meta missing"));
             }
             if incomplete_creation_files(&layout) {

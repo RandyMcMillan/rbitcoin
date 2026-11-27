@@ -2473,6 +2473,30 @@ fn empty_header() -> HeaderRecord {
     }
 }
 
+/// A store with no `meta` but a published guard mark is not an untouched
+/// first creation. Open must refuse it and leave the mark and files.
+#[test]
+fn missing_meta_with_guard_mark_is_kept() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::remove_file(dir.join("meta")).unwrap();
+    std::fs::create_dir_all(dir.join("guard")).unwrap();
+    std::fs::write(dir.join("guard").join("class_c"), b"mark").unwrap();
+    assert!(
+        Store::open_or_create_tiny(&dir).is_err(),
+        "a guard mark without meta must not be replaced by a fresh store"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("guard").join("class_c")).unwrap(),
+        b"mark"
+    );
+    assert!(!dir.join("meta").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn kill_first_start_interrupted_creation_reopens_empty_chain() {
     let torn = tmp();

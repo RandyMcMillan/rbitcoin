@@ -89,11 +89,15 @@ when every such subset is a state open accepts. Two shapes always pass:
   that commit, and open would roll the mark back around it.
 
 Any other write that changes committed bytes in more than one sector goes
-through `page_guard`. The writer stores the pre-image of every page that
+through `page_guard`. The writer stores an image of every page that
 write will touch, syncs that mark, writes the live bytes, syncs them, then
 removes the mark. Open copies the images back while the mark is there, and
-accepts the live pages only after the mark is gone. The committed end is the
-durable header length, not a RAM high-water.
+accepts the live pages only after the mark is gone. Restore copies each
+image verbatim and does not check its kind, so the writer picks the
+outcome: a backward mark holds pre-images and a crash rolls the write back;
+a forward mark holds the finished pages and a crash completes the write.
+Each mark's doc names its kind. The committed end is the durable header
+length, not a RAM high-water.
 
 **The marks.** `confirmed.body`, `header_txs_*`, and `strong_tx` use
 `store/guard/class_c`. `header.body` is an append: rows, then length, each

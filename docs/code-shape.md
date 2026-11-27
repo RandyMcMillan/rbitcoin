@@ -129,19 +129,17 @@ Raw store and mempool page writes are frozen per file and per token in
 `./scripts/page-write-ratchet.sh` fails when a token grows, when a file
 gains one, and when a cleanup leaves the old count in place. The tokens
 are `pwrite`, `pwrite_batch`, `pwrite_exact`, `handle_pwrite_all`,
-`set_len`, `set_file_len`, `truncate`, `fs::write`, `WriteOp`, and a
-path-qualified `FileExt::write_at`.
+`set_len`, `set_file_len`, `truncate`, `fs::write`, `WriteOp`, an io_uring
+`opcode::Write`, and a path-qualified `FileExt::write_at`.
 `write_all` counts only under `rbitcoin-mempool`. `write_at`,
 `write_at_pwrite`, `write_uncommitted`, `pwrite_all`, `persist_hwm`,
-`persist_logical_len`, `write_trailer`, and `zero_range` are the door:
-they go through the armed-page check in `TableFile::pwrite_all` and are
-not counted. `handle_pwrite_all` does not match inside `pwrite_all`.
+`persist_logical_len`, `write_trailer`, and `zero_range` are the
+`TableFile` write door and are not counted. `handle_pwrite_all` does not
+match inside `pwrite_all`.
 The scan is `crates/rbitcoin-store/src` and `crates/rbitcoin-mempool/src`,
-with the same `#[cfg(test)]` skip as the unwrap ratchet. A new write of
-a live page that already holds committed bytes goes through `page_guard`.
-The calls that still bypass the door are the baseline. `page_guard`
-(`append_past_end` and image restore) is the protocol bypass on that list. A baseline edit
-belongs in the commit that adds or removes the call.
+with the same `#[cfg(test)]` skip as the unwrap ratchet. The calls that
+bypass the door are the baseline. A baseline edit belongs in the commit
+that adds or removes the call.
 
 **Goal:** no `[workspace.lints.clippy]` `= "allow"`. A lint that is wrong
 for one item is `#[allow(clippy::lint)]` on **that item**, with a one-line

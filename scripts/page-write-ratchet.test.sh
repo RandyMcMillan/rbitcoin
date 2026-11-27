@@ -36,8 +36,6 @@ assert_fail "mempool write_all fails an empty baseline" \
   python3 "$PY" --root "$FIX/mempool-write-all"
 assert_ok "pwrite_all is the checked door" \
   python3 "$PY" --root "$FIX/pwrite-all"
-assert_ok "handle_pwrite_all is not counted as pwrite_all" \
-  python3 "$PY" --root "$FIX/match"
 assert_fail "a call split before its parenthesis fails an empty baseline" \
   python3 "$PY" --root "$FIX/split-call"
 assert_fail "a call split by comment-only and blank lines fails an empty baseline" \

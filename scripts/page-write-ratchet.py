@@ -33,6 +33,7 @@ CRATES = ("rbitcoin-mempool", "rbitcoin-store")
 TOKENS = (
     ("FileExt_write_at", r"FileExt::write_at\s*\(", None),
     ("WriteOp", r"(?<![A-Za-z0-9_])WriteOp\s*\{", None),
+    ("opcode_Write", r"opcode::Write::new\s*\(", None),
     ("fs_write", r"(?<![A-Za-z0-9_])fs::write\s*\(", None),
     ("handle_pwrite_all", r"(?<![A-Za-z0-9_])handle_pwrite_all\s*\(", None),
     ("pwrite", r"(?<![A-Za-z0-9_])pwrite\s*\(", None),

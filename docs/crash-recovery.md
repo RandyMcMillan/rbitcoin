@@ -232,10 +232,6 @@ appends its body the same way, then uses `mempool/guard/flush` for slots and
 file must exist. A strong bit a fence run names is set again by
 `restore_strong_from_fence`.
 
-**Not yet in effect.** The marks above are where this change series ends.
-Every store mark is wired at this revision. `mempool/guard/flush` takes over
-in #2188; until then the mempool flush arms no mark.
-
 The scripthash index is still gated: an append, an unlink, or a deferred
 empty-head commit writes `scripthash.dirty` before it writes. A full synced
 `ScriptHashTable::flush` (file data, then the `scripthash.body`,

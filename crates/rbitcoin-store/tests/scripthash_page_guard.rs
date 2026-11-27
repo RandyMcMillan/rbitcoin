@@ -288,37 +288,86 @@ fn empty_ingest_collision_restores_the_displaced_page() {
     );
 }
 
-/// A non-empty ingest places a second key past the first probe. That page
-/// is armed before the write.
+/// A non-empty ingest wraps a collision on its last slot to slot 0. Each
+/// slot sits in its own chunk and on its own 4 KiB page, so imaging only the
+/// primary chunk would leave slot 0 unarmed. The displaced page is armed too.
 #[test]
 fn nonempty_ingest_collision_restores_the_displaced_page() {
-    let slots = rbitcoin_store::scripthash::ingest_oa_slots(rbitcoin_store::HeadScale::Tiny);
-    let (a, b, page) = displaced_pair(slots);
+    // Tiny has 256 slots, and its last chunk spans both 4 KiB pages.
+    const SLOTS: u64 = 1024;
+    let (a, b) = last_slot_pair(SLOTS);
+    let prior = (0u32..)
+        .map(|i| script_hash(&[0xfe, (i & 0xff) as u8, (i >> 8) as u8]))
+        .find(|sh| {
+            let slot = ScriptHashHead::hash_slot(&ScriptHashHead::to_key(sh), SLOTS);
+            slot > SLOTS_PER_CHUNK && slot < SLOTS - SLOTS_PER_CHUNK
+        })
+        .unwrap();
     let dir = tmp();
     let ingest = ingest_path(&dir);
-    let prior = script_hash(&[0xff, 0xfe, 0xfd]);
+    let slot0 = ScriptHashHead::slot_file_off(0);
+    let slot0_page = slot0 / SH_PAGE_SIZE as u64 * SH_PAGE_SIZE as u64;
+    let before;
     {
         let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        *t.ingest.lock().unwrap() =
+            Some(ScriptHashHead::create_with_slots(&ingest, SLOTS).unwrap());
         put_create_batch(&t, [rec(prior, 7)]);
+        before = page_bytes(&ingest, slot0_page);
         t.fail_next_sh_guard_clear();
         let err = t
             .put_create_batch_append(&[rec(a, 1), rec(b, 2)])
             .unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
         assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
-        tear_bytes(&ingest, page, SH_PAGE_SIZE);
+        let word = |sh: &[u8; 32]| {
+            t.ingest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .value_word_offset(sh)
+                .unwrap()
+                .unwrap()
+        };
+        let last = ScriptHashHead::slot_file_off(SLOTS - 1);
+        let mut offs = [word(&a), word(&b)];
+        offs.sort_unstable();
+        assert!(
+            (slot0..slot0 + SH_HEAD_SLOT_SIZE as u64).contains(&offs[0]),
+            "no key wrapped to slot 0: {offs:?}"
+        );
+        assert!(
+            (last..last + SH_HEAD_SLOT_SIZE as u64).contains(&offs[1]),
+            "no key kept the last slot: {offs:?}"
+        );
+        assert_ne!(
+            offs[0] / SH_PAGE_SIZE as u64,
+            offs[1] / SH_PAGE_SIZE as u64,
+            "the displaced slot shares the primary page"
+        );
+        tear_bytes(&ingest, slot0, SH_HEAD_SLOT_SIZE);
         drop(t);
     }
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert!(sh_marks(&dir).is_empty(), "open removes the mark");
-    let got = page_bytes(&ingest, page);
-    assert_ne!(
-        got,
-        vec![0xffu8; SH_PAGE_SIZE],
+    assert_eq!(
+        page_bytes(&ingest, slot0_page),
+        before,
         "the displaced ingest page stayed torn"
     );
     assert!(create_fks(&t, &a).is_empty() && create_fks(&t, &b).is_empty());
     assert_eq!(create_fks(&t, &prior), vec![7]);
+}
+
+/// Two keys whose first probe is the last of `slots`.
+fn last_slot_pair(slots: u64) -> ([u8; 32], [u8; 32]) {
+    let mut hits = (0u32..200_000)
+        .map(|i| script_hash(&i.to_le_bytes()))
+        .filter(|sh| ScriptHashHead::hash_slot(&ScriptHashHead::to_key(sh), slots) == slots - 1);
+    let a = hits.next().expect("no key hashed to the last slot");
+    let b = hits.next().expect("one key hashed to the last slot");
+    (a, b)
 }
 
 /// `ingest.ahead` is the post-image. Open must not replay it over the mark.
@@ -327,17 +376,24 @@ fn ahead_sidecar_does_not_override_a_restored_ingest() {
     let dir = tmp();
     let a = script_hash(&[0x51]);
     let b = script_hash(&[0x52]);
+    let ingest = ingest_path(&dir);
+    let ahead = ingest.with_file_name("ingest.ahead");
     {
         let t = ScriptHashTable::create_tiny(&dir).unwrap();
         put_create_batch(&t, [rec(a, 1)]);
-        let ingest = ingest_path(&dir);
         rbitcoin_store::scripthash_head::fail_next_scripthash_head_flush_after_ahead(&ingest);
         let err = t.put_create_batch_append(&[rec(b, 2)]).unwrap_err();
         assert!(matches!(err, StoreError::Io { .. }), "{err}");
+        assert!(
+            format!("{err:?}").contains("injected scripthash head ahead failure"),
+            "the commit failed before the ahead write: {err:?}"
+        );
         assert!(!sh_marks(&dir).is_empty(), "the crash leaves the mark");
+        assert!(ahead.is_file(), "the failed flush published no ahead image");
         drop(t);
     }
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(!ahead.exists(), "open kept the ahead image");
     assert!(
         t.head_value(&b).unwrap().is_none(),
         "ahead replay published the failed key"

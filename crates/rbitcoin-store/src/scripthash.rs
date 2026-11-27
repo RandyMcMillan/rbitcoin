@@ -365,6 +365,10 @@ impl StagedSlabs {
     }
 }
 
+/// One page image a mark takes: the store-relative file, its offset, and
+/// the bytes, borrowed from the caller's imaged pages.
+type PageImageRef<'a> = (&'a str, u64, &'a [u8]);
+
 #[derive(Default)]
 pub(super) struct ArmedSh {
     files: BTreeMap<String, BTreeSet<String>>,
@@ -2592,31 +2596,26 @@ impl ScriptHashTable {
         &self,
         pages: &BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
     ) -> Result<ArmedSh, StoreError> {
-        let mut by_mark: BTreeMap<String, Vec<(String, u64, [u8; PAGE as usize])>> =
-            BTreeMap::new();
+        let mut by_mark: BTreeMap<&str, Vec<PageImageRef<'_>>> = BTreeMap::new();
         let mut armed = ArmedSh::default();
         for ((mark, rel, off), image) in pages {
             by_mark
-                .entry(mark.clone())
+                .entry(mark.as_str())
                 .or_default()
-                .push((rel.clone(), *off, *image));
+                .push((rel.as_str(), *off, image.as_slice()));
             armed
                 .files
                 .entry(mark.clone())
                 .or_default()
                 .insert(rel.clone());
         }
-        for (mark, recs) in &by_mark {
+        for (mark, mut recs) in by_mark {
             // A backward mark keeps the oldest pre-image. A page a commit that
             // failed before its clear still holds keeps that image, not this
             // commit's view of it, which already has the failed bytes.
             let held = page_guard::armed_group_pages(&self.store_dir.join(mark))?;
-            let refs: Vec<(&str, u64, &[u8])> = recs
-                .iter()
-                .filter(|(rel, off, _)| !held.contains(&(rel.clone(), *off)))
-                .map(|(rel, off, image)| (rel.as_str(), *off, image.as_slice()))
-                .collect();
-            page_guard::arm_store_group(&self.store_dir, mark, &refs)?;
+            recs.retain(|(rel, off, _)| !held.contains(&(rel.to_string(), *off)));
+            page_guard::arm_store_group(&self.store_dir, mark, &recs)?;
         }
         Ok(armed)
     }
@@ -2957,7 +2956,9 @@ impl ScriptHashTable {
         // Until the drop returns, ingest stays the only copy of these keys.
         if let Err(e) = self.drop_ingest_rel() {
             drop(sealed);
-            crate::scripthash_sorted_head::remove_sorted_head_files(&path)?;
+            if let Err(gone) = crate::scripthash_sorted_head::remove_sorted_head_files(&path) {
+                rbitcoin_log::warn!("store: rejected scripthash seal not removed: {gone}");
+            }
             return Err(e);
         }
         self.sealed_ovf.lock().unwrap().push(sealed);

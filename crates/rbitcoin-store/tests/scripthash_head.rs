@@ -559,3 +559,57 @@ fn cache_eviction_leaves_one_wave_in_the_ahead_image() {
     let _ = std::fs::remove_file(&ahead);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
+
+/// A fill of an empty table writes each run of adjacent slots once, not
+/// one write per 24-byte slot. Every key reads back.
+#[cfg(debug_assertions)]
+#[test]
+fn bulk_fill_writes_each_run_of_adjacent_slots_once() {
+    use rbitcoin_store::file::{arm_write_trace, take_write_trace, TracedWrite};
+    use rbitcoin_store::scripthash_layout::{ShHeadKey, SH_HEAD_KEY_LEN};
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-runs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let slots = 64u64;
+    let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+    let entries: Vec<(ShHeadKey, ShHeadValue)> = (0u64..40)
+        .map(|i| {
+            let mut full = [0u8; 32];
+            full[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+            full[8] = 1;
+            (
+                ScriptHashHead::to_key(&full),
+                ShHeadValue::inline_one(Fk(i + 1)),
+            )
+        })
+        .collect();
+    let keys: Vec<ShHeadKey> = entries.iter().map(|(k, _)| *k).collect();
+    let mut assigned = ScriptHashHead::assign_empty_slots(slots, &keys).unwrap();
+    assigned.sort_unstable();
+    assigned.dedup();
+    let runs = 1 + assigned.windows(2).filter(|w| w[1] != w[0] + 1).count();
+    assert!(runs < assigned.len(), "the fixture has no adjacent slots");
+    arm_write_trace();
+    h.bulk_fill_empty(&entries).unwrap();
+    let slot_writes = take_write_trace()
+        .into_iter()
+        .filter(|w| {
+            matches!(w, TracedWrite::Write { path: p, offset, .. }
+                if p == &path && *offset >= FILE_HEADER_LEN as u64)
+        })
+        .count();
+    assert_eq!(slot_writes, runs);
+    for (i, (key, val)) in entries.iter().enumerate() {
+        let mut full = [0u8; 32];
+        full[..SH_HEAD_KEY_LEN].copy_from_slice(key);
+        assert_eq!(h.get(&full).unwrap().as_ref(), Some(val), "key {i}");
+    }
+    drop(h);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}

@@ -307,6 +307,9 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
                 .metadata()
                 .map_err(|e| StoreError::io(&data_path, e))?
                 .len();
+            if len == 0 {
+                fit_empty_to_image(&file, &data_path, name, &pages)?;
+            }
             opened.push((name.clone(), file, data_path.clone(), len));
         }
         let Some((_, data, live, len)) = opened.iter().find(|(have, _, _, _)| have == name) else {
@@ -325,6 +328,26 @@ pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, Sto
     }
     remove_mark(mark, &live_paths(mark, &names))?;
     Ok(true)
+}
+
+/// Give an empty live file the full length of its images, durably, before
+/// any page lands. A restore that stops partway then leaves a file a retry
+/// sees as that length, so the retry writes every page in full.
+fn fit_empty_to_image(
+    file: &File,
+    path: &Path,
+    name: &str,
+    pages: &[(String, u64, usize)],
+) -> Result<(), StoreError> {
+    let end = pages
+        .iter()
+        .filter(|(have, _, _)| have == name)
+        .map(|(_, offset, _)| offset.saturating_add(PAGE))
+        .max()
+        .unwrap_or(0);
+    crate::file::set_file_len(file, path, end)?;
+    file.durable_sync_data()
+        .map_err(|e| StoreError::io(path, e))
 }
 
 /// Syncs `data`, then removes `path` and syncs its directory.

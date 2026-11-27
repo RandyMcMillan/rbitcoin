@@ -819,7 +819,9 @@ fn sealed_segment_files(dir: &Path) -> usize {
 }
 
 /// A seal whose mark-name drop fails keeps each key in one place. The
-/// retry seals ingest once, not a second segment of the same keys.
+/// rejected segment's removal is synced before the drop error returns, so
+/// a crash cannot bring it back beside ingest. The retry seals ingest once,
+/// not a second segment of the same keys.
 #[test]
 fn seal_that_fails_to_drop_the_ingest_name_keeps_one_copy() {
     let dir = tmp();
@@ -830,7 +832,24 @@ fn seal_that_fails_to_drop_the_ingest_name_keeps_one_copy() {
             put_create_batch(&t, [rec(*k, i as u64 + 1)]);
         }
         t.fail_next_ingest_rel_drop();
-        assert!(t.seal_ingest().is_err());
+        rbitcoin_store::file::arm_fsync_dir_trace();
+        let err = t.seal_ingest().unwrap_err();
+        let synced = rbitcoin_store::file::take_fsynced_dirs();
+        assert!(
+            err.to_string().contains("ingest name drop"),
+            "the drop error was replaced: {err}"
+        );
+        assert_eq!(sealed_segment_files(&dir), 0, "the rejected segment stayed");
+        // Windows has no directory fsync, so nothing is recorded there.
+        let ovf_syncs = synced
+            .iter()
+            .filter(|p| **p == dir.join("scripthash.ovf"))
+            .count();
+        assert!(
+            !cfg!(unix) || ovf_syncs >= 2,
+            "the segment's .idx rename syncs the directory once; its removal \
+             must sync it again: {synced:?}"
+        );
         t.seal_ingest().unwrap();
         assert_eq!(t.sealed_ovf.lock().unwrap().len(), 1, "keys sealed twice");
         assert!(

@@ -713,6 +713,63 @@ fn fit_restore_fills_an_empty_file_with_every_page() {
     assert_eq!(read_bytes(&live, PAGE as u64, PAGE), high);
 }
 
+/// A fit restore of an empty file that a crash stops after any of its
+/// writes keeps the mark, and the next restore still ends with every page.
+#[cfg(debug_assertions)]
+#[test]
+fn an_interrupted_fit_restore_of_an_empty_file_finishes_on_retry() {
+    use rbitcoin_store::file::{arm_write_trace, take_write_trace, TracedWrite};
+    let dir = TempDir::labeled("page-guard-fit-empty-retry").unwrap();
+    let live = dir.path().join("scripthash.ovf").join("ingest");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::File::create(&live).unwrap();
+    let mark = dir.path().join("guard/sh-ovf");
+    let (low, high) = (fill(0x61), fill(0x62));
+    arm_page_guard_group(
+        &mark,
+        &[
+            ("scripthash.ovf/ingest", 0, low.as_slice()),
+            ("scripthash.ovf/ingest", PAGE as u64, high.as_slice()),
+        ],
+    )
+    .unwrap();
+    let armed = std::fs::read(&mark).unwrap();
+    arm_write_trace();
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    let ops: Vec<TracedWrite> = take_write_trace()
+        .into_iter()
+        .filter(|w| match w {
+            TracedWrite::Write { path, .. } | TracedWrite::SetLen { path, .. } => path == &live,
+        })
+        .collect();
+    for stop in 1..ops.len() {
+        let file = OpenOptions::new().write(true).open(&live).unwrap();
+        file.set_len(0).unwrap();
+        drop(file);
+        for op in &ops[..stop] {
+            match op {
+                TracedWrite::Write { offset, len, .. } => {
+                    let image = if *offset < PAGE as u64 { &low } else { &high };
+                    write_bytes(&live, *offset, &image[..*len as usize]);
+                }
+                TracedWrite::SetLen { len, .. } => {
+                    let file = OpenOptions::new().write(true).open(&live).unwrap();
+                    file.set_len(*len).unwrap();
+                }
+            }
+        }
+        std::fs::write(&mark, &armed).unwrap();
+        assert!(restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+        assert_eq!(
+            std::fs::metadata(&live).unwrap().len(),
+            2 * PAGE as u64,
+            "stopped after {stop} of {ops:?}"
+        );
+        assert_eq!(read_bytes(&live, 0, PAGE), low);
+        assert_eq!(read_bytes(&live, PAGE as u64, PAGE), high);
+    }
+}
+
 /// The release check uses the committed end, not the RAM high-water, and the
 /// pages this arm names. A later page inside that high-water is still an
 /// append when it shares no committed byte. A committed page the arm does

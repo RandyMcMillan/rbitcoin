@@ -761,8 +761,23 @@ impl ScriptHashHead {
             rec[SH_HEAD_KEY_LEN..].copy_from_slice(&enc);
             final_slot.insert(assigned[i], rec);
         }
+        // One write per run of adjacent slots. A run never spans an
+        // unassigned slot, so it writes only bytes the fill owns.
+        let mut run_off = 0u64;
+        let mut run: Vec<u8> = Vec::new();
         for (slot, rec) in &final_slot {
-            self.file.write_at(Self::slot_file_off(*slot), rec)?;
+            let off = Self::slot_file_off(*slot);
+            if !run.is_empty() && off != run_off + run.len() as u64 {
+                self.file.write_at(run_off, &run)?;
+                run.clear();
+            }
+            if run.is_empty() {
+                run_off = off;
+            }
+            run.extend_from_slice(rec);
+        }
+        if !run.is_empty() {
+            self.file.write_at(run_off, &run)?;
         }
         self.set_occupied_known(final_slot.len() as u64)?;
         Ok(())

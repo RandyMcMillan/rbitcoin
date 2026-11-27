@@ -282,16 +282,33 @@ pub fn fuse_key16(key: &ShHeadKey) -> u64 {
     fuse_key_from_mixed(&pad)
 }
 
-/// Remove a segment [`SortedHead::write`] left unpublished: data, index, fuse.
+/// Remove a segment [`SortedHead::write`] left unpublished, then sync its
+/// directory so a crash cannot bring it back.
+///
+/// The data file goes first: open loads a segment by that name only. If it
+/// stays, so do its index and fuse, or open could not read it. A leftover
+/// index or fuse is unloadable and the next write at that id replaces it.
 pub(crate) fn remove_sorted_head_files(data: &Path) -> Result<(), StoreError> {
-    for path in [data.to_path_buf(), idx_path(data), fuse_path(data)] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StoreError::io(&path, e)),
+    let mut first = remove_if_present(data);
+    if first.is_ok() {
+        for path in [idx_path(data), fuse_path(data)] {
+            let gone = remove_if_present(&path);
+            first = first.and(gone);
         }
     }
-    Ok(())
+    if let Some(dir) = data.parent() {
+        let synced = crate::file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e));
+        first = first.and(synced);
+    }
+    first
+}
+
+fn remove_if_present(path: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
 }
 
 #[doc(hidden)]

@@ -88,6 +88,31 @@ when every such subset is a state open accepts. Two shapes always pass:
   protecting, it still has to be inside that mark's pages: it may belong to
   that commit, and open would roll the mark back around it.
 
+**The small-write rule.** The sector rule covers a crash. A running process
+has a second assumption: a write of a few bytes inside one sector is never
+left half applied. `handle_pwrite_all` retries a short `pwrite` for the
+bytes it did not write, so a cell can only stay half new if the kernel takes
+part of it and the retry then fails. The triggers would be a file-size limit
+(`RLIMIT_FSIZE`) or a copy-on-write filesystem out of space on an overwrite,
+landing inside an aligned field of 8 or 16 bytes. Nothing checks for it: the
+8-byte length at offset 8 and the `txstat` cells rely on it, and a half-new
+`txstat` cell still decodes. The failed write returns an error, and the next
+stamp of that cell rewrites all of it.
+
+This is the assumption storage engines with a single-sector commit record
+make and do not guard in software. PostgreSQL keeps `pg_control` within
+`PG_CONTROL_MAX_SAFE_SIZE` (512 bytes) so one `write()` updates it, and
+reports any short write as an error
+([`pg_control.h`](https://doxygen.postgresql.org/pg__control_8h_source.html),
+[ENOSPC](https://wiki.postgresql.org/wiki/ENOSPC)). LMDB writes its meta
+page in place and relies on 512-byte sector atomicity, placing the txnid last
+so a meta page cut short is ignored
+([openldap-devel](https://www.openldap.org/lists/openldap-devel/201410/msg00004.html)).
+SQLite assumes less: a sector write may be partial but is linear, and it
+journals whole sectors instead
+([psow](https://sqlite.org/psow.html),
+[atomic commit](https://www.sqlite.org/atomiccommit.html)).
+
 Any other write that changes committed bytes in more than one sector goes
 through `page_guard`. The writer stores an image of every page that
 write will touch, syncs that mark, writes the live bytes, syncs them, then

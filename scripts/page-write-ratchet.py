@@ -20,6 +20,9 @@ go through `TableFile::pwrite_all` or the same armed-page check. They
 are the door, not a raw site. The raw positional write is
 `std::os::unix::fs::FileExt`, which shares the door's `write_at` name, so
 each mention of `FileExt` (its import or a path-qualified call) is counted.
+In a file that mentions `FileExt`, each `write_at(` and `write_all_at(`
+call is also counted as `FileExt_write`, door calls included, so a new
+method-form raw write moves the baseline even after the import is there.
 """
 
 import argparse
@@ -46,6 +49,11 @@ TOKENS = (
     ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", ("rbitcoin-mempool",)),
 )
 
+# Counted only in a file whose `FileExt` count is above zero. The method
+# form `file.write_at(..)` names no trait, so the import alone would hide
+# every later call. Door `write_at` calls in such a file count too.
+FILEEXT_WRITE = ("FileExt_write", r"(?<![A-Za-z0-9_])write(?:_all)?_at\s*\(")
+
 
 def load_unwrap():
     path = os.path.join(os.path.dirname(__file__), "unwrap-ratchet.py")
@@ -58,7 +66,7 @@ def load_unwrap():
 def scan(root: str) -> dict[str, int]:
     ratchet = load_unwrap()
     compiled = []
-    for token, pattern, only in TOKENS:
+    for token, pattern, only in TOKENS + ((*FILEEXT_WRITE, None),):
         # The name may end one line and its `(` or `{` open the next code
         # line. Blank and comment-only lines between them do not count.
         # A bare name (`FileExt`) has no opener to split from.
@@ -86,6 +94,8 @@ def scan(root: str) -> dict[str, int]:
                 full = os.path.join(dirpath, name)
                 for token, rx, only, split in compiled:
                     if only is not None and crate not in only:
+                        continue
+                    if token == FILEEXT_WRITE[0] and f"{rel}\tFileExt" not in counts:
                         continue
 
                     def line_fn(code, prev, rx=rx, split=split):

@@ -132,6 +132,10 @@ are `pwrite`, `pwrite_batch`, `pwrite_exact`, `handle_pwrite_all`,
 `set_len`, `set_file_len`, `truncate`, `fs::write`, `WriteOp`, an io_uring
 `opcode::Write`, and any mention of `FileExt` (its import or a
 path-qualified call), since its method `write_at` shares the door's name.
+A method-form call names no trait, so in a file that mentions `FileExt`
+each `write_at` and `write_all_at` call also counts as `FileExt_write`,
+door calls included. A second raw write after the import still moves
+the baseline.
 `write_all` counts only under `rbitcoin-mempool`. `write_at`,
 `write_at_pwrite`, `write_uncommitted`, `pwrite_all`, `persist_hwm`,
 `persist_logical_len`, `write_trailer`, and `zero_range` are the

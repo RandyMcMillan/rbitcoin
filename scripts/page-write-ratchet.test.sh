@@ -44,6 +44,10 @@ assert_fail "a path-qualified FileExt::write_at fails an empty baseline" \
   python3 "$PY" --root "$FIX/fileext-write-at"
 assert_fail "a FileExt import with a method-form write_at fails an empty baseline" \
   python3 "$PY" --root "$FIX/fileext-method"
+assert_fail "a second FileExt write in a file that imports it fails its baseline" \
+  python3 "$PY" --root "$FIX/fileext-second-write"
+assert_ok "FileExt writes that match their baseline pass" \
+  python3 "$PY" --root "$FIX/fileext-writes-match"
 assert_fail "FileExt::write_at split after the path fails an empty baseline" \
   python3 "$PY" --root "$FIX/fileext-split-path"
 assert_fail "a cooked string across lines does not hide a later write" \

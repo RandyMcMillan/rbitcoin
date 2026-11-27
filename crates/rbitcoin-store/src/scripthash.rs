@@ -2601,8 +2601,13 @@ impl ScriptHashTable {
                 .insert(rel.clone());
         }
         for (mark, recs) in &by_mark {
+            // A backward mark keeps the oldest pre-image. A page a commit that
+            // failed before its clear still holds keeps that image, not this
+            // commit's view of it, which already has the failed bytes.
+            let held = page_guard::armed_group_pages(&self.store_dir.join(mark))?;
             let refs: Vec<(&str, u64, &[u8])> = recs
                 .iter()
+                .filter(|(rel, off, _)| !held.contains(&(rel.clone(), *off)))
                 .map(|(rel, off, image)| (rel.as_str(), *off, image.as_slice()))
                 .collect();
             page_guard::arm_store_group(&self.store_dir, mark, &refs)?;

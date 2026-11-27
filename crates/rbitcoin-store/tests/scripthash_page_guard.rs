@@ -681,12 +681,8 @@ fn gap_links_wait_for_the_arm() {
     std::fs::write(&guard, b"not a directory").unwrap();
     let many: Vec<ScriptHashRecord> = (4..=600u64).map(|i| rec(key, i)).collect();
     rbitcoin_store::file::arm_write_trace();
-    let err = t.put_create_batch_append(&many).unwrap_err();
+    assert!(t.put_create_batch_append(&many).is_err());
     let trace = rbitcoin_store::file::take_write_trace();
-    eprintln!(
-        "DEBUG err={err} trace={trace:?} bump={}",
-        t.allocs[0].lock().unwrap().bump
-    );
     for w in trace {
         if let TracedWrite::Write { path, offset, len } = w {
             assert!(
@@ -880,4 +876,30 @@ fn deferred_empty_retry_rearms_after_a_sibling_clear() {
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert!(create_fks(&t, &a).is_empty());
     assert!(create_fks(&t, &b).is_empty());
+}
+
+/// A commit that failed before its clear leaves its pre-images armed. A
+/// later commit in the same process must keep them, not re-image those
+/// pages with the failed commit's bytes: a crash during the later commit
+/// then restores both to the state before the first.
+#[test]
+fn a_later_commit_keeps_an_armed_pre_image() {
+    let dir = tmp();
+    let a = script_hash(&[0x61]);
+    let b = script_hash(&[0x62]);
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        put_create_batch(&t, [rec(a, 1), rec(a, 2)]);
+        put_create_batch(&t, [rec(b, 1), rec(b, 2)]);
+        t.flush().unwrap();
+        t.fail_next_sh_guard_clear();
+        assert!(t.put_create_batch_append(&[rec(a, 3), rec(a, 4)]).is_err());
+        t.fail_next_sh_guard_clear();
+        assert!(t.put_create_batch_append(&[rec(b, 3), rec(b, 4)]).is_err());
+        drop(t);
+    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(sh_marks(&dir).is_empty(), "open removes the marks");
+    assert_eq!(create_fks(&t, &a), vec![1, 2]);
+    assert_eq!(create_fks(&t, &b), vec![1, 2]);
 }

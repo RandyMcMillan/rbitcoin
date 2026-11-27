@@ -592,14 +592,14 @@ pub fn drop_page_guard_names(mark: &Path, names: &HashSet<String>) -> Result<(),
     retain_unsynced(mark, names)
 }
 
-/// Drop `rel` from every `guard/sh-*` mark, then sync `dir`.
-#[doc(hidden)]
 /// A renamed `guard/sh-*` mark. `sh-<shard>.tmp` is a rename leftover that
 /// may be partial; restore and drop skip it, and reset removes it.
 pub(crate) fn published_sh_mark(name: &str) -> bool {
     name.starts_with("sh-") && !name.ends_with(".tmp")
 }
 
+/// Drop `rel` from every `guard/sh-*` mark, then sync `dir`.
+#[doc(hidden)]
 pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
     let guard = dir.join("guard");
     let rd = match std::fs::read_dir(&guard) {

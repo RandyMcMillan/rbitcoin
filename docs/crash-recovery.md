@@ -353,11 +353,11 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   link is synced before the header names it. Only a body that reused an
   offset takes the extra barrier.
 - Disconnect tip: **one unlink per scripthash**. A megakey drops that block's
-  creates from the tail pages. The saved page image is synced before the undo
-  record is published. The page the head names is updated before any earlier
-  page is rewritten, then the head moves. Old pages are freed only after that.
-  If clearing the undo fails, the saved page and the old head word are written
-  back. A crash does the same restore, so the same disconnect can run again.
+  creates from the tail pages. Its `guard/sh-*` mark of the tail pages and
+  the head word is synced first. The page the head names is updated before
+  any earlier page is rewritten, then the head moves. Old pages are freed
+  only after that. A failed clear leaves the mark armed, and open restores
+  it, so the same disconnect can run again.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.

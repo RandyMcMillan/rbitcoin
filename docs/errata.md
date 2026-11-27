@@ -57,6 +57,24 @@ segwit activation. Do not key the check on witness presence instead: storage
 tests store witness-carrying blocks that were never valid, and those must keep
 reconstructing.
 
+## A failed scripthash commit can lose its rollback images
+
+A scripthash commit arms `guard/sh-*` with the pre-image of every page it
+writes. If its body sync fails, those images stay armed. A later commit on
+the same body that succeeds clears the mark by file name, so the failed
+commit's images go too. The key the failed commit touched then reads
+`Corrupt` (slab `used` disagrees with its decoded count), and a reopen
+cannot repair it ([#2192](https://github.com/rbitcoin-org/rbitcoin/issues/2192)).
+
+This needs an I/O error inside a live commit. An unclean shutdown alone
+does not reach it: the crash leaves the mark, and open restores it. The
+damage is refused, not served: the failed write holds `scripthash.dirty`
+until a wipe, a start with the index on refuses while it is set, and the
+query layer rebuilds the index when a read hits `Corrupt`.
+
+Closing it needs a latch that refuses scripthash commits after a landing
+failure until the wipe clears it, across the store and query crates.
+
 ## Retired confirm dual paths
 
 A missed fact the pipeline promised is

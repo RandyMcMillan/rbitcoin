@@ -2401,7 +2401,7 @@ impl ScriptHashTable {
         pages: &mut BTreeMap<(String, String, u64), [u8; PAGE as usize]>,
         keys: &[[u8; 32]],
     ) -> Result<(), StoreError> {
-        let (rel, path, spans) = {
+        let (rel, path, spans, occ_known) = {
             let g = self.ingest.lock().unwrap();
             let Some(h) = g.as_ref() else {
                 return Ok(());
@@ -2409,7 +2409,8 @@ impl ScriptHashTable {
             let rel = page_guard::guard_rel_name(&self.store_dir, h.file.path())?;
             let path = h.file.path().to_path_buf();
             let spans = h.upsert_write_spans(keys)?;
-            (rel, path, spans)
+            let occ_known = h.state.lock().unwrap().occ_known;
+            (rel, path, spans, occ_known)
         };
         if spans.is_empty() {
             return Ok(());
@@ -2421,6 +2422,11 @@ impl ScriptHashTable {
         let mark = page_guard::sh_mark("ovf");
         for (off, len) in spans {
             image_range(pages, &mark, &rel, &path, &file, off, len)?;
+        }
+        if !occ_known {
+            // Nothing writes `.occ` while the count is unknown. A record for
+            // a sidecar that may not exist would keep the mark past its clear.
+            return Ok(());
         }
         self.image_occ_sidecar(pages, &mark, &path)
     }

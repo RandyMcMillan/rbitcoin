@@ -3162,8 +3162,8 @@ fn unlink_batch_syncs_one_body_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Two ingest-head rewrites share one page image. A per-key `sync_data` fails
-/// this batch; the home flush is the body barrier, and it leaves no sidecar.
+/// Two ingest-head rewrites share one page image. The batch syncs the head
+/// once, as the body barrier, and leaves no sidecar. A second sync fails.
 #[test]
 fn unlink_batch_syncs_the_ingest_head_once() {
     let dir = tmp();
@@ -3190,7 +3190,7 @@ fn unlink_batch_syncs_the_ingest_head_once() {
         }
     }
     let _disarm = Disarm(handle);
-    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 1, 1);
     t.unlink_creates_batch(&[(a, vec![Fk(2)]), (b, vec![Fk(12)])])
         .unwrap();
     assert_eq!(t.entries(&a).unwrap().len(), 2);

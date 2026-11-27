@@ -813,6 +813,12 @@ impl ScriptHashHead {
         self.file.flush()
     }
 
+    /// Sync rewritten slots without the header. A slot table never changes
+    /// length, and the header page may sit outside a live mark's pages.
+    pub fn sync_slots(&self) -> Result<(), StoreError> {
+        self.file.sync_data_only()
+    }
+
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.file.flush_async()
     }

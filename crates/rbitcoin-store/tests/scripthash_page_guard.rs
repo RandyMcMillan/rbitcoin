@@ -903,3 +903,77 @@ fn a_later_commit_keeps_an_armed_pre_image() {
     assert_eq!(create_fks(&t, &a), vec![1, 2]);
     assert_eq!(create_fks(&t, &b), vec![1, 2]);
 }
+
+/// A large ingest (slots past page 0) with `a` holding two creates and `b`
+/// one, committed through the table.
+fn large_ingest_with_keys(dir: &Path) -> ([u8; 32], [u8; 32]) {
+    let slots = ((OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64) + 1).next_power_of_two();
+    let ingest = ingest_path(dir);
+    let a = script_hash(&[0xb1]);
+    let b = script_hash(&[0xb2]);
+    {
+        let t = ScriptHashTable::create_tiny(dir).unwrap();
+        drop(t);
+        let h = ScriptHashHead::create_with_slots(&ingest, slots).unwrap();
+        h.insert(&script_hash(&[0xb0]), &ShHeadValue::inline_one(Fk(1)))
+            .unwrap();
+        h.flush().unwrap();
+    }
+    let t = ScriptHashTable::open_tiny(dir).unwrap();
+    put_create_batch(&t, [rec(a, 2), rec(a, 3), rec(b, 4)]);
+    t.flush().unwrap();
+    assert!(sh_marks(dir).is_empty());
+    (a, b)
+}
+
+/// The unlink rewrites a slot far from the header page. Its flush must not
+/// be refused, and its mark must clear.
+#[test]
+fn an_unlink_on_a_large_ingest_commits_and_clears() {
+    let dir = tmp();
+    let (a, b) = large_ingest_with_keys(&dir);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    t.unlink_creates_batch(&[(a, vec![Fk(3)])]).unwrap();
+    assert_eq!(create_fks(&t, &a), vec![2]);
+    assert_eq!(create_fks(&t, &b), vec![4]);
+    assert!(sh_marks(&dir).is_empty(), "the unlink left its mark");
+}
+
+/// A large ingest opened without `.occ` has an unknown count and writes no
+/// sidecar. A mark must not wait on the missing file, or every later seal
+/// waits on it.
+#[test]
+fn an_unlink_on_an_ingest_without_occ_clears_its_mark() {
+    let dir = tmp();
+    let (a, b) = large_ingest_with_keys(&dir);
+    let occ = rbitcoin_store::scripthash_head::occ_sidecar_path(&ingest_path(&dir));
+    std::fs::remove_file(&occ).unwrap();
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    t.unlink_creates_batch(&[(a, vec![Fk(3)])]).unwrap();
+    assert_eq!(create_fks(&t, &a), vec![2]);
+    assert!(
+        !occ.exists(),
+        "the unlink wrote a sidecar for an unknown count"
+    );
+    assert!(sh_marks(&dir).is_empty(), "the unlink left its mark");
+    put_create_batch(&t, [rec(script_hash(&[0xb3]), 5)]);
+    assert!(sh_marks(&dir).is_empty(), "the append left its mark");
+    assert_eq!(create_fks(&t, &b), vec![4]);
+}
+
+/// A suffix unlink that moves a large ingest's head word syncs the head
+/// under its mark. That sync must not be refused.
+#[test]
+fn a_suffix_unlink_on_a_large_ingest_commits_and_clears() {
+    let dir = tmp();
+    let (a, b) = large_ingest_with_keys(&dir);
+    let n = SH_PAGE_STREAM_MAX as u64 + 400;
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    let many: Vec<_> = (10..10 + n).map(|i| rec(a, i)).collect();
+    t.put_create_batch_append(&many).unwrap();
+    let tail: Vec<Fk> = ((10 + n - 400)..10 + n).map(Fk).collect();
+    t.unlink_creates(&a, &tail).unwrap();
+    assert_eq!(create_fks(&t, &a).len(), 2 + n as usize - 400);
+    assert_eq!(create_fks(&t, &b), vec![4]);
+    assert!(sh_marks(&dir).is_empty(), "the unlink left its mark");
+}

@@ -461,7 +461,7 @@ impl ScriptHashTable {
             .any(|job| matches!(job.home, LocatedHome::SealedOvf));
         if ingest {
             if let Some(h) = self.ingest.lock().unwrap().as_ref() {
-                h.flush()?;
+                h.sync_slots()?;
             }
         }
         if ovf {

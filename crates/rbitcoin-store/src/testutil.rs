@@ -297,6 +297,12 @@ pub fn class_a_writers_at_last_failure() -> usize {
     crate::tx_table::WRITERS_AT_LATCH.with(|slot| slot.get())
 }
 
+/// Class A appends `txs` counts as in flight now.
+pub fn class_a_writers(txs: &crate::tx_table::TxTable) -> usize {
+    txs.class_a_writes
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// One-shot hook run inside the next Class A seal on this thread, after the
 /// latch check at entry and before the writer count is read. A test latches
 /// an append failure there, the way a racing append thread can.

@@ -209,6 +209,11 @@ fn a_panicking_append_releases_its_writer_count() {
         appending.put_tx_full_batch_indexed(&[coinbase([0x55u8; 32])], false)
     }));
     assert!(unwound.is_err(), "the hook did not run inside the append");
+    assert_eq!(
+        rbitcoin_store::testutil::class_a_writers(&s.txs),
+        0,
+        "the unwound append kept its writer count"
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     let syncing = std::sync::Arc::clone(&s);
     std::thread::spawn(move || {

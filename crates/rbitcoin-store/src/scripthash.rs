@@ -631,14 +631,17 @@ pub fn detect_sh_body_layout(dir: &Path) -> Result<ShBodyLayout, StoreError> {
 #[doc(hidden)]
 pub fn init_empty_body(body: &TableFile) -> Result<AllocState, StoreError> {
     let payload0 = payload_start(FILE_HEADER_LEN);
-    body.ensure_capacity(payload0)?;
-    body.set_logical_len(payload0)?;
     let state = AllocState {
         live_count: 0,
         bump: payload0,
         free_head: [0; SH_MAX_CLASS as usize + 1],
     };
-    write_alloc_header(body, &state)?;
+    // The alloc page is synced before the length names it. A crash between
+    // the two leaves a bare header, not a length over a page with no SHAL.
+    body.write_uncommitted(FILE_HEADER_LEN as u64, &alloc_header_bytes(&state))?;
+    body.ensure_capacity(payload0)?;
+    body.sync_data_only()?;
+    body.set_logical_len(payload0)?;
     Ok(state)
 }
 
@@ -4380,6 +4383,10 @@ impl<'a> ScriptHashBulkSession<'a> {
 
 #[doc(hidden)]
 pub fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreError> {
+    body.write_at(FILE_HEADER_LEN as u64, &alloc_header_bytes(state))
+}
+
+fn alloc_header_bytes(state: &AllocState) -> Vec<u8> {
     // Stop at the freelist. Bytes after that hold an in-progress unlink undo.
     let mut buf = vec![0u8; 24 + 8 * (SH_MAX_CLASS as usize + 1)];
     buf[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
@@ -4394,7 +4401,7 @@ pub fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), St
         buf[off..off + 8].copy_from_slice(&h.to_le_bytes());
         off += 8;
     }
-    body.write_at(FILE_HEADER_LEN as u64, &buf)
+    buf
 }
 
 /// Read SHAL alloc page. Returns `(state, on_disk_version)`.

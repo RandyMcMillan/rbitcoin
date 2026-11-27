@@ -4995,3 +4995,24 @@ fn append_retires_an_empty_ingest_with_unknown_occupancy() {
         ))
     );
 }
+
+/// A new body names its alloc page only after that page is synced. A crash
+/// in between must not leave a length over a page with no SHAL magic, which
+/// open refuses.
+#[test]
+fn init_empty_body_syncs_the_alloc_page_before_its_length() {
+    let dir = tmp();
+    let path = dir.path().join("body");
+    let body = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(body.io_handle(), 1);
+    assert!(
+        init_empty_body(&body).is_err(),
+        "init did not sync the page"
+    );
+    let raw = std::fs::read(&path).unwrap();
+    let len = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    assert_eq!(
+        len, FILE_HEADER_LEN as u64,
+        "the length came before the sync"
+    );
+}

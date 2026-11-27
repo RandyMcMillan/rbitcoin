@@ -34,17 +34,17 @@ transaction.
   the committed end, so the sectors it shares with committed rows land
   unchanged, and the barrier is the stem sync. Open removes a leftover
   `tear_guard/` or `{stem}.kept`, which no release wrote.
-- Class C `confirmed[]`, `header_txs_*`, and `strong_tx` share one synced
-  `store/guard/class_c` mark of the intended 4 KiB pages before an in-place
-  write. `header.body` only appends: rows, then length, each synced before
-  the head insert. Only the first append arms `store/guard/header.body`, an
-  empty flag, because open refuses an empty head beside body rows. One
-  `header.head` generation uses `store/guard/header.head`. Its `.mlt` only appends, and the
-  rows and length are synced before that mark arms. Open copies every named
-  image before reading those files. The scripthash ingest head still writes a
-  synced `*.ahead` image. An array flush always
-  images page 0, because it rewrites the length there even when a shrink
-  writes no slot or empties the table.
+- Class C `confirmed[]` and `header_txs_*` write a synced `*.ahead` sidecar
+  of the intended pages before an in-place write, and open restores it before
+  reading the table. An array flush always images page 0, because it rewrites
+  the length there even when a shrink writes no slot or empties the table.
+  `strong_tx` has no sidecar: open sets every strong bit a fence run names
+  again (`restore_strong_from_fence`).
+- `header.body` only appends, and its rows are synced before the
+  `header.head` insert names them. `header.head` writes a synced `*.ahead`
+  image before an in-place write, and open restores it before reading.
+- The scripthash ingest head writes its own synced `*.ahead` image, and open
+  restores it the same way.
 - A `txstat` stamp writes no image (the sector rule, below). Open refuses any
   entry named `txstat.body.ahead`, or one it cannot stat, instead of
   replaying it.

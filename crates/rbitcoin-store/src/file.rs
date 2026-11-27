@@ -196,6 +196,14 @@ fn open_tmp(tmp: &Path, private: bool) -> std::io::Result<File> {
     opts.open(tmp)
 }
 
+/// `Corrupt` when `path` is already present. `msg` names that file.
+pub(crate) fn refuse_if_present(path: &Path, msg: &'static str) -> Result<(), StoreError> {
+    if path.try_exists().map_err(|e| StoreError::io(path, e))? {
+        return Err(StoreError::Corrupt(msg));
+    }
+    Ok(())
+}
+
 /// `fsync` the directory so a renamed dirent survives a crash.
 ///
 /// Windows denies a directory handle (`ERROR_ACCESS_DENIED`), including with

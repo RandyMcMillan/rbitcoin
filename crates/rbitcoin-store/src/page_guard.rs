@@ -27,6 +27,9 @@ const GROUP_KIND: u16 = 1;
 /// The one directory under a store that holds marks. Open looks only here.
 pub(crate) const GUARD_DIR: &str = "guard";
 
+/// Forward images for `confirmed[]`, `header_txs_*`, and `strong_tx`.
+pub const CLASS_C_MARK: &str = "guard/class_c";
+
 fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     static ARMED: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
     ARMED.get_or_init(|| Mutex::new(HashMap::new()))
@@ -318,6 +321,48 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     }
     write_file_synced_tmp_rename(path, &buf)?;
     sync_mark_dir_then_release(mark_parent(path)?, &released)
+}
+
+/// Restore `dir/<mark>` when it exists, then continue. Missing is `Ok`.
+#[doc(hidden)]
+pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
+    restore_page_guard_group(&dir.join(mark), dir)
+}
+
+/// Promote `meta` to 31 when this directory is a datadir still on 30.
+///
+/// A table fixture with no `meta` still arms. A plain open does not call this.
+#[doc(hidden)]
+pub fn promote_meta_31(dir: &Path) -> Result<(), StoreError> {
+    match crate::store::check_meta(dir) {
+        Ok(ver) if ver < 31 => crate::store::write_meta_at(dir, 31),
+        Ok(_) => Ok(()),
+        Err(StoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Arm a store group mark after `meta` is 31. Empty is a no-op.
+#[doc(hidden)]
+pub fn arm_store_group(
+    dir: &Path,
+    mark: &str,
+    pages: &[(&str, u64, &[u8])],
+) -> Result<(), StoreError> {
+    if pages.is_empty() {
+        return Ok(());
+    }
+    promote_meta_31(dir)?;
+    arm_page_guard_group(&dir.join(mark), pages)?;
+    #[cfg(debug_assertions)]
+    ARM_TRACE.with(|trace| {
+        if let Some(marks) = trace.borrow_mut().as_mut() {
+            marks.push(mark.to_string());
+        }
+    });
+    Ok(())
 }
 
 #[cfg(debug_assertions)]

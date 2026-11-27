@@ -7,10 +7,21 @@ use crate::array_table::{
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadScale;
+use crate::page_guard::{self, PAGE};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
+use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
+
+const CONFIRMED_BODY_AHEAD: &str =
+    "confirmed.body.ahead is a legacy page image; this open does not restore it";
+const HEADER_TXS_FIRST_AHEAD: &str =
+    "header_txs_first.body.ahead is a legacy page image; this open does not restore it";
+const HEADER_TXS_COUNT_AHEAD: &str =
+    "header_txs_count.body.ahead is a legacy page image; this open does not restore it";
+const HEADER_TXS_SPLIT_TIERS: &str =
+    "header_txs_first and header_txs_count lengths straddle the in-RAM cap; reindex";
 
 /// Best-chain height → header fk. Length = tip_height + 1 when non-empty.
 pub struct ConfirmedTable {
@@ -26,10 +37,10 @@ impl ConfirmedTable {
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let path = dir.join("confirmed.body");
+        crate::file::refuse_if_present(&dir.join("confirmed.body.ahead"), CONFIRMED_BODY_AHEAD)?;
         // Every flush rewrites page 0 (the length) and the block that holds
         // the previous tip. A torn one comes back from the synced image.
-        ArrayTable::restore_ahead_keep(&path)?;
-        ArrayTable::remove_ahead(Some(ArrayTable::ahead_path(&path)))?;
+        page_guard::restore_store_group(dir, page_guard::CLASS_C_MARK)?;
         Ok(Self {
             arr: ArrayTable::open(path, TableKind::Confirmed)?,
         })
@@ -147,23 +158,7 @@ impl ConfirmedTable {
     /// Write the synced image of the pages this flush rewrites, then the
     /// payload, then drop the image.
     pub fn flush(&self) -> Result<(), StoreError> {
-        let ahead = ArrayTable::write_aheads(&[&self.arr], 0)?;
-        #[cfg(debug_assertions)]
-        if take_fail_ahead(self.arr.file.path()) {
-            return Err(StoreError::io(
-                self.arr.file.path(),
-                std::io::Error::other("injected confirmed ahead failure"),
-            ));
-        }
-        self.arr.flush()?;
-        #[cfg(debug_assertions)]
-        if take_fail_after_payload(self.arr.file.path()) {
-            return Err(StoreError::io(
-                self.arr.file.path(),
-                std::io::Error::other("injected confirmed payload failure"),
-            ));
-        }
-        ArrayTable::remove_ahead(ahead)
+        flush_class_c_tables(&[&self.arr])
     }
 }
 
@@ -228,6 +223,7 @@ impl StrongTxTable {
                 "strong_tx open chunk is not whole words",
             ));
         }
+        page_guard::restore_store_group(dir, page_guard::CLASS_C_MARK)?;
         let bits = TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
         let body = bits.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         let table = ArrayTable::bit_image(bits, body, strong_bit_reserve_bytes(scale))?;
@@ -313,7 +309,7 @@ impl StrongTxTable {
 
     #[doc(hidden)]
     pub fn mark_dirty_bit(&self, bit: u64) {
-        let _ = self.table.unstored_from.fetch_min(bit, Ordering::AcqRel);
+        self.table.note_unstored(bit);
     }
 
     #[doc(hidden)]
@@ -522,9 +518,9 @@ impl StrongTxTable {
     }
 
     /// Persist dirty L2 bit image by reading live bytes. The unstored mark
-    /// clears only after the length publish succeeds.
+    /// clears only after the group mark is gone.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
-        self.table.flush_dirty()
+        flush_class_c_tables(&[&self.table])
     }
 
     /// Same flush as [`ArrayTable::flush_dirty_between`]. The hook sees this
@@ -542,7 +538,7 @@ impl StrongTxTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.table.flush()
+        flush_class_c_tables(&[&self.table])
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
@@ -579,8 +575,8 @@ static FAIL_AFTER_FIRST: std::sync::Mutex<std::collections::BTreeSet<std::path::
 static FAIL_AFTER_PAYLOAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Leave the next write-ahead sidecar for `path` (`header_txs_*` or
-/// `confirmed`) behind and fail before the payload flush, as a power cut would.
+/// Leave the next Class C group mark for `path` behind and fail before the
+/// payload flush, as a power cut would.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_array_flush_after_ahead(path: &Path) {
@@ -598,6 +594,29 @@ pub fn fail_next_header_txs_flush_after_first(path: &Path) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+static FAIL_FD_BEFORE_LIVE: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Fail the next fd-only write of `path` after its mark is armed and just
+/// before its live bytes, as a power cut would.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_fd_write_before_live(path: &Path) {
+    FAIL_FD_BEFORE_LIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn take_fail_fd_before_live(path: &Path) -> bool {
+    FAIL_FD_BEFORE_LIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 /// Fail after the payload flush of `path`, before the sidecars are removed.
@@ -645,23 +664,27 @@ impl HeaderTxsTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let first_path = dir.join("header_txs_first.body");
-        let count_path = dir.join("header_txs_count.body");
-        // Restore only when both sidecars carry the same nonzero stamp.
-        // A retry with one dirty column writes that stamp again, so a crash
-        // still has one pair. A lone file, stamp 0, or two stamps is not one pair.
-        let first_side = ArrayTable::ahead_path(&first_path);
-        let count_side = ArrayTable::ahead_path(&count_path);
-        let first_gen = Self::sidecar_gen(&first_path)?;
-        let count_gen = Self::sidecar_gen(&count_path)?;
-        if first_gen != 0 && first_gen == count_gen {
-            ArrayTable::restore_ahead_keep(&first_path)?;
-            ArrayTable::restore_ahead_keep(&count_path)?;
+        crate::file::refuse_if_present(
+            &dir.join("header_txs_first.body.ahead"),
+            HEADER_TXS_FIRST_AHEAD,
+        )?;
+        crate::file::refuse_if_present(
+            &dir.join("header_txs_count.body.ahead"),
+            HEADER_TXS_COUNT_AHEAD,
+        )?;
+        // One mark images first and count together, so a crash cannot leave
+        // the pair split. Restore before any slot read.
+        page_guard::restore_store_group(dir, page_guard::CLASS_C_MARK)?;
+        let first = ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?;
+        let count = ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?;
+        // Each column picks its tier from its own length. Only a both-fd pair
+        // writes under one mark, so a pair on two tiers could tear a row.
+        if first.is_fd_only() != count.is_fd_only() {
+            return Err(StoreError::Corrupt(HEADER_TXS_SPLIT_TIERS));
         }
-        ArrayTable::remove_ahead([first_side, count_side])?;
         Ok(Self {
-            first: ArrayTable::open(first_path, TableKind::ArrayLink)?,
-            count: ArrayTable::open(count_path, TableKind::ArrayLink)?,
+            first,
+            count,
             seq: AtomicU64::new(0),
             write: Mutex::new(()),
         })
@@ -710,6 +733,15 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            return ArrayTable::write_fd_pair(
+                &self.first,
+                &[(id - 1, first_tx_fk.0)],
+                &self.count,
+                &[(id - 1, u64::from(n))],
+                true,
+            );
+        }
         self.first.set_zero_gap(write, id - 1, first_tx_fk.0)?;
         self.count.set_zero_gap(write, id - 1, u64::from(n))?;
         Ok(())
@@ -734,6 +766,15 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            return ArrayTable::write_fd_pair(
+                &self.first,
+                &first_pairs,
+                &self.count,
+                &count_pairs,
+                true,
+            );
+        }
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
         Ok(())
@@ -760,9 +801,23 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            return ArrayTable::write_fd_pair(
+                &self.first,
+                &first_pairs,
+                &self.count,
+                &count_pairs,
+                true,
+            );
+        }
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
         Ok(())
+    }
+
+    /// Both columns are fd-only, so a pair write needs one mark for both.
+    fn fd_pair(&self) -> bool {
+        self.first.is_fd_only() && self.count.is_fd_only()
     }
 
     pub fn get_range(&self, header_fk: Fk) -> Result<Option<(Fk, u32)>, StoreError> {
@@ -846,6 +901,10 @@ impl HeaderTxsTable {
         }
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
+        if self.fd_pair() {
+            ArrayTable::write_fd_pair(&self.first, &[(idx, 0)], &self.count, &[(idx, 0)], false)?;
+            return Ok(true);
+        }
         self.first.set(write, idx, 0)?;
         self.count.set(write, idx, 0)?;
         Ok(true)
@@ -859,74 +918,197 @@ impl HeaderTxsTable {
         })
     }
 
-    fn sidecar_gen(path: &Path) -> Result<u16, StoreError> {
-        let side = ArrayTable::ahead_path(path);
-        match std::fs::read(&side) {
-            Ok(raw) => ArrayTable::ahead_pair_gen(&raw),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(e) => Err(StoreError::io(&side, e)),
-        }
-    }
-
-    /// Next stamp for a `(first, count)` sidecar pair. `0` is reserved for
-    /// an image this writer did not stamp.
-    fn next_pair_gen(&self) -> Result<u16, StoreError> {
-        let prev = Self::sidecar_gen(self.first.file.path())?
-            .max(Self::sidecar_gen(self.count.file.path())?);
-        let next = prev.wrapping_add(1);
-        Ok(if next == 0 { 1 } else { next })
-    }
-
-    /// Stamp for this flush. One dirty column keeps the partner sidecar's
-    /// stamp. Two dirty columns take a new stamp and both files are rewritten.
-    fn pair_gen_for_flush(&self) -> Result<u16, StoreError> {
-        let first_dirty = self.first.has_unstored();
-        let count_dirty = self.count.has_unstored();
-        if first_dirty != count_dirty {
-            let partner = if count_dirty {
-                self.first.file.path()
-            } else {
-                self.count.file.path()
-            };
-            let stamp = Self::sidecar_gen(partner)?;
-            if stamp != 0 {
-                return Ok(stamp);
-            }
-        }
-        self.next_pair_gen()
+    /// Held across a grouped flush of `first` and `count`. Not reentrant.
+    pub(crate) fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let pair_gen = self.pair_gen_for_flush()?;
-        ArrayTable::write_aheads(&[&self.first, &self.count], pair_gen)?;
-        #[cfg(debug_assertions)]
-        if take_fail_ahead(self.first.file.path()) {
-            return Err(StoreError::io(
-                self.first.file.path(),
-                std::io::Error::other("injected header_txs ahead failure"),
-            ));
+        let _write = self.write_guard();
+        flush_class_c_tables(&[&self.first, &self.count])
+    }
+}
+
+/// Test pause after the first table's page images and before the next table's.
+///
+/// Armed for one store directory. A flush of another directory does not wait.
+#[cfg(debug_assertions)]
+mod class_c_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    struct Inner {
+        dir: Option<PathBuf>,
+        entered: bool,
+    }
+
+    struct Pause {
+        inner: Mutex<Inner>,
+        cv: Condvar,
+    }
+
+    fn pause() -> &'static Pause {
+        static PAUSE: OnceLock<Pause> = OnceLock::new();
+        PAUSE.get_or_init(|| Pause {
+            inner: Mutex::new(Inner {
+                dir: None,
+                entered: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub(super) fn between(dir: &Path) {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.dir.as_deref() != Some(dir) {
+            return;
         }
-        self.first.flush()?;
+        inner.entered = true;
+        pause.cv.notify_all();
+        while inner.dir.as_deref() == Some(dir) {
+            inner = pause.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn arm(dir: &Path) {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.dir = Some(dir.to_path_buf());
+        inner.entered = false;
+    }
+
+    #[doc(hidden)]
+    pub fn wait_until_entered(limit: Duration) -> bool {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + limit;
+        while !inner.entered {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = pause
+                .cv
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            inner = next;
+            if timeout.timed_out() && !inner.entered {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn release() {
+        let pause = pause();
+        let mut inner = pause.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.dir = None;
+        inner.entered = false;
+        pause.cv.notify_all();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_class_c_group_pause(dir: &Path) {
+    class_c_pause::arm(dir);
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn wait_class_c_group_paused(limit: std::time::Duration) -> bool {
+    class_c_pause::wait_until_entered(limit)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn release_class_c_group_pause() {
+    class_c_pause::release();
+}
+
+/// One `store/guard/class_c` mark for every table in the group, then the live
+/// writes, then the clear. Unstored stays set until the mark is gone so a
+/// retry re-images every column.
+pub(crate) fn flush_class_c_tables(tables: &[&ArrayTable]) -> Result<(), StoreError> {
+    let _hold = page_guard::hold_marks();
+    let mut owned: Vec<(String, u64, [u8; PAGE as usize])> = Vec::new();
+    let mut dirty: Vec<(&ArrayTable, crate::array_table::GuardSpan)> = Vec::new();
+    #[cfg(debug_assertions)]
+    let mut imaged = false;
+    for t in tables {
+        if !t.has_unstored() {
+            t.file.flush()?;
+            continue;
+        }
+        let name = t.guard_name()?.to_string();
+        let Some((span, pages)) = t.guard_pages()? else {
+            t.file.flush()?;
+            continue;
+        };
+        for (off, image) in pages {
+            owned.push((name.clone(), off, image));
+        }
+        dirty.push((*t, span));
         #[cfg(debug_assertions)]
-        if take_fail_after_first(self.first.file.path()) {
+        if !imaged {
+            imaged = true;
+            if let Some(dir) = t.file.path().parent() {
+                class_c_pause::between(dir);
+            }
+        }
+    }
+    if owned.is_empty() {
+        return Ok(());
+    }
+    let dir = dirty[0].0.store_dir()?;
+    let refs: Vec<(&str, u64, &[u8])> = owned
+        .iter()
+        .map(|(n, o, i)| (n.as_str(), *o, i.as_slice()))
+        .collect();
+    page_guard::arm_store_group(dir, page_guard::CLASS_C_MARK, &refs)?;
+    #[cfg(debug_assertions)]
+    {
+        for t in tables {
+            if take_fail_ahead(t.file.path()) {
+                return Err(StoreError::io(
+                    t.file.path(),
+                    std::io::Error::other("injected array ahead failure"),
+                ));
+            }
+        }
+    }
+    let mut spans = Vec::with_capacity(dirty.len());
+    for (t, imaged) in &dirty {
+        if let Some(span) = t.persist_dirty(imaged)? {
+            spans.push((*t, span));
+        }
+        #[cfg(debug_assertions)]
+        if take_fail_after_first(t.file.path()) {
             return Err(StoreError::io(
-                self.first.file.path(),
+                t.file.path(),
                 std::io::Error::other("injected header_txs first-column failure"),
             ));
         }
-        self.count.flush()?;
+        t.file.flush()?;
         #[cfg(debug_assertions)]
-        if take_fail_after_payload(self.first.file.path()) {
+        if take_fail_after_payload(t.file.path()) {
             return Err(StoreError::io(
-                self.first.file.path(),
-                std::io::Error::other("injected header_txs payload failure"),
+                t.file.path(),
+                std::io::Error::other("injected array payload failure"),
             ));
         }
-        ArrayTable::remove_ahead([
-            ArrayTable::ahead_path(self.first.file.path()),
-            ArrayTable::ahead_path(self.count.file.path()),
-        ])?;
-        Ok(())
     }
+    let files: Vec<(&File, &Path)> = dirty
+        .iter()
+        .map(|(t, _)| (&t.file.read_file, t.file.path() as &Path))
+        .collect();
+    page_guard::clear_page_guard_files(&dir.join(page_guard::CLASS_C_MARK), &files)?;
+    for (t, (n, gen)) in spans {
+        t.publish_clean(n, gen);
+    }
+    Ok(())
 }

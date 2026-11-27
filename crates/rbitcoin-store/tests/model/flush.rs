@@ -52,3 +52,61 @@ fn a_store_that_passes_the_flush_is_the_slot_on_disk() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// The grouped Class C flush publishes clean after its mark is cleared,
+/// outside the store exclusion. A store noted in that window must stay dirty,
+/// so the next flush writes it.
+#[test]
+fn a_note_during_the_grouped_publish_stays_dirty() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_store::chain::ConfirmedTable;
+    // Page images are 4 KiB on the stack. The model coroutine stack is 8 KiB.
+    fn big<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> loom::thread::JoinHandle<T> {
+        loom::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+    }
+    super::engine::check_at_most(3, || {
+        big(|| {
+            let dir = std::env::temp_dir().join("rbtc-group-publish-model");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let table = Arc::new(ConfirmedTable::create(&dir).unwrap());
+            let write = ClassCWrite::for_test();
+            table.set(&write, Height(0), Fk(5)).unwrap();
+            table.flush().unwrap();
+            table.set(&write, Height(0), Fk(6)).unwrap();
+            let writing = Arc::clone(&table);
+            let writer = big(move || {
+                writing
+                    .set(&ClassCWrite::for_test(), Height(0), Fk(99))
+                    .is_ok()
+            });
+            let flushing = Arc::clone(&table);
+            let flusher = big(move || flushing.flush().unwrap());
+            let stored = writer.join().unwrap();
+            flusher.join().unwrap();
+            table.flush().unwrap();
+            if !stored {
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            let mut buf = [0u8; 8];
+            table
+                .arr
+                .file
+                .read_at(ArrayTable::offset(0), &mut buf)
+                .unwrap();
+            let disk = u64::from_le_bytes(buf);
+            if disk != 99 {
+                panic!("a note during the grouped publish was marked clean: disk={disk}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .join()
+        .unwrap();
+    });
+}

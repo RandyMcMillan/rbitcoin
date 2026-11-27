@@ -26,6 +26,16 @@ fn open_fd_only(dir: &Path, slots: u64) -> ArrayTable {
     table
 }
 
+/// A forward page image is 4 KiB. The model coroutine stack is 8 KiB.
+fn wide<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    loom::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 /// One append against one sample. A length that covers the new index has
 /// that store's value.
 #[test]
@@ -34,11 +44,15 @@ fn fd_only_append_publishes_its_value() {
         let dir = std::env::temp_dir().join("rbtc-fd-append");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let slots = std::sync::Arc::new(open_fd_only(&dir, 1));
+        let made = dir.clone();
+        let slots = wide(move || std::sync::Arc::new(open_fd_only(&made, 1)));
         let slots_w = std::sync::Arc::clone(&slots);
-        let writer = loom::thread::spawn(move || {
-            slots_w.set(&ClassCWrite::for_test(), 1, 99).unwrap();
-        });
+        let writer = loom::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                slots_w.set(&ClassCWrite::for_test(), 1, 99).unwrap();
+            })
+            .unwrap();
         let reader = loom::thread::spawn(move || {
             let (value, len) = slots.get_sample(1).unwrap();
             if len > 1 {
@@ -59,13 +73,20 @@ fn fd_only_get_during_truncate_is_absent_or_present() {
         let dir = std::env::temp_dir().join("rbtc-fd-trunc");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let slots = std::sync::Arc::new(open_fd_only(&dir, 2));
-        slots.set(&ClassCWrite::for_test(), 0, 11).unwrap();
-        slots.set(&ClassCWrite::for_test(), 1, 22).unwrap();
-        let slots_w = std::sync::Arc::clone(&slots);
-        let truncator = loom::thread::spawn(move || {
-            slots_w.truncate(&ClassCWrite::for_test(), 0).unwrap();
+        let made = dir.clone();
+        let slots = wide(move || {
+            let slots = std::sync::Arc::new(open_fd_only(&made, 2));
+            slots.set(&ClassCWrite::for_test(), 0, 11).unwrap();
+            slots.set(&ClassCWrite::for_test(), 1, 22).unwrap();
+            slots
         });
+        let slots_w = std::sync::Arc::clone(&slots);
+        let truncator = loom::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                slots_w.truncate(&ClassCWrite::for_test(), 0).unwrap();
+            })
+            .unwrap();
         let reader = loom::thread::spawn(move || match slots.get_sample(1) {
             Ok((0, len)) => assert!(len <= 1, "zero slot while length covers it: {len}"),
             Ok((22, len)) if len > 1 => {}
@@ -88,15 +109,22 @@ fn fd_only_sample_is_one_generation() {
         let dir = std::env::temp_dir().join("rbtc-fd-gen");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let slots = std::sync::Arc::new(open_fd_only(&dir, 3));
-        for (index, value) in [(0, 1), (1, 2), (2, 3)] {
-            slots.set(&ClassCWrite::for_test(), index, value).unwrap();
-        }
-        let slots_w = std::sync::Arc::clone(&slots);
-        let writer = loom::thread::spawn(move || {
-            slots_w.truncate(&ClassCWrite::for_test(), 1).unwrap();
-            slots_w.set(&ClassCWrite::for_test(), 1, 20).unwrap();
+        let made = dir.clone();
+        let slots = wide(move || {
+            let slots = std::sync::Arc::new(open_fd_only(&made, 3));
+            for (index, value) in [(0, 1), (1, 2), (2, 3)] {
+                slots.set(&ClassCWrite::for_test(), index, value).unwrap();
+            }
+            slots
         });
+        let slots_w = std::sync::Arc::clone(&slots);
+        let writer = loom::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                slots_w.truncate(&ClassCWrite::for_test(), 1).unwrap();
+                slots_w.set(&ClassCWrite::for_test(), 1, 20).unwrap();
+            })
+            .unwrap();
         let reader = loom::thread::spawn(move || match slots.get_sample(1).unwrap() {
             (2, 3) | (0, 1) | (20, 2) => {}
             (value, len) => panic!("sample {value} at len {len}"),
@@ -115,16 +143,23 @@ fn fd_only_pair_sample_is_one_generation() {
         let dir = std::env::temp_dir().join("rbtc-fd-pair");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let slots = std::sync::Arc::new(open_fd_only(&dir, 3));
-        for (index, value) in [(0, 1), (1, 2), (2, 3)] {
-            slots.set(&ClassCWrite::for_test(), index, value).unwrap();
-        }
-        let slots_w = std::sync::Arc::clone(&slots);
-        let writer = loom::thread::spawn(move || {
-            slots_w.truncate(&ClassCWrite::for_test(), 1).unwrap();
-            slots_w.set(&ClassCWrite::for_test(), 1, 20).unwrap();
-            slots_w.set(&ClassCWrite::for_test(), 2, 30).unwrap();
+        let made = dir.clone();
+        let slots = wide(move || {
+            let slots = std::sync::Arc::new(open_fd_only(&made, 3));
+            for (index, value) in [(0, 1), (1, 2), (2, 3)] {
+                slots.set(&ClassCWrite::for_test(), index, value).unwrap();
+            }
+            slots
         });
+        let slots_w = std::sync::Arc::clone(&slots);
+        let writer = loom::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                slots_w.truncate(&ClassCWrite::for_test(), 1).unwrap();
+                slots_w.set(&ClassCWrite::for_test(), 1, 20).unwrap();
+                slots_w.set(&ClassCWrite::for_test(), 2, 30).unwrap();
+            })
+            .unwrap();
         let reader = loom::thread::spawn(move || match slots.get_pair_sample(1).unwrap() {
             ([2, 3], 3) | ([0, 0], 1) | ([20, 0], 2) | ([20, 30], 3) => {}
             (pair, len) => panic!("sample {pair:?} at len {len}"),

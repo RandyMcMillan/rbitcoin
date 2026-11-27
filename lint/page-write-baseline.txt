@@ -1,8 +1,7 @@
 crates/rbitcoin-mempool/src/store.rs	set_len	2
 crates/rbitcoin-mempool/src/store.rs	write_all	10
 crates/rbitcoin-store/src/address_head.rs	set_len	1
-crates/rbitcoin-store/src/array_table.rs	truncate	3
-crates/rbitcoin-store/src/array_table.rs	write_all	2
+crates/rbitcoin-store/src/array_table.rs	truncate	1
 crates/rbitcoin-store/src/bdz.rs	write_all	5
 crates/rbitcoin-store/src/bulk_io.rs	pwrite	1
 crates/rbitcoin-store/src/bulk_io.rs	pwrite_batch	1

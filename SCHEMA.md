@@ -132,7 +132,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 | Policy | Choice |
 |--------|--------|
 | Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls the private table at 80% slots only. |
-| `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
+| `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. Open refuses a `header_txs` pair whose two lengths fall on different sides of that cap. |
 | `RWF_DONTCACHE` | **Not used.** Confirm notes every spend slot in the delta, and Class A writes no `spent.body` bytes; a fold writes whole pages that checkpoints soon read again. |
 
 ### New script kinds without a wipe

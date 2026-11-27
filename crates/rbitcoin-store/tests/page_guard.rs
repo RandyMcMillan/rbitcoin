@@ -441,6 +441,41 @@ fn clear_keeps_a_mark_of_an_unknown_kind() {
     assert_eq!(std::fs::read(&mark).unwrap(), raw);
 }
 
+/// A retry after the `meta` rename landed and its directory sync failed
+/// sees 31 and skips the promote. The arm still syncs the store directory
+/// that holds `meta` before it publishes the mark.
+#[test]
+fn arm_on_meta_31_syncs_the_directory_that_holds_meta() {
+    let dir = TempDir::labeled("page-guard-meta-retry").unwrap();
+    let mut meta = STORE_MAGIC.to_vec();
+    meta.extend_from_slice(&31u16.to_le_bytes());
+    std::fs::write(dir.path().join("meta"), &meta).unwrap();
+    std::fs::create_dir(dir.path().join("guard")).unwrap();
+    let page = fill(0x01);
+    #[cfg(all(unix, debug_assertions))]
+    {
+        rbitcoin_store::file::arm_fsync_dir_trace();
+        rbitcoin_store::page_guard::arm_store_group(
+            dir.path(),
+            rbitcoin_store::page_guard::CLASS_C_MARK,
+            &[("confirmed.body", 0, page.as_slice())],
+        )
+        .unwrap();
+        let dirs = rbitcoin_store::file::take_fsynced_dirs();
+        assert!(
+            dirs.iter().any(|d| d == dir.path()),
+            "meta 31 must be durable before the mark, got {dirs:?}"
+        );
+    }
+    #[cfg(not(all(unix, debug_assertions)))]
+    rbitcoin_store::page_guard::arm_store_group(
+        dir.path(),
+        rbitcoin_store::page_guard::CLASS_C_MARK,
+        &[("confirmed.body", 0, page.as_slice())],
+    )
+    .unwrap();
+}
+
 #[test]
 fn clear_of_a_missing_mark_syncs_its_directory() {
     let dir = TempDir::labeled("page-guard-missing-clear").unwrap();

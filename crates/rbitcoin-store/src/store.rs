@@ -1,4 +1,4 @@
-use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable};
+use crate::chain::{flush_class_c_tables, ConfirmedTable, HeaderTxsTable, StrongTxTable};
 use crate::error::StoreError;
 use crate::hashhead::{HeadOpenOpts, HeadScale};
 use crate::header_table::{HeaderRecord, HeaderTable};
@@ -534,6 +534,7 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
+        restore_open_marks(&layout)?;
         open_layout_refuse_old(&path, meta_ver)?;
         drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
@@ -910,7 +911,8 @@ impl Store {
         // A durable body association must name durable creates.
         self.txs.sync_class_a_data()?;
         self.headers.flush()?;
-        self.header_txs.flush()?;
+        let _write = self.header_txs.write_guard();
+        flush_class_c_tables(&[&self.header_txs.first, &self.header_txs.count])?;
         Ok(())
     }
 
@@ -2071,8 +2073,12 @@ impl Store {
         self.txs.sync_class_a_data()?;
         // Headers first so conf tip cannot reference a non-durable header_fk.
         self.headers.flush()?;
-        self.strong_tx.flush()?;
-        self.header_txs.flush()?;
+        let _write = self.header_txs.write_guard();
+        flush_class_c_tables(&[
+            &self.strong_tx.table,
+            &self.header_txs.first,
+            &self.header_txs.count,
+        ])?;
         Ok(())
     }
 
@@ -2476,9 +2482,19 @@ impl Store {
     /// The tip this call sealed, `None` for an empty chain. After a failed
     /// Class A write or sync, the latch fails this call.
     pub fn flush_class_c_tip(&self) -> Result<Option<Height>, StoreError> {
-        self.flush_class_c_pre_tip()?;
-        // Commit point on disk: tip advance only after strong/header_txs.
-        self.confirmed.flush()?;
+        self.txs.sync_class_a_data()?;
+        self.headers.flush()?;
+        // One mark for the four Class C files, then tip_seal. Confirmed is
+        // last in the persist order so a kill cannot advance tip first.
+        {
+            let _write = self.header_txs.write_guard();
+            flush_class_c_tables(&[
+                &self.strong_tx.table,
+                &self.header_txs.first,
+                &self.header_txs.count,
+                &self.confirmed.arr,
+            ])?;
+        }
         self.publish_tip_seal()?;
         Ok(self.confirmed.tip_height())
     }
@@ -2488,7 +2504,7 @@ impl Store {
     /// Used by **disconnect** after RAM truncate so tip shrink is durable **before**
     /// unstrong. Do not use for connect (would tip-first).
     pub fn flush_confirmed_only(&self) -> Result<(), StoreError> {
-        self.confirmed.flush()?;
+        flush_class_c_tables(&[&self.confirmed.arr])?;
         self.publish_tip_seal()?;
         Ok(())
     }
@@ -2496,7 +2512,7 @@ impl Store {
     /// Class C **disconnect** post-clear barrier: strong after tip already
     /// shrunk and flushed via [`Self::flush_confirmed_only`].
     pub fn flush_class_c_after_disconnect_tip(&self) -> Result<(), StoreError> {
-        self.strong_tx.flush()?;
+        flush_class_c_tables(&[&self.strong_tx.table])?;
         // header_txs unchanged on disconnect (archive association remains).
         Ok(())
     }
@@ -2741,6 +2757,19 @@ pub fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
         std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
     }
     rbitcoin_log::warn!("store: dropping leftover spent.off (schema 22 uses create.loc)");
+    Ok(())
+}
+
+/// Copy armed page images back before trim or the tip walk. Every mark lives
+/// in the hot store directory: the cold directory holds only appends, which
+/// need none.
+#[doc(hidden)]
+pub fn restore_open_marks(layout: &StoreLayout) -> Result<(), StoreError> {
+    restore_hot_marks(&layout.dir)
+}
+
+fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
+    crate::page_guard::restore_store_group(path, crate::page_guard::CLASS_C_MARK)?;
     Ok(())
 }
 

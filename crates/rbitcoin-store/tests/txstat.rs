@@ -22,206 +22,6 @@ fn txstat_blob_longer_than_the_file_is_corrupt() {
 }
 
 #[test]
-fn torn_txstat_page_restores_from_ahead_image() {
-    let dir = TempDir::labeled("txstat-ahead").unwrap();
-    let path = dir.join("txstat.body");
-    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(
-            t.write_block_rows(Fk(1), 510, &rows[509..601]).is_err(),
-            "the failpoint must stop before the cell pwrite"
-        );
-        assert!(dir.join("txstat.body.ahead").is_file());
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    use std::io::{Seek, SeekFrom, Write};
-    file.seek(SeekFrom::Start(0)).unwrap();
-    file.write_all(&[0u8; 4096]).unwrap();
-    file.seek(SeekFrom::Start(4096)).unwrap();
-    file.write_all(&[0u8; 4096]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.count(), 601);
-    assert_eq!(
-        t.get_cell(Fk(509)).unwrap(),
-        pack_cell(&rows[508]).unwrap().0
-    );
-    assert_eq!(
-        t.get_cell(Fk(601)).unwrap(),
-        pack_cell(&rows[600]).unwrap().0
-    );
-    assert!(!dir.join("txstat.body.ahead").exists());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn leftover_ahead_pages_survive_a_later_write() {
-    let dir = TempDir::labeled("txstat-ahead-merge").unwrap();
-    let path = dir.join("txstat.body");
-    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(
-            t.write_block_rows(Fk(1), 510, &rows[509..601]).is_err(),
-            "the failpoint must stop before the cell pwrite"
-        );
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(
-            t.write_row(Fk(1), &tiny(9, 9, 9)).is_err(),
-            "the later write must replace the sidecar"
-        );
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap();
-    use std::io::{Seek, SeekFrom, Write};
-    file.seek(SeekFrom::Start(4096)).unwrap();
-    file.write_all(&[0u8; 4096]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.count(), 601);
-    assert_eq!(
-        t.get_cell(Fk(510)).unwrap(),
-        pack_cell(&rows[509]).unwrap().0,
-        "the committed cell on the first page was lost"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn append_keeps_an_uncovered_ahead_file() {
-    let dir = TempDir::labeled("txstat-ahead-keep").unwrap();
-    let path = dir.join("txstat.body");
-    let side = dir.join("txstat.body.ahead");
-    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
-    let extra: Vec<TxStatRow> = (602..=610u64).map(|i| tiny(i, 100, 10)).collect();
-    let stamped = tiny(9, 9, 9);
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(t.write_row(Fk(1), &stamped).is_err());
-        let before = std::fs::read(&side).unwrap();
-        #[cfg(unix)]
-        let ino = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(&side).unwrap().ino()
-        };
-        t.append_batch(601, &extra).unwrap();
-        assert_eq!(std::fs::read(&side).unwrap(), before);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!(
-                std::fs::metadata(&side).unwrap().ino(),
-                ino,
-                "append rewrote an ahead image it did not change"
-            );
-        }
-    }
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.get_cell(Fk(1)).unwrap(), pack_cell(&stamped).unwrap().0);
-    assert_eq!(
-        t.get_cell(Fk(610)).unwrap(),
-        pack_cell(&extra[8]).unwrap().0
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn append_drops_ahead_pages_the_new_tail_covers() {
-    let dir = TempDir::labeled("txstat-ahead-drop").unwrap();
-    let path = dir.join("txstat.body");
-    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
-    let extra: Vec<TxStatRow> = (602..=700u64).map(|i| tiny(i, 100, 10)).collect();
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &rows).unwrap();
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(t.write_block_rows(Fk(1), 510, &rows[509..601]).is_err());
-        t.append_batch(601, &extra).unwrap();
-    }
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(
-        t.get_cell(Fk(602)).unwrap(),
-        pack_cell(&extra[0]).unwrap().0,
-        "restore replayed a covered ahead page over the new tail"
-    );
-    assert_eq!(
-        t.get_cell(Fk(510)).unwrap(),
-        pack_cell(&rows[509]).unwrap().0
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn append_does_not_replay_a_stale_ahead_over_new_tail() {
-    let dir = TempDir::labeled("txstat-stale-ahead").unwrap();
-    let path = dir.join("txstat.body");
-    let first: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
-    let extra: Vec<TxStatRow> = (602..=700u64).map(|i| tiny(i, 100, 10)).collect();
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &first).unwrap();
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(t.write_row(Fk(1), &tiny(9, 9, 9)).is_err());
-        t.append_batch(601, &extra).unwrap();
-        assert_eq!(t.count(), 700);
-    }
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.count(), 700);
-    assert_eq!(
-        t.get_cell(Fk(700)).unwrap(),
-        pack_cell(&extra[98]).unwrap().0,
-        "restore replayed a stale image over the appended tail"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn restore_keeps_a_newer_length_when_the_header_write_fails() {
-    let dir = TempDir::labeled("txstat-page0-header").unwrap();
-    let path = dir.join("txstat.body");
-    let first: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
-    let extra: Vec<TxStatRow> = (602..=700u64).map(|i| tiny(i, 100, 10)).collect();
-    {
-        let t = TxStat::create(&dir).unwrap();
-        t.append_batch(0, &first).unwrap();
-        fail_next_txstat_flush_after_ahead(&path);
-        assert!(t.write_row(Fk(1), &tiny(9, 9, 9)).is_err());
-        t.append_batch(601, &extra).unwrap();
-        assert_eq!(t.count(), 700);
-    }
-    fail_next_txstat_restore_before_header(&path);
-    assert!(
-        TxStat::open(&dir).is_err(),
-        "restore must stop before the header write"
-    );
-    let t = TxStat::open(&dir).unwrap();
-    assert_eq!(t.count(), 700, "page 0 replay planted the older length");
-    assert_eq!(
-        t.get_cell(Fk(700)).unwrap(),
-        pack_cell(&extra[98]).unwrap().0
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn create_empty_then_extend_zeros() {
     let dir = TempDir::labeled("txstat-extend").unwrap();
     let t = TxStat::create(&dir).unwrap();
@@ -359,96 +159,20 @@ fn concurrent_header_blobs_keep_their_own_bytes() {
     assert!(wrong.is_empty(), "headers read another blob: {wrong:?}");
 }
 
-fn ahead_body(logical: u64) -> Vec<u8> {
-    let mut h = vec![0u8; 20];
-    h[0..4].copy_from_slice(b"TTA1");
-    h[4..6].copy_from_slice(&1u16.to_le_bytes());
-    h[8..12].copy_from_slice(&1u32.to_le_bytes());
-    h[12..20].copy_from_slice(&logical.to_le_bytes());
-    h
-}
-
-fn ahead_page(off: u64) -> Vec<u8> {
-    use bitcoin_hashes::{sha256, Hash, HashEngine};
-    let mut image = vec![0u8; 4096];
-    image[0] = 9;
-    let mut out = Vec::new();
-    out.extend_from_slice(&off.to_le_bytes());
-    let mut eng = sha256::HashEngine::default();
-    eng.input(&off.to_le_bytes());
-    eng.input(&image);
-    out.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-    out.extend_from_slice(&image);
-    out
-}
-
 #[test]
-fn txstat_open_rejects_every_bad_ahead_shape() {
-    let dir = TempDir::labeled("txstat-ahead-bad").unwrap();
-    let side = dir.join("txstat.body.ahead");
+fn open_refuses_a_legacy_txstat_ahead_journal() {
+    let dir = TempDir::labeled("txstat-legacy-ahead").unwrap();
     let t = TxStat::create(&dir).unwrap();
+    t.append_batch(0, &[tiny(1, 2, 3)]).unwrap();
     drop(t);
-
-    let mut zero = ahead_body(4096);
-    zero[8..12].copy_from_slice(&0u32.to_le_bytes());
-    let mut bad_magic = ahead_body(4096);
-    bad_magic[0] ^= 1;
-    let mut bad_ver = ahead_body(4096);
-    bad_ver[4] = 2;
-    let mut short = ahead_body(4096);
-    short.extend_from_slice(&[0u8; 10]);
-    let mut misaligned = ahead_body(4096);
-    let mut bad_sum = ahead_page(4096);
-    bad_sum[8] ^= 1;
-    let mut trailing = ahead_body(4096);
-    trailing.extend_from_slice(&ahead_page(4096));
-    trailing.push(0);
-
-    let mut huge = ahead_body(4096);
-    huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-    std::fs::write(&side, huge).unwrap();
-    assert!(TxStat::open(&dir).is_err());
-
-    let body_path = dir.join("txstat.body");
-    let before = std::fs::read(&body_path).unwrap();
-    let mut prefix_then_trailing = ahead_body(4096);
-    prefix_then_trailing.extend_from_slice(&ahead_page(0));
-    prefix_then_trailing.push(0);
-    std::fs::write(&side, prefix_then_trailing).unwrap();
-    assert!(TxStat::open(&dir).is_err());
-    assert_eq!(
-        std::fs::read(&body_path).unwrap(),
-        before,
-        "a malformed journal must not apply its prefix"
-    );
-
-    for (case, raw) in [
-        zero,
-        bad_magic,
-        bad_ver,
-        short,
-        {
-            misaligned.extend_from_slice(&ahead_page(4096));
-            misaligned[20..28].copy_from_slice(&1u64.to_le_bytes());
-            misaligned
-        },
-        {
-            let mut bad_off = ahead_body(4096);
-            bad_off.extend_from_slice(&ahead_page(4097));
-            bad_off
-        },
-        {
-            let mut b = ahead_body(8192);
-            b.extend_from_slice(&bad_sum);
-            b
-        },
-        trailing,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        std::fs::write(&side, raw).unwrap();
-        assert!(TxStat::open(&dir).is_err(), "case {case} was accepted");
+    std::fs::write(dir.join("txstat.body.ahead"), b"TTA1").unwrap();
+    let err = match TxStat::open(&dir) {
+        Ok(_) => panic!("open accepted a legacy ahead journal"),
+        Err(err) => err,
+    };
+    match err {
+        StoreError::Corrupt(msg) => assert!(msg.contains("txstat.body.ahead"), "{msg}"),
+        other => panic!("{other:?}"),
     }
     let _ = std::fs::remove_dir_all(dir.path());
 }
@@ -459,9 +183,61 @@ fn append_batch_relies_on_the_class_a_tail_guard() {
     let t = TxStat::create(&dir).unwrap();
     t.append_batch(0, &[tiny(1, 2, 3)]).unwrap();
     assert_eq!(t.count(), 1);
+    // The trace sees an arm that is cleared before the append returns.
+    #[cfg(debug_assertions)]
+    rbitcoin_store::page_guard::arm_store_mark_trace();
+    let rows: Vec<TxStatRow> = (2..=1200u64).map(|i| tiny(i, 100, 10)).collect();
+    t.append_batch(1, &rows).unwrap();
+    #[cfg(debug_assertions)]
     assert!(
-        !dir.join("txstat.body.ahead").exists(),
-        "an append-only batch must not copy the appended range"
+        rbitcoin_store::page_guard::take_armed_store_marks().is_empty(),
+        "an append armed a mark"
     );
+    assert!(!dir.join("txstat.body.ahead").exists());
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// The slot sync in `put_header_blob` must not publish a slot whose blob
+/// bytes and `txstat.ovf` length are still unsynced. A failed overflow sync
+/// stops the put before the slot is stamped.
+#[cfg(debug_assertions)]
+#[test]
+fn header_blob_syncs_the_overflow_before_its_slot() {
+    let dir = TempDir::labeled("txstat-ovf-order").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    t.flush().unwrap();
+    let blob = encode_ovf_blob(&[(1, vec![0x5Au8; 32])]).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(t.ovf.io_handle(), 1);
+    assert!(
+        t.put_header_blob(Fk(1), &blob).is_err(),
+        "the slot was stamped without syncing txstat.ovf"
+    );
+    assert!(t.header_blob(Fk(1)).unwrap().is_empty());
+    t.put_header_blob(Fk(1), &blob).unwrap();
+    assert_eq!(t.header_blob(Fk(1)).unwrap(), blob);
+}
+
+/// A stamp writes 8-byte cells, each inside one sector, so a tear leaves
+/// each cell old or new. It arms no mark, and it is synced before it
+/// returns: a failed sync fails the stamp.
+#[cfg(debug_assertions)]
+#[test]
+fn an_interior_stamp_arms_no_mark_and_is_synced() {
+    let dir = TempDir::labeled("txstat-interior-stamp").unwrap();
+    let rows: Vec<TxStatRow> = (1..=1200u64).map(|i| tiny(i, 100, 10)).collect();
+    let t = TxStat::create(&dir).unwrap();
+    t.append_batch(0, &rows).unwrap();
+    rbitcoin_store::page_guard::arm_store_mark_trace();
+    t.write_row(Fk(600), &tiny(9, 9, 9)).unwrap();
+    assert!(
+        rbitcoin_store::page_guard::take_armed_store_marks().is_empty(),
+        "an interior stamp armed a mark"
+    );
+    assert_eq!(
+        t.get_cell(Fk(600)).unwrap(),
+        pack_cell(&tiny(9, 9, 9)).unwrap().0
+    );
+    rbitcoin_store::io_handle::arm_fail_sync(t.body.io_handle(), 1);
+    assert!(t.write_row(Fk(700), &tiny(8, 8, 8)).is_err());
     let _ = std::fs::remove_dir_all(dir.path());
 }

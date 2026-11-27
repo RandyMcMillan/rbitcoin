@@ -17,7 +17,7 @@ use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 
 use crate::durability::Durable;
 use crate::error::StoreError;
-use crate::file::{fsync_parent_dir, handle_pwrite_all, write_file_synced_tmp_rename};
+use crate::file::{fsync_parent_dir, handle_pwrite_all, write_file_synced_tmp_rename, TableFile};
 
 pub const PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
 const HEAD: usize = 12;
@@ -318,6 +318,27 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
     sync_mark_dir_then_release(mark_parent(path)?, &released)
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static ARM_TRACE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the marks [`arm_store_group`] publishes on this thread, including
+/// one a later clear removes before the call returns.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_store_mark_trace() {
+    ARM_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop recording and return the marks armed since [`arm_store_mark_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_armed_store_marks() -> Vec<String> {
+    ARM_TRACE.with(|trace| trace.borrow_mut().take().unwrap_or_default())
+}
+
 /// File name of `path` as a single component, or `Corrupt`.
 #[doc(hidden)]
 pub fn guard_file_name(path: &Path) -> Result<&str, StoreError> {
@@ -541,6 +562,69 @@ pub fn append_past_end(
         return Err(StoreError::Rejected("append overwrites committed bytes"));
     }
     handle_pwrite_all(file, path, offset, bytes)
+}
+
+/// One file's part of [`commit_appends`].
+///
+/// `bytes` go at `at`, which is at or past the file's committed end.
+/// `new_logical` is the length the leading header names afterwards.
+#[doc(hidden)]
+pub struct Append<'a> {
+    pub file: &'a TableFile,
+    pub at: u64,
+    pub bytes: &'a [u8],
+    pub new_logical: u64,
+}
+
+/// Publish a group of appends with no mark, under the sector rule.
+///
+/// Every file's bytes are written past its published end, then every file
+/// is synced, then each new length is published and synced in the order the
+/// files first appear. A body listed before its index is therefore durable,
+/// bytes and length, before the index length that names it. A crash leaves
+/// each file at its old length or its new one, and bytes past a length are
+/// not read. A format whose last record ends at the body length must fit
+/// that record on open, as `sp_tweaks` does. On an error a length may
+/// already be durable, so every file in the group is poisoned: it refuses
+/// writes until reopen fits the group.
+#[doc(hidden)]
+pub fn commit_appends(writes: &[Append<'_>]) -> Result<(), StoreError> {
+    let committed = commit_appends_once(writes);
+    if committed.is_err() {
+        for w in writes {
+            w.file.poison();
+        }
+    }
+    committed
+}
+
+fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
+    // Refuse before any write, so a retry cannot stack on the group.
+    for w in writes {
+        w.file.refuse_if_poisoned()?;
+    }
+    let mut files: Vec<(&TableFile, u64)> = Vec::new();
+    for w in writes {
+        if w.file.trailing_header {
+            return Err(StoreError::Corrupt("an append needs a leading-header file"));
+        }
+        if w.at < w.file.logical_len() {
+            return Err(StoreError::Rejected("append overwrites committed bytes"));
+        }
+        w.file.write_uncommitted(w.at, w.bytes)?;
+        match files.iter_mut().find(|(f, _)| f.path() == w.file.path()) {
+            Some((_, end)) => *end = (*end).max(w.new_logical),
+            None => files.push((w.file, w.new_logical)),
+        }
+    }
+    for (file, _) in &files {
+        file.sync_data_only()?;
+    }
+    for (file, end) in &files {
+        file.set_logical_len(*end)?;
+        file.flush()?;
+    }
+    Ok(())
 }
 
 fn mark_group_pages(raw: &[u8]) -> Result<Vec<(String, u64, usize)>, StoreError> {

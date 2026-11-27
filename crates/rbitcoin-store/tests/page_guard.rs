@@ -579,6 +579,17 @@ fn arm_page0(dir: &TempDir, mark: &str) {
     arm_page_guard_group(&dir.path().join(mark), &[("body", 0, image.as_slice())]).unwrap();
 }
 
+fn page1_is_rejected(file: &rbitcoin_store::file::TableFile) {
+    // Crosses a 512-byte sector boundary, so a tear can mix two sectors.
+    let err = file
+        .write_at(PAGE as u64 + 256, &[0x33; 512])
+        .expect_err("page 1 is committed and still armed");
+    match err {
+        StoreError::Rejected(msg) => assert_eq!(msg, "write is outside the armed pages"),
+        other => panic!("expected reject, got {other:?}"),
+    }
+}
+
 /// A clear that unlinks the mark and then fails its directory sync blocks
 /// the file: the unlink is not durable, and a crash could bring the mark
 /// back over a later write. A retry that syncs releases it.
@@ -711,4 +722,78 @@ fn zero_fill_fallback_keeps_one_committed_end() {
         Err(StoreError::Rejected(msg)) => assert_eq!(msg, "write is outside the armed pages"),
         other => panic!("expected reject, got {other:?}"),
     }
+}
+
+/// The sector rule for the release check: an append that starts at the
+/// committed end inside its tail block is allowed on a file with a live arm.
+/// An in-place write outside the armed pages is rejected, even inside one
+/// sector: it may belong to the commit the mark protects.
+#[test]
+fn release_check_follows_the_sector_rule() {
+    let dir = TempDir::labeled("page-guard-sector").unwrap();
+    let (file, _path) = committed_body(&dir);
+    let committed = file.logical_len();
+    assert!(!committed.is_multiple_of(PAGE as u64));
+    arm_page0(&dir, "guard/mark");
+    file.write_at(committed, &[0x55; 64])
+        .expect("an append inside the committed tail block");
+    match file.write_at(PAGE as u64 + 8, &[0x66; 8]) {
+        Err(StoreError::Rejected(msg)) => assert_eq!(msg, "write is outside the armed pages"),
+        other => panic!("a one-sector write outside the arm went through: {other:?}"),
+    }
+    page1_is_rejected(&file);
+}
+
+/// A failed `commit_appends` may have published one length of its group
+/// and not another. Every file in the group refuses writes until reopen.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_append_poisons_its_group_until_reopen() {
+    use rbitcoin_primitives::TableKind;
+    use rbitcoin_store::error::StoreError;
+    use rbitcoin_store::file::{TableFile, FILE_HEADER_LEN};
+    use rbitcoin_store::page_guard::{commit_appends, Append};
+    let dir = rbitcoin_store::testutil::TempDir::labeled("append-poison").unwrap();
+    let (pa, pb) = (dir.path.join("a"), dir.path.join("b"));
+    let a = TableFile::create(&pa, TableKind::ArrayLink).unwrap();
+    let b = TableFile::create(&pb, TableKind::ArrayLink).unwrap();
+    let at = FILE_HEADER_LEN as u64;
+    let row = [7u8; 8];
+    let group = |a: &TableFile, b: &TableFile| {
+        commit_appends(&[
+            Append {
+                file: a,
+                at,
+                bytes: &row,
+                new_logical: at + 8,
+            },
+            Append {
+                file: b,
+                at,
+                bytes: &row,
+                new_logical: at + 8,
+            },
+        ])
+    };
+    // `a`'s length lands; `b`'s length flush fails.
+    rbitcoin_store::io_handle::arm_fail_flush(b.io_handle(), 1);
+    assert!(group(&a, &b).is_err());
+    for f in [&a, &b] {
+        let end = f.logical_len();
+        for refused in [
+            f.write_at_pwrite(FILE_HEADER_LEN as u64, &[1]),
+            f.write_uncommitted(end, &[1]),
+            f.set_logical_len(FILE_HEADER_LEN as u64),
+            group(&a, &b),
+        ] {
+            match refused {
+                Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+                other => panic!("a write after a failed append: {other:?}"),
+            }
+        }
+    }
+    drop((a, b));
+    let a = TableFile::open(&pa, TableKind::ArrayLink).unwrap();
+    a.write_at_pwrite(FILE_HEADER_LEN as u64, &[1])
+        .expect("reopen clears the poison");
 }

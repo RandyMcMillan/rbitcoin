@@ -318,6 +318,10 @@ pub struct TableFile {
     /// Header still names a longer end than `published_len`. A grow must store
     /// the short end before it extends the file, or open loads the old end.
     hwm_behind: AtomicBool,
+    /// A failed [`crate::page_guard::commit_appends`] may have published a
+    /// length its group's other files do not match. Every write is refused
+    /// until reopen; reads go on.
+    poisoned: AtomicBool,
     /// One flusher at a time, so a second never returns before the first's sync.
     pub flush_lock: Mutex<()>,
     /// [`GrowPolicy`] as u8. Idx uses 1 MiB; SH body uses 64 KiB; Class A slabs.
@@ -476,6 +480,7 @@ impl TableFile {
             kind,
             needs_sync: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -507,6 +512,7 @@ impl TableFile {
             kind,
             needs_sync: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         };
@@ -561,6 +567,7 @@ impl TableFile {
                 kind,
                 needs_sync: AtomicBool::new(false),
                 hwm_behind: AtomicBool::new(false),
+                poisoned: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
                 grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
             },
@@ -646,7 +653,7 @@ impl TableFile {
         footer[8..16].copy_from_slice(&logical.to_le_bytes());
         footer[16..32].copy_from_slice(&self.trailing_ext);
         self.ensure_capacity(logical)?;
-        self.pwrite_all(base, &footer)
+        self.pwrite_length(self.header_len_to_persist(), base, &footer)
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
@@ -713,6 +720,7 @@ impl TableFile {
             kind,
             needs_sync: AtomicBool::new(hwm_behind),
             hwm_behind: AtomicBool::new(hwm_behind),
+            poisoned: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -747,6 +755,7 @@ impl TableFile {
 
     /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
         let min = if self.trailing_header {
             TRAILING_FOOTER_LEN as u64
         } else {
@@ -769,6 +778,25 @@ impl TableFile {
         Ok(())
     }
 
+    /// Refuse every later write to this file until reopen. Set when an
+    /// append group failed, or by a caller whose own commit failed after it.
+    pub fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    pub fn poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn refuse_if_poisoned(&self) -> Result<(), StoreError> {
+        if self.poisoned() {
+            return Err(StoreError::Rejected(
+                "an earlier append to this file failed; reopen the store",
+            ));
+        }
+        Ok(())
+    }
+
     /// Publish `logical` and drop the file allocation past it.
     ///
     /// [`Self::set_logical_len`] leaves the fallocated tail in place. Prune
@@ -787,6 +815,7 @@ impl TableFile {
     /// For files whose lengths a separate commit names: a header write would
     /// rewrite the first block, and a cut on a block boundary rewrites none.
     pub fn shrink_to(&self, len: u64) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let now = file
             .metadata()
@@ -893,6 +922,14 @@ impl TableFile {
 
     /// [`Self::pwrite_all`] against a `committed` end the caller sampled.
     fn pwrite_checked(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
+        self.pwrite_length(committed, offset, bytes)
+    }
+
+    /// [`Self::pwrite_checked`] for the length a flush republishes. A
+    /// poisoned file still takes it: an append group publishes a length only
+    /// after its bytes are synced, so the RAM length names durable bytes.
+    fn pwrite_length(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if !bytes.is_empty() {
             // Committed end is the durable header, not a RAM high-water.
             // A shared page has to be one this file's current arm names.
@@ -934,12 +971,20 @@ impl TableFile {
         self.pread_at(offset, buf)
     }
 
+    /// Publish bytes below the committed end only when this file has no live
+    /// `page_guard` arm or those pages are the ones it names. Bytes at or past
+    /// the committed end are an append. The committed end is the durable
+    /// header length, not a RAM high-water.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         self.write_at_pwrite(offset, bytes)
     }
 
-    /// Payload past the published end. `published_len` stays put until the
-    /// caller commits, so a later failed write does not move readers.
+    /// Bytes at or past the committed end, including the committed tail block.
+    ///
+    /// That is the append door (crash-recovery.md, the sector rule).
+    /// `published_len` stays
+    /// put until the caller commits, so a later failed write does not move
+    /// readers.
     pub fn write_uncommitted(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
@@ -1305,6 +1350,10 @@ impl TableFile {
     }
 
     /// Punch a hole over `[offset, offset+len)`.
+    ///
+    /// A range below the committed end of a file with a live `page_guard` arm
+    /// has to be inside the pages that arm names. The committed end is the
+    /// durable header length.
     pub fn zero_range(&self, offset: u64, len: u64) -> Result<(), StoreError> {
         if len == 0 {
             return Ok(());
@@ -1345,7 +1394,7 @@ impl TableFile {
         } else {
             8
         };
-        self.pwrite_all(hwm_off, &bytes)
+        self.pwrite_length(self.header_len_to_persist(), hwm_off, &bytes)
     }
 
     #[doc(hidden)]
@@ -1482,6 +1531,13 @@ impl TableFile {
     pub fn persist_and_sync(&self) -> Result<(), StoreError> {
         let logical = self.header_len_to_persist();
         self.persist_logical_len(logical)?;
+        #[cfg(debug_assertions)]
+        if crate::io_handle::take_fail_flush(self.io_handle()) {
+            return Err(StoreError::io(
+                &self.path,
+                std::io::Error::from_raw_os_error(5),
+            ));
+        }
         self.file
             .lock()
             .unwrap()

@@ -233,10 +233,12 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     class_a.synced                   # optional: u64 LE create count a spend commit or scripthash mark named after a Class A sync (missing = 0). Open keeps exactly max(this, the highest `header_txs` create). No SCHEMA_VERSION bump
-    tear_guard/first                 # one sealed 4 KiB image per Class A stem, written once after that page is full. No SCHEMA_VERSION bump
-    tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
-    tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
-    *.ahead                          # transient write-ahead page image for confirmed, header_txs_*, header.head, txstat.body, scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. No SCHEMA_VERSION bump
+    guard/class_c                    # schema 31 sidecar: forward 4 KiB images for confirmed[], header_txs first+count, and strong_tx. One mark per flush group. Open copies every named image before any Class C read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/header.body                # schema 31 sidecar: empty flag armed only by the first header.body append. Open then takes an empty header.head beside body rows as that append, indexes the rows, and removes the flag once the head names them. Later appends sync rows, then length, with no mark. Published after meta 31. No SCHEMA_VERSION bump
+    guard/header.head                # schema 31 sidecar: forward 4 KiB images for one header.head generation (its .mlt appends with no mark). Open copies them before any head read. Published after meta 31. No SCHEMA_VERSION bump
+    guard/sh-*                       # schema 31 sidecar: backward 4 KiB images for one scripthash commit (body pages, page 0, and head words). Open copies them before any scripthash read or sealed-overflow magic check. A mark that does not parse writes scripthash.rebuild and is removed instead of stopping open. Published after meta 31. No SCHEMA_VERSION bump
+
+    *.ahead                          # transient write-ahead page image for the scripthash ingest head (scripthash.ovf/ingest.ahead); removed after a successful flush. Open refuses a leftover confirmed.body.ahead, header_txs_first.body.ahead, header_txs_count.body.ahead, header.head.ahead, header.head.gN.ahead, or txstat.body.ahead instead of restoring it. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked

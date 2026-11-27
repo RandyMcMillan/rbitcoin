@@ -172,6 +172,11 @@ static FAIL_HWM: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(
 #[cfg(debug_assertions)]
 static FAIL_SYNC: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
 
+/// Next N whole-table flushes (`TableFile::flush`) on these fds fail before
+/// their sync. Separate from [`FAIL_SYNC`], which a table flush leaves armed.
+#[cfg(debug_assertions)]
+static FAIL_FLUSH: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
+
 /// Ignore this many `sync_data` calls on these fds before [`FAIL_SYNC`] counts.
 #[cfg(debug_assertions)]
 static SYNC_SKIP: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
@@ -283,6 +288,7 @@ pub fn disarm_short_pwrite() {
         .clear();
     FAIL_HWM.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    FAIL_FLUSH.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SYNC_DELAY.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -310,6 +316,10 @@ pub fn disarm_pwrite(handle: IoHandle) {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
     FAIL_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
+    FAIL_FLUSH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
@@ -412,6 +422,10 @@ pub fn disarm_sync(handle: IoHandle) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
+    FAIL_FLUSH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
     SYNC_DELAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -460,7 +474,30 @@ pub(crate) fn take_fail_sync(handle: IoHandle) -> bool {
             }
         }
     }
-    let mut slots = FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    take_armed(&FAIL_SYNC, handle)
+}
+
+/// Fail the next `n` whole-table flushes of the file behind `handle`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_flush(handle: IoHandle, n: u32) {
+    let mut slots = FAIL_FLUSH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = slots.iter_mut().find(|(h, _)| *h == handle) {
+        slot.1 = n;
+    } else {
+        slots.push((handle, n));
+    }
+}
+
+/// One armed table flush on `handle` is consumed. Unarmed fds are untouched.
+#[cfg(debug_assertions)]
+pub(crate) fn take_fail_flush(handle: IoHandle) -> bool {
+    take_armed(&FAIL_FLUSH, handle)
+}
+
+#[cfg(debug_assertions)]
+fn take_armed(arms: &std::sync::Mutex<Vec<(IoHandle, u32)>>, handle: IoHandle) -> bool {
+    let mut slots = arms.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = slots.iter().position(|(h, _)| *h == handle) else {
         return false;
     };

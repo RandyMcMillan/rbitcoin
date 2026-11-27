@@ -16,17 +16,11 @@
 //! the stream is in that header's overflow blob (`encoded[8..]`). Pin / SH /
 //! tweaks do not open these files.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
-use crate::file::{self, GrowPolicy, TableFile, FILE_HEADER_LEN};
-use bitcoin_hashes::{sha256, Hash, HashEngine};
+use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{
-    le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind, STORE_MAGIC,
+    le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind,
 };
-use std::collections::BTreeMap;
-#[cfg(debug_assertions)]
-use std::collections::BTreeSet;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -41,241 +35,6 @@ pub const BLK_SLOT: u64 = 16;
 /// Overflow blob ceiling. A longer on-disk length is corrupt, not an allocation.
 #[doc(hidden)]
 pub const TXSTAT_BLOB_CEILING: usize = 16 * 1024 * 1024;
-
-const AHEAD_MAGIC: &[u8; 4] = b"TTA1";
-const AHEAD_VERSION: u16 = 1;
-const AHEAD_HEAD: usize = 20;
-const AHEAD_REC: usize = 8 + 32 + 4096;
-
-#[cfg(debug_assertions)]
-static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-#[cfg(debug_assertions)]
-static FAIL_RESTORE_HEADER: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-
-/// Leave the next txstat page image behind and fail before the pwrite.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn fail_next_txstat_flush_after_ahead(path: &Path) {
-    FAIL_AHEAD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_path_buf());
-}
-
-#[cfg(debug_assertions)]
-fn take_fail_ahead(path: &Path) -> bool {
-    FAIL_AHEAD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(path)
-}
-
-/// Stop the next `restore_ahead` of `path` after the page images and before
-/// the header write.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn fail_next_txstat_restore_before_header(path: &Path) {
-    FAIL_RESTORE_HEADER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_path_buf());
-}
-
-#[cfg(debug_assertions)]
-fn take_fail_restore_header(path: &Path) -> bool {
-    FAIL_RESTORE_HEADER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(path)
-}
-
-fn ahead_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("txstat"))
-        .to_os_string();
-    name.push(".ahead");
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], StoreError> {
-    let mut image = [0u8; 4096];
-    let len = std::fs::metadata(path)
-        .map_err(|e| StoreError::io(path, e))?
-        .len();
-    if block < len {
-        let n = ((len - block) as usize).min(4096);
-        file.pread_all(block, &mut image[..n])?;
-    }
-    Ok(image)
-}
-
-struct AheadPages {
-    logical: u64,
-    pages: BTreeMap<u64, [u8; 4096]>,
-}
-
-fn parse_ahead(raw: &[u8]) -> Result<AheadPages, StoreError> {
-    if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
-        return Err(StoreError::Corrupt("txstat ahead header"));
-    }
-    if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
-        return Err(StoreError::Corrupt("txstat ahead version"));
-    }
-    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-    if count == 0 {
-        return Err(StoreError::Corrupt("txstat ahead count"));
-    }
-    let payload = raw.len().saturating_sub(AHEAD_HEAD);
-    if !payload.is_multiple_of(AHEAD_REC) || payload / AHEAD_REC != count {
-        return Err(StoreError::Corrupt("txstat ahead length"));
-    }
-    let logical = u64::from_le_bytes([
-        raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19],
-    ]);
-    let mut at = AHEAD_HEAD;
-    let mut images = BTreeMap::new();
-    for _ in 0..count {
-        if raw.len() < at + AHEAD_REC {
-            return Err(StoreError::Corrupt("txstat ahead short"));
-        }
-        let mut off_buf = [0u8; 8];
-        off_buf.copy_from_slice(&raw[at..at + 8]);
-        let off = u64::from_le_bytes(off_buf);
-        let sum = &raw[at + 8..at + 40];
-        let image = &raw[at + 40..at + AHEAD_REC];
-        if !off.is_multiple_of(4096) {
-            return Err(StoreError::Corrupt("txstat ahead offset"));
-        }
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&off.to_le_bytes());
-        eng.input(image);
-        if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
-            return Err(StoreError::Corrupt("txstat ahead checksum"));
-        }
-        let mut page = [0u8; 4096];
-        page.copy_from_slice(image);
-        images.insert(off, page);
-        at += AHEAD_REC;
-    }
-    if at != raw.len() {
-        return Err(StoreError::Corrupt("txstat ahead length"));
-    }
-    Ok(AheadPages {
-        logical,
-        pages: images,
-    })
-}
-
-fn load_ahead(path: &Path) -> Result<Option<AheadPages>, StoreError> {
-    let side = ahead_path(path);
-    match std::fs::read(&side) {
-        Ok(raw) => parse_ahead(&raw).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(StoreError::io(&side, e)),
-    }
-}
-
-fn encode_ahead(logical: u64, blocks: &BTreeMap<u64, [u8; 4096]>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(AHEAD_MAGIC);
-    buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&logical.to_le_bytes());
-    for (off, image) in blocks {
-        buf.extend_from_slice(&off.to_le_bytes());
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&off.to_le_bytes());
-        eng.input(image);
-        buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-        buf.extend_from_slice(image);
-    }
-    buf
-}
-
-/// Apply full-page images left by an interrupted `write_at_head`.
-fn restore_ahead(path: &Path) -> Result<(), StoreError> {
-    let side = ahead_path(path);
-    let raw = match std::fs::read(&side) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(&side, e)),
-    };
-    let AheadPages {
-        logical,
-        pages: images,
-    } = parse_ahead(&raw)?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
-    let mut disk_header = [0u8; FILE_HEADER_LEN];
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| StoreError::io(path, e))?;
-    let disk_logical = match file.read_exact(&mut disk_header) {
-        Ok(()) => le_u64!(disk_header, 8),
-        Err(_) => 0,
-    };
-    // A later append may have grown the file past this image; do not shrink
-    // the header or replay bytes the append already published.
-    let keep_disk = disk_header[0..4] == STORE_MAGIC && disk_logical > logical;
-    for (off, image) in images {
-        if keep_disk && off >= logical {
-            continue;
-        }
-        let write_len = if keep_disk {
-            (logical.saturating_sub(off) as usize).min(4096)
-        } else {
-            4096
-        };
-        if write_len == 0 {
-            continue;
-        }
-        // Page 0 of an older image starts with that image's length. A crash
-        // before the header write below must leave the newer length in place.
-        let skip = if keep_disk && off == 0 {
-            FILE_HEADER_LEN.min(write_len)
-        } else {
-            0
-        };
-        if skip == write_len {
-            continue;
-        }
-        file.seek(SeekFrom::Start(off + skip as u64))
-            .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(&image[skip..write_len])
-            .map_err(|e| StoreError::io(path, e))?;
-    }
-    #[cfg(debug_assertions)]
-    if take_fail_restore_header(path) {
-        return Err(StoreError::io(
-            path,
-            std::io::Error::other("injected txstat restore header failure"),
-        ));
-    }
-    let header = if keep_disk {
-        disk_header
-    } else {
-        file::encode_leading_header(TableKind::TxStat, logical)
-    };
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| StoreError::io(path, e))?;
-    file.write_all(&header)
-        .map_err(|e| StoreError::io(path, e))?;
-    file.durable_sync_all()
-        .map_err(|e| StoreError::io(path, e))?;
-    drop(file);
-    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-    if let Some(parent) = side.parent() {
-        file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-    }
-    Ok(())
-}
 
 #[doc(hidden)]
 pub fn checked_blob_len(len: usize, remain: u64) -> Result<usize, StoreError> {
@@ -470,69 +229,26 @@ pub struct TxStat {
     /// Serialises [`Self::put_header_blob`]'s read of the `ovf` end and its
     /// append. Readers stamp blocks too, so appends run on several threads.
     ovf_append: Mutex<()>,
-    /// One journal+body write+sync+remove at a time. The IBD append and the
-    /// read-side stamp can otherwise replace each other's `*.ahead` image.
+    /// One body writer at a time. The IBD append checks the count it extends,
+    /// and a read-side stamp must not race it.
     journal: Mutex<()>,
 }
 
+/// Write stamp bytes in place, then sync them.
+///
+/// Cells are 8 bytes at 8-aligned offsets and block slots 16 bytes at
+/// 16-aligned offsets, so each sits inside one 512-byte sector. A tear
+/// leaves every cell or slot old or new, and an unstamped cell reads as the
+/// fallback (crash-recovery.md, the sector rule). No mark.
+fn stamp(file: &TableFile, start: u64, bytes: &[u8]) -> Result<(), StoreError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    file.write_at_pwrite(start, bytes)?;
+    file.sync_data_only()
+}
+
 impl TxStat {
-    /// Write the intended full pages before an in-place cell write.
-    fn write_ahead_pages(&self, start: u64, bytes: &[u8]) -> Result<Option<PathBuf>, StoreError> {
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let first = start & !4095;
-        let last = (start + bytes.len() as u64 - 1) & !4095;
-        let mut blocks: BTreeMap<u64, [u8; 4096]> = BTreeMap::new();
-        let mut block = first;
-        while block <= last {
-            blocks.insert(block, read_page(self.body.path(), &self.body, block)?);
-            block += 4096;
-        }
-        // The length write at offset 8 touches page 0 too.
-        if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(0) {
-            entry.insert(read_page(self.body.path(), &self.body, 0)?);
-        }
-        for (at, byte) in bytes.iter().enumerate() {
-            let off = start + at as u64;
-            let Some(image) = blocks.get_mut(&(off & !4095)) else {
-                continue;
-            };
-            image[(off & 4095) as usize] = *byte;
-        }
-        let mut logical = self.body.logical_len().max(start + bytes.len() as u64);
-        // A leftover sidecar from a failed write keeps pages this write does
-        // not replace; new images win on pages they cover.
-        if let Some(old) = load_ahead(self.body.path())? {
-            let mut merged = old.pages;
-            merged.extend(blocks);
-            blocks = merged;
-            logical = logical.max(old.logical);
-        }
-        let buf = encode_ahead(logical, &blocks);
-        let side = ahead_path(self.body.path());
-        file::write_synced_tmp_rename(&side, &buf)?;
-        #[cfg(debug_assertions)]
-        if take_fail_ahead(self.body.path()) {
-            return Err(StoreError::io(
-                self.body.path(),
-                std::io::Error::other("injected txstat ahead failure"),
-            ));
-        }
-        Ok(Some(side))
-    }
-
-    fn remove_ahead(side: Option<PathBuf>) -> Result<(), StoreError> {
-        let Some(side) = side else {
-            return Ok(());
-        };
-        std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-        if let Some(parent) = side.parent() {
-            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-        }
-        Ok(())
-    }
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.ovf.flush()?;
@@ -570,12 +286,17 @@ impl TxStat {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        // The page-guard mark replaced `*.ahead`. A journal left by the
+        // previous binary is not replayed, so opening would serve a torn page.
+        let ahead = dir.join("txstat.body.ahead");
+        if ahead.is_file() {
+            return Err(StoreError::Corrupt("txstat.body.ahead"));
+        }
         let leftover = dir.join("txfixed.body");
         if leftover.exists() {
             std::fs::remove_file(&leftover).map_err(|e| StoreError::io(&leftover, e))?;
         }
         let body_path = Self::body_path(dir);
-        restore_ahead(&body_path)?;
         let body = if body_path.exists() {
             TableFile::open(body_path, TableKind::TxStat)?
         } else {
@@ -783,24 +504,7 @@ impl TxStat {
                 tails.push((base_count + 1 + i as u64, t));
             }
         }
-        // Append-only. Class A tear_guard owns page 0 and the old partial
-        // tail; the barrier syncs txstat with the rest of the archive.
-        // Drop leftover images this append supersedes so restore cannot
-        // replay them over the new tail. An image whose pages all stay is
-        // already the right file, so leave it in place.
-        if let Some(old) = load_ahead(self.body.path())? {
-            let end = start + blob.len() as u64;
-            let mut old_blocks = old.pages;
-            let before = old_blocks.len();
-            old_blocks.retain(|&off, _| off.saturating_add(4096) <= start || off >= end);
-            let side = ahead_path(self.body.path());
-            if old_blocks.is_empty() {
-                Self::remove_ahead(Some(side))?;
-            } else if old_blocks.len() != before {
-                let buf = encode_ahead(old.logical, &old_blocks);
-                file::write_synced_tmp_rename(&side, &buf)?;
-            }
-        }
+        // Append-only: under the sector rule committed bytes land unchanged.
         self.body.write_at_pwrite(start, &blob)?;
         let new = base_count + rows.len() as u64;
         self.count.store(new, Ordering::Release);
@@ -818,10 +522,7 @@ impl TxStat {
             return Err(StoreError::Corrupt("txstat overflow needs header blob"));
         }
         let off = Self::entry_offset(id)?;
-        let side = self.write_ahead_pages(off, &cell)?;
-        self.body.write_at_pwrite(off, &cell)?;
-        self.body.sync_data_only()?;
-        Self::remove_ahead(side)?;
+        stamp(&self.body, off, &cell)?;
         Ok(())
     }
 
@@ -853,10 +554,7 @@ impl TxStat {
                 tails.push((idx, t));
             }
         }
-        let side = self.write_ahead_pages(start, &blob)?;
-        self.body.write_at_pwrite(start, &blob)?;
-        self.body.sync_data_only()?;
-        Self::remove_ahead(side)?;
+        stamp(&self.body, start, &blob)?;
         let raw = encode_ovf_blob(&tails)?;
         self.put_header_blob(header_fk, &raw)
     }
@@ -911,12 +609,17 @@ impl TxStat {
                 n_ovf,
             )
         };
+        if !blob.is_empty() {
+            // The slot below is synced. The blob and the txstat.ovf length it
+            // names go first, as in `flush`.
+            self.ovf.sync_data_only()?;
+        }
         let slot_off = BLK_HEADER + (hfk - 1) * BLK_SLOT;
         let mut slot = [0u8; 16];
         slot[0..8].copy_from_slice(&off.to_le_bytes());
         slot[8..12].copy_from_slice(&len.to_le_bytes());
         slot[12..16].copy_from_slice(&n.to_le_bytes());
-        self.blk.write_at_pwrite(slot_off, &slot)?;
+        stamp(&self.blk, slot_off, &slot)?;
         Ok(())
     }
 

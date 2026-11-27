@@ -205,7 +205,6 @@ fn header_on_file(path: &Path) -> Option<u64> {
 }
 
 fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
-    use std::io::Write as _;
     let Some(out) = std::env::var_os("WRITE_PROBE_OUT") else {
         return;
     };
@@ -226,6 +225,19 @@ fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
     } else {
         "<tmp>".to_string()
     };
+    // The classifier passes these classes without reading frames, so they
+    // skip the backtrace, which is most of the probe's cost.
+    if SAFE_CLASSES.contains(&class) {
+        write_entry(
+            &out,
+            format!("{class} {parent}/{name}"),
+            committed,
+            offset,
+            len,
+            &[],
+        );
+        return;
+    }
     let bt = std::backtrace::Backtrace::force_capture().to_string();
     let frames: Vec<String> = bt
         .lines()
@@ -255,6 +267,32 @@ fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
         h.finish()
     };
     let key = format!("{class} {parent}/{name} {caller}#{stack:016x}");
+    let rest: Vec<String> = frames.into_iter().skip(1).collect();
+    write_entry(&out, key, committed, offset, len, &rest);
+}
+
+/// Classes `scripts/write-probe-classify.py` passes as safe by structure.
+/// Keep the two lists the same.
+const SAFE_CLASSES: &[&str] = &[
+    "CREATE",
+    "ARMED",
+    "ONE_SECTOR",
+    "LEN_ONE_SECTOR",
+    "LEN_ARMED",
+    "LEN_AFTER_SYNC",
+    "FIXTURE",
+];
+
+/// Append one entry the first time its key is seen.
+fn write_entry(
+    out: &std::ffi::OsStr,
+    key: String,
+    committed: u64,
+    offset: u64,
+    len: u64,
+    frames: &[String],
+) {
+    use std::io::Write as _;
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     if !SEEN
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -265,7 +303,7 @@ fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
         return;
     }
     let mut line = format!("PROBE {key} end={committed} off={offset} len={len}\n");
-    for f in frames.iter().skip(1) {
+    for f in frames {
         line.push_str("    ");
         line.push_str(f);
         line.push('\n');
@@ -273,7 +311,7 @@ fn log(class: &str, path: &Path, committed: u64, offset: u64, len: u64) {
     if let Ok(mut fh) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&out)
+        .open(out)
     {
         let _ = fh.write_all(line.as_bytes());
     }

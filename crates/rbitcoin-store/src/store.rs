@@ -1046,7 +1046,7 @@ impl Store {
     }
 
     pub fn write_txstat_row(&self, fk: Fk, row: &crate::TxStatRow) -> Result<(), StoreError> {
-        self.txs.txstat.write_row(fk, row)
+        self.txs.stamp_txstat(|t| t.write_row(fk, row))
     }
 
     /// Stamp a confirmed block's `txstat` cells and that header's overflow blob.
@@ -1056,7 +1056,8 @@ impl Store {
         first_fk: u64,
         rows: &[crate::TxStatRow],
     ) -> Result<(), StoreError> {
-        self.txs.txstat.write_block_rows(header_fk, first_fk, rows)
+        self.txs
+            .stamp_txstat(|t| t.write_block_rows(header_fk, first_fk, rows))
     }
 
     /// One `txstat.body` row, or `None` if unstamped (all-zero). Loads overflow if needed.

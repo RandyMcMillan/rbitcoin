@@ -1679,6 +1679,52 @@ fn every_torn_txstat_stamp_reads_unstamped_and_restamps() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A stats stamp syncs `txstat` files the Class A barrier syncs. A failed
+/// sync there latches Class A as a barrier's does: a retried fsync can
+/// succeed after the kernel dropped the dirty pages, and the failed one may
+/// have taken an append's writeback error. A stamp the store refuses (a
+/// create past the count) is not a failed sync and does not latch.
+#[test]
+fn failed_txstat_stamp_sync_latches_class_a() {
+    let picks: [(&str, ClassAPick); 3] = [
+        ("txstat.body", |s| s.txs.txstat.body.io_handle()),
+        ("txstat.ovf", |s| s.txs.txstat.ovf.io_handle()),
+        ("txstat.blk", |s| s.txs.txstat.blk.io_handle()),
+    ];
+    for (name, pick) in picks {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+        let (h1, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+        assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(1)));
+        let fk = s.header_txs.get_list(h1).unwrap().unwrap()[0];
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&fired);
+        s.txs.on_class_a_failure(move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let wide = wide_txstat();
+        assert!(s.write_txstat_block(h1, fk.0 + 10, &[wide]).is_err());
+        assert!(!fired.load(std::sync::atomic::Ordering::SeqCst), "{name}");
+        s.txs.sync_class_a_data().unwrap();
+
+        rbitcoin_store::io_handle::arm_fail_sync(pick(&s), 1);
+        assert!(
+            s.write_txstat_block(h1, fk.0, &[wide]).is_err(),
+            "{name}: the stamp did not sync it"
+        );
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "{name}");
+        assert!(
+            s.txs.sync_class_a_data().is_err(),
+            "{name}: a barrier synced over a failed stamp sync"
+        );
+        assert!(s.write_txstat_block(h1, fk.0, &[wide]).is_err(), "{name}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A create open keeps past the committed floor can carry a stamped cell
 /// whose tail was in a block that never committed. It has no confirmed
 /// height to find that tail by, so its row reads as unstamped.

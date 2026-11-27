@@ -4050,10 +4050,32 @@ impl TxTable {
         &self,
         sync: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
+        self.class_a_latched_if(sync, |_| true)
+    }
+
+    /// A stats stamp after the barrier (`getblockstats` fills unstamped
+    /// rows). It writes and syncs `txstat` files the barrier syncs, so it
+    /// runs under the Class A latch, and a failed write or sync latches. A
+    /// stamp refused before any IO (a create past the count) does not.
+    pub(crate) fn stamp_txstat(
+        &self,
+        stamp: impl FnOnce(&crate::txstat::TxStat) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.class_a_latched_if(
+            || stamp(&self.txstat),
+            |e| matches!(e, StoreError::Io { .. }),
+        )
+    }
+
+    fn class_a_latched_if(
+        &self,
+        sync: impl FnOnce() -> Result<(), StoreError>,
+        latches: impl FnOnce(&StoreError) -> bool,
+    ) -> Result<(), StoreError> {
         let _one = self.class_a_sync.lock().unwrap_or_else(|e| e.into_inner());
         self.refuse_if_class_a_failed()?;
         let synced = sync();
-        if synced.is_err() {
+        if synced.as_ref().is_err_and(latches) {
             self.latch_class_a_failure();
         }
         synced

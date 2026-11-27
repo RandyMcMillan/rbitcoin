@@ -600,3 +600,33 @@ fn open_refuses_a_bare_file_name() {
         Ok(_) => panic!("bare name opened"),
     }
 }
+
+/// The first insert into an empty head writes and images only the pages its
+/// keys land in. An empty table is all zeros on disk, so writing the whole
+/// table would cost a mark the size of the table at mainnet scale.
+#[cfg(debug_assertions)]
+#[test]
+fn a_first_insert_writes_only_the_pages_it_fills() {
+    let path = tmp_path();
+    let h = HashHead::create_with_slots(&path, 1 << 16).unwrap();
+    let mut key = [0u8; 32];
+    key[0] = 0x5c;
+    rbitcoin_store::file::arm_write_trace();
+    h.insert(&key, Fk(7)).unwrap();
+    let written: u64 = rbitcoin_store::file::take_write_trace()
+        .into_iter()
+        .filter_map(|w| match w {
+            rbitcoin_store::file::TracedWrite::Write { path: p, len, .. } if p == path => Some(len),
+            _ => None,
+        })
+        .sum();
+    assert!(
+        written <= 2 * 4096,
+        "the first insert wrote {written} bytes"
+    );
+    assert_eq!(h.get_all(&key).unwrap(), vec![Fk(7)]);
+    drop(h);
+    let h = HashHead::open(&path).unwrap();
+    assert_eq!(h.get_all(&key).unwrap(), vec![Fk(7)]);
+    cleanup_hh(&path);
+}

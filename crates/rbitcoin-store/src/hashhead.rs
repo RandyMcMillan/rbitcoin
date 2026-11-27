@@ -744,6 +744,10 @@ impl HashHead {
         Ok(())
     }
 
+    /// Write a filled empty table at `offset`. The table on disk is all
+    /// zeros (a head only inserts), so only the pages that hold a non-zero
+    /// byte change: those are imaged and written, plus the page that holds
+    /// a new end.
     fn persist_table_image(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
@@ -753,16 +757,24 @@ impl HashHead {
         let mut pages = BTreeSet::new();
         if new_end != old {
             pages.insert(0u64);
+            pages.insert(((new_end - 1) / PAGE) * PAGE);
         }
         let first = (offset / PAGE) * PAGE;
         let last = ((new_end - 1) / PAGE) * PAGE;
+        let span = |page: u64| {
+            let lo = page.max(offset);
+            let hi = (page + PAGE).min(new_end);
+            (lo, &bytes[(lo - offset) as usize..(hi - offset) as usize])
+        };
         let mut page = first;
         while page <= last {
-            pages.insert(page);
+            if span(page).1.iter().any(|b| *b != 0) {
+                pages.insert(page);
+            }
             page += PAGE;
         }
         let mut images = Vec::with_capacity(pages.len());
-        for page in pages {
+        for &page in &pages {
             let mut image = read_page(self.file.path(), &self.file, page)?;
             if page == 0 {
                 image[..FILE_HEADER_LEN].copy_from_slice(&file::encode_leading_header(
@@ -776,7 +788,12 @@ impl HashHead {
         self.multi.commit_pending()?;
         let _hold = page_guard::hold_marks();
         self.arm_head_pages(&images)?;
-        self.file.write_at(offset, bytes)?;
+        for &page in &pages {
+            let (at, part) = span(page);
+            if !part.is_empty() {
+                self.file.write_at(at, part)?;
+            }
+        }
         self.clear_head_mark()
     }
 

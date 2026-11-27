@@ -31,7 +31,7 @@ mod flush_hold {
 }
 
 /// Pause [`HeaderTable::flush`] while `put_lock` is still held, after the
-/// live write and before the mark is gone.
+/// body and head flushes.
 #[doc(hidden)]
 #[cfg(debug_assertions)]
 pub fn bind_header_flush_hold(hold: Option<std::sync::Arc<crate::array_table::TipFlushHold>>) {

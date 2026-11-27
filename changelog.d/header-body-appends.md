@@ -9,3 +9,10 @@ Changed
   now commits in chunks of at most 2000 rows. Open looks up each row of
   the last chunk, so a crash inside a head insert that named a later row
   no longer leaves an earlier one out of `header.head`.
+- **`header.head` rewrites slots under a forward mark.** One
+  `header.head` generation uses `store/guard/header.head`; open copies it
+  back before any head read. The first fill of an empty generation images
+  and writes only the pages its keys land in. Open refuses a leftover
+  `header.head.ahead` or `header.head.gN.ahead`, and only `meta` 24/25
+  converts a 96-byte `header.body`; a later `meta` beside that length
+  refuses to open.

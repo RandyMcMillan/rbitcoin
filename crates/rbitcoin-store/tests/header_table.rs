@@ -99,7 +99,7 @@ fn header_put_get_by_hash_open_flush() {
 }
 
 #[test]
-fn header_flush_holds_put_lock_until_the_mark_is_cleared() {
+fn header_flush_holds_put_lock_until_its_flushes_finish() {
     use rbitcoin_store::array_table::TipFlushHold;
     use rbitcoin_store::bind_header_flush_hold;
     use std::sync::atomic::Ordering;
@@ -312,31 +312,32 @@ fn open_indexes_an_unnamed_row_below_a_named_one() {
 }
 
 /// A batch past one chunk commits as several appends, each named in the
-/// head before the next starts. A failure in the second chunk leaves the
-/// first chunk durable and named, so open's last-chunk scan misses no row.
+/// head before the next starts. A failure in the third chunk leaves the
+/// first two durable and named. Row 1 sits below open's last-chunk scan,
+/// so only the first chunk's own head insert can have named it.
 #[cfg(debug_assertions)]
 #[test]
 fn a_failure_past_the_first_chunk_keeps_that_chunk_named() {
     let dir = tmp();
     let t = HeaderTable::create_tiny(&dir).unwrap();
-    let recs: Vec<HeaderRecord> = (0..2_001u32)
+    let recs: Vec<HeaderRecord> = (0..4_001u32)
         .map(|i| {
             let mut h = [0x5bu8; 32];
             h[..4].copy_from_slice(&i.to_le_bytes());
             sample(h)
         })
         .collect();
-    // The header sync before the flag and the first chunk's data sync
-    // pass; the second chunk's data sync fails.
-    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 2, 1);
+    // The header sync before the flag and the first two chunks' data syncs
+    // pass; the third chunk's data sync fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 3, 1);
     assert!(
         t.ensure_batch(&recs).is_err(),
-        "the second chunk did not fail"
+        "the third chunk did not fail"
     );
     drop(t);
     let t = HeaderTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.count(), 2_000);
-    for i in [0usize, 1_999] {
+    assert_eq!(t.count(), 4_000);
+    for i in [0usize, 1_999, 3_999] {
         let found = t.get_by_hash(&recs[i].hash).unwrap().map(|(fk, _)| fk);
         assert_eq!(found, Some(Fk(i as u64 + 1)), "row {i}");
     }

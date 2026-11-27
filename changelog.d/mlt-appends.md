@@ -5,3 +5,4 @@ Changed
   arms. The mark images head pages only. A crash after the rows and before
   the head leaves unreferenced rows past the last id the head names. They
   are never read.
+  A failed `.mlt` length flush refuses later inserts until reopen.

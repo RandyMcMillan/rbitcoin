@@ -24,23 +24,6 @@ pub const SPENT_OVF_NAME: &str = "spent.ovf";
 #[doc(hidden)]
 pub const LEGACY_SPENDERS_BODY: &str = "spenders.body";
 
-/// The annotate freeze. [`Self::new`] borrows [`crate::store::UtxoViewGuard`]
-/// for the node sync, then the length write and its sync. An annotate
-/// append does not wait for it: [`SpenderTable::flush`] publishes only the
-/// end it sampled before the sync.
-pub struct SpenderFreeze<'a> {
-    _view: std::marker::PhantomData<&'a ()>,
-}
-
-impl<'a> SpenderFreeze<'a> {
-    pub fn new(guard: &'a crate::store::UtxoViewGuard<'_>) -> Self {
-        let _ = guard.view;
-        Self {
-            _view: std::marker::PhantomData,
-        }
-    }
-}
-
 pub struct SpenderTable {
     pub body: TableFile,
     pub count: AtomicU64,
@@ -140,13 +123,13 @@ impl SpenderTable {
     }
 
     /// Sync the nodes, then write and sync the length that names them.
-    pub fn flush(&self, _freeze: &SpenderFreeze<'_>) -> Result<(), StoreError> {
+    pub fn flush(&self) -> Result<(), StoreError> {
         self.refuse_if_sync_failed()?;
         self.finish_sync(self.publish_synced())
     }
 
-    /// The annotate path does not take the freeze, so an append can land
-    /// during a flush. The end is sampled before the sync: every append that
+    /// A flush runs without the UTXO view, so an annotate append can land
+    /// during it. The end is sampled before the sync: every append that
     /// published it had already written its node. One that lands after the
     /// sample stays past the header until the next flush.
     fn publish_synced(&self) -> Result<(), StoreError> {

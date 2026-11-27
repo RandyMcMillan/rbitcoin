@@ -33,10 +33,7 @@ fn append_get_chain() {
     ));
     assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
     assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
-    let freeze_dir = rbitcoin_store::testutil::TempDir::labeled("spender-freeze").unwrap();
-    let freeze = Store::create_tiny(freeze_dir.path()).unwrap();
-    let g = freeze.hold_utxo_view();
-    t.flush(&SpenderFreeze::new(&g)).unwrap();
+    t.flush().unwrap();
     t.flush_async().unwrap();
     drop(t);
     let t = SpenderTable::open(&dir).unwrap();
@@ -57,8 +54,7 @@ fn open_rejects_bad_body_size() {
     {
         let s = Store::create_tiny(dir.path()).unwrap();
         s.spenders.append(Fk(1), 0, Fk::NULL).unwrap();
-        let g = s.hold_utxo_view();
-        s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
+        s.spenders.flush().unwrap();
     }
     // Shrink below HWM so open clamps logical_len to a non-multiple of 16.
     let body = dir.path().join("spent.ovf");
@@ -88,11 +84,7 @@ fn open_renames_leftover_spenders_body_to_spent_ovf() {
     {
         let t = SpenderTable::create(&dir).unwrap();
         t.append(Fk(7), 9, Fk::NULL).unwrap();
-        let freeze_dir =
-            rbitcoin_store::testutil::TempDir::labeled("spender-legacy-freeze").unwrap();
-        let freeze = Store::create_tiny(freeze_dir.path()).unwrap();
-        let g = freeze.hold_utxo_view();
-        t.flush(&SpenderFreeze::new(&g)).unwrap();
+        t.flush().unwrap();
     }
     std::fs::rename(dir.join("spent.ovf"), dir.join("spenders.body")).unwrap();
     assert!(!dir.join("spent.ovf").exists());
@@ -162,10 +154,7 @@ fn a_crash_between_flushes_reopens_at_the_flushed_length() {
         for i in 1..=committed {
             s.spenders.append(Fk(i), i as u32, Fk::NULL).unwrap();
         }
-        {
-            let g = s.hold_utxo_view();
-            s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
-        }
+        s.spenders.flush().unwrap();
         kept = s.spenders.get(Fk(committed)).unwrap();
         s.spenders.append(Fk(9), 1, Fk::NULL).unwrap();
         s.spenders.append(Fk(9), 2, Fk::NULL).unwrap();
@@ -212,10 +201,7 @@ fn an_append_arms_no_mark_and_waits_for_flush_to_publish() {
         0,
         "the durable length waits for a flush"
     );
-    {
-        let g = s.hold_utxo_view();
-        s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
-    }
+    s.spenders.flush().unwrap();
     let reopened = SpenderTable::open(&path).unwrap();
     assert_eq!(reopened.count(), 1);
     assert_eq!(reopened.get(fk).unwrap(), (Fk(7), 1, Fk::NULL));
@@ -230,10 +216,8 @@ fn a_failed_node_sync_publishes_no_length() {
     let s = Store::create_tiny(&path).unwrap();
     s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
     rbitcoin_store::io_handle::arm_fail_sync(s.spenders.body.io_handle(), 1);
-    let g = s.hold_utxo_view();
-    let freeze = SpenderFreeze::new(&g);
-    assert!(s.spenders.flush(&freeze).is_err());
-    assert!(s.spenders.flush(&freeze).is_err(), "the latch holds");
+    assert!(s.spenders.flush().is_err());
+    assert!(s.spenders.flush().is_err(), "the latch holds");
     assert_eq!(SpenderTable::open(&path).unwrap().count(), 0);
 }
 
@@ -250,10 +234,7 @@ fn an_append_during_a_flush_stays_out_of_its_length() {
     rbitcoin_store::spender_table::set_after_node_sync(Some(Box::new(|t: &SpenderTable| {
         t.append(Fk(8), 1, Fk::NULL).unwrap();
     })));
-    {
-        let g = s.hold_utxo_view();
-        s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
-    }
+    s.spenders.flush().unwrap();
     assert_eq!(s.spenders.count(), 2);
     let header_len = |p: &std::path::Path| {
         let raw = std::fs::read(p.join("spent.ovf")).unwrap();
@@ -264,10 +245,7 @@ fn an_append_during_a_flush_stays_out_of_its_length() {
         SpenderTable::offset(2),
         "the flush published a node its sync did not cover"
     );
-    {
-        let g = s.hold_utxo_view();
-        s.spenders.flush(&SpenderFreeze::new(&g)).unwrap();
-    }
+    s.spenders.flush().unwrap();
     assert_eq!(header_len(&path), SpenderTable::offset(3));
 }
 
@@ -282,8 +260,6 @@ fn a_failed_length_sync_latches_the_flush() {
     s.spenders.append(Fk(7), 1, Fk::NULL).unwrap();
     // The node sync passes; the length sync after it fails.
     rbitcoin_store::io_handle::arm_fail_sync_after(s.spenders.body.io_handle(), 1, 1);
-    let g = s.hold_utxo_view();
-    let freeze = SpenderFreeze::new(&g);
-    assert!(s.spenders.flush(&freeze).is_err());
-    assert!(s.spenders.flush(&freeze).is_err(), "the latch holds");
+    assert!(s.spenders.flush().is_err());
+    assert!(s.spenders.flush().is_err(), "the latch holds");
 }

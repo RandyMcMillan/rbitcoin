@@ -356,14 +356,29 @@ fn staged_rows_publish_only_after_their_sync() {
         "nothing durable yet"
     );
     // Every file syncs before any length moves: a failed locator sync, the
-    // last of the three, leaves every header where it was.
-    let staged_body = t.body.logical_len();
+    // last of the three, leaves every header on disk where it was. Read the
+    // raw headers, since an open would cut a long body back to the locator.
+    let header_len = |name: &str| {
+        let raw = std::fs::read(dir.path().join(name)).unwrap();
+        u64::from_le_bytes(raw[8..16].try_into().unwrap())
+    };
+    let durable: Vec<u64> = ["input.body", "input.off", "input.loc"]
+        .iter()
+        .map(|n| header_len(n))
+        .collect();
     rbitcoin_store::io_handle::arm_fail_sync(t.loc.io_handle(), 1);
     assert!(t.publish_staged().is_err());
-    let before = Input::open(dir.path()).unwrap();
-    assert_eq!(before.count(), 1, "a length moved before its sync");
-    assert_eq!(before.body.logical_len(), staged_body - 1100 * REC_LEN);
-    drop(before);
+    for (name, want) in ["input.body", "input.off", "input.loc"]
+        .iter()
+        .zip(&durable)
+    {
+        assert_eq!(
+            header_len(name),
+            *want,
+            "{name}: a length moved before its sync"
+        );
+    }
+    assert_eq!(Input::open(dir.path()).unwrap().count(), 1);
     t.publish_staged().unwrap();
     let reopened = Input::open(dir.path()).unwrap();
     assert_eq!(reopened.count(), 1101);

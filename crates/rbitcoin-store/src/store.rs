@@ -2225,16 +2225,17 @@ impl Store {
             |log| {
                 {
                     use std::sync::atomic::Ordering;
-                    let g = hold_view(publish, view);
+                    let _g = hold_view(publish, view);
                     let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
                     let seen = reorgs.load(Ordering::Acquire);
                     let disconnected = filtered.load(Ordering::Acquire) != seen;
                     log.freeze_open(tip, disconnected.then_some(keep))?;
                     filtered.store(seen, Ordering::Release);
-                    // The appender is held off until the nodes and then
-                    // the spent.ovf length that names them are synced.
-                    spenders.flush(&crate::spender_table::SpenderFreeze::new(&g))?;
                 }
+                // Every spender a frozen note names was appended before the
+                // freeze, so the flush's sampled end covers it. Its nodes and
+                // then that length are synced before the commit names them.
+                spenders.flush()?;
                 let named = txs.settled_count();
                 txs.sync_class_a_named(named)?;
                 Ok(())
@@ -2507,11 +2508,7 @@ impl Store {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.txs.flush()?;
-        {
-            let g = self.hold_utxo_view();
-            self.spenders
-                .flush(&crate::spender_table::SpenderFreeze::new(&g))?;
-        }
+        self.spenders.flush()?;
         self.scripthash.flush()?;
         self.flush_class_c_tip()?;
         Ok(())

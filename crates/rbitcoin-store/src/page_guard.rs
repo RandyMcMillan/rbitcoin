@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 
@@ -141,6 +141,17 @@ pub fn check_armed_write(
         page = page.saturating_add(PAGE);
     }
     Ok(())
+}
+
+/// One process-wide hold for every mark. Arm and clear of the same path must
+/// sit inside one hold, or a second flusher can rename the file between them.
+#[doc(hidden)]
+pub fn hold_marks() -> MutexGuard<'static, ()> {
+    static MARKS: OnceLock<Mutex<()>> = OnceLock::new();
+    MARKS
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// One group mark for several files. A retry replaces the image at the same

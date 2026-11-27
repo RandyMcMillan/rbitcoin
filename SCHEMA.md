@@ -270,7 +270,9 @@ itself changed.
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
     blockfilter.idx/meta              # optional BIP158 basic (`--block-filter-index`): fmt:u32=1
     blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ len:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
-    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: body sync, then idx sync, then publish. Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: an append with no mark (body bytes, then idx bytes, synced; then the body length, then the idx length, each synced). Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+
+  mempool/guard/flush              # one forward 4 KiB mark for a mempool flush: new LIVE slots, durable DEAD bytes, and meta (tx.body appends and publishes its length before the mark). tx.body is not renamed. No SCHEMA_VERSION bump
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
@@ -284,7 +286,8 @@ itself changed.
 `--datadir` holds every file by default. `--datadir-cold PATH` places the
 files the IBD pin path does not read under `PATH/store/` and writes
 `seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
-and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Pin / SH /
+and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Those
+are appends and keep no guard mark. Pin / SH /
 spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: witness
 for the last 288 heights is only `seqsigwit.window/{height}.bin` on the hot
 store, and the stem stays a header (an archive enable copies that window out
@@ -682,8 +685,10 @@ single-file, `header_fk` + absolute off) are unlinked on store open.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 
-Durability: each put writes and syncs the body, then writes and syncs the
-idx, so an idx slot on disk never points at body bytes a power cut can lose.
+Durability: a put is an append with no mark (crash-recovery.md, the sector
+rule). Body and idx bytes are synced, then the body length, then the idx
+length, so an idx slot on disk never points at body bytes a power cut can
+lose.
 Open (and first enable) repairs a crash tail: slots above the tip (a
 disconnect whose truncate never ran) are dropped, then the last record is fit
 to its `n_tx` — body bytes past it are cut, and a short record drops its slot.

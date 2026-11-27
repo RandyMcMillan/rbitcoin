@@ -19,16 +19,18 @@
 //! When the next record's **start** would exceed `u32::MAX`, a new `NNNNNN`
 //! pair starts (the sp_tweaks rule).
 //!
-//! **Commit order:** body pwrite → body `sync_data` → idx pwrite → idx
-//! `sync_data`, all past the visible end, then the slot count is published.
-//! Readers never wait on commit IO. After power loss the idx HWM may cover a
-//! torn slot and the body may hold bytes of an uncommitted record: open keeps
-//! the longest prefix of slots whose records run back to back inside the body,
-//! cuts the body to its end, and the caller checks `header_fk` against
-//! `confirmed[]`.
+//! **Commit order:** a `put` is an append with no mark (crash-recovery.md,
+//! the sector rule). Body and idx bytes are written past their ends and
+//! synced, then the body length, then the idx length, each synced. `put`
+//! holds its writer lock through those syncs. After power loss the idx HWM may cover a torn slot and the body
+//! may hold bytes of an uncommitted record: open keeps the longest prefix of
+//! slots whose records run back to back inside the body, cuts the body to its
+//! end, and the caller checks `header_fk` against `confirmed[]`.
+//! `clamp_torn_tail` is that stream trim.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::page_guard::{self, Append};
 use crate::seg_pair::{locate, SegDirs, SegPair};
 use rbitcoin_primitives::{bytes, le_u32, le_u64, Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
@@ -208,6 +210,19 @@ impl BlockFilterTable {
         }
     }
 
+    /// A failed put may have made one length durable and not the other.
+    /// Reopen fits the files to each other, so writers wait for it.
+    /// A failed put poisoned its segment files, and a length may be
+    /// durable in one of a pair and not the other. Reopen fits the pairs, so
+    /// every put, cut, and repair waits for it.
+    fn refuse_after_failed_put(&self) -> Result<(), StoreError> {
+        for seg in &self.read().segs {
+            seg.idx.refuse_if_poisoned()?;
+            seg.body.refuse_if_poisoned()?;
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(Self::idx_dir(dir)).map_err(|e| StoreError::io(dir, e))?;
@@ -215,11 +230,14 @@ impl BlockFilterTable {
         let meta = TableFile::create(Self::meta_path(dir), TableKind::ArrayLink)?;
         meta.write_at_pwrite(HDR, &IDX_FMT.to_le_bytes())?;
         meta.flush()?;
-        Ok(Self::with_segs(
-            dir,
-            vec![Self::seg_dirs(dir).create(0, 0)?],
-            HDR,
-        ))
+        let seg = Self::seg_dirs(dir).create(0, 0)?;
+        // The first forward commit syncs only the segment files. `meta`, the
+        // segment names, and the two table directories have to be durable
+        // before a put can return.
+        for d in [Self::idx_dir(dir), Self::body_dir(dir), dir.to_path_buf()] {
+            crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
+        }
+        Ok(Self::with_segs(dir, vec![seg], HDR))
     }
 
     #[doc(hidden)]
@@ -425,6 +443,9 @@ impl BlockFilterTable {
         filter: &[u8],
     ) -> Result<bool, StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        // A failed put may have made one length durable and not the other.
+        // Reopen fits the pair before a repair writes into it.
+        self.refuse_after_failed_put()?;
         let inner = self.read();
         let Some((si, local)) = inner.locate(height) else {
             return Err(StoreError::NotFound);
@@ -451,34 +472,60 @@ impl BlockFilterTable {
     }
 
     /// Append consecutive heights starting at [`Self::next_height`], durably.
+    ///
+    /// The plan, the writes, and the syncs run under the read lock, so a
+    /// reader of a committed height does not wait for them. The writer mutex
+    /// keeps every other change out. A rolled pair stays local until the
+    /// commit is done. Only then does the write lock publish the new pairs,
+    /// slot counts, and tail. A failed put leaves readers on the old prefix.
     pub fn put(&self, items: &[BlockFilterRecord<'_>]) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        let next = self.read().next();
-        if items
-            .iter()
-            .zip(next..)
-            .any(|(it, want)| u64::from(it.height.0) != want)
-        {
-            return Err(StoreError::Corrupt(
-                "invariant: blockfilter put not next height",
-            ));
+        self.refuse_after_failed_put()?;
+        struct Plan {
+            si: usize,
+            body_at: u64,
+            body: Vec<u8>,
+            idx_at: u64,
+            idx: Vec<u8>,
+            body_end: u64,
         }
-        let mut i = 0usize;
-        while i < items.len() {
-            if self.read().tail_end > u64::from(u32::MAX) {
-                let mut inner = self.write();
-                self.dirs.roll(&mut inner.segs)?;
-                inner.tail_end = HDR;
+        let (counts, mut rolled, tail_end) = {
+            let inner = self.read();
+            let next = inner.next();
+            if items
+                .iter()
+                .zip(next..)
+                .any(|(it, want)| u64::from(it.height.0) != want)
+            {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter put not next height",
+                ));
             }
-            let (n, end) = {
-                let inner = self.read();
-                let tail = inner
-                    .segs
-                    .last()
-                    .ok_or(StoreError::Corrupt("blockfilter no segments"))?;
+            let mut counts: Vec<u64> = inner.segs.iter().map(|s| s.n_slots).collect();
+            let mut rolled: Vec<SegPair> = Vec::new();
+            let mut tail_end = inner.tail_end;
+            let mut plans: Vec<Plan> = Vec::new();
+            let mut i = 0usize;
+            while i < items.len() {
+                if tail_end > u64::from(u32::MAX) {
+                    let file_id = u32::try_from(counts.len())
+                        .map_err(|_| StoreError::Corrupt("too many segment pairs"));
+                    let pair = file_id.and_then(|id| self.dirs.create(id, counts.iter().sum()));
+                    match pair {
+                        Ok(pair) => rolled.push(pair),
+                        Err(e) => {
+                            self.dirs.drop_after(&mut rolled, 0);
+                            return Err(e);
+                        }
+                    }
+                    counts.push(0);
+                    tail_end = HDR;
+                }
+                let si = counts.len() - 1;
                 let mut body = Vec::new();
                 let mut idx_blob = Vec::new();
-                let mut at = inner.tail_end;
+                let mut at = tail_end;
+                let start_i = i;
                 while i < items.len() {
                     let (Ok(off), Ok(len)) =
                         (u32::try_from(at), u32::try_from(items[i].filter.len()))
@@ -490,22 +537,64 @@ impl BlockFilterTable {
                     at += u64::from(len);
                     i += 1;
                 }
-                if idx_blob.is_empty() {
+                if i == start_i {
+                    self.dirs.drop_after(&mut rolled, 0);
                     return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
                 }
-                tail.body.write_at_pwrite(inner.tail_end, &body)?;
-                tail.body.flush()?;
-                tail.idx
-                    .write_at_pwrite(HDR + tail.n_slots * SLOT, &idx_blob)?;
-                tail.idx.flush()?;
-                (idx_blob.len() as u64 / SLOT, at)
+                let n = (i - start_i) as u64;
+                plans.push(Plan {
+                    si,
+                    body_at: tail_end,
+                    body,
+                    idx_at: HDR + counts[si] * SLOT,
+                    idx: idx_blob,
+                    body_end: at,
+                });
+                counts[si] += n;
+                tail_end = at;
+            }
+            let pair = |si: usize| -> &SegPair {
+                if si < inner.segs.len() {
+                    &inner.segs[si]
+                } else {
+                    &rolled[si - inner.segs.len()]
+                }
             };
-            let mut inner = self.write();
-            let tail = inner
-                .segs
-                .last_mut()
-                .ok_or(StoreError::Corrupt("blockfilter no segments"))?;
-            tail.n_slots += n;
+            let mut writes: Vec<Append<'_>> = Vec::new();
+            for p in &plans {
+                let seg = pair(p.si);
+                if !p.body.is_empty() {
+                    writes.push(Append {
+                        file: &seg.body,
+                        at: p.body_at,
+                        bytes: &p.body,
+                        new_logical: p.body_end,
+                    });
+                }
+                writes.push(Append {
+                    file: &seg.idx,
+                    at: p.idx_at,
+                    bytes: &p.idx,
+                    new_logical: p.idx_at + p.idx.len() as u64,
+                });
+            }
+            // Body before idx in each plan, so a body length is durable
+            // before the idx length that names its records.
+            let committed = page_guard::commit_appends(&writes);
+            drop(writes);
+            // A length may be durable already, including a rolled pair's.
+            // The failed group is poisoned: leave the files for reopen and
+            // publish nothing.
+            committed?;
+            let tail_end = plans.last().map(|p| p.body_end);
+            (counts, rolled, tail_end)
+        };
+        let mut inner = self.write();
+        inner.segs.append(&mut rolled);
+        for (seg, n) in inner.segs.iter_mut().zip(counts) {
+            seg.n_slots = n;
+        }
+        if let Some(end) = tail_end {
             inner.tail_end = end;
         }
         Ok(())
@@ -514,6 +603,7 @@ impl BlockFilterTable {
     /// Drop heights above `tip` (`None` drops every slot).
     pub fn truncate_through(&self, tip: Option<Height>) -> Result<(), StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        self.refuse_after_failed_put()?;
         let keep = tip.map_or(0, |h| u64::from(h.0) + 1);
         let mut inner = self.write();
         if keep >= inner.next() {

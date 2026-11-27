@@ -17,11 +17,17 @@
 //! sp_tweaks.body/NNNNNN   u8 len ‖ [u8; len]
 //! ```
 //!
+//! **Crash.** A put appends with no mark: bytes, then the body length, then
+//! the idx length. The last record ends at the body length, so a body length
+//! that landed without its idx length lengthens it. Query open calls
+//! [`SpTweaksTable::trim_last_record`] with the block's `n_tx` to cut it back.
+//!
 //! Leftover **files** `sp_tweaks.idx` / `sp_tweaks.body` (pre-17 single-file)
 //! are unlinked on store open; `--sptweaks` backfill regenerates.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::page_guard::{self, Append};
 use crate::seg_pair::{locate, SegDirs, SegPair as Seg};
 use rbitcoin_primitives::{le_u32, Height, TableKind};
 use std::path::{Path, PathBuf};
@@ -110,6 +116,12 @@ impl SpTweaksTable {
         Self::write_meta(&dir, origin.0)?;
         let dirs = Self::seg_dirs(&dir);
         let seg = dirs.create(0, 0)?;
+        // The first forward commit syncs only the segment files and their own
+        // directories. `meta`, the segment names, and the two table
+        // directories have to be durable before a put can return.
+        for d in [Self::idx_dir(&dir), Self::body_dir(&dir), dir.clone()] {
+            crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
+        }
         Ok(Self {
             dirs,
             origin: origin.0,
@@ -123,7 +135,8 @@ impl SpTweaksTable {
         let mut prefix = [0u8; 8];
         prefix[..4].copy_from_slice(&origin.to_le_bytes());
         prefix[4..8].copy_from_slice(&IDX_FMT_SEG_TIP.to_le_bytes());
-        meta.write_at_pwrite(FILE_HEADER_LEN as u64, &prefix)
+        meta.write_at_pwrite(FILE_HEADER_LEN as u64, &prefix)?;
+        meta.flush()
     }
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -159,6 +172,19 @@ impl SpTweaksTable {
             origin,
             inner: Mutex::new(Inner { segs }),
         })
+    }
+
+    /// A failed put may have made one length durable and not the other.
+    /// Reopen fits the files to each other, so writers wait for it.
+    /// A failed put poisoned its segment files, and a length may be
+    /// durable in one of a pair and not the other. Reopen fits the last
+    /// record, so every put and cut waits for it.
+    fn refuse_after_failed_put(inner: &Inner) -> Result<(), StoreError> {
+        for seg in &inner.segs {
+            seg.idx.refuse_if_poisoned()?;
+            seg.body.refuse_if_poisoned()?;
+        }
+        Ok(())
     }
 
     /// Open existing dirs, or create empty ones. Leftover single files are dropped.
@@ -261,7 +287,7 @@ impl SpTweaksTable {
         let end = if need_next {
             u64::from(le_u32!(raw[n_rows], 0))
         } else {
-            seg.body.logical_len()
+            seg.last_record_end()
         };
         Ok((starts, end))
     }
@@ -448,26 +474,59 @@ impl SpTweaksTable {
             expect = Height(expect.0.saturating_add(1));
         }
         let mut inner = self.lock();
+        Self::refuse_after_failed_put(&inner)?;
         let mut i = 0usize;
+        struct Plan {
+            si: usize,
+            body_at: u64,
+            body: Vec<u8>,
+            idx_at: u64,
+            idx: Vec<u8>,
+            n: u64,
+        }
+        let mut plans: Vec<Plan> = Vec::new();
+        // `roll` stamps `first_slot` from `n_slots` already on the pairs.
+        // Count a plan when it is pushed so a later roll in this batch does
+        // not overlap the segment it just left. A failed commit subtracts
+        // those counts again.
+        fn undo_slot_plan(segs: &mut [Seg], plans: &[Plan]) {
+            for p in plans {
+                if p.si < segs.len() {
+                    segs[p.si].n_slots = segs[p.si].n_slots.saturating_sub(p.n);
+                }
+            }
+        }
         while i < items.len() {
             let start0 = inner
                 .segs
                 .last()
-                .map(|s| s.body.logical_len())
+                .map(|s| {
+                    plans
+                        .last()
+                        .filter(|p| p.si + 1 == inner.segs.len())
+                        .map(|p| p.body_at + p.body.len() as u64)
+                        .unwrap_or_else(|| s.body.logical_len())
+                })
                 .unwrap_or(FILE_HEADER_LEN as u64);
             if start0 > u32::MAX as u64 {
-                self.dirs.roll(&mut inner.segs)?;
+                if let Err(e) = self.dirs.roll(&mut inner.segs) {
+                    undo_slot_plan(&mut inner.segs, &plans);
+                    return Err(e);
+                }
             }
-            let tail = inner
-                .segs
-                .last_mut()
-                .ok_or(StoreError::Corrupt("sp_tweaks no segments"))?;
-            let start = tail.body.logical_len();
+            let si = inner.segs.len() - 1;
+            let start = if let Some(p) = plans.last().filter(|p| p.si == si) {
+                p.body_at + p.body.len() as u64
+            } else {
+                inner.segs[si].body.logical_len()
+            };
             if start > u32::MAX as u64 {
+                undo_slot_plan(&mut inner.segs, &plans);
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
             let mut body = Vec::new();
             let mut offs: Vec<u32> = Vec::new();
+            let start_i = i;
             while i < items.len() {
                 let rec_start = start.saturating_add(body.len() as u64);
                 if rec_start > u32::MAX as u64 {
@@ -477,25 +536,65 @@ impl SpTweaksTable {
                 body.extend_from_slice(&Self::encode_records(items[i].1));
                 i += 1;
             }
-            if offs.is_empty() {
+            if i == start_i {
+                undo_slot_plan(&mut inner.segs, &plans);
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
-            // Body before idx, each synced: an idx slot on disk never points
-            // at body bytes a power cut can lose.
-            if !body.is_empty() {
-                tail.body.write_at_pwrite(start, &body)?;
-                tail.body.flush()?;
-            }
-            let mut idx_blob = Vec::with_capacity(offs.len() * SLOT as usize);
+            let n = offs.len() as u64;
+            let n_slots = inner.segs[si].n_slots;
+            let mut idx = Vec::with_capacity(offs.len() * SLOT as usize);
             for o in &offs {
-                idx_blob.extend_from_slice(&o.to_le_bytes());
+                idx.extend_from_slice(&o.to_le_bytes());
             }
-            let idx_at = FILE_HEADER_LEN as u64 + tail.n_slots * SLOT;
-            if !idx_blob.is_empty() {
-                tail.idx.write_at_pwrite(idx_at, &idx_blob)?;
-                tail.idx.flush()?;
+            plans.push(Plan {
+                si,
+                body_at: start,
+                body,
+                idx_at: FILE_HEADER_LEN as u64 + n_slots * SLOT,
+                idx,
+                n,
+            });
+            inner.segs[si].n_slots = inner.segs[si].n_slots.saturating_add(n);
+        }
+        let mut writes: Vec<Append<'_>> = Vec::new();
+        for p in &plans {
+            let seg = &inner.segs[p.si];
+            if !p.body.is_empty() {
+                writes.push(Append {
+                    file: &seg.body,
+                    at: p.body_at,
+                    bytes: &p.body,
+                    new_logical: p.body_at + p.body.len() as u64,
+                });
             }
-            tail.n_slots = tail.n_slots.saturating_add(offs.len() as u64);
+            if !p.idx.is_empty() {
+                writes.push(Append {
+                    file: &seg.idx,
+                    at: p.idx_at,
+                    bytes: &p.idx,
+                    new_logical: p.idx_at + p.idx.len() as u64,
+                });
+            }
+        }
+        // Body before idx in each plan, so a body length is durable before
+        // the idx length that names its records.
+        let committed = page_guard::commit_appends(&writes);
+        drop(writes);
+        if let Err(e) = committed {
+            // A length may be durable already, including a rolled pair's, so
+            // the files stay as the commit left them for reopen and its
+            // last-record fit. Readers keep the old prefix: take the planned
+            // slots back out of the counts. The old last record ends at the
+            // body length, which may now name the put's bytes, so readers end
+            // it at the old length in RAM only.
+            undo_slot_plan(&mut inner.segs, &plans);
+            for p in &plans {
+                let seg = &mut inner.segs[p.si];
+                if seg.body.logical_len() > p.body_at {
+                    seg.read_end = Some(p.body_at);
+                }
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -563,6 +662,7 @@ impl SpTweaksTable {
     /// then checks the new last record.
     pub fn trim_last_record(&self, n_tx: u32) -> Result<TrimLast, StoreError> {
         let mut inner = self.lock();
+        Self::refuse_after_failed_put(&inner)?;
         let Some(seg) = inner.segs.iter_mut().rev().find(|s| s.n_slots > 0) else {
             return Ok(TrimLast::Clean);
         };
@@ -609,6 +709,9 @@ impl SpTweaksTable {
     #[doc(hidden)]
     pub fn truncate_keep_slots(&self, keep: u64) -> Result<(), StoreError> {
         let mut inner = self.lock();
+        // A failed put may have made one length durable and not the other.
+        // Reopen and the last-record fit settle the pair before a cut.
+        Self::refuse_after_failed_put(&inner)?;
         let total: u64 = inner.segs.iter().map(|s| s.n_slots).sum();
         if keep >= total {
             return Ok(());

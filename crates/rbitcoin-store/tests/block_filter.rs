@@ -116,6 +116,25 @@ fn repair_body_leaves_a_replaced_slot_unchanged() {
     assert_eq!(slot_now, live);
 }
 
+/// A repair rewrites a whole filter in place, across sectors at real sizes.
+/// It writes only the live slot's length, and the reader gets the new bytes.
+/// The write probe sees this one as the multi-sector repair it is.
+#[test]
+fn repair_body_rewrites_a_filter_across_sectors() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    let big = vec![0x31u8; 1_500];
+    t.put(&[BlockFilterRecord {
+        height: Height(0),
+        slot: slot(0),
+        filter: &big,
+    }])
+    .unwrap();
+    let fixed = vec![0x32u8; big.len()];
+    assert!(t.repair_body(Height(0), &slot(0), &fixed).unwrap());
+    assert_eq!(t.filter(Height(0)).unwrap().unwrap(), (fixed, slot(0)));
+}
+
 /// Checkpoint headers are heights 1000, 2000, … and nothing in between.
 #[test]
 fn checkpoint_headers_are_every_thousandth_slot() {
@@ -200,10 +219,322 @@ fn rolls_a_segment_when_the_next_start_passes_u32() {
     assert_eq!(t.next_height(), Height(1));
 }
 
+/// A crash inside a segment-pair create can keep one name of the newest
+/// pair and lose the other. That pair holds no row, so open removes it and
+/// keeps the pairs before it.
+#[test]
+fn open_drops_a_half_created_newest_pair() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 2);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    drop(dirs.create(1, 3).unwrap());
+    fs::remove_file(dirs.body_path(1)).unwrap();
+    let t = BlockFilterTable::open_or_create(&dir).expect("a half-created newest pair");
+    assert_eq!(t.next_height(), Height(3));
+    assert!(!dirs.idx_path(1).exists(), "the orphan idx stayed");
+    assert_eq!(
+        t.filters(Height(2), Height(2)).unwrap().unwrap(),
+        vec![(vec![2u8; 5], slot(2))]
+    );
+}
+
+/// One missing file in a pair before the newest is still corruption.
+#[test]
+fn open_refuses_a_missing_file_below_the_newest_pair() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    drop(dirs.create(1, 1).unwrap());
+    drop(dirs.create(2, 1).unwrap());
+    fs::remove_file(dirs.body_path(1)).unwrap();
+    assert!(matches!(
+        BlockFilterTable::open_or_create(&dir),
+        Err(StoreError::Corrupt(m)) if m.contains("incomplete")
+    ));
+}
+
+/// A pair create that fails leaves neither file, so the next roll can make
+/// the same pair again.
+#[test]
+fn a_failed_pair_create_leaves_no_file() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    drop(t);
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    // A directory where the body file goes: the idx is made, the body is not.
+    fs::create_dir_all(dirs.body_path(1)).unwrap();
+    assert!(dirs.create(1, 0).is_err());
+    assert!(!dirs.idx_path(1).exists(), "the failed create left its idx");
+    fs::remove_dir(dirs.body_path(1)).unwrap();
+    drop(dirs.create(1, 0).expect("the next create of the same pair"));
+}
+
+#[test]
+fn put_rolls_mid_batch_when_the_next_start_passes_u32() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    drop(t);
+    // Height 0 now ends 3 bytes before the u32 offset limit, so the next
+    // put's first record still fits and the one after it must roll.
+    let end = u32::MAX - 3;
+    let len = end - FILE_HEADER_LEN as u32;
+    let idx = BlockFilterTable::seg_dirs(&dir).idx_path(0);
+    let mut raw = fs::read(&idx).unwrap();
+    raw[FILE_HEADER_LEN + 4..FILE_HEADER_LEN + 8].copy_from_slice(&len.to_le_bytes());
+    fs::write(&idx, &raw).unwrap();
+    let body = BlockFilterTable::seg_dirs(&dir).body_path(0);
+    set_file_hwm(&body, u64::from(end));
+    // Sparse room past the logical end: a write near u32::MAX must not
+    // fallocate the hole from offset 0.
+    let f = fs::OpenOptions::new().write(true).open(&body).unwrap();
+    f.set_len(u64::from(end) + (1 << 20)).unwrap();
+    drop(f);
+
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+    put_range(&t, 1, 3);
+    assert!(BlockFilterTable::seg_dirs(&dir).body_path(1).is_file());
+    assert_eq!(t.filter(Height(1)).unwrap().unwrap().0, vec![1u8; 4]);
+    assert_eq!(t.filter(Height(2)).unwrap().unwrap().0, vec![2u8; 5]);
+    assert_eq!(t.filter(Height(3)).unwrap().unwrap().0, vec![3u8; 6]);
+    assert_eq!(t.next_height(), Height(4));
+}
+
 #[test]
 fn block_filter_slot_roundtrip_keeps_the_row() {
     let row = decode_slot(&encode_slot(9, 40, &slot(3)));
     assert_eq!(row.off, 9);
     assert_eq!(row.len, 40);
     assert_eq!(row.slot, slot(3));
+}
+
+/// A put that fails partway may leave one length durable and not the other.
+/// The next put waits for reopen, which fits the files.
+#[test]
+#[cfg(debug_assertions)]
+fn a_later_put_waits_for_reopen_after_a_failed_put() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    fail_next_idx_sync(&t);
+    let err = t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[1, 1, 1, 1],
+    }]);
+    assert!(err.is_err());
+    let err = t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[9, 9, 9, 9],
+    }]);
+    match err {
+        Err(StoreError::Rejected(msg)) => {
+            assert!(msg.contains("reopen"), "{msg}");
+        }
+        other => panic!("a failed put must refuse the next put, got {other:?}"),
+    }
+    assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
+    drop(t);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+}
+
+#[cfg(debug_assertions)]
+fn fail_next_idx_sync(t: &BlockFilterTable) {
+    let inner = t.inner.read().unwrap();
+    let idx = &inner.segs.last().unwrap().idx;
+    rbitcoin_store::io_handle::arm_fail_sync(idx.io_handle(), 1);
+}
+
+/// A failed put publishes nothing to readers: the failed height is not
+/// readable, and the old prefix is.
+#[test]
+#[cfg(debug_assertions)]
+fn a_failed_put_stays_out_of_the_read_watermark() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    fail_next_idx_sync(&t);
+    assert!(t
+        .put(&[BlockFilterRecord {
+            height: Height(1),
+            slot: slot(1),
+            filter: &[1, 1, 1, 1],
+        }])
+        .is_err());
+    assert_eq!(t.next_height(), Height(1));
+    assert!(t.slot(Height(1)).unwrap().is_none());
+    assert_eq!(t.slot(Height(0)).unwrap(), Some(slot(0)));
+}
+
+/// A crash can leave the body length durable and the idx length old. Open
+/// cuts the body back to the idx, and the next put lands at the cut.
+#[test]
+#[cfg(debug_assertions)]
+fn open_cuts_a_body_length_published_before_its_idx() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    let idx_path = {
+        let inner = t.inner.read().unwrap();
+        let idx = &inner.segs.last().unwrap().idx;
+        rbitcoin_store::io_handle::arm_fail_flush(idx.io_handle(), 1);
+        idx.path().to_path_buf()
+    };
+    let mut old_header = [0u8; FILE_HEADER_LEN];
+    fs::File::open(&idx_path)
+        .unwrap()
+        .read_exact(&mut old_header)
+        .unwrap();
+    assert!(t
+        .put(&[BlockFilterRecord {
+            height: Height(1),
+            slot: slot(1),
+            filter: &[1, 1, 1, 1],
+        }])
+        .is_err());
+    drop(t);
+    // The idx length pwrite never reached the disk.
+    let mut idx = fs::OpenOptions::new().write(true).open(&idx_path).unwrap();
+    idx.write_all(&old_header).unwrap();
+    drop(idx);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.next_height(), Height(1));
+    t.put(&[BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &[7, 7],
+    }])
+    .unwrap();
+    drop(t);
+    let t = BlockFilterTable::open(&dir).unwrap();
+    assert_eq!(t.filter(Height(1)).unwrap().unwrap().0, vec![7, 7]);
+    assert_eq!(t.filter(Height(0)).unwrap().unwrap().0, vec![0u8; 3]);
+}
+
+/// A reader of a committed height does not wait for a put's syncs and mark.
+#[test]
+fn a_committed_filter_reads_during_a_put() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    let held = rbitcoin_store::page_guard::hold_marks();
+    std::thread::scope(|scope| {
+        let putting = scope.spawn(|| {
+            t.put(&[BlockFilterRecord {
+                height: Height(1),
+                slot: slot(1),
+                filter: &[1, 1, 1, 1],
+            }])
+        });
+        // Let the put reach the mark hold inside its commit.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = &t;
+        scope.spawn(move || {
+            let _ = tx.send(t.slot(Height(0)).map(|s| s.is_some()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        assert!(
+            matches!(got, Ok(Ok(true))),
+            "a committed read waited for the put's commit: {got:?}"
+        );
+        putting.join().unwrap().unwrap();
+    });
+    assert_eq!(t.next_height(), Height(2));
+}
+
+/// A repair of a committed filter waits for reopen after a failed put, like
+/// the next put does.
+#[test]
+#[cfg(debug_assertions)]
+fn repair_refuses_after_a_failed_put() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 0);
+    let (bytes, got) = t.filter(Height(0)).unwrap().unwrap();
+    fail_next_idx_sync(&t);
+    assert!(t
+        .put(&[BlockFilterRecord {
+            height: Height(1),
+            slot: slot(1),
+            filter: &[1, 1, 1, 1],
+        }])
+        .is_err());
+    assert!(matches!(
+        t.repair_body(Height(0), &got, &bytes),
+        Err(StoreError::Rejected(_))
+    ));
+}
+
+/// A new table's `meta` and its two directories are durable before the
+/// first put can return. A put syncs only the segment files and their own
+/// directories.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn create_syncs_the_new_table_directories() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _t = BlockFilterTable::create(&dir).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    for want in [
+        dir.to_path_buf(),
+        BlockFilterTable::idx_dir(&dir),
+        BlockFilterTable::body_dir(&dir),
+    ] {
+        assert!(
+            synced.contains(&want),
+            "{} was not synced, got {synced:?}",
+            want.display()
+        );
+    }
+}
+
+/// A put is an append under the sector rule: bytes past the committed end,
+/// synced, then the length. It arms no mark.
+#[test]
+fn a_put_arms_no_mark() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 3);
+    assert!(!dir.join("guard").exists(), "a put armed a mark");
+    assert_eq!(t.next_height(), Height(4));
+}
+
+/// A rolled segment pair is named by its directories before any put lands
+/// in it: create syncs both directory entries.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn a_new_segment_pair_syncs_its_directories() {
+    let dir = tmp_dir();
+    let _t = BlockFilterTable::open_or_create(&dir).unwrap();
+    let dirs = BlockFilterTable::seg_dirs(&dir);
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _pair = dirs.create(1, 0).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(synced.contains(&dirs.idx), "idx dir not synced: {synced:?}");
+    // Each header is synced before its name, so a surviving name opens.
+    for (file, dir) in [
+        (dirs.idx_path(1), &dirs.idx),
+        (dirs.body_path(1), &dirs.body),
+    ] {
+        let file_at = synced.iter().position(|p| p == &file);
+        let dir_at = synced.iter().position(|p| p == dir);
+        assert!(
+            matches!((file_at, dir_at), (Some(f), Some(d)) if f < d),
+            "{} was not synced before its directory: {synced:?}",
+            file.display()
+        );
+    }
+    assert!(
+        synced.contains(&dirs.body),
+        "body dir not synced: {synced:?}"
+    );
 }

@@ -77,6 +77,26 @@ pub(crate) fn synced(path: &Path, at: SyncPoint) {
     }
 }
 
+/// A trailing table opened from disk: its footer end is durable. Only a
+/// path the probe has no record of takes it, so a table this process
+/// created and has not synced keeps no durable end.
+pub(crate) fn opened_trailing(path: &Path, end: u64) {
+    let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+    if t.0.contains_key(path) || t.1.contains_key(path) {
+        return;
+    }
+    t.0.insert(path.to_path_buf(), end);
+    t.1.insert(path.to_path_buf(), end);
+}
+
+/// A trailing table created at `path` has no durable end yet, whatever an
+/// earlier file at that path had.
+pub(crate) fn created_trailing(path: &Path) {
+    let mut t = trailers().lock().unwrap_or_else(|e| e.into_inner());
+    t.0.remove(path);
+    t.1.remove(path);
+}
+
 /// (last trailer end written, last trailer end a sync covered) per file.
 fn trailers() -> &'static Mutex<(HashMap<PathBuf, u64>, HashMap<PathBuf, u64>)> {
     static T: OnceLock<Mutex<(HashMap<PathBuf, u64>, HashMap<PathBuf, u64>)>> = OnceLock::new();
@@ -172,7 +192,9 @@ pub(crate) fn write(
         let named_safe = !named_unsynced
             || crate::page_guard::probe_armed_covers(path, lo, hi.saturating_sub(lo));
         if new <= committed {
-            None
+            // A length that does not grow names only durable bytes. The
+            // rewrite itself can still tear across sectors.
+            Some(in_place_class(path, offset, len))
         } else if named_safe
             && crate::page_guard::probe_armed_covers(path, offset, len)
             && named_unsynced
@@ -191,12 +213,8 @@ pub(crate) fn write(
         None
     } else if committed <= header_len {
         Some("CREATE")
-    } else if crate::page_guard::probe_armed_covers(path, offset, len) {
-        Some("ARMED")
-    } else if offset / SECTOR == (end - 1) / SECTOR {
-        Some("ONE_SECTOR")
     } else {
-        Some("MULTI_SECTOR")
+        Some(in_place_class(path, offset, len))
     };
     if !len_field {
         note_dirty(path, offset, end);
@@ -212,6 +230,18 @@ pub(crate) fn write(
             "FIXTURE"
         };
         log(class, path, committed, offset, len);
+    }
+}
+
+/// A write over durable bytes: safe when a live mark images its pages or it
+/// stays inside one sector.
+fn in_place_class(path: &Path, offset: u64, len: u64) -> &'static str {
+    if crate::page_guard::probe_armed_covers(path, offset, len) {
+        "ARMED"
+    } else if offset / SECTOR == (offset + len - 1) / SECTOR {
+        "ONE_SECTOR"
+    } else {
+        "MULTI_SECTOR"
     }
 }
 

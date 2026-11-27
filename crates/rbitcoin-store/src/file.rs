@@ -553,6 +553,8 @@ impl TableFile {
             .map_err(|e| StoreError::io(&path, e))?;
         let initial = TRAILING_FOOTER_LEN as u64;
         set_file_len(&file, &path, initial)?;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::created_trailing(&path);
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         let s = Self {
             path,
@@ -607,6 +609,8 @@ impl TableFile {
         let mut trailing_ext = [0u8; 16];
         trailing_ext.copy_from_slice(&footer[16..32]);
         let logical = expect;
+        #[cfg(feature = "write-probe")]
+        crate::write_probe::opened_trailing(&path, logical);
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         Ok((
             Self {

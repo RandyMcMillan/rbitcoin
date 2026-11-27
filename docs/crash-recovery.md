@@ -255,7 +255,10 @@ on `rbitcoin-store`. Every TableFile write below a file's durable end
 (the bulk body path included), and every length publish the length and
 footer writers name as one, is logged by class: a fresh file, pages a mark
 images, one sector (or a length that shares sector 0 with every byte it
-names), or a length published before or after its bytes were synced. `scripts/write-probe-classify.py` passes the classes that are safe
+names), or a length published before or after its bytes were synced. A
+length that does not grow rewrites durable bytes, so it is classed like an
+in-place write: a mark's pages, one sector, or several. A trailing table
+opened from disk starts from its footer as its durable end. `scripts/write-probe-classify.py` passes the classes that are safe
 by structure and fails CI on any other entry without a reviewed reason in
 its rule list: a Class A length past the synced floor, the `spent.body`
 fold that open replays, a hash-checked filter repair, and the few writes a

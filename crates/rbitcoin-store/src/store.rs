@@ -2778,9 +2778,8 @@ fn restore_hot_marks(path: &Path) -> Result<(), StoreError> {
 
 #[doc(hidden)]
 pub fn open_layout_refuse_old(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
-    // Only meta 24/25 names 96-byte rows. The conversion renames the body
-    // before any meta write, so a later meta beside a 96-byte length is a
-    // corrupt body, and `HeaderTable` open refuses it.
+    // Only meta 24/25 names 96-byte rows. The conversion renames the
+    // rewritten body into place before any meta write.
     if (24..=25).contains(&meta_ver) {
         HeaderTable::rewrite_v24_body_to_88(path)?;
     }

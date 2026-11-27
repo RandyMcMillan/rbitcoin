@@ -255,7 +255,8 @@ kill -9, an out-of-memory kill or a power cut), the next start with
 `--sh-index` exits with a "torn write" error, because the index can read as
 valid and be wrong. Start once with `RBITCOIN_SH_FORCE_REBUILD=1` to rebuild
 it from Class A. That takes hours on mainnet, but the chain is not touched.
-Under systemd, an exit loop with `Restart=always` is this refusal. Give a
+Under systemd, `Restart=always` repeats any failed start, so check the log
+for the "torn write" error before forcing a rebuild. Give a
 clean stop room to finish (`TimeoutStopSec`): the shutdown flush syncs the
 index first.
 

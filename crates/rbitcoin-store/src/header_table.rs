@@ -1,16 +1,63 @@
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HashHead, HeadScale};
+use crate::page_guard;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{bytes, le_i32, le_u32, le_u64, Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
+
+#[cfg(debug_assertions)]
+mod flush_hold {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    use crate::array_table::TipFlushHold;
+
+    thread_local! {
+        static HOLD: RefCell<Option<Arc<TipFlushHold>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn bind(hold: Option<Arc<TipFlushHold>>) {
+        HOLD.with(|slot| *slot.borrow_mut() = hold);
+    }
+
+    pub(super) fn wait() {
+        let Some(hold) = HOLD.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        hold.wait_while_set();
+    }
+}
+
+/// Pause [`HeaderTable::flush`] while `put_lock` is still held, after the
+/// live write and before the mark is gone.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn bind_header_flush_hold(hold: Option<std::sync::Arc<crate::array_table::TipFlushHold>>) {
+    flush_hold::bind(hold);
+}
 
 pub const HEADER_HEAD_DIR_REFUSE: &str =
     "header.head is a shard directory; wipe header.head and header.body and reindex";
 
 pub const HEADER_HEAD_EMPTY_REFUSE: &str =
     "header.head is empty at target slots; wipe header.head, header.head.mlt, and header.body and reindex";
+
+const HEADER_HEAD_AHEAD: &str =
+    "header.head.ahead is a legacy page image; this open does not restore it";
+const HEADER_HEAD_GEN_AHEAD: &str =
+    "a header.head.gN.ahead is a legacy page image; this open does not restore it";
+
+fn legacy_ahead(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".ahead");
+    path.with_file_name(name)
+}
+
+/// Most rows one body append and head insert carry. Open looks up this many
+/// tail rows, so a crash inside the last head insert loses none.
+const TAIL_CHUNK: u64 = 2_000;
 
 /// Live `header.body` record: consensus fields only. See SCHEMA.md.
 pub const HEADER_RECORD_LEN: usize = 88;
@@ -138,6 +185,7 @@ impl HeaderHead {
 
     #[doc(hidden)]
     pub fn open(base: PathBuf, body_count: u64, scale: HeadScale) -> Result<Self, StoreError> {
+        crate::file::refuse_if_present(&legacy_ahead(&base), HEADER_HEAD_AHEAD)?;
         if base.is_dir() {
             return Err(StoreError::Layout(HEADER_HEAD_DIR_REFUSE.to_string()));
         }
@@ -156,6 +204,7 @@ impl HeaderHead {
             if !p.is_file() {
                 break;
             }
+            crate::file::refuse_if_present(&legacy_ahead(&p), HEADER_HEAD_GEN_AHEAD)?;
             gens.push(HashHead::open(p)?);
             i += 1;
         }
@@ -281,20 +330,60 @@ impl HeaderTable {
         Self::open_with_scale(dir, HeadScale::Tiny)
     }
 
+    /// A `guard/header.body` flag is a first append that may not have reached
+    /// the head, so an empty head beside those rows is that append, not a
+    /// lost index. Open indexes the rows the head does not name, and removes
+    /// the flag only once the head insert is durable. An open that stops in
+    /// between leaves the flag for the next one.
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
+        let body_marked = page_guard::store_flag_armed(dir, page_guard::HEADER_BODY_MARK)?;
+        page_guard::restore_store_group(dir, page_guard::HEADER_HEAD_MARK)?;
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body_len % HEADER_RECORD_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("header body size"));
         }
         let count = body_len / HEADER_RECORD_LEN as u64;
-        let head = HeaderHead::open(dir.join("header.head"), count, scale)?;
-        Ok(Self {
+        let named = if body_marked { 0 } else { count };
+        let head = HeaderHead::open(dir.join("header.head"), named, scale)?;
+        let table = Self {
             body,
             head,
             count: std::sync::atomic::AtomicU64::new(count),
             put_lock: Mutex::new(()),
-        })
+        };
+        table.index_unindexed_tail()?;
+        if body_marked {
+            page_guard::clear_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
+        }
+        Ok(table)
+    }
+
+    /// Insert the tail rows `header.head` does not name.
+    ///
+    /// `ensure_batch` makes each chunk's rows and length durable before its
+    /// head insert, and starts a chunk only after the one before it is in
+    /// the head. A crash can leave only the last chunk partly unnamed, and in
+    /// any order: a head generation flushes its slot-ordered rows and then
+    /// rolls. So open looks up each of the last [`TAIL_CHUNK`] rows.
+    fn index_unindexed_tail(&self) -> Result<(), StoreError> {
+        let count = self.count.load(std::sync::atomic::Ordering::Acquire);
+        let mut missing: Vec<([u8; 32], Fk)> = Vec::new();
+        for id in count.saturating_sub(TAIL_CHUNK) + 1..=count {
+            let fk = Fk(id);
+            let rec = self.get(fk)?;
+            if self.get_by_hash_unlocked(&rec.hash)?.is_none() {
+                missing.push((rec.hash, fk));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        rbitcoin_log::warn!(
+            "store: indexing {} header rows header.head did not name",
+            missing.len()
+        );
+        self.head.insert_many(&missing)
     }
 
     /// Schema 24/25 → 26: strip trailing `size`/`weight` so each row is 88 B.
@@ -350,12 +439,15 @@ impl HeaderTable {
             blob.extend_from_slice(&raw[..HEADER_RECORD_LEN]);
         }
         let new_len = FILE_HEADER_LEN as u64 + n * HEADER_RECORD_LEN as u64;
+        // `header.body.grow` is not the live file. The live body stays as it
+        // is until the synced temp file is renamed over it, so no mark.
         dst.write_at(FILE_HEADER_LEN as u64, &blob)?;
         dst.set_logical_len(new_len)?;
         dst.flush()?;
         drop(dst);
         drop(src);
         std::fs::rename(&grow, &path).map_err(|e| StoreError::io(&path, e))?;
+        file::fsync_parent_dir(dir).map_err(|e| StoreError::io(dir, e))?;
         Ok(())
     }
 
@@ -376,7 +468,8 @@ impl HeaderTable {
         fks.pop().ok_or(StoreError::Corrupt("ensure_batch empty"))
     }
 
-    /// Batch [`Self::ensure`]: one `put_lock`, one `header.body` write, chunked head insert.
+    /// Batch [`Self::ensure`]: one `put_lock`, then one `header.body` append and
+    /// head insert per [`TAIL_CHUNK`] fresh rows.
     ///
     /// Output fks align with `recs`. Duplicate hashes in the batch share one body row.
     pub fn ensure_batch(&self, recs: &[HeaderRecord]) -> Result<Vec<Fk>, StoreError> {
@@ -385,6 +478,10 @@ impl HeaderTable {
             return Ok(Vec::new());
         }
         let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // A failed append or head insert poisoned the body: a retry would
+        // rewrite rows below a durable length or append a second row for
+        // one hash. Reopen indexes what the durable length names.
+        self.body.refuse_if_poisoned()?;
         let mut out = Vec::with_capacity(recs.len());
         let mut fresh: Vec<(Fk, HeaderRecord)> = Vec::new();
         let mut seen: Vec<([u8; 32], Fk)> = Vec::new();
@@ -411,25 +508,58 @@ impl HeaderTable {
             seen.push((rec.hash, fk));
             out.push(fk);
         }
-        if fresh.is_empty() {
-            return Ok(out);
+        for chunk in fresh.chunks(TAIL_CHUNK as usize) {
+            self.append_chunk(chunk)?;
         }
+        Ok(out)
+    }
+
+    /// Append one chunk of fresh rows to the body, then name them in the head.
+    fn append_chunk(&self, fresh: &[(Fk, HeaderRecord)]) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         let base = self.count.load(Ordering::Acquire);
         let offset = FILE_HEADER_LEN as u64 + base * HEADER_RECORD_LEN as u64;
         let mut blob = Vec::with_capacity(fresh.len().saturating_mul(HEADER_RECORD_LEN));
         let mut head_entries: Vec<([u8; 32], Fk)> = Vec::with_capacity(fresh.len());
-        for (fk, rec) in &fresh {
+        for (fk, rec) in fresh {
             blob.extend_from_slice(&rec.encode());
             head_entries.push((rec.hash, *fk));
         }
-        self.body.write_at(offset, &blob)?;
-        // Head insert fdatasyncs. The body must be durable first so a crash
-        // cannot leave header.head naming an fk above the durable row count.
-        self.body.sync_data_only()?;
+        let new_len = offset.saturating_add(blob.len() as u64);
+        let Some(dir) = self.body.path().parent() else {
+            return Err(StoreError::Rejected("header body has no directory"));
+        };
+        // Before the first row the head is empty, and open refuses an empty
+        // head beside body rows as a lost index. The flag says those rows are
+        // this append. Later appends need none: open indexes the tail the
+        // head does not name.
+        let first = base == 0;
+        if first {
+            // Store creation does not sync table headers. A flag over an
+            // unsynced header would keep open from replacing the store as an
+            // incomplete creation, so the header is durable first.
+            self.body.sync_data_only()?;
+            page_guard::arm_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
+        }
+        // Rows, sync, then length, sync: the head insert below never names
+        // a row whose bytes and length are not durable.
+        let appended = page_guard::commit_appends(&[page_guard::Append {
+            file: &self.body,
+            at: offset,
+            bytes: &blob,
+            new_logical: new_len,
+        }]);
+        appended?;
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
-        self.head.insert_many(&head_entries)?;
-        Ok(out)
+        if let Err(e) = self.head.insert_many(&head_entries) {
+            self.body.poison();
+            return Err(e);
+        }
+        if first {
+            page_guard::clear_store_flag(dir, page_guard::HEADER_BODY_MARK)?;
+        }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -539,12 +669,16 @@ impl HeaderTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.body.flush()?;
         self.head.flush()?;
+        #[cfg(debug_assertions)]
+        flush_hold::wait();
         Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
+        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.body.flush_async()?;
         self.head.flush_async()?;
         Ok(())

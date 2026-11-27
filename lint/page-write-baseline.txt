@@ -19,7 +19,6 @@ crates/rbitcoin-store/src/file.rs	truncate	1
 crates/rbitcoin-store/src/file.rs	win_set_eof	1
 crates/rbitcoin-store/src/file.rs	write_all	4
 crates/rbitcoin-store/src/fuse8_filter.rs	write_all	4
-crates/rbitcoin-store/src/hashhead.rs	write_all	1
 crates/rbitcoin-store/src/input.rs	truncate	1
 crates/rbitcoin-store/src/integrity.rs	truncate	1
 crates/rbitcoin-store/src/io_handle.rs	WriteFile	1
@@ -38,7 +37,6 @@ crates/rbitcoin-store/src/spend_delta.rs	truncate	2
 crates/rbitcoin-store/src/store.rs	fs_write	1
 crates/rbitcoin-store/src/store_secret.rs	write_all	1
 crates/rbitcoin-store/src/testutil.rs	write_all	1
-crates/rbitcoin-store/src/tx_head_mphf.rs	fs_write	1
 crates/rbitcoin-store/src/uring_session.rs	opcode_Write	1
 crates/rbitcoin-store/src/var_table.rs	WriteOp	2
 crates/rbitcoin-store/src/var_table.rs	pwrite_batch	2

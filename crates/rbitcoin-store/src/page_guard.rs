@@ -29,6 +29,10 @@ pub(crate) const GUARD_DIR: &str = "guard";
 
 /// Forward images for `confirmed[]`, `header_txs_*`, and `strong_tx`.
 pub const CLASS_C_MARK: &str = "guard/class_c";
+/// Empty flag: the first `header.body` append may not be in `header.head`.
+pub const HEADER_BODY_MARK: &str = "guard/header.body";
+/// Forward images for one `header.head` generation.
+pub const HEADER_HEAD_MARK: &str = "guard/header.head";
 
 fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     static ARMED: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
@@ -338,6 +342,35 @@ fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreErr
 #[doc(hidden)]
 pub fn restore_store_group(dir: &Path, mark: &str) -> Result<bool, StoreError> {
     restore_page_guard_group(&dir.join(mark), dir)
+}
+
+/// Publish `dir/<mark>` as an empty flag.
+///
+/// A flag names no pages. Its presence alone tells open how to read the
+/// files, so a crash leaves it or not, and nothing is copied back.
+pub(crate) fn arm_store_flag(dir: &Path, mark: &str) -> Result<(), StoreError> {
+    let path = dir.join(mark);
+    ensure_mark_parent(&path)?;
+    crate::file::write_file_synced_tmp_rename(&path, &[])?;
+    sync_arm_dir(mark_parent(&path)?)?;
+    #[cfg(debug_assertions)]
+    ARM_TRACE.with(|trace| {
+        if let Some(marks) = trace.borrow_mut().as_mut() {
+            marks.push(mark.to_string());
+        }
+    });
+    Ok(())
+}
+
+/// Whether the flag `dir/<mark>` is published.
+pub(crate) fn store_flag_armed(dir: &Path, mark: &str) -> Result<bool, StoreError> {
+    let path = dir.join(mark);
+    path.try_exists().map_err(|e| StoreError::io(&path, e))
+}
+
+/// Remove the flag `dir/<mark>` and sync its directory. Missing is `Ok`.
+pub(crate) fn clear_store_flag(dir: &Path, mark: &str) -> Result<(), StoreError> {
+    remove_mark(&dir.join(mark), &[])
 }
 
 /// Arm a store group mark. Empty is a no-op.

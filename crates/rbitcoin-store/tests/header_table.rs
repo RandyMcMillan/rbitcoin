@@ -98,6 +98,42 @@ fn header_put_get_by_hash_open_flush() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn header_flush_holds_put_lock_until_the_mark_is_cleared() {
+    use rbitcoin_store::array_table::TipFlushHold;
+    use rbitcoin_store::bind_header_flush_hold;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tmp();
+    let t = Arc::new(HeaderTable::create_tiny(&dir).unwrap());
+    t.ensure(&sample([1u8; 32])).unwrap();
+    let hold = Arc::new(TipFlushHold::new(true));
+    let flush_t = Arc::clone(&t);
+    let flush_hold = Arc::clone(&hold);
+    let handle = std::thread::spawn(move || {
+        bind_header_flush_hold(Some(Arc::clone(&flush_hold)));
+        flush_t.flush().unwrap();
+        bind_header_flush_hold(None);
+    });
+    assert!(
+        hold.wait_until_entered(Duration::from_secs(5)),
+        "flush never reached the hold"
+    );
+    let insert_t = Arc::clone(&t);
+    let insert = std::thread::spawn(move || insert_t.ensure(&sample([2u8; 32])).unwrap());
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !insert.is_finished(),
+        "an insert landed in the dirty pages before the mark was cleared"
+    );
+    hold.store(false, Ordering::Release);
+    handle.join().unwrap();
+    insert.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Real block-header fields with PoW-style hash committed to a real parent.
 fn linked_child(parent: &HeaderRecord, parent_fk: Fk, salt: u32) -> HeaderRecord {
     let version = 1;
@@ -139,23 +175,196 @@ fn ensure_batch_linked_headers_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The first append's data sync fails before any length moves. It leaves
+/// `guard/header.body` as an empty flag, not page images, and no row. Open
+/// finds no row, drops the flag, and takes that header again at fk 1.
 #[test]
-fn ensure_batch_syncs_the_body_before_the_head() {
+fn a_failed_first_append_leaves_an_empty_flag_and_no_row() {
     let dir = tmp();
     let t = HeaderTable::create_tiny(&dir).unwrap();
-    rbitcoin_store::io_handle::arm_fail_sync(t.body.io_handle(), 1);
+    // The header sync before the flag passes; the row data sync fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 1, 1);
     let g = sample([0x91; 32]);
     let err = t.ensure_batch(std::slice::from_ref(&g)).unwrap_err();
     assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    let flag = dir.join(rbitcoin_store::page_guard::HEADER_BODY_MARK);
+    assert_eq!(
+        std::fs::metadata(&flag).expect("no flag").len(),
+        0,
+        "the first append's flag holds page images"
+    );
     drop(t);
-    match HeaderTable::open_tiny(&dir) {
-        Err(StoreError::Layout(_)) => {}
-        Ok(t) => assert!(
-            t.get_by_hash(&g.hash).unwrap().is_none(),
-            "header.head must not name a row whose body sync failed"
-        ),
-        Err(other) => panic!("open after a failed body sync: {other}"),
+    let t = HeaderTable::open_tiny(&dir).expect("open after a failed body sync");
+    assert_eq!(t.count(), 0);
+    assert_eq!(t.get_by_hash(&g.hash).unwrap(), None);
+    assert!(!flag.exists(), "open left the flag");
+    assert_eq!(t.ensure(&g).unwrap(), Fk(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Store creation leaves the body header unsynced. The first append syncs
+/// it before the flag, so open never meets a flag over a header that is not
+/// on the device.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn the_first_header_append_syncs_the_body_before_its_flag() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    t.ensure(&sample([0x97; 32])).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    let body_at = synced.iter().position(|p| p == &dir.join("header.body"));
+    let guard_at = synced.iter().position(|p| p == &dir.join("guard"));
+    assert!(
+        matches!((body_at, guard_at), (Some(b), Some(g)) if b < g),
+        "header.body was not synced before the flag: {synced:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only the first header append arms `guard/header.body`. A later append
+/// writes its rows past the end, syncs, then publishes the length, so it
+/// arms nothing.
+#[cfg(debug_assertions)]
+#[test]
+fn a_header_append_after_the_first_arms_no_mark() {
+    use rbitcoin_store::page_guard::{arm_store_mark_trace, take_armed_store_marks};
+    let mark = rbitcoin_store::page_guard::HEADER_BODY_MARK.to_string();
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    arm_store_mark_trace();
+    t.ensure(&sample([0x92; 32])).unwrap();
+    let first = take_armed_store_marks();
+    assert!(
+        first.contains(&mark),
+        "the first append armed no flag: {first:?}"
+    );
+    arm_store_mark_trace();
+    t.ensure(&sample([0x93; 32])).unwrap();
+    let later = take_armed_store_marks();
+    assert!(!later.contains(&mark), "a later append armed {later:?}");
+    assert!(!dir.join(&mark).exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed length flush may leave the new body length durable. The table
+/// refuses later header puts until reopen with its own error, so no retry
+/// rewrites rows below that length. Reopen indexes the row the length names.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failed_length_flush_refuses_header_puts_until_reopen() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    t.ensure(&sample([0x94; 32])).unwrap();
+    rbitcoin_store::io_handle::arm_fail_flush(t.body.io_handle(), 1);
+    let g = sample([0x95; 32]);
+    assert!(
+        t.ensure(&g).is_err(),
+        "the failed length flush was not reported"
+    );
+    let next = sample([0x96; 32]);
+    match t.ensure(&next) {
+        Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+        other => panic!("a put after a failed length flush: {other:?}"),
     }
+    drop(t);
+    let t = HeaderTable::open_tiny(&dir).expect("open after a failed length flush");
+    // The length write reached the page cache before its flush failed.
+    assert_eq!(t.count(), 2);
+    assert_eq!(
+        t.get_by_hash(&g.hash).unwrap().map(|(fk, _)| fk),
+        Some(Fk(2))
+    );
+    assert_eq!(t.ensure(&next).unwrap(), Fk(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crash inside a head insert can leave the head naming any subset of
+/// the last batch, not a suffix: a generation flushes its slot-ordered rows
+/// and then rolls. Open checks every row of the last chunk, so a lower row
+/// the head does not name is indexed even when a higher one is.
+#[test]
+fn open_indexes_an_unnamed_row_below_a_named_one() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    t.ensure(&sample([0xA1; 32])).unwrap();
+    let (b, c) = (sample([0xA2; 32]), sample([0xA3; 32]));
+    let at = t.body.logical_len();
+    let rows = [b.encode(), c.encode()].concat();
+    rbitcoin_store::page_guard::commit_appends(&[rbitcoin_store::page_guard::Append {
+        file: &t.body,
+        at,
+        bytes: &rows,
+        new_logical: at + rows.len() as u64,
+    }])
+    .unwrap();
+    t.head.insert_many(&[(c.hash, Fk(3))]).unwrap();
+    drop(t);
+    let t = HeaderTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 3);
+    assert_eq!(
+        t.get_by_hash(&b.hash).unwrap().map(|(fk, _)| fk),
+        Some(Fk(2)),
+        "the unnamed row below a named one was not indexed"
+    );
+    assert_eq!(t.ensure(&b).unwrap(), Fk(2), "a second row for one hash");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch past one chunk commits as several appends, each named in the
+/// head before the next starts. A failure in the second chunk leaves the
+/// first chunk durable and named, so open's last-chunk scan misses no row.
+#[cfg(debug_assertions)]
+#[test]
+fn a_failure_past_the_first_chunk_keeps_that_chunk_named() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    let recs: Vec<HeaderRecord> = (0..2_001u32)
+        .map(|i| {
+            let mut h = [0x5bu8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            sample(h)
+        })
+        .collect();
+    // The header sync before the flag and the first chunk's data sync
+    // pass; the second chunk's data sync fails.
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.body.io_handle(), 2, 1);
+    assert!(
+        t.ensure_batch(&recs).is_err(),
+        "the second chunk did not fail"
+    );
+    drop(t);
+    let t = HeaderTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2_000);
+    for i in [0usize, 1_999] {
+        let found = t.get_by_hash(&recs[i].hash).unwrap().map(|(fk, _)| fk);
+        assert_eq!(found, Some(Fk(i as u64 + 1)), "row {i}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed head insert leaves durable rows the head does not name. A retry
+/// of the same header must not append a second row: the table refuses puts
+/// until reopen, which indexes the row.
+#[test]
+fn a_failed_head_insert_refuses_header_puts_until_reopen() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    t.ensure(&sample([0xB1; 32])).unwrap();
+    // A directory where the head mark goes: the head insert cannot arm.
+    let mark = dir.join(rbitcoin_store::page_guard::HEADER_HEAD_MARK);
+    std::fs::create_dir_all(mark.join("block")).unwrap();
+    let g = sample([0xB2; 32]);
+    assert!(t.ensure(&g).is_err(), "the head insert did not fail");
+    match t.ensure(&g) {
+        Err(StoreError::Rejected(m)) => assert!(m.contains("reopen"), "{m}"),
+        other => panic!("a retry after a failed head insert: {other:?}"),
+    }
+    drop(t);
+    std::fs::remove_dir_all(&mark).unwrap();
+    let t = HeaderTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 2);
+    assert_eq!(t.ensure(&g).unwrap(), Fk(2), "a second row for one hash");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

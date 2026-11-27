@@ -177,6 +177,17 @@ fn tx_head_mphf_unlinks_leftover_rel_and_bip30_mlt() {
 }
 
 #[test]
+fn write_mlt_renames_an_explicit_empty_image() {
+    let dir = tmp("mlt-empty");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("base.mlt");
+    write_mlt(&path, &std::collections::HashMap::new()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), 0u32.to_le_bytes());
+    assert!(read_mlt(&dir.join("missing.mlt")).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn mlt_reads_slot_rels_and_refuses_a_short_header() {
     let dir = tmp("mlt-fields");
     std::fs::create_dir_all(&dir).unwrap();

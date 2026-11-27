@@ -1,7 +1,8 @@
 //! Sealed `tx.head` shard: value-assigned BDZ MPHF (one candidate).
 //!
-//! `base.mphf` is BDZ2: `index(key) = newest_rel - 1`. Optional `base.mlt`
-//! holds extra older rels for BIP30. A miss is fuse-gated by the caller.
+//! `base.mphf` is BDZ2: `index(key) = newest_rel - 1`. `base.mlt` is renamed
+//! into place on every seal, including an empty map (4 zero bytes). A missing
+//! file is an empty map. The segment meta `mlt` flag says the file must exist.
 
 use crate::bdz::BdzMphf;
 use crate::error::StoreError;
@@ -115,6 +116,19 @@ impl TxHeadMphf {
     }
 
     pub fn open(base: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_at(base, false)
+    }
+
+    /// [`Self::open`], and a missing `.mlt` is corrupt.
+    ///
+    /// A short file is corrupt either way. Callers that have not set the
+    /// segment `mlt` flag use [`Self::open`] and treat a missing file as empty.
+    #[doc(hidden)]
+    pub fn open_requiring_mlt(base: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_at(base, true)
+    }
+
+    fn open_at(base: impl AsRef<Path>, require_mlt: bool) -> Result<Self, StoreError> {
         let base = base.as_ref().to_path_buf();
         let mp = mphf_path(&base);
         let mphf = BdzMphf::read_packed_from(&mp)?;
@@ -123,7 +137,11 @@ impl TxHeadMphf {
             eprintln!("store: dropping leftover tx.head .rel (schema 20 MPHF is value-assigned)");
             let _ = std::fs::remove_file(&rp);
         }
-        let mlt = read_mlt(&mlt_path(&base))?;
+        let mlt_file = mlt_path(&base);
+        if require_mlt && !mlt_file.is_file() {
+            return Err(StoreError::Corrupt("tx.head mlt missing"));
+        }
+        let mlt = read_mlt(&mlt_file)?;
         Ok(Self { mphf, mlt })
     }
 
@@ -162,10 +180,6 @@ impl TxHeadMphf {
 
 #[doc(hidden)]
 pub fn write_mlt(path: &Path, mlt: &HashMap<u32, Vec<u32>>) -> Result<(), StoreError> {
-    if mlt.is_empty() {
-        let _ = std::fs::remove_file(path);
-        return Ok(());
-    }
     let mut buf = Vec::new();
     buf.extend_from_slice(&(mlt.len() as u32).to_le_bytes());
     for (&slot, rels) in mlt {
@@ -175,8 +189,7 @@ pub fn write_mlt(path: &Path, mlt: &HashMap<u32, Vec<u32>>) -> Result<(), StoreE
             buf.extend_from_slice(&r.to_le_bytes());
         }
     }
-    std::fs::write(path, &buf).map_err(|e| StoreError::io(path, e))?;
-    Ok(())
+    crate::file::write_synced_tmp_rename(path, &buf)
 }
 
 #[doc(hidden)]

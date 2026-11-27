@@ -68,9 +68,15 @@ cannot repair it ([#2192](https://github.com/rbitcoin-org/rbitcoin/issues/2192))
 
 This needs an I/O error inside a live commit. An unclean shutdown alone
 does not reach it: the crash leaves the mark, and open restores it. The
-damage is refused, not served: the failed write holds `scripthash.dirty`
-until a wipe, a start with the index on refuses while it is set, and the
-query layer rebuilds the index when a read hits `Corrupt`.
+failed write holds `scripthash.dirty` until a wipe, and a start with the
+index on refuses while it is set.
+
+A slab whose `used` disagrees with its count is refused, not served: the
+query layer rebuilds the index when a read hits `Corrupt`. An append that
+fits in an extent's tail page rewrites that page at the same offset, and
+the head still names it. Until the next start refuses the index, a
+store-level read of that key can return the failed append's creates without
+`Corrupt`.
 
 Closing it needs a latch that refuses scripthash commits after a landing
 failure until the wipe clears it, across the store and query crates.

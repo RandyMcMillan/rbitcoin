@@ -48,18 +48,22 @@ fn tear_bytes(path: &Path, off: u64, n: usize) {
     file.sync_all().unwrap();
 }
 
+/// The armed `guard/sh-*` marks. A missing `guard/` has none. A
+/// `sh-*.tmp` rename leftover is not a mark, since restore skips it. Any
+/// other scan error fails the test instead of reading as "no marks".
 fn sh_marks(dir: &Path) -> Vec<std::path::PathBuf> {
     let guard = dir.join("guard");
-    let Ok(rd) = std::fs::read_dir(&guard) else {
-        return Vec::new();
+    let rd = match std::fs::read_dir(&guard) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("scan {}: {e}", guard.display()),
     };
     let mut out: Vec<_> = rd
-        .flatten()
-        .map(|e| e.path())
+        .map(|e| e.expect("guard/ entry").path())
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("sh-"))
+                .is_some_and(|n| n.starts_with("sh-") && !n.ends_with(".tmp"))
         })
         .collect();
     out.sort();
@@ -911,10 +915,29 @@ fn a_later_commit_keeps_an_armed_pre_image() {
         put_create_batch(&t, [rec(a, 1), rec(a, 2)]);
         put_create_batch(&t, [rec(b, 1), rec(b, 2)]);
         t.flush().unwrap();
+        // Each append must reach its guard clear, so both commits run
+        // under the armed mark and their lists are live before the crash.
+        let cleared = |err: StoreError| {
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Corrupt("scripthash page guard clear failed")
+                ),
+                "{err}"
+            );
+        };
         t.fail_next_sh_guard_clear();
-        assert!(t.put_create_batch_append(&[rec(a, 3), rec(a, 4)]).is_err());
+        cleared(
+            t.put_create_batch_append(&[rec(a, 3), rec(a, 4)])
+                .unwrap_err(),
+        );
         t.fail_next_sh_guard_clear();
-        assert!(t.put_create_batch_append(&[rec(b, 3), rec(b, 4)]).is_err());
+        cleared(
+            t.put_create_batch_append(&[rec(b, 3), rec(b, 4)])
+                .unwrap_err(),
+        );
+        assert_eq!(create_fks(&t, &a), vec![1, 2, 3, 4]);
+        assert_eq!(create_fks(&t, &b), vec![1, 2, 3, 4]);
         drop(t);
     }
     let t = ScriptHashTable::open_tiny(&dir).unwrap();

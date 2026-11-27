@@ -742,6 +742,18 @@ fn an_interrupted_fit_restore_of_an_empty_file_finishes_on_retry() {
             TracedWrite::Write { path, .. } | TracedWrite::SetLen { path, .. } => path == &live,
         })
         .collect();
+    // The prefixes below cover the first-page-only state only when the
+    // restore writes page 0 and then page 1 as two whole-page writes.
+    let page_write = |want: u64| {
+        ops.iter().position(|w| {
+            matches!(w, TracedWrite::Write { offset, len, .. }
+                if *offset == want && *len == PAGE as u64)
+        })
+    };
+    match (page_write(0), page_write(PAGE as u64)) {
+        (Some(low_at), Some(high_at)) if low_at < high_at => {}
+        _ => panic!("the restore must write page 0, then page 1: {ops:?}"),
+    }
     for stop in 1..ops.len() {
         let file = OpenOptions::new().write(true).open(&live).unwrap();
         file.set_len(0).unwrap();
@@ -870,6 +882,29 @@ fn clear_sh_marks_forgets_the_armed_pages() {
     clear_sh_marks(dir.path()).unwrap();
     assert!(!dir.path().join("guard/sh-ovf").exists());
     file.write_at(PAGE as u64, &[0x77; 16]).unwrap();
+}
+
+/// `clear_sh_marks` can unlink a mark and then fail its directory sync. A
+/// retry finds no `sh-*` mark, and it must still sync `guard/` before the
+/// caller rebuilds the index, or the unlink can be undone by power loss.
+// Windows has no directory fsync, so nothing is recorded there.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn clear_sh_marks_retry_syncs_the_guard_dir() {
+    let dir = TempDir::labeled("page-guard-sh-retry").unwrap();
+    let _ = committed_body(&dir);
+    arm_page0(&dir, "guard/sh-ovf");
+    let guard = dir.path().join("guard");
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&guard);
+    assert!(clear_sh_marks(dir.path()).is_err());
+    assert!(!guard.join("sh-ovf").exists(), "the unlink landed");
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    clear_sh_marks(dir.path()).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.contains(&guard),
+        "a retry with no mark syncs guard/: {synced:?}"
+    );
 }
 
 /// A clear that unlinks the mark and then fails its directory sync blocks

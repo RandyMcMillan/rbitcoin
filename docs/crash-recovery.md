@@ -342,10 +342,14 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   append skips each `fk ≤` the last fk its head or last page already holds.
   Hot path only appends + maintains heads in RAM.
 - Creates for unstrong / above-tip txs are **invisible** via `is_confirmed_strong`.
-- Append: one batch packs every key before it writes a slab. A batch that
-  reuses a free offset first syncs an alloc header that no longer names it,
-  so a crash leaks that offset instead of leaving a free head on a written
-  slab. Otherwise the payloads are synced before the header. The heads move
+- Append: one batch packs every key before it writes a slab, then arms its
+  `guard/sh-*` mark with page 0 (the alloc header) and every body range it
+  writes. A batch that reuses a free offset syncs an alloc header that no
+  longer names it before it writes that slab, so no durable header names a
+  written slab as free. A crash while the mark is armed does not leak the
+  offset: open restores the header, which names it as the free head again,
+  and the slab bytes with its free-list link. Otherwise the payloads are
+  synced before the header. The heads move
   last. A slab a class change replaced joins the free list only after the
   head that stopped naming it is durable: a main shard or sealed overflow
   head, updated in place, is synced first; an ingest head was already
@@ -356,8 +360,11 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   creates from the tail pages. Its `guard/sh-*` mark of the tail pages and
   the head word is synced first. The page the head names is updated before
   any earlier page is rewritten, then the head moves. Old pages are freed
-  only after that. A failed clear leaves the mark armed, and open restores
-  it, so the same disconnect can run again.
+  only after that. A failed clear leaves the mark armed and marks the index
+  degraded, and the disconnect goes on to make the tip shrink durable. Open
+  restores the mark, which rolls back the index pages only. The durable tip
+  decides whether the chain disconnect runs again: only a crash before the
+  tip shrink is durable leaves that block as the tip.
   A non-suffix unlink writes the replacement, syncs those bytes and the new
   heads once for the whole disconnect, then frees the old pages.
   A full-list unlink does not sync the empty head until the tip shrink is durable.
@@ -379,9 +386,13 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   `scripthash.runs` and `scripthash.unsorted` together. The wipe also clears an unlink undo record left armed by
   a failed unlink, so the next open does not reject it.
   The marker rescues faults that surface after open succeeded: a torn page, a failed write or unlink, a read of a
-  torn key. It cannot rescue damage that makes open itself fail (a truncated `scripthash.head/NN.val`, a torn
-  undo record, or an alloc header whose bump or free head is out of range): open validates the SH files before it reads the marker, so such a store does not start, with or
-  without `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove
+  torn key. Open restores the `guard/sh-*` marks before it opens the index. A published mark that does not
+  parse writes `scripthash.rebuild` and drops the scripthash marks, and the index open then discards the SH
+  files before it decodes them, so that start rebuilds from Class A. An OS error while restoring a mark still
+  stops open. Without such a request, damage that makes the index open fail (a truncated
+  `scripthash.head/NN.val`, a torn undo record, or an alloc header whose bump or free head is out of range)
+  is decoded before the degraded marker is read, so such a store does not start, with or without
+  `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove
   `scripthash*` (the marker included) from the store directory and start again; tip entry then builds the index
   cold from Class A.
 

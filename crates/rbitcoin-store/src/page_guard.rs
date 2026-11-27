@@ -551,7 +551,6 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(StoreError::io(&guard, e)),
     };
-    let mut any = false;
     let mut released = Vec::new();
     for ent in rd {
         let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
@@ -574,18 +573,14 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
             }
         }
         match std::fs::remove_file(&path) {
-            Ok(()) => {
-                any = true;
-                released.extend(live_paths(&path, &named));
-            }
+            Ok(()) => released.extend(live_paths(&path, &named)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(StoreError::io(&path, e)),
         }
     }
-    if any {
-        sync_mark_dir_then_release(&guard, &released)?;
-    }
-    Ok(())
+    // Sync even when this call unlinked nothing: a retry after a failed
+    // sync finds no mark, and the earlier unlink is not durable yet.
+    sync_mark_dir_then_release(&guard, &released)
 }
 
 /// Sync every live file, then drop those files' relative names from `mark`.

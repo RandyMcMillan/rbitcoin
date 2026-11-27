@@ -567,14 +567,8 @@ fn cache_eviction_leaves_one_wave_in_the_ahead_image() {
 fn bulk_fill_writes_each_run_of_adjacent_slots_once() {
     use rbitcoin_store::file::{arm_write_trace, take_write_trace, TracedWrite};
     use rbitcoin_store::scripthash_layout::{ShHeadKey, SH_HEAD_KEY_LEN};
-    let path = std::env::temp_dir().join(format!(
-        "rbitcoin-shhead-runs-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = rbitcoin_store::testutil::TempDir::labeled("shhead-runs").unwrap();
+    let path = dir.path.join("head");
     let slots = 64u64;
     let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
     let entries: Vec<(ShHeadKey, ShHeadValue)> = (0u64..40)
@@ -592,24 +586,40 @@ fn bulk_fill_writes_each_run_of_adjacent_slots_once() {
     let mut assigned = ScriptHashHead::assign_empty_slots(slots, &keys).unwrap();
     assigned.sort_unstable();
     assigned.dedup();
-    let runs = 1 + assigned.windows(2).filter(|w| w[1] != w[0] + 1).count();
-    assert!(runs < assigned.len(), "the fixture has no adjacent slots");
+    // Each run of adjacent slots is one expected (offset, len) write.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (i, slot) in assigned.iter().enumerate() {
+        if i > 0 && assigned[i - 1] + 1 == *slot {
+            runs.last_mut().unwrap().1 += SH_HEAD_SLOT_SIZE as u64;
+        } else {
+            runs.push((
+                ScriptHashHead::slot_file_off(*slot),
+                SH_HEAD_SLOT_SIZE as u64,
+            ));
+        }
+    }
+    assert!(
+        runs.len() < assigned.len(),
+        "the fixture has no adjacent slots"
+    );
     arm_write_trace();
     h.bulk_fill_empty(&entries).unwrap();
-    let slot_writes = take_write_trace()
+    let mut slot_writes: Vec<(u64, u64)> = take_write_trace()
         .into_iter()
-        .filter(|w| {
-            matches!(w, TracedWrite::Write { path: p, offset, .. }
-                if p == &path && *offset >= FILE_HEADER_LEN as u64)
+        .filter_map(|w| match w {
+            TracedWrite::Write {
+                path: p,
+                offset,
+                len,
+            } if p == path && offset >= FILE_HEADER_LEN as u64 => Some((offset, len)),
+            _ => None,
         })
-        .count();
+        .collect();
+    slot_writes.sort_unstable();
     assert_eq!(slot_writes, runs);
     for (i, (key, val)) in entries.iter().enumerate() {
         let mut full = [0u8; 32];
         full[..SH_HEAD_KEY_LEN].copy_from_slice(key);
         assert_eq!(h.get(&full).unwrap().as_ref(), Some(val), "key {i}");
     }
-    drop(h);
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }

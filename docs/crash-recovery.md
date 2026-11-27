@@ -209,10 +209,10 @@ file must exist. A strong bit a fence run names is set again by
 
 **Not yet in effect.** The marks above are where this change series ends.
 At this revision the write door checks armed pages, but no write path arms
-or restores a mark. `confirmed.body`, `header_txs_*`, `header.head`, `txstat.body`,
-and the scripthash ingest head still write the synced `*.ahead` image open
-restores (What open trusts, above). `strong_tx` has no sidecar. A
-scripthash slab or head word written in place has no page guard: the
+or restores a mark. `confirmed.body`, `header_txs_*`, `header.head`, and
+the scripthash ingest head still write the synced `*.ahead` image open
+restores (What open trusts, above). `strong_tx` has no sidecar.
+A scripthash slab or head word written in place has no page guard: the
 `scripthash.dirty` refusal below and the rebuild cover an unclean stop. A
 same-class scripthash slab rewritten in place can still tear
 ([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)), and an undo
@@ -221,11 +221,10 @@ restore of one head word can tear the neighbor slots on that page
 are closed, the whole-store guarantee is the guarded state above, not every
 row. Each mark takes over in the change that wires it:
 `store/guard/class_c` in #2184, the header marks in #2185, `guard/sh-*` in
-#2186, and `mempool/guard/flush` in #2188. `txstat` drops its image in
-#2180. Block-filter and tweak segment pairs take the shape above in #2181.
-Until then a new pair's names are not synced before its lengths, and open
-refuses a pair missing one file (`segment pair incomplete`) instead of
-dropping it.
+#2186, and `mempool/guard/flush` in #2188. Block-filter and tweak segment
+pairs take the shape above in #2181. Until then a new pair's names are not
+synced before its lengths, and open refuses a pair missing one file
+(`segment pair incomplete`) instead of dropping it.
 
 The scripthash index is still gated: an append, an unlink, or a deferred
 empty-head commit writes `scripthash.dirty` before it writes. A full synced

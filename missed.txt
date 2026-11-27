@@ -2473,3 +2473,87 @@ MISSED   crates/rbitcoin-store/src/io_handle.rs:362:19: replace || with && in ta
 MISSED   crates/rbitcoin-store/src/io_handle.rs:362:27: replace != with == in take_fail_pread_len in 3s build + 21s test
 MISSED   crates/rbitcoin-store/src/io_handle.rs:365:27: replace - with + in take_fail_pread_len in 3s build + 20s test
 MISSED   crates/rbitcoin-store/src/io_handle.rs:365:27: replace - with / in take_fail_pread_len in 3s build + 21s test
+# 45919629412 2 e0373b4eded353f1e348ff6a5cbf52fdacda026b
+MISSED   crates/rbitcoin-store/src/io_handle.rs:375:59: replace == with != in arm_fail_preads in 121s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:435:19: replace == with != in take_fail_sync in 11s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:476:53: replace == with != in take_fail_pread in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:479:19: replace == with != in take_fail_pread in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:483:16: replace -= with += in take_fail_pread in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:483:16: replace -= with /= in take_fail_pread in 11s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:484:19: replace == with != in take_fail_pread in 11s build + 113s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:498:59: replace == with != in arm_fail_hwm_pwrites in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:515:16: replace -= with += in take_fail_hwm in 12s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:515:16: replace -= with /= in take_fail_hwm in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:525:13: replace && with || in would_short_pwrite in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:525:9: replace > with >= in would_short_pwrite in 10s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:546:5: replace win_pread -> i32 with 0 in 11s build + 113s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:546:5: replace win_pread -> i32 with 1 in 10s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:546:5: replace win_pread -> i32 with -1 in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:552:5: replace win_pwrite -> i32 with 0 in 12s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:552:5: replace win_pwrite -> i32 with 1 in 9s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:552:5: replace win_pwrite -> i32 with -1 in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:562:9: replace <impl Drop for PositionalXferEvent>::drop with () in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:596:5: replace win_xfer -> i32 with 0 in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:596:5: replace win_xfer -> i32 with 1 in 9s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:596:5: replace win_xfer -> i32 with -1 in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:636:20: delete - in win_xfer in 12s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:650:31: replace >> with << in win_xfer in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:651:38: replace | with & in win_xfer in 10s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:651:38: replace | with ^ in win_xfer in 10s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:663:15: replace == with != in win_xfer in 10s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:666:20: replace == with != in win_xfer in 9s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:668:72: replace == with != in win_xfer in 10s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:671:31: replace && with || in win_xfer in 10s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:671:24: delete ! in win_xfer in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:671:38: replace == with != in win_xfer in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:674:28: delete - in win_xfer in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:676:30: replace && with || in win_xfer in 12s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:676:23: delete ! in win_xfer in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:676:37: replace == with != in win_xfer in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:679:24: delete - in win_xfer in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:694:5: replace win_set_eof -> std::io::Result<()> with Ok(()) in 12s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_handle.rs:721:11: replace == with != in win_set_eof in 12s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:75:45: delete - in 125s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:80:9: replace IocpEngine::open -> Result<Self, StoreError> with Ok(Default::default()) in 0s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:99:9: replace IocpEngine::associate -> Result<(), StoreError> with Ok(()) in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:140:9: replace IocpEngine::push_pread -> Result<(), StoreError> with Ok(()) in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:157:9: replace IocpEngine::push_pwrite -> Result<(), StoreError> with Ok(()) in 0s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:185:9: replace IocpEngine::issue -> Result<(), StoreError> with Ok(()) in 0s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:190:31: replace >> with << in IocpEngine::issue in 0s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:204:15: replace == with != in IocpEngine::issue in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:207:20: replace != with == in IocpEngine::issue in 0s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![] in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![(0, 0)] in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![(0, 1)] in 0s build + 111s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![(0, -1)] in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![(1, 0)] in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![(1, 1)] in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:222:9: replace IocpEngine::harvest_ready -> Vec<(u64, i32)> with vec![(1, -1)] in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:227:9: replace IocpEngine::wait_one_cqe_timeout -> bool with true in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:227:9: replace IocpEngine::wait_one_cqe_timeout -> bool with false in 0s build + 109s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:230:9: delete ! in IocpEngine::wait_one_cqe_timeout in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:235:9: replace IocpEngine::wait_idle -> Result<(), StoreError> with Ok(()) in 0s build + 109s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:241:9: replace IocpEngine::poll with () in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:254:29: replace == with != in IocpEngine::poll in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:256:17: delete - in IocpEngine::poll in 0s build + 109s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:261:27: replace == with != in IocpEngine::poll in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:272:9: replace <impl Drop for IocpEngine>::drop with () in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_iocp.rs:272:12: delete ! in <impl Drop for IocpEngine>::drop in 0s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_pool.rs:182:53: replace == with != in PoolEngine::wait_one_cqe_timeout in 127s build + 113s test
+MISSED   crates/rbitcoin-store/src/io_session_pool.rs:186:28: replace && with || in PoolEngine::wait_one_cqe_timeout in 11s build + 110s test
+MISSED   crates/rbitcoin-store/src/io_session_pool.rs:186:72: replace != with == in PoolEngine::wait_one_cqe_timeout in 12s build + 112s test
+MISSED   crates/rbitcoin-store/src/io_session_pool.rs:188:20: replace >= with < in PoolEngine::wait_one_cqe_timeout in 20s build + 113s test
+MISSED   crates/rbitcoin-store/src/io_session_pool.rs:197:31: replace && with || in PoolEngine::wait_one_cqe_timeout in 19s build + 114s test
+MISSED   crates/rbitcoin-store/src/point_table.rs:86:39: replace && with || in put_spend_on_create_at in 129s build + 112s test
+MISSED   crates/rbitcoin-store/src/point_table.rs:86:21: replace == with != in put_spend_on_create_at in 12s build + 111s test
+MISSED   crates/rbitcoin-store/src/point_table.rs:86:52: replace == with != in put_spend_on_create_at in 12s build + 112s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:93:9: replace ReadonlyMap::as_ptr -> *const u8 with Default::default() in 130s build + 113s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:98:9: replace ReadonlyMap::map_len -> usize with 0 in 12s build + 115s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:98:9: replace ReadonlyMap::map_len -> usize with 1 in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:102:36: replace > with < in ReadonlyMap::set_fingerprint_range in 11s build + 112s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:118:9: replace <impl Drop for ReadonlyMap>::drop with () in 13s build + 112s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:147:22: replace || with && in unmap in 11s build + 111s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:147:29: replace == with != in unmap in 12s build + 113s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:159:5: replace map_readonly -> std::io::Result<*mut u8> with Ok(Default::default()) in 12s build + 111s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:183:5: replace unmap with () in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/readonly_map.rs:223:5: replace map_readonly -> std::io::Result<*mut u8> with Ok(Default::default()) in 3s build + 21s test

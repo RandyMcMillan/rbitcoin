@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
   "new_skip": 3700,
-  "old_index": 25685,
+  "old_index": 25862,
   "new_cap_used": true,
   "run_id": "45919629412",
-  "old_name": "crates/rbitcoin-store/src/io_handle.rs:375:59: replace == with != in arm_fail_preads",
+  "old_name": "crates/rbitcoin-store/src/scripthash.rs:63:9: replace ColdProgress::path -> PathBuf with Default::default()",
   "new_len": 7492,
   "old_len": 31273,
   "new_remaining": 3792,
-  "old_remaining": 31214,
-  "completed_new": 314,
-  "completed_old": 59
+  "old_remaining": 31096,
+  "completed_new": 0,
+  "completed_old": 177
 }

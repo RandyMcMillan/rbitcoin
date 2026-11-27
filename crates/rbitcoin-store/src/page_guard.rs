@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
@@ -334,33 +334,19 @@ fn load_group_leftover(
     Ok(leftover)
 }
 
+/// One or two `/`-separated parts, each a plain name. A name has one
+/// spelling: `Path` would read `sub//live` and `sub/live/` as `sub/live`,
+/// and a retry and the parser compare the raw text.
 fn valid_guard_name(name: &str) -> bool {
-    if name.is_empty()
-        || name.len() > u16::MAX as usize
-        || name.contains('\\')
-        || name.contains('\0')
-    {
-        return false;
-    }
-    let path = Path::new(name);
-    if path.is_absolute() {
+    if name.len() > u16::MAX as usize || name.contains('\\') || name.contains('\0') {
         return false;
     }
     let mut n = 0usize;
-    for c in path.components() {
-        match c {
-            Component::Normal(s) => {
-                let s = s.to_str().unwrap_or("");
-                if s.is_empty() || s == "." || s == ".." {
-                    return false;
-                }
-                n += 1;
-                if n > 2 {
-                    return false;
-                }
-            }
-            _ => return false,
+    for part in name.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return false;
         }
+        n += 1;
     }
     n == 1 || n == 2
 }
@@ -397,16 +383,20 @@ fn mark_parent(path: &Path) -> Result<&Path, StoreError> {
 /// The mark rename syncs the guard directory. The store directory still has
 /// to name `guard/` before a crash, or the mark never comes back. A
 /// `guard/` that already exists is synced again, because an earlier arm may
-/// have created it and then failed that sync.
+/// have created it and then failed that sync. A mark with no store
+/// directory above `guard/` is refused before anything is created: the
+/// write check keys its pages by that directory.
 fn ensure_mark_parent(path: &Path) -> Result<(), StoreError> {
     let parent = mark_parent(path)?;
+    let Some(store) = guard_live_dir(path) else {
+        return Err(StoreError::Rejected(
+            "page guard mark has no store directory",
+        ));
+    };
     if !parent.is_dir() {
         std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
     }
-    if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fsync_parent_dir(grand).map_err(|e| StoreError::io(grand, e))?;
-    }
-    Ok(())
+    fsync_parent_dir(store).map_err(|e| StoreError::io(store, e))
 }
 
 /// Unlink `path`, run `forget` once the mark is gone, then sync its

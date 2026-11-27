@@ -92,7 +92,9 @@ when every such subset is a state open accepts. Two shapes always pass:
 has a second assumption: a write of a few bytes inside one sector is never
 left half applied. `handle_pwrite_all` retries a short `pwrite` for the
 bytes it did not write, so a cell can only stay half new if the kernel takes
-part of it and the retry then fails. The triggers would be a file-size limit
+part of it and the retry then fails, or the process stops between the two
+writes. A crash there keeps the half-new cell on the device, so open relies
+on this rule as well as the sector rule. The triggers would be a file-size limit
 (`RLIMIT_FSIZE`) or a copy-on-write filesystem out of space on an overwrite,
 landing inside an aligned field of 8 or 16 bytes. Nothing checks for it: the
 8-byte length at offset 8 and the `txstat` cells rely on it, and a half-new
@@ -155,6 +157,16 @@ a forward mark holds the finished pages and a crash completes the write.
 Each mark's doc names its kind. The committed end is the durable header
 length, not a RAM high-water.
 
+A live mark owns every byte on the pages it images, appends included.
+Restore writes whole pages, so an append that shares an imaged page rolls
+back or completes with the mark, and it is durable only once the mark is
+cleared. While the mark is live, the length that names such an append has
+to sit on a page the same mark images, so it rolls back or completes with
+the bytes. A leading header keeps that length at offset 8 on page 0, which
+the sector rule above already keeps inside the mark. No length in a file
+outside the mark, and no trailing footer past the committed end, may name
+it.
+
 **The marks.** `confirmed.body`, `header_txs_*`, and `strong_tx` use
 `store/guard/class_c`. `header.body` is an append: rows, then length, each
 synced before the head insert. Open indexes the rows the head does not name.
@@ -175,6 +187,23 @@ appends its body the same way, then uses `mempool/guard/flush` for slots and
 `tx.head` `*.mlt` is renamed into place, and the segment meta bit says the
 file must exist. A strong bit a fence run names is set again by
 `restore_strong_from_fence`.
+
+**Not yet in effect.** The marks above are where this change series ends.
+At this revision the write door checks armed pages, but no write path arms
+or restores a mark. `confirmed.body`, `header_txs_*`, `header.head`, `txstat.body`,
+and the scripthash ingest head still write the synced `*.ahead` image open
+restores (What open trusts, above). `strong_tx` has no sidecar. A
+scripthash slab or head word written in place has no page guard: the
+`scripthash.dirty` refusal below and the rebuild cover an unclean stop. A
+same-class scripthash slab rewritten in place can still tear
+([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)), and an undo
+restore of one head word can tear the neighbor slots on that page
+([#2132](https://github.com/rbitcoin-org/rbitcoin/issues/2132)). Until those
+are closed, the whole-store guarantee is the guarded state above, not every
+row. Each mark takes over in the change that wires it:
+`store/guard/class_c` in #2184, the header marks in #2185, `guard/sh-*` in
+#2186, and `mempool/guard/flush` in #2188. `txstat` drops its image in
+#2180.
 
 The scripthash index is still gated: an append, an unlink, or a deferred
 empty-head commit writes `scripthash.dirty` before it writes. A full synced

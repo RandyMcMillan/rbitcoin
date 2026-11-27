@@ -622,7 +622,7 @@ impl Store {
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         let dir = layout.dir.clone();
         if !dir.join("meta").exists() {
-            if creation_has_chain(&layout) || has_guard_mark(&layout.dir) {
+            if creation_has_chain(&layout) || has_guard_mark(&layout.dir)? {
                 return Err(StoreError::Corrupt("store meta missing"));
             }
             if incomplete_creation_files(&layout) {
@@ -637,10 +637,11 @@ impl Store {
         match Self::open_layout(layout.clone()) {
             Ok(store) => Ok(store),
             Err(err)
-                if !creation_has_chain(&layout)
-                    && !has_guard_mark(&layout.dir)
-                    && replaces_incomplete_first_creation(&err) =>
+                if !creation_has_chain(&layout) && replaces_incomplete_first_creation(&err) =>
             {
+                if has_guard_mark(&layout.dir)? {
+                    return Err(err);
+                }
                 rbitcoin_log::warn!(
                     "store: replacing incomplete first creation at {} ({err})",
                     dir.display()
@@ -2661,14 +2662,26 @@ fn dir_has_chain_payload(dir: &Path) -> bool {
 
 /// A published `guard/` mark names pages a write was changing, so the
 /// store is not an untouched first creation. An unreadable mark must reach
-/// the caller, not be wiped with the store.
-fn has_guard_mark(dir: &Path) -> bool {
-    std::fs::read_dir(dir.join("guard")).is_ok_and(|rd| {
-        rd.filter_map(Result::ok).any(|ent| {
-            !ent.file_name().to_string_lossy().ends_with(".tmp")
-                && ent.file_type().is_ok_and(|t| t.is_file())
-        })
-    })
+/// the caller, not be wiped with the store. Only a missing `guard/` is
+/// `Ok(false)`: a directory or entry that cannot be read may hold a mark.
+fn has_guard_mark(dir: &Path) -> Result<bool, StoreError> {
+    let guard = dir.join("guard");
+    let rd = match std::fs::read_dir(&guard) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(StoreError::io(&guard, e)),
+    };
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&guard, e))?;
+        if ent.file_name().to_string_lossy().ends_with(".tmp") {
+            continue;
+        }
+        let kind = ent.file_type().map_err(|e| StoreError::io(ent.path(), e))?;
+        if kind.is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn creation_has_chain(layout: &StoreLayout) -> bool {

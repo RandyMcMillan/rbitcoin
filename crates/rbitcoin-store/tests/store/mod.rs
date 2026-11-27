@@ -2497,6 +2497,25 @@ fn missing_meta_with_guard_mark_is_kept() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `guard` that cannot be listed may hold a mark. Open must return that
+/// error, not treat the directory as empty and create a store over it.
+#[test]
+fn missing_meta_with_an_unlistable_guard_is_kept() {
+    let dir = tmp();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("guard"), b"not a directory").unwrap();
+    assert!(
+        Store::open_or_create_tiny(&dir).is_err(),
+        "a guard that cannot be read must not be replaced by a fresh store"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("guard")).unwrap(),
+        b"not a directory"
+    );
+    assert!(!dir.join("meta").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn kill_first_start_interrupted_creation_reopens_empty_chain() {
     let torn = tmp();

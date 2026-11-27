@@ -149,6 +149,56 @@ fn arm_refuses_a_bare_name() {
     assert!(matches!(err, StoreError::Rejected(_)));
 }
 
+/// A mark with no store directory above `guard/` has nowhere to register
+/// its pages or sync `guard/`. Arm refuses it before it creates anything.
+#[test]
+fn arm_refuses_a_mark_with_no_store_directory() {
+    let rel = Path::new("page-guard-no-store-dir");
+    let _ = std::fs::remove_dir_all(rel);
+    let page = fill(0x01);
+    let res = arm_page_guard_group(&rel.join("live"), &[("live", 0, &page)]);
+    let created = rel.exists();
+    let _ = std::fs::remove_dir_all(rel);
+    assert!(matches!(res, Err(StoreError::Rejected(_))), "{res:?}");
+    assert!(
+        !created,
+        "arm created its guard directory before it refused"
+    );
+}
+
+/// One file has one spelling. `sub//live`, `sub/./live`, and `sub/live/`
+/// name the file `sub/live` names, so arm and restore refuse them.
+#[test]
+fn a_noncanonical_file_name_is_refused() {
+    let dir = TempDir::labeled("page-guard-canon").unwrap();
+    let mark = dir.path().join("guard/live");
+    let page = fill(0x01);
+    for name in ["sub//live", "sub/./live", "sub/live/"] {
+        let err = arm_page_guard_group(&mark, &[(name, 0, &page)]).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{name}: {err:?}");
+        assert!(!mark.exists(), "{name}");
+
+        let mut raw = STORE_MAGIC.to_vec();
+        raw.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        raw.extend_from_slice(&1u16.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        raw.extend_from_slice(name.as_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.extend_from_slice(&page);
+        std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
+        std::fs::write(&mark, &raw).unwrap();
+        let err = restore_page_guard_group(&mark, dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{name}: {err:?}");
+        assert!(!dir.path().join("sub").exists(), "{name}");
+        std::fs::remove_file(&mark).unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    arm_page_guard_group(&mark, &[("sub/live", 0, &page)]).unwrap();
+    assert!(restore_page_guard_group(&mark, dir.path()).unwrap());
+    assert_eq!(read_bytes(&dir.path().join("sub/live"), 0, PAGE), page);
+}
+
 #[test]
 fn clear_of_a_missing_mark_syncs_the_directory() {
     let dir = TempDir::labeled("page-guard-clear-missing").unwrap();

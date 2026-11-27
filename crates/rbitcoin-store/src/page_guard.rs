@@ -186,6 +186,8 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
     // directory sync. A failed sync then leaves the check matching the mark.
     write_file_synced_tmp_rename(path, &buf)?;
     remember_group(path, pages, &leftover);
+    #[cfg(debug_assertions)]
+    note_armed(path);
     sync_arm_dir(mark_parent(path)?)
 }
 
@@ -324,8 +326,18 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record the marks [`arm_store_group`] publishes on this thread, including
-/// one a later clear removes before the call returns.
+#[cfg(debug_assertions)]
+fn note_armed(path: &Path) {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    ARM_TRACE.with(|trace| {
+        if let (Some(marks), Some(name)) = (trace.borrow_mut().as_mut(), name) {
+            marks.push(format!("guard/{name}"));
+        }
+    });
+}
+
+/// Record the marks published on this thread, including one a later clear
+/// removes before the call returns.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn arm_store_mark_trace() {

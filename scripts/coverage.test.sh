@@ -90,8 +90,8 @@ assert_ok "required test job classifies the write probe" \
   bash -c 'awk "/^  test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -q -- "scripts/write-probe-classify.py"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "required test job still pins the bench scripthash" \
   grep -q 'cargo test -p rbitcoin-bench --lib hot_corpus_includes_p2a' "$ROOT/.github/workflows/ci.yml"
-assert_ok "pread job runs the skip-flushes switch test" \
-  bash -c 'awk "/^  pread:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -q -- "--features skip-flushes --test suite"' _ "$ROOT/.github/workflows/ci.yml"
+assert_ok "pread-release job runs the skip-flushes switch test" \
+  bash -c 'awk "/^  pread-release:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -q -- "--features skip-flushes --test suite"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "macos-test job runs the workspace suite with skip-flushes" \
   bash -c 'awk "/^  macos-test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -Eq -- "^ +run: cargo test --workspace --exclude rbitcoin-bench --features skip-flushes$"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "macos-test job starts with the other jobs (no needs)" \
@@ -103,11 +103,11 @@ assert_ok "coverage.sh reads the badge gate from gate.json, not a literal" \
 assert_ok "coverage-badge.py has no default gate" \
   bash -c 'grep -q "\"--gate\", type=int, required=True" "$1" && ! grep -qE "default=[0-9]{2}" "$1"' _ "$ROOT/scripts/coverage-badge.py"
 # TESTING.md (Coverage): release is check-only, in both shapes CI names.
-assert_ok "qc checks the release profile compiles (workspace shape)" \
+assert_ok "pread-release checks the release profile compiles (workspace shape)" \
   grep -q 'cargo check --release --workspace$' "$ROOT/.github/workflows/ci.yml"
-assert_ok "qc checks the release profile compiles (product shape)" \
+assert_ok "pread-release checks the release profile compiles (product shape)" \
   grep -q 'cargo check --release -p rbitcoin-node -p rbitcoin-cli -p rbitcoin-store$' "$ROOT/.github/workflows/ci.yml"
-assert_ok "qc builds rustdoc for the workspace" \
+assert_ok "pread-release builds rustdoc for the workspace" \
   grep -q 'cargo doc --workspace --no-deps$' "$ROOT/.github/workflows/ci.yml"
 assert_ok "gitignore ignores apilog jsonl" \
   bash -c 'grep -q "apilog\\*\\.jsonl" "$1/.gitignore" && git -C "$1" check-ignore -q -- apilog.jsonl && git -C "$1" check-ignore -q -- apilog-old.jsonl' _ "$ROOT"

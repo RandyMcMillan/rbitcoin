@@ -200,7 +200,7 @@ show as `core-functional / core-functional` and so on.
 
 | Check | Who |
 |-------|-----|
-| `qc` `test` `windows` `macos` `coverage` `pread` `rust-forward` `nixos-module-eval` `macos-test` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, unwrap-ratchet, hex-ratchet, page-write-ratchet, deny, script self-tests, then clippy. `pread` is `RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` on Ubuntu. `rust-forward` is `cargo check --workspace --all-targets` on the channel in `rust-forward.toml`. `pread`, `rust-forward`, and `nixos-module-eval` `need` `qc` and `test`, so they start with `coverage`. The module eval does not gate `coverage`. It is not a Protected status check until the ruleset names `nixos-module-eval`. `macos-test` is `cargo test --workspace --exclude rbitcoin-bench --features skip-flushes` on `macos-26`. It starts with the other jobs, not after `qc` and `test`. It is not a Protected status check until the ruleset names `macos-test`. The `test` job leaves `RBITCOIN_IO` unset (io_uring) and uses rustc 1.95. |
+| `qc` `test` `windows` `macos` `coverage` `pread-release` `toolchains` `nixos-module-eval` `macos-test` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, unwrap-ratchet, hex-ratchet, page-write-ratchet, deny, script self-tests, then clippy. `pread-release` is `RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` on Ubuntu, then `cargo check --release` and `cargo doc`. `toolchains` is the fuzz-run self-test, then `cargo check --workspace --all-targets` on the channel in `rust-forward.toml`. `pread-release`, `toolchains`, and `nixos-module-eval` `need` `qc` and `test`, so they start with `coverage`. The module eval does not gate `coverage`. It is not a Protected status check until the ruleset names `nixos-module-eval`. `macos-test` is `cargo test --workspace --exclude rbitcoin-bench --features skip-flushes` on `macos-26`. It starts with the other jobs, not after `qc` and `test`. It is not a Protected status check until the ruleset names `macos-test`. The `test` job leaves `RBITCOIN_IO` unset (io_uring) and uses rustc 1.95. |
 | `mutants` | Nightly `47 0 * * *` (17:47 Pacific during PDT) and `workflow_dispatch` (`mutants.yml`). Workspace tests. New mutants until half of the first job's budget, then the backlog; the second job does not open another new window. 8 hour budget in two jobs. Not required. Cursor and `MISSED` lines are on the `mutants-state` branch. |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
@@ -217,6 +217,11 @@ on `master` / `main` / `v*.*.x` (ruleset). Until then, agents still wait
 for it before merge. Ask the operator to add **`nixos-module-eval`** the
 same way after this workflow is on those branches. Until then the eval job
 runs on every PR and does not block merge.
+
+The `pread` job is now `pread-release`. When that rename reaches `master`,
+the operator swaps `pread` for `pread-release` in the Protected ruleset's
+required checks. Before that, a PR that carries the rename never reports
+`pread`, and a PR that does not carry it never reports `pread-release`.
 
 Unlabeled non-ship PRs keep cargo gates only (detect=`dev`, the three
 functional suites skipped, `release-extra` green).

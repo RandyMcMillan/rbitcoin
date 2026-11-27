@@ -32,8 +32,8 @@ all_green="$(
     windows pass 1m \
     macos pass 50s \
     coverage pass 2m \
-    pread pass 2m \
-    rust-forward pass 2m
+    pread-release pass 2m \
+    toolchains pass 2m
 )"
 rc=0
 out="$(CI_PR_CHECKS_TEXT="$all_green" "$RUN" --once 2>&1)" || rc=$?
@@ -47,8 +47,8 @@ analyze_pending_windows_green="$(
     windows pass 1m \
     macos pass 50s \
     coverage pass 2m \
-    pread pass 2m \
-    rust-forward pass 2m \
+    pread-release pass 2m \
+    toolchains pass 2m \
     'Analyze (rust)' pending 0
 )"
 rc=0

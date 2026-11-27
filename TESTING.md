@@ -58,13 +58,16 @@ meshes are the **`overlay-functional`** labeled / nightly / ship job
 ([`docs/overlay-functional.md`](docs/overlay-functional.md)), not default
 `cargo test`.
 
-The Linux `pread` job runs the same store and query suites with
+The Linux `pread-release` job runs the same store and query suites with
 `RBITCOIN_IO=pread` after `qc` and `test`, in parallel with `coverage`.
 The `test` job does not set `RBITCOIN_IO`, so it stays on io_uring.
-`pread` is Actions-only. It is not part of the local gate list.
-`rust-forward` is the same wait: `cargo check --workspace --all-targets`
-on the channel in `rust-forward.toml`, beside `pread`. Product builds stay
-on rustc 1.95. It is not part of the local gate list.
+`pread-release` is Actions-only. It is not part of the local gate list.
+It also runs `cargo check --release` and `cargo doc`.
+`toolchains` is the same wait: `cargo check --workspace --all-targets`
+on the channel in `rust-forward.toml`, beside `pread-release`, after the fuzz-run
+dry-run contract. Product builds stay on rustc 1.95. It is not part of the
+local gate list. Those three steps left `qc` so that `qc` stays shorter than
+`test`. Neither job runs longer than `coverage`.
 
 When adding or folding a pin:
 
@@ -199,7 +202,7 @@ agents: ignore that file.
 |------|---------|----------|
 | **Default** (CI / local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + live P2P (8-block `two_node`, restart reconstruct, dead-peer, hop serve, dual live seeders, post-IBD tip follow, getheaders gap fill, product `run_p2p --connect`) + hub reorgs. When agents run this suite: [`docs/how-we-plan.md`](docs/how-we-plan.md). Coverage stays a PR job. |
 
-**tmpfs:** Linux CI (`test`, `pread`, `coverage`, `mutants`) sets
+**tmpfs:** Linux CI (`test`, `pread-release`, `coverage`, `mutants`) sets
 `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER` to
 [`scripts/tmpfs-test-runner.sh`](scripts/tmpfs-test-runner.sh). Each test
 binary gets a private `TMPDIR` under `/dev/shm`, removed when it exits.
@@ -237,7 +240,7 @@ process the test starts, such as the `journey-node` in `asmap_journey`,
 still flushes. A test that needs a real flush belongs in a suite that does
 not call the macro, such as `rbitcoin-store`'s. The `skip-flushes-call` and
 `skip-flushes-macro` ast-grep rules refuse the switch anywhere else. CI's
-`pread` job runs each suite's switch test with the flag. The `macos-test`
+`pread-release` job runs each suite's switch test with the flag. The `macos-test`
 job runs the whole workspace with the flag, but only the nine suites above
 skip flushes. The rest, such as store and mempool, still flush.
 The workspace `cargo test` step in the required `test` job and
@@ -330,7 +333,7 @@ fails `qc` when one returns there; `rbitcoin-bench` keeps its `--lib`
 tests. `#[cfg(debug_assertions)]` hooks in
 production files still count. Those hooks also mean the suites link only in
 the `dev` / `test` profiles: `cargo test --release` does not build. The
-release profile is compiled on every PR by `cargo check --release` in `qc`
+release profile is compiled on every PR by `cargo check --release` in `pread-release`
 (workspace shape and the `-p rbitcoin-node -p rbitcoin-cli -p rbitcoin-store`
 product shape that `nix/rbitcoin.nix` and `release.yml` build) and built for
 real only at tag time. The labeled harnesses build `rbitcoin-node` in the

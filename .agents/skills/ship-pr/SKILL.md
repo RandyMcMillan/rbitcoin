@@ -83,18 +83,19 @@ Coverage and native `windows` / `macos` stay GitHub Actions;
 
 ## Push and poll
 
-Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, `pread`, and
-`rust-forward`. `qc` is fmt, ast-grep, unwrap-ratchet, hex-ratchet, unused-pub, deny, the
-script self-tests, then clippy, on one runner. `nixos-module-eval` waits for `qc` and `test` and runs beside `pread` and
-`rust-forward`. It does not gate `coverage`. It is not a Protected status
+Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, `pread-release`, and
+`toolchains`. `qc` is fmt, ast-grep, unwrap-ratchet, hex-ratchet, unused-pub, deny, the
+script self-tests, then clippy, on one runner. `nixos-module-eval` waits for `qc` and `test` and runs beside `pread-release` and
+`toolchains`. It does not gate `coverage`. It is not a Protected status
 check until the ruleset names it. Poll with `--interest nixos-module-eval`.
 `macos-test` (the workspace suite on `macos-26` with `--features skip-flushes`)
 starts with the other jobs and is not a required check either. Poll with
 `--interest macos-test`.
-`pread` is GitHub Actions only:
-`RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` after
-`qc` and `test`, in parallel with `coverage`. `rust-forward` is the same
-wait: `cargo check --workspace --all-targets` on the channel in
+`pread-release` is GitHub Actions only:
+`RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query`, then
+`cargo check --release` and `cargo doc`, after `qc` and `test`, in parallel
+with `coverage`. `toolchains` is the same wait: the fuzz-run self-test,
+then `cargo check --workspace --all-targets` on the channel in
 `rust-forward.toml`. Do not run either in the local gate list. The `test`
 job leaves `RBITCOIN_IO` unset and stays on rustc 1.95. Mutants run nightly
 with workspace tests (`mutants.yml`); they are not a required check.

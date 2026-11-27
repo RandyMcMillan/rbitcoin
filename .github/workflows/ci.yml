@@ -27,10 +27,14 @@ env:
 #
 # `qc` is one Ubuntu runner: fmt, ast-grep, unwrap-ratchet, hex-ratchet, write-probe classifier, src-test-modules, doc-attach, unused-pub, deny, scripts, clippy.
 # test, windows, macos, and macos-test each have their own runner.
-# coverage, pread, rust-forward, and nixos-module-eval wait for qc and test.
-# The module eval runs beside pread and rust-forward. It does not gate coverage.
+# coverage, pread-release, toolchains, and nixos-module-eval wait for qc and test.
+# Balance: qc stays shorter than test, so it never holds that wait. The
+# release-profile check and rustdoc run in pread-release, and the fuzz-run
+# dry-run contract in toolchains: both finish well before coverage, the longest
+# job after the wait. Move a step out of qc before adding a runner.
+# The module eval runs beside pread-release and toolchains. It does not gate coverage.
 # It is not a Protected status check until the ruleset names nixos-module-eval.
-# pread is the Linux libc backend (`RBITCOIN_IO=pread`) for store and query.
+# pread-release runs the Linux libc backend (`RBITCOIN_IO=pread`) for store and query.
 # `test` leaves that variable unset, so Linux stays on io_uring.
 # Mutants are not a PR check. Nightly workspace runs live in mutants.yml.
 # nixos-module-runtime is a labeled job (nixos-module-runtime.yml), not this file.
@@ -117,8 +121,6 @@ jobs:
         run: ./scripts/docker-tags.test.sh
       - name: nightly-guard self-test
         run: ./scripts/nightly-guard.test.sh
-      - name: fuzz-run self-test
-        run: ./scripts/fuzz-run.test.sh
       - name: release-pin self-test
         run: ./scripts/core-functional/release_pin.test.sh
       - name: fetch-bitcoind self-test
@@ -155,15 +157,6 @@ jobs:
           workspaces: ". -> target/dev"
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # Both shapes TESTING.md names: workspace, and the product set that
-      # nix/rbitcoin.nix and release.yml build (consensus without `corpus`).
-      - name: cargo check --release
-        run: |
-          cargo check --release --workspace
-          cargo check --release -p rbitcoin-node -p rbitcoin-cli -p rbitcoin-store
-      # doc(hidden) pub modules are rustdoc-visible; a broken link is an error.
-      - name: cargo doc
-        run: cargo doc --workspace --no-deps
 
   test:
     runs-on: ubuntu-latest
@@ -277,7 +270,7 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --exclude rbitcoin-bench --features skip-flushes
 
-  # NixOS module eval. Same wait as pread and rust-forward, so it takes a
+  # NixOS module eval. Same wait as pread-release and toolchains, so it takes a
   # runner only after qc and test. coverage does not need this job.
   nixos-module-eval:
     name: nixos-module-eval
@@ -302,8 +295,8 @@ jobs:
 
   # Linux libc pread. Same wait as coverage: a red `test` does not compile it.
   # Store and query own bulk IO. The `test` job does not set `RBITCOIN_IO`.
-  pread:
-    name: pread
+  pread-release:
+    name: pread-release
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [qc, test]
@@ -334,12 +327,25 @@ jobs:
           -p rbitcoin-esplora -p rbitcoin-sv2 -p rbitcoin-node
           --features skip-flushes --test suite
           -- --quiet flushes_skipped_matches_the_skip_flushes_feature
+      # Moved from qc, which must stay shorter than test. This job has the same
+      # stable toolchain and ends well before coverage.
+      # Both shapes TESTING.md names: workspace, and the product set that
+      # nix/rbitcoin.nix and release.yml build (consensus without `corpus`).
+      - name: cargo check --release
+        run: |
+          cargo check --release --workspace
+          cargo check --release -p rbitcoin-node -p rbitcoin-cli -p rbitcoin-store
+      # doc(hidden) pub modules are rustdoc-visible; a broken link is an error.
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
 
-  # Forward rustc. Same wait as pread: a red `test` does not compile it.
+  # Toolchains other than rust-toolchain.toml: the forward rustc check, and
+  # the fuzz runner's nightly contract. Same wait as pread-release: a red
+  # `test` does not compile it.
   # Product MSRV stays rust-toolchain.toml. This job checks the dialect still
-  # builds on the channel in rust-forward.toml, beside pread.
-  rust-forward:
-    name: rust-forward
+  # builds on the channel in rust-forward.toml, beside pread-release.
+  toolchains:
+    name: toolchains
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [qc, test]
@@ -349,6 +355,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Moved from qc. It runs before the forward toolchain is set: the
+      # contract checks the runner's default (nightly) when RUSTUP_TOOLCHAIN
+      # is unset.
+      - name: fuzz-run self-test
+        run: ./scripts/fuzz-run.test.sh
       - name: install forward toolchain
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-forward.toml)

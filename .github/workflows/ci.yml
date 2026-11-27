@@ -77,6 +77,10 @@ jobs:
         run: ./scripts/hex-ratchet.test.sh
       - name: hex ratchet
         run: ./scripts/hex-ratchet.sh
+      - name: page-write ratchet self-test
+        run: ./scripts/page-write-ratchet.test.sh
+      - name: page-write ratchet
+        run: ./scripts/page-write-ratchet.sh
       - name: src test modules self-test
         run: ./scripts/src-test-modules.test.sh
       - name: src test modules

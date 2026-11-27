@@ -216,7 +216,10 @@ def file_count(path: str, line_fn=bare_on_line) -> int:
             test_stack.pop()
         if depth < 0:
             depth = 0
-        prev = code.rstrip()
+        # A blank or comment-only line keeps the last code line as `prev`,
+        # so a call split across it still sees its name or receiver.
+        if stripped:
+            prev = code.rstrip()
     return n
 
 

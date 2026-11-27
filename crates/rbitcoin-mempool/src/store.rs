@@ -9,11 +9,13 @@
 //!
 //! Schema **4** packed live records (`fee‖weight‖sigops‖accept_secs‖…`); schema 1–3
 //! recode on open. Body is append-only (`body_persisted_len`);
-//! `persist_due` syncs the dirty tail, then syncs new LIVE slots, then writes meta.
-//! Compact copies packed payload ranges. An admit compacts first when dead
-//! payloads reach the live payload bytes, so a full pool that reuses the slot
-//! each eviction frees does not grow `tx.body` until a block. DEAD of a durable slot
-//! is a one-byte `pwrite`. A batch syncs `slots` once, then `meta`.
+//! `persist_due` appends the new records, syncs them, then writes and syncs
+//! the body length, and only then publishes the new LIVE slots and meta as
+//! one `guard/flush` mark. Compact still renames packed images. An admit
+//! compacts first when dead payloads reach the live payload bytes, so a full
+//! pool that reuses the slot each eviction frees does not grow `tx.body` until
+//! a block. DEAD of a durable slot is folded into that same flush. A batch
+//! writes the status bytes and `meta` once.
 //! Open keeps LIVE rows inside the logical body and returns [`MempoolError::Corrupt`]
 //! for an in-range payload that does not decode. The hub moves that image aside.
 //!
@@ -21,8 +23,8 @@
 //!
 //! Process-owned buffers (`meta` fields + `slots` / `body` `Vec`s) are the
 //! source of truth. Sidecar files are updated with normal `read`/`write` /
-//! `pwrite`-style IO — **no `memmap2`**. Flush bumps generation and `sync_data`
-//! of the body before slots, then slots before meta.
+//! `pwrite`-style IO — **no `memmap2`**. Flush bumps generation and commits
+//! through the same `guard/flush` mark.
 
 use crate::error::MempoolError;
 use crate::packed::{
@@ -62,6 +64,8 @@ pub const MAX_SLOT_CAP: u32 = 1_048_576;
 /// session. Schema 4 already had these bytes. Older files leave them 0.
 #[doc(hidden)]
 pub const SLOT_REC: usize = 48;
+/// The device writes a 512-byte sector whole (docs/crash-recovery.md).
+const SECTOR: usize = 512;
 
 /// One slot record. `off` names a record inside a table of
 /// `SLOTS_HEADER + cap * SLOT_REC` bytes.
@@ -133,6 +137,11 @@ pub struct Mempool {
     pub body_dirty: bool,
     /// On-disk body length that slots may legally index (header + durable payloads).
     pub body_persisted_len: u64,
+    /// Durable body length, synced and published. The next append starts
+    /// here. It runs ahead of `body_persisted_len` while the slots naming
+    /// those records are unpublished, and it bounds the deaths a removal
+    /// queues: any slot naming a durable record may be LIVE on disk.
+    body_synced_len: u64,
     pub opened: Instant,
     pub mock_now_ms: Option<u64>,
     pub last_persist_ms: u64,
@@ -141,11 +150,20 @@ pub struct Mempool {
     /// Next [`Self::append_live_tx`] returns [`MempoolError::Full`] once.
     #[cfg(debug_assertions)]
     pub fail_next_append: bool,
-    /// A durable DEAD `pwrite` is not yet covered by [`Self::sync_deaths`].
+    /// Durable DEAD rows waiting for the next flush mark.
     pub deaths_unsynced: bool,
+    /// Slots whose status byte the next flush mark must publish.
+    death_slots: Vec<u32>,
     /// The live slot table is `slots.tmp`: a compact renamed the body but not
     /// the slots. Writes stay there until a persist or the next open links it.
     slots_pending: bool,
+    /// `slots` file length known durable. A `set_len` whose sync failed is
+    /// visible in the file length but not counted here, so a retry syncs it.
+    slots_len_synced: u64,
+    /// `guard/flush` may be published and not cleared. It may hold a LIVE
+    /// slot image whose body never became durable, so a removal of that slot
+    /// must still publish its death. The next commit applies it first.
+    flush_mark_armed: bool,
 }
 
 impl Mempool {
@@ -154,6 +172,7 @@ impl Mempool {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(|e| MempoolError::io(&dir, e))?;
         finish_pending_compact(&dir)?;
+        restore_mempool_mark(&dir)?;
 
         let meta_path = dir.join("meta");
         let slots_path = dir.join("slots");
@@ -162,6 +181,10 @@ impl Mempool {
         let (meta_file, generation, slot_cap, live_count, meta_schema) =
             open_or_init_meta(&meta_path)?;
         let (slots_file, slots) = open_or_init_slots(&slots_path, slot_cap)?;
+        let slots_len_synced = slots_file
+            .metadata()
+            .map_err(|e| MempoolError::io(&slots_path, e))?
+            .len();
         let (body_file, body) = open_or_init_body(&body_path)?;
         let body_persisted_len = body_logical_len(&body)? as u64;
 
@@ -178,6 +201,7 @@ impl Mempool {
             live_body_bytes: 0,
             body_dirty: false,
             body_persisted_len,
+            body_synced_len: body_persisted_len,
             opened: Instant::now(),
             mock_now_ms: None,
             last_persist_ms: 0,
@@ -185,7 +209,10 @@ impl Mempool {
             #[cfg(debug_assertions)]
             fail_next_append: false,
             deaths_unsynced: false,
+            death_slots: Vec::new(),
             slots_pending: false,
+            slots_len_synced,
+            flush_mark_armed: false,
         };
         let mut body_hdr = [0u8; BODY_HEADER];
         body_hdr.copy_from_slice(&mp.body[..BODY_HEADER]);
@@ -247,37 +274,33 @@ impl Mempool {
 
     /// Persist buffers, bump generation, and fsync sidecar files.
     ///
-    /// Admits persist on [`Self::persist_due`] (5 s, body `sync_data` before
-    /// LIVE slots). A crash may lose admits since the last persist.
-    /// [`Self::flush`] is the durable checkpoint (generation + the same order).
+    /// Admits persist on [`Self::persist_due`] (5 s, one `guard/flush` mark).
+    /// A crash may lose admits since the last persist.
+    /// [`Self::flush`] is the durable checkpoint (generation + the same mark).
     pub fn flush(&mut self) -> Result<(), MempoolError> {
-        self.sync_deaths()?;
         self.generation = self.generation.saturating_add(1);
-        self.persist_body_then_slots()?;
-        Ok(())
+        self.persist_body_then_slots()
     }
 
     /// Time-based body persist: dirty admits wait [`PERSIST_INTERVAL_MS`].
     ///
-    /// Body tail is `sync_data`'d, then new LIVE slot records are written and
-    /// synced, then meta. One `fdatasync` of the dirty body per dirty interval.
-    /// DEAD of durable slots is a one-byte `pwrite` in [`Self::mark_slot_dead`];
-    /// [`Self::sync_deaths`] flushes those bytes once. Flush / grow / compact
-    /// still rewrite the full slot table.
+    /// The body tail and its length are synced first. One mark then covers
+    /// the new LIVE slot records, any durable DEAD bytes, and meta. Deaths do not wait out the admit interval.
+    /// Flush / grow / compact still rewrite the full slot table. The body
+    /// file is not renamed.
     pub fn persist_due(&mut self) -> Result<(), MempoolError> {
-        if self.deaths_unsynced {
-            self.sync_deaths()?;
-        }
-        if !self.body_dirty {
-            return Ok(());
-        }
-        if self.now_ms().saturating_sub(self.last_persist_ms) < PERSIST_INTERVAL_MS {
+        let body_due = self.body_dirty
+            && self.now_ms().saturating_sub(self.last_persist_ms) >= PERSIST_INTERVAL_MS;
+        if !body_due {
+            if self.deaths_unsynced {
+                self.sync_deaths()?;
+            }
             return Ok(());
         }
         let old_persisted = self.body_persisted_len;
-        self.persist_body_tail()?;
-        self.pwrite_live_slots_since(old_persisted)?;
-        self.persist_meta()?;
+        let mut ranges = self.slot_ranges_since(old_persisted);
+        ranges.extend(self.death_ranges());
+        self.commit_guarded(true, &ranges, None, true, &[], true)?;
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
         Ok(())
@@ -310,8 +333,25 @@ impl Mempool {
 
     #[doc(hidden)]
     pub fn persist_body_then_slots(&mut self) -> Result<(), MempoolError> {
-        self.persist_body_tail()?;
-        self.persist_slots_and_meta()?;
+        let logical = body_logical_len(&self.body)? as u64;
+        let saved = self.body_persisted_len;
+        self.body_persisted_len = logical;
+        let demoted = self.demoted_slots_image();
+        self.body_persisted_len = saved;
+        let mut stashed = None;
+        if demoted.is_none() {
+            stashed = Some(std::mem::take(&mut self.slots));
+        }
+        let ram: &[u8] = match demoted.as_deref() {
+            Some(bytes) => bytes,
+            None => stashed.as_deref().unwrap_or(&[]),
+        };
+        let committed = self.commit_guarded(true, &[], Some(ram), true, &[], true);
+        if let Some(slots) = stashed {
+            self.slots = slots;
+        }
+        committed?;
+        self.promote_pending_slots();
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
         Ok(())
@@ -323,12 +363,11 @@ impl Mempool {
         prev_end == off
     }
 
-    /// `pwrite` LIVE rows whose payload starts at or past `old_persisted`.
+    /// LIVE rows whose payload starts at or past `old_persisted`.
     ///
-    /// Adjacent new slots are one write. Does not rewrite the rest of the table.
-    #[doc(hidden)]
-    pub fn pwrite_live_slots_since(&mut self, old_persisted: u64) -> Result<(), MempoolError> {
-        let path = self.slots_path();
+    /// Adjacent new slots are one range. The bytes outside those ranges stay
+    /// as they are on disk.
+    fn slot_ranges_since(&self, old_persisted: u64) -> Vec<(usize, usize)> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for slot in 0..self.slot_cap {
             let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
@@ -349,18 +388,17 @@ impl Mempool {
             }
             ranges.push((off, rec_end));
         }
-        for (start, end) in ranges {
-            self.slots_file
-                .seek(SeekFrom::Start(start as u64))
-                .map_err(|e| MempoolError::io(&path, e))?;
-            self.slots_file
-                .write_all(&self.slots[start..end])
-                .map_err(|e| MempoolError::io(&path, e))?;
-        }
-        self.slots_file
-            .durable_sync_data()
-            .map_err(|e| MempoolError::io(&path, e))?;
-        Ok(())
+        ranges
+    }
+
+    fn death_ranges(&self) -> Vec<(usize, usize)> {
+        self.death_slots
+            .iter()
+            .map(|slot| {
+                let off = SLOTS_HEADER + (*slot as usize) * SLOT_REC;
+                (off, off + 1)
+            })
+            .collect()
     }
 
     /// Append a packed live record; mark a FREE slot LIVE.
@@ -429,10 +467,10 @@ impl Mempool {
 
     /// Mark slot DEAD and decrement live_count (confirm / RBF / eviction).
     ///
-    /// If the slot is already on disk, `pwrite` that one status byte and leave
-    /// the sync to [`Self::sync_deaths`]. An admit that was never durable stays
-    /// RAM-only. This path must not dump the full slot table (LIVE rows whose
-    /// body is still in the unpersisted tail).
+    /// If the slot is already on disk, the next flush mark publishes that
+    /// status byte. An admit that was never durable stays RAM-only. This path
+    /// must not dump the full slot table (LIVE rows whose body is still in
+    /// the unpersisted tail).
     pub fn mark_slot_dead(&mut self, slot: u32) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
@@ -447,23 +485,13 @@ impl Mempool {
         self.slots[off] = SLOT_DEAD;
         self.live_count = self.live_count.saturating_sub(1);
         self.live_body_bytes = self.live_body_bytes.saturating_sub(body_len);
-        if body_off.saturating_add(body_len) <= self.body_persisted_len {
-            self.pwrite_slot_status(slot, SLOT_DEAD)?;
+        // A slot whose record is durable may be LIVE on disk: a persist, or
+        // a mark open or a retry restored, can have published it. An armed
+        // flush mark may name it LIVE too: open would replay it.
+        if body_off.saturating_add(body_len) <= self.body_synced_len || self.flush_mark_armed {
+            self.death_slots.push(slot);
             self.deaths_unsynced = true;
         }
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn pwrite_slot_status(&mut self, slot: u32, status: u8) -> Result<(), MempoolError> {
-        let path = self.slots_path();
-        let off = (SLOTS_HEADER + (slot as usize) * SLOT_REC) as u64;
-        self.slots_file
-            .seek(SeekFrom::Start(off))
-            .map_err(|e| MempoolError::io(&path, e))?;
-        self.slots_file
-            .write_all(&[status])
-            .map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
     }
 
@@ -668,10 +696,12 @@ impl Mempool {
     /// Fill a LIVE record's sigop cost (post-migrate recompute).
     ///
     /// RAM image plus an 8-byte `pwrite` (no fsync) so the next open does not
-    /// recompute it. The field may straddle a sector, so a power-loss tear can
-    /// mix new and old 0xFF bytes; decode treats any cost above the block limit
-    /// as unknown, so a torn value is recomputed. A record still in the
-    /// unpersisted tail is rewritten from RAM by the next tail persist anyway.
+    /// recompute it. A 512-byte sector lands whole, so a field inside one
+    /// sector reads old (unknown) or new after a crash. A field that crosses
+    /// a sector could tear into a cost under the block limit, so its lower
+    /// sector is written and synced first: new low bytes under the old 0xFF
+    /// high bytes decode as unknown. A record still in the unpersisted tail is
+    /// rewritten from RAM by the next tail persist.
     pub fn set_sigop_cost(&mut self, slot: u32, cost: u64) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
@@ -683,14 +713,31 @@ impl Mempool {
         let rec = slot_rec(&self.slots, off);
         let body_off = le_u64!(rec, 4);
         let at = body_off as usize + SIGOP_COST_OFF;
-        self.body[at..at + 8].copy_from_slice(&cost.to_le_bytes());
+        let bytes = cost.to_le_bytes();
+        self.body[at..at + 8].copy_from_slice(&bytes);
         let path = self.dir.join("tx.body");
-        self.body_file
-            .seek(SeekFrom::Start(at as u64))
-            .map_err(|e| MempoolError::io(&path, e))?;
-        self.body_file
-            .write_all(&cost.to_le_bytes())
-            .map_err(|e| MempoolError::io(&path, e))?;
+        // Little-endian: the low-order bytes sit in the lower sector. Synced
+        // under the old 0xFF high bytes, they decode above the block limit.
+        let split = (SECTOR - at % SECTOR).min(8);
+        let file = &mut self.body_file;
+        let write = |file: &mut File, from: usize| -> std::io::Result<()> {
+            let end = if from == 0 { split } else { 8 };
+            file.seek(SeekFrom::Start((at + from) as u64))?;
+            file.write_all(&bytes[from..end])
+        };
+        write(file, 0).map_err(|e| MempoolError::io(&path, e))?;
+        if split < 8 {
+            #[cfg(debug_assertions)]
+            if sigop_sync_fails(&self.dir) {
+                return Err(MempoolError::io(
+                    &path,
+                    std::io::Error::other("injected sigop sync failure"),
+                ));
+            }
+            file.durable_sync_data()
+                .map_err(|e| MempoolError::io(&path, e))?;
+            write(file, split).map_err(|e| MempoolError::io(&path, e))?;
+        }
         Ok(())
     }
 
@@ -893,54 +940,28 @@ impl Mempool {
         Ok(logical as u64)
     }
 
-    /// Write the dirty body tail and `sync_data` it before any LIVE slot names it.
-    ///
-    /// Append-safe: a crash after a grown body and before new slots loses admits;
-    /// old LIVE ranges stay a prefix of the new body. Packed compact must not
-    /// use this order (see [`Self::install_images`]).
-    #[doc(hidden)]
-    pub fn persist_body_tail(&mut self) -> Result<(), MempoolError> {
-        let body_path = self.dir.join("tx.body");
-        let logical = body_logical_len(&self.body)? as u64;
-        let start = self.body_persisted_len.min(logical);
-        if logical != start {
-            self.body_file
-                .seek(SeekFrom::Start(8))
-                .map_err(|e| MempoolError::io(&body_path, e))?;
-            self.body_file
-                .write_all(&self.body[8..16])
-                .map_err(|e| MempoolError::io(&body_path, e))?;
-        }
-        self.body_file
-            .seek(SeekFrom::Start(start))
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.body_file
-            .write_all(&self.body[start as usize..logical as usize])
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.body_file
-            .set_len(logical)
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.body_file
-            .durable_sync_data()
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.body_persisted_len = logical;
-        Ok(())
-    }
-
     /// Slots + live_count. LIVE rows whose body is not yet durable are written
     /// as FREE so a slots-ahead-of-body crash cannot load offsets past EOF.
     #[doc(hidden)]
     pub fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
-        let slots_path = self.slots_path();
-        if let Some(disk) = self.demoted_slots_image() {
-            self.write_slots_bytes(&slots_path, &disk)?;
-        } else {
-            let buf = std::mem::take(&mut self.slots);
-            let w = Self::write_slots_file(&mut self.slots_file, &slots_path, &buf);
-            self.slots = buf;
-            w?;
+        // A leftover mark's admits become durable here. Apply it before the
+        // demoted image samples `body_persisted_len`.
+        let body_path = self.dir.join("tx.body");
+        self.settle_flush_mark(&body_path)?;
+        let demoted = self.demoted_slots_image();
+        let mut stashed = None;
+        if demoted.is_none() {
+            stashed = Some(std::mem::take(&mut self.slots));
         }
-        self.persist_meta()?;
+        let ram: &[u8] = match demoted.as_deref() {
+            Some(bytes) => bytes,
+            None => stashed.as_deref().unwrap_or(&[]),
+        };
+        let committed = self.commit_guarded(false, &[], Some(ram), true, &[], true);
+        if let Some(slots) = stashed {
+            self.slots = slots;
+        }
+        committed?;
         self.promote_pending_slots();
         Ok(())
     }
@@ -959,28 +980,6 @@ impl Mempool {
         if fs::rename(&slots_tmp, &slots_path).is_ok() {
             self.slots_pending = false;
         }
-    }
-
-    #[doc(hidden)]
-    pub fn write_slots_bytes(&mut self, path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
-        Self::write_slots_file(&mut self.slots_file, path, bytes)
-    }
-
-    #[doc(hidden)]
-    pub fn write_slots_file(
-        file: &mut File,
-        path: &Path,
-        bytes: &[u8],
-    ) -> Result<(), MempoolError> {
-        file.set_len(bytes.len() as u64)
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.write_all(bytes)
-            .map_err(|e| MempoolError::io(path, e))?;
-        file.durable_sync_data()
-            .map_err(|e| MempoolError::io(path, e))?;
-        Ok(())
     }
 
     #[doc(hidden)]
@@ -1010,38 +1009,329 @@ impl Mempool {
 
     #[doc(hidden)]
     pub fn persist_meta(&mut self) -> Result<(), MempoolError> {
-        let meta_path = self.dir.join("meta");
-        let mut meta = [0u8; META_LEN];
-        write_meta_bytes(&mut meta, self.generation, self.slot_cap, self.live_count);
-        self.meta_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
-        self.meta_file
-            .write_all(&meta)
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
-        self.meta_file
-            .durable_sync_data()
-            .map_err(|e| MempoolError::io(&meta_path, e))?;
-        Ok(())
+        self.commit_guarded(false, &[], None, true, &[], false)
     }
 
-    /// `fdatasync` DEAD `pwrite`s, then publish `live_count`.
+    /// Publish durable DEAD bytes and `live_count` in one mark.
     ///
-    /// Slot status is what open reloads. `meta` is written after that sync so a
-    /// crash between them reloads the DEAD rows and reconciles the count.
-    /// `deaths_unsynced` stays set until both syncs return, so a failed call
-    /// retries from [`Self::persist_due`] or [`Self::flush`]. Does not rewrite
-    /// the slot table (unpersisted LIVE rows stay off disk).
+    /// The status byte written is [`SLOT_DEAD`], not whatever RAM holds now.
+    /// An admit can reuse the slot before this flush; copying RAM would mark
+    /// the old on-disk record LIVE again. The replacement waits for the body
+    /// persist. `deaths_unsynced` stays set until the mark is cleared, so a
+    /// failed call retries. Does not rewrite the slot table and does not
+    /// rename `tx.body`.
     pub fn sync_deaths(&mut self) -> Result<(), MempoolError> {
         if !self.deaths_unsynced {
             return Ok(());
         }
-        let path = self.slots_path();
-        self.slots_file
+        let ranges = self.death_ranges();
+        let dead_at: Vec<usize> = ranges.iter().map(|(off, _)| *off).collect();
+        self.commit_guarded(false, &ranges, None, true, &dead_at, true)
+    }
+
+    /// One forward mark for the pages this flush dirties.
+    ///
+    /// The body tail and its length are synced before the mark. Slot ranges
+    /// and meta are the image: a crash copies them onto the live files. Slot images start from the disk page and overlay only `ranges`,
+    /// so a neighbor byte stays. `full_slots` is the demoted slot image and
+    /// replaces whole pages that differ.
+    ///
+    /// `retire_deaths` drops the queued deaths once this commit is durable:
+    /// a full slot image or a timed persist's death ranges published each
+    /// row's current status, and a death sync published those deaths. A
+    /// failure after that point, such as the `tx.body` trim, does not bring
+    /// them back, or a later death sync could stamp a slot an admit reused.
+    fn commit_guarded(
+        &mut self,
+        body: bool,
+        slot_ranges: &[(usize, usize)],
+        full_slots: Option<&[u8]>,
+        meta: bool,
+        stamp_dead: &[usize],
+        retire_deaths: bool,
+    ) -> Result<(), MempoolError> {
+        let body_path = self.dir.join("tx.body");
+        let slots_path = self.slots_path();
+        let meta_path = self.dir.join("meta");
+        let slots_name = slots_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("slots")
+            .to_string();
+        self.settle_flush_mark(&body_path)?;
+        let logical = if body {
+            Some(self.append_body(&body_path)?)
+        } else {
+            None
+        };
+        let mut images: Vec<(String, u64, [u8; 4096])> = Vec::new();
+        self.collect_slot_images(
+            slot_ranges,
+            full_slots,
+            &slots_path,
+            &slots_name,
+            &mut images,
+        )?;
+        stamp_slot_dead(&slots_name, stamp_dead, &mut images);
+        if meta {
+            self.collect_meta_image(&meta_path, &mut images)?;
+        }
+        self.publish_flush_mark(images, retire_deaths)?;
+        // The slots that name the appended records are durable now.
+        match logical {
+            Some(logical) if logical != self.body_persisted_len => {
+                self.adopt_body_len(&body_path, logical)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Apply a `guard/flush` an earlier flush left armed, before this flush
+    /// reads any live page. A failed flush can have written some of its
+    /// pages, and this flush's clear drops every record of a file it syncs.
+    /// Once applied, that mark's admits are on disk, so its body length is
+    /// the durable one.
+    fn settle_flush_mark(&mut self, body_path: &Path) -> Result<(), MempoolError> {
+        if !self.flush_mark_armed {
+            return Ok(());
+        }
+        {
+            let _hold = rbitcoin_store::page_guard::hold_marks();
+            restore_mempool_mark(&self.dir)?;
+        }
+        // The disk body length is durable, so the next append starts there.
+        // It is not the slot watermark: the mark just restored may not hold
+        // the slots that name those records, and the next persist must write
+        // them. The watermark moves only when a mark publishes those slots.
+        let page0 = read_page(&mut self.body_file, body_path, 0)?;
+        let disk = le_u64!(page0, 8);
+        if disk <= body_logical_len(&self.body)? as u64 {
+            self.body_synced_len = self.body_synced_len.max(disk);
+        }
+        self.flush_mark_armed = false;
+        Ok(())
+    }
+
+    /// Append the new body records past the durable end, sync, then write
+    /// and sync the length in page 0. Under the sector rule this needs no
+    /// image: the records share no committed byte, and the 8-byte length
+    /// sits in one sector. A crash before the length keeps the old one and
+    /// ignores the bytes past it. The LIVE slots that name these records
+    /// arm after this, so they never name a record that is not durable.
+    ///
+    /// Returns the body length. The caller adopts it as the slot watermark,
+    /// and trims the file to it, once the slots commit.
+    fn append_body(&mut self, body_path: &Path) -> Result<u64, MempoolError> {
+        let logical = body_logical_len(&self.body)? as u64;
+        let old = self.body_synced_len.min(logical);
+        if logical <= old {
+            return Ok(logical);
+        }
+        pwrite_from(
+            &mut self.body_file,
+            body_path,
+            old,
+            old,
+            &self.body[old as usize..logical as usize],
+        )?;
+        self.body_file
             .durable_sync_data()
-            .map_err(|e| MempoolError::io(&path, e))?;
-        self.persist_meta()?;
+            .map_err(|e| MempoolError::io(body_path, e))?;
+        pwrite_from(&mut self.body_file, body_path, old, 8, &self.body[8..16])?;
+        self.body_file
+            .durable_sync_data()
+            .map_err(|e| MempoolError::io(body_path, e))?;
+        self.body_synced_len = logical;
+        Ok(logical)
+    }
+
+    fn collect_slot_images(
+        &mut self,
+        slot_ranges: &[(usize, usize)],
+        full_slots: Option<&[u8]>,
+        slots_path: &Path,
+        slots_name: &str,
+        images: &mut Vec<(String, u64, [u8; 4096])>,
+    ) -> Result<(), MempoolError> {
+        let page = rbitcoin_store::page_guard::PAGE;
+        if let Some(ram) = full_slots {
+            let need = ram.len() as u64;
+            let have = self
+                .slots_file
+                .metadata()
+                .map_err(|e| MempoolError::io(slots_path, e))?
+                .len();
+            if need > self.slots_len_synced {
+                if need > have {
+                    self.slots_file
+                        .set_len(need)
+                        .map_err(|e| MempoolError::io(slots_path, e))?;
+                }
+                // The growth mark publishes `slot_cap` in page 0 and does not
+                // image the zero tail. The longer file has to be durable first.
+                #[cfg(debug_assertions)]
+                if grow_sync_fails(&self.dir) {
+                    return Err(MempoolError::io(
+                        slots_path,
+                        std::io::Error::other("injected slot growth sync failure"),
+                    ));
+                }
+                self.slots_file
+                    .durable_sync_all()
+                    .map_err(|e| MempoolError::io(slots_path, e))?;
+                self.slots_len_synced = need;
+            }
+            let mut page_off = 0u64;
+            while (page_off as usize) < ram.len() {
+                let mut image = read_page(&mut self.slots_file, slots_path, page_off)?;
+                let before = image;
+                let lo = page_off as usize;
+                let hi = (lo + page as usize).min(ram.len());
+                image[..hi - lo].copy_from_slice(&ram[lo..hi]);
+                if image != before {
+                    images.push((slots_name.to_string(), page_off, image));
+                }
+                page_off = page_off.saturating_add(page);
+            }
+        } else if !slot_ranges.is_empty() {
+            let mut pages: std::collections::BTreeMap<u64, [u8; 4096]> =
+                std::collections::BTreeMap::new();
+            for &(start, end) in slot_ranges {
+                if start >= end || end > self.slots.len() {
+                    continue;
+                }
+                let mut at = start;
+                while at < end {
+                    let page_off = (at as u64) & !(page - 1);
+                    let image = match pages.entry(page_off) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            let image = read_page(&mut self.slots_file, slots_path, page_off)?;
+                            entry.insert(image)
+                        }
+                    };
+                    let hi = end.min((page_off as usize).saturating_add(page as usize));
+                    let dst = at - page_off as usize;
+                    image[dst..dst + (hi - at)].copy_from_slice(&self.slots[at..hi]);
+                    at = hi;
+                }
+            }
+            for (off, image) in pages {
+                images.push((slots_name.to_string(), off, image));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_meta_image(
+        &mut self,
+        meta_path: &Path,
+        images: &mut Vec<(String, u64, [u8; 4096])>,
+    ) -> Result<(), MempoolError> {
+        let mut image = read_page(&mut self.meta_file, meta_path, 0)?;
+        let mut rec = [0u8; META_LEN];
+        write_meta_bytes(&mut rec, self.generation, self.slot_cap, self.live_count);
+        image[..META_LEN].copy_from_slice(&rec);
+        images.push(("meta".to_string(), 0, image));
+        Ok(())
+    }
+
+    fn publish_flush_mark(
+        &mut self,
+        images: Vec<(String, u64, [u8; 4096])>,
+        retire_deaths: bool,
+    ) -> Result<(), MempoolError> {
+        let slots_path = self.slots_path();
+        let slots_path = slots_path.as_path();
+        let meta_path = self.dir.join("meta");
+        let meta_path = meta_path.as_path();
+        if images.is_empty() {
+            if retire_deaths {
+                self.retire_deaths();
+            }
+            return Ok(());
+        }
+        let _hold = rbitcoin_store::page_guard::hold_marks();
+        let refs: Vec<(&str, u64, &[u8])> = images
+            .iter()
+            .map(|(name, off, image)| (name.as_str(), *off, image.as_slice()))
+            .collect();
+        let mark = self.dir.join("guard/flush");
+        let armed =
+            rbitcoin_store::page_guard::arm_page_guard_group(&mark, &refs).map_err(map_store);
+        #[cfg(debug_assertions)]
+        let armed = armed.and_then(|()| match take_fail_mempool_arm(&self.dir) {
+            true => Err(MempoolError::io(
+                &mark,
+                std::io::Error::other("injected mempool arm failure after rename"),
+            )),
+            false => Ok(()),
+        });
+        if let Err(e) = armed {
+            // The rename can land before the directory sync fails. A mark
+            // that may be visible stays armed until a commit clears it.
+            if mark.try_exists().unwrap_or(true) {
+                self.flush_mark_armed = true;
+            }
+            return Err(e);
+        }
+        self.flush_mark_armed = true;
+        #[cfg(debug_assertions)]
+        if take_fail_mempool_guard(&self.dir) {
+            return Err(MempoolError::io(
+                &mark,
+                std::io::Error::other("injected mempool guard failure"),
+            ));
+        }
+        for (name, off, image) in &images {
+            match name.as_str() {
+                "meta" => pwrite_at(&mut self.meta_file, meta_path, *off, image)?,
+                _ => pwrite_at(&mut self.slots_file, slots_path, *off, image)?,
+            }
+        }
+        let mut live: Vec<(&File, &Path)> = Vec::new();
+        let mut saw_slots = false;
+        let mut saw_meta = false;
+        for (name, _, _) in &images {
+            match name.as_str() {
+                "meta" => saw_meta = true,
+                _ => saw_slots = true,
+            }
+        }
+        if saw_slots {
+            live.push((&self.slots_file, slots_path));
+        }
+        if saw_meta {
+            live.push((&self.meta_file, meta_path));
+        }
+        rbitcoin_store::page_guard::clear_page_guard_files(&mark, &live).map_err(map_store)?;
+        self.flush_mark_armed = mark.exists();
+        if retire_deaths {
+            self.retire_deaths();
+        }
+        Ok(())
+    }
+
+    fn retire_deaths(&mut self) {
+        self.death_slots.clear();
         self.deaths_unsynced = false;
+    }
+
+    fn adopt_body_len(&mut self, path: &Path, logical: u64) -> Result<(), MempoolError> {
+        // The LIVE bytes are already synced and the mark is gone. A later
+        // `set_len` failure must not keep the old durable length, or a death
+        // of this tail is skipped.
+        self.body_persisted_len = logical;
+        #[cfg(debug_assertions)]
+        if take_fail_body_adopt(&self.dir) {
+            return Err(MempoolError::io(
+                path,
+                std::io::Error::other("injected tx.body trim failure"),
+            ));
+        }
+        self.body_file
+            .set_len(logical)
+            .map_err(|e| MempoolError::io(path, e))?;
         Ok(())
     }
 
@@ -1065,6 +1355,9 @@ impl Mempool {
         live_count: u32,
         live_body_bytes: u64,
     ) -> Result<(), MempoolError> {
+        // An interrupted flush mark still names the pre-compact pages. Apply
+        // it and drop it before the packed names replace those files.
+        restore_mempool_mark(&self.dir)?;
         let body_path = self.dir.join("tx.body");
         let slots_path = self.dir.join("slots");
         let body_tmp = self.dir.join("tx.body.tmp");
@@ -1082,25 +1375,254 @@ impl Mempool {
         self.body = body;
         self.body_file = body_file;
         self.body_persisted_len = logical as u64;
+        self.body_synced_len = logical as u64;
         self.last_persist_ms = self.now_ms();
         self.body_dirty = false;
         if let Err(e) = fs::rename(&slots_tmp, &slots_path) {
-            self.slots = slots;
-            self.slots_file = slots_file;
-            self.live_count = live_count;
-            self.live_body_bytes = live_body_bytes;
+            self.adopt_slot_table(slots, slots_file, live_count, live_body_bytes);
             self.slots_pending = true;
             // The body is committed. A failed meta leaves a stale live_count,
             // which open reconciles from the slot table.
             let _ = self.persist_meta();
             return Err(MempoolError::io(&slots_path, e));
         }
+        self.adopt_slot_table(slots, slots_file, live_count, live_body_bytes);
+        self.persist_meta()
+    }
+
+    /// The packed table is the table. Dead rows are gone and the rest moved,
+    /// so indexes recorded against the previous table name different records.
+    fn adopt_slot_table(
+        &mut self,
+        slots: Vec<u8>,
+        slots_file: File,
+        live_count: u32,
+        live_body_bytes: u64,
+    ) {
+        // `write_file_synced` synced the whole packed table.
+        self.slots_len_synced = slots.len() as u64;
         self.slots = slots;
         self.slots_file = slots_file;
         self.live_count = live_count;
         self.live_body_bytes = live_body_bytes;
-        self.persist_meta()
+        self.death_slots.clear();
+        self.deaths_unsynced = false;
     }
+}
+
+/// Force status bytes to [`SLOT_DEAD`] on slot images this flush already built.
+///
+/// A one-byte death flush must not copy RAM: the slot may have been reused.
+fn stamp_slot_dead(slots_name: &str, offsets: &[usize], images: &mut [(String, u64, [u8; 4096])]) {
+    if offsets.is_empty() {
+        return;
+    }
+    let page = rbitcoin_store::page_guard::PAGE;
+    let by_page: std::collections::HashMap<u64, usize> = images
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _, _))| name == slots_name)
+        .map(|(i, (_, at, _))| (*at, i))
+        .collect();
+    for &off in offsets {
+        let page_off = (off as u64) & !(page - 1);
+        let dst = (off as u64 - page_off) as usize;
+        if let Some(&i) = by_page.get(&page_off) {
+            if let Some(byte) = images[i].2.get_mut(dst) {
+                *byte = SLOT_DEAD;
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+static FAIL_MEMPOOL_GUARD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The next mempool flush in `dir` arms `guard/flush`, then returns before
+/// the shared pages are written. The mark stays.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_mempool_guard_before_write(dir: &Path) {
+    FAIL_MEMPOOL_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_mempool_guard(dir: &Path) -> bool {
+    let mut armed = FAIL_MEMPOOL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == dir) else {
+        return false;
+    };
+    armed.remove(i);
+    true
+}
+
+#[cfg(debug_assertions)]
+static FAIL_MEMPOOL_ARM: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The next mempool flush in `dir` publishes `guard/flush`, then its arm
+/// returns an error, as a failed directory sync after the rename would.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_mempool_arm_after_rename(dir: &Path) {
+    FAIL_MEMPOOL_ARM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_mempool_arm(dir: &Path) -> bool {
+    let mut armed = FAIL_MEMPOOL_ARM.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == dir) else {
+        return false;
+    };
+    armed.remove(i);
+    true
+}
+
+#[cfg(debug_assertions)]
+static FAIL_GROW_SYNC: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// While set for `dir`, the sync that makes a longer `slots` file durable
+/// fails. It stays set until cleared, so a retry fails the same way.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_mempool_grow_sync_fails(dir: &Path, fails: bool) {
+    let mut armed = FAIL_GROW_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    armed.retain(|p| p != dir);
+    if fails {
+        armed.push(dir.to_path_buf());
+    }
+}
+
+#[cfg(debug_assertions)]
+fn grow_sync_fails(dir: &Path) -> bool {
+    FAIL_GROW_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == dir)
+}
+
+#[cfg(debug_assertions)]
+static FAIL_SIGOP_SYNC: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// While set for `dir`, the sync between the two sector writes of a sigop
+/// cost that crosses a sector fails.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_mempool_sigop_sync_fails(dir: &Path, fails: bool) {
+    let mut armed = FAIL_SIGOP_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    armed.retain(|p| p != dir);
+    if fails {
+        armed.push(dir.to_path_buf());
+    }
+}
+
+#[cfg(debug_assertions)]
+fn sigop_sync_fails(dir: &Path) -> bool {
+    FAIL_SIGOP_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p == dir)
+}
+
+#[cfg(debug_assertions)]
+static FAIL_BODY_ADOPT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// The next mempool flush in `dir` commits and clears its mark, then fails
+/// the `tx.body` trim that follows.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_mempool_body_adopt(dir: &Path) {
+    FAIL_BODY_ADOPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_body_adopt(dir: &Path) -> bool {
+    let mut armed = FAIL_BODY_ADOPT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(i) = armed.iter().position(|p| p == dir) else {
+        return false;
+    };
+    armed.remove(i);
+    true
+}
+
+fn map_store(e: rbitcoin_store::StoreError) -> MempoolError {
+    match e {
+        rbitcoin_store::StoreError::Io { path, source } => MempoolError::Io { path, source },
+        rbitcoin_store::StoreError::BadMagic => MempoolError::BadMagic,
+        other => map_store_status(other),
+    }
+}
+
+fn map_store_status(e: rbitcoin_store::StoreError) -> MempoolError {
+    match e {
+        rbitcoin_store::StoreError::BadSchema(v) => MempoolError::BadSchema(v),
+        rbitcoin_store::StoreError::Corrupt(s) => MempoolError::Corrupt(s),
+        other => MempoolError::io(
+            PathBuf::from("mempool"),
+            std::io::Error::other(other.to_string()),
+        ),
+    }
+}
+
+/// Copy `mempool/guard/flush` onto the live files before they are read.
+fn restore_mempool_mark(dir: &Path) -> Result<(), MempoolError> {
+    rbitcoin_store::page_guard::restore_page_guard_group(&dir.join("guard/flush"), dir)
+        .map(|_| ())
+        .map_err(map_store)
+}
+
+fn read_page(file: &mut File, path: &Path, off: u64) -> Result<[u8; 4096], MempoolError> {
+    let mut image = [0u8; 4096];
+    file.seek(SeekFrom::Start(off))
+        .map_err(|e| MempoolError::io(path, e))?;
+    let mut got = 0usize;
+    while got < image.len() {
+        match file.read(&mut image[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(MempoolError::io(path, e)),
+        }
+    }
+    Ok(image)
+}
+
+/// Write a page the current mark names. The whole file length counts as
+/// committed.
+fn pwrite_at(file: &mut File, path: &Path, off: u64, bytes: &[u8]) -> Result<(), MempoolError> {
+    let committed = file
+        .metadata()
+        .map_err(|e| MempoolError::io(path, e))?
+        .len();
+    pwrite_from(file, path, committed, off, bytes)
+}
+
+/// Write `bytes` at `off`. A range that shares a block below `committed`
+/// has to be a page the current mark names.
+fn pwrite_from(
+    file: &mut File,
+    path: &Path,
+    committed: u64,
+    off: u64,
+    bytes: &[u8],
+) -> Result<(), MempoolError> {
+    rbitcoin_store::page_guard::check_armed_write(path, committed, off, bytes.len() as u64)
+        .map_err(map_store)?;
+    file.seek(SeekFrom::Start(off))
+        .map_err(|e| MempoolError::io(path, e))?;
+    file.write_all(bytes)
+        .map_err(|e| MempoolError::io(path, e))?;
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -1119,11 +1641,19 @@ pub fn body_logical_len(body: &[u8]) -> Result<usize, MempoolError> {
 
 #[doc(hidden)]
 pub fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<File, MempoolError> {
-    let mut f = File::create(path).map_err(|e| MempoolError::io(path, e))?;
-    f.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
-    f.durable_sync_all()
-        .map_err(|e| MempoolError::io(path, e))?;
-    Ok(f)
+    {
+        // `File::create` is write-only. The flush mark reads the live page
+        // back, and a write-only fd returns EBADF on that read.
+        let mut f = File::create(path).map_err(|e| MempoolError::io(path, e))?;
+        f.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
+        f.durable_sync_all()
+            .map_err(|e| MempoolError::io(path, e))?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| MempoolError::io(path, e))
 }
 
 /// Finish a compact install interrupted after the body rename.
@@ -1171,10 +1701,21 @@ pub fn quarantine_sidecar(dir: &Path) -> Result<PathBuf, MempoolError> {
         dest = dir.join(format!("torn-{secs}-{n}"));
     }
     fs::create_dir(&dest).map_err(|e| MempoolError::io(&dest, e))?;
-    for name in ["meta", "slots", "tx.body", "slots.tmp", "tx.body.tmp"] {
+    for name in [
+        "meta",
+        "slots",
+        "tx.body",
+        "slots.tmp",
+        "tx.body.tmp",
+        "guard/flush",
+    ] {
         let src = dir.join(name);
         if src.exists() {
-            fs::rename(&src, dest.join(name)).map_err(|e| MempoolError::io(&src, e))?;
+            let to = dest.join(name);
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent).map_err(|e| MempoolError::io(parent, e))?;
+            }
+            fs::rename(&src, &to).map_err(|e| MempoolError::io(&src, e))?;
         }
     }
     Ok(dest)
@@ -1275,9 +1816,21 @@ pub fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>),
         buf[8..12].copy_from_slice(&slot_cap.to_le_bytes());
         file.write_all(&buf)
             .map_err(|e| MempoolError::io(path, e))?;
-        file.flush().map_err(|e| MempoolError::io(path, e))?;
+        sync_new_file(&file, path)?;
         Ok((file, buf))
     }
+}
+
+/// A new `slots` or `tx.body` is the base later marks patch in place, and
+/// its length is taken as durable. Sync its bytes and its directory entry.
+fn sync_new_file(file: &File, path: &Path) -> Result<(), MempoolError> {
+    file.durable_sync_all()
+        .map_err(|e| MempoolError::io(path, e))?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
+        rbitcoin_store::file::fsync_parent_dir(dir).map_err(|e| MempoolError::io(dir, e))?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -1322,7 +1875,7 @@ pub fn open_or_init_body(path: &Path) -> Result<(File, Vec<u8>), MempoolError> {
         buf[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
         file.write_all(&buf)
             .map_err(|e| MempoolError::io(path, e))?;
-        file.flush().map_err(|e| MempoolError::io(path, e))?;
+        sync_new_file(&file, path)?;
         Ok((file, buf))
     }
 }

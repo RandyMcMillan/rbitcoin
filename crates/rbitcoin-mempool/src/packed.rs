@@ -130,9 +130,8 @@ pub fn decode_packed(
         let mut word = [0u8; 8];
         word.copy_from_slice(&buf[16..24]);
         let v = u64::from_le_bytes(word);
-        // Above the block limit is unknown: covers SIGOP_COST_UNKNOWN and a
-        // torn in-place write-back (0xFF.. partly overwritten, see
-        // `Mempool::set_sigop_cost`), which always overestimates.
+        // Above the block limit is unknown: SIGOP_COST_UNKNOWN, or a write-back
+        // that crashed after its low sector (`Mempool::set_sigop_cost`).
         (v <= crate::graph::MAX_BLOCK_SIGOPS_COST).then_some(v)
     } else {
         None

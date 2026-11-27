@@ -705,11 +705,11 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head/meta` (**v2**: per-segment `sealed` and `tagged` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` |
+| Files | `tx.head/meta` (**v2**: per-segment `sealed`, `tagged`, and `mlt` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` + `.mlt` |
 | Default | **BITS=25**, **4 B** entries → **128 MiB** per segment (`2^25` slots) |
 | Bits | Tiny **16**, otherwise **25**. No process env. The entry is always 4 B; a footer that says 8 B **refuses** (`tx.head footer entry width`) |
 | Entry | LE u32 word `rel \| fp << bits`. Low `bits`: **relative** create id, **0 = empty**, `fk = first_fk + rel − 1`. Spare high bits: fingerprint of the mixed key, `1..=2^(32−bits)−1`; **0 = untagged**, matches every key. No fingerprint at bits 32 |
-| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A |
+| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A. The `mlt` flag (value 4) is set when seal renames `NNNNNN.mlt`, including an empty 4-byte image. A segment without the flag and no `.mlt` is an empty multi-list. The flag set with a missing or short file is unreadable (`tx.head mlt missing` / `tx.head mlt short`) and is not an index refuse: open wipes `tx.head` and rebuilds it from `txid.body`. No meta version bump |
 | Capacity | Segment ends at **80% of head slots** (`max_keys`) → open the next private table, seal the previous on a sidecar. Class A loc/body size does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode — **refused** (wipe `store/tx.head` and `store/scripthash*`; Class A kept) |

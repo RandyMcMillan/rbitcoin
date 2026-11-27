@@ -11,17 +11,18 @@
 //!
 //! **Commit model:** body tail complete → slot LIVE → RAM graph. No fsync per
 //! tx. Admits persist on a 5 s timer ([`ActiveMempool::persist_due`]); that path
-//! appends the body tail and `pwrite`s only new LIVE slot records. Tip-follow
-//! drives it from the perf tick. Confirm/RBF DEAD of an already-durable slot
-//! is a one-byte `pwrite`. The removal's owner `fdatasync`s `slots` once, then
-//! `meta` (a block's confirms and conflict spends share that pair; not a full
-//! slot dump, not one sync per tx).
-//! [`ActiveMempool::flush`] bumps `G`, rewrites slots, and `sync_data`s. Crash
-//! may lose ≤5 s of admits; never LIVE slots past durable `tx.body`. Leftover
-//! schema 1–3 converts on open. Schema 1 has empty vin aux (SH reindex
-//! batch-fills), schema ≤ 2 has unknown sigops until the hub recomputes them,
-//! and every upgraded record takes the migrate's wall-clock second as its
-//! accept time.
+//! appends and syncs the body tail and its length, then publishes one
+//! `mempool/guard/flush` mark covering the new LIVE slot records, any
+//! durable DEAD bytes, and `meta`. Tip-follow drives admits from the perf
+//! tick. A removal (`remove_block_txids`, RBF, expiry, `remove_txid`)
+//! publishes its DEAD bytes on that same mark immediately, without waiting for
+//! the tick (not a one-byte pwrite, not a full slot dump, not one sync per tx).
+//! [`ActiveMempool::flush`] bumps `G` and publishes the body, the slot table,
+//! and `meta` in that mark. `tx.body` is not renamed. Crash may lose ≤5 s of
+//! admits; never LIVE slots past durable `tx.body`. Leftover schema 1–3
+//! converts on open. Schema 1 has empty vin aux (SH reindex batch-fills),
+//! schema ≤ 2 has unknown sigops until the hub recomputes them, and every
+//! upgraded record takes the migrate's wall-clock second as its accept time.
 //!
 //! Packed decode uses stored txid/wtxid (no SHA256d). Vin aux is hashed at
 //! admit from resolved prevouts. Compact copies packed payload ranges; an

@@ -1766,6 +1766,30 @@ fn remove_txid_notes_extra_compact() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A durable removal whose death mark fails reports the failure. The graph
+/// entry is already gone and the death stays queued for the next persist.
+#[cfg(debug_assertions)]
+#[test]
+fn remove_txid_reports_a_failed_death_publication() {
+    let dir = tmp_dir();
+    let (op, txout, utxos) = chain_utxo(100_000);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tx = spend_tx(op, txout.value.to_sat() - 1_000);
+    let txid = tx.compute_txid();
+    mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+    mp.flush().unwrap();
+    rbitcoin_mempool::store::fail_next_mempool_guard_before_write(&dir);
+    assert!(
+        mp.remove_txid(&txid, BLOCK).is_err(),
+        "the death mark failed but the removal returned Ok"
+    );
+    mp.flush().unwrap();
+    drop(mp);
+    let mp = ActiveMempool::open_or_create(&dir).unwrap();
+    assert_eq!(mp.live_count(), 0, "the retried death must reach disk");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn remove_live_txids_deaths_survive_reopen() {
     let dir = tmp_dir();

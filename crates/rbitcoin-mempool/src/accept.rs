@@ -2782,9 +2782,12 @@ impl ActiveMempool {
     }
 
     /// Durable remove one live tx (confirm / RBF / eviction).
+    ///
+    /// An `Err` from the death mark comes back after the graph entry is
+    /// gone. The death stays queued, and the next persist publishes it.
     pub fn remove_txid(&mut self, txid: &Txid, removal: Removal) -> Result<(), AcceptError> {
         self.unlink_txid(txid, removal)?;
-        let _ = self.store.sync_deaths();
+        self.store.sync_deaths()?;
         Ok(())
     }
 

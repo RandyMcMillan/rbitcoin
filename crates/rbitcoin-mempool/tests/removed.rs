@@ -177,6 +177,40 @@ fn a_failed_slots_rename_keeps_later_removals() {
     assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
 }
 
+/// After a failed slots rename, slot writes go to `slots.tmp`, so a flush
+/// mark armed then names `slots.tmp`. Open must apply that mark before it
+/// links `slots.tmp` into place, or the images land on a fresh file and the
+/// removal they publish is lost.
+#[cfg(debug_assertions)]
+#[test]
+fn open_applies_a_slots_tmp_mark_before_linking_it() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(4);
+    let mut mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    let txs: Vec<_> = ops.iter().map(|op| spend(*op, 99_000)).collect();
+    for tx in &txs {
+        mp.accept_tx(tx, &utxos, TIP_OK).expect("admit");
+    }
+    mp.flush().unwrap();
+    let slots = dir.path().join("slots");
+    fs::remove_file(&slots).unwrap();
+    fs::create_dir(&slots).unwrap();
+    assert!(mp.compact().is_err());
+    // The removal's death mark is armed and then its pages are never written.
+    rbitcoin_mempool::store::fail_next_mempool_guard_before_write(dir.path());
+    assert!(mp.remove_txid(&txs[3].compute_txid(), BLOCK).is_err());
+    assert!(dir.path().join("guard/flush").is_file());
+    fs::remove_dir(&slots).unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
+    let mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    assert!(
+        mp.get_tx(&txs[3].compute_txid()).is_none(),
+        "the removal in the slots.tmp mark was lost"
+    );
+    assert_eq!(mp.live_count(), 3);
+}
+
 fn out0(tx: &Transaction) -> OutPoint {
     OutPoint {
         txid: tx.compute_txid(),

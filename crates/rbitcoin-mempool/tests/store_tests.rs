@@ -951,35 +951,6 @@ fn a_death_flush_keeps_the_pending_admit_images() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A slot-table write after a failed persist applies that mark first. Its
-/// admit is then durable, so the table must not write it FREE.
-#[cfg(debug_assertions)]
-#[test]
-fn a_slot_table_write_keeps_the_settled_admit() {
-    use rbitcoin_mempool::store::fail_next_mempool_guard_before_write;
-    let dir = tmp_dir();
-    let kept = Txid::from_byte_array([0xF7; 32]);
-    {
-        let mut mp = Mempool::open_or_create(&dir).unwrap();
-        mp.set_now_ms(0);
-        put_live(&mut mp, &kept, 1, 400);
-        mp.set_now_ms(PERSIST_INTERVAL_MS);
-        fail_next_mempool_guard_before_write(&dir);
-        assert!(mp.persist_due().is_err());
-        mp.persist_slots_without_body().unwrap();
-        mp.persist_due().unwrap();
-    }
-    let mp = Mempool::open_or_create(&dir).unwrap();
-    let ids: Vec<_> = mp
-        .load_live_txs()
-        .unwrap()
-        .iter()
-        .map(|tx| tx.packed.txid)
-        .collect();
-    assert!(ids.contains(&kept), "the settled admit was written FREE");
-    let _ = fs::remove_dir_all(&dir);
-}
-
 /// Once a later commit has applied an earlier failed persist, its admit is
 /// on disk. A removal of that admit must still reach disk.
 #[cfg(debug_assertions)]

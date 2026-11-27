@@ -1783,8 +1783,11 @@ fn remove_txid_reports_a_failed_death_publication() {
         mp.remove_txid(&txid, BLOCK).is_err(),
         "the death mark failed but the removal returned Ok"
     );
-    mp.flush().unwrap();
-    drop(mp);
+    // A death-only retry: a full flush would publish the slot DEAD from RAM
+    // whether or not the death stayed queued.
+    mp.store.sync_deaths().unwrap();
+    // The process dies here: nothing flushes on the way out.
+    std::mem::forget(mp);
     let mp = ActiveMempool::open_or_create(&dir).unwrap();
     assert_eq!(mp.live_count(), 0, "the retried death must reach disk");
     let _ = std::fs::remove_dir_all(&dir);

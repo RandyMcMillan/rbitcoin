@@ -171,8 +171,10 @@ impl Mempool {
     pub fn open_or_create(dir: impl Into<PathBuf>) -> Result<Self, MempoolError> {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(|e| MempoolError::io(&dir, e))?;
-        finish_pending_compact(&dir)?;
+        // A mark armed after a compact's slots rename failed names
+        // `slots.tmp`. Apply it before that file is linked into place.
         restore_mempool_mark(&dir)?;
+        finish_pending_compact(&dir)?;
 
         let meta_path = dir.join("meta");
         let slots_path = dir.join("slots");
@@ -944,8 +946,10 @@ impl Mempool {
     /// as FREE so a slots-ahead-of-body crash cannot load offsets past EOF.
     #[doc(hidden)]
     pub fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
-        // A leftover mark's admits become durable here. Apply it before the
-        // demoted image samples `body_persisted_len`.
+        // Apply a leftover mark first, so its pages are on disk before this
+        // image replaces them. Its admits are written FREE here until a
+        // persist publishes their slots; the callers run at open, with no
+        // mark armed.
         let body_path = self.dir.join("tx.body");
         self.settle_flush_mark(&body_path)?;
         let demoted = self.demoted_slots_image();

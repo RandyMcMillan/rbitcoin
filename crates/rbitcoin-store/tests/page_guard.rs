@@ -914,6 +914,52 @@ fn clear_sh_marks_retry_syncs_the_guard_dir() {
         .expect("the synced retry releases the file");
 }
 
+/// `restore_sh_marks` copies the last `sh-*` mark, unlinks it, and then
+/// fails the `guard/` sync, which blocks the file. A retry in the same
+/// process finds no mark; it must still sync `guard/` and release the file,
+/// or committed writes stay refused until a restart.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn restore_sh_marks_retry_with_no_mark_releases_the_blocked_file() {
+    let dir = TempDir::labeled("page-guard-sh-restore-retry").unwrap();
+    let (file, _path) = committed_body(&dir);
+    arm_page0(&dir, "guard/sh-ovf");
+    let guard = dir.path().join("guard");
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&guard);
+    assert!(rbitcoin_store::page_guard::restore_sh_marks(dir.path()).is_err());
+    assert!(!guard.join("sh-ovf").exists(), "the unlink landed");
+    assert!(
+        file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
+        "the file took a write before the unlink was durable"
+    );
+    rbitcoin_store::page_guard::restore_sh_marks(dir.path()).unwrap();
+    file.write_at(PAGE as u64, &[0x77; 16])
+        .expect("the synced retry releases the file");
+}
+
+/// `restore_page_guard_group_fit` unlinks its mark and then fails the
+/// `guard/` sync. A retry on the same mark finds it gone; it must still sync
+/// `guard/` and release the file before it returns `Ok(false)`.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn restore_fit_retry_with_no_mark_releases_the_blocked_file() {
+    let dir = TempDir::labeled("page-guard-fit-restore-retry").unwrap();
+    let (file, _path) = committed_body(&dir);
+    arm_page0(&dir, "guard/sh-ovf");
+    let guard = dir.path().join("guard");
+    let mark = guard.join("sh-ovf");
+    rbitcoin_store::page_guard::fail_next_mark_dir_sync(&guard);
+    assert!(restore_page_guard_group_fit(&mark, dir.path()).is_err());
+    assert!(!mark.exists(), "the unlink landed");
+    assert!(
+        file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
+        "the file took a write before the unlink was durable"
+    );
+    assert!(!restore_page_guard_group_fit(&mark, dir.path()).unwrap());
+    file.write_at(PAGE as u64, &[0x77; 16])
+        .expect("the synced retry releases the file");
+}
+
 /// `clear_sh_marks` unlinks `sh-a`, then fails to unlink `sh-b`. The file
 /// `sh-a` named stays blocked, because that unlink is not durable yet, and
 /// the retry that finds `sh-a` gone still releases it once `guard/` syncs.

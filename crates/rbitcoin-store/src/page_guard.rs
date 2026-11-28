@@ -312,10 +312,18 @@ fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<Option<Vec<PathBuf
 /// with the full page.
 #[doc(hidden)]
 pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
-    mark_parent(mark)?;
+    let parent = mark_parent(mark)?;
     let raw = match std::fs::read(mark) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A retry after a failed sync finds no mark; its sync releases
+            // the files that unlink left pending. No `guard/` means no mark
+            // change to make durable.
+            if parent.is_dir() {
+                sync_mark_dir_then_release(parent, &[])?;
+            }
+            return Ok(false);
+        }
         Err(e) => return Err(StoreError::io(mark, e)),
     };
     let pages = mark_group_pages(&raw)?;
@@ -574,7 +582,10 @@ pub fn restore_sh_marks(dir: &Path) -> Result<(), StoreError> {
     for name in names {
         restore_page_guard_group_fit(&guard.join(name), dir)?;
     }
-    Ok(())
+    // Sync even when no mark was left: a retry after a failed sync finds
+    // none, and the files that unlink blocked stay pending until `guard/`
+    // syncs.
+    sync_mark_dir_then_release(&guard, &[])
 }
 
 /// Drop every `guard/sh-*` mark. Missing is `Ok`.

@@ -296,6 +296,8 @@ fn open_indexes_an_unnamed_row_below_a_named_one() {
         at,
         bytes: &rows,
         new_logical: at + rows.len() as u64,
+        length_wave: 0,
+        length_order: 0,
     }])
     .unwrap();
     t.head.insert_many(&[(c.hash, Fk(3))]).unwrap();

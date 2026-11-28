@@ -747,3 +747,198 @@ fn open_keeps_a_pair_whose_files_it_cannot_stat() {
     let t = BlockFilterTable::open(&dir).unwrap();
     assert_eq!(t.next_height(), Height(3));
 }
+
+/// A filter put and a tweak put in one seal share three barriers. Both body
+/// lengths are in their headers before either idx length is written.
+#[cfg(debug_assertions)]
+#[test]
+fn a_filter_and_tweak_seal_is_three_barriers() {
+    use rbitcoin_store::sp_tweaks::SpTweaksTable;
+    let dir = tmp_dir();
+    let filters = BlockFilterTable::open_or_create(&dir).unwrap();
+    let tweaks = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    let filter_dirs = BlockFilterTable::seg_dirs(&dir);
+    let paths = vec![
+        filter_dirs.body_path(0),
+        filter_dirs.idx_path(0),
+        SpTweaksTable::body_dir(&dir).join("000000"),
+        SpTweaksTable::idx_dir(&dir).join("000000"),
+    ];
+    let body = vec![1u8, 2, 3];
+    let recs = [BlockFilterRecord {
+        height: Height(0),
+        slot: slot(0),
+        filter: &body,
+    }];
+    let mut tweak = [0u8; 33];
+    tweak[0] = 0x02;
+    let row = [Some(tweak)];
+    let items = [(Height(0), row.as_slice())];
+    rbitcoin_store::file::arm_sync_barrier_trace(&paths);
+    seal_filter_and_tweak_puts(&filters, &recs, &tweaks, &items).unwrap();
+    let barriers = rbitcoin_store::file::take_sync_barrier_trace();
+    assert_eq!(barriers.len(), 3, "{barriers:?}");
+    assert_eq!(barriers[0].synced.len(), 4, "{barriers:?}");
+    assert!(
+        barriers[0]
+            .headers
+            .iter()
+            .all(|(_, len)| *len == FILE_HEADER_LEN as u64),
+        "payload barrier wrote a length: {:?}",
+        barriers[0].headers
+    );
+    let mut body_paths = vec![paths[0].clone(), paths[2].clone()];
+    let mut idx_paths = vec![paths[1].clone(), paths[3].clone()];
+    body_paths.sort();
+    idx_paths.sort();
+    let mut synced1 = barriers[1].synced.clone();
+    let mut synced2 = barriers[2].synced.clone();
+    synced1.sort();
+    synced2.sort();
+    assert_eq!(synced1, body_paths, "{barriers:?}");
+    assert_eq!(synced2, idx_paths, "{barriers:?}");
+    let old = FILE_HEADER_LEN as u64;
+    let header = |path: &std::path::Path| {
+        barriers[1]
+            .headers
+            .iter()
+            .find(|(watched, _)| watched == path)
+            .map(|(_, len)| *len)
+            .unwrap_or(0)
+    };
+    assert!(header(&paths[0]) > old, "{barriers:?}");
+    assert!(header(&paths[2]) > old, "{barriers:?}");
+    assert_eq!(header(&paths[1]), old, "{barriers:?}");
+    assert_eq!(header(&paths[3]), old, "{barriers:?}");
+    assert_eq!(filters.next_height(), Height(1));
+    assert_eq!(tweaks.next_height(), Height(1));
+}
+
+/// The tweak table has already rolled, so its live segment id is 1 and the
+/// filter table is still on 0. This seal rolls neither. Both index lengths
+/// still share the third wait.
+#[cfg(debug_assertions)]
+#[test]
+fn different_segment_ids_still_seal_in_three_barriers() {
+    use rbitcoin_store::sp_tweaks::SpTweaksTable;
+    let dir = tmp_dir();
+    let tweaks = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    tweaks.put_block(Height(0), &[None]).unwrap();
+    tweaks.flush().unwrap();
+    drop(tweaks);
+
+    let tweak_dirs = SpTweaksTable::seg_dirs(&dir);
+    let start = u32::MAX;
+    set_file_hwm(&tweak_dirs.body_path(0), u64::from(start) + 1);
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .open(tweak_dirs.body_path(0))
+            .unwrap();
+        f.seek(SeekFrom::Start(u64::from(start))).unwrap();
+        f.write_all(&[0u8]).unwrap();
+    }
+    {
+        let mut raw = fs::read(tweak_dirs.idx_path(0)).unwrap();
+        raw[FILE_HEADER_LEN..FILE_HEADER_LEN + 4].copy_from_slice(&start.to_le_bytes());
+        fs::write(tweak_dirs.idx_path(0), &raw).unwrap();
+    }
+    let tweaks = SpTweaksTable::open(&dir).unwrap();
+    tweaks
+        .put_block(Height(1), &[None])
+        .expect("next start rolls onto segment 1");
+    assert!(tweak_dirs.body_path(1).is_file());
+
+    let filters = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&filters, 0, 0);
+    let filter_dirs = BlockFilterTable::seg_dirs(&dir);
+    let paths = vec![
+        filter_dirs.body_path(0),
+        filter_dirs.idx_path(0),
+        tweak_dirs.body_path(1),
+        tweak_dirs.idx_path(1),
+    ];
+    let body = vec![1u8, 2, 3];
+    let recs = [BlockFilterRecord {
+        height: Height(1),
+        slot: slot(1),
+        filter: &body,
+    }];
+    let row = [None];
+    let items = [(Height(2), row.as_slice())];
+    rbitcoin_store::file::arm_sync_barrier_trace(&paths);
+    seal_filter_and_tweak_puts(&filters, &recs, &tweaks, &items).unwrap();
+    let barriers = rbitcoin_store::file::take_sync_barrier_trace();
+    assert_eq!(barriers.len(), 3, "{barriers:?}");
+    let mut idx_paths = vec![paths[1].clone(), paths[3].clone()];
+    idx_paths.sort();
+    let mut synced = barriers[2].synced.clone();
+    synced.sort();
+    assert_eq!(synced, idx_paths, "{barriers:?}");
+}
+
+/// A seal that rolls one table still syncs that table's earlier index
+/// before it writes the new segment's index length. The other table's
+/// index shares the earlier wait.
+#[cfg(debug_assertions)]
+#[test]
+fn a_rolled_index_stays_behind_the_other_tables_index() {
+    use rbitcoin_store::sp_tweaks::SpTweaksTable;
+    let dir = tmp_dir();
+    let tweaks = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    tweaks.put_block(Height(0), &[None]).unwrap();
+    tweaks.flush().unwrap();
+    drop(tweaks);
+    let tweak_dirs = SpTweaksTable::seg_dirs(&dir);
+    set_file_hwm(&tweak_dirs.body_path(0), u64::from(u32::MAX - 4));
+    let tweaks = SpTweaksTable::open(&dir).unwrap();
+    let filters = BlockFilterTable::open_or_create(&dir).unwrap();
+    let filter_dirs = BlockFilterTable::seg_dirs(&dir);
+    let body = vec![9u8, 9];
+    let recs = [BlockFilterRecord {
+        height: Height(0),
+        slot: slot(0),
+        filter: &body,
+    }];
+    let fat: Vec<Option<[u8; 33]>> = vec![None; 20];
+    let one = [None];
+    let items = [(Height(1), fat.as_slice()), (Height(2), one.as_slice())];
+    let paths = vec![
+        filter_dirs.body_path(0),
+        filter_dirs.idx_path(0),
+        tweak_dirs.body_path(0),
+        tweak_dirs.idx_path(0),
+        tweak_dirs.body_path(1),
+        tweak_dirs.idx_path(1),
+    ];
+    rbitcoin_store::file::arm_sync_barrier_trace(&paths);
+    seal_filter_and_tweak_puts(&filters, &recs, &tweaks, &items).unwrap();
+    let barriers = rbitcoin_store::file::take_sync_barrier_trace();
+    // Creating the rolled pair syncs its new files before the commit.
+    assert!(barriers.len() >= 4, "{barriers:?}");
+    let seal = barriers.len() - 4;
+    let header = |barrier: usize, path: &Path| -> u64 {
+        barriers[barrier]
+            .headers
+            .iter()
+            .find(|(watched, _)| watched == path)
+            .map(|(_, len)| *len)
+            .unwrap_or(0)
+    };
+    let old = FILE_HEADER_LEN as u64;
+    assert!(header(seal + 2, &paths[1]) > old, "{barriers:?}");
+    assert!(header(seal + 2, &paths[3]) > old, "{barriers:?}");
+    assert_eq!(header(seal + 2, &paths[5]), old, "{barriers:?}");
+    assert!(header(seal + 3, &paths[5]) > old, "{barriers:?}");
+    let mut earlier = vec![paths[1].clone(), paths[3].clone()];
+    earlier.sort();
+    let mut synced = barriers[seal + 2].synced.clone();
+    synced.sort();
+    assert_eq!(synced, earlier, "{barriers:?}");
+    assert_eq!(
+        barriers[seal + 3].synced,
+        vec![paths[5].clone()],
+        "{barriers:?}"
+    );
+    assert!(tweak_dirs.body_path(1).is_file());
+}

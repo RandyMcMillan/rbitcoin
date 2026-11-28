@@ -315,6 +315,8 @@ impl MultiList {
             at,
             bytes: &bytes,
             new_logical: at + bytes.len() as u64,
+            length_wave: 0,
+            length_order: 0,
         }])?;
         pending.clear();
         Ok(())

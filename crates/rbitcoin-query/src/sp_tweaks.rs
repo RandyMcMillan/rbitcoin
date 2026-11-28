@@ -508,10 +508,32 @@ impl Query {
         Some(self.sptweaks_next_height()?.0.max(origin))
     }
 
-    #[allow(clippy::type_complexity)] // packed (fk, range) / span row is the on-disk shape
+    /// `true` when `items` is the next tweak height and each `confirmed[h]`
+    /// is still that header. Empty, a moved watermark, or a reorg is `false`.
+    pub(crate) fn tweak_rows_still_next(
+        &self,
+        next: Height,
+        items: impl IntoIterator<Item = (Height, Fk)>,
+    ) -> Result<bool, QueryError> {
+        let mut items = items.into_iter();
+        let Some((height, header_fk)) = items.next() else {
+            return Ok(false);
+        };
+        if height != next || self.store.confirmed.get(height)? != Some(header_fk) {
+            return Ok(false);
+        }
+        for (height, header_fk) in items {
+            if self.store.confirmed.get(height)? != Some(header_fk) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Commit tweak records for consecutive heights (a window) under the
     /// index write-behind lock. Returns heights committed; 0 when the table's
     /// next height or a `confirmed[h]` moved (a reorg).
+    #[allow(clippy::type_complexity)] // packed (fk, range) / span row is the on-disk shape
     pub fn commit_window_tweaks(
         &self,
         items: &[(Height, Fk, Vec<Option<[u8; 33]>>)],
@@ -521,13 +543,8 @@ impl Query {
         let Some(t) = g.as_ref() else {
             return Ok(0);
         };
-        if items.first().is_none_or(|i| i.0 != t.next_height()) {
+        if !self.tweak_rows_still_next(t.next_height(), items.iter().map(|(h, fk, _)| (*h, *fk)))? {
             return Ok(0);
-        }
-        for (h, header_fk, _) in items {
-            if self.store.confirmed.get(*h)? != Some(*header_fk) {
-                return Ok(0);
-            }
         }
         let refs: Vec<(Height, &[Option<[u8; 33]>])> =
             items.iter().map(|(h, _, r)| (*h, r.as_slice())).collect();

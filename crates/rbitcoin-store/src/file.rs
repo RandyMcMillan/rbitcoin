@@ -342,6 +342,81 @@ fn note_fsynced_dir(dir: &Path) {
     }
 }
 
+/// One sync barrier: the files it waits on, and the header length of each
+/// watched path at the moment the wait starts.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct SyncBarrier {
+    pub synced: Vec<PathBuf>,
+    pub headers: Vec<(PathBuf, u64)>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SYNC_BARRIER_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SYNC_BARRIER_WATCH: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static SYNC_BARRIERS: std::cell::RefCell<Vec<SyncBarrier>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record each later sync barrier on this thread until [`take_sync_barrier_trace`].
+///
+/// `watch` is snapshotted at every barrier, including files the barrier does
+/// not sync, so a test can see a length that has not been written yet.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_sync_barrier_trace(watch: &[PathBuf]) {
+    SYNC_BARRIER_TRACE.with(|on| on.set(true));
+    SYNC_BARRIER_WATCH.with(|w| *w.borrow_mut() = watch.to_vec());
+    SYNC_BARRIERS.with(|b| b.borrow_mut().clear());
+}
+
+/// Stop recording and return the barriers since [`arm_sync_barrier_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_sync_barrier_trace() -> Vec<SyncBarrier> {
+    SYNC_BARRIER_TRACE.with(|on| on.set(false));
+    SYNC_BARRIERS.with(|b| std::mem::take(&mut *b.borrow_mut()))
+}
+
+#[cfg(debug_assertions)]
+fn header_u64(path: &Path) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    if file.seek(SeekFrom::Start(8)).is_err() {
+        return 0;
+    }
+    let mut bytes = [0u8; 8];
+    if file.read_exact(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(bytes)
+}
+
+#[cfg(debug_assertions)]
+fn note_sync_barrier(paths: &[&Path]) {
+    if !SYNC_BARRIER_TRACE.with(|on| on.get()) {
+        return;
+    }
+    let headers = SYNC_BARRIER_WATCH.with(|watch| {
+        watch
+            .borrow()
+            .iter()
+            .map(|path| (path.clone(), header_u64(path)))
+            .collect()
+    });
+    SYNC_BARRIERS.with(|barriers| {
+        barriers.borrow_mut().push(SyncBarrier {
+            synced: paths.iter().map(|path| path.to_path_buf()).collect(),
+            headers,
+        });
+    });
+}
+
 /// Trailing-header tables (`tx.head`): 16-byte store identity + 16-byte layout
 /// extension (bits / entry width / generation). Slots still start at file offset 0
 /// so probe pages stay OS-page-aligned.
@@ -1631,6 +1706,8 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
+        #[cfg(debug_assertions)]
+        note_sync_barrier(&[&self.path]);
         #[cfg(feature = "write-probe")]
         let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_file());
         self.read_file
@@ -1675,11 +1752,61 @@ impl TableFile {
                 ));
             }
         }
+        #[cfg(debug_assertions)]
+        {
+            let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
+            note_sync_barrier(&paths);
+        }
         // The io_uring `Fsync` ops below never reach `Durable`.
         #[cfg(debug_assertions)]
         if crate::durability::flushes_skipped() {
             return Ok(());
         }
+        Self::durable_sync_overlapped(files, extra)
+    }
+
+    /// One overlapped sync of lengths already written into the headers.
+    ///
+    /// `fail_flush` still applies. `fail_sync` does not: that injection is
+    /// the payload barrier. A successful return clears `needs_sync`.
+    pub(crate) fn sync_length_wave(files: &[&TableFile]) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        for f in files {
+            if crate::io_handle::take_fail_flush(f.io_handle()) {
+                return Err(StoreError::io(
+                    &f.path,
+                    std::io::Error::from_raw_os_error(5),
+                ));
+            }
+        }
+        for f in files {
+            f.needs_sync.store(false, Ordering::Release);
+        }
+        let synced = Self::sync_published_lengths(files);
+        if synced.is_err() {
+            for f in files {
+                f.needs_sync.store(true, Ordering::Release);
+            }
+        }
+        synced
+    }
+
+    fn sync_published_lengths(files: &[&TableFile]) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        {
+            let paths: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
+            note_sync_barrier(&paths);
+            if crate::durability::flushes_skipped() {
+                return Ok(());
+            }
+        }
+        Self::durable_sync_overlapped(files, &[])
+    }
+
+    fn durable_sync_overlapped(
+        files: &[&TableFile],
+        extra: &[(&Path, &File)],
+    ) -> Result<(), StoreError> {
         #[cfg(feature = "write-probe")]
         let probe_n: Vec<_> = files
             .iter()
@@ -1760,6 +1887,8 @@ impl TableFile {
                 std::io::Error::from_raw_os_error(5),
             ));
         }
+        #[cfg(debug_assertions)]
+        note_sync_barrier(&[&self.path]);
         #[cfg(feature = "write-probe")]
         let probe_n = crate::write_probe::sync_begin(&self.path, self.probe_file());
         self.file

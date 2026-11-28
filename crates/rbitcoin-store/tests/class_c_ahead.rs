@@ -932,8 +932,9 @@ fn flush_sees_an_fd_write_that_failed_while_it_waited() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-hold").unwrap();
     let t = fd_only_confirmed(&dir.path, 5000);
     rbitcoin_store::chain::arm_class_c_hold_pause(&dir.path);
-    let _release = ReleasePause;
     std::thread::scope(|scope| {
+        // Dropped before the scope joins: a failed wait still frees the worker.
+        let _release = ReleasePause;
         let flush = scope.spawn(|| t.flush());
         assert!(
             rbitcoin_store::chain::wait_class_c_group_paused(Duration::from_secs(5)),
@@ -957,7 +958,7 @@ fn flush_sees_an_fd_write_that_failed_while_it_waited() {
 #[test]
 fn a_waiting_pair_read_sees_a_failed_fd_pair_write() {
     use rbitcoin_store::chain::HeaderTxsTable;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     let dir = rbitcoin_store::testutil::TempDir::labeled("c-fd-pair-wait").unwrap();
     let write = rbitcoin_store::ClassCWrite::for_test();
     {
@@ -979,15 +980,22 @@ fn a_waiting_pair_read_sees_a_failed_fd_pair_write() {
         while !t.write_lock_held() {
             std::thread::yield_now();
         }
-        std::thread::sleep(Duration::from_millis(50));
+        t.watch_pair_reads();
         let reader = scope.spawn(|| t.get_range(Fk(1)));
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader waits on the odd generation before the write fails.
+        let start = Instant::now();
+        while !t.pair_read_saw_odd() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the reader never saw the odd pair generation"
+            );
+            std::thread::yield_now();
+        }
         drop(marks);
         assert!(writer.join().unwrap().is_err());
         match reader.join().unwrap() {
             Err(rbitcoin_store::error::StoreError::Rejected(_)) => {}
-            Ok(Some((Fk(1), 1))) => {}
-            other => panic!("read of a torn pair: {other:?}"),
+            other => panic!("a waiting read accepted a failed pair write: {other:?}"),
         }
     });
 }

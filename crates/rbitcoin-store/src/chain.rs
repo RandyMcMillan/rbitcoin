@@ -946,6 +946,21 @@ impl HeaderTxsTable {
         )
     }
 
+    /// Watch this table's pair counter: [`Self::pair_read_saw_odd`] turns
+    /// true once a pair read waits on an odd generation. A test probe.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn watch_pair_reads(&self) {
+        crate::array_table::odd_read::watch(&self.seq);
+    }
+
+    /// True once a pair read saw the watched counter odd. A test probe.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn pair_read_saw_odd(&self) -> bool {
+        crate::array_table::odd_read::seen()
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         let _write = self.write_guard();
         flush_class_c_tables(&[&self.first, &self.count])

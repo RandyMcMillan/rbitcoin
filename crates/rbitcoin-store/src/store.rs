@@ -548,7 +548,7 @@ impl Store {
             HeaderTxsTable::create(&path)?
         };
         let confirmed = ConfirmedTable::open(&path)?;
-        crate::integrity::cut_or_refuse_confirmed_hole(&path, &confirmed)?;
+        let hole_cut = crate::integrity::cut_or_refuse_confirmed_hole(&path, &confirmed)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
         drop_leftover_tx_height(&path);
         crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
@@ -574,6 +574,12 @@ impl Store {
         // 29 files go once `meta` 30 is durable.
         open_layout_rewrite_current(&path, meta_ver)?;
         crate::spend_pages_v29::remove(&path)?;
+        // The hole cut's flush arms the first mark, which moves `meta` to 31.
+        // Only after the adoption: before it, a 31 `meta` beside a populated
+        // `spent.body` with no `spent.delta/` refuses.
+        if hole_cut {
+            confirmed.flush()?;
+        }
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }

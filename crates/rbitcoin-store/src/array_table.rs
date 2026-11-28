@@ -669,6 +669,8 @@ pub(crate) fn seq_read<T>(seq: &AtomicU64, mut sample: impl FnMut() -> Option<T>
     loop {
         let g1 = seq.load(Ordering::Acquire);
         if g1 & 1 != 0 {
+            #[cfg(debug_assertions)]
+            odd_read::note(seq);
             crate::sync::spin();
             continue;
         }
@@ -679,6 +681,32 @@ pub(crate) fn seq_read<T>(seq: &AtomicU64, mut sample: impl FnMut() -> Option<T>
         } else if seq_holds(seq, g1) {
             crate::sync::spin();
         }
+    }
+}
+
+/// Test signal: a [`seq_read`] on one watched counter saw an odd generation.
+#[cfg(debug_assertions)]
+pub(crate) mod odd_read {
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    static WATCHED: AtomicPtr<super::AtomicU64> = AtomicPtr::new(std::ptr::null_mut());
+    static SEEN: AtomicBool = AtomicBool::new(false);
+
+    /// Watch `seq` from now on, with nothing seen yet.
+    pub(crate) fn watch(seq: &super::AtomicU64) {
+        SEEN.store(false, Ordering::SeqCst);
+        WATCHED.store(std::ptr::from_ref(seq).cast_mut(), Ordering::SeqCst);
+    }
+
+    pub(super) fn note(seq: &super::AtomicU64) {
+        if std::ptr::eq(WATCHED.load(Ordering::SeqCst), seq) {
+            SEEN.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// True once a read of the watched counter saw it odd.
+    pub(crate) fn seen() -> bool {
+        SEEN.load(Ordering::SeqCst)
     }
 }
 

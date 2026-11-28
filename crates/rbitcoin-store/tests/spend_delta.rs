@@ -594,11 +594,17 @@ fn a_short_delta_record_is_an_error_not_an_unspent_slot() {
 /// A schema-29 datadir with one confirmed create, its single spend slot at
 /// byte 16 of `spent.body`, and `meta` back at 29.
 fn schema_29_store(d: &std::path::Path) {
+    schema_29_store_with(d, |_| {});
+}
+
+/// [`schema_29_store`] with `chain` run on the new store first.
+fn schema_29_store_with(d: &std::path::Path, chain: impl FnOnce(&rbitcoin_store::Store)) {
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::header_table::HeaderRecord;
     use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord};
 
     let s = rbitcoin_store::Store::create_tiny(d).unwrap();
+    chain(&s);
     let hdr = HeaderRecord {
         prev_fk: Fk::NULL,
         version: 1,
@@ -759,6 +765,89 @@ fn an_upgrade_killed_before_the_adoption_adopts_again() {
     assert_eq!(
         rbitcoin_store::store::check_meta(&d).unwrap(),
         rbitcoin_primitives::SCHEMA_VERSION
+    );
+}
+
+/// Heights `0..20` sealed at the tip, then `confirmed[16]` nulled: the
+/// crash an older binary left in the block that holds the sealed tip.
+fn sealed_chain_with_tip_block_hole(s: &rbitcoin_store::Store) {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_store::header_table::{block_header_hash, HeaderRecord};
+
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let mut parent = [0u8; 32];
+    let mut prev = Fk::NULL;
+    for h in 0..20u32 {
+        let mut merkle = [0u8; 32];
+        merkle[0] = h as u8;
+        let (timestamp, bits) = (h + 1, 0x207fffff);
+        let rec = HeaderRecord {
+            prev_fk: prev,
+            version: 1,
+            timestamp,
+            bits,
+            nonce: h,
+            merkle_root: merkle,
+            hash: block_header_hash(1, &parent, &merkle, timestamp, bits, h),
+            size: 0,
+            weight: 0,
+        };
+        parent = rec.hash;
+        prev = s.put_header(&rec).unwrap();
+        s.confirmed.set(&write, Height(h), prev).unwrap();
+    }
+    s.headers.flush().unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.confirmed.set_raw_for_test(&write, Height(16), 0).unwrap();
+    s.confirmed.flush().unwrap();
+    rbitcoin_store::spend_durable::SpendDurable::new(17, 17)
+        .store(s.path())
+        .unwrap();
+}
+
+/// An upgrade that cuts a hole in the sealed tip block and stops before the
+/// spend delta adopts `spent.body` leaves `meta` at 29 and arms no mark. A
+/// mark would publish `meta` 31 first, and a 31 datadir with a populated
+/// body and no `spent.delta/` refuses to open. The next open adopts the
+/// spends, then makes the cut durable.
+#[test]
+fn an_upgrade_stopped_after_the_tip_hole_cut_adopts_again() {
+    use rbitcoin_primitives::Height;
+
+    let (_clean, d) = CleanDir::new();
+    schema_29_store_with(&d, sealed_chain_with_tip_block_hole);
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk(9), 0).unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join("spent.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(16)).unwrap();
+        f.write_all(&slot).unwrap();
+    }
+    // The stop: a `spent.delta` that is a file fails the open after the cut
+    // and before the adoption.
+    std::fs::write(delta_dir(&d), b"x").unwrap();
+    rbitcoin_store::page_guard::arm_store_mark_trace();
+    assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
+    let marks = rbitcoin_store::page_guard::take_armed_store_marks();
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        29,
+        "the tip hole cut published meta before the adoption"
+    );
+    assert!(marks.is_empty(), "armed before the adoption: {marks:?}");
+    std::fs::remove_file(delta_dir(&d)).unwrap();
+    let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
+    assert_eq!(s.spend_directory_slot(16).unwrap(), Some(slot));
+    assert_eq!(s.confirmed.tip_height(), Some(Height(15)));
+    drop(s);
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        31,
+        "the cut's flush after the adoption is the first mark"
     );
 }
 

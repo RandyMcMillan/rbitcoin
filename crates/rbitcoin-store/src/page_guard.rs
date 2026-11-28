@@ -43,12 +43,39 @@ fn armed_map() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
     ARMED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Per `guard/` directory, the live files a mark change dropped whose
-/// directory sync failed. The next sync of that directory makes the change
-/// durable and releases them, even when the retry itself drops nothing.
-fn pending_release_map() -> &'static Mutex<HashMap<PathBuf, HashSet<PathBuf>>> {
-    static PENDING: OnceLock<Mutex<HashMap<PathBuf, HashSet<PathBuf>>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+/// Live files a mark change dropped whose `guard/` sync failed. A crash can
+/// bring that mark back, and a retried sync is not trusted: it can report
+/// success for a change the device never got (`docs/crash-recovery.md`). So
+/// each file refuses writes below its committed end and new arms until the
+/// process restarts.
+fn latched_set() -> &'static Mutex<HashSet<PathBuf>> {
+    static LATCHED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    LATCHED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn latch(paths: &[PathBuf]) {
+    let mut set = latched_set().lock().unwrap_or_else(|e| e.into_inner());
+    set.extend(paths.iter().cloned());
+}
+
+fn is_latched(path: &Path) -> bool {
+    latched_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
+}
+
+/// Refuse when a mark change that dropped `path` failed its `guard/` sync.
+/// A writer that replaces a file outside [`check_armed_write`], such as a
+/// rename over it, asks here first.
+#[doc(hidden)]
+pub fn refuse_if_latched(path: &Path) -> Result<(), StoreError> {
+    if is_latched(path) {
+        return Err(StoreError::Rejected(
+            "a guard mark change for this file is not durable",
+        ));
+    }
+    Ok(())
 }
 
 fn guard_live_dir(mark: &Path) -> Option<&Path> {
@@ -69,17 +96,9 @@ fn remember_group(mark: &Path, pages: &[(&str, u64, &[u8])], leftover: &[(String
     for &(file, offset, _) in pages {
         by_file.entry(file.to_string()).or_default().insert(offset);
     }
-    // A new arm owns these files now: a later sync must not release it.
-    let mut pending = pending_release_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let mut map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
     for (file, offs) in by_file {
-        let path = dir.join(file);
-        for set in pending.values_mut() {
-            set.remove(&path);
-        }
-        map.insert(path, offs);
+        map.insert(dir.join(file), offs);
     }
 }
 
@@ -88,16 +107,6 @@ fn forget_armed(path: &Path) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path);
-}
-
-/// An arm with no pages: [`check_armed_write`] refuses every write below
-/// the committed end. A file stays here until a clear or an arm of it
-/// succeeds.
-fn block_armed(path: &Path) {
-    armed_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(path.to_path_buf(), HashSet::new());
 }
 
 /// Live paths of `names` under the store that holds `mark`.
@@ -109,38 +118,19 @@ fn live_paths(mark: &Path, names: &HashSet<String>) -> Vec<PathBuf> {
 }
 
 /// Sync the guard directory after a mark change that drops `released`.
-/// A file is released only once that change is durable. Until then a crash
-/// can bring the old mark back, and open would copy its images over a later
-/// write, so a failed sync blocks the file and keeps it pending. A later
-/// sync of the same directory releases every pending file with `released`.
+/// A file is released only once that change is durable. A failed sync
+/// latches it ([`latched_set`]): a crash can bring the old mark back, and
+/// open would copy its images over a later write.
 fn sync_mark_dir_then_release(parent: &Path, released: &[PathBuf]) -> Result<(), StoreError> {
     let synced = sync_mark_dir(parent);
-    let mut pending = pending_release_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     if synced.is_ok() {
-        let earlier = pending.remove(parent).unwrap_or_default();
-        for path in earlier.iter().chain(released) {
+        for path in released {
             forget_armed(path);
         }
     } else {
-        hold_pending(&mut pending, parent, released);
+        latch(released);
     }
     synced
-}
-
-/// Block `released` and keep them pending on `parent` until a sync of it
-/// succeeds.
-fn hold_pending(
-    pending: &mut HashMap<PathBuf, HashSet<PathBuf>>,
-    parent: &Path,
-    released: &[PathBuf],
-) {
-    let set = pending.entry(parent.to_path_buf()).or_default();
-    for path in released {
-        block_armed(path);
-        set.insert(path.clone());
-    }
 }
 
 /// Reject a range that shares a committed page when `path` has a live arm
@@ -151,7 +141,7 @@ fn hold_pending(
 /// even a one-sector write that lands whole may belong to the commit the
 /// mark protects, and open would roll the mark back around it. A path with
 /// no live arm is not checked. A file whose mark change failed its directory
-/// sync refuses every such write. `committed_end` is the durable header
+/// sync refuses every such write until restart. `committed_end` is the durable header
 /// length, not a RAM high-water.
 #[doc(hidden)]
 pub fn check_armed_write(
@@ -163,15 +153,11 @@ pub fn check_armed_write(
     if len == 0 || offset >= committed_end {
         return Ok(());
     }
+    refuse_if_latched(path)?;
     let map = armed_map().lock().unwrap_or_else(|e| e.into_inner());
     let Some(pages) = map.get(path) else {
         return Ok(());
     };
-    if pages.is_empty() {
-        return Err(StoreError::Rejected(
-            "a guard mark change for this file is not durable",
-        ));
-    }
     let Some(end) = offset.checked_add(len) else {
         return Err(StoreError::Rejected("write is outside the armed pages"));
     };
@@ -225,6 +211,11 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
             return Err(StoreError::Corrupt("page guard names one page twice"));
         }
     }
+    if let Some(dir) = guard_live_dir(path) {
+        for &(file, _, _) in pages {
+            refuse_if_latched(&dir.join(file))?;
+        }
+    }
     let leftover = load_group_leftover(path, &seen)?;
     let count = u32::try_from(pages.len().saturating_add(leftover.len()))
         .map_err(|_| StoreError::Corrupt("page guard arm is too large"))?;
@@ -255,13 +246,6 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
 #[doc(hidden)]
 pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
     let Some(restored) = replay_page_guard_group(mark, dir)? else {
-        // A retry after a failed sync finds no mark; its sync releases the
-        // files that unlink left pending. No `guard/` means no mark change
-        // to make durable.
-        let parent = mark_parent(mark)?;
-        if parent.is_dir() {
-            sync_mark_dir_then_release(parent, &[])?;
-        }
         return Ok(false);
     };
     remove_mark(mark, &restored)?;
@@ -319,18 +303,10 @@ fn replay_page_guard_group(mark: &Path, dir: &Path) -> Result<Option<Vec<PathBuf
 /// with the full page.
 #[doc(hidden)]
 pub fn restore_page_guard_group_fit(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
-    let parent = mark_parent(mark)?;
+    mark_parent(mark)?;
     let raw = match std::fs::read(mark) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // A retry after a failed sync finds no mark; its sync releases
-            // the files that unlink left pending. No `guard/` means no mark
-            // change to make durable.
-            if parent.is_dir() {
-                sync_mark_dir_then_release(parent, &[])?;
-            }
-            return Ok(false);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(StoreError::io(mark, e)),
     };
     let pages = mark_group_pages(&raw)?;
@@ -439,11 +415,7 @@ pub fn clear_page_guard_files(path: &Path, files: &[(&File, &Path)]) -> Result<(
 fn retain_unsynced(path: &Path, synced: &HashSet<String>) -> Result<(), StoreError> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // A retry after a failed sync finds no mark; its sync releases
-            // the files that change left pending.
-            return sync_mark_dir_then_release(mark_parent(path)?, &[]);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(StoreError::io(path, e)),
     };
     // A mark of a kind this binary does not know stays for the restore to
@@ -593,10 +565,7 @@ pub fn restore_sh_marks(dir: &Path) -> Result<(), StoreError> {
     for name in names {
         restore_page_guard_group_fit(&guard.join(name), dir)?;
     }
-    // Sync even when no mark was left: a retry after a failed sync finds
-    // none, and the files that unlink blocked stay pending until `guard/`
-    // syncs.
-    sync_mark_dir_then_release(&guard, &[])
+    Ok(())
 }
 
 /// Drop every `guard/sh-*` mark. Missing is `Ok`.
@@ -621,6 +590,7 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
     }
     names.sort_unstable();
     let mut released = Vec::new();
+    let mut unlinked = false;
     for name in names {
         let path = guard.join(&name);
         let mut named = HashSet::new();
@@ -634,24 +604,22 @@ pub fn clear_sh_marks(dir: &Path) -> Result<(), StoreError> {
             }
         }
         match std::fs::remove_file(&path) {
-            Ok(()) => released.extend(live_paths(&path, &named)),
+            Ok(()) => {
+                unlinked = true;
+                released.extend(live_paths(&path, &named));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 // The earlier unlinks are not durable, and a retry no longer
-                // finds those marks: their files stay pending on `guard/`.
-                hold_pending(
-                    &mut pending_release_map()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()),
-                    &guard,
-                    &released,
-                );
+                // finds those marks: their files latch.
+                latch(&released);
                 return Err(StoreError::io(&path, e));
             }
         }
     }
-    // Sync even when this call unlinked nothing: a retry after a failed
-    // sync finds no mark, and the earlier unlink is not durable yet.
+    if !unlinked {
+        return Ok(());
+    }
     sync_mark_dir_then_release(&guard, &released)
 }
 
@@ -714,10 +682,6 @@ pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
             drop_page_guard_names(&ent.path(), &names)?;
         }
     }
-    // Sync even when no mark was left: a retry after a failed sync finds
-    // none, and the files that unlink blocked stay pending until `guard/`
-    // syncs.
-    sync_mark_dir_then_release(&guard, &[])?;
     if let Some(parent) = Path::new(rel).parent() {
         if !parent.as_os_str().is_empty() {
             let live_parent = dir.join(parent);

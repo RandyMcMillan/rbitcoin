@@ -196,7 +196,11 @@ image verbatim and does not check its kind, so the writer picks the
 outcome: a backward mark holds pre-images and a crash rolls the write back;
 a forward mark holds the finished pages and a crash completes the write.
 Each mark's doc names its kind. The committed end is the durable header
-length, not a RAM high-water.
+length, not a RAM high-water. Removing or rewriting a mark syncs `guard/`.
+When that sync fails, the files the change dropped refuse writes below their
+committed end and new arms until the process restarts: a crash can bring the
+old mark back, and a later sync that succeeds is not trusted to have made
+the change durable.
 
 A live mark owns every byte on the pages it images, appends included.
 Restore writes whole pages, so an append that shares an imaged page rolls

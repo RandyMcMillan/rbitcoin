@@ -1,14 +1,14 @@
 {
   "new_base": "0c500814592097d74fc68bc6d754f397a7a8c32d",
   "new_skip": 3932,
-  "old_index": 26062,
+  "old_index": 26443,
   "new_cap_used": true,
   "run_id": "46090357244",
-  "old_name": "crates/rbitcoin-store/src/scripthash.rs:1129:9: replace ScriptHashTable::alloc_for -> &Mutex<AllocState> with Box::leak(Box::new(Mutex::new(Default::default())))",
+  "old_name": "crates/rbitcoin-store/src/scripthash_head.rs:34:46: replace * with +",
   "new_len": 7492,
   "old_len": 31273,
   "new_remaining": 3560,
-  "old_remaining": 31073,
-  "completed_new": 232,
-  "completed_old": 200
+  "old_remaining": 30892,
+  "completed_new": 0,
+  "completed_old": 381
 }

@@ -2623,3 +2623,86 @@ MISSED   crates/rbitcoin-store/src/scripthash.rs:885:24: replace > with >= in co
 MISSED   crates/rbitcoin-store/src/scripthash.rs:885:73: replace > with == in collect_extent_then_tail in 11s build + 110s test
 MISSED   crates/rbitcoin-store/src/scripthash.rs:885:73: replace > with < in collect_extent_then_tail in 3s build + 20s test
 MISSED   crates/rbitcoin-store/src/scripthash.rs:885:73: replace > with >= in collect_extent_then_tail in 3s build + 21s test
+# 46090357244 2 e0373b4eded353f1e348ff6a5cbf52fdacda026b
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1160:9: replace ScriptHashTable::persist_all_allocs -> Result<(), StoreError> with Ok(()) in 123s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1173:9: replace ScriptHashTable::flush_all_bodies -> Result<(), StoreError> with Ok(()) in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1184:9: replace ScriptHashTable::flush_all_bodies_async -> Result<(), StoreError> with Ok(()) in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1373:35: replace || with && in ScriptHashTable::has_index_occupancy in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1380:26: delete ! in ScriptHashTable::has_index_occupancy in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1404:9: replace ScriptHashTable::mphf_g_resident_bytes -> u64 with 0 in 12s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1404:9: replace ScriptHashTable::mphf_g_resident_bytes -> u64 with 1 in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1422:9: replace ScriptHashTable::mphf_occ_resident_bytes -> u64 with 0 in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1422:9: replace ScriptHashTable::mphf_occ_resident_bytes -> u64 with 1 in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1498:9: replace ScriptHashTable::has_sorted_main -> bool with true in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1694:31: replace > with == in ScriptHashTable::put_create_batch_append in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1726:19: replace += with -= in ScriptHashTable::put_create_batch_append in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1726:19: replace += with *= in ScriptHashTable::put_create_batch_append in 10s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1892:16: delete ! in ScriptHashTable::sealed_miss_try_l1 in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1939:51: replace - with + in ScriptHashTable::ingest_insert_many in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1955:9: replace ScriptHashTable::maybe_seal_ingest -> Result<(), StoreError> with Ok(()) in 20s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:1959:17: replace < with <= in ScriptHashTable::maybe_seal_ingest in 19s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2005:9: replace ScriptHashTable::maybe_compact_sealed_ovf -> Result<(), StoreError> with Ok(()) in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2007:18: replace >= with < in ScriptHashTable::maybe_compact_sealed_ovf in 12s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2021:9: replace ScriptHashTable::warn_l1_frozen with () in 23s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2040:24: replace < with > in ScriptHashTable::compact_sealed_ovf in 22s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2241:58: replace - with + in ScriptHashTable::pack_entries_reuse in 16s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2241:58: replace - with / in ScriptHashTable::pack_entries_reuse in 15s build + 103s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2255:23: replace > with == in ScriptHashTable::pack_entries_reuse in 14s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2255:23: replace > with >= in ScriptHashTable::pack_entries_reuse in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2286:18: replace > with == in ScriptHashTable::read_slab in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2286:18: replace > with >= in ScriptHashTable::read_slab in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2291:17: replace > with == in ScriptHashTable::read_slab in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2291:17: replace > with >= in ScriptHashTable::read_slab in 11s build + 103s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2360:20: replace == with != in ScriptHashTable::append_fks_to_pages in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2372:28: replace > with == in ScriptHashTable::append_fks_to_pages in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2381:20: replace > with == in ScriptHashTable::append_fks_to_pages in 10s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2413:23: replace > with == in ScriptHashTable::alloc_extent in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2413:23: replace > with < in ScriptHashTable::alloc_extent in 11s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2413:23: replace > with >= in ScriptHashTable::alloc_extent in 12s build + 106s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2426:18: replace > with == in ScriptHashTable::alloc_slab in 120s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2426:18: replace > with >= in ScriptHashTable::alloc_slab in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2444:23: replace > with == in ScriptHashTable::alloc_slab in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2444:23: replace > with < in ScriptHashTable::alloc_slab in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2444:23: replace > with >= in ScriptHashTable::alloc_slab in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2570:9: replace ScriptHashTable::flush -> Result<(), StoreError> with Ok(()) in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2590:9: replace ScriptHashTable::flush_async -> Result<(), StoreError> with Ok(()) in 10s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2616:17: replace > with == in ScriptHashTable::pack_shard_session in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2616:17: replace > with < in ScriptHashTable::pack_shard_session in 12s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2616:17: replace > with >= in ScriptHashTable::pack_shard_session in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2684:17: replace > with == in ScriptHashTable::publish_packed_shard in 11s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2684:17: replace > with < in ScriptHashTable::publish_packed_shard in 10s build + 105s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2684:17: replace > with >= in ScriptHashTable::publish_packed_shard in 10s build + 104s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2834:46: replace * with + in 11s build + 103s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2834:46: replace * with / in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2834:39: replace * with + in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2834:39: replace * with / in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2839:9: replace ScriptHashBulkSession<'a>::keys_written -> u64 with 0 in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2839:9: replace ScriptHashBulkSession<'a>::keys_written -> u64 with 1 in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2848:9: replace ScriptHashBulkSession<'a>::take_fk_scratch -> Vec<u64> with vec![] in 4s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2849:27: replace < with == in ScriptHashBulkSession<'a>::take_fk_scratch in 4s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2849:27: replace < with > in ScriptHashBulkSession<'a>::take_fk_scratch in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2849:27: replace < with <= in ScriptHashBulkSession<'a>::take_fk_scratch in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2863:9: replace ScriptHashBulkSession<'a>::shards_flushed -> u32 with 0 in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2863:9: replace ScriptHashBulkSession<'a>::shards_flushed -> u32 with 1 in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2891:17: replace > with == in ScriptHashBulkSession<'a>::persist_session_alloc in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2891:17: replace > with < in ScriptHashBulkSession<'a>::persist_session_alloc in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2891:17: replace > with >= in ScriptHashBulkSession<'a>::persist_session_alloc in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2971:25: replace < with == in ScriptHashBulkSession<'a>::push_open_fk in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2971:25: replace < with <= in ScriptHashBulkSession<'a>::push_open_fk in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2979:48: replace - with / in ScriptHashBulkSession<'a>::push_open_fk in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2999:17: replace > with == in ScriptHashBulkSession<'a>::push_open_fk in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2999:17: replace > with < in ScriptHashBulkSession<'a>::push_open_fk in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:2999:17: replace > with >= in ScriptHashBulkSession<'a>::push_open_fk in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3206:55: replace == with != in ScriptHashBulkSession<'a>::bulk_write_slab in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3276:36: replace >= with < in ScriptHashBulkSession<'a>::write_body_bytes in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3294:39: replace + with - in ScriptHashBulkSession<'a>::flush_body in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3294:39: replace + with * in ScriptHashBulkSession<'a>::flush_body in 2s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3316:20: replace > with == in write_alloc_header in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3316:20: replace > with >= in write_alloc_header in 3s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3316:16: replace + with - in write_alloc_header in 4s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3336:14: replace < with <= in read_alloc_header in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3349:24: replace != with == in read_alloc_header in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3357:20: replace > with == in read_alloc_header in 2s build + 20s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3357:20: replace > with >= in read_alloc_header in 3s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3357:16: replace + with - in read_alloc_header in 2s build + 21s test
+MISSED   crates/rbitcoin-store/src/scripthash.rs:3357:16: replace + with * in read_alloc_header in 3s build + 21s test

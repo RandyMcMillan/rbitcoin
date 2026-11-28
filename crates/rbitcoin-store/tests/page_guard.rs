@@ -792,6 +792,27 @@ fn a_failed_append_poisons_its_group_until_reopen() {
                 other => panic!("a write after a failed append: {other:?}"),
             }
         }
+        // A publisher must not move the length either. A flush still
+        // republishes the length RAM already holds.
+        let header = |f: &TableFile| {
+            let raw = std::fs::read(f.path()).unwrap();
+            u64::from_le_bytes(raw[8..16].try_into().unwrap())
+        };
+        let before = header(f);
+        for durable in [true, false] {
+            assert!(
+                !f.publish_end(end + 8, durable),
+                "publish_end on a poisoned file"
+            );
+            assert!(
+                !f.publish_locator_end(end + 8, durable),
+                "publish_locator_end on a poisoned file"
+            );
+        }
+        assert_eq!(f.logical_len(), end, "RAM length moved on a poisoned file");
+        assert_eq!(header(f), before, "header moved on a poisoned file");
+        f.flush().expect("a flush republishes the RAM length");
+        assert_eq!(header(f), end);
     }
     drop((a, b));
     let a = TableFile::open(&pa, TableKind::ArrayLink).unwrap();

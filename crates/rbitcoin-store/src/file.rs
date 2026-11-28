@@ -929,6 +929,8 @@ impl TableFile {
     /// [`Self::pwrite_checked`] for the length a flush republishes. A
     /// poisoned file still takes it: an append group publishes a length only
     /// after its bytes are synced, so the RAM length names durable bytes.
+    /// Nothing else may move that length: every publisher refuses a
+    /// poisoned file before it changes RAM.
     fn pwrite_length(&self, committed: u64, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if !bytes.is_empty() {
             // Committed end is the durable header, not a RAM high-water.
@@ -1032,8 +1034,12 @@ impl TableFile {
     /// [`Self::write_at`]. Otherwise only RAM moves, and `flush` keeps the
     /// previous header. A failed header pwrite does not roll RAM back.
     /// Returns whether the on-disk header names `end` or already covered it.
+    /// A poisoned file returns false and moves nothing.
     #[must_use]
     pub fn publish_end(&self, end: u64, durable: bool) -> bool {
+        if self.poisoned() {
+            return false;
+        }
         if !durable {
             self.publish_ram_only(end);
             return false;
@@ -1050,9 +1056,12 @@ impl TableFile {
     /// Locator publish. Same one header pwrite as [`Self::publish_end`] when
     /// the write lands. A miss keeps the previous durable end so a later
     /// [`Self::catch_up_header`] can store it. The success path does not take
-    /// the flush lock.
+    /// the flush lock. A poisoned file returns false and moves nothing.
     #[must_use]
     pub fn publish_locator_end(&self, end: u64, durable: bool) -> bool {
+        if self.poisoned() {
+            return false;
+        }
         if !durable {
             self.publish_ram_only(end);
             return false;
@@ -1385,9 +1394,17 @@ impl TableFile {
         Ok(())
     }
 
-    /// Persist 8-byte HWM field (complete pwrite of the unit).
+    /// Persist 8-byte HWM field (complete pwrite of the unit). Refused on a
+    /// poisoned file; only a flush republishes there.
     #[doc(hidden)]
     pub fn persist_hwm(&self, logical: u64) -> Result<(), StoreError> {
+        self.refuse_if_poisoned()?;
+        self.republish_hwm(logical)
+    }
+
+    /// [`Self::persist_hwm`] for the length a flush samples. A poisoned file
+    /// takes it, as [`Self::pwrite_length`] says.
+    fn republish_hwm(&self, logical: u64) -> Result<(), StoreError> {
         let bytes = logical.to_le_bytes();
         let hwm_off = if self.trailing_header {
             logical
@@ -1405,7 +1422,7 @@ impl TableFile {
             // Full trailer is the durability unit (magic+schema+kind+HWM+ext).
             self.write_trailer(logical)?;
         } else {
-            self.persist_hwm(logical)?;
+            self.republish_hwm(logical)?;
         }
         Ok(())
     }

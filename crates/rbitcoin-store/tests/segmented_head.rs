@@ -660,52 +660,6 @@ fn roll_does_not_join_seal_open_probes_sealing_oa() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn tx_head_fuse_mapping_uses_random_access_after_seal_and_reopen() {
-    use rbitcoin_store::binary_fuse8::Fingerprints;
-    use rbitcoin_store::fuse8_filter::SealedFuse8;
-    use rbitcoin_store::testutil::TempDir;
-
-    fn random_access(fuse: &SealedFuse8) -> bool {
-        let Fingerprints::Map(map) = &fuse.filter.fingerprints else {
-            panic!("sealed fuse must use a file mapping");
-        };
-        let header_prefix = format!("{:x}-", map.as_ptr() as usize);
-        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-        let flags = smaps
-            .lines()
-            .skip_while(|line| !line.starts_with(&header_prefix))
-            .find_map(|line| line.strip_prefix("VmFlags:"))
-            .expect("flags for the sealed fuse mapping");
-        flags.split_whitespace().any(|flag| flag == "rr")
-    }
-
-    let dir = TempDir::labeled("seghead-random-access").unwrap();
-    let layout = HeadLayout::new(8).unwrap();
-    let head = SegmentedTxHead::create(dir.path(), layout).unwrap();
-    let n = max_keys_for_layout(layout) + 1;
-    let mut entries: Vec<_> = (1..=n).map(|i| (mixed(i), Fk(i))).collect();
-    head.insert_many(&mut entries).unwrap();
-    head.flush().unwrap();
-    assert!(
-        random_access(head.segments_snapshot()[0].fuse.as_ref().unwrap()),
-        "freshly sealed tx.head fuse mapping needs random access advice"
-    );
-    drop(head);
-
-    let reopened = SegmentedTxHead::open(dir.path()).unwrap();
-    assert!(
-        random_access(reopened.segments_snapshot()[0].fuse.as_ref().unwrap()),
-        "reopened tx.head fuse mapping needs random access advice"
-    );
-    let generic = SealedFuse8::read_from(&segment_fuse_path(dir.path(), 0)).unwrap();
-    assert!(
-        !random_access(&generic),
-        "generic fuse mappings retain the default advice"
-    );
-}
-
 /// A sealed segment probe returns `(key, cands)` only for keys with
 /// candidates, not the whole wave.
 #[test]

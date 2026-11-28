@@ -98,15 +98,6 @@ impl ReadonlyMap {
         self.map_len
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn advise_random_access(&self) {
-        // SAFETY: this span is the live mmap owned by self. Advice only affects
-        // the kernel's readahead policy; failure leaves the mapping usable.
-        unsafe {
-            libc::madvise(self.ptr.cast(), self.map_len, libc::MADV_RANDOM);
-        }
-    }
-
     pub fn set_fingerprint_range(&mut self, off: usize, len: usize) -> Result<(), StoreError> {
         if off.saturating_add(len) > self.map_len {
             return Err(StoreError::Corrupt("fuse8 fingerprints truncated"));

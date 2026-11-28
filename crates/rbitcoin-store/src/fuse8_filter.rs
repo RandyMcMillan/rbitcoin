@@ -97,13 +97,6 @@ impl SealedFuse8 {
     pub fn read_from(path: &Path) -> Result<Self, StoreError> {
         open_file(path)
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn advise_random_access(&self) {
-        if let Fingerprints::Map(map) = &self.filter.fingerprints {
-            map.advise_random_access();
-        }
-    }
 }
 
 /// Open a BF8R fuse file. v1 and unreadable v2 refuse (no always-probe).

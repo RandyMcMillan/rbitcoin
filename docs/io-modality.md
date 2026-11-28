@@ -16,9 +16,7 @@ process `Vec`.
 **Map vs FdOnly:** map when the bytes are immutable after write, touched as
 a few random bytes per key, and must stay resident for the hot path (sealed
 `.fuse8`: every unfinished key probes every sealed segment; SH BDZ3 `occ`:
-1.23 bits/key, rank on every compact index). Linux applies best-effort
-`MADV_RANDOM` to sealed `tx.head` filters to suppress readahead on random
-fingerprint probes. Keep FdOnly +
+1.23 bits/key, rank on every compact index). Keep FdOnly +
 completion session when the file is larger than the residency budget or is
 read as page batches (`txid.body` / `txout` / `spent` / `create.loc`, packed
 BDZ `g`, SH tags/`.val`).

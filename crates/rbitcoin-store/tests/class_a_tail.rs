@@ -66,6 +66,44 @@ fn a_class_a_barrier_writes_no_page_image() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A write that lands only in the unpublished part of the 512-byte sector
+/// holding `txid.body`'s committed end leaves the committed part alone.
+/// Open keeps the named count, and the txids in that sector's committed
+/// bytes still read.
+#[test]
+fn a_write_past_the_committed_end_keeps_the_shared_sector() {
+    const SECTOR: u64 = 512;
+    let dir = tmp();
+    store_130(&dir);
+    let txid = dir.join("txid.body");
+    let published = logical_of(&txid);
+    let sector = published & !(SECTOR - 1);
+    assert!(
+        sector >= PAGE as u64 && sector < published,
+        "txid.body ends on a sector boundary at {published}"
+    );
+    let before = std::fs::read(&txid).unwrap();
+    let mut file = std::fs::OpenOptions::new().write(true).open(&txid).unwrap();
+    file.seek(SeekFrom::Start(published)).unwrap();
+    file.write_all(&vec![0xabu8; (sector + SECTOR - published) as usize])
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 130, "open moved the named count");
+    for i in 128..=130u64 {
+        assert_eq!(s.txs.txids.get(Fk(i)).unwrap(), [i as u8; 32], "txid {i}");
+    }
+    drop(s);
+    let after = std::fs::read(&txid).unwrap();
+    assert_eq!(
+        after[sector as usize..published as usize],
+        before[sector as usize..published as usize],
+        "the committed part of the shared sector changed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Sync-array order of the build that imaged Class A pages.
 const LEGACY_STEMS: [&str; 16] = [
     "txout.body",

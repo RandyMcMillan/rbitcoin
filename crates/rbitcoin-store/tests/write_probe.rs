@@ -405,6 +405,8 @@ fn a_punched_range_is_unsynced_until_a_sync() {
     assert_eq!(publish(&path, 16, 16 + 8192), Some("LEN_AFTER_SYNC"));
 }
 
+/// The fallback is forced through a debug-only hook.
+#[cfg(debug_assertions)]
 #[test]
 fn a_zeroed_range_without_a_punch_publishes_its_own_end() {
     let store = Store::new();

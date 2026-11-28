@@ -981,6 +981,9 @@ impl Mempool {
         }
         let slots_path = self.dir.join("slots");
         let slots_tmp = self.dir.join("slots.tmp");
+        if latched(&slots_path) || latched(&slots_tmp) {
+            return;
+        }
         if fs::rename(&slots_tmp, &slots_path).is_ok() {
             self.slots_pending = false;
         }
@@ -1386,10 +1389,13 @@ impl Mempool {
     ) -> Result<(), MempoolError> {
         // An interrupted flush mark still names the pre-compact pages. Apply
         // it and drop it before the packed names replace those files. A mark
-        // a failed clear unlinked may still be named on disk, so the removal
-        // is made durable here too.
+        // a failed clear unlinked may still be named on disk: those files
+        // latched, and the packed names do not replace them.
         restore_mempool_mark(&self.dir)?;
-        sync_guard_dir(&self.dir)?;
+        for name in ["tx.body", "slots", "slots.tmp", "meta"] {
+            rbitcoin_store::page_guard::refuse_if_latched(&self.dir.join(name))
+                .map_err(map_store)?;
+        }
         let body_path = self.dir.join("tx.body");
         let slots_path = self.dir.join("slots");
         let body_tmp = self.dir.join("tx.body.tmp");
@@ -1467,15 +1473,6 @@ impl QueuedDeath {
     fn names(&self, rec: &[u8; SLOT_REC]) -> bool {
         rec[4..] == self.record
     }
-}
-
-/// Sync `guard/` when it exists, so an unlinked mark stays gone after a crash.
-fn sync_guard_dir(dir: &Path) -> Result<(), MempoolError> {
-    let guard = dir.join("guard");
-    if !guard.is_dir() {
-        return Ok(());
-    }
-    rbitcoin_store::file::fsync_parent_dir(&guard).map_err(|e| MempoolError::io(&guard, e))
 }
 
 /// Force status bytes to [`SLOT_DEAD`] on slot images this flush already built.
@@ -1735,9 +1732,17 @@ pub fn finish_pending_compact(dir: &Path) -> Result<(), MempoolError> {
     let body_tmp = dir.join("tx.body.tmp");
     let slots_tmp = dir.join("slots.tmp");
     if !body_tmp.exists() && slots_tmp.exists() {
+        for path in [&slots_tmp, &dir.join("slots")] {
+            rbitcoin_store::page_guard::refuse_if_latched(path).map_err(map_store)?;
+        }
         fs::rename(&slots_tmp, dir.join("slots")).map_err(|e| MempoolError::io(dir, e))?;
     }
     Ok(())
+}
+
+/// A failed `guard/` sync latched `path`; leave it in place until restart.
+fn latched(path: &Path) -> bool {
+    rbitcoin_store::page_guard::refuse_if_latched(path).is_err()
 }
 
 #[doc(hidden)]

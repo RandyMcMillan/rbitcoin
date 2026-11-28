@@ -2072,12 +2072,11 @@ fn a_death_sync_does_not_publish_an_unsynced_slot_growth() {
 }
 
 /// A death sync unlinks its mark and then fails the `guard/` sync, so the
-/// unlink may not be durable. A compact must make it durable before the
-/// packed files take their names, or a crash replays the old pages onto
-/// the packed table.
+/// unlink may not be durable and a crash can replay the old pages. The
+/// files latch, and a compact refuses to install packed files over them.
 #[cfg(debug_assertions)]
 #[test]
-fn compact_syncs_a_cleared_mark_away_before_installing() {
+fn compact_refuses_after_a_failed_mark_dir_sync() {
     use rbitcoin_store::page_guard::fail_next_mark_dir_sync;
     let dir = tmp_dir();
     let mut mp = Mempool::open_or_create(&dir).unwrap();
@@ -2089,14 +2088,9 @@ fn compact_syncs_a_cleared_mark_away_before_installing() {
     fail_next_mark_dir_sync(&guard);
     assert!(mp.sync_deaths().is_err());
     assert!(!guard.join("flush").exists());
-    rbitcoin_store::file::arm_fsync_dir_trace();
-    mp.compact().unwrap();
-    let synced = rbitcoin_store::file::take_fsynced_dirs();
-    let guard_at = synced.iter().position(|d| d == &guard);
-    let dir_at = synced.iter().position(|d| d == dir.path());
-    assert!(
-        matches!((guard_at, dir_at), (Some(g), Some(m)) if g < m),
-        "compact installed before guard/ was synced: {synced:?}"
-    );
+    let err = mp
+        .compact()
+        .expect_err("a compact installed over latched files");
+    assert!(err.to_string().contains("not durable"), "{err}");
     let _ = fs::remove_dir_all(&dir);
 }

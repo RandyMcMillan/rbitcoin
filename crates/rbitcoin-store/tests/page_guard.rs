@@ -10,6 +10,19 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// `r` is the refusal a latched file returns.
+fn assert_latched<T: std::fmt::Debug>(r: Result<T, StoreError>, why: &str) {
+    match r {
+        Err(StoreError::Rejected(msg)) => {
+            assert_eq!(
+                msg, "a guard mark change for this file is not durable",
+                "{why}"
+            )
+        }
+        other => panic!("{why}: {other:?}"),
+    }
+}
+
 const PAGE: usize = 4096;
 
 fn fill(byte: u8) -> Vec<u8> {
@@ -238,22 +251,22 @@ fn a_noncanonical_file_name_is_refused() {
     assert_eq!(read_bytes(&dir.path().join("sub/live"), 0, PAGE), page);
 }
 
+/// A clear that finds no mark is done: it syncs nothing, because a sync
+/// after a failed one is not trusted to make an earlier unlink durable.
 #[test]
-fn clear_of_a_missing_mark_syncs_the_directory() {
+fn clear_of_a_missing_mark_syncs_nothing() {
     let dir = TempDir::labeled("page-guard-clear-missing").unwrap();
-    let live = dir.path().join("live");
-    let mark = dir.path().join("guard");
+    let live = dir.path().join("header.head");
+    let mark = dir.path().join("guard").join("header.head");
+    std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
     write_bytes(&live, 0, &fill(0x11));
     let file = open_rw(&live);
     #[cfg(all(unix, debug_assertions))]
     {
         rbitcoin_store::file::arm_fsync_dir_trace();
         clear_page_guard(&mark, &file, &live).unwrap();
-        let dirs = rbitcoin_store::file::take_fsynced_dirs();
-        assert!(
-            dirs.iter().any(|d| d == dir.path()),
-            "a retry after the unlink must still sync the directory, got {dirs:?}"
-        );
+        let synced = rbitcoin_store::file::take_fsynced_dirs();
+        assert!(synced.is_empty(), "a missing mark synced {synced:?}");
     }
     #[cfg(not(all(unix, debug_assertions)))]
     clear_page_guard(&mark, &file, &live).unwrap();
@@ -477,29 +490,6 @@ fn arm_on_meta_31_syncs_the_directory_that_holds_meta() {
         &[("confirmed.body", 0, page.as_slice())],
     )
     .unwrap();
-}
-
-#[test]
-fn clear_of_a_missing_mark_syncs_its_directory() {
-    let dir = TempDir::labeled("page-guard-missing-clear").unwrap();
-    let live = dir.path().join("header.head");
-    let mark = dir.path().join("guard").join("header.head");
-    std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
-    write_bytes(&live, 0, &fill(0x11));
-    let file = open_rw(&live);
-    #[cfg(all(unix, debug_assertions))]
-    {
-        rbitcoin_store::file::arm_fsync_dir_trace();
-        clear_page_guard(&mark, &file, &live).unwrap();
-        let synced = rbitcoin_store::file::take_fsynced_dirs();
-        let parent = mark.parent().unwrap();
-        assert!(
-            synced.iter().any(|p| p == parent),
-            "a missing mark must still sync its directory, got {synced:?}"
-        );
-    }
-    #[cfg(not(all(unix, debug_assertions)))]
-    clear_page_guard(&mark, &file, &live).unwrap();
 }
 
 #[test]
@@ -884,14 +874,12 @@ fn clear_sh_marks_forgets_the_armed_pages() {
     file.write_at(PAGE as u64, &[0x77; 16]).unwrap();
 }
 
-/// `clear_sh_marks` can unlink a mark and then fail its directory sync. A
-/// retry finds no `sh-*` mark, and it must still sync `guard/` before the
-/// caller rebuilds the index, or the unlink can be undone by power loss.
-/// The failed sync blocks the file; the synced retry releases it.
-// Windows has no directory fsync, so nothing is recorded there.
+/// `clear_sh_marks` can unlink a mark and then fail its directory sync. The
+/// unlink may not be durable, and a retried sync is not trusted, so the file
+/// stays latched after a retry that finds no mark.
 #[cfg(all(unix, debug_assertions))]
 #[test]
-fn clear_sh_marks_retry_syncs_the_guard_dir() {
+fn clear_sh_marks_retry_keeps_the_file_latched() {
     let dir = TempDir::labeled("page-guard-sh-retry").unwrap();
     let (file, _path) = committed_body(&dir);
     arm_page0(&dir, "guard/sh-ovf");
@@ -903,24 +891,19 @@ fn clear_sh_marks_retry_syncs_the_guard_dir() {
         file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
         "the file took a write before the unlink was durable"
     );
-    rbitcoin_store::file::arm_fsync_dir_trace();
     clear_sh_marks(dir.path()).unwrap();
-    let synced = rbitcoin_store::file::take_fsynced_dirs();
-    assert!(
-        synced.contains(&guard),
-        "a retry with no mark syncs guard/: {synced:?}"
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
     );
-    file.write_at(PAGE as u64, &[0x77; 16])
-        .expect("the synced retry releases the file");
 }
 
 /// `restore_sh_marks` copies the last `sh-*` mark, unlinks it, and then
-/// fails the `guard/` sync, which blocks the file. A retry in the same
-/// process finds no mark; it must still sync `guard/` and release the file,
-/// or committed writes stay refused until a restart.
+/// fails the `guard/` sync, which latches the file. A retry in the same
+/// process finds no mark and leaves the file latched until restart.
 #[cfg(all(unix, debug_assertions))]
 #[test]
-fn restore_sh_marks_retry_with_no_mark_releases_the_blocked_file() {
+fn restore_sh_marks_retry_with_no_mark_keeps_the_file_latched() {
     let dir = TempDir::labeled("page-guard-sh-restore-retry").unwrap();
     let (file, _path) = committed_body(&dir);
     arm_page0(&dir, "guard/sh-ovf");
@@ -933,16 +916,18 @@ fn restore_sh_marks_retry_with_no_mark_releases_the_blocked_file() {
         "the file took a write before the unlink was durable"
     );
     rbitcoin_store::page_guard::restore_sh_marks(dir.path()).unwrap();
-    file.write_at(PAGE as u64, &[0x77; 16])
-        .expect("the synced retry releases the file");
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
+    );
 }
 
 /// `restore_page_guard_group_fit` unlinks its mark and then fails the
-/// `guard/` sync. A retry on the same mark finds it gone; it must still sync
-/// `guard/` and release the file before it returns `Ok(false)`.
+/// `guard/` sync. A retry on the same mark finds it gone, returns
+/// `Ok(false)`, and leaves the file latched.
 #[cfg(all(unix, debug_assertions))]
 #[test]
-fn restore_fit_retry_with_no_mark_releases_the_blocked_file() {
+fn restore_fit_retry_with_no_mark_keeps_the_file_latched() {
     let dir = TempDir::labeled("page-guard-fit-restore-retry").unwrap();
     let (file, _path) = committed_body(&dir);
     arm_page0(&dir, "guard/sh-ovf");
@@ -956,17 +941,19 @@ fn restore_fit_retry_with_no_mark_releases_the_blocked_file() {
         "the file took a write before the unlink was durable"
     );
     assert!(!restore_page_guard_group_fit(&mark, dir.path()).unwrap());
-    file.write_at(PAGE as u64, &[0x77; 16])
-        .expect("the synced retry releases the file");
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
+    );
 }
 
 /// `drop_sh_rel` drops the only name in the last `sh-*` mark, so the mark is
-/// unlinked, and then the `guard/` sync fails, which blocks the file. A
-/// retry finds no mark; it must still sync `guard/` and release the file,
-/// or committed writes stay refused until a restart.
+/// unlinked, and then the `guard/` sync fails, which latches the file. A
+/// retry refuses, so the caller's rename cannot replace that file, and the
+/// file stays latched until restart.
 #[cfg(all(unix, debug_assertions))]
 #[test]
-fn drop_sh_rel_retry_with_no_mark_releases_the_blocked_file() {
+fn drop_sh_rel_retry_with_no_mark_keeps_the_file_latched() {
     let dir = TempDir::labeled("page-guard-drop-rel-retry").unwrap();
     let (file, _path) = committed_body(&dir);
     arm_page0(&dir, "guard/sh-ovf");
@@ -978,18 +965,22 @@ fn drop_sh_rel_retry_with_no_mark_releases_the_blocked_file() {
         file.write_at(PAGE as u64 + 256, &[0x44; 16]).is_err(),
         "the file took a write before the unlink was durable"
     );
-    rbitcoin_store::page_guard::drop_sh_rel(dir.path(), "body").unwrap();
-    file.write_at(PAGE as u64, &[0x77; 16])
-        .expect("the synced retry releases the file");
+    assert_latched(
+        rbitcoin_store::page_guard::drop_sh_rel(dir.path(), "body"),
+        "a retry refuses a name an earlier drop latched, so no rename replaces it",
+    );
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
+    );
 }
 
 /// `restore_page_guard_group` copies its mark, unlinks it, and then fails
-/// the `guard/` sync, which blocks the restored file. A retry on the same
-/// mark finds it gone; it must still sync `guard/` and release the file
-/// before it returns `Ok(false)`.
+/// the `guard/` sync, which latches the restored file. A retry on the same
+/// mark finds it gone, returns `Ok(false)`, and leaves the file latched.
 #[cfg(all(unix, debug_assertions))]
 #[test]
-fn restore_retry_with_no_mark_releases_the_blocked_file() {
+fn restore_retry_with_no_mark_keeps_the_file_latched() {
     let dir = TempDir::labeled("page-guard-restore-retry").unwrap();
     let live = dir.path().join("live");
     write_bytes(&live, 0, &fill(0x11));
@@ -1003,16 +994,18 @@ fn restore_retry_with_no_mark_releases_the_blocked_file() {
         "the restored file is open before the unlink is durable"
     );
     assert!(!restore_page_guard_group(&mark, dir.path()).unwrap());
-    rbitcoin_store::page_guard::check_armed_write(&live, PAGE as u64, 256, 512)
-        .expect("the synced retry releases the file");
+    assert_latched(
+        rbitcoin_store::page_guard::check_armed_write(&live, PAGE as u64, 256, 512),
+        "a retry does not release a latched file",
+    );
 }
 
 /// `clear_sh_marks` unlinks `sh-a`, then fails to unlink `sh-b`. The file
-/// `sh-a` named stays blocked, because that unlink is not durable yet, and
-/// the retry that finds `sh-a` gone still releases it once `guard/` syncs.
+/// `sh-a` named latches, because that unlink is not durable yet, and the
+/// retry that finds `sh-a` gone leaves it latched.
 #[cfg(all(unix, debug_assertions))]
 #[test]
-fn clear_sh_marks_keeps_an_earlier_unlink_pending_when_a_later_one_fails() {
+fn clear_sh_marks_latches_an_earlier_unlink_when_a_later_one_fails() {
     let dir = TempDir::labeled("page-guard-sh-partial").unwrap();
     let (file, path) = committed_body(&dir);
     arm_page0(&dir, "guard/sh-a");
@@ -1028,15 +1021,17 @@ fn clear_sh_marks_keeps_an_earlier_unlink_pending_when_a_later_one_fails() {
     );
     std::fs::remove_dir(guard.join("sh-b")).unwrap();
     clear_sh_marks(dir.path()).unwrap();
-    file.write_at(PAGE as u64, &[0x77; 16])
-        .expect("the synced retry releases the file sh-a named");
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
+    );
 }
 
 /// `clear_page_guard_rel` unlinks the mark, then fails the `guard/` sync.
-/// The retry finds no mark; its sync must still release the blocked file.
+/// The retry finds no mark and leaves the file latched.
 #[cfg(debug_assertions)]
 #[test]
-fn clear_rel_retry_with_no_mark_releases_the_blocked_file() {
+fn clear_rel_retry_with_no_mark_keeps_the_file_latched() {
     let dir = TempDir::labeled("page-guard-rel-retry").unwrap();
     let (file, path) = committed_body(&dir);
     let mark = dir.path().join("guard/mark");
@@ -1050,16 +1045,19 @@ fn clear_rel_retry_with_no_mark_releases_the_blocked_file() {
         "the file took a write before the unlink was durable"
     );
     clear_page_guard_rel(&mark, dir.path(), &files).unwrap();
-    file.write_at(PAGE as u64, &[0x77; 16])
-        .expect("the synced retry releases the file");
+    assert_latched(
+        file.write_at(PAGE as u64, &[0x77; 16]),
+        "a retry does not release a latched file",
+    );
 }
 
-/// A clear that unlinks the mark and then fails its directory sync blocks
+/// A clear that unlinks the mark and then fails its directory sync latches
 /// the file: the unlink is not durable, and a crash could bring the mark
-/// back over a later write. A retry that syncs releases it.
+/// back over a later write. A retry does not release it, and neither does a
+/// new arm.
 #[cfg(debug_assertions)]
 #[test]
-fn a_removed_mark_blocks_its_file_until_the_dir_sync_succeeds() {
+fn a_removed_mark_latches_its_file_when_the_dir_sync_fails() {
     let dir = TempDir::labeled("page-guard-forget").unwrap();
     let live = dir.path().join("live");
     write_bytes(&live, 0, &fill(0x11));
@@ -1085,15 +1083,22 @@ fn a_removed_mark_blocks_its_file_until_the_dir_sync_succeeds() {
     assert!(check(PAGE as u64 + 256).is_err());
     check(committed).expect("an append stays allowed");
     clear_page_guard(&mark, &file, &live).unwrap();
-    check(256).expect("a synced retry releases the file");
-    check(PAGE as u64 + 256).expect("a synced retry releases the file");
+    assert_latched(check(256), "a retry does not release a latched file");
+    assert_latched(
+        check(PAGE as u64 + 256),
+        "a retry does not release a latched file",
+    );
+    assert_latched(
+        arm_page_guard_group(&mark, &[("live", 0, fill(0x11).as_slice())]),
+        "a latched file takes no new arm",
+    );
 }
 
 /// A clear that rewrites a two-file mark without one file, then fails the
-/// directory sync, blocks the dropped file. The kept file stays armed.
+/// directory sync, latches the dropped file. The kept file stays armed.
 #[cfg(debug_assertions)]
 #[test]
-fn a_dropped_file_stays_blocked_when_the_rewrite_sync_fails() {
+fn a_dropped_file_latches_when_the_rewrite_sync_fails() {
     let dir = TempDir::labeled("page-guard-drop-block").unwrap();
     let a = dir.path().join("a");
     let b = dir.path().join("b");
@@ -1123,7 +1128,7 @@ fn a_dropped_file_stays_blocked_when_the_rewrite_sync_fails() {
     );
     check(&b).expect("b is still armed");
     clear_page_guard(&mark, &file, &a).unwrap();
-    check(&a).expect("a synced retry releases a");
+    assert_latched(check(&a), "a retry does not release a latched file");
 }
 
 /// A restore whose mark unlink fails its directory sync blocks the files it
@@ -1168,9 +1173,9 @@ fn an_arm_registers_its_pages_before_the_dir_sync() {
 }
 
 /// A clear that rewrites the mark without one file and then fails its
-/// directory sync blocks that file: the rename is not durable, and a crash
-/// could bring the old mark back over a later write. An arm that syncs
-/// releases it.
+/// directory sync latches that file: the rename is not durable, and a crash
+/// could bring the old mark back over a later write. A new arm of that file
+/// is refused too.
 #[cfg(debug_assertions)]
 #[test]
 fn a_rewritten_mark_blocks_dropped_pages_when_the_dir_sync_fails() {
@@ -1205,8 +1210,14 @@ fn a_rewritten_mark_blocks_dropped_pages_when_the_dir_sync_fails() {
         other => panic!("`live` is open before the rewrite is durable: {other:?}"),
     }
     assert!(check(PAGE as u64).is_err());
-    arm_page_guard_group(&mark, &[("live", PAGE as u64, fill(0x12).as_slice())]).unwrap();
-    check(PAGE as u64).expect("a synced arm releases `live`");
+    assert_latched(
+        arm_page_guard_group(&mark, &[("live", PAGE as u64, fill(0x12).as_slice())]),
+        "a latched file takes no new arm",
+    );
+    assert_latched(
+        check(PAGE as u64),
+        "a retry does not release a latched file",
+    );
 }
 
 /// Without hole punching, `zero_range` writes zeros in 1 MiB chunks. Each

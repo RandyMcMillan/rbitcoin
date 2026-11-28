@@ -864,6 +864,7 @@ impl TableFile {
     /// [`Self::set_logical_len`] leaves the fallocated tail in place. Prune
     /// uses this so the bytes come back.
     pub fn release_to_len(&self, logical: u64) -> Result<(), StoreError> {
+        crate::page_guard::refuse_if_latched(&self.path)?;
         self.set_logical_len(logical)?;
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         set_file_len(&file, &self.path, logical)?;
@@ -878,6 +879,7 @@ impl TableFile {
     /// rewrite the first block, and a cut on a block boundary rewrites none.
     pub fn shrink_to(&self, len: u64) -> Result<(), StoreError> {
         self.refuse_if_poisoned()?;
+        crate::page_guard::refuse_if_latched(&self.path)?;
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let now = file
             .metadata()

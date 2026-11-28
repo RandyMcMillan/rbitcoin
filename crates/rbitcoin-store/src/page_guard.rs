@@ -255,6 +255,13 @@ pub fn arm_page_guard_group(path: &Path, pages: &[(&str, u64, &[u8])]) -> Result
 #[doc(hidden)]
 pub fn restore_page_guard_group(mark: &Path, dir: &Path) -> Result<bool, StoreError> {
     let Some(restored) = replay_page_guard_group(mark, dir)? else {
+        // A retry after a failed sync finds no mark; its sync releases the
+        // files that unlink left pending. No `guard/` means no mark change
+        // to make durable.
+        let parent = mark_parent(mark)?;
+        if parent.is_dir() {
+            sync_mark_dir_then_release(parent, &[])?;
+        }
         return Ok(false);
     };
     remove_mark(mark, &restored)?;
@@ -677,7 +684,8 @@ pub(crate) fn published_sh_mark(name: &str) -> bool {
     name.starts_with("sh-") && !name.ends_with(".tmp")
 }
 
-/// Drop `rel` from every `guard/sh-*` mark, then sync `dir`.
+/// Drop `rel` from every `guard/sh-*` mark, then sync `guard/` and the
+/// directory that holds `rel`.
 #[doc(hidden)]
 pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
     let guard = dir.join("guard");
@@ -698,6 +706,10 @@ pub fn drop_sh_rel(dir: &Path, rel: &str) -> Result<(), StoreError> {
             drop_page_guard_names(&ent.path(), &names)?;
         }
     }
+    // Sync even when no mark was left: a retry after a failed sync finds
+    // none, and the files that unlink blocked stay pending until `guard/`
+    // syncs.
+    sync_mark_dir_then_release(&guard, &[])?;
     if let Some(parent) = Path::new(rel).parent() {
         if !parent.as_os_str().is_empty() {
             let live_parent = dir.join(parent);

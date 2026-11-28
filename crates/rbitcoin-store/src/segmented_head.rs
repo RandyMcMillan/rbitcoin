@@ -25,7 +25,7 @@
 
 use crate::address_head::{AddressHead, HeadLayout, SnapshotImage, HEAD_LOAD_START, MAINNET_BITS};
 use crate::error::StoreError;
-use crate::fuse8_filter::{fuse_key_from_mixed, SealedFuse8};
+use crate::fuse8_filter::{fuse_key_from_mixed, open_file, SealedFuse8};
 use crate::tx_head_mphf::TxHeadMphf;
 use rbitcoin_primitives::{le_u32, le_u64, Fk, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
@@ -165,7 +165,7 @@ impl SegmentedTxHead {
                 if !fp.exists() {
                     return Err(StoreError::Corrupt("tx.head sealed segment missing fuse8"));
                 }
-                Some(map_segment_fuse(&dir, d.file_id)?)
+                Some(open_file(&fp)?)
             } else {
                 None
             };
@@ -1478,10 +1478,7 @@ pub fn segment_fuse_path(dir: &Path, file_id: u32) -> PathBuf {
 
 #[doc(hidden)]
 pub fn map_segment_fuse(dir: &Path, file_id: u32) -> Result<SealedFuse8, StoreError> {
-    let fuse = SealedFuse8::read_from(&segment_fuse_path(dir, file_id))?;
-    #[cfg(target_os = "linux")]
-    fuse.advise_random_access();
-    Ok(fuse)
+    SealedFuse8::read_from(&segment_fuse_path(dir, file_id))
 }
 
 #[doc(hidden)]

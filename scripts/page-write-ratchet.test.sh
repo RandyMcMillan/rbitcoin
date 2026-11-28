@@ -65,6 +65,10 @@ assert_fail "io::Write::write of borrowed bytes after a seek fails an empty base
   python3 "$PY" --root "$FIX/io-write"
 assert_fail "io::Write::write split before its borrowed bytes fails an empty baseline" \
   python3 "$PY" --root "$FIX/io-write-split"
+assert_fail "io::Write::write split before its opening paren fails an empty baseline" \
+  python3 "$PY" --root "$FIX/io-write-paren-split"
+assert_ok "a declaration with extra spacing or fn on its own line is not a call" \
+  python3 "$PY" --root "$FIX/win-decl-spacing"
 assert_ok "RwLock write, OpenOptions write, and write_guard are not counted" \
   python3 "$PY" --root "$FIX/lock-write"
 

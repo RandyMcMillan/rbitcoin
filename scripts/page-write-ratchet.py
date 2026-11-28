@@ -60,14 +60,31 @@ TOKENS = (
     ("truncate", r"(?<![A-Za-z0-9_])truncate\s*\(", None),
     ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", None),
     ("io_write", r"\.write\s*\(\s*&", None),
-    ("WriteFile", r"(?<![A-Za-z0-9_])(?<!fn )WriteFile\s*\(", None),
+    ("WriteFile", r"(?<![A-Za-z0-9_])WriteFile\s*\(", None),
     ("seek_write", r"(?<![A-Za-z0-9_])seek_write\s*\(", None),
-    ("win_set_eof", r"(?<![A-Za-z0-9_])(?<!fn )win_set_eof\s*\(", None),
+    ("win_set_eof", r"(?<![A-Za-z0-9_])win_set_eof\s*\(", None),
 )
 
-# A split a token's own pattern does not imply: (previous line, this line).
-# rustfmt can break `.write(` from its `&bytes` argument.
-SPLITS = {"io_write": (r"\.write\s*\(\s*$", r"^\s*&")}
+# Splits a token's own pattern does not imply: (previous line, this line).
+# rustfmt can break `.write(` from its `&bytes` argument, or `.write` from
+# its `(&bytes)`.
+SPLITS = {
+    "io_write": (
+        (r"\.write\s*\(\s*$", r"^\s*&"),
+        (r"\.write\s*$", r"^\s*\(\s*&"),
+    ),
+}
+
+# A declaration or definition is not a call: `fn NAME(` on one line, or
+# `fn` ending one code line and `NAME(` opening the next, with any spacing.
+DECLS = {
+    tok: (
+        re.compile(r"(?<![A-Za-z0-9_])fn\s+" + tok + r"\s*\("),
+        re.compile(r"(?<![A-Za-z0-9_])fn\s*$"),
+        re.compile(r"^\s*" + tok + r"\s*\("),
+    )
+    for tok in ("WriteFile", "win_set_eof")
+}
 
 # Counted only in a file whose `FileExt` count is above zero. The method
 # form `file.write_at(..)` names no trait, so the import alone would hide
@@ -91,13 +108,15 @@ def scan(root: str) -> dict[str, int]:
         # line. Blank and comment-only lines between them do not count.
         # A bare name (`FileExt`) has no opener to split from.
         call = re.match(r"(.*)\\s\*(\\\(|\\\{)$", pattern)
-        split = None
+        splits = ()
         if token in SPLITS:
-            split = tuple(re.compile(rx) for rx in SPLITS[token])
+            splits = tuple(
+                (re.compile(a), re.compile(b)) for a, b in SPLITS[token]
+            )
         elif call:
             name, opener = call.groups()
-            split = (re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener))
-        compiled.append((token, re.compile(pattern), only, split))
+            splits = ((re.compile(name + r"\s*$"), re.compile(r"^\s*" + opener)),)
+        compiled.append((token, re.compile(pattern), only, splits))
     counts: dict[str, int] = {}
     for crate in CRATES:
         src = os.path.join(root, "crates", crate, "src")
@@ -114,17 +133,23 @@ def scan(root: str) -> dict[str, int]:
                     continue
                 rel = f"{rel_dir}/{name}"
                 full = os.path.join(dirpath, name)
-                for token, rx, only, split in compiled:
+                for token, rx, only, splits in compiled:
                     if only is not None and crate not in only:
                         continue
                     if token == FILEEXT_WRITE[0] and f"{rel}\tFileExt" not in counts:
                         continue
 
-                    def line_fn(code, prev, rx=rx, split=split):
+                    def line_fn(code, prev, rx=rx, splits=splits, token=token):
                         n = len(rx.findall(code))
-                        if split and split[0].search(prev) and split[1].search(code):
-                            n += 1
-                        return n
+                        for a, b in splits:
+                            if a.search(prev) and b.search(code):
+                                n += 1
+                        decl = DECLS.get(token)
+                        if decl:
+                            n -= len(decl[0].findall(code))
+                            if decl[1].search(prev) and decl[2].search(code):
+                                n -= 1
+                        return max(n, 0)
 
                     got = ratchet.file_count(full, line_fn)
                     if got:

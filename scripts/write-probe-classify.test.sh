@@ -20,6 +20,8 @@ assert_fail "a caller with a space does not hide a second, unreviewed stack" \
   python3 "$PY" "$FIX/caller-space.log"
 assert_fail "a footer across two sectors with no mark fails" \
   python3 "$PY" "$FIX/len-multi-sector.log"
+assert_fail "a length on a mark from the cold scripthash pack fails" \
+  python3 "$PY" "$FIX/sh-pack-on-mark.log"
 assert_fail "an empty log fails: the probe did not run" \
   python3 "$PY" "$FIX/empty.log"
 assert_fail "a missing log fails" \

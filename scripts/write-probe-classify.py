@@ -32,10 +32,19 @@ RULES = [
      "spent.body fold: open replays it from spent.delta"),
     (r"MULTI_SECTOR|LEN_BEFORE_SYNC", r"tx\.head/", r"AddressHead::write_snapshot",
      "fresh shutdown snapshot: footer generation stays 0, which open does not trust, until the image is synced"),
-    (r".*", r"scripthash", r"scripthash_materialize::|pack_shard_session|ScriptHashBulkSession",
-     "cold scripthash build behind scripthash.dirty: a crash rebuilds"),
-    (r"MULTI_SECTOR", r"scripthash\.ovf/ingest|shhead", r"ScriptHashHead|SlotPageCache|unlink_write_home|scripthash_head::",
+    # A shard pack soft-clears the ingest keys its main now owns
+    # (publish_packed_shard -> drop_ingest_covered_by_packed_main ->
+    # stage_rewrites). Those frames are inlined, so the stack shows seal_shard.
+    (r"MULTI_SECTOR", r"scripthash\.ovf/ingest|shhead",
+     r"ScriptHashHead|SlotPageCache|unlink_write_home|scripthash_head::|scripthash_materialize::seal_shard",
      "scripthash ingest head: synced ingest.ahead image"),
+    # The cold pack publishes a shard body's length before its sync. Open
+    # trusts a packed shard only through its NN.packed mark, and
+    # publish_packed_shard writes that mark only after it flushes the body
+    # (data, length, alloc header). Only that class, on that stack.
+    (r"LEN_BEFORE_SYNC", r"scripthash\.body/",
+     r"scripthash_materialize::pack_and_seal_unsorted_shard|ScriptHashBulkSession::finish_pack",
+     "cold pack body: open trusts a shard only by its NN.packed mark, written after the body sync"),
     (r"MULTI_SECTOR", r"scripthash", r"unlink::restore_page|unlink::arm_undo|recover_unlink_undos",
      "legacy unlink undo replay at open, or its test hook"),
     (r"MULTI_SECTOR", r"blockfilter\.body", r"repair_body|repaired_filter_body",

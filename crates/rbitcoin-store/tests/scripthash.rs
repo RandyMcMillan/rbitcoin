@@ -1787,6 +1787,32 @@ fn empty_ingest_shard_seal_does_not_walk_slots() {
         .expect("absent ingest is not scanned");
 }
 
+/// `open_sorted_main_shards` trusts any shard whose `.packed` mark exists.
+/// The seal must make the body bytes, length, and alloc header durable first:
+/// a failed body flush leaves no mark, so a crash cannot seal unsynced chains.
+#[cfg(debug_assertions)]
+#[test]
+fn pack_mark_waits_for_the_shard_body_flush() {
+    let dir = tmp();
+    let t = four_shard_table(&dir);
+    let mut session = t.pack_shard_session(0).unwrap();
+    for i in 0..8u8 {
+        let base = u64::from(i) * 10 + 1;
+        push_chain(&mut session, shard0_key(i), &[Fk(base), Fk(base + 1)]);
+    }
+    let pack = session.finish_pack().unwrap();
+    let base = sorted_main_shard_path(dir.path(), 0, t.head_shard_count());
+    rbitcoin_store::io_handle::arm_fail_flush(t.shard_body(0).io_handle(), 1);
+    assert!(
+        t.publish_packed_shard(0, pack).is_err(),
+        "the seal ignored a failed body flush"
+    );
+    assert!(
+        !shard_pack_mark_path(&base).exists(),
+        "the pack mark landed before the shard body was durable"
+    );
+}
+
 fn shard0_key(i: u8) -> [u8; 32] {
     let mut k = [0u8; 32];
     k[0] = i & 0x3f;

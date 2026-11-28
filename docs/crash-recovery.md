@@ -244,7 +244,8 @@ when no write started since its sync began, and never a mark that was present
 at open or that a failed write left. A clean shutdown of a dirty index runs
 that flush. The cold build and pack paths do not mark: an unsealed shard is
 untrusted until its pack mark, and its keys stay in ingest or overflow until
-then. A start with `--sh-index` that finds the file refuses and names the fix:
+then. The seal syncs the shard body (data, length, and alloc header) before it
+writes the mark, so a marked shard never names chains the device lacks. A start with `--sh-index` that finds the file refuses and names the fix:
 `RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
 markers) wipes the index at open and removes the file, or start without
 `--sh-index`. There is no clean-close gate and no whole-store snapshot, so a

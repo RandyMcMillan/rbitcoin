@@ -3748,6 +3748,9 @@ impl ScriptHashTable {
             free_head,
         };
         write_alloc_header(body, &state)?;
+        // `.packed` makes open trust these chains. Body bytes, length, and
+        // alloc header reach the device before it.
+        body.flush()?;
         *self.shard_alloc(shard).lock().unwrap() = state;
         self.note_shard_packed(shard)?;
         self.drop_ingest_covered_by_packed_main(shard)?;

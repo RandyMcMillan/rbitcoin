@@ -30,7 +30,7 @@ assert_fail "a new token in a known file fails" \
   python3 "$PY" --root "$FIX/new-token"
 assert_ok "a door call is not a raw page write" \
   python3 "$PY" --root "$FIX/alias"
-assert_ok "store write_all is not a raw page write" \
+assert_fail "store write_all fails an empty baseline" \
   python3 "$PY" --root "$FIX/store-write-all"
 assert_fail "mempool write_all fails an empty baseline" \
   python3 "$PY" --root "$FIX/mempool-write-all"

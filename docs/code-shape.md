@@ -136,7 +136,8 @@ A method-form call names no trait, so in a file that mentions `FileExt`
 each `write_at` and `write_all_at` call also counts as `FileExt_write`,
 door calls included. A second raw write after the import still moves
 the baseline.
-`write_all` counts only under `rbitcoin-mempool`. `write_at`,
+`write_all` counts in both crates: the store's frozen sites write a
+whole new file or a temp, or replay a synced ahead image at open. `write_at`,
 `write_at_pwrite`, `write_uncommitted`, `pwrite_all`, `persist_hwm`,
 `persist_logical_len`, `write_trailer`, and `zero_range` are the
 `TableFile` write door and are not counted. `handle_pwrite_all` does not

@@ -10,9 +10,10 @@ for counts above zero. A token above its line, a positive token with no
 line, or a line that is now lower (or whose file is gone) fails.
 --write rewrites the file from the tree.
 
-`write_all(` is counted only in rbitcoin-mempool. The store uses it to
-fill a temp file inside the rename helper, which is not a live page
-write. `handle_pwrite_all(` does not match inside `pwrite_all`.
+`write_all(` counts in both crates. The store's sites today write a
+whole new file or a temp before a rename, or replay a synced ahead image
+in place at open. The baseline freezes them per file, so a new
+`std::io::Write::write_all` on a store data file moves its line. `handle_pwrite_all(` does not match inside `pwrite_all`.
 
 `write_at`, `write_at_pwrite`, `write_uncommitted`, `pwrite_all`,
 `persist_hwm`, `persist_logical_len`, `write_trailer`, and `zero_range`
@@ -46,7 +47,7 @@ TOKENS = (
     ("set_file_len", r"(?<![A-Za-z0-9_])set_file_len\s*\(", None),
     ("set_len", r"(?<![A-Za-z0-9_])set_len\s*\(", None),
     ("truncate", r"(?<![A-Za-z0-9_])truncate\s*\(", None),
-    ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", ("rbitcoin-mempool",)),
+    ("write_all", r"(?<![A-Za-z0-9_])write_all\s*\(", None),
 )
 
 # Counted only in a file whose `FileExt` count is above zero. The method

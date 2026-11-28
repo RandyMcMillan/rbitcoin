@@ -549,6 +549,7 @@ impl HeaderTable {
             bytes: &blob,
             new_logical: new_len,
             length_wave: 0,
+            length_order: 0,
         }]);
         appended?;
         self.count

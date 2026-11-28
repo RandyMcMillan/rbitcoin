@@ -265,6 +265,40 @@ fn put_blocks_rolls_mid_batch_when_next_start_exceeds_u32() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A plan that rolls and then is dropped gives those slots back. The empty
+/// pair must not keep a `first_slot` that still counts them, or the next
+/// plan stores height R where locate reads height R plus that gap.
+#[test]
+fn a_dropped_roll_rebases_the_empty_pair_before_the_next_plan() {
+    let dir = tmp_dir();
+    let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+    t.put_block(Height(0), &[None]).unwrap();
+    t.flush().unwrap();
+    drop(t);
+
+    let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
+    set_file_hwm(&body, u64::from(u32::MAX - 4));
+    let t = SpTweaksTable::open(&dir).unwrap();
+    let fat: Vec<Option<[u8; 33]>> = vec![None; 20];
+    let staged = t
+        .stage_blocks(&[
+            (Height(1), fat.as_slice()),
+            (Height(2), &[None] as &[Option<[u8; 33]>]),
+        ])
+        .unwrap();
+    drop(staged);
+    t.put_blocks(&[
+        (Height(1), fat.as_slice()),
+        (Height(2), &[None] as &[Option<[u8; 33]>]),
+    ])
+    .unwrap();
+    // Height 0's body length is the stretched file, so this pin reads only
+    // the heights the dropped roll wrote.
+    assert_eq!(t.get_block(Height(1), 20).unwrap().unwrap(), fat);
+    assert_eq!(t.get_block(Height(2), 1).unwrap().unwrap(), vec![None]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reorg_truncates_and_regenerates_tip_height() {
     let dir = tmp_dir();

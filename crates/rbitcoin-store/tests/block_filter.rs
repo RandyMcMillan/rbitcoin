@@ -778,14 +778,6 @@ fn a_filter_and_tweak_seal_is_three_barriers() {
     seal_filter_and_tweak_puts(&filters, &recs, &tweaks, &items).unwrap();
     let barriers = rbitcoin_store::file::take_sync_barrier_trace();
     assert_eq!(barriers.len(), 3, "{barriers:?}");
-    let names = |synced: &[std::path::PathBuf]| {
-        let mut names: Vec<_> = synced
-            .iter()
-            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    };
     assert_eq!(barriers[0].synced.len(), 4, "{barriers:?}");
     assert!(
         barriers[0]
@@ -795,18 +787,29 @@ fn a_filter_and_tweak_seal_is_three_barriers() {
         "payload barrier wrote a length: {:?}",
         barriers[0].headers
     );
-    assert_eq!(names(&barriers[1].synced).len(), 2);
-    assert_eq!(names(&barriers[2].synced).len(), 2);
+    let mut body_paths = vec![paths[0].clone(), paths[2].clone()];
+    let mut idx_paths = vec![paths[1].clone(), paths[3].clone()];
+    body_paths.sort();
+    idx_paths.sort();
+    let mut synced1 = barriers[1].synced.clone();
+    let mut synced2 = barriers[2].synced.clone();
+    synced1.sort();
+    synced2.sort();
+    assert_eq!(synced1, body_paths, "{barriers:?}");
+    assert_eq!(synced2, idx_paths, "{barriers:?}");
     let old = FILE_HEADER_LEN as u64;
-    let idx_still_old = barriers[1]
-        .headers
-        .iter()
-        .filter(|(path, _)| path.ends_with("000000") && path.to_string_lossy().contains(".idx"))
-        .all(|(_, len)| *len == old);
-    assert!(
-        idx_still_old,
-        "an idx length moved with the bodies: {barriers:?}"
-    );
+    let header = |path: &std::path::Path| {
+        barriers[1]
+            .headers
+            .iter()
+            .find(|(watched, _)| watched == path)
+            .map(|(_, len)| *len)
+            .unwrap_or(0)
+    };
+    assert!(header(&paths[0]) > old, "{barriers:?}");
+    assert!(header(&paths[2]) > old, "{barriers:?}");
+    assert_eq!(header(&paths[1]), old, "{barriers:?}");
+    assert_eq!(header(&paths[3]), old, "{barriers:?}");
     assert_eq!(filters.next_height(), Height(1));
     assert_eq!(tweaks.next_height(), Height(1));
 }

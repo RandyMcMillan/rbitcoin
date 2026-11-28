@@ -593,6 +593,7 @@ impl BlockFilterTable {
                         bytes: &p.body,
                         new_logical: p.body_end,
                         length_wave: 0,
+                        length_order: 0,
                     });
                 }
                 writes.push(Append {
@@ -601,6 +602,7 @@ impl BlockFilterTable {
                     bytes: &p.idx,
                     new_logical: p.idx_at + p.idx.len() as u64,
                     length_wave: 1,
+                    length_order: seg.file_id,
                 });
             }
             // Body wave 0, idx wave 1. `commit` may add the tweak pair on

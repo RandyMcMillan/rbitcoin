@@ -1042,6 +1042,11 @@ pub struct Append<'a> {
     /// Length-publish wave. Wave 0 is written and synced before wave 1 is
     /// written. Files that share a wave share one sync.
     pub length_wave: u32,
+    /// Order inside one wave. A lower order is synced before a higher
+    /// order's lengths are written. A segment index uses its file id, so
+    /// the earlier pair's index length is durable before the next pair's
+    /// index length is written.
+    pub length_order: u32,
 }
 
 /// Publish a group of appends with no mark, under the sector rule.
@@ -1051,8 +1056,11 @@ pub struct Append<'a> {
 /// that wave's lengths are written and synced before the next wave's
 /// lengths are written. A body at wave 0 and its index at wave 1 is
 /// durable, bytes and length, before the index length that names it.
-/// Files that share a wave share the sync. A crash leaves each file at
-/// its old length or its new one, and bytes past a length are not read.
+/// Files that share a wave and a [`Append::length_order`] share the sync.
+/// A lower order in that wave is synced before a higher order's lengths
+/// are written, so a later segment index cannot be published while the
+/// earlier segment's index length is still old. A crash leaves each file
+/// at its old length or its new one, and bytes past a length are not read.
 /// A format whose last record ends at the body length must fit that
 /// record on open, as `sp_tweaks` does. On an error a length may already
 /// be durable, so every file in the group is poisoned: it refuses writes
@@ -1077,6 +1085,7 @@ fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
         file: &'a TableFile,
         end: u64,
         wave: u32,
+        order: u32,
     }
     let mut files: Vec<Published<'_>> = Vec::new();
     for w in writes {
@@ -1092,12 +1101,16 @@ fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
                 if got.wave != w.length_wave {
                     return Err(StoreError::Corrupt("an append file has two length waves"));
                 }
+                if got.order != w.length_order {
+                    return Err(StoreError::Corrupt("an append file has two length orders"));
+                }
                 got.end = got.end.max(w.new_logical);
             }
             None => files.push(Published {
                 file: w.file,
                 end: w.new_logical,
                 wave: w.length_wave,
+                order: w.length_order,
             }),
         }
     }
@@ -1111,15 +1124,24 @@ fn commit_appends_once(writes: &[Append<'_>]) -> Result<(), StoreError> {
     waves.sort_unstable();
     waves.dedup();
     for wave in waves {
-        let group: Vec<&TableFile> = files
+        let mut orders: Vec<u32> = files
             .iter()
             .filter(|f| f.wave == wave)
-            .map(|f| f.file)
+            .map(|f| f.order)
             .collect();
-        for f in files.iter().filter(|f| f.wave == wave) {
-            f.file.set_logical_len(f.end)?;
+        orders.sort_unstable();
+        orders.dedup();
+        for order in orders {
+            let group: Vec<&TableFile> = files
+                .iter()
+                .filter(|f| f.wave == wave && f.order == order)
+                .map(|f| f.file)
+                .collect();
+            for f in files.iter().filter(|f| f.wave == wave && f.order == order) {
+                f.file.set_logical_len(f.end)?;
+            }
+            TableFile::sync_length_wave(&group)?;
         }
-        TableFile::sync_length_wave(&group)?;
     }
     Ok(())
 }

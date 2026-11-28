@@ -108,6 +108,7 @@ impl<'a> StagedBlocks<'a> {
                     bytes: &plan.body,
                     new_logical: plan.body_at + plan.body.len() as u64,
                     length_wave: 0,
+                    length_order: 0,
                 });
             }
             if !plan.idx.is_empty() {
@@ -117,6 +118,7 @@ impl<'a> StagedBlocks<'a> {
                     bytes: &plan.idx,
                     new_logical: plan.idx_at + plan.idx.len() as u64,
                     length_wave: 1,
+                    length_order: seg.file_id,
                 });
             }
         }
@@ -587,6 +589,14 @@ impl SpTweaksTable {
         }
         let mut inner = self.lock();
         Self::refuse_after_failed_put(&inner)?;
+        // A dropped plan gives its slots back but leaves a rolled pair.
+        // That pair's `first_slot` still counts the slots. Rebase it.
+        if let Some(last) = inner.segs.len().checked_sub(1) {
+            if inner.segs[last].n_slots == 0 {
+                let base: u64 = inner.segs[..last].iter().map(|s| s.n_slots).sum();
+                inner.segs[last].first_slot = base;
+            }
+        }
         let mut i = 0usize;
         let mut plans: Vec<TweakPlan> = Vec::new();
         // `roll` stamps `first_slot` from `n_slots` already on the pairs.

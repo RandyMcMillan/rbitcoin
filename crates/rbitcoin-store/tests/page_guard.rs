@@ -1273,6 +1273,7 @@ fn a_failed_append_poisons_its_group_until_reopen() {
                 bytes: &row,
                 new_logical: at + 8,
                 length_wave: 0,
+                length_order: 0,
             },
             Append {
                 file: b,
@@ -1280,6 +1281,7 @@ fn a_failed_append_poisons_its_group_until_reopen() {
                 bytes: &row,
                 new_logical: at + 8,
                 length_wave: 0,
+                length_order: 0,
             },
         ])
     };
@@ -1359,6 +1361,7 @@ fn two_pairs_publish_lengths_in_three_barriers() {
             bytes: &row,
             new_logical: end,
             length_wave,
+            length_order: 0,
         })
         .collect();
     rbitcoin_store::file::arm_sync_barrier_trace(&paths);
@@ -1398,4 +1401,56 @@ fn two_pairs_publish_lengths_in_three_barriers() {
     assert_eq!(names(&barriers[2].synced), ["a.idx", "b.idx"]);
     assert_eq!(header(&barriers[2], "a.idx"), end);
     assert_eq!(header(&barriers[2], "b.idx"), end);
+}
+
+/// Two index files in one wave still publish the earlier file's length
+/// before the later file's length is written.
+#[cfg(debug_assertions)]
+#[test]
+fn an_earlier_index_length_is_durable_before_the_next_index() {
+    use rbitcoin_primitives::TableKind;
+    use rbitcoin_store::file::{TableFile, FILE_HEADER_LEN};
+    use rbitcoin_store::page_guard::{commit_appends, Append};
+    let dir = rbitcoin_store::testutil::TempDir::labeled("append-index-order").unwrap();
+    let paths: Vec<_> = ["a.body", "a.idx", "b.body", "b.idx"]
+        .into_iter()
+        .map(|name| dir.path.join(name))
+        .collect();
+    let files: Vec<_> = paths
+        .iter()
+        .map(|path| TableFile::create(path, TableKind::ArrayLink).unwrap())
+        .collect();
+    let at = FILE_HEADER_LEN as u64;
+    let row = [9u8; 8];
+    let end = at + 8;
+    let waves = [0u32, 1, 0, 1];
+    let orders = [0u32, 0, 0, 1];
+    let appends: Vec<Append<'_>> = files
+        .iter()
+        .zip(waves)
+        .zip(orders)
+        .map(|((file, length_wave), length_order)| Append {
+            file,
+            at,
+            bytes: &row,
+            new_logical: end,
+            length_wave,
+            length_order,
+        })
+        .collect();
+    rbitcoin_store::file::arm_sync_barrier_trace(&paths);
+    commit_appends(&appends).unwrap();
+    let barriers = rbitcoin_store::file::take_sync_barrier_trace();
+    assert_eq!(barriers.len(), 4, "sync barriers: {barriers:?}");
+    let header = |barrier: &rbitcoin_store::file::SyncBarrier, name: &str| -> u64 {
+        barrier
+            .headers
+            .iter()
+            .find(|(path, _)| path.ends_with(name))
+            .map(|(_, len)| *len)
+            .unwrap_or(0)
+    };
+    assert_eq!(header(&barriers[2], "a.idx"), end);
+    assert_eq!(header(&barriers[2], "b.idx"), at);
+    assert_eq!(header(&barriers[3], "b.idx"), end);
 }

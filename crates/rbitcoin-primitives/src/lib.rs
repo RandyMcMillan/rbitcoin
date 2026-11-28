@@ -109,11 +109,11 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **31:** `meta` only. A new store is created at 31; an upgraded one
-///         reaches 31 at its first page-guard mark, before the mark is
-///         published. A plain open of 30 does not. No table rewrite:
-///         every other file keeps stamp 30 ([`FILE_SCHEMA_VERSION`]).
-///         An older binary refuses 31 `meta`.
+/// **31:** A page-guard mark may exist under `store/guard/`. No table
+///         rewrite. Open rewrites 22–30 `meta` to 31, and a new store is
+///         created at 31. Files keep the stamp they were written with. A 30
+///         binary refuses 31 `meta`, so it never opens a store with a mark
+///         it would ignore.
 /// **30:** Every spend slot is a note in `spent.delta/`: page records in
 ///         16 MiB segments, a directory base plus log, and `commit`. Class A
 ///         writes no `spent.body` bytes; only a fold does. A 29 binary would
@@ -155,20 +155,12 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
 pub const SCHEMA_VERSION: u16 = 31;
 
-/// Stamp in every store file other than `meta` and a page-guard mark.
-///
-/// The newest schema that changed such a file. Schema 31 changed `meta`
-/// only, so a plain open of a 30 store, which leaves `meta` at 30, writes
-/// tables, heads, and sidecars a schema-30 binary still opens.
-pub const FILE_SCHEMA_VERSION: u16 = 30;
-
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
 /// Schema **31** is current. Meta **22** through **31** opens. Occupied **22**
 /// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
-/// trailing size/weight from 96 B `header.body` rows. Any meta below **30**
-/// is rewritten to 30. Meta **30** stays 30 until the first Class A arm
-/// writes 31. A short `txstat.body` is aligned to the loc count.
+/// trailing size/weight from 96 B `header.body` rows. Any meta below **31**
+/// is rewritten to 31; a short `txstat.body` is aligned to the loc count.
 /// An older binary refuses 31 `meta`.
 /// Meta older than **22** is not
 /// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /

@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 30` (`rbitcoin_primitives`).
-**Status:** 30 replaces the `spend.pages` image log with a schema-30 spend delta that records every spend slot. `spent.body` keeps its layout but is sparse: Class A writes none of its bytes, and only a fold writes its pages. `store/spent.delta/` holds page records in capped segments, a page directory written as a base plus a log of one batch per generation, and the commit that names the snapshot. Old segments fold into `spent.body`. A 29 binary would read stale `spent.body` and miss the delta, so it refuses 30 `meta`. Opening any 22–29 datadir here rewrites `meta` to 30, publishes a committed schema-29 page log as the delta's first generation, and removes the 29 files. A 29 binary then refuses the directory. 29 records which generation file held each `spend.pages` image; it is read once, at that open. 28 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. A 27 binary refuses 28 `meta`. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+**Version:** `SCHEMA_VERSION = 31` (`rbitcoin_primitives`).
+**Status:** 31 adds page-guard marks under `store/guard/` and changes no table. Opening a 22–30 datadir rewrites `meta` to 31, so a 30 binary refuses it. 30 replaces the `spend.pages` image log with a schema-30 spend delta that records every spend slot. `spent.body` keeps its layout but is sparse: Class A writes none of its bytes, and only a fold writes its pages. `store/spent.delta/` holds page records in capped segments, a page directory written as a base plus a log of one batch per generation, and the commit that names the snapshot. Old segments fold into `spent.body`. A 29 binary would read stale `spent.body` and miss the delta, so it refuses 30 `meta`. Opening any 22–29 datadir here rewrites `meta` to 30, publishes a committed schema-29 page log as the delta's first generation, and removes the 29 files. A 29 binary then refuses the directory. 29 records which generation file held each `spend.pages` image; it is read once, at that open. 28 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. A 27 binary refuses 28 `meta`. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
 `txstat` for that header's create range. A 25 binary refuses 26 `meta`.
@@ -23,7 +23,7 @@ divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Meta older than 22
 is one refuse, empty or occupied: `schema before 22 refuses this datadir;
 wipe datadir and redo IBD`. That is the last time `tx.body`, `txout.body`,
 or `inwit.body` / `seqsigwit.body` had to be deleted rather than rewritten.
-`schema_file_openable` is 22 through 30. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`. A 27 binary refuses 28 `meta`. A 28 binary refuses 29 `meta`. A 29 binary refuses 30 `meta`.
+`schema_file_openable` is 22 through 31. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`. A 27 binary refuses 28 `meta`. A 28 binary refuses 29 `meta`. A 29 binary refuses 30 `meta`. A 30 binary refuses 31 `meta`.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
@@ -302,7 +302,7 @@ and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not prun
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — new files are stamped **30** (`FILE_SCHEMA_VERSION`): schema 31 changed `meta` only. Occupied files keep the version they were written; **22–31** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **31** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–31** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 

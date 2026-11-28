@@ -173,8 +173,7 @@ fn occupied_schema23_header_body_opens_as_24() {
     assert_eq!(got.weight, 0);
     drop(s);
     let meta = std::fs::read(dir.join("meta")).unwrap();
-    // Open rewrites 22–29 to schema 30. The first Class A arm publishes 31.
-    assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), 30);
+    assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), SCHEMA_VERSION);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -702,7 +701,7 @@ fn open_schema24_occupied_creates_zero_txstat() {
     assert_eq!(s.txs.txstat.count(), 1);
     assert_eq!(s.txs.txstat.get_cell(Fk(1)).unwrap(), [0u8; 8]);
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), 30);
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
     assert!(dir.join("txstat.body").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -715,7 +714,7 @@ fn poke_logical_len(path: &Path, logical: u64) {
 }
 
 /// Schema 27 is master without the spend log. Opening it here rewrites meta
-/// to 30 so that build refuses the directory instead of writing under the log.
+/// to the current schema so that build refuses the directory instead of writing under the log.
 #[test]
 fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     let dir = tmp();
@@ -726,8 +725,7 @@ fn schema_27_rewrites_meta_so_an_older_build_refuses() {
     write_store_meta_ver(&dir, 27);
     let s = Store::open_tiny(&dir).unwrap();
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 31);
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -773,42 +771,26 @@ fn restamp_store(dir: &Path, ver: u16) {
     }
 }
 
-/// A plain open leaves meta 30 alone so a schema-30 binary still opens the
-/// store. Every file this binary writes there other than `meta` and a
-/// `guard/` mark, including a `header_txs_first` pair the open creates, must
-/// carry a stamp that binary accepts. Schema 31 is `meta` only.
+/// A plain open of a schema-30 store rewrites `meta` to 31, so a 0.9 binary
+/// refuses a datadir this binary has opened, even one it wrote no mark into.
 #[test]
-fn plain_open_of_meta_30_stamps_no_file_past_30() {
+fn plain_open_of_meta_30_rewrites_meta_to_31() {
     let dir = tmp();
     {
         let s = Store::create_tiny(&dir).unwrap();
-        let item = coinbase_item([0x30u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
-        s.put_tx_full_batch_indexed(&[item], true).unwrap();
-        s.txs.sync_class_a_named(s.txs.count()).unwrap();
         s.flush().unwrap();
     }
     restamp_store(&dir, 30);
-    std::fs::remove_file(dir.join("header_txs_first.body")).unwrap();
-    std::fs::remove_file(dir.join("header_txs_count.body")).unwrap();
-    {
-        let s = Store::open_tiny(&dir).unwrap();
-        let item = coinbase_item([0x31u8; 32], vec![OutputRecord::unspent(50, vec![0x52])]);
-        s.put_tx_full_batch_indexed(&[item], true).unwrap();
-        s.txs.sync_class_a_named(s.txs.count()).unwrap();
-        s.flush().unwrap();
-    }
-    assert!(dir.join("header_txs_first.body").is_file());
-    let meta = dir.join("meta");
-    let guard = dir.join("guard");
-    let past: Vec<_> = store_stamps(&dir)
-        .into_iter()
-        .filter(|(p, _, v)| *v > 30 && *p != meta && !p.starts_with(&guard))
-        .collect();
-    assert!(past.is_empty(), "a schema-30 binary refuses {past:?}");
+    assert_eq!(read_store_meta_ver(&dir), 30);
+    drop(Store::open_tiny(&dir).unwrap());
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 31);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A 26 datadir whose witness locator is already the finished cut must open,
-/// keep the creates, and rewrite meta to 30. A 26 binary wipes that layout.
+/// keep the creates, and rewrite meta to the current schema. A 26 binary
+/// wipes that layout.
 #[test]
 fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     let dir = tmp();
@@ -835,8 +817,7 @@ fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     let s = Store::open_tiny(&dir).unwrap();
     assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), 30);
-    assert_eq!(SCHEMA_VERSION, 31);
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(
         synced.iter().any(|p| p == dir.path()),
@@ -987,8 +968,7 @@ fn open_schema22_occupied_rewrites_create_ovf_12_to_16() {
     assert_eq!(tx.output_count, n_out);
     assert_eq!(outs.len(), n_out as usize);
     drop(s);
-    // Open rewrites 22–29 to schema 30. The first Class A arm publishes 31.
-    assert_eq!(read_store_meta_ver(&dir), 30);
+    assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
     assert_eq!(ovf_data_len(&dir), 16);
     let _ = std::fs::remove_dir_all(&dir);
 }

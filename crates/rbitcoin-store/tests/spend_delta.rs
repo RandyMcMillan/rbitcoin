@@ -690,17 +690,20 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
     drop(s);
     assert!(!d.join("spend.pages.commit").exists());
     assert!(!d.join("spend.pages").exists());
-    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        rbitcoin_primitives::SCHEMA_VERSION
+    );
     let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
 }
 
 /// An upgrade whose open fails after the spend delta published its
-/// adoption already says schema 30, and the 29 log is gone: no schema-29
+/// adoption already says the current schema, and the 29 log is gone: no schema-29
 /// binary can open the datadir and write spends the published delta would
 /// never read.
 #[test]
-fn an_upgrade_open_that_fails_after_the_adoption_is_already_30() {
+fn an_upgrade_open_that_fails_after_the_adoption_is_already_current() {
     let (_clean, d) = CleanDir::new();
     schema_29_store(&d);
     let meta =
@@ -713,7 +716,10 @@ fn an_upgrade_open_that_fails_after_the_adoption_is_already_30() {
     bytes[..4].copy_from_slice(b"XXXX");
     std::fs::write(&path, bytes).unwrap();
     assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
-    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        rbitcoin_primitives::SCHEMA_VERSION
+    );
     assert!(!d.join("spend.pages.commit").exists());
     assert!(!d.join("spend.pages").exists());
 }
@@ -750,7 +756,10 @@ fn an_upgrade_killed_before_the_adoption_adopts_again() {
     let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(slot));
     drop(s);
-    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        rbitcoin_primitives::SCHEMA_VERSION
+    );
 }
 
 /// A schema-30 datadir that lost `spent.delta/` refuses to open, even when
@@ -762,9 +771,12 @@ fn a_schema_30_body_without_its_delta_refuses_whatever_its_length() {
     let (_clean, d) = CleanDir::new();
     schema_29_store(&d);
     {
-        // The upgrade: adopts the body, writes `meta` 30.
+        // The upgrade: adopts the body, writes the current `meta`.
         let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
-        assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+        assert_eq!(
+            rbitcoin_store::store::check_meta(&d).unwrap(),
+            rbitcoin_primitives::SCHEMA_VERSION
+        );
         let end = s.txs.spent.body_published_len();
         drop(s);
         std::fs::remove_dir_all(delta_dir(&d)).unwrap();
@@ -793,7 +805,10 @@ fn a_held_schema_29_log_opens_and_is_filtered() {
         rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk(9), 0).unwrap();
     write_schema_29_log(&d, &[(0, page_zero_image(meta))], 0, true);
     let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
-    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        rbitcoin_primitives::SCHEMA_VERSION
+    );
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
     s.drop_spends_above_tip().unwrap();
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some([0u8; 8]));

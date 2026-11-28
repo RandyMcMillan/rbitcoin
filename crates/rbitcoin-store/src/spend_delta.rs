@@ -88,7 +88,7 @@ use crate::file::{
     fsync_parent_dir, write_synced_tmp_rename, GrowPolicy, TableFile, FILE_HEADER_LEN,
 };
 use crate::tx_table::BODY_PAGE_SIZE;
-use rbitcoin_primitives::{schema_file_openable, TableKind, FILE_SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasherDefault;
@@ -1124,7 +1124,7 @@ impl Commit {
     fn encode(&self) -> [u8; COMMIT_LEN] {
         let mut b = [0u8; COMMIT_LEN];
         b[0..4].copy_from_slice(&STORE_MAGIC);
-        b[4..6].copy_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
+        b[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
         b[6..8].copy_from_slice(&COMMIT_LAYOUT.to_le_bytes());
         b[8..12].copy_from_slice(&self.generation.to_le_bytes());
         b[12..16].copy_from_slice(&self.dir_pages.to_le_bytes());
@@ -3591,7 +3591,7 @@ impl FoldFile {
     fn new() -> Self {
         let mut buf = Vec::new();
         buf.extend_from_slice(&STORE_MAGIC);
-        buf.extend_from_slice(&FILE_SCHEMA_VERSION.to_le_bytes());
+        buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         Self { buf, count: 0 }

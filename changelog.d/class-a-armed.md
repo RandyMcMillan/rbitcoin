@@ -8,6 +8,4 @@ Changed
   master build that imaged pages is written back to the stems, synced,
   and removed on open. The choice of what to write back is saved first,
   so an open after a failed write or sync finishes it. One that does not
-  decode stops open as corrupt and stays on disk. Store meta 31 is published by the
-  first page-guard mark. A plain open of a schema 30 datadir leaves it at
-  30, and an older binary refuses 31 `meta`.
+  decode stops open as corrupt and stays on disk.

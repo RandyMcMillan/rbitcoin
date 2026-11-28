@@ -756,7 +756,7 @@ fn mixed_spent_body_page_under_fold_reopens_as_the_fold_image() {
     let delta = dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR);
     let mut fold = Vec::new();
     fold.extend_from_slice(&rbitcoin_primitives::STORE_MAGIC);
-    fold.extend_from_slice(&rbitcoin_primitives::FILE_SCHEMA_VERSION.to_le_bytes());
+    fold.extend_from_slice(&rbitcoin_primitives::SCHEMA_VERSION.to_le_bytes());
     fold.extend_from_slice(&0u16.to_le_bytes());
     fold.extend_from_slice(&1u32.to_le_bytes());
     fold.extend_from_slice(&4096u64.to_le_bytes());
